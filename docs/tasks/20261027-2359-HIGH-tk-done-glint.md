@@ -1,6 +1,6 @@
 # tk done: отказ при находках glint в репо с .glint.yaml
 
-Статус: в работе
+Статус: готово
 Исполнитель: luna:1027-2312-tk
 
 ## Вход
@@ -26,3 +26,4 @@
 - 2026-10-27 23:59 открыт — akit-master: просьба лида (решение пользователя `glint-threshold`).
 - 2026-10-28 00:00 в работе — luna:1027-2312-tk
 - 2026-10-28 00:00 note — akit-master: задание бойцу 1027-2312-tk, дерево ~/.cache/worktrees/akit/tk (ветка tk-glint от main), приёмка ~/.cache/akit-accept/tk-glint.sh
+- 2026-10-28 00:05 готово — akit-master: ревью диффа (prepareDone/checkGlint), приёмка ~/.cache/akit-accept/tk-glint.sh OK на main, живьём: клон dream — done отказал с кодом 1 и списком находок; v1.5.0
