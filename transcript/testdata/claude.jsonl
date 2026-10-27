@@ -1,0 +1,14 @@
+{"type":"agent-name","agentName":"main","sessionId":"x"}
+{"type":"api-request","sessionId":"x","body":"huge"}
+{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:00:00.000Z","message":{"role":"user","content":"привет, сделай sub"}}
+{"parentUuid":"a","type":"assistant","timestamp":"2026-10-25T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Делаю."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"go test ./...","description":"tests"}}]}}
+{"parentUuid":"b","type":"user","timestamp":"2026-10-25T10:00:09.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok  akit/edit"}]}}
+{"parentUuid":"c","type":"assistant","timestamp":"2026-10-25T10:01:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{"questions":[]}}]}}
+{"parentUuid":"d","type":"user","timestamp":"2026-10-25T10:01:30.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"User answered"}]},"toolUseResult":{"answers":{"Какое имя?":"sub (Recommended)"}}}
+{"parentUuid":"e","type":"user","origin":{"kind":"peer"},"timestamp":"2026-10-25T10:02:00.000Z","message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message from=\"uds:/run/x.sock\" from-name=\"reviewer\" from-mode=\"bypass\">\nимя — sub\n</cross-session-message>"}}
+{"parentUuid":"f","type":"attachment","timestamp":"2026-10-25T10:03:00.000Z","attachment":{"type":"queued_command","prompt":"и ещё вопрос","origin":{"kind":"human"}}}
+{"parentUuid":"g","type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-10-25T10:04:00.000Z","message":{"role":"user","content":"<task-notification>done</task-notification>"}}
+{"parentUuid":"h","type":"user","isCompactSummary":true,"timestamp":"2026-10-25T10:05:00.000Z","message":{"role":"user","content":"summary of the conversation"}}
+{"parentUuid":"i","type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:06:00.000Z","message":{"role":"user","content":[{"type":"text","text":"смотри скрин"},{"type":"image","source":{}}]}}
+{"parentUuid":"broken","type":"user","timest
+{"parentUuid":"j","type":"assistant","timestamp":"2026-10-25T10:07:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"SendMessage","input":{"to":"main","message":"готово"}}]}}
