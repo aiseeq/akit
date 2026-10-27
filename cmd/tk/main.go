@@ -16,15 +16,38 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/proc"
+	"github.com/aiseeq/akit/timearg"
 )
 
 const usage = `tk — track repository tasks in docs/tasks.
-Usage: tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME]
-       tk ls [--all] [--status STATUS] [--root DIR]
-       tk start|review|done|reject ID [flags]
-       tk archive [--older DURATION]
-       tk show ID
-Statuses: открыт, в работе, на проверке, готово, отклонён.
+
+Usage:
+  tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME] [--text FILE|-]
+  tk ls [--all] [--status STATUS] [--root DIR]
+  tk start ID [--by NAME]
+  tk wait ID --until TEXT [--by NAME]
+  tk review ID [--by NAME] [--note TEXT]
+  tk done ID --check TEXT [--by NAME] [--doer NAME]
+  tk reject ID --why TEXT [--by NAME]
+  tk show ID
+  tk archive [--older DURATION]
+
+Flags:
+  --prio P       new: priority HIGH, MEDIUM, or LOW (default MEDIUM)
+  --title TEXT   new: ticket title (default: slug)
+  --by NAME      actor name (default: current session)
+  --text FILE|-  new: fill ticket sections from FILE, or standard input with -
+  --all          ls: include closed tickets
+  --status S     ls: show only status S
+  --root DIR     ls: scan DIR and its first-level repositories
+  --note TEXT    review: add a review note to the journal
+  --check TEXT   done: describe independent verification (required)
+  --doer NAME    done: specify the executor of a legacy ticket
+  --why TEXT     reject: explain why the ticket was declined (required)
+  --until TEXT   wait: time or condition to wait for (required)
+  --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
+
+Statuses: открыт, в работе, ждёт, на проверке, готово, отклонён.
 Exit: 0 success, 1 not found or declined, 2 usage or I/O error.
 `
 const (
@@ -35,13 +58,15 @@ const (
 )
 
 var slugRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
-var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-(HIGH|MEDIUM|LOW)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$`)
+var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-([A-Z]+)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$`)
+var nameRE = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N}._:@-]*$`)
+var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-[a-z0-9]+(?:-[a-z0-9]+)*(?:\.md)?$`)
 var errHelp = errors.New("help")
 
 type options struct {
-	cmd, id, prio, title, by, note, check, doer, why, status, root string
-	all                                                            bool
-	older                                                          time.Duration
+	cmd, id, prio, title, by, note, check, doer, why, status, root, until, text string
+	all                                                                         bool
+	older                                                                       time.Duration
 }
 type task struct {
 	path, slug, status, prio, title, body string
@@ -81,7 +106,7 @@ func parseArgs(a []string) (options, error) {
 }
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--root": &o.root}
+	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--root": &o.root, "--until": &o.until, "--text": &o.text}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -131,7 +156,7 @@ func validateCommand(o *options, pos []string) error {
 		return validateNew(o, pos)
 	case "ls":
 		return validateList(o, pos)
-	case "start", "review", "done", "reject", "show":
+	case "start", "wait", "review", "done", "reject", "show":
 		return validateTicketAction(o, pos)
 	case "archive":
 		if len(pos) > 0 {
@@ -153,6 +178,9 @@ func validateNew(o *options, pos []string) error {
 	if o.prio != "HIGH" && o.prio != "MEDIUM" && o.prio != "LOW" {
 		return errors.New("--prio must be HIGH, MEDIUM, or LOW")
 	}
+	if o.by != "" && !nameRE.MatchString(o.by) {
+		return errors.New("--by must be a name without spaces; use --by NAME")
+	}
 	return nil
 }
 
@@ -167,8 +195,17 @@ func validateList(o *options, pos []string) error {
 }
 
 func validateTicketAction(o *options, pos []string) error {
-	if len(pos) != 1 || !slugRE.MatchString(o.id) {
-		return fmt.Errorf("%s needs a valid task id", o.cmd)
+	if len(pos) != 1 || (!slugRE.MatchString(o.id) && !ticketIDRE.MatchString(o.id)) {
+		return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
+	}
+	if o.by != "" && !nameRE.MatchString(o.by) {
+		return errors.New("--by must be a name without spaces; use --by NAME")
+	}
+	if o.doer != "" && !nameRE.MatchString(o.doer) {
+		return errors.New("--doer must be a name without spaces; use --doer NAME")
+	}
+	if o.cmd == "wait" && o.until == "" {
+		return errors.New("wait requires --until")
 	}
 	if o.cmd == "done" && o.check == "" {
 		return errors.New("done requires --check")
@@ -194,18 +231,17 @@ func duration(s string) (time.Duration, error) {
 }
 func validStatus(s string) bool {
 	switch s {
-	case "открыт", "в работе", "на проверке", "готово", "отклонён":
+	case "открыт", "в работе", "ждёт", "на проверке", "готово", "отклонён":
 		return true
 	}
 	return false
 }
 func run(o options, out, errout io.Writer) int {
-	if o.cmd != "ls" && o.cmd != "archive" && o.cmd != "show" && o.by == "" {
-		o.by = session()
-		if o.by == "" {
-			fmt.Fprintln(errout, "tk: cannot determine session; pass --by NAME")
-			return exitUsage
-		}
+	if code := prepareActor(&o, errout); code != 0 {
+		return code
+	}
+	if code := readTicketText(&o, errout); code != 0 {
+		return code
 	}
 	if o.cmd == "ls" && o.root != "" {
 		return list("", o, out, errout)
@@ -235,11 +271,50 @@ func run(o options, out, errout io.Writer) int {
 		return exitUsage
 	}
 	if o.cmd == "show" {
-		fmt.Fprintf(out, "%s\n%s\n", relative(root, t.path), t.status)
+		fmt.Fprintf(out, "%s\n%s", relative(root, t.path), t.body)
+		if !strings.HasSuffix(t.body, "\n") {
+			fmt.Fprintln(out)
+		}
 		return 0
 	}
 	return transition(t, o, out, errout)
 }
+func prepareActor(o *options, errout io.Writer) int {
+	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" {
+		return 0
+	}
+	if o.by == "" {
+		o.by = session()
+	}
+	if o.by == "" {
+		fmt.Fprintln(errout, "tk: cannot determine session; pass --by NAME")
+		return exitUsage
+	}
+	if !nameRE.MatchString(o.by) {
+		fmt.Fprintln(errout, "tk: --by must be a name without spaces; pass --by NAME")
+		return exitUsage
+	}
+	return 0
+}
+
+func readTicketText(o *options, errout io.Writer) int {
+	if o.cmd != "new" || o.text == "" {
+		return 0
+	}
+	var b []byte
+	var err error
+	if o.text == "-" {
+		b, err = io.ReadAll(os.Stdin)
+	} else {
+		b, err = os.ReadFile(o.text)
+	}
+	if err != nil {
+		return fail(errout, err)
+	}
+	o.text = string(b)
+	return 0
+}
+
 func session() string {
 	b, e := os.ReadFile("/proc/self/cgroup")
 	if e != nil {
@@ -268,7 +343,7 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	}
 	for i := range ts {
 		t := ts[i]
-		if t.slug == o.id {
+		if matchesID(t, o.id) {
 			fmt.Fprintf(errout, "tk: task %q already exists\n", o.id)
 			return exitNone
 		}
@@ -279,8 +354,11 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		title = o.id
 	}
 	// Исполнителя ставит start: автор тикета часто его же и проверяет.
-	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n\n## Постановка\n\n## Что сделать\n\n## Чем проверить\n\n## Журнал\n- %s открыт — %s\n",
+	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n\n## Вход\n- Проблема:\n- Метод:\n- Дешевле:\n- Инструмент:\n- Цена:\n- Если не делать:\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
 		title, now.Format("2006-01-02 15:04"), o.by)
+	if o.text != "" {
+		body = fillTicket(body, o.text)
+	}
 	p := filepath.Join(dir, now.Format("20060102-1504")+"-"+o.prio+"-"+o.id+".md")
 	if e = os.WriteFile(p, []byte(body), fileMode); e != nil {
 		return fail(errout, e)
@@ -385,7 +463,7 @@ func find(dir, id string) (task, error) {
 	var got []task
 	for i := range ts {
 		t := ts[i]
-		if t.slug == id {
+		if matchesID(t, id) {
 			got = append(got, t)
 		}
 	}
@@ -397,6 +475,11 @@ func find(dir, id string) (task, error) {
 	}
 	return got[0], nil
 }
+func matchesID(t task, id string) bool {
+	base := filepath.Base(t.path)
+	return t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id
+}
+
 func list(root string, o options, out, errout io.Writer) int {
 	repos, err := taskRepos(root, o.root)
 	if err != nil {
@@ -404,14 +487,31 @@ func list(root string, o options, out, errout io.Writer) int {
 	}
 	var all []task
 	labels := make(map[string]string)
+	var skipped []string
 	for _, repo := range repos {
-		ts, err := load(filepath.Join(repo, "docs/tasks"))
+		dir := filepath.Join(repo, "docs/tasks")
+		ts, err := load(dir)
 		if err != nil {
+			return fail(errout, err)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fail(errout, err)
 		}
 		label := ""
 		if o.root != "" {
-			label = filepath.Base(repo)
+			label, err = filepath.Rel(o.root, repo)
+			if err != nil {
+				return fail(errout, err)
+			}
+			if label == "." {
+				label = filepath.Base(repo)
+			}
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") && fileRE.FindStringSubmatch(entry.Name()) == nil {
+				skipped = append(skipped, entry.Name())
+			}
 		}
 		for i := range ts {
 			t := ts[i]
@@ -421,13 +521,17 @@ func list(root string, o options, out, errout io.Writer) int {
 			}
 		}
 	}
-	if len(all) == 0 {
+	if len(all) == 0 && len(skipped) == 0 {
 		fmt.Fprintln(out, "no tasks")
 		return 0
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].created.Before(all[j].created) })
 	for i := range all {
 		printTask(out, all[i], labels[all[i].path])
+	}
+	if len(skipped) > 0 {
+		sort.Strings(skipped)
+		fmt.Fprintf(out, "skipped %d files not named YYYYMMDD-HHMM-PRIO-slug.md: %s\n", len(skipped), strings.Join(skipped, ", "))
 	}
 	return 0
 }
@@ -452,6 +556,13 @@ func taskRepos(root, baseDir string) ([]string, error) {
 	}
 	var repos []string
 	for _, repo := range candidates {
+		gitInfo, gitErr := os.Lstat(filepath.Join(repo, ".git"))
+		if gitErr == nil && !gitInfo.IsDir() {
+			continue
+		}
+		if gitErr != nil && !errors.Is(gitErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("check repository marker in %q: %w", repo, gitErr)
+		}
 		if _, err := os.Stat(filepath.Join(repo, "docs/tasks")); err == nil {
 			repos = append(repos, repo)
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -465,7 +576,7 @@ func includeTask(t task, o options) bool {
 	if o.status != "" {
 		return t.status == o.status
 	}
-	return o.all || t.status == "открыт" || t.status == "в работе" || t.status == "на проверке"
+	return o.all || t.status == "открыт" || t.status == "в работе" || t.status == "ждёт" || t.status == "на проверке"
 }
 
 func printTask(out io.Writer, t task, label string) {
@@ -482,7 +593,120 @@ func printTask(out io.Writer, t task, label string) {
 	if label != "" {
 		label += " "
 	}
-	fmt.Fprintf(out, "%s%s %s %s %s %s\n", label, t.slug, t.status, t.prio, ageText, t.title)
+	wait := waiting(t.body)
+	if wait != "" {
+		shown := wait
+		if at, err := timearg.Parse(wait, time.Now()); err == nil {
+			shown = "до " + at.Format("2006-01-02 15:04")
+			if !at.After(time.Now()) {
+				shown += " overdue"
+			}
+		}
+		wait = " [" + shown + "]"
+	}
+	fmt.Fprintf(out, "%s%s %s %s %s %s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait)
+}
+
+func waiting(s string) string {
+	for line := range strings.SplitSeq(s, "\n") {
+		if value, ok := strings.CutPrefix(line, "Ждёт: "); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func setWaiting(s, value string) string {
+	ls := strings.Split(s, "\n")
+	for i, line := range ls {
+		if strings.HasPrefix(line, "Статус: ") {
+			if i+1 < len(ls) && strings.HasPrefix(ls[i+1], "Ждёт: ") {
+				ls[i+1] = "Ждёт: " + value
+			} else {
+				ls = append(ls[:i+1], append([]string{"Ждёт: " + value}, ls[i+1:]...)...)
+			}
+			return strings.Join(ls, "\n")
+		}
+	}
+	return s
+}
+
+func removeWaiting(s string) string {
+	ls := strings.Split(s, "\n")
+	kept := ls[:0]
+	for _, line := range ls {
+		if !strings.HasPrefix(line, "Ждёт: ") {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+func fillTicket(template, text string) string {
+	sections, extra := parseTicketSections(text)
+	return replaceTicketSections(template, sections, extra)
+}
+
+func parseTicketSections(text string) (map[string][]string, []string) {
+	sections := make(map[string][]string)
+	var current string
+	var extra []string
+	for line := range strings.SplitSeq(strings.TrimSpace(text), "\n") {
+		if strings.HasPrefix(line, "# ") {
+			continue
+		}
+		if strings.HasPrefix(line, "## ") {
+			current = line
+			if !standardTicketSection(current) && current != "## Журнал" {
+				extra = append(extra, line)
+			}
+			continue
+		}
+		if current == "" {
+			current = "## Что сделать"
+		}
+		if current == "## Журнал" {
+			continue
+		}
+		sections[current] = append(sections[current], line)
+		if !standardTicketSection(current) {
+			extra = append(extra, line)
+		}
+	}
+	return sections, extra
+}
+
+func standardTicketSection(section string) bool {
+	return section == "## Что сделать" || section == "## Приёмка" || section == "## Вход"
+}
+
+func replaceTicketSections(template string, sections map[string][]string, extra []string) string {
+	lines := strings.Split(template, "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if standardTicketSection(line) {
+			out = append(out, line)
+			content, ok := sections[line]
+			if ok && len(content) > 0 {
+				out = append(out, content...)
+			} else if line == "## Вход" {
+				out = append(out, lines[i+1:i+7]...)
+				i += 6
+			}
+			for i+1 < len(lines) && lines[i+1] == "" {
+				i++
+			}
+			out = append(out, "")
+			continue
+		}
+		if line == "## Журнал" && len(extra) > 0 {
+			out = append(out, extra...)
+			out = append(out, "")
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 func executor(s string) string {
@@ -556,17 +780,17 @@ func journal(s, line string) string {
 	return strings.Join(ls, "\n")
 }
 func transition(t task, o options, out, errout io.Writer) int {
-	next := map[string]string{"start": "в работе", "review": "на проверке", "done": "готово", "reject": "отклонён"}[o.cmd]
+	next := map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён"}[o.cmd]
 	if o.cmd == "done" {
 		doer := executor(t.body)
 		if o.doer != "" {
 			doer = o.doer
 		}
-		if doer == "" {
-			fmt.Fprintln(errout, "tk: executor unknown; pass --doer NAME")
+		if doer == "" || !nameRE.MatchString(doer) {
+			fmt.Fprintln(errout, "tk: executor unknown or invalid; pass --doer NAME")
 			return exitNone
 		}
-		if doer == o.by {
+		if strings.EqualFold(doer, o.by) {
 			fmt.Fprintln(errout, "tk: reviewer must differ from executor")
 			return exitNone
 		}
@@ -577,6 +801,12 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "start" || o.cmd == "review" && executor(t.body) == "" {
 		t.body = setExecutor(t.body, o.by)
 	}
+	if o.cmd == "wait" {
+		t.body = setWaiting(setStatus(t.body, next), o.until)
+	}
+	if o.cmd == "start" {
+		t.body = removeWaiting(t.body)
+	}
 	line := fmt.Sprintf("- %s %s — %s", time.Now().Format("2006-01-02 15:04"), next, o.by)
 	if o.cmd == "done" {
 		line += " — " + o.check
@@ -586,6 +816,9 @@ func transition(t task, o options, out, errout io.Writer) int {
 	}
 	if o.cmd == "review" && o.note != "" {
 		line += " — " + o.note
+	}
+	if o.cmd == "wait" {
+		line += " — " + o.until
 	}
 	t.body = journal(setStatus(t.body, next), line)
 	if e := os.WriteFile(t.path, []byte(t.body), fileMode); e != nil {
@@ -599,7 +832,7 @@ func archive(root, dir string, o options, out, errout io.Writer) int {
 	if e != nil {
 		return fail(errout, e)
 	}
-	dstDir := filepath.Join(dir, "archive")
+	dstDir := filepath.Join(root, "docs/tasks-archive")
 	cut := time.Now().Add(-o.older)
 	var moved []string
 	for i := range ts {

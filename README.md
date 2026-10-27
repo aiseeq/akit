@@ -78,20 +78,32 @@ blocks after it. With a FILE argument a path line may only repeat that file (`./
 
 ## tk
 
-Repository task files in `docs/tasks/`: each ticket records the work and how to check it. A ticket is
-closed only after an independent review; old closed tickets can be moved to `docs/tasks/archive/`.
+Repository task files live in `docs/tasks/`; closed tickets can be moved to `docs/tasks-archive/`
+after an independent review.
 
     tk new fix-login --prio HIGH --title 'Fix login' --by agent
     tk ls                              # open tickets, oldest first
     tk start fix-login --by agent
-    tk review fix-login --by agent
+    tk wait fix-login --until '2026-10-28 09:00' --by agent
+    tk review fix-login --by reviewer
     tk done fix-login --check 'graft gate' --by reviewer
     tk archive                         # closed tickets older than 14 days
 
-Ticket IDs are slugs unique within the task folder. `tk ls --all` includes closed tickets;
-`--status STATUS` filters by status. `tk ls --root DIR` lists tasks for repositories directly
-inside DIR. `tk show ID` prints the ticket path and status. Without `--by`, commands use the
-current agent session name when it can be read from the process cgroup.
+`tk new` starts a ticket with an `Вход` section. Each line answers one question:
+
+- `Проблема` — is there a real problem, and where is it visible?
+- `Метод` — can the chosen method reach the goal?
+- `Дешевле` — is there a cheaper way?
+- `Инструмент` — could the tool itself be at fault?
+- `Цена` — is the work worth its cost against the queue?
+- `Если не делать` — what happens if the work is skipped?
+
+Ticket IDs accept the slug, the full file name, or the file name without `.md`. `tk ls --all`
+includes closed tickets; `--status STATUS` filters by status. `tk ls --root DIR` lists tasks for
+DIR and its first-level repositories, skipping linked worktrees. Waiting tickets show their
+condition or deadline, with overdue times marked. `tk show ID` prints the ticket path and full
+text. Without `--by`, commands use the current session name when it can be read from the process
+cgroup. `tk -h` lists commands and flags.
 
 ## tl
 
