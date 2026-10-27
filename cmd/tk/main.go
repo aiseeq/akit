@@ -1218,18 +1218,10 @@ func lintTicket(path, shown string) ([]string, error) {
 	return issues, nil
 }
 
-// strictCompletion — то же для lint: годится только строка «готово — кто: проверка», последняя в журнале.
+// strictCompletion — то же для lint: годится строка «готово», где назван и проверяющий, и проверка.
 func strictCompletion(s string) (checker, check string, ok bool) {
-	for _, line := range journalLines(s) {
-		_, after, found := strings.Cut(line, " готово — ")
-		if !found {
-			continue
-		}
-		who, what, _ := strings.Cut(after, ": ")
-		checker, check = strings.TrimSpace(who), strings.TrimSpace(what)
-		ok = checker != "" && check != ""
-	}
-	return checker, check, ok
+	checker, check = completion(s)
+	return checker, check, checker != "" && check != ""
 }
 
 func explicitStatus(s string) (string, bool) {

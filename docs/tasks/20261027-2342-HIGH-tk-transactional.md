@@ -1,6 +1,6 @@
 # tk: тикеты вне репо, note, ls --by, ждёт к сроку
 
-Статус: в работе
+Статус: готово
 Исполнитель: luna:1027-2312-tk
 
 ## Вход
@@ -33,3 +33,5 @@
 - 2026-10-27 23:46 note — akit-master: просьба лида для обхода Сна (~/.claude/improve/state/process-scan-spec.md, «Просьба к akit»): пп. 7–9 (ls --json, show --json, lint); приоритет — после пп. 1–3.
 - 2026-10-27 23:49 в работе — luna:1027-2312-tk
 - 2026-10-27 23:49 note — akit-master: задание бойцу — worker continue 1027-2312-tk, дерево ~/.cache/worktrees/akit/tk (ветка tk-tx от main fd6bb2d), приёмка ~/.cache/akit-accept/tk-tx.sh
+- 2026-10-27 23:56 на проверке — akit-master — боец сдал, tk-tx.sh OK
+- 2026-10-27 23:56 готово — akit-master: ревью диффа cmd/tk, правка completion (последняя строка «готово»), приёмка ~/.cache/akit-accept/tk-tx.sh OK на main, graft gate зелёный; v1.4.0

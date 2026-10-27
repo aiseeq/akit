@@ -1,6 +1,6 @@
 # pressure: ReadLoadAvg для наблюдения aguard
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -23,3 +23,4 @@
 - 2026-10-27 23:46 открыт — akit-master: просьба aguard-master.
 - 2026-10-27 23:46 в работе — akit-master
 - 2026-10-27 23:46 на проверке — akit-master — v1.2.0 (1a11065); тесты pressure и cmd/busy зелёные; busy на машине — free при обмене 212 KB/s
+- 2026-10-27 23:56 готово — aguard-master: aguard 2e86d5b на v1.2.0: ReadLoadAvg вживую (ноут /proc, PC по папке снятых файлов) и тест на снятом файле

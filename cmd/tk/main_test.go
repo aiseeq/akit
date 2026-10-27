@@ -359,3 +359,14 @@ func TestFillTicketPreservesSectionsAndJournal(t *testing.T) {
 		t.Fatalf("filled ticket duplicated acceptance section:\n%s", body)
 	}
 }
+
+func TestLintAcceptsEarlierDoneLine(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "20200101-1200-LOW-closed.md")
+	body := "# Closed\n\nСтатус: готово\nИсполнитель: worker\n\n## Приёмка\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer — go test зелёный\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if issues, err := lintTicket(p, "closed"); err != nil || len(issues) != 0 {
+		t.Fatalf("строка «готово — кто — проверка» прежних версий: %v %v", issues, err)
+	}
+}
