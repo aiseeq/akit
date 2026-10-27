@@ -20,14 +20,16 @@ import (
 const usage = `busy — is the machine busy by the shared rule (akit/pressure), in one line.
 
 Usage:
-  busy [--runnable N] [--window D] [--proc DIR]
+  busy [--runnable N] [--mem-some P] [--window D] [--proc DIR]
 
 Busy when the tasks ready to run now (procs_running, one reading, without busy itself) are at or
-above the machine's threads, the IO pressure (full avg60) is above 10%, or swapping over the
-window is above 1024 KB/s. The same rule graft queues heavy tasks by and aguard watches.
+above the machine's threads, the IO pressure (full avg60) is above 10%, or the memory pressure
+(some avg10) is above 10% while swapping over the window is above 1024 KB/s. Swapping alone is
+not busy. The same rule graft queues heavy tasks by and aguard watches.
 
 Flags:
   --runnable N    busy at N runnable tasks (default: the machine's threads)
+  --mem-some P    memory pressure limit, % (default 10)
   --window D      swapping measured over D (default 1s)
   --proc DIR      read DIR instead of /proc
 
@@ -86,6 +88,11 @@ func parseArgs(args []string) (options, error) {
 				err = errors.New("must be positive")
 			}
 			opts.limits.Runnable = float64(n)
+		case "--mem-some":
+			opts.limits.MaxMemSome, err = strconv.ParseFloat(value, 64)
+			if err == nil && opts.limits.MaxMemSome <= 0 {
+				err = errors.New("must be positive")
+			}
 		case "--window":
 			opts.limits.SwapWindow, err = time.ParseDuration(value)
 		case "--proc":
@@ -133,8 +140,11 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 	if !skipped(pressure.ErrNoIOPressure) {
 		parts = append(parts, fmt.Sprintf("IO pressure %.1f%% (limit %v%%)", m.IOFull, l.MaxIOFull))
 	}
+	if !skipped(pressure.ErrNoMemPressure) {
+		parts = append(parts, fmt.Sprintf("memory pressure %.1f%% (some avg10, limit %v%%)", m.MemSome, l.MaxMemSome))
+	}
 	if !skipped(pressure.ErrNoVMStat) {
-		parts = append(parts, fmt.Sprintf("swapping %.0f KB/s (limit %v)", m.SwapKBs, l.MaxSwapKBs))
+		parts = append(parts, fmt.Sprintf("swapping %.0f KB/s (counts above %v only with memory pressure)", m.SwapKBs, l.MaxSwapKBs))
 	}
 	for _, e := range v.Skipped {
 		parts = append(parts, "not checked: "+e.Error())

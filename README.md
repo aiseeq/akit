@@ -12,8 +12,10 @@ Install: `tools/install.sh [tool…]` — builds into `~/bin` from a clean tree 
 
 Is the machine busy, in one line, by the rule graft queues heavy tasks by and aguard watches
 (`akit/pressure`): tasks ready to run now (`procs_running`, one reading) at or above the machine's
-threads, IO pressure above 10%, or swapping above 1024 KB/s over a second. Use it instead of
-`cat /proc/loadavg`: the 1-minute load lags. Exit 0 free, 1 busy, 2 usage or reading error.
+threads, IO pressure above 10%, or memory pressure (some avg10) above 10% while swapping above
+1024 KB/s over a second; swapping alone is not busy. Use it instead of `cat /proc/loadavg` to
+decide whether to start heavy work now: the 1-minute load lags. Exit 0 free, 1 busy, 2 usage or
+reading error. `pressure.ReadLoadAvg` reads the system load average for watching long overload.
 
     busy                        # busy: runnable 31 is at or above 22; runnable 31 (busy at 22, threads 22); …
     busy --runnable 16          # busy from 16 runnable tasks instead of the thread count

@@ -14,33 +14,42 @@ import (
 
 // Правило «машина занята» — одно на всех: graft пускает по нему тяжёлые задачи, aguard следит, команда
 // busy показывает агентам. Процессор — по числу задач, готовых к работе прямо сейчас, одним чтением:
-// нужно не точное число, а актуальное, а минутный load запаздывает.
+// нужно не точное число, а актуальное, а минутный load запаздывает. Обмен со свопом сам по себе
+// не занятость: он идёт и при запасе памяти, а вредит, когда задачи ждут память, — поэтому своп
+// судится только вместе с давлением памяти.
 
 // Мера, по которой машина занята.
 const (
 	CPU  = "cpu"
 	IO   = "io"
-	Swap = "swap"
+	Swap = "swap" // обмен со свопом при давлении памяти
 )
 
 // Меры, которых нет в системе (не Linux, ядро без PSI): потребитель пропускает меру и говорит об этом.
 var (
-	ErrNoRunnable   = errors.New("no /proc/stat to count runnable tasks from")
-	ErrNoIOPressure = errors.New("no /proc/pressure/io to read the IO pressure from")
-	ErrNoVMStat     = errors.New("no /proc/vmstat to count swapping from")
+	ErrNoRunnable    = errors.New("no /proc/stat to count runnable tasks from")
+	ErrNoIOPressure  = errors.New("no /proc/pressure/io to read the IO pressure from")
+	ErrNoMemPressure = errors.New("no /proc/pressure/memory to read the memory pressure from")
+	ErrNoVMStat      = errors.New("no /proc/vmstat to count swapping from")
 )
 
 // Limits — пороги правила. Runnable 0 — число потоков машины, у которой procRoot: так машины с разным
-// числом потоков судятся одинаково.
+// числом потоков судятся одинаково. MaxMemSome 0 — DefaultMemSome: так потребитель, не знающий этого
+// порога, получает правило с ним.
 type Limits struct {
 	Runnable   float64       // занята, когда готовых к работе задач столько или больше
 	MaxIOFull  float64       // занята выше: % последней минуты, когда все задачи ждали диск (full avg60)
-	MaxSwapKBs float64       // занята выше: обмен со свопом, KB/s; занятый своп не вредит, вредит обмен
+	MaxMemSome float64       // память: % последних 10 с, когда хоть одна задача ждала память (some avg10)
+	MaxSwapKBs float64       // и при этом обмен со свопом выше, KB/s; один обмен, без давления, — не занята
 	SwapWindow time.Duration // окно замера обмена при свежем замере
 }
 
+// DefaultMemSome — порог давления памяти по умолчанию, %. По замерам машины за неделю: some avg10
+// выше 10 — в 0,4% замеров, все — в эпизодах нехватки памяти; обычный фон — доли процента.
+const DefaultMemSome = 10
+
 // DefaultLimits — пороги graft по умолчанию (load.max_io_full 10, load.max_swap_kbs 1024, окно 1 с).
-var DefaultLimits = Limits{MaxIOFull: 10, MaxSwapKBs: 1024, SwapWindow: time.Second}
+var DefaultLimits = Limits{MaxIOFull: 10, MaxMemSome: DefaultMemSome, MaxSwapKBs: 1024, SwapWindow: time.Second}
 
 // Load — замеры машины. Непрочитанная мера — 0, её сентинел в Verdict.Skipped.
 type Load struct {
@@ -48,6 +57,7 @@ type Load struct {
 	Threads  int     // потоков машины: строки cpuN в /proc/stat
 	CPUSome  float64 // % последних 10 с, когда хоть одна задача ждала процессор (some avg10), для справки
 	IOFull   float64 // % последней минуты, когда все задачи ждали диск (full avg60)
+	MemSome  float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	SwapKBs  float64 // обмен со свопом, KB/s
 }
 
@@ -57,7 +67,7 @@ type Verdict struct {
 	Value   float64
 	Limit   float64
 	Load    Load
-	Skipped []error // меры, которых нет в системе: ErrNoRunnable, ErrNoIOPressure, ErrNoVMStat
+	Skipped []error // меры, которых нет в системе: ErrNoRunnable, ErrNoIOPressure, ErrNoMemPressure, ErrNoVMStat
 }
 
 // Busy — занята ли машина.
@@ -71,25 +81,31 @@ func (v Verdict) Why() string {
 	case IO:
 		return fmt.Sprintf("IO pressure %.1f%% is above %v%%", v.Value, v.Limit)
 	case Swap:
-		return fmt.Sprintf("swapping %.0f KB/s is above %v", v.Value, v.Limit)
+		return fmt.Sprintf("memory pressure %.1f%% is above %v%% while swapping %.0f KB/s", v.Value, v.Limit, v.Load.SwapKBs)
 	}
 	return ""
 }
 
-// Rule применяет пороги к замерам: процессор, потом диск, потом своп; пропущенная мера не судится.
+// Rule применяет пороги к замерам: процессор, потом диск, потом память со свопом; пропущенная мера не
+// судится. Value и Limit у Swap — давление памяти и его порог: обмен лишь подтверждает его.
 func Rule(m Load, l Limits, skipped []error) Verdict {
 	v := Verdict{Load: m, Skipped: skipped}
 	runnable := l.Runnable
 	if runnable <= 0 {
 		runnable = float64(m.Threads)
 	}
+	memSome := l.MaxMemSome
+	if memSome <= 0 {
+		memSome = DefaultMemSome
+	}
+	memory := !skippedAny(skipped, ErrNoMemPressure) && !skippedAny(skipped, ErrNoVMStat)
 	switch {
 	case !skippedAny(skipped, ErrNoRunnable) && runnable > 0 && float64(m.Runnable) >= runnable:
 		v.Measure, v.Value, v.Limit = CPU, float64(m.Runnable), runnable
 	case !skippedAny(skipped, ErrNoIOPressure) && m.IOFull > l.MaxIOFull:
 		v.Measure, v.Value, v.Limit = IO, m.IOFull, l.MaxIOFull
-	case !skippedAny(skipped, ErrNoVMStat) && m.SwapKBs > l.MaxSwapKBs:
-		v.Measure, v.Value, v.Limit = Swap, m.SwapKBs, l.MaxSwapKBs
+	case memory && m.MemSome > memSome && m.SwapKBs > l.MaxSwapKBs:
+		v.Measure, v.Value, v.Limit = Swap, m.MemSome, memSome
 	}
 	return v
 }
@@ -146,6 +162,14 @@ func (m *Meter) Check(ctx context.Context, l Limits, fresh bool) (Verdict, error
 				return err
 			}
 			load.IOFull, err = psiField(string(psi), "full", "avg60")
+			return err
+		}),
+		measure(ErrNoMemPressure, func() error {
+			psi, err := m.read(filepath.Join("pressure", "memory"), ErrNoMemPressure)
+			if err != nil {
+				return err
+			}
+			load.MemSome, err = psiField(string(psi), "some", "avg10")
 			return err
 		}),
 	)
@@ -277,4 +301,54 @@ func ParseSwapPages(s string) (int64, error) {
 		return 0, errors.New("vmstat: no pswpin and pswpout")
 	}
 	return pages, nil
+}
+
+// ErrNoLoadAvg — нет /proc/loadavg (не Linux).
+var ErrNoLoadAvg = errors.New("no /proc/loadavg to read the load average from")
+
+// LoadAvg — строка /proc/loadavg: средние за 1, 5, 15 минут и сущности планировщика (выполняются / всего).
+// Для наблюдения за длительной перегрузкой; решение «пускать ли сейчас» — по Check.
+type LoadAvg struct {
+	Avg1, Avg5, Avg15 float64
+	Running, Total    int
+}
+
+// ParseLoadAvg разбирает текст /proc/loadavg.
+func ParseLoadAvg(s string) (LoadAvg, error) {
+	var la LoadAvg
+	f := strings.Fields(s)
+	if len(f) < 4 {
+		return la, fmt.Errorf("loadavg %q: want at least 4 fields", strings.TrimSpace(s))
+	}
+	for i, p := range []*float64{&la.Avg1, &la.Avg5, &la.Avg15} {
+		v, err := strconv.ParseFloat(f[i], 64)
+		if err != nil {
+			return la, fmt.Errorf("loadavg %q: %w", f[i], err)
+		}
+		*p = v
+	}
+	running, total, ok := strings.Cut(f[3], "/")
+	if !ok {
+		return la, fmt.Errorf("loadavg %q: want running/total", f[3])
+	}
+	var err error
+	if la.Running, err = strconv.Atoi(running); err != nil {
+		return la, fmt.Errorf("loadavg running %q: %w", running, err)
+	}
+	if la.Total, err = strconv.Atoi(total); err != nil {
+		return la, fmt.Errorf("loadavg total %q: %w", total, err)
+	}
+	return la, nil
+}
+
+// ReadLoadAvg читает procRoot/loadavg; файла нет — ErrNoLoadAvg.
+func ReadLoadAvg(procRoot string) (LoadAvg, error) {
+	data, err := os.ReadFile(filepath.Join(procRoot, "loadavg"))
+	if errors.Is(err, os.ErrNotExist) {
+		return LoadAvg{}, ErrNoLoadAvg
+	}
+	if err != nil {
+		return LoadAvg{}, fmt.Errorf("loadavg: %w", err)
+	}
+	return ParseLoadAvg(string(data))
 }
