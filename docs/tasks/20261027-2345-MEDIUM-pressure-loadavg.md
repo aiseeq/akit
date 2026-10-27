@@ -1,6 +1,7 @@
 # pressure: ReadLoadAvg для наблюдения aguard
 
-Статус: открыт
+Статус: на проверке
+Исполнитель: akit-master
 
 ## Вход
 - Проблема: aguard переходит на системный load average для наблюдения за длительной перегрузкой (`~/.claude/decisions.md` `## load-measure`: наблюдение — системный LA, решение «пускать ли» — моментальное число готовых задач). Своего разбора /proc/loadavg в akit нет, копии в graft, sc2go, sc2demu, llmark.
@@ -20,3 +21,5 @@
 
 ## Журнал
 - 2026-10-27 23:46 открыт — akit-master: просьба aguard-master.
+- 2026-10-27 23:46 в работе — akit-master
+- 2026-10-27 23:46 на проверке — akit-master — v1.2.0 (1a11065); тесты pressure и cmd/busy зелёные; busy на машине — free при обмене 212 KB/s
