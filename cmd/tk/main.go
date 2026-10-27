@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +31,7 @@ Usage:
   tk start ID [--by NAME]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
-  tk done ID --check TEXT [--by NAME] [--doer NAME]
+  tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG]
   tk reject ID --why TEXT [--by NAME]
   tk show ID [--json]
   tk archive [--older DURATION]
@@ -49,6 +50,7 @@ Flags:
   --note TEXT    review: add a review note to the journal
   --check TEXT   done: describe independent verification (required)
   --doer NAME    done: specify the executor of a legacy ticket
+  --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject: explain why the ticket was declined (required)
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
@@ -70,9 +72,9 @@ var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-[a-z0-9]+(?:-[a-z
 var errHelp = errors.New("help")
 
 type options struct {
-	cmd, id, prio, title, by, note, check, doer, why, status, root, until, text string
-	all, due, json                                                              bool
-	older                                                                       time.Duration
+	cmd, id, prio, title, by, note, check, doer, why, status, root, until, text, glintDebt, baseRoot string
+	all, due, json                                                                                   bool
+	older                                                                                            time.Duration
 }
 type task struct {
 	path, slug, status, prio, title, body string
@@ -112,7 +114,7 @@ func parseArgs(a []string) (options, error) {
 }
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--root": &o.root, "--until": &o.until, "--text": &o.text}
+	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -241,6 +243,9 @@ func validateTicketAction(o *options, pos []string) error {
 	if o.doer != "" && !nameRE.MatchString(o.doer) {
 		return errors.New("--doer must be a name without spaces; use --doer NAME")
 	}
+	if o.glintDebt != "" && (!slugRE.MatchString(o.glintDebt) || o.cmd != "done") {
+		return errors.New("--glint-debt needs a ticket slug and is only valid for done")
+	}
 	if o.cmd == "wait" && o.until == "" {
 		return errors.New("wait requires --until")
 	}
@@ -347,6 +352,7 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	if o.cmd == "note" {
 		return addNote(t, o, out, errout)
 	}
+	o.baseRoot = root
 	return transition(t, o, out, errout)
 }
 
@@ -999,23 +1005,142 @@ func journal(s, line string) string {
 	ls = append(ls[:at], append([]string{line}, ls[at:]...)...)
 	return strings.Join(ls, "\n")
 }
+
+type glintReport struct {
+	Summary *struct {
+		Total *int `json:"total"`
+	} `json:"summary"`
+	Issues *[]struct {
+		Rule     string `json:"rule"`
+		Severity string `json:"severity"`
+		File     string `json:"file"`
+		Line     int    `json:"line"`
+	} `json:"issues"`
+}
+
+func checkGlint(root string) (glintReport, error) {
+	if _, err := os.Stat(filepath.Join(root, ".glint.yaml")); errors.Is(err, os.ErrNotExist) {
+		return glintReport{}, nil
+	} else if err != nil {
+		return glintReport{}, fmt.Errorf("inspect .glint.yaml: %w", err)
+	}
+	path, err := exec.LookPath("glint")
+	if err != nil {
+		return glintReport{}, fmt.Errorf("find glint in PATH: %w", err)
+	}
+	cmd := exec.Command(path, "check", ".", "-s", "low", "-o", "json")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	dec := json.NewDecoder(&stdout)
+	var report glintReport
+	if err := dec.Decode(&report); err != nil {
+		if runErr != nil {
+			return glintReport{}, fmt.Errorf("glint check failed (%w): %s", runErr, strings.TrimSpace(stderr.String()))
+		}
+		return glintReport{}, fmt.Errorf("parse glint JSON: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return glintReport{}, errors.New("parse glint JSON: trailing data")
+		}
+		return glintReport{}, fmt.Errorf("parse glint JSON: %w", err)
+	}
+	if report.Summary == nil || report.Summary.Total == nil || report.Issues == nil || *report.Summary.Total < 0 {
+		return glintReport{}, errors.New("parse glint JSON: missing summary.total or issues")
+	}
+	if runErr != nil && len(*report.Issues) == 0 && *report.Summary.Total == 0 {
+		return glintReport{}, fmt.Errorf("glint check failed: %s", strings.TrimSpace(stderr.String()))
+	}
+	return report, nil
+}
+
+func openDebtTicket(dir, slug string) (bool, error) {
+	t, err := find(dir, slug)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch t.status {
+	case "открыт", "в работе", "ждёт", "на проверке":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func prepareDone(t *task, o options, errout io.Writer) (int, int) {
+	doer := executor(t.body)
+	if o.doer != "" {
+		doer = o.doer
+	}
+	if doer == "" || !nameRE.MatchString(doer) {
+		fmt.Fprintln(errout, "tk: executor unknown or invalid; pass --doer NAME")
+		return 0, exitNone
+	}
+	if strings.EqualFold(doer, o.by) {
+		fmt.Fprintln(errout, "tk: reviewer must differ from executor")
+		return 0, exitNone
+	}
+	if o.glintDebt != "" {
+		valid, err := openDebtTicket(filepath.Join(o.baseRoot, "docs/tasks"), o.glintDebt)
+		if err != nil {
+			return 0, fail(errout, err)
+		}
+		if !valid {
+			fmt.Fprintf(errout, "tk: glint debt ticket %q not found or not open\n", o.glintDebt)
+			return 0, exitNone
+		}
+	}
+	findings := 0
+	if o.baseRoot != "" {
+		report, err := checkGlint(o.baseRoot)
+		if err != nil {
+			return 0, fail(errout, err)
+		}
+		if report.Summary != nil {
+			findings = *report.Summary.Total
+		}
+		if findings > 0 && o.glintDebt == "" {
+			reportGlintFindings(errout, findings, *report.Issues)
+			return 0, exitNone
+		}
+	}
+	if o.doer != "" {
+		t.body = setExecutor(t.body, o.doer)
+	}
+	return findings, 0
+}
+
+func reportGlintFindings(w io.Writer, findings int, issues []struct {
+	Rule     string `json:"rule"`
+	Severity string `json:"severity"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+}) {
+	fmt.Fprintf(w, "tk: glint: %d findings; fix them or pass --glint-debt SLUG (an open ticket for all of them)\n", findings)
+	shown := min(len(issues), 10)
+	for _, issue := range issues[:shown] {
+		fmt.Fprintf(w, "%s %s:%d %s\n", issue.Severity, issue.File, issue.Line, issue.Rule)
+	}
+	if findings > shown {
+		fmt.Fprintf(w, "… and %d more\n", findings-shown)
+	}
+}
+
 func transition(t task, o options, out, errout io.Writer) int {
 	next := map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён"}[o.cmd]
+	glintFindings := 0
 	if o.cmd == "done" {
-		doer := executor(t.body)
-		if o.doer != "" {
-			doer = o.doer
-		}
-		if doer == "" || !nameRE.MatchString(doer) {
-			fmt.Fprintln(errout, "tk: executor unknown or invalid; pass --doer NAME")
-			return exitNone
-		}
-		if strings.EqualFold(doer, o.by) {
-			fmt.Fprintln(errout, "tk: reviewer must differ from executor")
-			return exitNone
-		}
-		if o.doer != "" {
-			t.body = setExecutor(t.body, o.doer)
+		var code int
+		glintFindings, code = prepareDone(&t, o, errout)
+		if code != 0 {
+			return code
 		}
 	}
 	if o.cmd == "start" || o.cmd == "review" && executor(t.body) == "" {
@@ -1030,6 +1155,9 @@ func transition(t task, o options, out, errout io.Writer) int {
 	line := fmt.Sprintf("- %s %s — %s", time.Now().Format("2006-01-02 15:04"), next, o.by)
 	if o.cmd == "done" {
 		line += ": " + o.check
+		if glintFindings > 0 && o.glintDebt != "" {
+			line += fmt.Sprintf("; glint: %d findings, debt %s", glintFindings, o.glintDebt)
+		}
 	}
 	if o.cmd == "reject" {
 		line += " — " + o.why

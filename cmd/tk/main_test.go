@@ -285,6 +285,79 @@ func TestWaitReplaceAndStartClearsWait(t *testing.T) {
 	}
 }
 
+func TestDoneGlintBlocksAndDebtAllows(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".glint.yaml"), []byte("rules: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	glint := filepath.Join(bin, "glint")
+	script := "#!/bin/sh\nprintf '%s' '{\"summary\":{\"total\":1},\"issues\":[{\"rule\":\"sample-rule\",\"severity\":\"low\",\"file\":\"sample.go\",\"line\":7,\"message\":\"synthetic\"}]}'\n"
+	if err := os.WriteFile(glint, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-change.md")
+	body := "# Change\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\ncheck\n\n## Журнал\n- 2020-01-01 12:00 открыт — worker\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := find(dir, "change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	options := options{cmd: "done", by: "reviewer", check: "synthetic check", baseRoot: root}
+	if code := transition(ticket, options, &out, &errOut); code != exitNone || !strings.Contains(errOut.String(), "1 findings") || !strings.Contains(errOut.String(), "low sample.go:7 sample-rule") {
+		t.Fatalf("glint should block completion: code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	unchanged, err := os.ReadFile(path)
+	if err != nil || string(unchanged) != body {
+		t.Fatalf("blocked completion changed ticket: %v", err)
+	}
+	debt := filepath.Join(dir, "20200101-1200-LOW-debt.md")
+	if err := os.WriteFile(debt, []byte("# Debt\n\nСтатус: открыт\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errOut.Reset()
+	options.glintDebt = "debt"
+	if code := transition(ticket, options, &out, &errOut); code != 0 {
+		t.Fatalf("debt completion failed: code=%d err=%q", code, errOut.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(updated), "готово — reviewer: synthetic check; glint: 1 findings, debt debt") {
+		t.Fatalf("missing debt record: %s, %v", updated, err)
+	}
+}
+
+func TestDoneGlintInvalidOutputDoesNotWrite(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".glint.yaml"), []byte("rules: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "glint"), []byte("#!/bin/sh\necho unavailable >&2\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	path := filepath.Join(t.TempDir(), "20200101-1200-MEDIUM-change.md")
+	body := "# Change\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := transition(task{path: path, slug: "change", body: body}, options{cmd: "done", by: "reviewer", check: "check", baseRoot: root}, &out, &errOut)
+	updated, err := os.ReadFile(path)
+	if code != exitUsage || err != nil || string(updated) != body || !strings.Contains(errOut.String(), "glint check failed") {
+		t.Fatalf("invalid glint result: code=%d err=%q body=%q readErr=%v", code, errOut.String(), updated, err)
+	}
+}
+
 func TestNamesAndLegacyExecutor(t *testing.T) {
 	if _, err := parseArgs([]string{"start", "ticket", "--by", "two words"}); err == nil {
 		t.Fatal("--by with spaces accepted")

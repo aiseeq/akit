@@ -54,7 +54,8 @@ func appendFile(path, text string) error {
 }
 
 func TestParseArgsErrors(t *testing.T) {
-	past := time.Now().Add(-time.Hour).Format("15:04")
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.Local)
+	past := now.Add(-time.Hour).Format("15:04")
 	for _, args := range [][]string{
 		{}, {"--any"}, {"wait", "x"}, {"exit"}, {"exit", "abc"}, {"line", "x"}, {"line", "(", "f"},
 		{"file", "x", "--timeout", "soon"}, {"file", "x", "--every", "-1s"}, {"time", "yesterday"},
@@ -65,7 +66,7 @@ func TestParseArgsErrors(t *testing.T) {
 			t.Errorf("%q accepted", args)
 		}
 	}
-	if _, err := parseArgs([]string{"time", past}, time.Now); err == nil && past != "00:00" {
+	if _, err := parseArgs([]string{"time", past}, func() time.Time { return now }); err == nil {
 		t.Errorf("past %s accepted", past)
 	}
 }

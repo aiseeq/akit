@@ -103,6 +103,8 @@ repository, `tk` uses the nearest `docs/tasks/` up to `$HOME`; `new` creates it 
 directory when none exists. `tk ls --all` includes closed tickets; `--status STATUS` filters by
 status, `--by NAME` filters by executor (or opening actor on older tickets), and `--due` lists
 waiting tickets whose parsed deadline has passed. Empty acceptance sections are marked `no-check`.
+When `.glint.yaml` exists at the task base, `tk done` checks all glint severities; findings block
+completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
 `--json` emits the filtered list as JSON. `tk show ID` prints the ticket path and full text, or
 structured details with `--json`. `tk note ID TEXT` appends a journal entry without changing status.
