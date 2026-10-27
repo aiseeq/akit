@@ -74,6 +74,23 @@ near-miss that differs only in indentation). Exit 0 written, 1 mismatch, 2 usage
 blocks after it. With a FILE argument a path line may only repeat that file (`./a.go` for
 `a.go` is fine), another path is an error. `sub -h` prints the full format.
 
+## tk
+
+Repository task files in `docs/tasks/`: each ticket records the work and how to check it. A ticket is
+closed only after an independent review; old closed tickets can be moved to `docs/tasks/archive/`.
+
+    tk new fix-login --prio HIGH --title 'Fix login' --by agent
+    tk ls                              # open tickets, oldest first
+    tk start fix-login --by agent
+    tk review fix-login --by agent
+    tk done fix-login --check 'graft gate' --by reviewer
+    tk archive                         # closed tickets older than 14 days
+
+Ticket IDs are slugs unique within the task folder. `tk ls --all` includes closed tickets;
+`--status STATUS` filters by status. `tk ls --root DIR` lists tasks for repositories directly
+inside DIR. `tk show ID` prints the ticket path and status. Without `--by`, commands use the
+current agent session name when it can be read from the process cgroup.
+
 ## tl
 
 Session transcripts for an agent, briefly: a time/role window of one session or a search across
