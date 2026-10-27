@@ -32,3 +32,4 @@
 - 2026-10-27 23:44 note — akit-master: поправка лида — тикеты лида и админов в docs/tasks своей папки, вместо --dir/TK_DIR поиск docs/tasks вверх до $HOME вне репо (пп. 1–2 переписаны).
 - 2026-10-27 23:46 note — akit-master: просьба лида для обхода Сна (~/.claude/improve/state/process-scan-spec.md, «Просьба к akit»): пп. 7–9 (ls --json, show --json, lint); приоритет — после пп. 1–3.
 - 2026-10-27 23:49 в работе — luna:1027-2312-tk
+- 2026-10-27 23:49 note — akit-master: задание бойцу — worker continue 1027-2312-tk, дерево ~/.cache/worktrees/akit/tk (ветка tk-tx от main fd6bb2d), приёмка ~/.cache/akit-accept/tk-tx.sh
