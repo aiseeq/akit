@@ -435,11 +435,36 @@ func TestFillTicketPreservesSectionsAndJournal(t *testing.T) {
 
 func TestLintAcceptsEarlierDoneLine(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "20200101-1200-LOW-closed.md")
-	body := "# Closed\n\nСтатус: готово\nИсполнитель: worker\n\n## Приёмка\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer — go test зелёный\n"
+	body := "# Closed\n\nСтатус: готово\nИсполнитель: worker\n\n## Приёмка\n- go test\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer — go test зелёный\n"
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if issues, err := lintTicket(p, "closed"); err != nil || len(issues) != 0 {
 		t.Fatalf("строка «готово — кто — проверка» прежних версий: %v %v", issues, err)
+	}
+}
+
+func TestFillTicketOldSectionNames(t *testing.T) {
+	template := "# T\n\nСтатус: открыт\n\n## Вход\n- Проблема:\n- Метод:\n- Дешевле:\n- Инструмент:\n- Цена:\n- Если не делать:\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- открыт\n"
+	got := fillTicket(template, "## Постановка\nсуть\n\n## Что сделать\n1. шаг\n\n## Чем проверить\n- тест\n")
+	want := "# T\n\nСтатус: открыт\n\n## Вход\nсуть\n\n## Что сделать\n1. шаг\n\n## Приёмка\n- тест\n\n## Журнал\n- открыт\n"
+	if got != want {
+		t.Fatalf("fillTicket:\n%s\nждали:\n%s", got, want)
+	}
+	if noCheck(got) {
+		t.Error("заполненная «Приёмка» помечена no-check")
+	}
+	if !noCheck("## Приёмка\n\n## Чем проверить\n\n## Журнал\n") || noCheck("## Приёмка\n\n## Чем проверить\n- тест\n") {
+		t.Error("noCheck судит по первому разделу, а не по всем")
+	}
+}
+
+func TestLintEmptyCheck(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "20200101-1200-LOW-empty.md")
+	if err := os.WriteFile(p, []byte("# E\n\nСтатус: открыт\n\n## Приёмка\n\n## Журнал\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if issues, err := lintTicket(p, "empty"); err != nil || len(issues) != 1 || !strings.Contains(issues[0], "empty Приёмка") {
+		t.Fatalf("lint пустой «Приёмки»: %v %v", issues, err)
 	}
 }

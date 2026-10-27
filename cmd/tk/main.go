@@ -825,6 +825,10 @@ func parseTicketSections(text string) (map[string][]string, []string) {
 		}
 		if strings.HasPrefix(line, "## ") {
 			current = line
+			// Разделы прежнего шаблона ложатся в свои нынешние.
+			if alias, ok := sectionAliases[current]; ok {
+				current = alias
+			}
 			if !standardTicketSection(current) && current != "## Журнал" {
 				extra = append(extra, line)
 			}
@@ -844,6 +848,8 @@ func parseTicketSections(text string) (map[string][]string, []string) {
 	return sections, extra
 }
 
+var sectionAliases = map[string]string{"## Постановка": "## Вход", "## Чем проверить": "## Приёмка"}
+
 func standardTicketSection(section string) bool {
 	return section == "## Что сделать" || section == "## Приёмка" || section == "## Вход"
 }
@@ -855,12 +861,14 @@ func replaceTicketSections(template string, sections map[string][]string, extra 
 		line := lines[i]
 		if standardTicketSection(line) {
 			out = append(out, line)
-			content, ok := sections[line]
-			if ok && len(content) > 0 {
+			content := trimBlankEdges(sections[line])
+			if len(content) > 0 {
 				out = append(out, content...)
 			} else if line == "## Вход" {
 				out = append(out, lines[i+1:i+7]...)
-				i += 6
+			}
+			if line == "## Вход" {
+				i += 6 // поля шаблона: заменены текстом или уже перенесены
 			}
 			for i+1 < len(lines) && lines[i+1] == "" {
 				i++
@@ -875,6 +883,16 @@ func replaceTicketSections(template string, sections map[string][]string, extra 
 		out = append(out, line)
 	}
 	return strings.Join(out, "\n")
+}
+
+func trimBlankEdges(lines []string) []string {
+	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 func opener(s string) string {
@@ -911,13 +929,18 @@ func journalLines(s string) []string {
 	return lines
 }
 
+// noCheck — раздел проверки есть, но ни один не заполнен.
 func noCheck(s string) bool {
+	found := false
 	for _, heading := range []string{"## Приёмка", "## Чем проверить"} {
 		if body, ok := sectionBody(s, heading); ok {
-			return strings.TrimSpace(body) == ""
+			if strings.TrimSpace(body) != "" {
+				return false
+			}
+			found = true
 		}
 	}
-	return false
+	return found
 }
 
 func sectionBody(s, heading string) (string, bool) {
@@ -1334,6 +1357,9 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	if !hasJournal {
 		issues = append(issues, shown+": missing Журнал section")
+	}
+	if noCheck(body) {
+		issues = append(issues, shown+": empty Приёмка")
 	}
 	if statusValue == "готово" {
 		checker, check, strict := strictCompletion(body)
