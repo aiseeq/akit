@@ -98,12 +98,17 @@ after an independent review.
 - `Цена` — is the work worth its cost against the queue?
 - `Если не делать` — what happens if the work is skipped?
 
-Ticket IDs accept the slug, the full file name, or the file name without `.md`. `tk ls --all`
-includes closed tickets; `--status STATUS` filters by status. `tk ls --root DIR` lists tasks for
-DIR and its first-level repositories, skipping linked worktrees. Waiting tickets show their
-condition or deadline, with overdue times marked. `tk show ID` prints the ticket path and full
-text. Without `--by`, commands use the current session name when it can be read from the process
-cgroup. `tk -h` lists commands and flags.
+Ticket IDs accept the slug, the full file name, or the file name without `.md`. Outside a Git
+repository, `tk` uses the nearest `docs/tasks/` up to `$HOME`; `new` creates it in the current
+directory when none exists. `tk ls --all` includes closed tickets; `--status STATUS` filters by
+status, `--by NAME` filters by executor (or opening actor on older tickets), and `--due` lists
+waiting tickets whose parsed deadline has passed. Empty acceptance sections are marked `no-check`.
+`tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
+`--json` emits the filtered list as JSON. `tk show ID` prints the ticket path and full text, or
+structured details with `--json`. `tk note ID TEXT` appends a journal entry without changing status.
+`tk lint` checks ticket names, statuses, acceptance sections, and independent completion checks;
+`--root DIR` scans DIR and its first-level repositories. Without `--by`, actor commands use the
+current session name when it can be read from the process cgroup. `tk -h` lists commands and flags.
 
 ## tl
 

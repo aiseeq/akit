@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,13 +24,15 @@ const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
   tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME] [--text FILE|-]
-  tk ls [--all] [--status STATUS] [--root DIR]
+  tk ls [--all] [--status STATUS] [--root DIR] [--by NAME] [--due] [--json]
+  tk note ID TEXT [--by NAME]
+  tk lint [--root DIR]
   tk start ID [--by NAME]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
   tk done ID --check TEXT [--by NAME] [--doer NAME]
   tk reject ID --why TEXT [--by NAME]
-  tk show ID
+  tk show ID [--json]
   tk archive [--older DURATION]
 
 Flags:
@@ -38,6 +41,9 @@ Flags:
   --by NAME      actor name (default: current session)
   --text FILE|-  new: fill ticket sections from FILE, or standard input with -
   --all          ls: include closed tickets
+  --by NAME      ls: show tickets assigned to NAME; note: journal actor
+  --due          ls: show waiting tickets whose parsed deadline has passed
+  --json         ls: output JSON array; show: output the ticket and journal as JSON
   --status S     ls: show only status S
   --root DIR     ls: scan DIR and its first-level repositories
   --note TEXT    review: add a review note to the journal
@@ -65,7 +71,7 @@ var errHelp = errors.New("help")
 
 type options struct {
 	cmd, id, prio, title, by, note, check, doer, why, status, root, until, text string
-	all                                                                         bool
+	all, due, json                                                              bool
 	older                                                                       time.Duration
 }
 type task struct {
@@ -111,8 +117,15 @@ func parseOptions(args []string, o *options) ([]string, error) {
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		v := args[i]
-		if v == "--all" {
+		switch v {
+		case "--all":
 			o.all = true
+			continue
+		case "--due":
+			o.due = true
+			continue
+		case "--json":
+			o.json = true
 			continue
 		}
 		if p, ok := values[v]; ok {
@@ -145,6 +158,22 @@ func parseOptions(args []string, o *options) ([]string, error) {
 }
 
 func validateCommand(o *options, pos []string) error {
+	if o.cmd == "note" {
+		if len(pos) != 2 {
+			return errors.New("note needs a ticket ID and text")
+		}
+		if !validID(pos[0]) {
+			return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
+		}
+		o.id, o.note = pos[0], pos[1]
+		if strings.TrimSpace(o.note) == "" {
+			return errors.New("note text must not be empty")
+		}
+		if o.by != "" && !nameRE.MatchString(o.by) {
+			return errors.New("--by must be a name without spaces; use --by NAME")
+		}
+		return nil
+	}
 	if len(pos) > 1 {
 		return errors.New("too many arguments")
 	}
@@ -158,6 +187,10 @@ func validateCommand(o *options, pos []string) error {
 		return validateList(o, pos)
 	case "start", "wait", "review", "done", "reject", "show":
 		return validateTicketAction(o, pos)
+	case "lint":
+		if len(pos) > 0 {
+			return errors.New("lint takes no id")
+		}
 	case "archive":
 		if len(pos) > 0 {
 			return errors.New("archive takes no id")
@@ -166,6 +199,7 @@ func validateCommand(o *options, pos []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", o.cmd)
 	}
+	return nil
 }
 
 func validateNew(o *options, pos []string) error {
@@ -191,11 +225,14 @@ func validateList(o *options, pos []string) error {
 	if o.status != "" && !validStatus(o.status) {
 		return fmt.Errorf("unknown status %q", o.status)
 	}
+	if o.by != "" && !nameRE.MatchString(o.by) {
+		return errors.New("--by must be a name without spaces; use --by NAME")
+	}
 	return nil
 }
 
 func validateTicketAction(o *options, pos []string) error {
-	if len(pos) != 1 || (!slugRE.MatchString(o.id) && !ticketIDRE.MatchString(o.id)) {
+	if len(pos) != 1 || !validID(o.id) {
 		return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
 	}
 	if o.by != "" && !nameRE.MatchString(o.by) {
@@ -213,7 +250,13 @@ func validateTicketAction(o *options, pos []string) error {
 	if o.cmd == "reject" && o.why == "" {
 		return errors.New("reject requires --why")
 	}
+	if o.cmd != "show" && o.json {
+		return errors.New("--json is only valid for ls and show")
+	}
 	return nil
+}
+func validID(id string) bool {
+	return slugRE.MatchString(id) || ticketIDRE.MatchString(id)
 }
 func duration(s string) (time.Duration, error) {
 	if before, ok := strings.CutSuffix(s, "d"); ok {
@@ -243,44 +286,107 @@ func run(o options, out, errout io.Writer) int {
 	if code := readTicketText(&o, errout); code != 0 {
 		return code
 	}
-	if o.cmd == "ls" && o.root != "" {
+	if (o.cmd == "ls" || o.cmd == "lint") && o.root != "" {
+		return runRootScan(o, out, errout)
+	}
+	root, dir, found, err := resolveTaskBase()
+	if err != nil {
+		return fail(errout, err)
+	}
+	if !found && o.cmd != "new" {
+		fmt.Fprintln(errout, "tk: no docs/tasks here or above up to $HOME")
+		return exitNone
+	}
+	if !found {
+		root, err = os.Getwd()
+		if err != nil {
+			return fail(errout, fmt.Errorf("get current directory: %w", err))
+		}
+		dir = filepath.Join(root, "docs/tasks")
+	}
+	return runAtBase(root, dir, o, out, errout)
+}
+
+func runRootScan(o options, out, errout io.Writer) int {
+	if o.cmd == "ls" {
 		return list("", o, out, errout)
 	}
-	b, e := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if e != nil {
-		fmt.Fprintf(errout, "tk: repository root: %v\n", e)
-		return exitUsage
-	}
-	root := strings.TrimSpace(string(b))
-	dir := filepath.Join(root, "docs/tasks")
+	return lint("", o.root, out, errout)
+}
+
+func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	switch o.cmd {
 	case "new":
 		return create(root, dir, o, out, errout)
 	case "ls":
 		return list(root, o, out, errout)
+	case "lint":
+		return lint(root, "", out, errout)
 	case "archive":
 		return archive(root, dir, o, out, errout)
 	}
-	t, e := find(dir, o.id)
-	if e != nil {
-		if errors.Is(e, os.ErrNotExist) {
+	t, err := find(dir, o.id)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintf(errout, "tk: task %q not found\n", o.id)
 			return exitNone
 		}
-		fmt.Fprintln(errout, "tk:", e)
+		fmt.Fprintln(errout, "tk:", err)
 		return exitUsage
 	}
 	if o.cmd == "show" {
+		if o.json {
+			return showJSON(root, t, out, errout)
+		}
 		fmt.Fprintf(out, "%s\n%s", relative(root, t.path), t.body)
 		if !strings.HasSuffix(t.body, "\n") {
 			fmt.Fprintln(out)
 		}
 		return 0
 	}
+	if o.cmd == "note" {
+		return addNote(t, o, out, errout)
+	}
 	return transition(t, o, out, errout)
 }
+
+func resolveTaskBase() (string, string, bool, error) {
+	b, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err == nil {
+		root := strings.TrimSpace(string(b))
+		return root, filepath.Join(root, "docs/tasks"), true, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", "", false, fmt.Errorf("get current directory: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", false, fmt.Errorf("get home directory: %w", err)
+	}
+	cwd, err = filepath.Abs(cwd)
+	if err != nil {
+		return "", "", false, fmt.Errorf("resolve current directory: %w", err)
+	}
+	home, err = filepath.Abs(home)
+	if err != nil {
+		return "", "", false, fmt.Errorf("resolve home directory: %w", err)
+	}
+	for candidate := cwd; ; candidate = filepath.Dir(candidate) {
+		if _, err := os.Stat(filepath.Join(candidate, "docs/tasks")); err == nil {
+			return candidate, filepath.Join(candidate, "docs/tasks"), true, nil
+		}
+		if candidate == home || candidate == filepath.Dir(candidate) {
+			break
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "docs/tasks")); err == nil {
+		return home, filepath.Join(home, "docs/tasks"), true, nil
+	}
+	return cwd, filepath.Join(cwd, "docs/tasks"), false, nil
+}
 func prepareActor(o *options, errout io.Writer) int {
-	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" {
+	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" || o.cmd == "lint" {
 		return 0
 	}
 	if o.by == "" {
@@ -368,6 +474,10 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 }
 func fail(w io.Writer, e error) int { fmt.Fprintf(w, "tk: %v\n", e); return exitUsage }
 func load(dir string) ([]task, error) {
+	return loadTasks(dir, false)
+}
+
+func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 	es, e := os.ReadDir(dir)
 	if errors.Is(e, os.ErrNotExist) {
 		return nil, nil
@@ -400,7 +510,10 @@ func load(dir string) ([]task, error) {
 		s := string(b)
 		st, err := status(s)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", p, err)
+			if !tolerateUnknownStatus {
+				return nil, fmt.Errorf("%s: %w", p, err)
+			}
+			st, _ = explicitStatus(s)
 		}
 		ts = append(ts, task{p, m[4], st, m[3], title(s), s, created, lastChange(s, info.ModTime())})
 	}
@@ -481,45 +594,12 @@ func matchesID(t task, id string) bool {
 }
 
 func list(root string, o options, out, errout io.Writer) int {
-	repos, err := taskRepos(root, o.root)
+	all, labels, skipped, err := gatherTasks(root, o)
 	if err != nil {
 		return fail(errout, err)
 	}
-	var all []task
-	labels := make(map[string]string)
-	var skipped []string
-	for _, repo := range repos {
-		dir := filepath.Join(repo, "docs/tasks")
-		ts, err := load(dir)
-		if err != nil {
-			return fail(errout, err)
-		}
-		entries, err := os.ReadDir(dir)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fail(errout, err)
-		}
-		label := ""
-		if o.root != "" {
-			label, err = filepath.Rel(o.root, repo)
-			if err != nil {
-				return fail(errout, err)
-			}
-			if label == "." {
-				label = filepath.Base(repo)
-			}
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") && fileRE.FindStringSubmatch(entry.Name()) == nil {
-				skipped = append(skipped, entry.Name())
-			}
-		}
-		for i := range ts {
-			t := ts[i]
-			if includeTask(t, o) {
-				all = append(all, t)
-				labels[t.path] = label
-			}
-		}
+	if o.json {
+		return writeListJSON(root, all, labels, o, out, errout)
 	}
 	if len(all) == 0 && len(skipped) == 0 {
 		fmt.Fprintln(out, "no tasks")
@@ -534,6 +614,62 @@ func list(root string, o options, out, errout io.Writer) int {
 		fmt.Fprintf(out, "skipped %d files not named YYYYMMDD-HHMM-PRIO-slug.md: %s\n", len(skipped), strings.Join(skipped, ", "))
 	}
 	return 0
+}
+
+func gatherTasks(root string, o options) ([]task, map[string]string, []string, error) {
+	repos, err := taskRepos(root, o.root)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	labels := make(map[string]string)
+	var skipped []string
+	var tasks []task
+	for _, repo := range repos {
+		dir := filepath.Join(repo, "docs/tasks")
+		loaded, err := loadTasks(dir, true)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, nil, err
+		}
+		label, err := repoLabel(o.root, repo)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") && fileRE.FindStringSubmatch(entry.Name()) == nil {
+				skipped = append(skipped, entry.Name())
+			}
+		}
+		for i := range loaded {
+			t := &loaded[i]
+			if includeTask(*t, o) && matchesListFilters(*t, o) {
+				tasks = append(tasks, *t)
+				labels[t.path] = label
+			}
+		}
+	}
+	return tasks, labels, skipped, nil
+}
+
+func repoLabel(baseDir, repo string) (string, error) {
+	if baseDir == "" {
+		return "", nil
+	}
+	base, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve list root: %w", err)
+	}
+	label, err := filepath.Rel(base, repo)
+	if err != nil {
+		return "", fmt.Errorf("make repository label: %w", err)
+	}
+	if label == "." {
+		label = filepath.Base(repo)
+	}
+	return label, nil
 }
 
 func taskRepos(root, baseDir string) ([]string, error) {
@@ -579,6 +715,28 @@ func includeTask(t task, o options) bool {
 	return o.all || t.status == "открыт" || t.status == "в работе" || t.status == "ждёт" || t.status == "на проверке"
 }
 
+func matchesListFilters(t task, o options) bool {
+	if o.by != "" {
+		who := executor(t.body)
+		if who == "" {
+			who = opener(t.body)
+		}
+		if !strings.EqualFold(who, o.by) {
+			return false
+		}
+	}
+	if o.due {
+		if t.status != "ждёт" {
+			return false
+		}
+		at, err := timearg.Parse(waiting(t.body), time.Now())
+		if err != nil || at.After(time.Now()) {
+			return false
+		}
+	}
+	return true
+}
+
 func printTask(out io.Writer, t task, label string) {
 	age := time.Since(t.created)
 	var ageText string
@@ -604,7 +762,11 @@ func printTask(out io.Writer, t task, label string) {
 		}
 		wait = " [" + shown + "]"
 	}
-	fmt.Fprintf(out, "%s%s %s %s %s %s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait)
+	checkMark := ""
+	if noCheck(t.body) {
+		checkMark = " no-check"
+	}
+	fmt.Fprintf(out, "%s%s %s %s %s %s%s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait, checkMark)
 }
 
 func waiting(s string) string {
@@ -709,6 +871,64 @@ func replaceTicketSections(template string, sections map[string][]string, extra 
 	return strings.Join(out, "\n")
 }
 
+func opener(s string) string {
+	lines := journalLines(s)
+	if len(lines) == 0 {
+		return ""
+	}
+	part := strings.SplitN(lines[0], " — ", 2)
+	if len(part) != 2 {
+		return ""
+	}
+	fields := strings.Fields(part[0])
+	if len(fields) == 0 || fields[len(fields)-1] != "открыт" {
+		return ""
+	}
+	return strings.TrimSpace(part[1])
+}
+
+func journalLines(s string) []string {
+	lines := make([]string, 0)
+	inJournal := false
+	for line := range strings.SplitSeq(s, "\n") {
+		if line == "## Журнал" {
+			inJournal = true
+			continue
+		}
+		if inJournal && strings.HasPrefix(line, "## ") {
+			break
+		}
+		if inJournal && strings.HasPrefix(line, "- ") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func noCheck(s string) bool {
+	for _, heading := range []string{"## Приёмка", "## Чем проверить"} {
+		if body, ok := sectionBody(s, heading); ok {
+			return strings.TrimSpace(body) == ""
+		}
+	}
+	return false
+}
+
+func sectionBody(s, heading string) (string, bool) {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if line != heading {
+			continue
+		}
+		end := i + 1
+		for end < len(lines) && !strings.HasPrefix(lines[end], "## ") {
+			end++
+		}
+		return strings.Join(lines[i+1:end], "\n"), true
+	}
+	return "", false
+}
+
 func executor(s string) string {
 	for l := range strings.SplitSeq(s, "\n") {
 		if after, ok := strings.CutPrefix(l, "Исполнитель: "); ok {
@@ -809,7 +1029,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 	}
 	line := fmt.Sprintf("- %s %s — %s", time.Now().Format("2006-01-02 15:04"), next, o.by)
 	if o.cmd == "done" {
-		line += " — " + o.check
+		line += ": " + o.check
 	}
 	if o.cmd == "reject" {
 		line += " — " + o.why
@@ -827,6 +1047,200 @@ func transition(t task, o options, out, errout io.Writer) int {
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
 	return 0
 }
+func addNote(t task, o options, out, errout io.Writer) int {
+	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, o.note)
+	body := journal(t.body, line)
+	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintf(out, "%s noted\n", t.slug)
+	return 0
+}
+
+type taskJSON struct {
+	Repo     string   `json:"repo,omitempty"`
+	Slug     string   `json:"slug"`
+	Status   string   `json:"status"`
+	Prio     string   `json:"prio"`
+	Title    string   `json:"title"`
+	Created  string   `json:"created"`
+	Changed  string   `json:"changed"`
+	Path     string   `json:"path"`
+	Executor string   `json:"executor"`
+	Waits    string   `json:"waits"`
+	Overdue  bool     `json:"overdue"`
+	NoCheck  bool     `json:"no_check"`
+	Check    string   `json:"check"`
+	Checker  string   `json:"checker"`
+	Journal  []string `json:"journal"`
+}
+
+func taskObject(root string, t task, repo string, details bool) taskJSON {
+	waits := waiting(t.body)
+	overdue := false
+	if t.status == "ждёт" {
+		if at, err := timearg.Parse(waits, time.Now()); err == nil && !at.After(time.Now()) {
+			overdue = true
+		}
+	}
+	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: t.prio, Title: t.title,
+		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
+		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, NoCheck: noCheck(t.body)}
+	if details {
+		obj.Journal = journalLines(t.body)
+		obj.Checker, obj.Check = completion(t.body)
+	}
+	return obj
+}
+
+// completion — проверяющий и проверка последней строки «готово» журнала: тикет могли открыть заново.
+func completion(s string) (checker, check string) {
+	for _, line := range journalLines(s) {
+		_, after, ok := strings.Cut(line, " готово — ")
+		if !ok {
+			continue
+		}
+		if who, what, ok := strings.Cut(after, ": "); ok {
+			checker, check = strings.TrimSpace(who), strings.TrimSpace(what)
+		} else if who, what, ok := strings.Cut(after, " — "); ok {
+			checker, check = strings.TrimSpace(who), strings.TrimSpace(what)
+		}
+	}
+	return checker, check
+}
+
+func writeListJSON(root string, ts []task, labels map[string]string, o options, out, errout io.Writer) int {
+	if o.root != "" {
+		var err error
+		root, err = filepath.Abs(o.root)
+		if err != nil {
+			return fail(errout, err)
+		}
+	}
+	objects := make([]taskJSON, 0, len(ts))
+	for i := range ts {
+		t := &ts[i]
+		repo := ""
+		if o.root != "" {
+			repo = labels[t.path]
+		}
+		objects = append(objects, taskObject(root, *t, repo, false))
+	}
+	if err := json.NewEncoder(out).Encode(objects); err != nil {
+		return fail(errout, err)
+	}
+	return 0
+}
+
+func showJSON(root string, t task, out, errout io.Writer) int {
+	obj := taskObject(root, t, "", true)
+	if err := json.NewEncoder(out).Encode(obj); err != nil {
+		return fail(errout, err)
+	}
+	return 0
+}
+
+func lint(root, scanDir string, out, errout io.Writer) int {
+	repos, err := taskRepos(root, scanDir)
+	if err != nil {
+		return fail(errout, err)
+	}
+	var problems []string
+	for _, repo := range repos {
+		entries, err := os.ReadDir(filepath.Join(repo, "docs/tasks"))
+		if err != nil {
+			return fail(errout, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+				continue
+			}
+			path := filepath.Join(repo, "docs/tasks", entry.Name())
+			shown := lintPath(root, scanDir, repo, entry.Name(), path)
+			issues, err := lintTicket(path, shown)
+			if err != nil {
+				return fail(errout, err)
+			}
+			problems = append(problems, issues...)
+		}
+	}
+	if len(problems) == 0 {
+		fmt.Fprintln(out, "ok")
+		return 0
+	}
+	for _, problem := range problems {
+		fmt.Fprintln(out, problem)
+	}
+	return exitNone
+}
+
+func lintPath(root, scanDir, repo, name, path string) string {
+	if scanDir != "" {
+		return filepath.ToSlash(filepath.Join(filepath.Base(repo), "docs/tasks", name))
+	}
+	return relative(root, path)
+}
+
+func lintTicket(path, shown string) ([]string, error) {
+	bodyBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read ticket %s: %w", path, err)
+	}
+	body := string(bodyBytes)
+	var issues []string
+	if fileRE.FindStringSubmatch(filepath.Base(path)) == nil {
+		issues = append(issues, shown+": invalid file name")
+	}
+	statusValue, hasStatus := explicitStatus(body)
+	if hasStatus && !validStatus(statusValue) {
+		issues = append(issues, shown+": unknown status "+statusValue)
+	}
+	if !hasStatus {
+		return issues, nil
+	}
+	_, acceptance := sectionBody(body, "## Приёмка")
+	_, oldCheck := sectionBody(body, "## Чем проверить")
+	_, hasJournal := sectionBody(body, "## Журнал")
+	if !acceptance && !oldCheck {
+		issues = append(issues, shown+": missing Приёмка or Чем проверить section")
+	}
+	if !hasJournal {
+		issues = append(issues, shown+": missing Журнал section")
+	}
+	if statusValue == "готово" {
+		checker, check, strict := strictCompletion(body)
+		if !strict || checker == "" || check == "" {
+			issues = append(issues, shown+": готово without journal verification")
+		} else if doer := executor(body); doer != "" && strings.EqualFold(checker, doer) {
+			issues = append(issues, shown+": checker equals executor")
+		}
+	}
+	return issues, nil
+}
+
+// strictCompletion — то же для lint: годится только строка «готово — кто: проверка», последняя в журнале.
+func strictCompletion(s string) (checker, check string, ok bool) {
+	for _, line := range journalLines(s) {
+		_, after, found := strings.Cut(line, " готово — ")
+		if !found {
+			continue
+		}
+		who, what, _ := strings.Cut(after, ": ")
+		checker, check = strings.TrimSpace(who), strings.TrimSpace(what)
+		ok = checker != "" && check != ""
+	}
+	return checker, check, ok
+}
+
+func explicitStatus(s string) (string, bool) {
+	for line := range strings.SplitSeq(s, "\n") {
+		if value, ok := strings.CutPrefix(line, "Статус:"); ok {
+			return strings.TrimSpace(value), true
+		}
+	}
+	return "", false
+}
+
 func archive(root, dir string, o options, out, errout io.Writer) int {
 	ts, e := load(dir)
 	if e != nil {

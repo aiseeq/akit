@@ -2,12 +2,106 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestNoteListJSONAndDue(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	past := "# Waiting\n\nСтатус: ждёт\nЖдёт: 2020-01-01 10:00\nИсполнитель: Agent\n\n## Приёмка\n\n## Журнал\n- 2020-01-01 10:00 открыт — Agent\n"
+	future := "# Future\n\nСтатус: ждёт\nЖдёт: 2099-01-01 10:00\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — Other\n"
+	for name, body := range map[string]string{
+		"20200101-1000-MEDIUM-waiting.md": past,
+		"20200101-1000-INFO-future.md":    future,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, errOut bytes.Buffer
+	if code := list("", options{cmd: "ls", root: base, due: true}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "waiting") || strings.Contains(out.String(), "future") {
+		t.Fatalf("due listing %d: %q %s", code, out.String(), errOut.String())
+	}
+	out.Reset()
+	if code := list("", options{cmd: "ls", root: base, by: "aGENT", json: true}, &out, &errOut); code != 0 {
+		t.Fatalf("JSON listing %d: %s", code, errOut.String())
+	}
+	var rows []taskJSON
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil || len(rows) != 1 || rows[0].Slug != "waiting" || !rows[0].Overdue || !rows[0].NoCheck || rows[0].Repo == "" {
+		t.Fatalf("unexpected JSON list %#v, err=%v, raw=%s", rows, err, out.String())
+	}
+	ticket, err := find(dir, "waiting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := addNote(ticket, options{by: "Agent", note: "progress recorded"}, &out, &errOut); code != 0 {
+		t.Fatalf("note %d: %s", code, errOut.String())
+	}
+	updated, err := os.ReadFile(ticket.path)
+	if err != nil || !strings.Contains(string(updated), "note — Agent: progress recorded") || !strings.Contains(string(updated), "Статус: ждёт") {
+		t.Fatalf("note changed wrong content: %s, %v", updated, err)
+	}
+}
+
+func TestLintReportsRulesAndLegacyScope(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"bad-name.md":                   "# malformed\nСтатус: strange\n",
+		"20200101-1000-MEDIUM-ready.md": "# Ready\nСтатус: готово\nИсполнитель: Same\n\n## Приёмка\ncheck\n\n## Журнал\n- 2020-01-01 10:00 готово — same: checked\n",
+		"20200101-1000-INFO-legacy.md":  "# Legacy\n## Incomplete\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, errOut bytes.Buffer
+	if code := lint(root, "", &out, &errOut); code != 1 || !strings.Contains(out.String(), "bad-name.md: invalid file name") || !strings.Contains(out.String(), "unknown status strange") || !strings.Contains(out.String(), "checker equals executor") || strings.Contains(out.String(), "legacy.md: missing") {
+		t.Fatalf("lint result %d: %q; err=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestOutsideRepositoryBaseSearch(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHome := os.Getenv("HOME")
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	work := filepath.Join(home, "work", "nested")
+	if err := os.MkdirAll(filepath.Join(home, "docs", "tasks"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(work, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+		_ = os.Setenv("HOME", oldHome)
+	})
+	root, dir, found, err := resolveTaskBase()
+	if err != nil || !found || root != home || dir != filepath.Join(home, "docs", "tasks") {
+		t.Fatalf("resolved base %q %q %v %v", root, dir, found, err)
+	}
+}
 
 func TestLegacyTicketAndTextPreservation(t *testing.T) {
 	dir := t.TempDir()
