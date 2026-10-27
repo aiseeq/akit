@@ -1,6 +1,6 @@
 # Гейт glint на high: остаток проверяет tk done
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -17,3 +17,4 @@
 - 2026-10-28 00:13 в работе — akit-master
 - 2026-10-28 00:16 note — akit-master: первый коммит cbf2c94 ушёл без правки (sed не совпал с отступом) — правка в a5e198b
 - 2026-10-28 00:16 на проверке — akit-master — a5e198b: fail_on low снят, min_severity low на месте, graft gate зелёный
+- 2026-10-28 00:17 готово — git-admin: git-admin: a5e198b в origin/main — снята одна строка fail_on в .glint.yaml, min_severity low на месте
