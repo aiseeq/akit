@@ -6,7 +6,7 @@ Built for Claude Code and codex agents on Linux; some tools read files of the au
 setup under `~/.claude` (noted per tool). MIT license.
 
 Layout: library packages at the root (`edit`, `transcript`, …), one command per tool in `cmd/<tool>`.
-Install: `tools/install.sh [tool…]` — builds into `~/bin` from a clean tree only, prints the installed revision.
+Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/bin` from committed code only, prints each tool's revision.
 
 ## busy
 

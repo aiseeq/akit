@@ -11,12 +11,21 @@ tasks:
     tests: go
     run:
       - go test -p {threads} -json {args} ./...
+  build:
+    desc: собрать утилиты в bin/
+    run:
+      - go build -o bin/ ./cmd/...
+  install:
+    desc: поставить утилиты из bin/ в bin_dir (~/bin), только закоммиченное
+    deps: [build]
+    run:
+      - {install: bin/*}
 
 # Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок.
 gate:
   - sh: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
   - task: test
-  # glint падает кодом выхода на любой находке: fail_on: low в .glint.yaml.
+  # glint падает кодом выхода на находке high (умолчание fail_on); остальные проверяет tk done.
   - sh: GOWORK=off ~/bin/glint check .
 
 version:
