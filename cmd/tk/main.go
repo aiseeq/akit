@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -540,12 +541,17 @@ func status(s string) (string, error) {
 	return "открыт", nil
 }
 func title(s string) string {
+	return cmp.Or(lineValue(s, "# "), "(no title)")
+}
+
+// lineValue returns the rest of the first line starting with prefix, or "" when there is none.
+func lineValue(s, prefix string) string {
 	for l := range strings.SplitSeq(s, "\n") {
-		if after, ok := strings.CutPrefix(l, "# "); ok {
+		if after, ok := strings.CutPrefix(l, prefix); ok {
 			return after
 		}
 	}
-	return "(no title)"
+	return ""
 }
 func lastChange(s string, mtime time.Time) time.Time {
 	inJournal := false
@@ -776,12 +782,7 @@ func printTask(out io.Writer, t task, label string) {
 }
 
 func waiting(s string) string {
-	for line := range strings.SplitSeq(s, "\n") {
-		if value, ok := strings.CutPrefix(line, "Ждёт: "); ok {
-			return value
-		}
-	}
-	return ""
+	return lineValue(s, "Ждёт: ")
 }
 
 func setWaiting(s, value string) string {
