@@ -1,6 +1,6 @@
 # tk: title и waiting — одна функция значения строки по префиксу
 
-Статус: в работе
+Статус: на проверке
 Исполнитель: akit-master
 
 ## Вход
@@ -15,3 +15,4 @@
 ## Журнал
 - 2026-10-28 15:01 открыт — akit-master
 - 2026-10-28 15:01 в работе — akit-master
+- 2026-10-28 15:03 на проверке — akit-master — 68169ea: lineValue(s, prefix), title — cmp.Or с "(no title)", waiting — lineValue; graft gate и glint check . без находок; tk установлен
