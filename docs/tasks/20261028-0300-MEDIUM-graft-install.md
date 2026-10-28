@@ -1,6 +1,6 @@
 # Установка утилит задачей graft install вместо tools/install.sh
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -24,3 +24,4 @@
 - 2026-10-28 03:00 в работе — akit-master
 - 2026-10-28 03:00 note — akit-master: в приёмке «11 утилит» — ошибка подсчёта, в cmd/ их 10
 - 2026-10-28 03:00 на проверке — akit-master — ad1c782: задачи build/install, tools/install.sh удалён, README и design.md поправлены; graft install поставил 10 утилит ad1c782, go version -m ~/bin/tk: revision=HEAD, modified=false
+- 2026-10-28 03:01 готово — git-admin: git-admin: .graft.yaml build+install {install: bin/*} (ad1c782), bin/ в .gitignore, tools/install.sh нет; go version -m ~/bin/{tk,sub,busy}: revision a51e30d=HEAD, modified=false
