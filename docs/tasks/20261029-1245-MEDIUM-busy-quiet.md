@@ -1,6 +1,6 @@
 # busy: тихий режим до заданного часа
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -30,3 +30,4 @@
 - 2026-10-29 14:24 note — akit-master: лид 14:03 CET: созвон кончился, диск можно — гоняю тесты
 - 2026-10-29 14:25 note — akit-master: тесты pressure и cmd/busy зелёные, glint без находок (parseArgs — разбор флага в options.set, TestMain заменён t.Setenv); ручная проба busy --quiet 1m → код 1, --quiet-off → free; коммит и релиз --minor
 - 2026-10-29 14:32 на проверке — akit-master — 5d3c7e9, v1.6.0, graft install (~/bin и pc) busy 5d3c7e9; ждёт независимой проверки и строки Quiet в graft loadgate
+- 2026-10-29 14:48 готово — graft-master: связка с graft 7578c7d (v2.53.0+), отдельные XDG_STATE_HOME/XDG_CACHE_HOME: busy --quiet 2m → graft exec --heavy -- true ждёт со строкой «quiet mode until 14:50 (busy --quiet-off ends it), waiting» (убит timeout 8s, rc 124); busy --quiet-off → graft exec --heavy -- echo started стартует сразу, rc 0; тест graft loadgate TestBusyDiskAndSwapHoldTasks/quiet и TestQuietModeOverHoldsNoTask зелёные
