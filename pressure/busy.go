@@ -20,9 +20,10 @@ import (
 
 // Мера, по которой машина занята.
 const (
-	CPU  = "cpu"
-	IO   = "io"
-	Swap = "swap" // обмен со свопом при давлении памяти
+	CPU   = "cpu"
+	IO    = "io"
+	Swap  = "swap"  // обмен со свопом при давлении памяти
+	Quiet = "quiet" // тихий режим: срок в файле QuietPath ещё не прошёл
 )
 
 // Меры, которых нет в системе (не Linux, ядро без PSI): потребитель пропускает меру и говорит об этом.
@@ -59,6 +60,8 @@ type Load struct {
 	IOFull   float64 // % последней минуты, когда все задачи ждали диск (full avg60)
 	MemSome  float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	SwapKBs  float64 // обмен со свопом, KB/s
+	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
+	QuietUntil time.Time
 }
 
 // Verdict — ответ правила: Measure пусто — свободна; иначе мера, её значение и порог.
@@ -82,12 +85,24 @@ func (v Verdict) Why() string {
 		return fmt.Sprintf("IO pressure %.1f%% is above %v%%", v.Value, v.Limit)
 	case Swap:
 		return fmt.Sprintf("memory pressure %.1f%% is above %v%% while swapping %.0f KB/s", v.Value, v.Limit, v.Load.SwapKBs)
+	case Quiet:
+		return "quiet mode until " + quietClock(v.Load.QuietUntil, time.Now())
 	}
 	return ""
 }
 
-// Rule применяет пороги к замерам: процессор, потом диск, потом память со свопом; пропущенная мера не
-// судится. Value и Limit у Swap — давление памяти и его порог: обмен лишь подтверждает его.
+// quietClock — срок тихого режима местным временем: часы, а не сегодня — и день.
+func quietClock(until, now time.Time) string {
+	until, now = until.Local(), now.Local()
+	if y, m, d := until.Date(); y == now.Year() && m == now.Month() && d == now.Day() {
+		return until.Format("15:04")
+	}
+	return until.Format("2006-01-02 15:04")
+}
+
+// Rule применяет пороги к замерам: сначала тихий режим, потом процессор, диск, память со свопом;
+// пропущенная мера не судится. Value и Limit у Swap — давление памяти и его порог: обмен лишь
+// подтверждает его; у Quiet их нет, срок — в Load.QuietUntil.
 func Rule(m Load, l Limits, skipped []error) Verdict {
 	v := Verdict{Load: m, Skipped: skipped}
 	runnable := l.Runnable
@@ -100,6 +115,8 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 	}
 	memory := !skippedAny(skipped, ErrNoMemPressure) && !skippedAny(skipped, ErrNoVMStat)
 	switch {
+	case !m.QuietUntil.IsZero():
+		v.Measure = Quiet
 	case !skippedAny(skipped, ErrNoRunnable) && runnable > 0 && float64(m.Runnable) >= runnable:
 		v.Measure, v.Value, v.Limit = CPU, float64(m.Runnable), runnable
 	case !skippedAny(skipped, ErrNoIOPressure) && m.IOFull > l.MaxIOFull:
@@ -122,6 +139,7 @@ func skippedAny(skipped []error, target error) bool {
 // Meter замеряет машину procRoot (/proc) раз за разом и помнит прошлое чтение свопа.
 type Meter struct {
 	procRoot string
+	quiet    string // файл срока тихого режима; пусто — QuietPath
 	pages    int64
 	at       time.Time
 	now      func() time.Time
@@ -134,10 +152,22 @@ func NewMeter(procRoot string) *Meter {
 }
 
 // Check замеряет машину и применяет правило. fresh — обмен со свопом за l.SwapWindow (ждёт окно);
-// иначе — с прошлого Check, а у первого — тоже за окно. Ошибка — мера есть, но не читается.
+// иначе — с прошлого Check, а у первого — тоже за окно. Файл тихого режима читается первым, затем
+// меры из procRoot: и в тихом режиме вердикт несёт все замеры. Ошибка — без вердикта: файл тихого
+// режима не читается или не разбирается, мера есть, но не читается.
 func (m *Meter) Check(ctx context.Context, l Limits, fresh bool) (Verdict, error) {
 	var load Load
 	var skipped []error
+	quiet := m.quiet
+	var err error
+	if quiet == "" {
+		if quiet, err = QuietPath(); err != nil {
+			return Verdict{}, err
+		}
+	}
+	if load.QuietUntil, err = quietUntil(quiet, m.now()); err != nil {
+		return Verdict{}, err
+	}
 	// measure кладёт замер или, когда меры нет в системе, её сентинел в skipped.
 	measure := func(none error, read func() error) error {
 		err := read()
@@ -147,7 +177,7 @@ func (m *Meter) Check(ctx context.Context, l Limits, fresh bool) (Verdict, error
 		}
 		return err
 	}
-	err := errors.Join(
+	err = errors.Join(
 		measure(ErrNoRunnable, func() error {
 			stat, err := m.read("stat", ErrNoRunnable)
 			if err != nil {

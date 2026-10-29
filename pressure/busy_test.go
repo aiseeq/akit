@@ -71,6 +71,7 @@ func fakeProc(t *testing.T, files map[string]string) (*Meter, *time.Time) {
 	}
 	now := time.Unix(1000, 0)
 	m := NewMeter(root)
+	m.quiet = filepath.Join(root, "quiet-until")
 	m.now = func() time.Time { return now }
 	m.sleep = func(_ context.Context, d time.Duration) error {
 		now = now.Add(d)
@@ -135,6 +136,7 @@ func TestCheckBroken(t *testing.T) {
 		t.Error("stat без procs_running — ждали ошибку, а не пропуск меры")
 	}
 	writeProc(t, m.procRoot, "stat", stat)
+	t.Setenv("XDG_STATE_HOME", t.TempDir()) // Check без Meter читает файл тихого режима из XDG_STATE_HOME
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := Check(ctx, m.procRoot, DefaultLimits); !errors.Is(err, context.Canceled) {
