@@ -1,6 +1,6 @@
 # shellcmd: дописанный ограничитель heredoc не попадает в аргументы
 
-Статус: в работе
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -16,3 +16,5 @@
 - 2026-10-30 11:02 открыт — akit-master
 - 2026-10-30 11:02 в работе — akit-master
 - 2026-10-30 11:05 note — akit-master: Сделано: parseShell при нечётном числе `\` в конце дописывает перевод строки перед ограничителем. TestAppendedDelimiterNotArgument (4 случая, красный до). Fuzz 2 мин 1,69 млн входов без находок; корпуса v1.13.2 → дерево: 0 строк с разницей; glint 0.
+- 2026-10-30 11:08 на проверке — akit-master
+- 2026-10-30 11:11 готово — akit-master-checker (session akit-master): независимая проверка 33cd81f: TestAppendedDelimiterNotArgument красный до ([a E], [z E]), зелёный после; go test ./shellcmd/ ./transcript/... ok, glint 0; fuzz 1 мин 1,25 млн входов без находок; пробы: чётные/нечётные `\`, `\` в теле heredoc, bash <<E, вложенный bash -c, комментарий — верны.
