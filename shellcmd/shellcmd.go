@@ -23,6 +23,20 @@ type Call struct {
 	Offset int
 	// Redirs — перенаправления простой команды по порядку (у снятой обёртки — те же, что у неё).
 	Redirs []Redir
+	// Loop — вызов в теле цикла while, until или for (и во вложенном скрипте такого тела).
+	Loop bool
+}
+
+// cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
+type cmd struct {
+	call  Call
+	words []word
+}
+
+// word — место слова в исходной команде и его текст как скрипта.
+type word struct {
+	offset int    // смещение в исходной команде; -1 — слово не литерал
+	script string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -56,33 +70,71 @@ func Find(cmd string, names ...string) ([]Call, error) {
 		wanted[name] = true
 	}
 	filtered := calls[:0]
-	for _, call := range calls {
-		if wanted[call.Name] {
-			filtered = append(filtered, call)
+	for i := range calls {
+		if wanted[calls[i].Name] {
+			filtered = append(filtered, calls[i])
 		}
 	}
 	return filtered, nil
 }
 
 func parse(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
-	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(src), "")
+	file, full, err := parseShell(src)
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
-	return walkCalls(file, src, lineBase, inherited, vars, calls)
+	first := len(*calls)
+	if err := walkCalls(file, full, lineBase, inherited, vars, calls); err != nil {
+		return err
+	}
+	// Тело дочитанного heredoc кончается на конце исходного текста, а не дописанного ограничителя.
+	for _, c := range (*calls)[first:] {
+		for i := range c.Redirs {
+			if r := &c.Redirs[i]; r.BodyEnd > len(src) {
+				r.BodyEnd, r.Body = len(src), src[r.BodyStart:]
+			}
+		}
+	}
+	return nil
+}
+
+// parseShell разбирает текст как bash. Незакрытый heredoc bash дочитывает до конца текста с предупреждением,
+// а разбор считает ошибкой — тогда ограничитель дописывается в конец; full — разобранный текст.
+func parseShell(src string) (file *syntax.File, full string, err error) {
+	full = src
+	for range 8 {
+		file, err = syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(full), "")
+		var pe syntax.ParseError
+		if !errors.As(err, &pe) {
+			return file, full, err
+		}
+		delim, ok := strings.CutPrefix(pe.Text, "unclosed here-document `")
+		if !ok {
+			return nil, full, err
+		}
+		full += "\n" + strings.TrimSuffix(delim, "`") + "\n"
+	}
+	return nil, full, err
 }
 
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
 	timedCalls := timedCallSet(file)
 	redirs := make(map[*syntax.CallExpr][]Redir)
+	loopCalls := loopCallSet(file)
 	var shellInputs []*syntax.Stmt
 	var parseErr error
-	syntax.Walk(file, func(node syntax.Node) bool {
+	var visit func(node syntax.Node) bool
+	visit = func(node syntax.Node) bool {
 		if parseErr != nil { //nolint:silent-error-handling // Обход прекращается после сохранения ошибки для возврата наружу.
 			return false
 		}
-		if _, ok := node.(*syntax.Redirect); ok {
-			return false // Содержимое heredoc — данные, пока оно не передано оболочке.
+		if r, ok := node.(*syntax.Redirect); ok {
+			// Цель перенаправления выполняется (`< /proc/$(pgrep x)/cmdline`), тело heredoc — данные,
+			// пока оно не передано оболочке.
+			if r.Word != nil {
+				syntax.Walk(r.Word, visit)
+			}
+			return false
 		}
 		if clause, ok := node.(*syntax.TimeClause); ok {
 			start, end := int(clause.Pos().Offset()), int(clause.End().Offset())
@@ -109,7 +161,6 @@ func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, 
 			return true
 		}
 		args := words(call.Args, src, vars)
-		name := commandName(args[0])
 		start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
 		if !validSpan(src, start, end) {
 			parseErr = fmt.Errorf("shellcmd: invalid source span for command")
@@ -119,28 +170,43 @@ func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, 
 		if timedCalls[call] {
 			via = append(via, "time")
 		}
-		offsets := wordOffsets(call.Args)
-		entry := Call{Name: name, Args: append([]string(nil), args[1:]...), Raw: src[start:end], Line: int(call.Pos().Line()) + lineBase, Via: via, Offset: offsets[0], Redirs: redirs[call]}
-		*calls = append(*calls, entry)
-		if err := expand(entry, offsets, lineBase, vars, calls); err != nil {
+		ws := cmdWords(call.Args, src)
+		c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: src[start:end], Line: int(call.Pos().Line()) + lineBase, Via: via, Offset: ws[0].offset, Redirs: redirs[call], Loop: loopCalls[call]}, words: ws}
+		if err := emit(c, lineBase, vars, calls); err != nil {
 			parseErr = err
 			return false
 		}
-		if nested, wrapperVia, ok := unwrap(name, args[1:]); ok {
-			tail := offsets[len(offsets)-len(nested):]
-			child := Call{Name: nested[0], Args: nested[1:], Raw: entry.Raw, Line: entry.Line, Via: append(append([]string(nil), inherited...), wrapperVia...), Offset: tail[0], Redirs: entry.Redirs}
-			*calls = append(*calls, child)
-			if err := expand(child, tail, lineBase, vars, calls); err != nil {
-				parseErr = err
-				return false
-			}
-		}
 		return true
-	})
+	}
+	syntax.Walk(file, visit)
 	if parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", parseErr)
 	}
-	return parseHeredocStmts(shellInputs, src, lineBase, inherited, vars, calls)
+	return parseHeredocStmts(shellInputs, src, lineBase, inherited, vars, loopCalls, calls)
+}
+
+func loopCallSet(file *syntax.File) map[*syntax.CallExpr]bool {
+	loopCalls := make(map[*syntax.CallExpr]bool)
+	mark := func(stmts []*syntax.Stmt) {
+		for _, stmt := range stmts {
+			syntax.Walk(stmt, func(node syntax.Node) bool {
+				if call, ok := node.(*syntax.CallExpr); ok {
+					loopCalls[call] = true
+				}
+				return true
+			})
+		}
+	}
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch clause := node.(type) {
+		case *syntax.WhileClause:
+			mark(clause.Do)
+		case *syntax.ForClause:
+			mark(clause.Do)
+		}
+		return true
+	})
+	return loopCalls
 }
 
 func timedCallSet(file *syntax.File) map[*syntax.CallExpr]bool {
@@ -184,7 +250,7 @@ func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
 }
 
-func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
+func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited []string, vars map[string]string, loopCalls map[*syntax.CallExpr]bool, calls *[]Call) error {
 	for _, stmt := range stmts {
 		name, shellVia, ok := shellInputName(stmt, src, vars)
 		if !ok {
@@ -199,7 +265,8 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 				continue
 			}
 			via := append(append(append([]string(nil), inherited...), shellVia...), name)
-			if err := parseNested(body, int(redir.Hdoc.Pos().Line())+lineBase-1, via, vars, calls); err != nil {
+			call, _ := stmt.Cmd.(*syntax.CallExpr)
+			if err := parseNested(body, int(redir.Hdoc.Pos().Line())+lineBase-1, via, loopCalls[call], vars, calls); err != nil {
 				return err
 			}
 		}
@@ -247,6 +314,9 @@ func isShell(name string) bool {
 	return name == "bash" || name == "sh" || name == "zsh"
 }
 
+// IsShell сообщает, входит ли команда в список поддерживаемых оболочек.
+func IsShell(name string) bool { return isShell(name) }
+
 type nestedParseError struct {
 	script string
 	err    error
@@ -255,7 +325,7 @@ type nestedParseError struct {
 func (e *nestedParseError) Error() string { return e.err.Error() }
 func (e *nestedParseError) Unwrap() error { return e.err }
 
-func parseNested(src string, lineBase int, via []string, vars map[string]string, calls *[]Call) error {
+func parseNested(src string, lineBase int, via []string, inLoop bool, vars map[string]string, calls *[]Call) error {
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
@@ -269,6 +339,7 @@ func parseNested(src string, lineBase int, via []string, vars map[string]string,
 	// Смещения во вложенном тексте не указывают в исходную команду.
 	for i := range nestedCalls {
 		nestedCalls[i].Offset = -1
+		nestedCalls[i].Loop = nestedCalls[i].Loop || inLoop
 		redirs := slices.Clone(nestedCalls[i].Redirs)
 		for j := range redirs {
 			redirs[j].BodyStart, redirs[j].BodyEnd = -1, -1
@@ -316,52 +387,119 @@ func heredocBodyLen(text, delim string) int {
 	return i + 1
 }
 
-// wordOffsets — смещения слов в исходной команде; -1 у нелитерального слова ($R, $(…)).
-func wordOffsets(words []*syntax.Word) []int {
-	offsets := make([]int, len(words))
-	for i, word := range words {
-		offsets[i] = -1
-		if _, literal := wordValue(word); literal {
-			offsets[i] = int(word.Pos().Offset())
+// cmdWords — место и текст скрипта каждого слова команды.
+func cmdWords(args []*syntax.Word, src string) []word {
+	ws := make([]word, len(args))
+	for i, arg := range args {
+		ws[i] = word{offset: -1, script: wordScript(arg, src)}
+		if _, literal := wordValue(arg); literal {
+			ws[i].offset = int(arg.Pos().Offset())
 		}
 	}
-	return offsets
+	return ws
 }
 
-func words(words []*syntax.Word, src string, vars map[string]string) []string {
-	result := make([]string, len(words))
-	for i, word := range words {
-		if value, ok := wordValue(word); ok {
+// wordScript — текст слова, который оболочка разберёт как скрипт (`bash -c СЛОВО`, удалённая команда ssh).
+// Литерал — его значение. Слово в двойных кавычках — текст внутри без экранирования: подстановки в нём
+// ($x, $(…)) остаются текстом, а строй скрипта (циклы, вызовы) виден. Слово только из подстановки
+// ("$cmd", $cmd) — "": что выполнится, видно только при запуске.
+func wordScript(w *syntax.Word, src string) string {
+	if value, literal := wordValue(w); literal {
+		return value
+	}
+	if len(w.Parts) != 1 {
+		return ""
+	}
+	quoted, ok := w.Parts[0].(*syntax.DblQuoted)
+	if !ok || !slices.ContainsFunc(quoted.Parts, func(p syntax.WordPart) bool { _, lit := p.(*syntax.Lit); return lit }) {
+		return ""
+	}
+	start, end := int(quoted.Pos().Offset()), int(quoted.End().Offset())
+	if !validSpan(src, start, end) || end-start < 2 {
+		return ""
+	}
+	return unescapeDouble.Replace(src[start+1 : end-1])
+}
+
+// unescapeDouble снимает экранирование в двойных кавычках: обратная косая значима только перед " \ $ ` и переводом строки.
+var unescapeDouble = strings.NewReplacer(`\"`, `"`, `\\`, `\`, `\$`, `$`, "\\`", "`", "\\\n", "")
+
+// unescapeBare снимает экранирование вне кавычек: `\x` — x, `\`+перевод строки — продолжение строки.
+func unescapeBare(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			if s[i] == '\n' {
+				continue
+			}
+		}
+		out.WriteByte(s[i])
+	}
+	return out.String()
+}
+
+// words — значения слов команды; argv0 из переменной, присвоенной раньше литералом, — её значение.
+func words(ws []*syntax.Word, src string, vars map[string]string) []string {
+	result := make([]string, len(ws))
+	for i, w := range ws {
+		if value, ok := wordValue(w); ok {
 			result[i] = value
 			continue
 		}
-		start, end := int(word.Pos().Offset()), int(word.End().Offset())
-		if start >= 0 && end >= start && end <= len(src) {
-			result[i] = src[start:end]
-		}
+		result[i] = wordText(w, src)
 	}
-	if len(result) > 0 && strings.HasPrefix(result[0], "$") {
-		if value := vars[strings.Trim(result[0], "${}")]; value != "" {
-			result[0] = value
+	if len(ws) > 0 {
+		if name, ok := paramName(ws[0]); ok && vars[name] != "" {
+			result[0] = vars[name]
 		}
 	}
 	return result
 }
 
-func wordText(word *syntax.Word, src string) string {
-	start, end := int(word.Pos().Offset()), int(word.End().Offset())
-	if start >= 0 && end >= start && end <= len(src) {
+// paramName — имя переменной у слова из одной простой подстановки: $R, ${R}, "$R", "${R}".
+func paramName(w *syntax.Word) (string, bool) {
+	if len(w.Parts) != 1 {
+		return "", false
+	}
+	part := w.Parts[0]
+	if quoted, ok := part.(*syntax.DblQuoted); ok {
+		if len(quoted.Parts) != 1 {
+			return "", false
+		}
+		part = quoted.Parts[0]
+	}
+	p, ok := part.(*syntax.ParamExp)
+	if !ok || !simpleParamExp(p) {
+		return "", false
+	}
+	return p.Param.Value, true
+}
+
+func wordText(w *syntax.Word, src string) string {
+	start, end := int(w.Pos().Offset()), int(w.End().Offset())
+	if validSpan(src, start, end) {
 		return src[start:end]
 	}
 	return ""
 }
 
-func wordValue(word *syntax.Word) (string, bool) {
+func simpleParamExp(p *syntax.ParamExp) bool {
+	return p.Param != nil && p.Flags == nil && !p.Excl && !p.Length && !p.Width && !p.IsSet &&
+		p.Split == syntax.OptUnset && p.GlobSubst == syntax.OptUnset && p.RcExpand == syntax.OptUnset &&
+		p.NestedParam == nil && p.Index == nil && len(p.Modifiers) == 0 && p.Slice == nil && p.Repl == nil && p.Names == 0 && p.Exp == nil
+}
+
+// wordValue — значение слова без кавычек, если в нём нет подстановок.
+func wordValue(w *syntax.Word) (string, bool) {
 	var value strings.Builder
-	for _, part := range word.Parts {
+	for _, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			value.WriteString(p.Value)
+			value.WriteString(unescapeBare(p.Value))
 		case *syntax.SglQuoted:
 			value.WriteString(p.Value)
 		case *syntax.DblQuoted:
@@ -370,7 +508,7 @@ func wordValue(word *syntax.Word) (string, bool) {
 				if !ok {
 					return "", false
 				}
-				value.WriteString(lit.Value)
+				value.WriteString(unescapeDouble.Replace(lit.Value))
 			}
 		default:
 			return "", false
@@ -379,27 +517,90 @@ func wordValue(word *syntax.Word) (string, bool) {
 	return value.String(), true
 }
 
-// expand раскрывает цель `X exec … --` и скрипт `bash -c`; offsets — смещения слов имени и Args вызова.
-func expand(call Call, offsets []int, lineBase int, vars map[string]string, calls *[]Call) error {
-	if target, ok := execTarget(call.Args); ok {
-		tail := offsets[len(offsets)-len(target):]
-		child := Call{Name: target[0], Args: target[1:], Raw: call.Raw, Line: call.Line, Via: append(append([]string(nil), call.Via...), call.Name, "exec"), Offset: tail[0]}
-		*calls = append(*calls, child)
-		return expand(child, tail, lineBase, vars, calls)
+// sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
+func (c cmd) sub(i int, via []string) cmd {
+	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop}, words: c.words[i:]}
+}
+
+func (c cmd) via(more ...string) []string {
+	return append(slices.Clone(c.call.Via), more...)
+}
+
+// emit добавляет вызов и всё, что он запускает: программу под обёрткой, цель `X exec … --`, скрипт `bash -c`.
+func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
+	*calls = append(*calls, c.call)
+	if err := expand(c, lineBase, vars, calls); err != nil {
+		return err
 	}
-	if isShell(call.Name) {
-		for i, arg := range call.Args {
+	if nested, wrapperVia, ok := unwrap(c.call.Name, c.call.Args); ok {
+		return emit(c.sub(len(c.words)-len(nested), c.via(wrapperVia...)), lineBase, vars, calls)
+	}
+	return nil
+}
+
+// expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).
+func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
+	name, args := c.call.Name, c.call.Args
+	if target, ok := execTarget(args); ok {
+		return emit(c.sub(len(c.words)-len(target), c.via(name, "exec")), lineBase, vars, calls)
+	}
+	switch {
+	case isShell(name):
+		for i, arg := range args {
 			if !shellCommandOption(arg) {
 				continue
 			}
-			if i+1 >= len(call.Args) || strings.Contains(call.Args[i+1], "$") {
+			if i+1 >= len(args) || c.words[i+2].script == "" {
+				return nil // скрипта нет или он виден только при запуске
+			}
+			return parseNested(c.words[i+2].script, c.call.Line-1, c.via(name, "-c"), c.call.Loop, vars, calls)
+		}
+	case name == "ssh":
+		start, ok := sshCommand(args)
+		if !ok {
+			return nil
+		}
+		parts := make([]string, 0, len(args)-start)
+		for _, w := range c.words[start+1:] {
+			if w.script == "" {
 				return nil
 			}
-			via := append(append([]string(nil), call.Via...), call.Name, "-c")
-			return parseNested(call.Args[i+1], call.Line-1, via, vars, calls)
+			parts = append(parts, w.script)
+		}
+		return parseNested(strings.Join(parts, " "), c.call.Line-1, c.via("ssh"), c.call.Loop, vars, calls)
+	case !wrappers[name] && !dataArgs[name]:
+		// Оболочка с -c среди аргументов незнакомой программы (`X exec dir bash -c '…'`): та её запускает.
+		for i, arg := range args {
+			if isShell(baseName(arg)) && i+1 < len(args) && shellCommandOption(args[i+1]) {
+				return emit(c.sub(i+1, c.via(name)), lineBase, vars, calls)
+			}
 		}
 	}
 	return nil
+}
+
+// dataArgs — программы, чьи аргументы — данные: `echo bash -c x` ничего не запускает.
+var dataArgs = set("echo", "printf")
+
+var sshValueOptions = set("-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w")
+
+// sshCommand — индекс в args первого слова удалённой команды ssh; false — команды нет.
+func sshCommand(args []string) (int, bool) {
+	i := 0
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		if args[i] == "--" {
+			i++
+			break
+		}
+		if sshValueOptions[args[i]] {
+			i += 2
+			continue
+		}
+		i++
+	}
+	i++ // хост
+	return i, i < len(args)
 }
 
 func shellCommandOption(arg string) bool {
@@ -427,7 +628,6 @@ func baseName(path string) string {
 }
 
 func unwrap(name string, args []string) ([]string, []string, bool) {
-	wrappers := map[string]bool{"timeout": true, "env": true, "sudo": true, "nohup": true, "nice": true, "ionice": true, "stdbuf": true, "time": true, "command": true, "builtin": true, "exec": true, "xargs": true}
 	var via []string
 	for wrappers[name] {
 		via = append(via, name)
@@ -459,6 +659,9 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	}
 	return append([]string{name}, args...), via, len(via) > 0
 }
+
+// wrappers — программы, которые запускают программу из своих аргументов.
+var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs")
 
 // valueOptions — опции обёрток, следующее слово после которых — их значение, а не программа.
 var valueOptions = map[string]map[string]bool{

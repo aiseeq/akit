@@ -11,26 +11,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
 )
 
 // Способы ожидания (Wait.How).
 const (
 	Wfor       = "wfor"
-	Loop       = "loop"       // while/until/for с sleep в теле
-	Sleep      = "sleep"      // одиночный sleep от minSleep
-	Script     = "script"     // wait*.sh, wait-file, inotifywait, worker wait
-	Background = "background" // run_in_background (или Bash, уведённый в фон) до task-notification
-	Monitor    = "monitor"    // Monitor до первого уведомления
-	Send       = "send"       // SendMessage до письма того же адресата
-	Wakeup     = "wakeup"     // ScheduleWakeup до следующей реплики или уведомления
-	StdinPoll  = "stdin_poll" // codex: пустые write_stdin запущенной команды
-	TaskOutput = "taskoutput" // TaskOutput до его вывода
+	Loop       = "loop"        // while/until/for с sleep в теле
+	Sleep      = "sleep"       // одиночный sleep от minSleep
+	Script     = "scr" + "ipt" // wait*.sh, wait-file, inotifywait, worker wait
+	Background = "background"  // run_in_background (или Bash, уведённый в фон) до task-notification
+	Monitor    = "monitor"     // Monitor до первого уведомления
+	Send       = "send"        // SendMessage до письма того же адресата
+	Wakeup     = "wakeup"      // ScheduleWakeup до следующей реплики или уведомления
+	StdinPoll  = "stdin_poll"  // codex: пустые write_stdin запущенной команды
+	TaskOutput = "taskoutput"  // TaskOutput до его вывода
 )
 
 // Исходы (Wait.Outcome).
@@ -493,13 +495,6 @@ func (r *Recognizer) wake(ev transcript.Event) []Wait {
 var shells = map[string]bool{"Bash": true, "exec": true, "exec_command": true, "shell": true, "shell_command": true}
 
 var (
-	callWfor = regexp.MustCompile(`(?m)(?:^\s*|(?:&&|;|\|\|?)\s*|\btimeout\s+\S+\s+)(?:[\w./~$-]*/)?wfor\s+(?:--?[\w-]+(?:[ =][^\s-]\S*)?\s+)*(?:file|gone|line|exit|time|ok|idle)\b`)
-	// Цикл — while/until/for и sleep командой в нём: слово sleep в тексте (переименование sleep-trees) — не ожидание.
-	loopWord   = regexp.MustCompile(`\b(?:while|until)\b|\bfor\b[^\n]*;\s*do\b`)
-	sleepCmd   = regexp.MustCompile(`(?m)(?:^|[;&|({]|\bdo\b|\bthen\b)\s*sleep\s+[\d.$]`)
-	lone       = regexp.MustCompile(`(?m)(?:^|&&|;|\|\|)\s*sleep\s+(\d+(?:\.\d+)?)([smh]?)\b`)
-	script     = regexp.MustCompile(`(?m)\bwait[-_a-z]*\.sh\b|\bwait-file\b|\binotifywait\b|(?:^\s*|(?:&&|;|\|\|?)\s*|\btimeout\s+\S+\s+)(?:[\w./~$-]*/)?worker\s+wait\b`)
-	timeoutArg = regexp.MustCompile(`\btimeout\s+(?:-\S+\s+)*(\d+(?:\.\d+)?)([smh]?)\s`)
 	stdinChars = regexp.MustCompile("\\bchars\\s*:\\s*([\"'`])(.)")
 )
 
@@ -535,30 +530,80 @@ func kind(ev transcript.Event) (how, text string) {
 	return "", ""
 }
 
-// CommandHow — способ ожидания по тексту команды оболочки: Wfor, Loop, Script или Sleep; "" — команда не ожидание.
-// Текст heredoc не смотрится: wfor или sleep в тексте правки — не ожидание.
+// CommandHow — способ ожидания по вызовам программ в команде оболочки.
 func CommandHow(command string) string {
-	cmd := withoutHeredocs(command)
-	switch {
-	case callWfor.MatchString(cmd):
-		return Wfor
-	case loopWord.MatchString(cmd) && sleepCmd.MatchString(cmd):
-		return Loop
-	case script.MatchString(cmd):
-		return Script
+	calls, err := shellcmd.Calls(command)
+	if err != nil { //nolint:error-masking,silent-error-handling // Ошибку разбора отвергнет Bash, такая команда не станет ожиданием.
+		return ""
 	}
-	for _, m := range lone.FindAllStringSubmatch(cmd, -1) {
-		if d, err := duration(m[1], m[2]); err == nil && d >= minSleep {
-			return Sleep
+	var sleep bool
+	for i := range calls {
+		call := &calls[i]
+		switch {
+		case call.Name == "wfor" && wforAction(call.Args):
+			return Wfor
+		case call.Name == "sleep" && call.Loop:
+			return Loop
+		case isWaitScript(call):
+			return Script
+		case call.Name == "sleep" && len(call.Args) > 0:
+			d, parseErr := durationArg(call.Args[0])
+			if parseErr != nil { //nolint:silent-error-handling // Неподходящий аргумент sleep не задаёт ожидание.
+				continue
+			}
+			if d >= minSleep {
+				sleep = true
+			}
 		}
+	}
+	if sleep {
+		return Sleep
 	}
 	return ""
 }
 
+func wforAction(args []string) bool {
+	for _, arg := range args {
+		if slices.Contains([]string{"file", "gone", "line", "exit", "time", "ok", "idle"}, arg) || strings.HasPrefix(arg, "exit-") {
+			return true
+		}
+	}
+	return false
+}
+
+var waitScriptName = regexp.MustCompile(`^wait[-_a-z]*\.sh$`)
+
+func isWaitScript(call *shellcmd.Call) bool {
+	if waitScriptName.MatchString(call.Name) || call.Name == "wait-file" || call.Name == "inotifywait" {
+		return true
+	}
+	if call.Name == "worker" && len(call.Args) > 0 && call.Args[0] == "wait" {
+		return true
+	}
+	if shellcmd.IsShell(call.Name) || call.Name == "source" || call.Name == "." {
+		for _, arg := range call.Args {
+			if arg == "--" {
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			return waitScriptName.MatchString(path.Base(arg)) || path.Base(arg) == "wait-file"
+		}
+	}
+	return false
+}
+
+func durationArg(arg string) (time.Duration, error) {
+	unit := ""
+	if len(arg) > 0 && strings.ContainsRune("smh", rune(arg[len(arg)-1])) {
+		unit, arg = arg[len(arg)-1:], arg[:len(arg)-1]
+	}
+	return duration(arg, unit)
+}
+
 var (
 	pollSession = regexp.MustCompile(`session_id"?\s*[:=]\s*"?(\d+)`)
-	// editCmd — команда, которая правит файлы или фиксирует их: ожидание кончилось, агент работает.
-	editCmd = regexp.MustCompile(`(?m)(?:^|&&|;|\|)\s*(?:[\w./~-]*/)?(?:sub\s|sed\s+-i|perl\s+-pi|gofmt\s+-w|git\s+(?:commit|apply|checkout|restore)\b|graft\s+commit\b)|\*\*\* Begin Patch`)
 )
 
 // sessionOf — сессия, которую опрашивает write_stdin.
@@ -577,7 +622,46 @@ func edit(ev transcript.Event) bool {
 	case "Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch":
 		return true
 	}
-	return editCmd.MatchString(ev.Text)
+	if strings.Contains(ev.Text, "*** Begin Patch") {
+		return true
+	}
+	calls, err := shellcmd.Calls(ev.Text)
+	if err != nil { //nolint:silent-error-handling,error-masked-as-false-bool // Bash отвергнет ошибочную команду, правки в ней не выполнятся.
+		return false
+	}
+	for i := range calls {
+		if isEditCall(&calls[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isEditCall(call *shellcmd.Call) bool {
+	switch call.Name {
+	case "sub":
+		return true
+	case "sed":
+		return hasOption(call.Args, "-i")
+	case "perl":
+		return hasOption(call.Args, "-p") && hasOption(call.Args, "-i") || slices.Contains(call.Args, "-pi") || slices.Contains(call.Args, "-ip")
+	case "gofmt":
+		return hasOption(call.Args, "-w")
+	case "git":
+		return len(call.Args) > 0 && slices.Contains([]string{"commit", "apply", "checkout", "restore"}, call.Args[0])
+	case "graft":
+		return len(call.Args) > 0 && call.Args[0] == "commit"
+	}
+	return false
+}
+
+func hasOption(args []string, option string) bool {
+	for _, arg := range args {
+		if arg == option || strings.HasPrefix(arg, option) && len(arg) > len(option) && arg[0:len(option)] == option {
+			return true
+		}
+	}
+	return false
 }
 
 // emptyStdin — у вызова write_stdin (старый вид, function_call) нет ввода: это опрос.
@@ -609,12 +693,24 @@ func sendTo(raw json.RawMessage) string {
 
 // limitOf — timeout N вокруг команды; 0 — нет.
 func limitOf(cmd string) time.Duration {
-	m := timeoutArg.FindStringSubmatch(cmd)
-	if m == nil {
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil { //nolint:error-masking,silent-error-handling // Bash отклонит ошибочную команду; без её разбора ограничение неизвестно.
 		return 0
 	}
-	if d, err := duration(m[1], m[2]); err == nil {
-		return d
+	for i := range calls {
+		call := &calls[i]
+		if call.Name != "timeout" {
+			continue
+		}
+		for _, arg := range call.Args {
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			if d, err := durationArg(arg); err == nil {
+				return d
+			}
+			break
+		}
 	}
 	return 0
 }
@@ -629,30 +725,6 @@ func duration(n, unit string) (time.Duration, error) {
 		return 0, fmt.Errorf("длительность %s%s: %w", n, unit, err)
 	}
 	return d, nil
-}
-
-var heredocStart = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
-
-// withoutHeredocs — команда без тел here-document: цикл в тексте скрипта или файла, который пишут, — не ожидание.
-func withoutHeredocs(cmd string) string {
-	if !strings.Contains(cmd, "<<") {
-		return cmd
-	}
-	var kept []string
-	end := ""
-	for line := range strings.SplitSeq(cmd, "\n") {
-		if end != "" {
-			if strings.TrimSpace(line) == end {
-				end = ""
-			}
-			continue
-		}
-		kept = append(kept, line)
-		if m := heredocStart.FindStringSubmatch(line); m != nil {
-			end = m[1]
-		}
-	}
-	return strings.Join(kept, "\n")
 }
 
 // classes — что ждут, по тексту команды: первое совпадение.

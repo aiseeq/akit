@@ -28,6 +28,22 @@ func TestCalls(t *testing.T) {
 		{"wrapper options", `timeout 5 env -u X sudo -n rg x`, []string{"timeout", "rg"}},
 		{"xargs option value", `xargs -I{} jq .`, []string{"xargs", "jq"}},
 		{"bash command string", `bash -euo pipefail -c 'rg x; echo ok'`, []string{"bash", "rg", "echo"}},
+		{"bash command string with variables", `bash -c 'while grep -q "$x"; do sleep 5; done'`, []string{"bash", "grep", "sleep"}},
+		{"bash double-quoted command string", `timeout 15 bash -c "while kill -0 $cp 2>/dev/null; do sleep 1; done"`, []string{"timeout", "bash", "kill", "sleep"}},
+		{"ssh remote command", `ssh -o StrictHostKeyChecking=no -p 22 host 'timeout 35m bash -c "while true; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "true", "sleep"}},
+		{"ssh remote command with parameter", `ssh host 'timeout 35m bash -c "while kill -0 $child 2>/dev/null; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "kill", "sleep"}},
+		{"ssh without command", `ssh -p 22 host`, []string{"ssh"}},
+		{"ssh quoted remote script", `ssh host 'echo $(sleep 5)'`, []string{"ssh", "echo", "sleep"}},
+		{"ssh remote loop with command substitution", `ssh host 'timeout 35m bash -c "while test $(printf x) = x; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "test", "printf", "sleep", "printf"}},
+		{"bash -c in double quotes with any substitution", `bash -c "while test \"${x:-y}\"; do sleep 5; done"`, []string{"bash", "test", "sleep"}},
+		{"only a variable as bash -c script", `bash -c "$cmd"`, []string{"bash"}},
+		{"quoted variable argv0", "R=~/bin/mytool; \"$R\" history; \"${R}\" history", []string{"mytool", "mytool"}},
+		{"shell -c under an unknown program", `frame.sh exec /tmp/t bash -c 'grep -rl x d'`, []string{"frame.sh", "bash", "grep"}},
+		{"echo of bash -c is data", `echo bash -c 'rg x'`, []string{"echo"}},
+		{"substitution in a redirect target", `tr a b < /proc/$(pgrep -f x | head -1)/cmdline`, []string{"tr", "pgrep", "head"}},
+		{"heredoc body with substitution stays data", "cat <<EOF\n$(rg x)\nEOF", []string{"cat"}},
+		{"escapes in words", `sh -c "rg \"a b\" \$HOME"; echo a\ b`, []string{"sh", "rg", "echo"}},
+		{"unclosed heredoc runs to the end like bash", "bash <<'EOF'\nrg x", []string{"bash", "rg"}},
 		{"invalid nested script", `bash -c 'echo "unterminated'; echo after`, nil},
 		{"invalid nested script syntax", `bash -c 'rg x; if then'`, nil},
 		{"bash long option is not command string", `bash --norc -c 'rg x'`, []string{"bash", "rg"}},
@@ -71,6 +87,7 @@ EOF`, []string{"echo", "cat"}},
 
 		{"nonliteral name", `$(which rg) x`, []string{"", "which"}},
 		{"-- command wrapper", `graft exec --heavy -- go test`, []string{"graft", "go"}},
+		{"nested command wrapper", `graft exec --heavy -- sudo sed -i x f`, []string{"graft", "sudo", "sed"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,6 +116,50 @@ EOF`, []string{"echo", "cat"}},
 	}
 }
 
+func TestLoopCalls(t *testing.T) {
+	calls, err := Calls("while true; do sleep 5; done; bash -c 'for x in a; do sleep 2; done'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loops []string
+	for _, call := range calls {
+		if call.Name == "sleep" && call.Loop {
+			loops = append(loops, call.Args[0])
+		}
+	}
+	if !reflect.DeepEqual(loops, []string{"5", "2"}) {
+		t.Fatalf("sleep в циклах = %#v", loops)
+	}
+	calls, err = Calls("sleep 1; echo done")
+	if err != nil || len(calls) != 2 || calls[0].Loop {
+		t.Fatalf("вызовы вне цикла = %#v, %v", calls, err)
+	}
+	for _, command := range []string{
+		`for i in 1 2; do bash -c 'sleep 30'; done`,
+		"for i in 1 2; do bash <<'END'\nsleep 30\nEND\ndone",
+		`ssh host 'timeout 35m bash -c "while true; do sleep 20; done"'`,
+	} {
+		calls, err = Calls(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == "sleep" && call.Loop {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("вложенный вызов в цикле не помечен: %#v", calls)
+		}
+		for _, call := range calls {
+			if call.Name == "sleep" && call.Offset != -1 {
+				t.Errorf("смещение вложенного вызова = %d, want -1", call.Offset)
+			}
+		}
+	}
+}
+
 func TestCallDetails(t *testing.T) {
 	got, err := Calls("echo x\nsudo /usr/bin/rg 'a b' $q")
 	if err != nil {
@@ -109,6 +170,10 @@ func TestCallDetails(t *testing.T) {
 	}
 	if got[2].Name != "rg" || !reflect.DeepEqual(got[2].Args, []string{"a b", "$q"}) || got[2].Line != 2 || !reflect.DeepEqual(got[2].Via, []string{"sudo"}) {
 		t.Fatalf("call details = %#v", got[2])
+	}
+	esc, err := Find(`rg "a \"b\" \$x" c\ d`, "rg")
+	if err != nil || len(esc) != 1 || !reflect.DeepEqual(esc[0].Args, []string{`a "b" $x`, "c d"}) {
+		t.Fatalf("escaped args = %#v, %v", esc, err)
 	}
 	found, err := Find("echo x; rg y", "rg")
 	if err != nil || len(found) != 1 || found[0].Name != "rg" {
@@ -182,6 +247,10 @@ func TestRedirs(t *testing.T) {
 	}
 	if r := nested[0].Redirs; len(r) != 2 || r[1].Body != "x\n" || r[1].BodyStart != -1 || r[1].BodyEnd != -1 {
 		t.Fatalf("nested redirs = %#v", r)
+	}
+	open, err := Find("cat <<EOF\nab", "cat")
+	if err != nil || len(open) != 1 || open[0].Redirs[0].Body != "ab" || open[0].Redirs[0].BodyEnd != 12 {
+		t.Fatalf("unclosed heredoc = %#v, %v", open, err)
 	}
 	empty, err := Find("cat <<EOF\nEOF", "cat")
 	if err != nil || len(empty) != 1 || len(empty[0].Redirs) != 1 || empty[0].Redirs[0].Body != "" {

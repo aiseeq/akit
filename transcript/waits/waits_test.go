@@ -339,6 +339,30 @@ func TestRepeatSameWay(t *testing.T) {
 	}
 }
 
+func TestEditCommands(t *testing.T) {
+	cases := []struct {
+		command string
+		want    bool
+	}{
+		{`sudo sed -i 's/a/b/' file`, true},
+		{`git log --grep sleep`, false},
+		{`echo "sed -i"`, false},
+		{"cat <<'EOF'\\nsed -i x f\\nEOF", false},
+		{`git commit -m done`, true},
+		{`graft exec --heavy -- sudo sed -i x f`, true},
+		{`sed -i 'unterminated`, false},
+		{`*** Begin Patch`, true},
+	}
+	for _, tt := range cases {
+		if got := edit(transcript.Event{Who: "Bash", Text: tt.command}); got != tt.want {
+			t.Errorf("edit(%q) = %t, want %t", tt.command, got, tt.want)
+		}
+	}
+	if got := limitOf(`timeout 600 wfor exit 123`); got != 600*time.Second {
+		t.Errorf("limitOf() = %s, want 10m0s", got)
+	}
+}
+
 func TestCommandHow(t *testing.T) {
 	cases := map[string]string{
 		"wfor file /tmp/x --timeout 10m":                Wfor,
@@ -354,6 +378,15 @@ func TestCommandHow(t *testing.T) {
 		`echo "worker wait later"`:                      "",
 		"cat > f.md <<'X'\nworker wait abc\nwfor file y\nsleep 60\nX\n": "",
 	}
+	cases[`echo "wfor line x"`] = ""
+	cases[`git log --grep sleep`] = ""
+	cases[`bash -c 'while true; do sleep 5; done'`] = Loop
+	cases[`timeout 600 wfor exit 123`] = Wfor
+	cases[`timeout 30 wfor exit-file f`] = Wfor
+	cases[`bash -c 'until grep -q "$x"; do sleep 1; done'`] = Loop
+	cases[`bash /x/wait-any.sh 50`] = Script
+	cases[`source ./wait-ready.sh 5`] = Script
+	cases[`cat ./wait-ready.sh`] = ""
 	for cmd, want := range cases {
 		if got := CommandHow(cmd); got != want {
 			t.Errorf("CommandHow(%q) = %q, want %q", cmd, got, want)
