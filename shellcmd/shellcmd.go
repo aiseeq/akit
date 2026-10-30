@@ -615,13 +615,23 @@ func sourceBase(n syntax.Node, value string, skip int, src string) int {
 }
 
 // litSource — исходный текст литерала и его смещение: в Value разбор уже убрал продолжения строки
-// (`\`+перевод строки), а карте нужны байты исходника; без верного места — Value и -1.
-func litSource(lit *syntax.Lit, src string) (raw string, base int) {
+// (`\`+перевод строки), а карте нужны байты исходника; без верного места — Value и -1. Литерал перед
+// продолжением строки кончается на `\` без перевода строки — срез берёт и его.
+func litSource(lit *syntax.Lit, src string, double bool) (raw string, base int) {
 	start, end := int(lit.Pos().Offset()), int(lit.End().Offset())
-	if validSpan(src, start, end) {
-		return src[start:end], start
+	if !validSpan(src, start, end) {
+		return lit.Value, -1
 	}
-	return lit.Value, -1
+	if strings.HasSuffix(src[start:end], `\`) && end < len(src) && src[end] == '\n' {
+		end++
+	}
+	var fromSource, fromValue mapped
+	fromSource.unescape(src[start:end], start, double)
+	fromValue.unescape(lit.Value, -1, double)
+	if fromSource.String() != fromValue.String() {
+		return lit.Value, -1
+	}
+	return src[start:end], start
 }
 
 // mapped — текст и смещение каждого его байта в исходной команде (-1 — такого байта нет).
@@ -636,7 +646,7 @@ func (m *mapped) String() string { return string(m.text) }
 func (m *mapped) addLiteral(part syntax.WordPart, src string) {
 	switch p := part.(type) {
 	case *syntax.Lit:
-		raw, base := litSource(p, src)
+		raw, base := litSource(p, src, false)
 		m.unescape(raw, base, false)
 	case *syntax.SglQuoted:
 		base := -1
@@ -647,7 +657,7 @@ func (m *mapped) addLiteral(part syntax.WordPart, src string) {
 	case *syntax.DblQuoted:
 		for _, inner := range p.Parts {
 			if lit, ok := inner.(*syntax.Lit); ok {
-				raw, base := litSource(lit, src)
+				raw, base := litSource(lit, src, true)
 				m.unescape(raw, base, true)
 			}
 		}
