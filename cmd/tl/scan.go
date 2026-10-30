@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"runtime"
@@ -34,11 +35,19 @@ type result struct {
 type filter struct {
 	opts    options
 	re      *regexp.Regexp
+	rawRE   *regexp.Regexp
 	literal []byte // строчный литерал поиска для отсева сырых строк; nil — отсева нет
 }
 
 func newFilter(opts options) (*filter, error) {
 	f := &filter{opts: opts}
+	if opts.raw != "" {
+		re, err := regexp.Compile("(?i)" + opts.raw)
+		if err != nil {
+			return nil, fmt.Errorf("--raw: %w", err)
+		}
+		f.rawRE = re
+	}
 	if opts.grep == "" {
 		return f, nil
 	}
@@ -58,7 +67,10 @@ func newFilter(opts options) (*filter, error) {
 }
 
 func (f *filter) keepRaw(raw []byte) bool {
-	return bytes.Contains(bytes.ToLower(raw), f.literal)
+	if f.literal != nil && !bytes.Contains(bytes.ToLower(raw), f.literal) {
+		return false
+	}
+	return f.rawRE == nil || f.rawRE.Match(raw)
 }
 
 func (f *filter) inWindow(ev transcript.Event) bool {
@@ -78,7 +90,7 @@ func (f *filter) match(ev transcript.Event) bool {
 // file читает один файл и отдаёт отобранные события с окрестностью -C.
 func (f *filter) file(src source) ([]hit, transcript.Meta, error) {
 	var keep func([]byte) bool
-	if f.literal != nil {
+	if f.literal != nil || f.rawRE != nil {
 		keep = f.keepRaw
 	}
 	var (
@@ -199,6 +211,18 @@ func report(res result, opts options, e env, w io.Writer) int {
 		}
 		seen[h.src.id] = true
 		name := res.names[h.src.id]
+		if h.src.parentID != "" {
+			parentName := res.names[h.src.parentID]
+			if parentName != "" {
+				parentName = " " + parentName
+			}
+			description := ""
+			if h.src.description != "" {
+				description = fmt.Sprintf(" %q", h.src.description)
+			}
+			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", h.src.id, h.src.parentID, parentName, description, tilde(h.src.path, e.home))
+			continue
+		}
 		if name != "" {
 			name += " "
 		}
@@ -240,6 +264,9 @@ func windowNote(opts options, e env) string {
 	if opts.grep != "" {
 		parts = append(parts, fmt.Sprintf("grep %q", opts.grep))
 	}
+	if opts.raw != "" {
+		parts = append(parts, fmt.Sprintf("raw %q", opts.raw))
+	}
 	roles := make([]string, 0, len(opts.roles))
 	for _, r := range transcript.Roles {
 		if opts.roles[r] {
@@ -265,6 +292,13 @@ func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
 		return exitUsage
 	}
 	src := newSource(path)
+	if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
+		src, err = subSource(path)
+		if err != nil {
+			fmt.Fprintf(stderr, "tl: %v\n", err)
+			return exitUsage
+		}
+	}
 	var found []transcript.Event
 	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
 		if ev.Line == lineNo {

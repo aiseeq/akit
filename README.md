@@ -137,11 +137,13 @@ current session name when it can be read from the process cgroup. `tk -h` lists 
 ## tl
 
 Session transcripts for an agent, briefly: a time/role window of one session or a search across
-all projects. Reads Claude Code transcripts and codex rollouts. Each event line carries a reference
+all projects. Reads Claude Code transcripts, their subagents and codex rollouts. Each event line carries a reference
 `id:line`; `tl id:line` prints that event in full. Exit 0 events found, 1 none, 2 usage/IO error.
 
     tl backend --since 12:00               # the conversation of a live session since noon
     tl --all --role user,ask --grep wfor   # what the human said about wfor, last 7 days
+    tl --all --raw '"isSidechain":true'    # records marked as subagent events
+    tl backend --subagents                 # this session and its subagents
     tl 1a2b3c4d:7759                       # one event in full
     tl --all --since 1d --usage            # tokens and API cost per session, TSV
 

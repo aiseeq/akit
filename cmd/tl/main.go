@@ -35,8 +35,11 @@ path (Claude Code or codex rollout).
                 or ago: 30m 2h 3d
   --until T     up to time T, same forms
   --grep RE     events whose text matches RE (case-insensitive)
+  --raw RE      raw jsonl lines matching RE (case-insensitive), e.g. --raw '"hook_cancelled"'
   -C N          with --grep: N events around each hit
-  --all         all transcripts in ~/.claude/projects
+  --all         all transcripts in ~/.claude/projects, including subagents
+  --no-subagents with --all: omit subagent transcripts
+  --subagents   with SESSION: include that session's subagents
   --codex       with --all: also codex rollouts of worker fighters
   --project S   with --all: project folders containing S
   --max N       last N events (default 100, 0 = all)
@@ -59,19 +62,22 @@ const (
 )
 
 type options struct {
-	roles    map[transcript.Role]bool
-	since    time.Time
-	until    time.Time
-	grep     string
-	context  int
-	all      bool
-	codex    bool
-	project  string
-	max      int
-	width    int
-	usage    bool
-	rolesSet bool
-	args     []string
+	roles       map[transcript.Role]bool
+	since       time.Time
+	until       time.Time
+	grep        string
+	raw         string
+	context     int
+	all         bool
+	codex       bool
+	noSubagents bool
+	subagents   bool
+	project     string
+	max         int
+	width       int
+	usage       bool
+	rolesSet    bool
+	args        []string
 }
 
 var errHelp = errors.New("help")
@@ -122,6 +128,12 @@ func parseArgs(args []string, now time.Time) (options, error) {
 		case "--codex":
 			opts.codex = true
 			continue
+		case "--no-subagents":
+			opts.noSubagents = true
+			continue
+		case "--subagents":
+			opts.subagents = true
+			continue
 		case "--usage":
 			opts.usage = true
 			continue
@@ -145,8 +157,11 @@ func parseArgs(args []string, now time.Time) (options, error) {
 	if opts.context > 0 && opts.grep == "" {
 		return opts, errors.New("-C works with --grep")
 	}
-	if (opts.codex || opts.project != "") && !opts.all {
-		return opts, errors.New("--codex and --project work with --all")
+	if (opts.codex || opts.project != "" || opts.noSubagents) && !opts.all {
+		return opts, errors.New("--codex, --project and --no-subagents work with --all")
+	}
+	if opts.subagents && opts.all {
+		return opts, errors.New("--subagents works with SESSION, not --all")
 	}
 	return opts, nil
 }
@@ -163,6 +178,8 @@ func setFlag(opts *options, name, val string, now time.Time) error {
 		opts.until, err = timearg.Parse(val, now)
 	case "--grep":
 		opts.grep = val
+	case "--raw":
+		opts.raw = val
 	case "-C":
 		opts.context, err = nonNegative(name, val)
 	case "--project":

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,8 +18,10 @@ import (
 
 // source — файл транскрипта и его короткий id для ссылок.
 type source struct {
-	path string
-	id   string
+	path        string
+	id          string
+	parentID    string
+	description string
 }
 
 // sinceDefault — окно --all без --since: за неделю транскриптов около 2 ГБ, за всё время — больше 10.
@@ -42,7 +45,7 @@ func resolve(opts options, e env) ([]source, error) {
 		if since.IsZero() {
 			since = e.now.Add(-sinceDefault)
 		}
-		return allSources(e.home, since, opts.project, opts.codex)
+		return allSources(e.home, since, opts.project, opts.codex, !opts.noSubagents)
 	}
 	args := opts.args
 	if len(args) == 0 {
@@ -58,6 +61,13 @@ func resolve(opts options, e env) ([]source, error) {
 			return nil, err
 		}
 		out = append(out, newSource(path))
+		if opts.subagents {
+			subs, err := subSources(path)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, subs...)
+		}
 	}
 	return out, nil
 }
@@ -92,6 +102,13 @@ func find(arg, home string) (string, error) {
 		return "", fmt.Errorf("find %s: %w", arg, err)
 	}
 	matches = append(matches, codex...)
+	if len(matches) == 0 {
+		subs, err := filepath.Glob(filepath.Join(projects, "*", "*", "subagents", "agent-"+arg+"*.jsonl"))
+		if err != nil {
+			return "", fmt.Errorf("find %s: %w", arg, err)
+		}
+		matches = append(matches, subs...)
+	}
 	switch len(matches) {
 	case 0:
 		if aliveErr != nil {
@@ -108,11 +125,18 @@ func workerSessions(home string) string {
 	return filepath.Join(home, ".local", "state", "worker", "*", "codex", "sessions")
 }
 
-// allSources — транскрипты сессий (без суб-агентов), изменённые после since.
-func allSources(home string, since time.Time, project string, codex bool) ([]source, error) {
+// allSources — транскрипты сессий, изменённые после since.
+func allSources(home string, since time.Time, project string, codex, includeSubs bool) ([]source, error) {
 	paths, err := filepath.Glob(filepath.Join(session.ProjectsDir(home), "*", "*.jsonl"))
 	if err != nil {
 		return nil, fmt.Errorf("list transcripts: %w", err)
+	}
+	if includeSubs {
+		subs, err := filepath.Glob(filepath.Join(session.ProjectsDir(home), "*", "*", "subagents", "agent-*.jsonl"))
+		if err != nil {
+			return nil, fmt.Errorf("list subagent transcripts: %w", err)
+		}
+		paths = append(paths, subs...)
 	}
 	if codex {
 		more, err := filepath.Glob(filepath.Join(workerSessions(home), "*", "*", "*", "rollout-*.jsonl"))
@@ -136,10 +160,60 @@ func allSources(home string, since time.Time, project string, codex bool) ([]sou
 		if st.ModTime().Before(since) {
 			continue
 		}
-		out = append(out, newSource(p))
+		src := newSource(p)
+		if strings.Contains(p, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
+			src, err = subSource(p)
+			if err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, src)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })
 	return out, nil
+}
+
+func subSources(parent string) ([]source, error) {
+	dir := filepath.Join(strings.TrimSuffix(parent, filepath.Ext(parent)), "subagents")
+	paths, err := filepath.Glob(filepath.Join(dir, "agent-*.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("list subagents for %s: %w", parent, err)
+	}
+	out := make([]source, 0, len(paths))
+	for _, path := range paths {
+		src, err := subSource(path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, src)
+	}
+	return out, nil
+}
+
+func subSource(path string) (source, error) {
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "agent-") {
+		return source{}, fmt.Errorf("invalid subagent transcript name %s", path)
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(base, "agent-"), ".jsonl")
+	parent := filepath.Base(filepath.Dir(filepath.Dir(path)))
+	parentID := newSource(parent + ".jsonl").id
+	if len(id) == 0 {
+		return source{}, fmt.Errorf("invalid subagent transcript name %s", path)
+	}
+	src := source{path: path, id: id[:min(8, len(id))], parentID: parentID}
+	data, err := os.ReadFile(strings.TrimSuffix(path, ".jsonl") + ".meta.json")
+	if err == nil {
+		var meta struct {
+			Description string `json:"description"`
+		}
+		if json.Unmarshal(data, &meta) == nil {
+			src.description = meta.Description
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return source{}, fmt.Errorf("subagent metadata %s: %w", path, err)
+	}
+	return src, nil
 }
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)

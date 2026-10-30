@@ -123,6 +123,43 @@ func TestAllSinceAndNone(t *testing.T) {
 	}
 }
 
+func TestSubagentsAndRawFilter(t *testing.T) {
+	e := fakeHome(t)
+	parentPath := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", sessionID+".jsonl")
+	subDir := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "subagents")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "abcdef0123456789"
+	subPath := filepath.Join(subDir, "agent-"+agentID+".jsonl")
+	row := `{"type":"user","isSidechain":true,"agentId":"abcdef0123456789","sessionId":"` + sessionID + `","timestamp":"2026-10-25T11:59:00Z","message":{"role":"user","content":"sub marker"}}` + "\n"
+	row += `{"type":"user","agentId":"abcdef0123456789","sessionId":"` + sessionID + `","timestamp":"2026-10-25T11:59:01Z","message":{"role":"user","content":"sub marker ordinary"}}` + "\n"
+	if err := os.WriteFile(subPath, []byte(row), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "agent-"+agentID+".meta.json"), []byte(`{"description":"Synthetic work"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, _ := runTL(t, e, "--all", "--role", "all", "--since", "1h")
+	if code != 0 || !strings.Contains(out, "== abcdef01 sub of 1a2b3c4d main \"Synthetic work\"") || !strings.Contains(out, "abcdef01:1 ") {
+		t.Fatalf("--all: code %d:\n%s", code, out)
+	}
+	code, out, _ = runTL(t, e, "--all", "--no-subagents", "--role", "all", "--since", "1h")
+	if strings.Contains(out, "sub marker") {
+		t.Fatalf("--no-subagents: code %d:\n%s", code, out)
+	}
+	for _, args := range [][]string{{"abcdef01:1"}, {"abcdef01", "--role", "all"}, {"1a2b3c4d", "--subagents", "--role", "all"}} {
+		code, out, _ = runTL(t, e, args...)
+		if code != 0 || !strings.Contains(out, "sub marker") {
+			t.Errorf("%q: code %d:\n%s", args, code, out)
+		}
+	}
+	code, out, _ = runTL(t, e, "--all", "--role", "all", "--since", "1h", "--raw", `"isSidechain":true`, "--grep", "sub marker")
+	if code != 0 || !strings.Contains(out, "abcdef01:1 ") || strings.Contains(out, "abcdef01:2 ") {
+		t.Errorf("--raw with --grep: code %d:\n%s", code, out)
+	}
+}
+
 func TestRef(t *testing.T) {
 	e := fakeHome(t)
 	code, out, _ := runTL(t, e, "1a2b3c4d:12")
