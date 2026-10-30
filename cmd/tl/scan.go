@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aiseeq/akit/transcript"
 )
@@ -22,6 +23,7 @@ type hit struct {
 
 type result struct {
 	hits  []hit
+	waits []time.Duration   // --wait: ожидания вывода, сведённые по ходу чтения файлов
 	names map[string]string // id → имя сессии
 	files int
 	errs  []error // файлы, которые не прочитались: их события не вошли
@@ -86,11 +88,16 @@ func (f *filter) match(ev transcript.Event) bool {
 	return f.re == nil || f.re.MatchString(ev.Who+" "+ev.Shown())
 }
 
-// file читает один файл и отдаёт отобранные события с окрестностью -C.
-func (f *filter) file(src source) ([]hit, transcript.Meta, error) {
+// file читает один файл и отдаёт отобранные события с окрестностью -C; в режиме --wait вместо событий — ожидания
+// вывода: события в памяти не копятся.
+func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, error) {
 	var keep func([]byte) bool
 	if f.literal != nil || f.rawRE != nil {
 		keep = f.keepRaw
+	}
+	var wt *waitTracker
+	if f.opts.waitProg != "" {
+		wt = newWaitTracker(f.opts)
 	}
 	var (
 		out    []hit
@@ -99,6 +106,10 @@ func (f *filter) file(src source) ([]hit, transcript.Meta, error) {
 	)
 	meta, err := transcript.Read(src.path, keep, func(ev transcript.Event) {
 		if !f.inWindow(ev) {
+			return
+		}
+		if wt != nil {
+			wt.event(ev)
 			return
 		}
 		switch {
@@ -119,10 +130,14 @@ func (f *filter) file(src source) ([]hit, transcript.Meta, error) {
 			before = append(before, ev)
 		}
 	})
-	if err != nil {
-		return out, meta, fmt.Errorf("read %s: %w", src.path, err)
+	var waits []time.Duration
+	if wt != nil {
+		waits = wt.waits
 	}
-	return out, meta, nil
+	if err != nil {
+		return out, waits, meta, fmt.Errorf("read %s: %w", src.path, err)
+	}
+	return out, waits, meta, nil
 }
 
 // scan читает файлы параллельно; ошибка одного файла не мешает остальным и уходит в итог (result.errs).
@@ -140,9 +155,10 @@ func scan(sources []source, opts options) (result, error) {
 	for range max(1, runtime.NumCPU()/2) {
 		wg.Go(func() {
 			for src := range jobs {
-				hits, meta, err := f.file(src)
+				hits, waits, meta, err := f.file(src)
 				mu.Lock()
 				res.hits = append(res.hits, hits...)
+				res.waits = append(res.waits, waits...)
 				res.bad += meta.Bad
 				if meta.FirstBad != nil && res.firstBad == nil {
 					res.firstBad = fmt.Errorf("%s %w", src.id, meta.FirstBad)

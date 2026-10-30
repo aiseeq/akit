@@ -26,38 +26,47 @@ type waitCall struct {
 	count   int
 }
 
-func reportWait(res result, opts options, stdout, stderr io.Writer) int {
-	calls := make(map[string]waitCall)
-	waits := make([]time.Duration, 0)
-	for i := range res.hits {
-		h := &res.hits[i]
-		ev := h.ev
-		key := h.src.path + "\x00" + ev.CallID
-		switch ev.Role {
-		case transcript.Cmd:
-			command, bg := waitCommand(ev)
-			if command != "" {
-				call := calls[key]
-				if call.count == 0 {
-					call.command, call.at = command, ev.Time
-				}
-				call.count++
-				call.bg = call.bg || bg
-				calls[key] = call
+// waitTracker сводит вызов команды с его выводом по ходу чтения одного файла: в памяти только вызовы, ждущие
+// вывода, и найденные ожидания.
+type waitTracker struct {
+	prog, sub string
+	calls     map[string]waitCall // CallID → вызов
+	waits     []time.Duration
+}
+
+func newWaitTracker(opts options) *waitTracker {
+	return &waitTracker{prog: opts.waitProg, sub: opts.waitSub, calls: map[string]waitCall{}}
+}
+
+func (t *waitTracker) event(ev transcript.Event) {
+	switch ev.Role {
+	case transcript.Cmd:
+		command, bg := waitCommand(ev)
+		if command != "" {
+			call := t.calls[ev.CallID]
+			if call.count == 0 {
+				call.command, call.at = command, ev.Time
 			}
-		case transcript.Out:
-			call, ok := calls[key]
-			if !ok || call.count != 1 || call.bg {
-				continue
-			}
-			if matchedWaitCommand(call.command, opts.waitProg, opts.waitSub) {
-				if d := ev.Time.Sub(call.at); d >= 0 {
-					waits = append(waits, d)
-				}
-			}
-			delete(calls, key)
+			call.count++
+			call.bg = call.bg || bg
+			t.calls[ev.CallID] = call
 		}
+	case transcript.Out:
+		call, ok := t.calls[ev.CallID]
+		if !ok || call.count != 1 || call.bg {
+			return
+		}
+		if matchedWaitCommand(call.command, t.prog, t.sub) {
+			if d := ev.Time.Sub(call.at); d >= 0 {
+				t.waits = append(t.waits, d)
+			}
+		}
+		delete(t.calls, ev.CallID)
 	}
+}
+
+func reportWait(res result, opts options, stdout, stderr io.Writer) int {
+	waits := res.waits
 	if len(waits) < 20 {
 		fmt.Fprintf(stderr, "tl: %d wait event(s); need at least 20\n", len(waits))
 		return 3
