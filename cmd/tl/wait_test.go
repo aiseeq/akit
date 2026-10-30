@@ -112,6 +112,7 @@ func TestWaitCodexAndInsufficientData(t *testing.T) {
 	}{
 		{events: 2, q: "50", code: 3, errOut: "2 wait event(s); --q 50 needs at least 3"},
 		{events: 3, q: "50", code: 0, out: "1000\n"},
+		{events: 3, q: "51", code: 3, errOut: "3 wait event(s); --q 51 needs at least 20"},
 		{events: 3, q: "95", code: 3, errOut: "3 wait event(s); --q 95 needs at least 20"},
 		{events: 19, q: "50", code: 0, out: "1000\n"},
 		{events: 19, q: "95", code: 3, errOut: "19 wait event(s); --q 95 needs at least 20"},
