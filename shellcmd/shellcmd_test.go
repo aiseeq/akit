@@ -308,6 +308,35 @@ func TestOffset(t *testing.T) {
 	}
 }
 
+func TestVariableArgv0Split(t *testing.T) {
+	tests := []struct {
+		command, name string
+		args          []string
+		via           []string
+		offset        int
+	}{
+		{`P="pgrep -f"; $P x`, "pgrep", []string{"-f", "x"}, nil, -1},
+		{"P='pgrep\t-f'; ${P} x", "pgrep", []string{"-f", "x"}, nil, -1},
+		{`P="pgrep -f"; "$P" x`, "pgrep -f", []string{"x"}, nil, -1},
+		{`P="timeout 5"; $P pgrep x`, "pgrep", []string{"x"}, []string{"timeout"}, 18},
+		{`C="curl -u $U:$K"; $C "$url"`, "curl", []string{"-u", "$U:$K", `"$url"`}, nil, -1},
+		{`R="$HOME/bin/tool"; $R x`, "tool", []string{"x"}, nil, -1},
+	}
+	for _, tt := range tests {
+		calls, err := Calls(tt.command)
+		if err != nil || len(calls) == 0 {
+			t.Fatalf("%q: Calls() = %#v, %v", tt.command, calls, err)
+		}
+		got := calls[len(calls)-1]
+		if got.Name != tt.name || !reflect.DeepEqual(got.Args, tt.args) || !reflect.DeepEqual(got.Via, tt.via) {
+			t.Errorf("%q: call = %q %q via %q; want %q %q via %q", tt.command, got.Name, got.Args, got.Via, tt.name, tt.args, tt.via)
+		}
+		if got.Offset != tt.offset {
+			t.Errorf("%q: Offset = %d; want %d", tt.command, got.Offset, tt.offset)
+		}
+	}
+}
+
 func TestCallsExternalParseErrorReturnsNil(t *testing.T) {
 	calls, err := Calls("echo before; if")
 	if err == nil || calls != nil {

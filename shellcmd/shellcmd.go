@@ -241,7 +241,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		collectAssignments(call, w.src, w.vars)
 		return
 	}
-	args := words(call.Args, w.src, w.vars)
+	args, split := words(call.Args, w.src, w.vars)
 	start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
 	if !validSpan(w.src, start, end) {
 		w.parseErr = fmt.Errorf("shellcmd: invalid source span for command")
@@ -251,7 +251,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	if w.info.timedCalls[call] {
 		via = append(via, "time")
 	}
-	ws := cmdWords(call.Args, w.src)
+	ws := splitWords(cmdWords(call.Args, w.src), split)
 	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call]}, words: ws}
 	if err := emit(c, w.lineBase, w.vars, w.calls); err != nil {
 		var nested *NestedError
@@ -344,7 +344,7 @@ func collectAssignments(call *syntax.CallExpr, src string, vars map[string]strin
 		}
 		value, literal := wordValue(assign.Value)
 		if !literal {
-			value = nodeText(assign.Value, src)
+			value = unquotedText(assign.Value, src)
 		}
 		vars[assign.Name.Value] = value
 	}
@@ -404,7 +404,7 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false
 	}
-	args := words(call.Args, src, vars)
+	args, _ := words(call.Args, src, vars)
 	name, args := commandName(args[0]), args[1:]
 	var via []string
 	for {
@@ -729,8 +729,10 @@ func unescapeBare(s string) string {
 }
 
 // words — значения слов команды; у слов с подстановками — их текст. argv0 из переменной, присвоенной
-// раньше литералом, — её значение; другой argv0 с подстановками — текст без кавычек ("$HOME/bin/x" → $HOME/bin/x).
-func words(ws []*syntax.Word, src string, vars map[string]string) []string {
+// раньше литералом, — её значение, без кавычек ($P) делённое на слова по пробелам, табам и переводам
+// строк, как делит оболочка; другой argv0 с подстановками — текст без кавычек ("$HOME/bin/x" → $HOME/bin/x).
+// Второй результат — сколько слов добавило деление argv0.
+func words(ws []*syntax.Word, src string, vars map[string]string) ([]string, int) {
 	result := make([]string, len(ws))
 	for i, w := range ws {
 		if value, ok := wordValue(w); ok {
@@ -742,11 +744,32 @@ func words(ws []*syntax.Word, src string, vars map[string]string) []string {
 	if len(ws) > 0 {
 		if name, ok := paramName(ws[0]); ok && vars[name] != "" {
 			result[0] = vars[name]
+			if _, quoted := ws[0].Parts[0].(*syntax.DblQuoted); !quoted {
+				if fields := strings.FieldsFunc(vars[name], isIFS); len(fields) > 1 {
+					return append(fields, result[1:]...), len(fields) - 1
+				}
+			}
 		} else if _, literal := wordValue(ws[0]); !literal {
 			result[0] = unquotedText(ws[0], src)
 		}
 	}
-	return result
+	return result, 0
+}
+
+func isIFS(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\n'
+}
+
+// splitWords вставляет после argv0 слова, добавленные делением его значения: их нет в исходном тексте.
+func splitWords(ws []word, split int) []word {
+	if split == 0 {
+		return ws
+	}
+	result := append([]word{ws[0]}, make([]word, split)...)
+	for i := 1; i <= split; i++ {
+		result[i] = word{offset: -1}
+	}
+	return append(result, ws[1:]...)
 }
 
 // unquotedText — текст слова без кавычек; подстановки остаются текстом.
