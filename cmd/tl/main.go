@@ -119,23 +119,10 @@ func parseArgs(args []string, now time.Time) (options, error) {
 			opts.args = append(opts.args, a)
 			continue
 		}
-		switch name {
-		case "-h", "--help":
+		if name == "-h" || name == "--help" {
 			return opts, errHelp
-		case "--all":
-			opts.all = true
-			continue
-		case "--codex":
-			opts.codex = true
-			continue
-		case "--no-subagents":
-			opts.noSubagents = true
-			continue
-		case "--subagents":
-			opts.subagents = true
-			continue
-		case "--usage":
-			opts.usage = true
+		}
+		if setSwitch(&opts, name) {
 			continue
 		}
 		if !hasVal {
@@ -154,16 +141,40 @@ func parseArgs(args []string, now time.Time) (options, error) {
 			return opts, err
 		}
 	}
+	return opts, checkCombos(opts)
+}
+
+// setSwitch ставит флаг без значения; false — это не переключатель.
+func setSwitch(opts *options, name string) bool {
+	switch name {
+	case "--all":
+		opts.all = true
+	case "--codex":
+		opts.codex = true
+	case "--no-subagents":
+		opts.noSubagents = true
+	case "--subagents":
+		opts.subagents = true
+	case "--usage":
+		opts.usage = true
+	default:
+		return false
+	}
+	return true
+}
+
+// checkCombos отвергает флаги, которые не работают друг без друга или вместе.
+func checkCombos(opts options) error {
 	if opts.context > 0 && opts.grep == "" {
-		return opts, errors.New("-C works with --grep")
+		return errors.New("-C works with --grep")
 	}
 	if (opts.codex || opts.project != "" || opts.noSubagents) && !opts.all {
-		return opts, errors.New("--codex, --project and --no-subagents work with --all")
+		return errors.New("--codex, --project and --no-subagents work with --all")
 	}
 	if opts.subagents && opts.all {
-		return opts, errors.New("--subagents works with SESSION, not --all")
+		return errors.New("--subagents works with SESSION, not --all")
 	}
-	return opts, nil
+	return nil
 }
 
 func setFlag(opts *options, name, val string, now time.Time) error {
