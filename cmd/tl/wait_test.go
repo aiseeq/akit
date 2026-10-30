@@ -91,18 +91,37 @@ func TestWaitClaudePercentilesAndFiltering(t *testing.T) {
 	}
 }
 
-func TestWaitCodexAndInsufficientData(t *testing.T) {
-	e := fakeHome(t)
-	var rows []string
-	rows = append(rows, `{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`)
-	for i := 1; i <= 19; i++ {
-		rows = append(rows, fmt.Sprintf(`{"timestamp":"2026-10-25T10:00:%02dZ","type":"response_item","payload":{"type":"function_call","call_id":"c%d","name":"exec_command","arguments":%q}}`, i, i, fmt.Sprintf(`{"cmd":"tk done item | head"}`)))
+// codexWaitRows — rollout codex с n вызовами `tk done`, каждый ждёт вывода 1 с.
+func codexWaitRows(n int) string {
+	rows := []string{`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`}
+	for i := 1; i <= n; i++ {
+		rows = append(rows, fmt.Sprintf(`{"timestamp":"2026-10-25T10:00:%02dZ","type":"response_item","payload":{"type":"function_call","call_id":"c%d","name":"exec_command","arguments":%q}}`, i, i, `{"cmd":"tk done item | head"}`))
 		rows = append(rows, fmt.Sprintf(`{"timestamp":"2026-10-25T10:00:%02dZ","type":"response_item","payload":{"type":"function_call_output","call_id":"c%d","output":"ok"}}`, i+1, i))
 	}
-	path := writeWaitTranscript(t, e, "rollout-synthetic.jsonl", strings.Join(rows, "\n")+"\n")
-	code, out, errOut := runTL(t, e, "--wait", "tk done", path)
-	if code != 3 || out != "" || !strings.Contains(errOut, "19 wait event") {
-		t.Errorf("code=%d out=%q stderr=%q", code, out, errOut)
+	return strings.Join(rows, "\n") + "\n"
+}
+
+func TestWaitCodexAndInsufficientData(t *testing.T) {
+	e := fakeHome(t)
+	for _, tc := range []struct {
+		events int
+		q      string
+		code   int
+		out    string
+		errOut string
+	}{
+		{events: 2, q: "50", code: 3, errOut: "2 wait event(s); --q 50 needs at least 3"},
+		{events: 3, q: "50", code: 0, out: "1000\n"},
+		{events: 3, q: "95", code: 3, errOut: "3 wait event(s); --q 95 needs at least 20"},
+		{events: 19, q: "50", code: 0, out: "1000\n"},
+		{events: 19, q: "95", code: 3, errOut: "19 wait event(s); --q 95 needs at least 20"},
+		{events: 20, q: "95", code: 0, out: "1000\n"},
+	} {
+		path := writeWaitTranscript(t, e, fmt.Sprintf("rollout-synthetic-%d.jsonl", tc.events), codexWaitRows(tc.events))
+		code, out, errOut := runTL(t, e, "--wait", "tk done", "--q", tc.q, path)
+		if code != tc.code || out != tc.out || !strings.Contains(errOut, tc.errOut) {
+			t.Errorf("events=%d q=%s: code=%d out=%q stderr=%q", tc.events, tc.q, code, out, errOut)
+		}
 	}
 }
 

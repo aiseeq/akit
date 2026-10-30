@@ -65,10 +65,19 @@ func (t *waitTracker) event(ev transcript.Event) {
 	}
 }
 
+// minWaitEvents — сколько событий нужно перцентилю: хвост (q выше 50) по меньшему числу событий не перцентиль,
+// а медиане хватает трёх.
+func minWaitEvents(q int) int {
+	if q <= 50 {
+		return 3
+	}
+	return 20
+}
+
 func reportWait(res result, opts options, stdout, stderr io.Writer) int {
 	waits := res.waits
-	if len(waits) < 20 {
-		fmt.Fprintf(stderr, "tl: %d wait event(s); need at least 20\n", len(waits))
+	if need := minWaitEvents(opts.q); len(waits) < need {
+		fmt.Fprintf(stderr, "tl: %d wait event(s); --q %d needs at least %d\n", len(waits), opts.q, need)
 		return 3
 	}
 	slices.Sort(waits)

@@ -48,7 +48,8 @@ path (Claude Code or codex rollout).
                 row per session and the total (--role defaults to all)
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
-  --q N         percentile for --wait, from 1 to 99 (default 50)
+  --q N         percentile for --wait, from 1 to 99 (default 50); needs at least
+                3 events for --q 50 and below, 20 above
 
 Roles: user — typed by the human; ask — the human's answer in a question
 dialog; peer — a message from another session; agent — the agent's text;

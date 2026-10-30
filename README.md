@@ -177,8 +177,9 @@ all flags.
 
 `--wait PROG [SUB]` prints the nearest-rank percentile of milliseconds from a shell command call to
 its output; calls without output, background Bash calls, and commands that also run unrelated programs
-are excluded. The default percentile is 50; `--q` accepts 1–99. Fewer than 20 matching events returns
-exit 3 with the count in stderr and no stdout.
+are excluded. The default percentile is 50; `--q` accepts 1–99. Fewer matching events than the
+percentile needs (3 for `--q` 50 and below, 20 above) returns exit 3 with the count in stderr and no
+stdout.
 
 ## user-word
 
