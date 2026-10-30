@@ -58,10 +58,10 @@ type Load struct {
 	Runnable       int           // готовых к работе задач без читающего процесса: procs_running из /proc/stat − 1
 	Threads        int           // потоков машины: строки cpuN в /proc/stat
 	CPUSome        float64       // % последних 10 с, когда хоть одна задача ждала процессор (some avg10), для справки
-	IOFull         float64       // % времени, когда все задачи ждали диск; источник диска — окно 5 с, fallback — с прошлого Check
+	IOFull         float64       // % IOWindow, когда все задачи ждали диск, до 0,1; при источнике — его окно 5 с, без него — дельта total PSI io за окно свопа (fresh) или с прошлого Check
 	IOWindow       time.Duration // окно замера IOFull
-	Disk           *DiskNow
-	DiskFault      error
+	Disk           *DiskNow      // снимок источника состояния диска; nil — источника нет или он сбоит
+	DiskFault      error         // почему источника нет или чем он сбоит; сентинел той же ошибки — в Verdict.Skipped
 	ioFullExact    float64
 	hasIOFullExact bool
 	MemSome        float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)

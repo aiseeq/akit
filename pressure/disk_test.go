@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -236,16 +237,54 @@ func TestMeterSilentSourceDeadline(t *testing.T) {
 		"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1\n",
 		"pressure/memory": "some avg10=0 avg60=0 avg300=0 total=1\n",
 	})
-	m.sleep = func(context.Context, time.Duration) error { return nil }
+	writeProc(t, m.procRoot, "pressure/io", "full avg10=0.5 avg60=12.5 avg300=1 total=1\n")
 	m.disk = socket(t, func(conn net.Conn) { defer conn.Close(); _, _ = io.Copy(io.Discard, conn) })
 	started := time.Now()
-	v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 9.6}, "", true)
+	// Окно свопа подменённый sleep проходит мгновенно и двигает total на 96 мс: откат даёт 9.6% за 1 с.
+	v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 9.6, SwapWindow: time.Second}, "", true)
 	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsError(v.Skipped, ErrIOSourceFailed) || elapsed > 300*time.Millisecond {
-		t.Errorf("таймаут: elapsed=%s skipped=%v", elapsed, v.Skipped)
+	if !slices.Contains(v.Skipped, ErrIOSourceFailed) || elapsed > 300*time.Millisecond {
+		t.Errorf("таймаут: elapsed=%s skipped=%v (нужно само значение ErrIOSourceFailed)", elapsed, v.Skipped)
+	}
+	if v.Load.Disk != nil || v.Load.IOFull != 9.6 || v.Load.IOWindow != time.Second || v.Measure != IO {
+		t.Errorf("откат при молчащем источнике = %+v", v)
+	}
+}
+
+func TestMeterDiskOpenFromSource(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		limit float64
+		want  string
+	}{
+		{"freeze busy", 9.6, IO},
+		{"disk checks off", 100, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, now := fakeProc(t, map[string]string{
+				"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1\n",
+				"pressure/memory": "some avg10=0 avg60=0 avg300=0 total=1\n",
+				"vmstat":          "pswpin 1\npswpout 1\n",
+			})
+			m.disk = socket(t, func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = bufio.NewReader(conn).ReadBytes('\n')
+				_, _ = fmt.Fprintf(conn, `{"v":1,"at":%q,"5s":{"io_full_ms":10},"open":{"open":true,"ms":340}}`+"\n", now.Format(time.RFC3339Nano))
+			})
+			v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: tc.limit}, "", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.Load.Disk == nil || !v.Load.Disk.Open || v.Load.Disk.OpenMs != 340 || v.Measure != tc.want {
+				t.Fatalf("Check = %+v, Disk %+v", v, v.Load.Disk)
+			}
+			if tc.want == IO && v.Why() != "disk freeze in progress for 340 ms" {
+				t.Errorf("Why = %q", v.Why())
+			}
+		})
 	}
 }
 

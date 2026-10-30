@@ -25,9 +25,10 @@ overload.
 
 The optional disk state source listens on the Unix socket `$XDG_RUNTIME_DIR/io-state.sock`. Each
 connection carries one JSON request line and returns one JSON response line. The request is
-`{"v":1,"q":"now","kind":"…"}`; `kind` is omitted when empty.
+`{"v":1,"q":"now","kind":"…"}`; `kind` is omitted when empty. Without `XDG_RUNTIME_DIR` there is no
+source.
 
-The client reads `v`, `error`, `at`, `1s`, `5s`, `30s`, `nproc`, `open`, and `profile`. Each window
+The client reads `v`, `error`, `at` (RFC 3339 with nanoseconds), `1s`, `5s`, `30s`, `nproc`, `open`, and `profile`. Each window
 contains `steps`, `io_full_ms`, `stall_ms`, `write_bps`, `read_bps`, `w_await_ms`, `inflight_max`,
 `cpu_some_ms`, and `runnable_max`. `open` contains `open` and `ms`. `profile` is passed through
 byte for byte without interpretation. Extra response fields are ignored.
