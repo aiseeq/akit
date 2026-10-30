@@ -8,10 +8,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/pressure"
 )
 
 func proc(t *testing.T, running string) string {
 	t.Helper()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	t.Setenv("XDG_STATE_HOME", t.TempDir()) // файл тихого режима — свой у теста, не настоящий машины
 	root := t.TempDir()
 	files := map[string]string{
@@ -66,10 +69,23 @@ func TestRun(t *testing.T) {
 
 func TestRunNoProc(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	var out bytes.Buffer
 	code := run(context.Background(), options{procRoot: t.TempDir()}, &out, &out)
 	if code != 0 || !strings.Contains(out.String(), "not checked: no /proc/stat") {
 		t.Errorf("без /proc: код %d, %q", code, out.String())
+	}
+}
+
+func TestLineIOWindow(t *testing.T) {
+	limits := pressure.Limits{MaxIOFull: 9.6}
+	withSource := line(pressure.Verdict{Load: pressure.Load{IOFull: 9.6, IOWindow: 5 * time.Second, Disk: &pressure.DiskNow{}}}, limits)
+	if !strings.Contains(withSource, "of 5s from the disk state source") {
+		t.Errorf("строка с источником = %q", withSource)
+	}
+	fallback := line(pressure.Verdict{Load: pressure.Load{IOFull: 9.6, IOWindow: time.Second, DiskFault: pressure.ErrNoIOSource}, Skipped: []error{pressure.ErrNoIOSource}}, limits)
+	if !strings.Contains(fallback, "of 1s") || !strings.Contains(fallback, "no disk state source") {
+		t.Errorf("строка fallback = %q", fallback)
 	}
 }
 

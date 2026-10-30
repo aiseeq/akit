@@ -108,7 +108,7 @@ func TestMechanisms(t *testing.T) {
 	// имя совпало — выше всех, хотя строк меньше
 	card("tool-draft.md", "актуальна", "черновики")
 	// два разных слова и ручная часть — её строка первой
-	write(t, filepath.Join(dir, "project-aguard.md"), "# aguard\nСтатус: актуальна\nЧто: страж\nчерновик проверка\n"+
+	write(t, filepath.Join(dir, "project-monitor.md"), "# monitor\nСтатус: актуальна\nЧто: страж\nчерновик проверка\n"+
 		"поле ввода\n## Важно знать\ninputChecks: черновик в поле ввода\n")
 	card("cmd-old.md", "УСТАРЕЛА - источник новее", "черновик")
 	card("cmd-none.md", "актуальна", "другое")
@@ -116,10 +116,10 @@ func TestMechanisms(t *testing.T) {
 	got := sectionOf(out, "механизмы")[1:] // первая строка — нет inventory
 	want := []string{
 		"tool-draft.md:1:tool-draft | Что: черновики",
-		"project-aguard.md:1:aguard | Что: страж",
-		"project-aguard.md:7:inputChecks: черновик в поле ввода",
-		"project-aguard.md:4:черновик проверка",
-		"project-aguard.md:5:поле ввода",
+		"project-monitor.md:1:monitor | Что: страж",
+		"project-monitor.md:7:inputChecks: черновик в поле ввода",
+		"project-monitor.md:4:черновик проверка",
+		"project-monitor.md:5:поле ввода",
 		"cmd-old.md:1:cmd-old | Что: черновик",
 		"  Статус: УСТАРЕЛА - источник новее",
 	}

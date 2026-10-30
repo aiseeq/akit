@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-// Правило «машина занята» — одно на всех: graft пускает по нему тяжёлые задачи, aguard следит, команда
+// Правило «машина занята» — одно на всех: graft пускает по нему тяжёлые задачи, команда
 // busy показывает агентам. Процессор — по числу задач, готовых к работе прямо сейчас, одним чтением:
 // нужно не точное число, а актуальное, а минутный load запаздывает. Обмен со свопом сам по себе
 // не занятость: он идёт и при запасе памяти, а вредит, когда задачи ждут память, — поэтому своп
@@ -34,12 +35,12 @@ var (
 	ErrNoVMStat      = errors.New("no /proc/vmstat to count swapping from")
 )
 
-// Limits — пороги правила. Runnable 0 — число потоков машины, у которой procRoot: так машины с разным
+// Limits — пороги правила. MaxIOFull 100 и выше выключает проверку диска. Runnable 0 — число потоков машины, у которой procRoot: так машины с разным
 // числом потоков судятся одинаково. MaxMemSome 0 — DefaultMemSome: так потребитель, не знающий этого
 // порога, получает правило с ним.
 type Limits struct {
 	Runnable   float64       // занята, когда готовых к работе задач столько или больше
-	MaxIOFull  float64       // занята выше: % последней минуты, когда все задачи ждали диск (full avg60)
+	MaxIOFull  float64       // занята на пороге: % времени, когда все задачи ждали диск за окно 5 с
 	MaxMemSome float64       // память: % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	MaxSwapKBs float64       // и при этом обмен со свопом выше, KB/s; один обмен, без давления, — не занята
 	SwapWindow time.Duration // окно замера обмена при свежем замере
@@ -49,17 +50,22 @@ type Limits struct {
 // выше 10 — в 0,4% замеров, все — в эпизодах нехватки памяти; обычный фон — доли процента.
 const DefaultMemSome = 10
 
-// DefaultLimits — пороги graft по умолчанию (load.max_io_full 10, load.max_swap_kbs 1024, окно 1 с).
-var DefaultLimits = Limits{MaxIOFull: 10, MaxMemSome: DefaultMemSome, MaxSwapKBs: 1024, SwapWindow: time.Second}
+// DefaultLimits — пороги правила по умолчанию: IO 9,6%, память 10%, своп 1024 KB/s за 1 с.
+var DefaultLimits = Limits{MaxIOFull: 9.6, MaxMemSome: DefaultMemSome, MaxSwapKBs: 1024, SwapWindow: time.Second}
 
 // Load — замеры машины. Непрочитанная мера — 0, её сентинел в Verdict.Skipped.
 type Load struct {
-	Runnable int     // готовых к работе задач без читающего процесса: procs_running из /proc/stat − 1
-	Threads  int     // потоков машины: строки cpuN в /proc/stat
-	CPUSome  float64 // % последних 10 с, когда хоть одна задача ждала процессор (some avg10), для справки
-	IOFull   float64 // % последней минуты, когда все задачи ждали диск (full avg60)
-	MemSome  float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
-	SwapKBs  float64 // обмен со свопом, KB/s
+	Runnable       int           // готовых к работе задач без читающего процесса: procs_running из /proc/stat − 1
+	Threads        int           // потоков машины: строки cpuN в /proc/stat
+	CPUSome        float64       // % последних 10 с, когда хоть одна задача ждала процессор (some avg10), для справки
+	IOFull         float64       // % времени, когда все задачи ждали диск; источник диска — окно 5 с, fallback — с прошлого Check
+	IOWindow       time.Duration // окно замера IOFull
+	Disk           *DiskNow
+	DiskFault      error
+	ioFullExact    float64
+	hasIOFullExact bool
+	MemSome        float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
+	SwapKBs        float64 // обмен со свопом, KB/s
 	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
 	QuietUntil time.Time
 }
@@ -70,7 +76,7 @@ type Verdict struct {
 	Value   float64
 	Limit   float64
 	Load    Load
-	Skipped []error // меры, которых нет в системе: ErrNoRunnable, ErrNoIOPressure, ErrNoMemPressure, ErrNoVMStat
+	Skipped []error // отсутствующие меры и источник состояния диска
 }
 
 // Busy — занята ли машина.
@@ -82,7 +88,10 @@ func (v Verdict) Why() string {
 	case CPU:
 		return fmt.Sprintf("runnable %.0f is at or above %v", v.Value, v.Limit)
 	case IO:
-		return fmt.Sprintf("IO pressure %.1f%% is above %v%%", v.Value, v.Limit)
+		if v.Load.Disk != nil && v.Load.Disk.Open {
+			return fmt.Sprintf("disk freeze in progress for %d ms", v.Load.Disk.OpenMs)
+		}
+		return fmt.Sprintf("IO pressure %.1f%% of the last %s is at or above %v%%", v.Value, v.Load.IOWindow.String(), v.Limit)
 	case Swap:
 		return fmt.Sprintf("memory pressure %.1f%% is above %v%% while swapping %.0f KB/s", v.Value, v.Limit, v.Load.SwapKBs)
 	case Quiet:
@@ -105,6 +114,10 @@ func quietClock(until, now time.Time) string {
 // подтверждает его; у Quiet их нет, срок — в Load.QuietUntil.
 func Rule(m Load, l Limits, skipped []error) Verdict {
 	v := Verdict{Load: m, Skipped: skipped}
+	maxIOFull := l.MaxIOFull
+	if maxIOFull <= 0 {
+		maxIOFull = DefaultLimits.MaxIOFull
+	}
 	runnable := l.Runnable
 	if runnable <= 0 {
 		runnable = float64(m.Threads)
@@ -113,14 +126,19 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 	if memSome <= 0 {
 		memSome = DefaultMemSome
 	}
+	ioFull := m.IOFull
+	if m.hasIOFullExact {
+		ioFull = m.ioFullExact
+	}
 	memory := !skippedAny(skipped, ErrNoMemPressure) && !skippedAny(skipped, ErrNoVMStat)
 	switch {
 	case !m.QuietUntil.IsZero():
 		v.Measure = Quiet
 	case !skippedAny(skipped, ErrNoRunnable) && runnable > 0 && float64(m.Runnable) >= runnable:
 		v.Measure, v.Value, v.Limit = CPU, float64(m.Runnable), runnable
-	case !skippedAny(skipped, ErrNoIOPressure) && m.IOFull > l.MaxIOFull:
-		v.Measure, v.Value, v.Limit = IO, m.IOFull, l.MaxIOFull
+	case maxIOFull < 100 && (m.Disk != nil || !skippedAny(skipped, ErrNoIOPressure)) &&
+		((m.Disk != nil && m.Disk.Open) || ioFull >= maxIOFull):
+		v.Measure, v.Value, v.Limit = IO, m.IOFull, maxIOFull
 	case memory && m.MemSome > memSome && m.SwapKBs > l.MaxSwapKBs:
 		v.Measure, v.Value, v.Limit = Swap, m.MemSome, memSome
 	}
@@ -142,6 +160,10 @@ type Meter struct {
 	quiet    string // файл срока тихого режима; пусто — QuietPath
 	pages    int64
 	at       time.Time
+	ioTotal  int64
+	ioAt     time.Time
+	ioValid  bool
+	disk     string
 	now      func() time.Time
 	sleep    func(context.Context, time.Duration) error
 }
@@ -155,7 +177,7 @@ func NewMeter(procRoot string) *Meter {
 // иначе — с прошлого Check, а у первого — тоже за окно. Файл тихого режима читается первым, затем
 // меры из procRoot: и в тихом режиме вердикт несёт все замеры. Ошибка — без вердикта: файл тихого
 // режима не читается или не разбирается, мера есть, но не читается.
-func (m *Meter) Check(ctx context.Context, l Limits, fresh bool) (Verdict, error) {
+func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (Verdict, error) {
 	var load Load
 	var skipped []error
 	quiet := m.quiet
@@ -186,14 +208,6 @@ func (m *Meter) Check(ctx context.Context, l Limits, fresh bool) (Verdict, error
 			load.Runnable, load.Threads, err = ParseStat(string(stat))
 			return err
 		}),
-		measure(ErrNoIOPressure, func() error {
-			psi, err := m.read(filepath.Join("pressure", "io"), ErrNoIOPressure)
-			if err != nil {
-				return err
-			}
-			load.IOFull, err = psiField(string(psi), "full", "avg60")
-			return err
-		}),
 		measure(ErrNoMemPressure, func() error {
 			psi, err := m.read(filepath.Join("pressure", "memory"), ErrNoMemPressure)
 			if err != nil {
@@ -212,18 +226,84 @@ func (m *Meter) Check(ctx context.Context, l Limits, fresh bool) (Verdict, error
 			return Verdict{}, fmt.Errorf("CPU pressure: %w", err)
 		}
 	}
-	if err := measure(ErrNoVMStat, func() (err error) {
-		load.SwapKBs, err = m.swapping(ctx, l.SwapWindow, fresh)
-		return err
-	}); err != nil {
+	if err := m.measureSwapAndIO(ctx, l, fresh, &load, &skipped); err != nil {
 		return Verdict{}, err
+	}
+	load.Disk, load.DiskFault = readDisk(ctx, m.socketPath(), kind, m.now())
+	if load.Disk != nil {
+		load.ioFullExact = load.Disk.Five.IOFullMS / 50
+		load.IOFull, load.IOWindow = math.Round(load.ioFullExact*10)/10, 5*time.Second
+		load.hasIOFullExact = true
+	} else {
+		if load.IOWindow == 0 {
+			load.IOWindow = time.Second
+		}
+		switch {
+		case errors.Is(load.DiskFault, ErrNoIOSource):
+			skipped = append(skipped, ErrNoIOSource)
+		case load.DiskFault != nil:
+			skipped = append(skipped, ErrIOSourceFailed)
+		}
 	}
 	return Rule(load, l, skipped), nil
 }
 
+func (m *Meter) measureSwapAndIO(ctx context.Context, l Limits, fresh bool, load *Load, skipped *[]error) error {
+	var ioStart int64
+	ioStartValid := m.ioValid
+	ioStartAt := m.ioAt
+	if fresh || m.at.IsZero() {
+		var err error
+		ioStart, ioStartValid, err = m.readIOTotal()
+		if err != nil {
+			return err
+		}
+		ioStartAt = m.now()
+	}
+	swap, err := m.swapping(ctx, l.SwapWindow, fresh)
+	if errors.Is(err, ErrNoVMStat) {
+		*skipped = append(*skipped, ErrNoVMStat)
+	} else if err != nil {
+		return err
+	} else {
+		load.SwapKBs = swap
+	}
+	ioEnd, ioEndValid, err := m.readIOTotal()
+	if err != nil {
+		return err
+	}
+	ioAt := m.now()
+	if ioEndValid {
+		baseAt, baseTotal, baseValid := m.ioAt, m.ioTotal, m.ioValid
+		if fresh || baseAt.IsZero() {
+			baseAt, baseTotal, baseValid = ioStartAt, ioStart, ioStartValid
+		}
+		if baseValid && !baseAt.IsZero() && ioAt.After(baseAt) {
+			load.IOWindow = ioAt.Sub(baseAt).Round(100 * time.Millisecond)
+			load.ioFullExact = float64(ioEnd-baseTotal) / ioAt.Sub(baseAt).Seconds() / 10000
+			load.IOFull = math.Round(load.ioFullExact*10) / 10
+			load.hasIOFullExact = true
+		} else if !baseValid {
+			*skipped = append(*skipped, ErrNoIOPressure)
+		}
+		m.ioTotal, m.ioAt, m.ioValid = ioEnd, ioAt, true
+	} else {
+		m.ioTotal, m.ioAt, m.ioValid = 0, ioAt, false
+		*skipped = append(*skipped, ErrNoIOPressure)
+	}
+	return nil
+}
+
 // Check — один свежий замер машины procRoot по правилу.
-func Check(ctx context.Context, procRoot string, l Limits) (Verdict, error) {
-	return NewMeter(procRoot).Check(ctx, l, true)
+func Check(ctx context.Context, procRoot string, l Limits, kind string) (Verdict, error) {
+	return NewMeter(procRoot).Check(ctx, l, kind, true)
+}
+
+func (m *Meter) socketPath() string {
+	if m.disk != "" {
+		return m.disk
+	}
+	return diskPath()
 }
 
 // read читает файл procRoot; файла нет — мера none.
@@ -235,25 +315,46 @@ func (m *Meter) read(name string, none error) ([]byte, error) {
 	return data, err
 }
 
-// swapping — обмен со свопом в KB/s: за окно, когда fresh или прошлого чтения нет, иначе с прошлого чтения.
+// swapping — обмен со свопом в KB/s за окно или с прошлого чтения.
 func (m *Meter) swapping(ctx context.Context, window time.Duration, fresh bool) (float64, error) {
-	if fresh || m.at.IsZero() {
-		if err := m.readSwap(); err != nil {
-			return 0, err
-		}
+	first := fresh || m.at.IsZero()
+	var before int64
+	var beforeAt time.Time
+	if !first {
+		before, beforeAt = m.pages, m.at
+	} else if err := m.readSwap(); err != nil && !errors.Is(err, ErrNoVMStat) {
+		return 0, err
+	} else if err == nil {
+		before, beforeAt = m.pages, m.at
+	}
+	if first {
 		if err := m.sleep(ctx, window); err != nil {
 			return 0, err
 		}
 	}
-	pages, at := m.pages, m.at
 	if err := m.readSwap(); err != nil {
 		return 0, err
 	}
-	elapsed := m.at.Sub(at).Seconds()
-	if elapsed <= 0 {
+	elapsed := m.at.Sub(beforeAt).Seconds()
+	if elapsed <= 0 || beforeAt.IsZero() {
 		return 0, nil
 	}
-	return float64(m.pages-pages) * float64(os.Getpagesize()) / 1024 / elapsed, nil
+	return float64(m.pages-before) * float64(os.Getpagesize()) / 1024 / elapsed, nil
+}
+
+func (m *Meter) readIOTotal() (int64, bool, error) {
+	data, err := m.read(filepath.Join("pressure", "io"), ErrNoIOPressure)
+	if errors.Is(err, ErrNoIOPressure) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("IO pressure: %w", err)
+	}
+	total, err := psiTotal(string(data), "full")
+	if err != nil {
+		return 0, false, fmt.Errorf("IO pressure: %w", err)
+	}
+	return total, true, nil
 }
 
 func (m *Meter) readSwap() error {
@@ -267,6 +368,20 @@ func (m *Meter) readSwap() error {
 	}
 	m.pages, m.at = pages, m.now()
 	return nil
+}
+
+func psiTotal(s, kind string) (int64, error) {
+	for line := range strings.SplitSeq(s, "\n") {
+		if !strings.HasPrefix(line, kind+" ") {
+			continue
+		}
+		for field := range strings.FieldsSeq(line) {
+			if value, ok := strings.CutPrefix(field, "total="); ok {
+				return strconv.ParseInt(value, 10, 64)
+			}
+		}
+	}
+	return 0, fmt.Errorf("PSI: нет строки %s с total", kind)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

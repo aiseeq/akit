@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,7 +38,11 @@ func TestRule(t *testing.T) {
 		{"ниже потоков", Load{Runnable: 21, Threads: 22}, l, nil, ""},
 		{"свой порог", Load{Runnable: 10, Threads: 22}, Limits{Runnable: 10, MaxIOFull: 10, MaxSwapKBs: 1024}, nil, CPU},
 		{"диск", Load{Runnable: 1, Threads: 22, IOFull: 10.5}, l, nil, IO},
-		{"диск на пороге", Load{Runnable: 1, Threads: 22, IOFull: 10}, l, nil, ""},
+		{"диск на пороге", Load{Runnable: 1, Threads: 22, IOFull: 9.6}, l, nil, IO},
+		{"диск ниже порога", Load{Runnable: 1, Threads: 22, IOFull: 9.5}, l, nil, ""},
+		{"замороженный диск", Load{Runnable: 1, Threads: 22, Disk: &DiskNow{Open: true}}, l, nil, IO},
+		{"диск выключен при заморозке", Load{Runnable: 1, Threads: 22, IOFull: 50, Disk: &DiskNow{Open: true}}, Limits{MaxIOFull: 100}, nil, ""},
+		{"диск выключен по давлению", Load{Runnable: 1, Threads: 22, IOFull: 50}, Limits{MaxIOFull: 100}, nil, ""},
 		{"обмен без давления памяти", Load{Runnable: 1, Threads: 22, MemSome: 0.4, SwapKBs: 5000}, l, nil, ""},
 		{"давление памяти с обменом", Load{Runnable: 1, Threads: 22, MemSome: 12, SwapKBs: 3000}, l, nil, Swap},
 		{"давление памяти без обмена", Load{Runnable: 1, Threads: 22, MemSome: 12}, l, nil, ""},
@@ -65,6 +70,7 @@ func TestRule(t *testing.T) {
 // fakeProc — /proc в папке, часы и сон без ожидания.
 func fakeProc(t *testing.T, files map[string]string) (*Meter, *time.Time) {
 	t.Helper()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	root := t.TempDir()
 	for name, body := range files {
 		writeProc(t, root, name, body)
@@ -75,6 +81,11 @@ func fakeProc(t *testing.T, files map[string]string) (*Meter, *time.Time) {
 	m.now = func() time.Time { return now }
 	m.sleep = func(_ context.Context, d time.Duration) error {
 		now = now.Add(d)
+		path := filepath.Join(root, "pressure", "io")
+		if data, err := os.ReadFile(path); err == nil {
+			updated := strings.Replace(string(data), "full avg10=0.5 avg60=12.5 avg300=1 total=1", "full avg10=0.5 avg60=12.5 avg300=1 total=96001", 1)
+			_ = os.WriteFile(path, []byte(updated), 0o644)
+		}
 		return nil
 	}
 	return m, &now
@@ -99,18 +110,20 @@ func TestCheck(t *testing.T) {
 		"pressure/memory": "some avg10=12.50 avg60=3 avg300=1 total=1\nfull avg10=5 avg60=1 avg300=0 total=1\n",
 		"vmstat":          "pswpin 10\npswpout 20\n",
 	})
-	v, err := m.Check(context.Background(), DefaultLimits, true)
+	v, err := m.Check(context.Background(), DefaultLimits, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Load{Runnable: 3, Threads: 3, CPUSome: 40, IOFull: 12.5, MemSome: 12.5}
-	if v.Measure != CPU || v.Load != want || v.Skipped != nil {
+	want := Load{Runnable: 3, Threads: 3, CPUSome: 40, IOFull: 9.6, IOWindow: time.Second, ioFullExact: 9.6, hasIOFullExact: true, MemSome: 12.5}
+	got := v.Load
+	got.DiskFault = nil
+	if v.Measure != CPU || got != want || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
 		t.Errorf("Check = %+v; ждали занята по cpu, %+v", v, want)
 	}
 	// Своп с прошлого замера, без ожидания окна: 512 страниц за 1 с.
 	writeProc(t, m.procRoot, "vmstat", "pswpin 10\npswpout 532\n")
 	*now = now.Add(time.Second)
-	v, err = m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 50, MaxSwapKBs: 1}, false)
+	v, err = m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 50, MaxSwapKBs: 1}, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,25 +134,25 @@ func TestCheck(t *testing.T) {
 
 func TestCheckNoProc(t *testing.T) {
 	m, _ := fakeProc(t, nil)
-	v, err := m.Check(context.Background(), DefaultLimits, true)
+	v, err := m.Check(context.Background(), DefaultLimits, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Busy() || !slices.Equal(v.Skipped, []error{ErrNoRunnable, ErrNoIOPressure, ErrNoMemPressure, ErrNoVMStat}) {
+	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
 		t.Errorf("без /proc = %+v; ждали свободна и все меры пропущены", v)
 	}
 }
 
 func TestCheckBroken(t *testing.T) {
 	m, _ := fakeProc(t, map[string]string{"stat": "cpu0 1\n", "vmstat": "pswpin 1\npswpout 1\n"})
-	if _, err := m.Check(context.Background(), DefaultLimits, true); err == nil {
+	if _, err := m.Check(context.Background(), DefaultLimits, "", true); err == nil {
 		t.Error("stat без procs_running — ждали ошибку, а не пропуск меры")
 	}
 	writeProc(t, m.procRoot, "stat", stat)
 	t.Setenv("XDG_STATE_HOME", t.TempDir()) // Check без Meter читает файл тихого режима из XDG_STATE_HOME
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Check(ctx, m.procRoot, DefaultLimits); !errors.Is(err, context.Canceled) {
+	if _, err := Check(ctx, m.procRoot, DefaultLimits, ""); !errors.Is(err, context.Canceled) {
 		t.Errorf("отменённый контекст: %v", err)
 	}
 }

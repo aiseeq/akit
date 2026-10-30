@@ -58,7 +58,7 @@ func TestCheckQuiet(t *testing.T) {
 	if err := SetQuiet(m.quiet, until); err != nil {
 		t.Fatal(err)
 	}
-	v, err := m.Check(context.Background(), DefaultLimits, true)
+	v, err := m.Check(context.Background(), DefaultLimits, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,13 +69,13 @@ func TestCheckQuiet(t *testing.T) {
 		t.Errorf("Why = %q", why)
 	}
 	*now = until
-	if v, err = m.Check(context.Background(), DefaultLimits, true); err != nil || v.Busy() || !v.Load.QuietUntil.IsZero() {
+	if v, err = m.Check(context.Background(), DefaultLimits, "", true); err != nil || v.Busy() || !v.Load.QuietUntil.IsZero() {
 		t.Errorf("истёкший срок = %+v, %v; ждали свободна", v, err)
 	}
 	if err := os.WriteFile(m.quiet, []byte("soon\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Check(context.Background(), DefaultLimits, true); err == nil {
+	if _, err := m.Check(context.Background(), DefaultLimits, "", true); err == nil {
 		t.Error("битый файл тихого режима — ждали ошибку замера")
 	}
 }

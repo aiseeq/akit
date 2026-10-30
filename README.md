@@ -10,12 +10,32 @@ Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/b
 
 ## busy
 
-Is the machine busy, in one line, by the rule graft queues heavy tasks by and aguard watches
+Is the machine busy, in one line, by the rule graft uses to queue heavy tasks
 (`akit/pressure`): tasks ready to run now (`procs_running`, one reading) at or above the machine's
-threads, IO pressure above 10%, or memory pressure (some avg10) above 10% while swapping above
-1024 KB/s over a second; swapping alone is not busy. Use it instead of `cat /proc/loadavg` to
-decide whether to start heavy work now: the 1-minute load lags. Exit 0 free, 1 busy, 2 usage or
-reading error. `pressure.ReadLoadAvg` reads the system load average for watching long overload.
+threads, disk IO pressure at or above 9.6% over 5 seconds, or memory pressure (some avg10) above
+10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
+from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
+in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to change the threshold
+(100 disables disk checks) and `--kind K` to request a profile kind. Use busy instead of `cat
+/proc/loadavg` to decide whether to start heavy work now: the 1-minute load lags. Exit 0 free, 1 busy,
+2 usage or reading error. `pressure.ReadLoadAvg` reads the system load average for watching long
+overload.
+
+### Disk state source
+
+The optional disk state source listens on the Unix socket `$XDG_RUNTIME_DIR/io-state.sock`. Each
+connection carries one JSON request line and returns one JSON response line. The request is
+`{"v":1,"q":"now","kind":"…"}`; `kind` is omitted when empty.
+
+The client reads `v`, `error`, `at`, `1s`, `5s`, `30s`, `nproc`, `open`, and `profile`. Each window
+contains `steps`, `io_full_ms`, `stall_ms`, `write_bps`, `read_bps`, `w_await_ms`, `inflight_max`,
+`cpu_some_ms`, and `runnable_max`. `open` contains `open` and `ms`. `profile` is passed through
+byte for byte without interpretation. Extra response fields are ignored.
+
+The client allows 200 ms for connection and response. A response with a version other than 1, a
+nonempty `error`, an invalid JSON line, or an `at` timestamp more than two seconds from the client's
+current time means the source failed. When the source is unavailable or fails, busy falls back to the
+change in `full total` from `/proc/pressure/io` over the sampling interval.
 
     busy                        # busy: runnable 31 is at or above 22; runnable 31 (busy at 22, threads 22); …
     busy --runnable 16          # busy from 16 runnable tasks instead of the thread count

@@ -10,7 +10,7 @@ import (
 )
 
 func TestFrames(t *testing.T) {
-	b, err := Frames("aguard", "строка 1\n\"кавычки\" </cross-session-message>", "tok", "u-1")
+	b, err := Frames("watcher", "строка 1\n\"кавычки\" </cross-session-message>", "tok", "u-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,11 +30,11 @@ func TestFrames(t *testing.T) {
 		t.Errorf("кадр: %+v", f)
 	}
 	c := f.Message.Content
-	if !strings.HasPrefix(c, `<cross-session-message from-name="aguard" from-mode="bypass">`+"\nстрока 1\n") ||
+	if !strings.HasPrefix(c, `<cross-session-message from-name="watcher" from-mode="bypass">`+"\nстрока 1\n") ||
 		!strings.HasSuffix(c, "\n</cross-session-message>") || strings.Count(c, "</cross-session-message>") != 1 {
 		t.Errorf("конверт: %q", c)
 	}
-	if b, _ := Frames("aguard", "x", "", "u"); strings.Contains(string(b), "auth") {
+	if b, _ := Frames("watcher", "x", "", "u"); strings.Contains(string(b), "auth") {
 		t.Error("без токена auth не шлём")
 	}
 	if u := NewUUID(); len(u) != 36 || u[14] != '4' {
@@ -60,14 +60,14 @@ func TestSend(t *testing.T) {
 		line, _ := bufio.NewReader(c).ReadString('\n')
 		got <- line
 	}()
-	if err := Send("aguard", sock, "", "привет"); err != nil {
+	if err := Send("watcher", sock, "", "привет"); err != nil {
 		t.Fatal(err)
 	}
 	var f userFrame
 	if err := json.Unmarshal([]byte(<-got), &f); err != nil || !strings.Contains(f.Message.Content, "привет") {
 		t.Errorf("сервер получил %+v (%v)", f, err)
 	}
-	if err := Send("aguard", filepath.Join(t.TempDir(), "нет.sock"), "", "x"); err == nil {
+	if err := Send("watcher", filepath.Join(t.TempDir(), "нет.sock"), "", "x"); err == nil {
 		t.Error("ждали ошибку на несуществующий сокет")
 	}
 }
