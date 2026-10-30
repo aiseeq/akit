@@ -60,7 +60,11 @@ func resolve(opts options, e env) ([]source, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, newSource(path))
+		src, err := sourceAt(path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, src)
 		if opts.subagents {
 			subs, err := subSources(path)
 			if err != nil {
@@ -160,17 +164,22 @@ func allSources(home string, since time.Time, project string, codex, includeSubs
 		if st.ModTime().Before(since) {
 			continue
 		}
-		src := newSource(p)
-		if strings.Contains(p, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
-			src, err = subSource(p)
-			if err != nil {
-				return nil, err
-			}
+		src, err := sourceAt(p)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, src)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })
 	return out, nil
+}
+
+// sourceAt — источник по пути: транскрипт суб-агента с пометкой родителя, иначе обычный.
+func sourceAt(path string) (source, error) {
+	if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
+		return subSource(path)
+	}
+	return newSource(path), nil
 }
 
 func subSources(parent string) ([]source, error) {

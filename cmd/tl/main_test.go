@@ -148,10 +148,17 @@ func TestSubagentsAndRawFilter(t *testing.T) {
 	if strings.Contains(out, "sub marker") {
 		t.Fatalf("--no-subagents: code %d:\n%s", code, out)
 	}
-	for _, args := range [][]string{{"abcdef01:1"}, {"abcdef01", "--role", "all"}, {"1a2b3c4d", "--subagents", "--role", "all"}} {
+	for _, args := range [][]string{{"abcdef01:1"}, {"abcdef01", "--role", "all"}, {subPath, "--role", "all"}, {"1a2b3c4d", "--subagents", "--role", "all"}} {
 		code, out, _ = runTL(t, e, args...)
 		if code != 0 || !strings.Contains(out, "sub marker") {
 			t.Errorf("%q: code %d:\n%s", args, code, out)
+		}
+	}
+	// Суб-агент по префиксу id и по пути — тот же заголовок и короткие ссылки, что в --all.
+	for _, arg := range []string{"abcdef01", subPath} {
+		code, out, _ = runTL(t, e, arg, "--role", "all")
+		if code != 0 || !strings.Contains(out, "== abcdef01 sub of 1a2b3c4d") || !strings.Contains(out, "abcdef01:1 ") {
+			t.Errorf("%s: code %d:\n%s", arg, code, out)
 		}
 	}
 	code, out, _ = runTL(t, e, "--all", "--role", "all", "--since", "1h", "--raw", `"isSidechain":true`, "--grep", "sub marker")

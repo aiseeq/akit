@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"runtime"
@@ -291,13 +290,10 @@ func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	src := newSource(path)
-	if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
-		src, err = subSource(path)
-		if err != nil {
-			fmt.Fprintf(stderr, "tl: %v\n", err)
-			return exitUsage
-		}
+	src, err := sourceAt(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "tl: %v\n", err)
+		return exitUsage
 	}
 	var found []transcript.Event
 	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
