@@ -167,12 +167,18 @@ all projects. Reads Claude Code transcripts, their subagents and codex rollouts.
     tl backend --subagents                 # this session and its subagents
     tl 1a2b3c4d:7759                       # one event in full
     tl --all --since 1d --usage            # tokens and API cost per session, TSV
+    tl --all --since 24h --wait 'tk done' --q 95  # 95th percentile wait for output, ms
 
 Roles: `user` typed by the human, `ask` answers in a question dialog, `peer` messages from other
 sessions, `agent`, `think` the agent's thinking, `cmd` tool calls, `out` tool output, `attach`
 Claude Code attachments (hooks, diagnostics), `note` notices, compaction, briefs and program
-prompts. `assistant` and `tool`, as jsonl names them, mean `agent` and `cmd`. `tl -h` prints all
-flags.
+prompts. `assistant` and `tool`, as jsonl names them, mean `agent` and `cmd`. `tl -h` prints
+all flags.
+
+`--wait PROG [SUB]` prints the nearest-rank percentile of milliseconds from a shell command call to
+its output; calls without output, background Bash calls, and commands that also run unrelated programs
+are excluded. The default percentile is 50; `--q` accepts 1–99. Fewer than 20 matching events returns
+exit 3 with the count in stderr and no stdout.
 
 ## user-word
 

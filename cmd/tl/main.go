@@ -46,6 +46,9 @@ path (Claude Code or codex rollout).
   --width N     characters of text per event (default 300, 0 = whole)
   --usage       tokens and API cost of model replies instead of events: a TSV
                 row per session and the total (--role defaults to all)
+  --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
+                (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
+  --q N         percentile for --wait, from 1 to 99 (default 50)
 
 Roles: user — typed by the human; ask — the human's answer in a question
 dialog; peer — a message from another session; agent — the agent's text;
@@ -76,6 +79,12 @@ type options struct {
 	max         int
 	width       int
 	usage       bool
+	waitProg    string
+	waitSub     string
+	q           int
+	qSet        bool
+	maxSet      bool
+	widthSet    bool
 	rolesSet    bool
 	args        []string
 }
@@ -108,7 +117,7 @@ type env struct {
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
-	opts := options{max: 100, width: 300}
+	opts := options{max: 100, width: 300, q: 50}
 	if err := setRoles(&opts, "user,ask,peer,agent"); err != nil {
 		return opts, err
 	}
@@ -134,6 +143,13 @@ func parseArgs(args []string, now time.Time) (options, error) {
 		}
 		if err := setFlag(&opts, name, val, now); err != nil {
 			return opts, err
+		}
+	}
+	if opts.waitProg != "" {
+		if !opts.rolesSet {
+			if err := setRoles(&opts, "all"); err != nil {
+				return opts, err
+			}
 		}
 	}
 	if opts.usage && !opts.rolesSet {
@@ -174,6 +190,16 @@ func checkCombos(opts options) error {
 	if opts.subagents && opts.all {
 		return errors.New("--subagents works with SESSION, not --all")
 	}
+	if opts.waitProg != "" {
+		if opts.usage {
+			return errors.New("--wait and --usage cannot be used together")
+		}
+		if opts.rolesSet || opts.grep != "" || opts.raw != "" || opts.context > 0 || opts.maxSet || opts.widthSet {
+			return errors.New("--wait cannot be used with event output options")
+		}
+	} else if opts.qSet {
+		return errors.New("--q works with --wait")
+	}
 	return nil
 }
 
@@ -195,10 +221,27 @@ func setFlag(opts *options, name, val string, now time.Time) error {
 		opts.context, err = nonNegative(name, val)
 	case "--project":
 		opts.project = val
+	case "--wait":
+		fields := strings.Fields(val)
+		if len(fields) < 1 || len(fields) > 2 {
+			return errors.New("--wait needs PROG [SUB]")
+		}
+		opts.waitProg = fields[0]
+		if len(fields) == 2 {
+			opts.waitSub = fields[1]
+		}
+	case "--q":
+		opts.q, err = strconv.Atoi(val)
+		opts.qSet = true
+		if err == nil && (opts.q < 1 || opts.q > 99) {
+			err = fmt.Errorf("--q needs a number from 1 to 99, got %q", val)
+		}
 	case "--max":
 		opts.max, err = nonNegative(name, val)
+		opts.maxSet = true
 	case "--width":
 		opts.width, err = nonNegative(name, val)
+		opts.widthSet = true
 	default:
 		return fmt.Errorf("unknown flag %s", name)
 	}
@@ -265,6 +308,9 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
+	}
+	if opts.waitProg != "" {
+		return reportWait(res, opts, stdout, stderr)
 	}
 	if opts.usage {
 		return reportUsage(res, opts, e, stdout)
