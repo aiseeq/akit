@@ -38,6 +38,7 @@ func TestCalls(t *testing.T) {
 		{"bash -c in double quotes with any substitution", `bash -c "while test \"${x:-y}\"; do sleep 5; done"`, []string{"bash", "test", "sleep"}},
 		{"only a variable as bash -c script", `bash -c "$cmd"`, []string{"bash"}},
 		{"quoted variable argv0", "R=~/bin/mytool; \"$R\" history; \"${R}\" history", []string{"mytool", "mytool"}},
+		{"quoted argv0 path from a variable", `"$HOME/bin/mytool" history x; "${HOME}/bin/mytool" x; "$HOME"/bin/mytool x; '/opt/my tool'"/$v/mytool" x`, []string{"mytool", "mytool", "mytool", "mytool"}},
 		{"shell -c under an unknown program", `frame.sh exec /tmp/t bash -c 'grep -rl x d'`, []string{"frame.sh", "bash", "grep"}},
 		{"echo of bash -c is data", `echo bash -c 'rg x'`, []string{"echo"}},
 		{"substitution in a redirect target", `tr a b < /proc/$(pgrep -f x | head -1)/cmdline`, []string{"tr", "pgrep", "head"}},

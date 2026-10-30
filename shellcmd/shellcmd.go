@@ -233,7 +233,7 @@ func collectAssignments(call *syntax.CallExpr, src string, vars map[string]strin
 		}
 		value, literal := wordValue(assign.Value)
 		if !literal {
-			value = wordText(assign.Value, src)
+			value = nodeText(assign.Value, src)
 		}
 		vars[assign.Name.Value] = value
 	}
@@ -363,7 +363,7 @@ func stmtRedirs(rs []*syntax.Redirect, src string) []Redir {
 			if value, literal := wordValue(r.Word); literal {
 				red.Target = value
 			} else {
-				red.Target = wordText(r.Word, src)
+				red.Target = nodeText(r.Word, src)
 			}
 		}
 		if r.Hdoc != nil {
@@ -442,7 +442,8 @@ func unescapeBare(s string) string {
 	return out.String()
 }
 
-// words — значения слов команды; argv0 из переменной, присвоенной раньше литералом, — её значение.
+// words — значения слов команды; у слов с подстановками — их текст. argv0 из переменной, присвоенной
+// раньше литералом, — её значение; другой argv0 с подстановками — текст без кавычек ("$HOME/bin/x" → $HOME/bin/x).
 func words(ws []*syntax.Word, src string, vars map[string]string) []string {
 	result := make([]string, len(ws))
 	for i, w := range ws {
@@ -450,14 +451,48 @@ func words(ws []*syntax.Word, src string, vars map[string]string) []string {
 			result[i] = value
 			continue
 		}
-		result[i] = wordText(w, src)
+		result[i] = nodeText(w, src)
 	}
 	if len(ws) > 0 {
 		if name, ok := paramName(ws[0]); ok && vars[name] != "" {
 			result[0] = vars[name]
+		} else if _, literal := wordValue(ws[0]); !literal {
+			result[0] = unquotedText(ws[0], src)
 		}
 	}
 	return result
+}
+
+// unquotedText — текст слова без кавычек; подстановки остаются текстом.
+func unquotedText(w *syntax.Word, src string) string {
+	var text strings.Builder
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			text.WriteString(unescapeBare(p.Value))
+		case *syntax.SglQuoted:
+			text.WriteString(p.Value)
+		case *syntax.DblQuoted:
+			for _, inner := range p.Parts {
+				if lit, ok := inner.(*syntax.Lit); ok {
+					text.WriteString(unescapeDouble.Replace(lit.Value))
+				} else {
+					text.WriteString(nodeText(inner, src))
+				}
+			}
+		default:
+			text.WriteString(nodeText(part, src))
+		}
+	}
+	return text.String()
+}
+
+func nodeText(n syntax.Node, src string) string {
+	start, end := int(n.Pos().Offset()), int(n.End().Offset())
+	if validSpan(src, start, end) {
+		return src[start:end]
+	}
+	return ""
 }
 
 // paramName — имя переменной у слова из одной простой подстановки: $R, ${R}, "$R", "${R}".
@@ -477,14 +512,6 @@ func paramName(w *syntax.Word) (string, bool) {
 		return "", false
 	}
 	return p.Param.Value, true
-}
-
-func wordText(w *syntax.Word, src string) string {
-	start, end := int(w.Pos().Offset()), int(w.End().Offset())
-	if validSpan(src, start, end) {
-		return src[start:end]
-	}
-	return ""
 }
 
 func simpleParamExp(p *syntax.ParamExp) bool {
