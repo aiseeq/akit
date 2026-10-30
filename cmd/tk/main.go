@@ -26,7 +26,7 @@ const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
   tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME] [--text FILE|-]
-  tk ls [--all] [--status STATUS] [--root DIR] [--by NAME] [--due] [--json]
+  tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk lint [--root DIR]
   tk start ID [--by NAME]
@@ -35,7 +35,7 @@ Usage:
   tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG]
   tk reject ID --why TEXT [--by NAME]
   tk show ID [--json]
-  tk archive [--older DURATION]
+  tk archive [--older DURATION] [--root DIR]
 
 Flags:
   --prio P       new: priority HIGH, MEDIUM, or LOW (default MEDIUM)
@@ -47,7 +47,8 @@ Flags:
   --due          ls: show waiting tickets whose parsed deadline has passed
   --json         ls: output JSON array; show: output the ticket and journal as JSON
   --status S     ls: show only status S
-  --root DIR     ls: scan DIR and its first-level repositories
+  --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
+  --root DIR     ls/lint/archive: scan DIR and its first-level repositories
   --note TEXT    review: add a review note to the journal
   --check TEXT   done: describe independent verification (required)
   --doer NAME    done: specify the executor of a legacy ticket
@@ -67,15 +68,17 @@ const (
 )
 
 var slugRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+var slugPrefixRE = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*-?$`)
 var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-([A-Z]+)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$`)
 var nameRE = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N}._:@-]*$`)
 var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-[a-z0-9]+(?:-[a-z0-9]+)*(?:\.md)?$`)
 var errHelp = errors.New("help")
+var session = currentSession
 
 type options struct {
-	cmd, id, prio, title, by, note, check, doer, why, status, root, until, text, glintDebt, baseRoot string
-	all, due, json                                                                                   bool
-	older                                                                                            time.Duration
+	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot string
+	all, due, json                                                                                         bool
+	older                                                                                                  time.Duration
 }
 type task struct {
 	path, slug, status, prio, title, body string
@@ -115,7 +118,7 @@ func parseArgs(a []string) (options, error) {
 }
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt}
+	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -231,6 +234,9 @@ func validateList(o *options, pos []string) error {
 	if o.by != "" && !nameRE.MatchString(o.by) {
 		return errors.New("--by must be a name without spaces; use --by NAME")
 	}
+	if o.slug != "" && !slugPrefixRE.MatchString(strings.ToLower(o.slug)) {
+		return errors.New("--slug must be a lowercase slug prefix")
+	}
 	return nil
 }
 
@@ -292,7 +298,7 @@ func run(o options, out, errout io.Writer) int {
 	if code := readTicketText(&o, errout); code != 0 {
 		return code
 	}
-	if (o.cmd == "ls" || o.cmd == "lint") && o.root != "" {
+	if (o.cmd == "ls" || o.cmd == "lint" || o.cmd == "archive") && o.root != "" {
 		return runRootScan(o, out, errout)
 	}
 	root, dir, found, err := resolveTaskBase()
@@ -317,7 +323,10 @@ func runRootScan(o options, out, errout io.Writer) int {
 	if o.cmd == "ls" {
 		return list("", o, out, errout)
 	}
-	return lint("", o.root, out, errout)
+	if o.cmd == "lint" {
+		return lint("", o.root, out, errout)
+	}
+	return archive("", "", o, out, errout)
 }
 
 func runAtBase(root, dir string, o options, out, errout io.Writer) int {
@@ -428,7 +437,7 @@ func readTicketText(o *options, errout io.Writer) int {
 	return 0
 }
 
-func session() string {
+func currentSession() string {
 	b, e := os.ReadFile("/proc/self/cgroup")
 	if e != nil {
 		return ""
@@ -728,6 +737,9 @@ func includeTask(t task, o options) bool {
 }
 
 func matchesListFilters(t task, o options) bool {
+	if o.slug != "" && !strings.HasPrefix(strings.ToLower(t.slug), strings.ToLower(o.slug)) {
+		return false
+	}
 	if o.by != "" {
 		who := executor(t.body)
 		if who == "" {
@@ -1099,6 +1111,10 @@ func openDebtTicket(dir, slug string) (bool, error) {
 }
 
 func prepareDone(t *task, o options, errout io.Writer) (int, int) {
+	if noCheck(t.body) {
+		fmt.Fprintln(errout, "tk: empty Приёмка: fill it before done")
+		return 0, exitNone
+	}
 	doer := executor(t.body)
 	if o.doer != "" {
 		doer = o.doer
@@ -1110,6 +1126,10 @@ func prepareDone(t *task, o options, errout io.Writer) (int, int) {
 	if strings.EqualFold(doer, o.by) {
 		fmt.Fprintln(errout, "tk: reviewer must differ from executor")
 		return 0, exitNone
+	}
+	// Не отказ: свежий суб-агент исполнителя — независимый проверяющий, а сессия у него родительская.
+	if s := session(); s != "" && strings.EqualFold(s, doer) {
+		fmt.Fprintf(errout, "tk: checked from the executor's session %s: counts only as a fresh sub-agent's check\n", s)
 	}
 	if o.glintDebt != "" {
 		valid, err := openDebtTicket(filepath.Join(o.baseRoot, "docs/tasks"), o.glintDebt)
@@ -1178,6 +1198,10 @@ func transition(t task, o options, out, errout io.Writer) int {
 	}
 	line := fmt.Sprintf("- %s %s — %s", time.Now().Format("2006-01-02 15:04"), next, o.by)
 	if o.cmd == "done" {
+		checkSession := session()
+		if checkSession != "" && !strings.EqualFold(checkSession, o.by) {
+			line = fmt.Sprintf("- %s %s — %s (session %s)", time.Now().Format("2006-01-02 15:04"), next, o.by, checkSession)
+		}
 		line += ": " + o.check
 		if glintFindings > 0 && o.glintDebt != "" {
 			line += fmt.Sprintf("; glint: %d findings, debt %s", glintFindings, o.glintDebt)
@@ -1210,21 +1234,22 @@ func addNote(t task, o options, out, errout io.Writer) int {
 }
 
 type taskJSON struct {
-	Repo     string   `json:"repo,omitempty"`
-	Slug     string   `json:"slug"`
-	Status   string   `json:"status"`
-	Prio     string   `json:"prio"`
-	Title    string   `json:"title"`
-	Created  string   `json:"created"`
-	Changed  string   `json:"changed"`
-	Path     string   `json:"path"`
-	Executor string   `json:"executor"`
-	Waits    string   `json:"waits"`
-	Overdue  bool     `json:"overdue"`
-	NoCheck  bool     `json:"no_check"`
-	Check    string   `json:"check"`
-	Checker  string   `json:"checker"`
-	Journal  []string `json:"journal"`
+	Repo           string   `json:"repo,omitempty"`
+	Slug           string   `json:"slug"`
+	Status         string   `json:"status"`
+	Prio           string   `json:"prio"`
+	Title          string   `json:"title"`
+	Created        string   `json:"created"`
+	Changed        string   `json:"changed"`
+	Path           string   `json:"path"`
+	Executor       string   `json:"executor"`
+	Waits          string   `json:"waits"`
+	Overdue        bool     `json:"overdue"`
+	NoCheck        bool     `json:"no_check"`
+	Check          string   `json:"check"`
+	Checker        string   `json:"checker"`
+	CheckerSession string   `json:"checker_session"`
+	Journal        []string `json:"journal"`
 }
 
 func taskObject(root string, t task, repo string, details bool) taskJSON {
@@ -1240,25 +1265,36 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, NoCheck: noCheck(t.body)}
 	if details {
 		obj.Journal = journalLines(t.body)
-		obj.Checker, obj.Check = completion(t.body)
 	}
+	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
 	return obj
 }
 
 // completion — проверяющий и проверка последней строки «готово» журнала: тикет могли открыть заново.
-func completion(s string) (checker, check string) {
+func completion(s string) (checker, check, checkerSession string) {
 	for _, line := range journalLines(s) {
 		_, after, ok := strings.Cut(line, " готово — ")
 		if !ok {
 			continue
 		}
 		if who, what, ok := strings.Cut(after, ": "); ok {
-			checker, check = strings.TrimSpace(who), strings.TrimSpace(what)
+			checker, check, checkerSession = completionParts(who, what)
 		} else if who, what, ok := strings.Cut(after, " — "); ok {
-			checker, check = strings.TrimSpace(who), strings.TrimSpace(what)
+			checker, check, checkerSession = completionParts(who, what)
 		}
 	}
-	return checker, check
+	return checker, check, checkerSession
+}
+
+func completionParts(who, check string) (string, string, string) {
+	checker := strings.TrimSpace(who)
+	const marker = " (session "
+	if i := strings.LastIndex(checker, marker); i >= 0 && strings.HasSuffix(checker, ")") {
+		session := strings.TrimSuffix(checker[i+len(marker):], ")")
+		checker = strings.TrimSpace(checker[:i])
+		return checker, strings.TrimSpace(check), session
+	}
+	return checker, strings.TrimSpace(check), ""
 }
 
 func writeListJSON(root string, ts []task, labels map[string]string, o options, out, errout io.Writer) int {
@@ -1363,20 +1399,14 @@ func lintTicket(path, shown string) ([]string, error) {
 		issues = append(issues, shown+": empty Приёмка")
 	}
 	if statusValue == "готово" {
-		checker, check, strict := strictCompletion(body)
-		if !strict || checker == "" || check == "" {
+		checker, check, _ := completion(body)
+		if checker == "" || check == "" {
 			issues = append(issues, shown+": готово without journal verification")
 		} else if doer := executor(body); doer != "" && strings.EqualFold(checker, doer) {
 			issues = append(issues, shown+": checker equals executor")
 		}
 	}
 	return issues, nil
-}
-
-// strictCompletion — то же для lint: годится строка «готово», где назван и проверяющий, и проверка.
-func strictCompletion(s string) (checker, check string, ok bool) {
-	checker, check = completion(s)
-	return checker, check, checker != "" && check != ""
 }
 
 func explicitStatus(s string) (string, bool) {
@@ -1388,30 +1418,46 @@ func explicitStatus(s string) (string, bool) {
 	return "", false
 }
 
-func archive(root, dir string, o options, out, errout io.Writer) int {
-	ts, e := load(dir)
-	if e != nil {
-		return fail(errout, e)
+func archive(root, _ string, o options, out, errout io.Writer) int {
+	repos, err := taskRepos(root, o.root)
+	if err != nil {
+		return fail(errout, err)
 	}
-	dstDir := filepath.Join(root, "docs/tasks-archive")
+	base := root
+	if o.root != "" {
+		base, err = filepath.Abs(o.root)
+		if err != nil {
+			return fail(errout, err)
+		}
+	}
 	cut := time.Now().Add(-o.older)
 	var moved []string
-	for i := range ts {
-		t := ts[i]
-		if (t.status != "готово" && t.status != "отклонён") || t.changed.After(cut) {
-			continue
+	for _, repo := range repos {
+		taskDir := filepath.Join(repo, "docs/tasks")
+		ts, err := load(taskDir)
+		if err != nil {
+			return fail(errout, err)
 		}
-		if e = os.MkdirAll(dstDir, dirMode); e != nil {
-			return fail(errout, e)
+		dstDir := filepath.Join(repo, "docs/tasks-archive")
+		for i := range ts {
+			t := ts[i]
+			if (t.status != "готово" && t.status != "отклонён") || t.changed.After(cut) {
+				continue
+			}
+			if err = os.MkdirAll(dstDir, dirMode); err != nil {
+				return fail(errout, err)
+			}
+			dst := filepath.Join(dstDir, filepath.Base(t.path))
+			if _, err = os.Stat(dst); err == nil {
+				return fail(errout, fmt.Errorf("archive destination exists: %s", dst))
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fail(errout, err)
+			}
+			if err = os.Rename(t.path, dst); err != nil {
+				return fail(errout, err)
+			}
+			moved = append(moved, relative(base, dst))
 		}
-		dst := filepath.Join(dstDir, filepath.Base(t.path))
-		if _, e = os.Stat(dst); e == nil {
-			return fail(errout, fmt.Errorf("archive destination exists: %s", dst))
-		}
-		if e = os.Rename(t.path, dst); e != nil {
-			return fail(errout, e)
-		}
-		moved = append(moved, relative(root, dst))
 	}
 	fmt.Fprintf(out, "archived %d\n", len(moved))
 	for _, p := range moved {

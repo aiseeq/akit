@@ -88,6 +88,7 @@ after an independent review.
     tk review fix-login --by reviewer
     tk done fix-login --check 'graft gate' --by reviewer
     tk archive                         # closed tickets older than 14 days
+    tk archive --root DIR              # archive tasks in DIR and its first-level repositories
 
 `tk new` starts a ticket with an `Вход` section. Each line answers one question:
 
@@ -106,7 +107,12 @@ waiting tickets whose parsed deadline has passed. Empty acceptance sections are 
 When `.glint.yaml` exists at the task base, `tk done` checks all glint severities; findings block
 completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
-`--json` emits the filtered list as JSON. `tk show ID` prints the ticket path and full text, or
+`--slug PREFIX` filters by a case-insensitive slug prefix, and `--json` emits the filtered list with
+completion details. `tk archive --root DIR` archives each repository's tasks to its own
+`docs/tasks-archive/` and prints paths relative to DIR. Completion journal entries record the
+checker session when it differs from `--by` (`checker_session` in JSON): a fresh sub-agent runs in its
+parent's session, so the session alone does not tell a self-check apart; `tk done` only warns when it matches the executor. `tk done` refuses tickets with an empty `Приёмка` or `Чем проверить` section.
+`tk show ID` prints the ticket path and full text, or
 structured details with `--json`. `tk note ID TEXT` appends a journal entry without changing status.
 `tk lint` checks ticket names, statuses, acceptance sections, and independent completion checks;
 `--root DIR` scans DIR and its first-level repositories. Without `--by`, actor commands use the

@@ -468,3 +468,126 @@ func TestLintEmptyCheck(t *testing.T) {
 		t.Fatalf("lint пустой «Приёмки»: %v %v", issues, err)
 	}
 }
+
+func TestDoneSessionAndEmptyAcceptance(t *testing.T) {
+	oldSession := session
+	session = func() string { return "checker-session" }
+	t.Cleanup(func() { session = oldSession })
+	path := filepath.Join(t.TempDir(), "20261001-1200-MEDIUM-session-check.md")
+	body := "# Check\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\n- проверка\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	ticket := task{path: path, slug: "session-check", body: body}
+	if code := transition(ticket, options{cmd: "done", by: "reviewer", check: "verified"}, &out, &errOut); code != 0 {
+		t.Fatalf("done returned %d: %s", code, errOut.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(updated), "готово — reviewer (session checker-session): verified") {
+		t.Fatalf("journal lacks checker session: %s, %v", updated, err)
+	}
+	closed, err := find(filepath.Dir(path), "session-check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := taskObject(filepath.Dir(filepath.Dir(filepath.Dir(path))), closed, "", false)
+	if obj.Checker != "reviewer" || obj.Check != "verified" || obj.CheckerSession != "checker-session" {
+		t.Fatalf("completion fields: %#v", obj)
+	}
+
+	oldBody := "# Empty\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\n\n## Журнал\n"
+	emptyPath := filepath.Join(filepath.Dir(path), "20261001-1200-MEDIUM-empty-check.md")
+	if err := os.WriteFile(emptyPath, []byte(oldBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := transition(task{path: emptyPath, slug: "empty-check", body: oldBody}, options{cmd: "done", by: "reviewer", check: "verified"}, &out, &errOut); code != exitNone || errOut.String() != "tk: empty Приёмка: fill it before done\n" {
+		t.Fatalf("empty acceptance result %d: %q", code, errOut.String())
+	}
+	unchanged, err := os.ReadFile(emptyPath)
+	if err != nil || string(unchanged) != oldBody {
+		t.Fatalf("empty acceptance ticket changed: %s, %v", unchanged, err)
+	}
+}
+
+// Тесты не видят сессию машины, на которой идут; нужная тесту — подменой session.
+func init() { session = func() string { return "" } }
+
+func TestDoneCheckerSession(t *testing.T) {
+	oldSession := session
+	session = func() string { return "Worker" }
+	t.Cleanup(func() { session = oldSession })
+	path := filepath.Join(t.TempDir(), "20261001-1200-MEDIUM-self-check.md")
+	body := "# Check\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\n- check\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := transition(task{path: path, slug: "self-check", body: body}, options{cmd: "done", by: "reviewer", check: "verified"}, &out, &errOut); code != 0 || !strings.Contains(errOut.String(), "executor's session Worker") {
+		t.Fatalf("done result %d: %q", code, errOut.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), " готово — reviewer (session Worker): verified") {
+		t.Fatalf("no checker session in journal:\n%s", updated)
+	}
+	if checker, check, s := completion(string(updated)); checker != "reviewer" || check != "verified" || s != "Worker" {
+		t.Fatalf("completion = %q %q %q", checker, check, s)
+	}
+	// Сессия проверяющего — данные, не находка: свежий суб-агент живёт в сессии исполнителя.
+	if issues, err := lintTicket(path, "self-check.md"); err != nil || len(issues) != 0 {
+		t.Fatalf("lint: %v %v", issues, err)
+	}
+	legacy := strings.Replace(string(updated), " (session Worker)", "", 1)
+	if checker, _, s := completion(legacy); checker != "reviewer" || s != "" {
+		t.Fatalf("legacy completion = %q %q", checker, s)
+	}
+}
+
+func TestArchiveRootAndListSlugJSON(t *testing.T) {
+	base := t.TempDir()
+	for _, repo := range []string{"one", "two"} {
+		dir := filepath.Join(base, repo, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		name := "20200101-1200-LOW-archive-" + repo + ".md"
+		body := "# Closed\n\nСтатус: готово\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer: verified\n"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, errOut bytes.Buffer
+	if code := archive("", "", options{root: base, older: time.Hour}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "archived 2") || !strings.Contains(out.String(), "one/docs/tasks-archive/") || !strings.Contains(out.String(), "two/docs/tasks-archive/") {
+		t.Fatalf("root archive %d: %q %s", code, out.String(), errOut.String())
+	}
+
+	listDir := filepath.Join(base, "listing", "docs", "tasks")
+	if err := os.MkdirAll(listDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{"alpha-one", "alpha-two", "beta-one"} {
+		name := "20200101-1200-LOW-" + slug + ".md"
+		body := "# Ticket\n\nСтатус: готово\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 12:00 готово — checker (session inspect): verified\n"
+		if err := os.WriteFile(filepath.Join(listDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out.Reset()
+	if code := list("", options{root: base, all: true, json: true, slug: "ALPHA"}, &out, &errOut); code != 0 {
+		t.Fatalf("slug JSON list %d: %s", code, errOut.String())
+	}
+	var rows []taskJSON
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil || len(rows) != 2 {
+		t.Fatalf("slug JSON rows %#v: %v; %s", rows, err, out.String())
+	}
+	for _, row := range rows {
+		if !strings.HasPrefix(row.Slug, "alpha") || row.Checker != "checker" || row.Check != "verified" || row.CheckerSession != "inspect" {
+			t.Fatalf("slug JSON completion fields: %#v", row)
+		}
+	}
+}
