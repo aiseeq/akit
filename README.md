@@ -8,6 +8,20 @@ setup under `~/.claude` (noted per tool). MIT license.
 Layout: library packages at the root (`edit`, `transcript`, …), one command per tool in `cmd/<tool>`.
 Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/bin` from committed code only, prints each tool's revision.
 
+## shellcmd
+
+Finds program calls in shell scripts, including nested substitutions, wrapper commands, and scripts
+passed to `bash -c` or through a shell heredoc. It returns each program name, arguments, source line,
+raw command text, and wrappers that led to the call.
+
+```go
+import "github.com/aiseeq/akit/shellcmd"
+
+calls, err := shellcmd.Calls(`timeout 5 bash -c 'rg pattern file'`)
+```
+
+`Calls` returns every program call; `Find` filters the result by program name.
+
 ## busy
 
 Is the machine busy, in one line, by the rule graft uses to queue heavy tasks

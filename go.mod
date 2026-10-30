@@ -6,6 +6,7 @@ require (
 	github.com/chromedp/cdproto v0.157.8
 	github.com/chromedp/chromedp v0.20.1
 	golang.org/x/net v0.62.0
+	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
