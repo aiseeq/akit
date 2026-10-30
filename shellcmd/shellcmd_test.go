@@ -507,3 +507,65 @@ func TestNestedHeredocBounds(t *testing.T) {
 		t.Errorf("ansi-c quoted script = %#v, %v", calls, err)
 	}
 }
+
+// Входы, на которых разбор падал паникой: недочитанные heredoc подряд, `time` без команды, проза.
+var noPanicInputs = []string{
+	"a <<A; b <<B",
+	"a <<'B'\\n+x; b <<'B'\\n+y",
+	"time",
+	"echo `time`; x=$(time)",
+	"Приёмка дошла до `graft gate` и поймала ошибку: не хватало импорта `time`.",
+	"bash -c 'a <<A; b <<B'",
+	"bash <<'E'\na <<A; b <<B\nE",
+	"bash -c 'time'",
+	"sh<<E\n!",
+	"<<0 \\",
+}
+
+func TestCallsNoPanic(t *testing.T) {
+	for _, command := range noPanicInputs {
+		calls, err := Calls(command)
+		for _, c := range calls {
+			for _, r := range c.Redirs {
+				if !validBounds(r, command) {
+					t.Errorf("%q: heredoc bounds %d:%d outside %d", command, r.BodyStart, r.BodyEnd, len(command))
+				}
+			}
+		}
+		t.Logf("%q: %d calls, %v", command, len(calls), err)
+	}
+}
+
+func FuzzCalls(f *testing.F) {
+	for _, command := range noPanicInputs {
+		f.Add(command)
+	}
+	for _, command := range []string{
+		"bash -c 'pgrep x'", "ssh h -p 22 -- 'cat <<E\n$(kill 1)\nE'", "P=\"pgrep -f\"; $P x",
+		"cat > f <<'EOF'\nbody\nEOF\nsudo tee -a \"$f\" 2>>err.log <<< hi", "bash -c \"echo a\\\n;pgrep\"",
+		"bash -c $'pgrep x'", "for x in a; do sleep 1 & done", "timeout 5 bash <<'EOF'\necho $(pgrep x)\nEOF",
+	} {
+		f.Add(command)
+	}
+	f.Fuzz(func(t *testing.T, command string) {
+		calls, _ := Calls(command)
+		for _, c := range calls {
+			if c.Offset >= len(command) {
+				t.Errorf("Offset %d outside %d", c.Offset, len(command))
+			}
+			for _, r := range c.Redirs {
+				if !validBounds(r, command) {
+					t.Errorf("heredoc bounds %d:%d outside %d", r.BodyStart, r.BodyEnd, len(command))
+				}
+			}
+		}
+	})
+}
+
+// validBounds — границы тела heredoc: обе -1 или диапазон внутри команды.
+func validBounds(r Redir, command string) bool {
+	if r.BodyStart == -1 && r.BodyEnd == -1 {
+		return true
+	}
+	return r.BodyStart >= 0 && r.BodyStart <= r.BodyEnd && r.BodyEnd <= len(command)
+}

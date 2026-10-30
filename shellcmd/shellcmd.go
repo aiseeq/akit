@@ -97,18 +97,34 @@ func parse(src string, lineBase int, inherited []string, vars map[string]string,
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
 	first := len(*calls)
-	if err := walkCalls(file, full, lineBase, inherited, vars, calls); err != nil {
-		return err
+	err = walkCalls(file, full, lineBase, inherited, vars, calls)
+	if len(full) > len(src) {
+		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
-	// Тело дочитанного heredoc кончается на конце исходного текста, а не дописанного ограничителя.
-	for _, c := range (*calls)[first:] {
+	return err
+}
+
+// trimAppended убирает следы ограничителя, дописанного parseShell: вызовы из дописанного текста (после
+// `\` в конце строки он склеивается с ней) выпадают, тело дочитанного heredoc кончается на конце src.
+func trimAppended(calls []Call, src string) []Call {
+	kept := calls[:0]
+	for _, c := range calls {
+		if c.Offset >= len(src) {
+			continue
+		}
 		for i := range c.Redirs {
-			if r := &c.Redirs[i]; r.BodyEnd > len(src) {
+			r := &c.Redirs[i]
+			switch {
+			case r.BodyEnd <= len(src):
+			case r.BodyStart >= len(src):
+				r.BodyStart, r.BodyEnd, r.Body = -1, -1, ""
+			default:
 				r.BodyEnd, r.Body = len(src), src[r.BodyStart:]
 			}
 		}
+		kept = append(kept, c)
 	}
-	return nil
+	return kept
 }
 
 // parseShell разбирает текст как bash. Незакрытый heredoc bash дочитывает до конца текста с предупреждением,
@@ -323,8 +339,9 @@ func loopCallSet(file *syntax.File) map[*syntax.CallExpr]bool {
 func timedCallSet(file *syntax.File) map[*syntax.CallExpr]bool {
 	timedCalls := make(map[*syntax.CallExpr]bool)
 	syntax.Walk(file, func(node syntax.Node) bool {
+		// `time` без команды разбор даёт TimeClause без Stmt.
 		clause, ok := node.(*syntax.TimeClause)
-		if ok {
+		if ok && clause.Stmt != nil {
 			syntax.Walk(clause.Stmt, func(child syntax.Node) bool {
 				if call, ok := child.(*syntax.CallExpr); ok {
 					timedCalls[call] = true
