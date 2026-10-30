@@ -1,6 +1,6 @@
 # Первый референс скорости akit (perf-baseline-1030, пилот)
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -23,3 +23,4 @@
 - 2026-10-30 12:54 note — akit-master: Профиль (perf, плоский): tl --all --grep литерал — 76 % CPU в bytes.ToLower строки (scan.go:68); регулярка wfor|wfoz — ~70 % encoding/json (нет отсева, 57 % шаблонов агентов — регулярки); prior — 77 % wall в daydigest -log (dream, тикет dream 20261030-1253-MEDIUM-daydigest-log-offset). --wait держал все события (RSS 5 ГБ за 7 дн) → тикет wait-memory. Референсы 7 дн до 30.10 12:50 — /home/aisee/.cache/claude-tmp/perf-usage/refs.out. Черновики /home/aisee/.claude/improve/state/perf/akit.tsv и akit.md; ждут wall grep под graft exec --heavy.
 - 2026-10-30 13:42 note — akit-master: Файлы в claude-config ee0e93f: /home/aisee/.claude/improve/state/perf/akit.tsv (10 путей, у всех команда), akit.md. Референс по FORMAT.md от 13:25 — худшее суточное за 7 сут (daily.sh, /home/aisee/.cache/claude-tmp/perf-usage/daily.out); grep-строки без graft exec --heavy (ночной шаг dream не дождался очереди за 120 с); page-shot убран в Пробелы (нет суток с 20 событиями). Находка prior → dream-master, тикет dream 20261030-1253-MEDIUM-daydigest-log-offset.
 - 2026-10-30 13:42 на проверке — akit-master
+- 2026-10-30 13:53 готово — akit-master-checker (session akit-master): независимая проверка 13:43–13:48: akit.tsv — шапка побайтно по FORMAT.md, 10 строк по 8 полей без пустых, вид/мера/ждёт из списков; все 10 команд из ~ через bash -c: одно число, код 0, 5,5–24,2 с (ветка кода 3 проверена на 23.10); референс cli:sub 326 и cli:tk note 637 = максимум суточных окон 23–29.10, совпадает с md; md — шапка и 4 раздела, у 3 кандидатов путь, замер, выигрыш, почему без потерь, доля; scan.go keepRaw/bytes.ToLower и dream log.go подтверждены; файлы = claude-config ee0e93f (+9ad290d ссылки строк по замечанию)
