@@ -476,7 +476,7 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		title = o.id
 	}
 	// Исполнителя ставит start: автор тикета часто его же и проверяет.
-	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n\n## Вход\n- Проблема:\n- Метод:\n- Дешевле:\n- Инструмент:\n- Цена:\n- Если не делать:\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
+	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
 		title, now.Format("2006-01-02 15:04"), o.by)
 	if o.text != "" {
 		body = fillTicket(body, o.text)
@@ -872,17 +872,15 @@ func replaceTicketSections(template string, sections map[string][]string, extra 
 	var out []string
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
+		// «Вход» в шаблоне нет: раздел из текста встаёт перед «Что сделать».
+		if intake := trimBlankEdges(sections["## Вход"]); line == "## Что сделать" && len(intake) > 0 {
+			out = append(out, "## Вход")
+			out = append(out, intake...)
+			out = append(out, "")
+		}
 		if standardTicketSection(line) {
 			out = append(out, line)
-			content := trimBlankEdges(sections[line])
-			if len(content) > 0 {
-				out = append(out, content...)
-			} else if line == "## Вход" {
-				out = append(out, lines[i+1:i+7]...)
-			}
-			if line == "## Вход" {
-				i += 6 // поля шаблона: заменены текстом или уже перенесены
-			}
+			out = append(out, trimBlankEdges(sections[line])...)
 			for i+1 < len(lines) && lines[i+1] == "" {
 				i++
 			}

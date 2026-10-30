@@ -110,14 +110,9 @@ after an independent review.
     tk archive                         # closed tickets older than 14 days
     tk archive --root DIR              # archive tasks in DIR and its first-level repositories
 
-`tk new` starts a ticket with an `Вход` section. Each line answers one question:
-
-- `Проблема` — is there a real problem, and where is it visible?
-- `Метод` — can the chosen method reach the goal?
-- `Дешевле` — is there a cheaper way?
-- `Инструмент` — could the tool itself be at fault?
-- `Цена` — is the work worth its cost against the queue?
-- `Если не делать` — what happens if the work is skipped?
+`tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. A `## Вход` section
+in `--text` (context: where the request came from, facts behind it) goes before `Что сделать`;
+without it the ticket has none.
 
 Ticket IDs accept the slug, the full file name, or the file name without `.md`. Outside a Git
 repository, `tk` uses the nearest `docs/tasks/` up to `$HOME`; `new` creates it in the current

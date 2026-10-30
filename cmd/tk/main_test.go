@@ -420,10 +420,13 @@ func TestListSkipsLinkedWorktreesAndReportsBadNames(t *testing.T) {
 }
 
 func TestFillTicketPreservesSectionsAndJournal(t *testing.T) {
-	template := "# Example\n\nСтатус: открыт\n\n## Вход\n- Проблема:\n- Метод:\n- Дешевле:\n- Инструмент:\n- Цена:\n- Если не делать:\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- time открыт — actor\n"
+	template := "# Example\n\nСтатус: открыт\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- time открыт — actor\n"
 	input := "# Example\n## Что сделать\n1. Сделать раз.\n\n## Приёмка\n- graft gate\n\n## Ссылки\n- doc\n"
 	body := fillTicket(template, input)
-	for _, want := range []string{"## Вход\n- Проблема:", "1. Сделать раз.", "## Приёмка\n- graft gate", "## Ссылки\n- doc\n\n## Журнал", "- time открыт — actor"} {
+	if strings.Contains(body, "## Вход") {
+		t.Errorf("«Вход» без текста для него:\n%s", body)
+	}
+	for _, want := range []string{"1. Сделать раз.", "## Приёмка\n- graft gate", "## Ссылки\n- doc\n\n## Журнал", "- time открыт — actor"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("filled ticket missing %q:\n%s", want, body)
 		}
@@ -445,7 +448,7 @@ func TestLintAcceptsEarlierDoneLine(t *testing.T) {
 }
 
 func TestFillTicketOldSectionNames(t *testing.T) {
-	template := "# T\n\nСтатус: открыт\n\n## Вход\n- Проблема:\n- Метод:\n- Дешевле:\n- Инструмент:\n- Цена:\n- Если не делать:\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- открыт\n"
+	template := "# T\n\nСтатус: открыт\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- открыт\n"
 	got := fillTicket(template, "## Постановка\nсуть\n\n## Что сделать\n1. шаг\n\n## Чем проверить\n- тест\n")
 	want := "# T\n\nСтатус: открыт\n\n## Вход\nсуть\n\n## Что сделать\n1. шаг\n\n## Приёмка\n- тест\n\n## Журнал\n- открыт\n"
 	if got != want {
