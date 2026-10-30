@@ -1,6 +1,6 @@
 # tl: суб-агенты в --all с пометкой родителя, фильтр --raw
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -26,3 +26,4 @@
 - 2026-10-30 03:29 note — akit-master: боец Luna, дерево /home/aisee/.cache/worktrees/akit/tl-subagents, бриф и приёмка /home/aisee/.cache/worktrees/akit/tl-subagents-brief/
 - 2026-10-30 03:46 на проверке — akit-master — влито b032b49 (Luna) и ed6d2b3 (мастер: parseArgs разбит по находке glint cyclomatic 25>20); приёмка мастера ACCEPT OK; живые пробы: --all --since 4h --project akit --max 0 — 3 заголовка «sub of 157d4aea» с description из meta; --raw hook_cancelled --role all — 1 событие (без --role all роль attach не в умолчании); --max 100 по умолчанию прячет ранние события суб-агентов — не дефект
 - 2026-10-30 03:49 note — akit-master: независимая проверка (суб-агент): не принято — tl <префикс> и tl <путь> суб-агента шли через newSource: id = полный путь, без «sub of» (source.go resolve). Починено: один выбор конструктора sourceAt для resolve, allSources, showRef; тест проверяет заголовок и ссылку abcdef01:1 по префиксу и по пути. Замечание проверки: трейлер Worker в ed6d2b3 поставил graft по дереву бойца, коммит мастера — запушен, не правлю
+- 2026-10-30 03:50 готово — akit-master-checker (session akit-master): суб-агент с брифом из тикета, 2 захода 30.10 03:48 и 03:50 CET: 1-й — не принято (префикс и путь суб-агента без «sub of»), починено 11289f5; 2-й — принято: синтетический HOME (tl abcdef01 и путь — заголовок «== abcdef01 sub of 1a2b3c4d», ссылки abcdef01:N; --all, --no-subagents, ref, --subagents, --raw с --grep), go test ./cmd/tl ok, живая tl a8cc63ff — заголовок sub of 157d4aea; дифф без внутренних имён
