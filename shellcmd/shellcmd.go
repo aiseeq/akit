@@ -18,6 +18,22 @@ type Call struct {
 	Raw  string
 	Line int
 	Via  []string
+	// Offset — байтовое смещение имени программы (после снятых обёрток) в исходной команде;
+	// -1 — его нет в исходном тексте как слова: вызов из вложенного скрипта или argv0 из переменной.
+	Offset int
+	// Redirs — перенаправления простой команды по порядку (у снятой обёртки — те же, что у неё).
+	Redirs []Redir
+}
+
+// Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
+type Redir struct {
+	Op     string // оператор: >, >>, <, <<, <<-, <<<, &>, >& …
+	N      string // номер дескриптора перед оператором ("2" в 2>), пусто — по умолчанию
+	Target string // цель: значение литерального слова, иначе его исходный текст; у heredoc — ограничитель
+	Body   string // тело heredoc как в исходном тексте
+	// BodyStart, BodyEnd — байтовые границы тела heredoc в исходной команде, без строки ограничителя;
+	// -1 — heredoc нет, тело пустое или heredoc во вложенном скрипте.
+	BodyStart, BodyEnd int
 }
 
 // Calls возвращает вызовы программ во всех частях скрипта.
@@ -58,6 +74,7 @@ func parse(src string, lineBase int, inherited []string, vars map[string]string,
 
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
 	timedCalls := timedCallSet(file)
+	redirs := make(map[*syntax.CallExpr][]Redir)
 	var shellInputs []*syntax.Stmt
 	var parseErr error
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -73,10 +90,15 @@ func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, 
 				parseErr = fmt.Errorf("shellcmd: invalid source span for time clause")
 				return false
 			}
-			*calls = append(*calls, Call{Name: "time", Raw: src[start:end], Line: int(clause.Pos().Line()) + lineBase, Via: append([]string(nil), inherited...)})
+			*calls = append(*calls, Call{Name: "time", Raw: src[start:end], Line: int(clause.Pos().Line()) + lineBase, Via: append([]string(nil), inherited...), Offset: start})
 		}
-		if stmt, ok := node.(*syntax.Stmt); ok && shellInput(stmt, src, vars) {
-			shellInputs = append(shellInputs, stmt)
+		if stmt, ok := node.(*syntax.Stmt); ok {
+			if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(stmt.Redirs) > 0 {
+				redirs[call] = stmtRedirs(stmt.Redirs, src)
+			}
+			if shellInput(stmt, src, vars) {
+				shellInputs = append(shellInputs, stmt)
+			}
 		}
 		call, ok := node.(*syntax.CallExpr)
 		if !ok {
@@ -97,16 +119,18 @@ func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, 
 		if timedCalls[call] {
 			via = append(via, "time")
 		}
-		entry := Call{Name: name, Args: append([]string(nil), args[1:]...), Raw: src[start:end], Line: int(call.Pos().Line()) + lineBase, Via: via}
+		offsets := wordOffsets(call.Args)
+		entry := Call{Name: name, Args: append([]string(nil), args[1:]...), Raw: src[start:end], Line: int(call.Pos().Line()) + lineBase, Via: via, Offset: offsets[0], Redirs: redirs[call]}
 		*calls = append(*calls, entry)
-		if err := expand(entry, lineBase, vars, calls); err != nil {
+		if err := expand(entry, offsets, lineBase, vars, calls); err != nil {
 			parseErr = err
 			return false
 		}
 		if nested, wrapperVia, ok := unwrap(name, args[1:]); ok {
-			child := Call{Name: nested[0], Args: nested[1:], Raw: entry.Raw, Line: entry.Line, Via: append(append([]string(nil), inherited...), wrapperVia...)}
+			tail := offsets[len(offsets)-len(nested):]
+			child := Call{Name: nested[0], Args: nested[1:], Raw: entry.Raw, Line: entry.Line, Via: append(append([]string(nil), inherited...), wrapperVia...), Offset: tail[0], Redirs: entry.Redirs}
 			*calls = append(*calls, child)
-			if err := expand(child, lineBase, vars, calls); err != nil {
+			if err := expand(child, tail, lineBase, vars, calls); err != nil {
 				parseErr = err
 				return false
 			}
@@ -242,9 +266,66 @@ func parseNested(src string, lineBase int, via []string, vars map[string]string,
 		}
 		return fmt.Errorf("shellcmd: parse nested shell: %w", &nestedParseError{script: src, err: err})
 	}
+	// Смещения во вложенном тексте не указывают в исходную команду.
+	for i := range nestedCalls {
+		nestedCalls[i].Offset = -1
+		redirs := slices.Clone(nestedCalls[i].Redirs)
+		for j := range redirs {
+			redirs[j].BodyStart, redirs[j].BodyEnd = -1, -1
+		}
+		nestedCalls[i].Redirs = redirs
+	}
 	*calls = append(*calls, nestedCalls...)
 	maps.Copy(vars, nestedVars)
 	return nil
+}
+
+// stmtRedirs — перенаправления команды с телами heredoc и их границами в src.
+func stmtRedirs(rs []*syntax.Redirect, src string) []Redir {
+	out := make([]Redir, 0, len(rs))
+	for _, r := range rs {
+		red := Redir{Op: r.Op.String(), BodyStart: -1, BodyEnd: -1}
+		if r.N != nil {
+			red.N = r.N.Value
+		}
+		if r.Word != nil {
+			if value, literal := wordValue(r.Word); literal {
+				red.Target = value
+			} else {
+				red.Target = wordText(r.Word, src)
+			}
+		}
+		if r.Hdoc != nil {
+			start, end := int(r.Hdoc.Pos().Offset()), int(r.Hdoc.End().Offset())
+			if validSpan(src, start, end) {
+				end = start + heredocBodyLen(src[start:end], red.Target)
+				red.Body, red.BodyStart, red.BodyEnd = src[start:end], start, end
+			}
+		}
+		out = append(out, red)
+	}
+	return out
+}
+
+// heredocBodyLen — длина тела heredoc: разбор отдаёт его вместе со строкой ограничителя.
+func heredocBodyLen(text, delim string) int {
+	i := strings.LastIndexByte(text, '\n')
+	if strings.TrimLeft(text[i+1:], "\t") != delim {
+		return len(text)
+	}
+	return i + 1
+}
+
+// wordOffsets — смещения слов в исходной команде; -1 у нелитерального слова ($R, $(…)).
+func wordOffsets(words []*syntax.Word) []int {
+	offsets := make([]int, len(words))
+	for i, word := range words {
+		offsets[i] = -1
+		if _, literal := wordValue(word); literal {
+			offsets[i] = int(word.Pos().Offset())
+		}
+	}
+	return offsets
 }
 
 func words(words []*syntax.Word, src string, vars map[string]string) []string {
@@ -298,11 +379,13 @@ func wordValue(word *syntax.Word) (string, bool) {
 	return value.String(), true
 }
 
-func expand(call Call, lineBase int, vars map[string]string, calls *[]Call) error {
+// expand раскрывает цель `X exec … --` и скрипт `bash -c`; offsets — смещения слов имени и Args вызова.
+func expand(call Call, offsets []int, lineBase int, vars map[string]string, calls *[]Call) error {
 	if target, ok := execTarget(call.Args); ok {
-		child := Call{Name: target[0], Args: target[1:], Raw: call.Raw, Line: call.Line, Via: append(append([]string(nil), call.Via...), call.Name, "exec")}
+		tail := offsets[len(offsets)-len(target):]
+		child := Call{Name: target[0], Args: target[1:], Raw: call.Raw, Line: call.Line, Via: append(append([]string(nil), call.Via...), call.Name, "exec"), Offset: tail[0]}
 		*calls = append(*calls, child)
-		return expand(child, lineBase, vars, calls)
+		return expand(child, tail, lineBase, vars, calls)
 	}
 	if isShell(call.Name) {
 		for i, arg := range call.Args {
@@ -349,10 +432,6 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	for wrappers[name] {
 		via = append(via, name)
 		i := 0
-
-		if name == "nice" && len(args) > 1 && args[0] == "-n" {
-			i = 2
-		}
 		for i < len(args) && strings.HasPrefix(args[i], "-") {
 			if args[i] == "--" {
 				i++
@@ -381,12 +460,27 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	return append([]string{name}, args...), via, len(via) > 0
 }
 
-func optionValue(wrapper, option string) bool {
-	switch option {
-	case "-I", "-P", "-L", "-d", "-E", "-s", "-a", "-u", "-i", "-t", "-r", "-o", "-T", "-C", "-k", "--kill-after", "--signal":
-		return true
-	case "-n":
-		return wrapper == "xargs" || wrapper == "nice"
+// valueOptions — опции обёрток, следующее слово после которых — их значение, а не программа.
+var valueOptions = map[string]map[string]bool{
+	"timeout": set("-s", "--signal", "-k", "--kill-after"),
+	"env":     set("-u", "--unset", "-C", "--chdir"),
+	"sudo":    set("-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user"),
+	"nice":    set("-n", "--adjustment"),
+	"ionice":  set("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"),
+	"stdbuf":  set("-i", "--input", "-o", "--output", "-e", "--error"),
+	"time":    set("-f", "--format", "-o", "--output"),
+	"exec":    set("-a"),
+	"xargs":   set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"),
+}
+
+func set(items ...string) map[string]bool {
+	out := make(map[string]bool, len(items))
+	for _, item := range items {
+		out[item] = true
 	}
-	return false
+	return out
+}
+
+func optionValue(wrapper, option string) bool {
+	return valueOptions[wrapper][option]
 }
