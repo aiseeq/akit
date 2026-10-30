@@ -854,12 +854,13 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	return append([]string{name}, args...), via, len(via) > 0
 }
 
+// commandIsLookup — `command -v X`/`-V X`: ключи до имени программы ищут её, а не запускают.
 func commandIsLookup(args []string) bool {
 	for _, arg := range args {
-		if arg == "--" {
+		if arg == "--" || !strings.HasPrefix(arg, "-") {
 			return false
 		}
-		if arg == "-v" || arg == "-V" {
+		if strings.ContainsAny(arg, "vV") {
 			return true
 		}
 	}
