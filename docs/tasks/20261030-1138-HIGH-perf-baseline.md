@@ -1,6 +1,6 @@
 # Первый референс скорости akit (perf-baseline-1030, пилот)
 
-Статус: в работе
+Статус: на проверке
 Исполнитель: akit-master
 
 ## Вход
@@ -20,3 +20,6 @@
 - 2026-10-30 11:38 открыт — akit-master
 - 2026-10-30 11:38 в работе — akit-master
 - 2026-10-30 11:53 note — akit-master: Разбор транскриптов за 7 дн (/home/aisee/.cache/claude-tmp/perf-usage/main.go): 112631 команд; вызовов/p50/p95 одиночных: tl 3582/433/10093 мс (1,0 ч ожидания), sub 5057/78/253, tk 3399/72/485, wfor 501 (ждёт по назначению), prior 351/1022/7227, user-word 390/306/1452, page-shot 414/2074/12635, busy 301/1068/1348 (окно замера 1 с по замыслу). Мера для tsv — новый режим `tl --wait PROG [SUB] --q N` (одно число мс по транскриптам за окно, <20 — код 3): боец Luna 1030-1153-tl-wait, класс фича-инструмента, бриф /home/aisee/.cache/worktrees/akit/tl-wait-brief.md.
+- 2026-10-30 12:54 note — akit-master: Профиль (perf, плоский): tl --all --grep литерал — 76 % CPU в bytes.ToLower строки (scan.go:68); регулярка wfor|wfoz — ~70 % encoding/json (нет отсева, 57 % шаблонов агентов — регулярки); prior — 77 % wall в daydigest -log (dream, тикет dream 20261030-1253-MEDIUM-daydigest-log-offset). --wait держал все события (RSS 5 ГБ за 7 дн) → тикет wait-memory. Референсы 7 дн до 30.10 12:50 — /home/aisee/.cache/claude-tmp/perf-usage/refs.out. Черновики /home/aisee/.claude/improve/state/perf/akit.tsv и akit.md; ждут wall grep под graft exec --heavy.
+- 2026-10-30 13:42 note — akit-master: Файлы в claude-config ee0e93f: /home/aisee/.claude/improve/state/perf/akit.tsv (10 путей, у всех команда), akit.md. Референс по FORMAT.md от 13:25 — худшее суточное за 7 сут (daily.sh, /home/aisee/.cache/claude-tmp/perf-usage/daily.out); grep-строки без graft exec --heavy (ночной шаг dream не дождался очереди за 120 с); page-shot убран в Пробелы (нет суток с 20 событиями). Находка prior → dream-master, тикет dream 20261030-1253-MEDIUM-daydigest-log-offset.
+- 2026-10-30 13:42 на проверке — akit-master
