@@ -18,8 +18,9 @@ type Call struct {
 	Raw  string
 	Line int
 	Via  []string
-	// Offset — байтовое смещение имени программы (после снятых обёрток) в исходной команде;
-	// -1 — его нет в исходном тексте как слова: вызов из вложенного скрипта или argv0 из переменной.
+	// Offset — байтовое смещение имени программы (после снятых обёрток) в исходной команде, в том числе
+	// внутри вложенного скрипта (`bash -c '…'`, `ssh host …`, heredoc на вход оболочке); -1 — его нет
+	// в исходном тексте как слова: argv0 из переменной или с подстановкой, байт скрипта из $'…'.
 	Offset int
 	// Redirs — перенаправления простой команды по порядку (у снятой обёртки — те же, что у неё).
 	Redirs []Redir
@@ -39,6 +40,7 @@ type cmd struct {
 type word struct {
 	offset int    // смещение в исходной команде; -1 — слово не литерал
 	script string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
+	pos    []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -367,10 +369,11 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 			if redir.Hdoc == nil {
 				continue
 			}
-			body := heredocText(redir, src)
+			var body mapped
+			body.add(heredocText(redir, src), int(redir.Hdoc.Pos().Offset()))
 			via := append(append(append([]string(nil), inherited...), shellVia...), name)
 			call, _ := stmt.Cmd.(*syntax.CallExpr)
-			if err := parseNested(body, int(redir.Hdoc.Pos().Line())+lineBase-1, via, loopCalls[call], backgroundCalls[call], vars, calls); err != nil {
+			if err := parseNested(body.String(), body.pos, int(redir.Hdoc.Pos().Line())+lineBase-1, via, loopCalls[call], backgroundCalls[call], vars, calls); err != nil {
 				nestedErrs = append(nestedErrs, err)
 			}
 		}
@@ -489,7 +492,9 @@ type NestedError struct {
 func (e *NestedError) Error() string { return e.Err.Error() }
 func (e *NestedError) Unwrap() error { return e.Err }
 
-func parseNested(src string, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call) error {
+// parseNested добавляет вызовы скрипта src, который выполнит вложенная оболочка; pos[i] — смещение байта i
+// скрипта во внешнем тексте (-1 — такого байта нет).
+func parseNested(src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call) error {
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
@@ -500,9 +505,8 @@ func parseNested(src string, lineBase int, via []string, inLoop, inBackground bo
 			err = &NestedError{Script: src, Err: err}
 		}
 	}
-	// Смещения во вложенном тексте не указывают в исходную команду.
 	for i := range nestedCalls {
-		nestedCalls[i].Offset = -1
+		nestedCalls[i].Offset = outerOffset(nestedCalls[i].Offset, pos)
 		nestedCalls[i].Loop = nestedCalls[i].Loop || inLoop
 		nestedCalls[i].Background = nestedCalls[i].Background || inBackground
 		redirs := slices.Clone(nestedCalls[i].Redirs)
@@ -514,6 +518,14 @@ func parseNested(src string, lineBase int, via []string, inLoop, inBackground bo
 	*calls = append(*calls, nestedCalls...)
 	maps.Copy(vars, nestedVars)
 	return err
+}
+
+// outerOffset переводит смещение во вложенном скрипте во внешний текст по карте pos.
+func outerOffset(offset int, pos []int) int {
+	if offset < 0 || offset >= len(pos) {
+		return -1
+	}
+	return pos[offset]
 }
 
 // stmtRedirs — перенаправления команды с телами heredoc и их границами в src.
@@ -556,7 +568,8 @@ func heredocBodyLen(text, delim string) int {
 func cmdWords(args []*syntax.Word, src string) []word {
 	ws := make([]word, len(args))
 	for i, arg := range args {
-		ws[i] = word{offset: -1, script: wordScript(arg, src)}
+		script, pos := wordScript(arg, src)
+		ws[i] = word{offset: -1, script: script, pos: pos}
 		if _, literal := wordValue(arg); literal {
 			ws[i].offset = int(arg.Pos().Offset())
 		}
@@ -568,43 +581,113 @@ func cmdWords(args []*syntax.Word, src string) []word {
 // Литерал — его значение. Слово в двойных кавычках — текст внутри без экранирования: подстановки в нём
 // ($x, $(…)) остаются текстом, а строй скрипта (циклы, вызовы) виден. Слово только из подстановки
 // ("$cmd", $cmd) — "": что выполнится, видно только при запуске.
-func wordScript(w *syntax.Word, src string) string {
-	if value, literal := wordValue(w); literal {
-		return value
+// Возвращает и карту байтов текста в исходную команду.
+func wordScript(w *syntax.Word, src string) (string, []int) {
+	var text mapped
+	if _, literal := wordValue(w); literal {
+		for _, part := range w.Parts {
+			text.addLiteral(part, src)
+		}
+		return text.String(), text.pos
 	}
 	if len(w.Parts) != 1 {
-		return ""
+		return "", nil
 	}
 	quoted, ok := w.Parts[0].(*syntax.DblQuoted)
 	if !ok || !slices.ContainsFunc(quoted.Parts, func(p syntax.WordPart) bool { _, lit := p.(*syntax.Lit); return lit }) {
-		return ""
+		return "", nil
 	}
 	start, end := int(quoted.Pos().Offset()), int(quoted.End().Offset())
 	if !validSpan(src, start, end) || end-start < 2 {
-		return ""
+		return "", nil
 	}
-	return unescapeDouble.Replace(src[start+1 : end-1])
+	text.unescape(src[start+1:end-1], start+1, true)
+	return text.String(), text.pos
 }
 
-// unescapeDouble снимает экранирование в двойных кавычках: обратная косая значима только перед " \ $ ` и переводом строки.
-var unescapeDouble = strings.NewReplacer(`\"`, `"`, `\\`, `\`, `\$`, `$`, "\\`", "`", "\\\n", "")
+// sourceBase — смещение value в src, если value — точный текст узла n без skip байтов по краям; иначе -1.
+func sourceBase(n syntax.Node, value string, skip int, src string) int {
+	start, end := int(n.Pos().Offset())+skip, int(n.End().Offset())-skip
+	if validSpan(src, start, end) && src[start:end] == value {
+		return start
+	}
+	return -1
+}
+
+// mapped — текст и смещение каждого его байта в исходной команде (-1 — такого байта нет).
+type mapped struct {
+	text []byte
+	pos  []int
+}
+
+func (m *mapped) String() string { return string(m.text) }
+
+// addLiteral добавляет значение части слова без подстановок (её пропускает wordValue).
+func (m *mapped) addLiteral(part syntax.WordPart, src string) {
+	switch p := part.(type) {
+	case *syntax.Lit:
+		m.unescape(p.Value, sourceBase(p, p.Value, 0, src), false)
+	case *syntax.SglQuoted:
+		base := -1
+		if !p.Dollar {
+			base = sourceBase(p, p.Value, 1, src)
+		}
+		m.add(p.Value, base)
+	case *syntax.DblQuoted:
+		for _, inner := range p.Parts {
+			if lit, ok := inner.(*syntax.Lit); ok {
+				m.unescape(lit.Value, sourceBase(lit, lit.Value, 0, src), true)
+			}
+		}
+	}
+}
+
+// add добавляет raw как есть; base — смещение raw в исходной команде, -1 — его нет.
+func (m *mapped) add(raw string, base int) {
+	for i := 0; i < len(raw); i++ {
+		m.push(raw[i], base, i)
+	}
+}
+
+func (m *mapped) push(b byte, base, i int) {
+	m.text = append(m.text, b)
+	if base < 0 {
+		m.pos = append(m.pos, -1)
+	} else {
+		m.pos = append(m.pos, base+i)
+	}
+}
+
+// unescape добавляет raw без экранирования; base — смещение raw в исходной команде, -1 — его нет.
+// В двойных кавычках обратная косая значима только перед " \ $ ` и переводом строки, вне кавычек — перед
+// любым байтом; `\`+перевод строки — продолжение строки.
+func (m *mapped) unescape(raw string, base int, double bool) {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) && (!double || strings.IndexByte("\"\\$`\n", raw[i+1]) >= 0) {
+			i++
+			if raw[i] == '\n' {
+				continue
+			}
+		}
+		m.push(raw[i], base, i)
+	}
+}
+
+// unescapeDouble снимает экранирование в двойных кавычках.
+func unescapeDouble(s string) string {
+	var m mapped
+	m.unescape(s, -1, true)
+	return m.String()
+}
 
 // unescapeBare снимает экранирование вне кавычек: `\x` — x, `\`+перевод строки — продолжение строки.
 func unescapeBare(s string) string {
 	if !strings.Contains(s, `\`) {
 		return s
 	}
-	var out strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			i++
-			if s[i] == '\n' {
-				continue
-			}
-		}
-		out.WriteByte(s[i])
-	}
-	return out.String()
+	var m mapped
+	m.unescape(s, -1, false)
+	return m.String()
 }
 
 // words — значения слов команды; у слов с подстановками — их текст. argv0 из переменной, присвоенной
@@ -640,7 +723,7 @@ func unquotedText(w *syntax.Word, src string) string {
 		case *syntax.DblQuoted:
 			for _, inner := range p.Parts {
 				if lit, ok := inner.(*syntax.Lit); ok {
-					text.WriteString(unescapeDouble.Replace(lit.Value))
+					text.WriteString(unescapeDouble(lit.Value))
 				} else {
 					text.WriteString(nodeText(inner, src))
 				}
@@ -700,7 +783,7 @@ func wordValue(w *syntax.Word) (string, bool) {
 				if !ok {
 					return "", false
 				}
-				value.WriteString(unescapeDouble.Replace(lit.Value))
+				value.WriteString(unescapeDouble(lit.Value))
 			}
 		default:
 			return "", false
@@ -743,20 +826,25 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 		if !command || operand >= len(args) || c.words[operand+1].script == "" {
 			return nil // нет -c, скрипта нет или он виден только при запуске
 		}
-		return parseNested(c.words[operand+1].script, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
+		script := c.words[operand+1]
+		return parseNested(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
 	case name == "ssh":
 		start, ok := sshCommand(args)
 		if !ok {
 			return nil
 		}
-		parts := make([]string, 0, len(args)-start)
-		for _, w := range c.words[start+1:] {
+		var remote mapped
+		for i, w := range c.words[start+1:] {
 			if w.script == "" {
 				return nil
 			}
-			parts = append(parts, w.script)
+			if i > 0 {
+				remote.add(" ", -1) // ssh соединяет слова команды пробелом
+			}
+			remote.text = append(remote.text, w.script...)
+			remote.pos = append(remote.pos, w.pos...)
 		}
-		return parseNested(strings.Join(parts, " "), c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls)
+		return parseNested(remote.String(), remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls)
 	case !wrappers[name] && !dataArgs[name]:
 		// Оболочка с -c среди аргументов незнакомой программы (`X exec dir bash -c '…'`): та её запускает.
 		for i, arg := range args {

@@ -184,7 +184,7 @@ func TestHeredocSubstitutionOffset(t *testing.T) {
 
 	script := "bash <<EOF\n$(kill 1)\necho ok\nEOF"
 	calls, err = Find(script, "kill")
-	if err != nil || len(calls) != 1 || calls[0].Offset != -1 {
+	if err != nil || len(calls) != 1 || calls[0].Offset != strings.Index(script, "kill") {
 		t.Errorf("вызов подстановки в скрипте heredoc = %#v, %v", calls, err)
 	}
 }
@@ -226,8 +226,11 @@ func TestLoopCalls(t *testing.T) {
 			t.Errorf("вложенный вызов в цикле не помечен: %#v", calls)
 		}
 		for _, call := range calls {
-			if call.Name == "sleep" && call.Offset != -1 {
-				t.Errorf("смещение вложенного вызова = %d, want -1", call.Offset)
+			if call.Name != "sleep" {
+				continue
+			}
+			if want := strings.Index(command, "sleep "+call.Args[0]); call.Offset != want {
+				t.Errorf("смещение вложенного вызова = %d, want %d", call.Offset, want)
 			}
 		}
 	}
@@ -264,12 +267,18 @@ func TestOffset(t *testing.T) {
 		{"second line and path", "echo a\nsudo -u r /usr/bin/pgrep x", "pgrep", []int{17}},
 		{"exec target", "graft exec --heavy -- pgrep x", "pgrep", []int{22}},
 		{"time keyword", "time pgrep x", "time", []int{0}},
-		{"bash -c", "bash -c 'pgrep x'", "pgrep", []int{-1}},
-		{"shell heredoc", "bash <<'EOF'\npgrep x\nEOF", "pgrep", []int{-1}},
+		{"bash -c", "bash -c 'pgrep x'", "pgrep", []int{9}},
+		{"bash -c double-quoted with escapes", `bash -c "echo \"a\" \$b; pgrep x"`, "pgrep", []int{25}},
+		{"bash -c bare word", `sh -c pgrep`, "pgrep", []int{6}},
+		{"nested bash -c", `bash -c "sh -c 'pgrep x'"`, "pgrep", []int{16}},
+		{"ssh remote words", `ssh -p 22 h echo a\; pgrep x`, "pgrep", []int{21}},
+		{"ssh quoted remote script", "ssh h 'cd /x && pgrep y'", "pgrep", []int{16}},
+		{"ansi-c quoted script", "bash -c $'pgrep x'", "pgrep", []int{-1}},
+		{"shell heredoc", "bash <<'EOF'\npgrep x\nEOF", "pgrep", []int{13}},
 		{"variable argv0", "P=/usr/bin/pgrep; $P x", "pgrep", []int{-1}},
 		{"substitution", "echo $(pgrep x)", "pgrep", []int{7}},
 		{"substitution in heredoc", "cat <<EOF\n$(pgrep x)\nEOF", "pgrep", []int{12}},
-		{"substitution in shell heredoc script", "bash <<'EOF'\necho $(pgrep x)\nEOF", "pgrep", []int{-1}},
+		{"substitution in shell heredoc script", "bash <<'EOF'\necho $(pgrep x)\nEOF", "pgrep", []int{20}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
