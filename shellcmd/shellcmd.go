@@ -742,28 +742,76 @@ func words(ws []*syntax.Word, src string, vars map[string]string) ([]string, int
 		result[i] = nodeText(w, src)
 	}
 	if len(ws) > 0 {
-		if name, ok := paramName(ws[0]); ok && vars[name] != "" {
-			result[0] = vars[name]
-			if _, quoted := ws[0].Parts[0].(*syntax.DblQuoted); !quoted {
-				if fields := strings.FieldsFunc(vars[name], isIFS); len(fields) > 1 {
-					return append(fields, result[1:]...), len(fields) - 1
+		name, ok := paramName(ws[0])
+		value, set := vars[name]
+		_, quoted := ws[0].Parts[0].(*syntax.DblQuoted)
+		switch {
+		case ok && set && !quoted:
+			fields := splitFields(value)
+			if len(fields) == 0 {
+				if len(ws) > 1 {
+					return result[1:], -1
 				}
+				result[0] = value
+				break
 			}
-		} else if _, literal := wordValue(ws[0]); !literal {
-			result[0] = unquotedText(ws[0], src)
+			return append(fields, result[1:]...), len(fields) - 1
+		case ok && value != "":
+			result[0] = value
+		default:
+			if _, literal := wordValue(ws[0]); !literal {
+				result[0] = unquotedText(ws[0], src)
+			}
 		}
 	}
 	return result, 0
 }
 
-func isIFS(r rune) bool {
-	return r == ' ' || r == '\t' || r == '\n'
+// splitFields делит значение переменной на слова по пробелам, табам и переводам строк вне подстановок
+// ($(…), ${…}, `…`): их текст остаётся одним словом, как останется результат подстановки в имени.
+func splitFields(s string) []string {
+	var fields []string
+	var closers []byte
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case len(closers) > 0 && c == closers[len(closers)-1]:
+			closers = closers[:len(closers)-1]
+		case c == '`':
+			closers = append(closers, '`')
+		case c == '$' && i+1 < len(s) && (s[i+1] == '(' || s[i+1] == '{'):
+			closers = append(closers, map[byte]byte{'(': ')', '{': '}'}[s[i+1]])
+			if start < 0 {
+				start = i
+			}
+			i++
+			continue
+		case len(closers) == 0 && (c == ' ' || c == '\t' || c == '\n'):
+			if start >= 0 {
+				fields = append(fields, s[start:i])
+				start = -1
+			}
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		fields = append(fields, s[start:])
+	}
+	return fields
 }
 
-// splitWords вставляет после argv0 слова, добавленные делением его значения: их нет в исходном тексте.
+// splitWords согласует слова команды с делением argv0: split > 0 — после argv0 вставлены слова,
+// которых нет в исходном тексте; -1 — argv0 из пустого значения выпал, программа — следующее слово.
 func splitWords(ws []word, split int) []word {
 	if split == 0 {
 		return ws
+	}
+	if split < 0 {
+		return ws[1:]
 	}
 	result := append([]word{ws[0]}, make([]word, split)...)
 	for i := 1; i <= split; i++ {

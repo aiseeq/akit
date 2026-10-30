@@ -321,6 +321,12 @@ func TestVariableArgv0Split(t *testing.T) {
 		{`P="timeout 5"; $P pgrep x`, "pgrep", []string{"x"}, []string{"timeout"}, 18},
 		{`C="curl -u $U:$K"; $C "$url"`, "curl", []string{"-u", "$U:$K", `"$url"`}, nil, -1},
 		{`R="$HOME/bin/tool"; $R x`, "tool", []string{"x"}, nil, -1},
+		{`P=" pgrep"; $P x`, "pgrep", []string{"x"}, nil, -1},
+		{`P="pgrep "; $P x`, "pgrep", []string{"x"}, nil, -1},
+		{`P="   "; $P pgrep x`, "pgrep", []string{"x"}, nil, 12},
+		{`P=""; $P pgrep x`, "pgrep", []string{"x"}, nil, 9},
+		{`P="$(command -v pgrep) -f"; $P x`, "", []string{"-f", "x"}, nil, -1},
+		{`P="${T:-pgrep -f}"; $P x`, "${T:-pgrep -f}", []string{"x"}, nil, -1},
 	}
 	for _, tt := range tests {
 		calls, err := Calls(tt.command)
