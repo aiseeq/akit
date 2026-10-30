@@ -9,6 +9,8 @@ tasks:
   test:
     desc: все тесты
     tests: go
+    # Тесты читают только своё дерево и временные папки: при занятой машине гейт отдаёт их PC.
+    remote: true
     run:
       - go test -p {threads} -json {args} ./...
   build:

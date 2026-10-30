@@ -1,6 +1,6 @@
 # shellcmd: argv0 из переменной без кавычек делится на слова
 
-Статус: в работе
+Статус: на проверке
 Исполнитель: akit-master
 
 ## Вход
@@ -16,3 +16,4 @@
 - 2026-10-30 06:00 открыт — akit-master
 - 2026-10-30 06:00 в работе — akit-master
 - 2026-10-30 06:02 note — akit-master: Сделано: words делит значение argv0 из $P без кавычек по пробелу, табу, переводу строки (splitWords вставляет слова с Offset -1); collectAssignments хранит нелитеральное значение без кавычек (unquotedText), иначе имя было `"curl`/`x"`. TestVariableArgv0Split (6 случаев, красный до правки). Сверка v1.13.1 → рабочее дерево (/home/aisee/.cache/claude-tmp/split-cmp/, names.sh): waits-corpus 188 строк, corpus-search-dryrun 9 — все со сменой имени мусор → программа (git, workspace-cli, curl, tmux), строк только со сменой аргументов 0.
+- 2026-10-30 06:02 на проверке — akit-master
