@@ -42,10 +42,19 @@ func TestCalls(t *testing.T) {
 		{"shell -c under an unknown program", `frame.sh exec /tmp/t bash -c 'grep -rl x d'`, []string{"frame.sh", "bash", "grep"}},
 		{"echo of bash -c is data", `echo bash -c 'rg x'`, []string{"echo"}},
 		{"substitution in a redirect target", `tr a b < /proc/$(pgrep -f x | head -1)/cmdline`, []string{"tr", "pgrep", "head"}},
-		{"heredoc body with substitution stays data", "cat <<EOF\n$(rg x)\nEOF", []string{"cat"}},
+		{"heredoc body substitution executes", "cat <<EOF\n$(rg x)\nEOF", []string{"cat", "rg"}},
+		{"heredoc substitutions execute", "cat <<EOF\n$(kill 1) `which rg`\nEOF", []string{"cat", "kill", "which"}},
+		{"shell heredoc after script file is data", "bash script.sh <<'EOF'\nSELECT * FROM t;\nEOF", []string{"bash"}},
+		{"shell heredoc after command string is data", "bash -c 'cat' <<EOF\n$(kill 1)\nEOF", []string{"bash", "cat", "kill"}},
+		{"shell heredoc after options and script file is data", "timeout 5 bash -euo pipefail -- script.sh <<'EOF'\nSELECT * FROM t;\nEOF", []string{"timeout", "bash"}},
+		{"shell heredoc after plus option value", "bash +o pipefail <<'EOF'\nrg x\nEOF", []string{"bash", "rg"}},
+		{"shell heredoc after long option", "bash --norc <<'EOF'\nrg x\nEOF", []string{"bash", "rg"}},
+		{"shell stdin option heredoc is script", "bash -s -- arg <<'EOF'\nrg x\nEOF", []string{"bash", "rg"}},
+		{"command lookup does not run target", "command -v wfor; command -V rg; command -p -v sed", []string{"command", "command", "command"}},
+		{"command wrapper runs target", "command -p rg x", []string{"command", "rg"}},
 		{"escapes in words", `sh -c "rg \"a b\" \$HOME"; echo a\ b`, []string{"sh", "rg", "echo"}},
 		{"unclosed heredoc runs to the end like bash", "bash <<'EOF'\nrg x", []string{"bash", "rg"}},
-		{"invalid nested script", `bash -c 'echo "unterminated'; echo after`, nil},
+		{"invalid nested script", `bash -c 'echo "unterminated'; echo after`, []string{"bash", "echo"}},
 		{"invalid nested script syntax", `bash -c 'rg x; if then'`, nil},
 		{"bash long option is not command string", `bash --norc -c 'rg x'`, []string{"bash", "rg"}},
 		{"timeout shell heredoc", "timeout 5 bash <<'EOF'\nrg x\nEOF", []string{"timeout", "bash", "rg"}},
@@ -97,14 +106,17 @@ EOF`, []string{"echo", "cat"}},
 				if err == nil {
 					t.Fatal("Calls() не вернул ошибку разбора")
 				}
-				var nestedErr *nestedParseError
+				var nestedErr *NestedError
 				if !errors.As(err, &nestedErr) {
 					t.Fatalf("ошибка вложенного разбора не обёрнута: %v", err)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatal(err)
+				var nestedErr *NestedError
+				if !errors.As(err, &nestedErr) {
+					t.Fatal(err)
+				}
 			}
 			var names []string
 			for _, call := range got {
@@ -114,6 +126,62 @@ EOF`, []string{"echo", "cat"}},
 				t.Fatalf("names = %#v, want %#v; calls: %#v", names, tt.want, got)
 			}
 		})
+	}
+}
+
+func TestNestedErrorsKeepCalls(t *testing.T) {
+	calls, err := Calls(`echo a; sh -c 'echo "x'; rg y; bash -c 'if then'; sed z`)
+	var nested *NestedError
+	if !errors.As(err, &nested) || nested.Script == "" {
+		t.Fatalf("NestedError = %#v, %v", nested, err)
+	}
+	var names []string
+	for _, call := range calls {
+		names = append(names, call.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"echo", "sh", "rg", "bash", "sed"}) {
+		t.Fatalf("вызовы при ошибках вложенных скриптов = %#v", names)
+	}
+	found, findErr := Find(`echo a; sh -c 'echo "x'; rg y`, "rg")
+	if !errors.As(findErr, &nested) || len(found) != 1 || found[0].Name != "rg" {
+		t.Fatalf("Find при ошибке вложенного скрипта = %#v, %v", found, findErr)
+	}
+}
+
+func TestBackgroundCalls(t *testing.T) {
+	calls, err := Calls(`(bash -c 'sleep 5') & { rg x; } && sleep 1 & echo done`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "echo" {
+			if call.Background {
+				t.Errorf("передний вызов помечен фоновым: %#v", call)
+			}
+		} else if !call.Background {
+			t.Errorf("вызов не унаследовал фон: %#v", call)
+		}
+	}
+}
+
+func TestHeredocSubstitutionOffset(t *testing.T) {
+	command := "cat <<EOF\n$(kill 1)\nEOF"
+	calls, err := Find(command, "kill")
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("вызов из heredoc = %#v, %v", calls, err)
+	}
+	if want := strings.Index(command, "kill"); calls[0].Offset != want {
+		t.Errorf("Offset = %d, want %d", calls[0].Offset, want)
+	}
+	parent, err := Find(command, "cat")
+	if err != nil || len(parent) != 1 || len(parent[0].Redirs) != 1 || parent[0].Redirs[0].Body != "$(kill 1)\n" {
+		t.Errorf("данные heredoc изменились: %#v, %v", parent, err)
+	}
+
+	script := "bash <<EOF\n$(kill 1)\necho ok\nEOF"
+	calls, err = Find(script, "kill")
+	if err != nil || len(calls) != 1 || calls[0].Offset != -1 {
+		t.Errorf("вызов подстановки в скрипте heredoc = %#v, %v", calls, err)
 	}
 }
 
@@ -196,6 +264,8 @@ func TestOffset(t *testing.T) {
 		{"shell heredoc", "bash <<'EOF'\npgrep x\nEOF", "pgrep", []int{-1}},
 		{"variable argv0", "P=/usr/bin/pgrep; $P x", "pgrep", []int{-1}},
 		{"substitution", "echo $(pgrep x)", "pgrep", []int{7}},
+		{"substitution in heredoc", "cat <<EOF\n$(pgrep x)\nEOF", "pgrep", []int{12}},
+		{"substitution in shell heredoc script", "bash <<'EOF'\necho $(pgrep x)\nEOF", "pgrep", []int{-1}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -215,6 +285,13 @@ func TestOffset(t *testing.T) {
 				t.Fatalf("offsets = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCallsExternalParseErrorReturnsNil(t *testing.T) {
+	calls, err := Calls("echo before; if")
+	if err == nil || calls != nil {
+		t.Fatalf("Calls() = %#v, %v; want nil and parse error", calls, err)
 	}
 }
 
@@ -309,9 +386,9 @@ func TestCorpus(t *testing.T) {
 			continue
 		}
 		failures++
-		var nestedErr *nestedParseError
+		var nestedErr *NestedError
 		if errors.As(parseErr, &nestedErr) {
-			if err := exec.Command("bash", "-n", "-c", nestedErr.script).Run(); err == nil {
+			if err := exec.Command("bash", "-n", "-c", nestedErr.Script).Run(); err == nil {
 				t.Errorf("строка %d: вложенный скрипт не разобран, но bash -n его принял: %v", total, parseErr)
 				continue
 			}

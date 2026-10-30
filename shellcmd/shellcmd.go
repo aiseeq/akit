@@ -25,6 +25,8 @@ type Call struct {
 	Redirs []Redir
 	// Loop — вызов в теле цикла while, until или for (и во вложенном скрипте такого тела).
 	Loop bool
+	// Background — вызов в задании, чей оператор или объемлющий оператор заканчивается `&`.
+	Background bool
 }
 
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
@@ -50,11 +52,16 @@ type Redir struct {
 	BodyStart, BodyEnd int
 }
 
-// Calls возвращает вызовы программ во всех частях скрипта.
+// Calls возвращает найденные вызовы и ошибки разбора вложенных скриптов. При ошибке внешнего
+// разбора или обхода возвращает nil. Find сохраняет то же правило при фильтрации.
 func Calls(cmd string) ([]Call, error) {
 	var calls []Call
 	if err := parse(cmd, 0, nil, make(map[string]string), &calls); err != nil {
-		return nil, err
+		var nested *NestedError
+		if !errors.As(err, &nested) {
+			return nil, err
+		}
+		return calls, err
 	}
 	return calls, nil
 }
@@ -62,7 +69,8 @@ func Calls(cmd string) ([]Call, error) {
 // Find возвращает только вызовы с указанными именами.
 func Find(cmd string, names ...string) ([]Call, error) {
 	calls, err := Calls(cmd)
-	if err != nil {
+	var nested *NestedError
+	if err != nil && !errors.As(err, &nested) {
 		return nil, err
 	}
 	wanted := make(map[string]bool, len(names))
@@ -75,7 +83,7 @@ func Find(cmd string, names ...string) ([]Call, error) {
 			filtered = append(filtered, calls[i])
 		}
 	}
-	return filtered, nil
+	return filtered, err
 }
 
 func parse(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
@@ -118,71 +126,169 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 }
 
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
-	timedCalls := timedCallSet(file)
-	redirs := make(map[*syntax.CallExpr][]Redir)
-	loopCalls := loopCallSet(file)
-	var shellInputs []*syntax.Stmt
-	var parseErr error
-	var visit func(node syntax.Node) bool
-	visit = func(node syntax.Node) bool {
-		if parseErr != nil { //nolint:silent-error-handling // Обход прекращается после сохранения ошибки для возврата наружу.
-			return false
-		}
-		if r, ok := node.(*syntax.Redirect); ok {
-			// Цель перенаправления выполняется (`< /proc/$(pgrep x)/cmdline`), тело heredoc — данные,
-			// пока оно не передано оболочке.
-			if r.Word != nil {
-				syntax.Walk(r.Word, visit)
-			}
-			return false
-		}
-		if clause, ok := node.(*syntax.TimeClause); ok {
-			start, end := int(clause.Pos().Offset()), int(clause.End().Offset())
-			if !validSpan(src, start, end) {
-				parseErr = fmt.Errorf("shellcmd: invalid source span for time clause")
-				return false
-			}
-			*calls = append(*calls, Call{Name: "time", Raw: src[start:end], Line: int(clause.Pos().Line()) + lineBase, Via: append([]string(nil), inherited...), Offset: start})
-		}
-		if stmt, ok := node.(*syntax.Stmt); ok {
-			if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(stmt.Redirs) > 0 {
-				redirs[call] = stmtRedirs(stmt.Redirs, src)
-			}
-			if shellInput(stmt, src, vars) {
-				shellInputs = append(shellInputs, stmt)
-			}
-		}
-		call, ok := node.(*syntax.CallExpr)
-		if !ok {
+	info := collectWalkInfo(file, src, vars)
+	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, info: info}
+	syntax.Walk(file, walker.visit)
+	if walker.parseErr != nil {
+		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
+	}
+	if err := parseHeredocStmts(info.shellInputs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls); err != nil {
+		walker.nestedErrs = append(walker.nestedErrs, err)
+	}
+	return errors.Join(walker.nestedErrs...)
+}
+
+type walkInfo struct {
+	timedCalls      map[*syntax.CallExpr]bool
+	redirs          map[*syntax.CallExpr][]Redir
+	loopCalls       map[*syntax.CallExpr]bool
+	backgroundCalls map[*syntax.CallExpr]bool
+	shellInputs     []*syntax.Stmt
+	shellHdocs      map[*syntax.Redirect]bool
+}
+
+func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walkInfo {
+	info := walkInfo{
+		timedCalls:      timedCallSet(file),
+		redirs:          make(map[*syntax.CallExpr][]Redir),
+		loopCalls:       loopCallSet(file),
+		backgroundCalls: backgroundCallSet(file),
+		shellHdocs:      make(map[*syntax.Redirect]bool),
+	}
+	syntax.Walk(file, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok || !shellInput(stmt, src, vars) {
 			return true
 		}
-		if len(call.Args) == 0 {
-			collectAssignments(call, src, vars)
-			return true
-		}
-		args := words(call.Args, src, vars)
-		start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
-		if !validSpan(src, start, end) {
-			parseErr = fmt.Errorf("shellcmd: invalid source span for command")
-			return false
-		}
-		via := append([]string(nil), inherited...)
-		if timedCalls[call] {
-			via = append(via, "time")
-		}
-		ws := cmdWords(call.Args, src)
-		c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: src[start:end], Line: int(call.Pos().Line()) + lineBase, Via: via, Offset: ws[0].offset, Redirs: redirs[call], Loop: loopCalls[call]}, words: ws}
-		if err := emit(c, lineBase, vars, calls); err != nil {
-			parseErr = err
-			return false
+		info.shellInputs = append(info.shellInputs, stmt)
+		for _, redirect := range stmt.Redirs {
+			if redirect.Hdoc != nil {
+				info.shellHdocs[redirect] = true
+			}
 		}
 		return true
+	})
+	return info
+}
+
+type callWalker struct {
+	src        string
+	lineBase   int
+	inherited  []string
+	vars       map[string]string
+	calls      *[]Call
+	info       walkInfo
+	parseErr   error
+	nestedErrs []error
+}
+
+func (w *callWalker) visit(node syntax.Node) bool {
+	if w.parseErr != nil {
+		return false
 	}
-	syntax.Walk(file, visit)
-	if parseErr != nil {
-		return fmt.Errorf("shellcmd: walk syntax tree: %w", parseErr)
+	if redirect, ok := node.(*syntax.Redirect); ok {
+		w.visitRedirect(redirect)
+		return false
 	}
-	return parseHeredocStmts(shellInputs, src, lineBase, inherited, vars, loopCalls, calls)
+	if clause, ok := node.(*syntax.TimeClause); ok {
+		w.addTime(clause)
+		if w.parseErr != nil {
+			return false
+		}
+	}
+	if stmt, ok := node.(*syntax.Stmt); ok {
+		w.visitStmt(stmt)
+	}
+	if call, ok := node.(*syntax.CallExpr); ok {
+		w.visitCall(call)
+		return w.parseErr == nil
+	}
+	return true
+}
+
+func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
+	// Цель перенаправления выполняется, тело heredoc — данные, пока оно не передано оболочке.
+	if redirect.Word != nil {
+		syntax.Walk(redirect.Word, w.visit)
+	}
+	if redirect.Hdoc != nil && !w.info.shellHdocs[redirect] && !quotedHeredoc(redirect.Word) {
+		syntax.Walk(redirect.Hdoc, w.visit)
+	}
+}
+
+func (w *callWalker) addTime(clause *syntax.TimeClause) {
+	start, end := int(clause.Pos().Offset()), int(clause.End().Offset())
+	if !validSpan(w.src, start, end) {
+		w.parseErr = fmt.Errorf("shellcmd: invalid source span for time clause")
+		return
+	}
+	*w.calls = append(*w.calls, Call{Name: "time", Raw: w.src[start:end], Line: int(clause.Pos().Line()) + w.lineBase, Via: append([]string(nil), w.inherited...), Offset: start})
+}
+
+func (w *callWalker) visitStmt(stmt *syntax.Stmt) {
+	if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(stmt.Redirs) > 0 {
+		w.info.redirs[call] = stmtRedirs(stmt.Redirs, w.src)
+	}
+}
+
+func (w *callWalker) visitCall(call *syntax.CallExpr) {
+	if len(call.Args) == 0 {
+		collectAssignments(call, w.src, w.vars)
+		return
+	}
+	args := words(call.Args, w.src, w.vars)
+	start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
+	if !validSpan(w.src, start, end) {
+		w.parseErr = fmt.Errorf("shellcmd: invalid source span for command")
+		return
+	}
+	via := append([]string(nil), w.inherited...)
+	if w.info.timedCalls[call] {
+		via = append(via, "time")
+	}
+	ws := cmdWords(call.Args, w.src)
+	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call]}, words: ws}
+	if err := emit(c, w.lineBase, w.vars, w.calls); err != nil {
+		var nested *NestedError
+		if errors.As(err, &nested) {
+			w.nestedErrs = append(w.nestedErrs, err)
+			return
+		}
+		w.parseErr = err
+		return
+	}
+}
+
+func backgroundCallSet(file *syntax.File) map[*syntax.CallExpr]bool {
+	backgroundCalls := make(map[*syntax.CallExpr]bool)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok || !stmt.Background {
+			return true
+		}
+		syntax.Walk(stmt, func(child syntax.Node) bool {
+			if call, ok := child.(*syntax.CallExpr); ok {
+				backgroundCalls[call] = true
+			}
+			return true
+		})
+		return true
+	})
+	return backgroundCalls
+}
+
+func quotedHeredoc(word *syntax.Word) bool {
+	quoted := false
+	if word != nil {
+		syntax.Walk(word, func(node syntax.Node) bool {
+			switch node.(type) {
+			case *syntax.SglQuoted, *syntax.DblQuoted:
+				quoted = true
+			}
+			return !quoted
+		})
+	}
+	return quoted
 }
 
 func loopCallSet(file *syntax.File) map[*syntax.CallExpr]bool {
@@ -250,7 +356,8 @@ func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
 }
 
-func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited []string, vars map[string]string, loopCalls map[*syntax.CallExpr]bool, calls *[]Call) error {
+func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call) error {
+	var nestedErrs []error
 	for _, stmt := range stmts {
 		name, shellVia, ok := shellInputName(stmt, src, vars)
 		if !ok {
@@ -260,18 +367,25 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 			if redir.Hdoc == nil {
 				continue
 			}
-			body, literal := wordValue(redir.Hdoc)
-			if !literal {
-				continue
-			}
+			body := heredocText(redir, src)
 			via := append(append(append([]string(nil), inherited...), shellVia...), name)
 			call, _ := stmt.Cmd.(*syntax.CallExpr)
-			if err := parseNested(body, int(redir.Hdoc.Pos().Line())+lineBase-1, via, loopCalls[call], vars, calls); err != nil {
-				return err
+			if err := parseNested(body, int(redir.Hdoc.Pos().Line())+lineBase-1, via, loopCalls[call], backgroundCalls[call], vars, calls); err != nil {
+				nestedErrs = append(nestedErrs, err)
 			}
 		}
 	}
-	return nil
+	return errors.Join(nestedErrs...)
+}
+
+func heredocText(redir *syntax.Redirect, src string) string {
+	start, end := int(redir.Hdoc.Pos().Offset()), int(redir.Hdoc.End().Offset())
+	if !validSpan(src, start, end) {
+		return ""
+	}
+	delim, _ := wordValue(redir.Word)
+	end = start + heredocBodyLen(src[start:end], delim)
+	return src[start:end]
 }
 
 func shellInput(stmt *syntax.Stmt, src string, vars map[string]string) bool {
@@ -290,7 +404,7 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	for {
 		if isShell(name) {
 			for _, redir := range stmt.Redirs {
-				if redir.Hdoc != nil {
+				if redir.Hdoc != nil && shellReadsHeredoc(args) {
 					return name, via, true
 				}
 			}
@@ -314,32 +428,82 @@ func isShell(name string) bool {
 	return name == "bash" || name == "sh" || name == "zsh"
 }
 
+// shellReadsHeredoc — оболочка читает heredoc как скрипт, если её stdin не заменён -c или файлом.
+func shellReadsHeredoc(args []string) bool {
+	stdin, command := false, false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return (stdin || i+1 == len(args) || args[i+1] == "-") && !command
+		}
+		if arg == "-" {
+			return true
+		}
+		isOption, takesValue, readsStdin, readsCommand := shellArgumentOption(arg)
+		if isOption {
+			stdin, command = stdin || readsStdin, command || readsCommand
+			if takesValue {
+				i++
+			}
+			continue
+		}
+		return stdin && !command
+	}
+	return !command
+}
+
+func shellArgumentOption(arg string) (option, takesValue, stdin, command bool) {
+	if arg == "--rcfile" || arg == "--init-file" {
+		return true, true, false, false
+	}
+	if strings.HasPrefix(arg, "--") {
+		return true, false, false, false
+	}
+	if len(arg) < 2 || (arg[0] != '-' && arg[0] != '+') {
+		return false, false, false, false
+	}
+	for j := 1; j < len(arg); j++ {
+		switch arg[j] {
+		case 'c':
+			command = true
+		case 's':
+			stdin = true
+		case 'o', 'O':
+			takesValue = j == len(arg)-1
+			return true, takesValue, stdin, command
+		}
+	}
+	return true, false, stdin, command
+}
+
 // IsShell сообщает, входит ли команда в список поддерживаемых оболочек.
 func IsShell(name string) bool { return isShell(name) }
 
-type nestedParseError struct {
-	script string
-	err    error
+// NestedError описывает синтаксическую ошибку скрипта, переданного вложенной оболочке.
+type NestedError struct {
+	Script string
+	Err    error
 }
 
-func (e *nestedParseError) Error() string { return e.err.Error() }
-func (e *nestedParseError) Unwrap() error { return e.err }
+func (e *NestedError) Error() string { return e.Err.Error() }
+func (e *NestedError) Unwrap() error { return e.Err }
 
-func parseNested(src string, lineBase int, via []string, inLoop bool, vars map[string]string, calls *[]Call) error {
+func parseNested(src string, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call) error {
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
-	if err := parse(src, lineBase, via, nestedVars, &nestedCalls); err != nil {
-		var nestedErr *nestedParseError
-		if errors.As(err, &nestedErr) {
-			return fmt.Errorf("shellcmd: parse nested shell: %w", err)
+	err := parse(src, lineBase, via, nestedVars, &nestedCalls)
+	if err != nil {
+		var nestedErr *NestedError
+		if !errors.As(err, &nestedErr) {
+			err = &NestedError{Script: src, Err: err}
 		}
-		return fmt.Errorf("shellcmd: parse nested shell: %w", &nestedParseError{script: src, err: err})
 	}
 	// Смещения во вложенном тексте не указывают в исходную команду.
 	for i := range nestedCalls {
 		nestedCalls[i].Offset = -1
 		nestedCalls[i].Loop = nestedCalls[i].Loop || inLoop
+		nestedCalls[i].Background = nestedCalls[i].Background || inBackground
 		redirs := slices.Clone(nestedCalls[i].Redirs)
 		for j := range redirs {
 			redirs[j].BodyStart, redirs[j].BodyEnd = -1, -1
@@ -348,7 +512,7 @@ func parseNested(src string, lineBase int, via []string, inLoop bool, vars map[s
 	}
 	*calls = append(*calls, nestedCalls...)
 	maps.Copy(vars, nestedVars)
-	return nil
+	return err
 }
 
 // stmtRedirs — перенаправления команды с телами heredoc и их границами в src.
@@ -547,7 +711,7 @@ func wordValue(w *syntax.Word) (string, bool) {
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop}, words: c.words[i:]}
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background}, words: c.words[i:]}
 }
 
 func (c cmd) via(more ...string) []string {
@@ -581,7 +745,7 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 			if i+1 >= len(args) || c.words[i+2].script == "" {
 				return nil // скрипта нет или он виден только при запуске
 			}
-			return parseNested(c.words[i+2].script, c.call.Line-1, c.via(name, "-c"), c.call.Loop, vars, calls)
+			return parseNested(c.words[i+2].script, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
 		}
 	case name == "ssh":
 		start, ok := sshCommand(args)
@@ -595,7 +759,7 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 			}
 			parts = append(parts, w.script)
 		}
-		return parseNested(strings.Join(parts, " "), c.call.Line-1, c.via("ssh"), c.call.Loop, vars, calls)
+		return parseNested(strings.Join(parts, " "), c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls)
 	case !wrappers[name] && !dataArgs[name]:
 		// Оболочка с -c среди аргументов незнакомой программы (`X exec dir bash -c '…'`): та её запускает.
 		for i, arg := range args {
@@ -658,6 +822,9 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	var via []string
 	for wrappers[name] {
 		via = append(via, name)
+		if name == "command" && commandIsLookup(args) {
+			return nil, via, false
+		}
 		i := 0
 		for i < len(args) && strings.HasPrefix(args[i], "-") {
 			if args[i] == "--" {
@@ -685,6 +852,18 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 		return nil, via, false
 	}
 	return append([]string{name}, args...), via, len(via) > 0
+}
+
+func commandIsLookup(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "-v" || arg == "-V" {
+			return true
+		}
+	}
+	return false
 }
 
 // wrappers — программы, которые запускают программу из своих аргументов.

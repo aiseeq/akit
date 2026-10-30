@@ -9,6 +9,7 @@ package waits
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"path"
@@ -533,12 +534,16 @@ func kind(ev transcript.Event) (how, text string) {
 // CommandHow — способ ожидания по вызовам программ в команде оболочки.
 func CommandHow(command string) string {
 	calls, err := shellcmd.Calls(command)
-	if err != nil { //nolint:error-masking,silent-error-handling // Ошибку разбора отвергнет Bash, такая команда не станет ожиданием.
+	var nested *shellcmd.NestedError
+	if err != nil && !errors.As(err, &nested) {
 		return ""
 	}
 	var sleep bool
 	for i := range calls {
 		call := &calls[i]
+		if call.Background {
+			continue
+		}
 		switch {
 		case call.Name == "wfor" && wforAction(call.Args):
 			return Wfor
@@ -626,7 +631,8 @@ func edit(ev transcript.Event) bool {
 		return true
 	}
 	calls, err := shellcmd.Calls(ev.Text)
-	if err != nil { //nolint:silent-error-handling,error-masked-as-false-bool // Bash отвергнет ошибочную команду, правки в ней не выполнятся.
+	var nested *shellcmd.NestedError
+	if err != nil && !errors.As(err, &nested) {
 		return false
 	}
 	for i := range calls {
@@ -694,7 +700,8 @@ func sendTo(raw json.RawMessage) string {
 // limitOf — timeout N вокруг команды; 0 — нет.
 func limitOf(cmd string) time.Duration {
 	calls, err := shellcmd.Calls(cmd)
-	if err != nil { //nolint:error-masking,silent-error-handling // Bash отклонит ошибочную команду; без её разбора ограничение неизвестно.
+	var nested *shellcmd.NestedError
+	if err != nil && !errors.As(err, &nested) {
 		return 0
 	}
 	for i := range calls {

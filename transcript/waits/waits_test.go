@@ -372,9 +372,12 @@ func TestCommandHow(t *testing.T) {
 		"cd ~/git/x && ~/bin/worker wait abc":           Script,
 		"timeout 3600 worker wait abc":                  Script,
 		"sleep 30":                                      Sleep,
+		"sleep 30 & echo started":                       "",
+		"(exec sleep 20) & sleep 0.3; kill %1":          "",
 		"sleep 2":                                       "",
 		"go test ./...":                                 "",
 		"worker run task.md":                            "",
+		"worker wait task & disown":                     "",
 		`echo "worker wait later"`:                      "",
 		"cat > f.md <<'X'\nworker wait abc\nwfor file y\nsleep 60\nX\n": "",
 	}
@@ -387,6 +390,9 @@ func TestCommandHow(t *testing.T) {
 	cases[`bash /x/wait-any.sh 50`] = Script
 	cases[`source ./wait-ready.sh 5`] = Script
 	cases[`cat ./wait-ready.sh`] = ""
+	cases[`sleep 30 & echo started`] = ""
+	cases[`(exec sleep 20) & sleep 0.3; kill %1`] = ""
+	cases[`echo a; sh -c 'echo "x'; wfor exit 123`] = Wfor
 	for cmd, want := range cases {
 		if got := CommandHow(cmd); got != want {
 			t.Errorf("CommandHow(%q) = %q, want %q", cmd, got, want)

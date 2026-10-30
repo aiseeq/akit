@@ -23,8 +23,11 @@ calls, err := shellcmd.Calls(`timeout 5 bash -c 'rg pattern file'`)
 `Calls` returns every program call; `Find` filters the result by program name. `Call.Offset` is the
 byte offset of the program word in the command (`-1` inside a nested script or for a program taken
 from a variable); `Call.Redirs` lists redirections with heredoc bodies and their byte bounds; `Call.Loop`
-marks calls inside a `while`, `until` or `for` body. Scripts are expanded from `bash -c` (also under an
-unknown program), a shell heredoc and the remote command of `ssh` (`Via` names the way in).
+marks calls inside a `while`, `until` or `for` body; `Call.Background` marks calls in a background job.
+Scripts are expanded from `bash -c` (also under an unknown program), a shell heredoc read as stdin, and
+the remote command of `ssh` (`Via` names the way in). A shell heredoc is not treated as a script when
+the shell has `-c` or a script file. `Calls` and `Find` return calls found outside a malformed nested
+script with a `NestedError` that identifies the script and unwraps its parse error.
 
 ## busy
 
