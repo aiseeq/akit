@@ -430,26 +430,27 @@ func isShell(name string) bool {
 
 // shellReadsHeredoc — оболочка читает heredoc как скрипт, если её stdin не заменён -c или файлом.
 func shellReadsHeredoc(args []string) bool {
-	stdin, command := false, false
+	operand, command, stdin := shellArgs(args)
+	return !command && (stdin || operand == len(args))
+}
+
+// shellArgs разбирает `bash [опции] [-c СКРИПТ | -s | ФАЙЛ] [аргументы]`: operand — индекс первого
+// аргумента после опций (len(args) — его нет), command — есть -c, stdin — есть -s.
+func shellArgs(args []string) (operand int, command, stdin bool) {
 	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			return (stdin || i+1 == len(args) || args[i+1] == "-") && !command
+		if args[i] == "--" || args[i] == "-" {
+			return i + 1, command, stdin
 		}
-		if arg == "-" {
-			return true
+		isOption, takesValue, readsStdin, readsCommand := shellArgumentOption(args[i])
+		if !isOption {
+			return i, command, stdin
 		}
-		isOption, takesValue, readsStdin, readsCommand := shellArgumentOption(arg)
-		if isOption {
-			stdin, command = stdin || readsStdin, command || readsCommand
-			if takesValue {
-				i++
-			}
-			continue
+		stdin, command = stdin || readsStdin, command || readsCommand
+		if takesValue {
+			i++
 		}
-		return stdin && !command
 	}
-	return !command
+	return len(args), command, stdin
 }
 
 func shellArgumentOption(arg string) (option, takesValue, stdin, command bool) {
@@ -738,15 +739,11 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 	}
 	switch {
 	case isShell(name):
-		for i, arg := range args {
-			if !shellCommandOption(arg) {
-				continue
-			}
-			if i+1 >= len(args) || c.words[i+2].script == "" {
-				return nil // скрипта нет или он виден только при запуске
-			}
-			return parseNested(c.words[i+2].script, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
+		operand, command, _ := shellArgs(args)
+		if !command || operand >= len(args) || c.words[operand+1].script == "" {
+			return nil // нет -c, скрипта нет или он виден только при запуске
 		}
+		return parseNested(c.words[operand+1].script, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
 	case name == "ssh":
 		start, ok := sshCommand(args)
 		if !ok {
@@ -891,6 +888,18 @@ func set(items ...string) map[string]bool {
 	return out
 }
 
+// optionValue — следующее слово — значение опции: `-u`, и в сцепке `-iu` (у `-uroot` значение внутри).
 func optionValue(wrapper, option string) bool {
-	return valueOptions[wrapper][option]
+	if valueOptions[wrapper][option] {
+		return true
+	}
+	if len(option) < 3 || option[0] != '-' || option[1] == '-' {
+		return false
+	}
+	for j := 1; j < len(option); j++ {
+		if valueOptions[wrapper]["-"+option[j:j+1]] {
+			return j == len(option)-1
+		}
+	}
+	return false
 }
