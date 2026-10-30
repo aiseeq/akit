@@ -33,6 +33,8 @@ func TestCalls(t *testing.T) {
 		{"ssh remote command", `ssh -o StrictHostKeyChecking=no -p 22 host 'timeout 35m bash -c "while true; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "true", "sleep"}},
 		{"ssh remote command with parameter", `ssh host 'timeout 35m bash -c "while kill -0 $child 2>/dev/null; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "kill", "sleep"}},
 		{"ssh without command", `ssh -p 22 host`, []string{"ssh"}},
+		{"ssh options after host", `ssh h -- 'pgrep x'; ssh h -p 22 -o A=b pgrep y; ssh -vp 22 h wc z`, []string{"ssh", "pgrep", "ssh", "pgrep", "ssh", "wc"}},
+		{"ssh options after host without command", `ssh h -p 22`, []string{"ssh"}},
 		{"ssh quoted remote script", `ssh host 'echo $(sleep 5)'`, []string{"ssh", "echo", "sleep"}},
 		{"ssh remote loop with command substitution", `ssh host 'timeout 35m bash -c "while test $(printf x) = x; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "test", "printf", "sleep", "printf"}},
 		{"bash -c in double quotes with any substitution", `bash -c "while test \"${x:-y}\"; do sleep 5; done"`, []string{"bash", "test", "sleep"}},

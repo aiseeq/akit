@@ -881,24 +881,29 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 // dataArgs — программы, чьи аргументы — данные: `echo bash -c x` ничего не запускает.
 var dataArgs = set("echo", "printf")
 
-var sshValueOptions = set("-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w")
-
-// sshCommand — индекс в args первого слова удалённой команды ssh; false — команды нет.
+// sshCommand — индекс в args первого слова удалённой команды ssh; false — команды нет. OpenSSH разбирает
+// опции и после хоста, если до хоста не было `--`.
 func sshCommand(args []string) (int, bool) {
-	i := 0
+	i, ended := sshOptions(args, 0)
+	i++ // хост
+	if !ended {
+		i, _ = sshOptions(args, i)
+	}
+	return i, i < len(args)
+}
+
+// sshOptions пропускает опции ssh с позиции i; ended — их закончил `--`.
+func sshOptions(args []string, i int) (int, bool) {
 	for i < len(args) && strings.HasPrefix(args[i], "-") {
 		if args[i] == "--" {
-			i++
-			break
+			return i + 1, true
 		}
-		if sshValueOptions[args[i]] {
-			i += 2
-			continue
+		if optionValue("ssh", args[i]) {
+			i++
 		}
 		i++
 	}
-	i++ // хост
-	return i, i < len(args)
+	return i, false
 }
 
 func shellCommandOption(arg string) bool {
@@ -977,7 +982,7 @@ func commandIsLookup(args []string) bool {
 // wrappers — программы, которые запускают программу из своих аргументов.
 var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs")
 
-// valueOptions — опции обёрток, следующее слово после которых — их значение, а не программа.
+// valueOptions — опции обёрток и ssh, следующее слово после которых — их значение, а не программа.
 var valueOptions = map[string]map[string]bool{
 	"timeout": set("-s", "--signal", "-k", "--kill-after"),
 	"env":     set("-u", "--unset", "-C", "--chdir"),
@@ -988,6 +993,7 @@ var valueOptions = map[string]map[string]bool{
 	"time":    set("-f", "--format", "-o", "--output"),
 	"exec":    set("-a"),
 	"xargs":   set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"),
+	"ssh":     set("-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"),
 }
 
 func set(items ...string) map[string]bool {
