@@ -273,6 +273,8 @@ func TestOffset(t *testing.T) {
 		{"nested bash -c", `bash -c "sh -c 'pgrep x'"`, "pgrep", []int{16}},
 		{"ssh remote words", `ssh -p 22 h echo a\; pgrep x`, "pgrep", []int{21}},
 		{"ssh quoted remote script", "ssh h 'cd /x && pgrep y'", "pgrep", []int{16}},
+		{"line continuation in a double-quoted script", "bash -c \"echo a \\\n; pgrep x\"", "echo", []int{9}},
+		{"line continuation in a bare script", "bash -c echo\\ a\\\n\\;pgrep", "pgrep", []int{19}},
 		{"ansi-c quoted script", "bash -c $'pgrep x'", "pgrep", []int{-1}},
 		{"shell heredoc", "bash <<'EOF'\npgrep x\nEOF", "pgrep", []int{13}},
 		{"variable argv0", "P=/usr/bin/pgrep; $P x", "pgrep", []int{-1}},
