@@ -141,6 +141,10 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 		if !ok {
 			return nil, full, err
 		}
+		if trailing := len(full) - len(strings.TrimRight(full, `\`)); trailing%2 == 1 {
+			// `\` в конце продолжил бы строку дописанным ограничителем.
+			full += "\n"
+		}
 		full += "\n" + strings.TrimSuffix(delim, "`") + "\n"
 	}
 	return nil, full, err

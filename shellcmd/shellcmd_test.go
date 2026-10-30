@@ -569,3 +569,17 @@ func validBounds(r Redir, command string) bool {
 	}
 	return r.BodyStart >= 0 && r.BodyStart <= r.BodyEnd && r.BodyEnd <= len(command)
 }
+
+func TestAppendedDelimiterNotArgument(t *testing.T) {
+	for command, want := range map[string][]string{
+		"pgrep a <<E \\":       {"a"},
+		"cat <<E; pgrep z \\":  {"z"},
+		"pgrep b\\\\ <<E":      {"b\\"},
+		"pgrep c <<E\nline \\": {"c"},
+	} {
+		calls, err := Find(command, "pgrep")
+		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, want) {
+			t.Errorf("%q: Find = %#v, %v; want args %q", command, calls, err, want)
+		}
+	}
+}
