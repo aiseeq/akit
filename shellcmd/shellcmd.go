@@ -50,7 +50,9 @@ type Redir struct {
 	Target string // цель: значение литерального слова, иначе его исходный текст; у heredoc — ограничитель
 	Body   string // тело heredoc как в исходном тексте
 	// BodyStart, BodyEnd — байтовые границы тела heredoc в исходной команде, без строки ограничителя;
-	// -1 — heredoc нет, тело пустое или heredoc во вложенном скрипте.
+	// -1 — heredoc нет, тело пустое или его края не в исходном тексте ($'…'). Во вложенном скрипте
+	// (`bash -c "…"`) диапазон охватывает тело, но текст в нём может отличаться от Body кавычками и
+	// экранированием; вне вложенного скрипта он равен Body.
 	BodyStart, BodyEnd int
 }
 
@@ -511,7 +513,7 @@ func parseNested(src string, pos []int, lineBase int, via []string, inLoop, inBa
 		nestedCalls[i].Background = nestedCalls[i].Background || inBackground
 		redirs := slices.Clone(nestedCalls[i].Redirs)
 		for j := range redirs {
-			redirs[j].BodyStart, redirs[j].BodyEnd = -1, -1
+			redirs[j].BodyStart, redirs[j].BodyEnd = outerSpan(redirs[j].BodyStart, redirs[j].BodyEnd, pos)
 		}
 		nestedCalls[i].Redirs = redirs
 	}
@@ -526,6 +528,19 @@ func outerOffset(offset int, pos []int) int {
 		return -1
 	}
 	return pos[offset]
+}
+
+// outerSpan переводит непустой диапазон [start, end) вложенного скрипта во внешний текст по карте pos:
+// от места первого байта до места последнего включительно; нет места у края — -1, -1.
+func outerSpan(start, end int, pos []int) (int, int) {
+	if start < 0 || end <= start {
+		return -1, -1
+	}
+	first, last := outerOffset(start, pos), outerOffset(end-1, pos)
+	if first < 0 || last < first {
+		return -1, -1
+	}
+	return first, last + 1
 }
 
 // stmtRedirs — перенаправления команды с телами heredoc и их границами в src.

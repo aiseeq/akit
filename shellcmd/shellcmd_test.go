@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -338,7 +339,7 @@ func TestRedirs(t *testing.T) {
 	if err != nil || len(nested) != 1 {
 		t.Fatalf("nested = %#v, %v", nested, err)
 	}
-	if r := nested[0].Redirs; len(r) != 2 || r[1].Body != "x\n" || r[1].BodyStart != -1 || r[1].BodyEnd != -1 {
+	if r := nested[0].Redirs; len(r) != 2 || r[1].Body != "x\n" || r[1].BodyStart != 23 || r[1].BodyEnd != 25 {
 		t.Fatalf("nested redirs = %#v", r)
 	}
 	open, err := Find("cat <<EOF\nab", "cat")
@@ -363,8 +364,17 @@ func checkPositions(t *testing.T, line int, cmd string, calls []Call) {
 				t.Errorf("строка %d: Offset %d не указывает на %q", line, c.Offset, c.Name)
 			}
 		}
+		nested := slices.ContainsFunc(c.Via, func(v string) bool { return v == "ssh" || v == "-c" || IsShell(v) })
 		for _, r := range c.Redirs {
-			if r.BodyStart >= 0 && cmd[r.BodyStart:r.BodyEnd] != r.Body {
+			if r.BodyStart < 0 {
+				continue
+			}
+			span := cmd[r.BodyStart:r.BodyEnd]
+			// Во вложенном скрипте текст диапазона отличается от Body кавычками и экранированием, края — те же.
+			if nested && span != "" && r.Body != "" && span[0] == r.Body[0] && span[len(span)-1] == r.Body[len(r.Body)-1] {
+				continue
+			}
+			if span != r.Body {
 				t.Errorf("строка %d: границы тела heredoc %d:%d не совпадают с Body", line, r.BodyStart, r.BodyEnd)
 			}
 		}
@@ -430,3 +440,31 @@ func TestCorpus(t *testing.T) {
 }
 
 var backticks = regexp.MustCompile("`[^`]*`")
+
+func TestNestedHeredocBounds(t *testing.T) {
+	tests := []struct {
+		name, command, first, last string // first, last — начало и конец тела в исходной команде
+	}{
+		{"double-quoted script with splices", "/bin/bash -lc \"cat > R.md <<'EOF'\nchecks: \"'`bash -n x.sh`'\" \\\"done\\\"\nEOF\ngit status\"", "checks: ", "done\\\"\n"},
+		{"single-quoted script", "bash -c 'cat > f <<EOF\nab\nEOF'", "ab", "ab\n"},
+		{"ssh remote script", "ssh h 'cat > f <<EOF\nab\nEOF\necho ok'", "ab", "ab\n"},
+		{"nested shell", "bash -c \"sh -c 'cat > f <<EOF\nab\nEOF'\"", "ab", "ab\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.command, "cat")
+			if err != nil || len(calls) != 1 || len(calls[0].Redirs) != 2 {
+				t.Fatalf("calls = %#v, %v", calls, err)
+			}
+			r := calls[0].Redirs[1]
+			start, end := strings.Index(tt.command, tt.first), strings.LastIndex(tt.command, tt.last)+len(tt.last)
+			if r.BodyStart != start || r.BodyEnd != end {
+				t.Errorf("body %q at %d:%d, want %d:%d (%q)", r.Body, r.BodyStart, r.BodyEnd, start, end, tt.command[max(start, 0):max(end, 0)])
+			}
+		})
+	}
+	calls, err := Find("bash -c $'cat > f <<EOF\\nab\\nEOF'", "cat")
+	if err != nil || len(calls) != 1 || len(calls[0].Redirs) != 2 || calls[0].Redirs[1].BodyStart != -1 || calls[0].Redirs[1].BodyEnd != -1 {
+		t.Errorf("ansi-c quoted script = %#v, %v", calls, err)
+	}
+}
