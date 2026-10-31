@@ -212,3 +212,20 @@ func TestProblemsInSummary(t *testing.T) {
 		t.Errorf("line 0 taken as a ref: %q %v", ref, err)
 	}
 }
+
+func TestGrepFindsComposedText(t *testing.T) {
+	e := fakeHome(t)
+	// текст совпадения — Who, пробел и показанный текст: литерал шаблона может не лежать в сырой строке подряд
+	for pattern, want := range map[string]string{
+		"Bash go test":      ":4 cmd",
+		"Bash ok":           ":5 out",
+		"context compacted": ":11 note",
+		`\[image\]`:         ":12 user",
+		"→ main":            ":14 cmd",
+	} {
+		code, out, _ := runTL(t, e, "1a2b3c4d", "--role", "all", "--grep", pattern)
+		if code != 0 || !strings.Contains(out, want) {
+			t.Errorf("--grep %q: code %d, no %q in:\n%s", pattern, code, want, out)
+		}
+	}
+}

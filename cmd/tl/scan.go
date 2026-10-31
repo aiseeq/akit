@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"regexp"
-	"regexp/syntax"
 	"sort"
 	"strings"
 	"sync"
@@ -33,10 +31,9 @@ type result struct {
 
 // filter — отбор событий одного файла: роль, время, поиск и окрестность найденного.
 type filter struct {
-	opts    options
-	re      *regexp.Regexp
-	rawRE   *regexp.Regexp
-	literal []byte // строчный литерал поиска для отсева сырых строк; nil — отсева нет
+	opts  options
+	re    *regexp.Regexp
+	rawRE *regexp.Regexp
 }
 
 func newFilter(opts options) (*filter, error) {
@@ -55,22 +52,14 @@ func newFilter(opts options) (*filter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("--grep: %w", err)
 	}
+	// --grep сырые строки не отсеивает: текст совпадения сборный (Who, пробел, текст, отметки обвязки, Who результата
+	// из строки вызова), и литерал шаблона может не лежать в сырой строке подряд.
 	f.re = re
-	// Отсев сырых строк годится, только если искомое — литерал без символов, которые JSON экранирует.
-	if parsed, err := syntax.Parse(opts.grep, syntax.Perl); err == nil && opts.context == 0 {
-		lit := parsed.Simplify()
-		if lit.Op == syntax.OpLiteral && !strings.ContainsAny(string(lit.Rune), "\"\\\n\t\r") {
-			f.literal = bytes.ToLower([]byte(string(lit.Rune)))
-		}
-	}
 	return f, nil
 }
 
 func (f *filter) keepRaw(raw []byte) bool {
-	if f.literal != nil && !bytes.Contains(bytes.ToLower(raw), f.literal) {
-		return false
-	}
-	return f.rawRE == nil || f.rawRE.Match(raw)
+	return f.rawRE.Match(raw)
 }
 
 func (f *filter) inWindow(ev transcript.Event) bool {
@@ -91,7 +80,7 @@ func (f *filter) match(ev transcript.Event) bool {
 // вывода: события в памяти не копятся.
 func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, error) {
 	var keep func([]byte) bool
-	if f.literal != nil || f.rawRE != nil {
+	if f.rawRE != nil {
 		keep = f.keepRaw
 	}
 	var wt *waitTracker
