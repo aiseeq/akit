@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/session"
@@ -59,22 +60,55 @@ var yo = strings.NewReplacer("ё", "е", "Ё", "е")
 func fold(s string) string { return strings.Join(strings.Fields(yo.Replace(strings.ToLower(s))), " ") }
 
 // hasFragment сверяет целый фрагмент или последовательность фрагментов, разделённых многоточием.
-func hasFragment(text, fragment string) bool {
-	parts := strings.Split(fragment, "…")
+func hasFragment(text, fragment string) bool { return matchParts(text, fragment, false) }
+
+// hasWords — как hasFragment, но каждый кусок цитаты начинается и кончается на границе слова: короткая цитата
+// «да» не находит «удали».
+func hasWords(text, fragment string) bool { return matchParts(text, fragment, true) }
+
+func matchParts(text, fragment string, bounded bool) bool {
 	whole := fold(text)
 	at := 0
-	for _, part := range parts {
+	for part := range strings.SplitSeq(fragment, "…") {
 		part = fold(part)
 		if part == "" {
 			continue
 		}
-		i := strings.Index(whole[at:], part)
+		i := indexFrom(whole, part, at, bounded)
 		if i < 0 {
 			return false
 		}
-		at += i + len(part)
+		at = i + len(part)
 	}
 	return true
+}
+
+// indexFrom — первое вхождение part в s не раньше from; bounded — только на границах слова.
+func indexFrom(s, part string, from int, bounded bool) int {
+	for from <= len(s) {
+		i := strings.Index(s[from:], part)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		if !bounded || (wordEdge(s[:i], true) && wordEdge(s[i+len(part):], false)) {
+			return i
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		from = i + size
+	}
+	return -1
+}
+
+// wordEdge — по эту сторону (before — конец s, иначе начало) нет буквы или цифры.
+func wordEdge(s string, before bool) bool {
+	var r rune
+	if before {
+		r, _ = utf8.DecodeLastRuneInString(s)
+	} else {
+		r, _ = utf8.DecodeRuneInString(s)
+	}
+	return r == utf8.RuneError || !(unicode.IsLetter(r) || unicode.IsDigit(r))
 }
 
 // prefilter — отсев сырых строк транскрипта до разбора. Перевод в нижний регистр каждой строки втрое замедлял
@@ -297,8 +331,16 @@ func jsonEscaped(s string) []byte { return []byte(jsonEscape.Replace(s)) }
 
 var notAlnum = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
-var briefLink = regexp.MustCompile("user-word\\s+((?:/|~/)(?:[^\\s'`]*\\.jsonl|[^\\s'`]*…jsonl))\\s+'([^']+)'")
-var userMarker = regexp.MustCompile(`пользовател[а-яё]*\s+(\d{2}\.\d{2})(?:\s+(\d{2}:\d{2}(?::\d{2})?))?`)
+var briefLink = regexp.MustCompile("user-word\\s+((?:/|~/)[^\\s'\"`]*(?:\\.jsonl|…jsonl))\\s+(?:'([^']+)'|\"([^\"]+)\")")
+
+// briefLinkLike — всё, что похоже на ссылку: не подошедшее под briefLink попадает в итог как «не найдено», а не
+// пропадает молча. Образец вроде `user-word <jsonl> '<кусок>'` без .jsonl сюда не попадает.
+var briefLinkLike = regexp.MustCompile("user-word\\s+[^\\s'\"`]*(?:\\.jsonl|…jsonl)")
+
+var userMarker = regexp.MustCompile(`[Пп]ользовател[а-яё]*\s+(\d{2}\.\d{2})(?:\s+(\d{2}:\d{2}(?::\d{2})?))?`)
+
+// markerDate — дата пометки в тексте между пометкой и цитатой: значит, цитата принадлежит другой пометке.
+var markerDate = regexp.MustCompile(`\b\d{2}\.\d{2}\b`)
 
 // briefWord — слово пользователя, указанное ссылкой или цитатой в брифе.
 type briefWord struct {
@@ -339,35 +381,42 @@ func runBrief(opts options, e env, stdout, stderr io.Writer) int {
 	found, ambiguous, missing := 0, 0, 0
 	for i, word := range words {
 		fmt.Fprintf(stdout, "== %d. %s\n", i+1, word.raw)
-		hits, reason, err := briefHits(word, e, contexts)
+		hits, note, err := briefHits(word, e, contexts)
 		if err != nil {
 			fmt.Fprintf(stderr, "user-word: %v\n", err)
 			return exitUsage
 		}
-		if len(hits) == 0 {
-			fmt.Fprintf(stdout, "not found: %s — %s\n", word.raw, reason)
+		// Реплика, которой нет при перечитывании (живая сессия переписала файл), — не совпадение.
+		var located []hit
+		for _, h := range hits {
+			if findLine(contexts[h.path], h.line) >= 0 {
+				located = append(located, h)
+			}
+		}
+		if len(hits) > 0 && len(located) == 0 {
+			note = "transcript changed during lookup"
+		}
+		switch {
+		case len(located) == 0:
+			fmt.Fprintf(stdout, "not found: %s — %s\n", word.raw, note)
 			missing++
 			continue
-		}
-		if word.isQuote && len(hits) > 1 {
+		case len(located) > 1:
 			ambiguous++
 			shown := ""
-			if len(hits) > 5 {
+			if len(located) > 5 {
 				shown = ", first 5 shown"
 			}
-			fmt.Fprintf(stdout, "ambiguous: %d lines%s\n", len(hits), shown)
-		} else {
+			fmt.Fprintf(stdout, "ambiguous: %d lines%s\n", len(located), shown)
+		default:
 			found++
-		}
-		for _, h := range hits[:min(len(hits), 5)] {
-			lines := contexts[h.path]
-			at := findLine(lines, h.line)
-			if at < 0 {
-				fmt.Fprintf(stdout, "not found: %s — transcript changed during lookup\n", word.raw)
-				missing++
-				continue
+			if note != "" {
+				fmt.Fprintf(stdout, "note: %s\n", note)
 			}
-			showBrief(stdout, lines, at, until, e.loc)
+		}
+		for _, h := range located[:min(len(located), 5)] {
+			lines := contexts[h.path]
+			showBrief(stdout, lines, findLine(lines, h.line), until, e.loc)
 		}
 	}
 	fmt.Fprintf(stdout, "brief: %d user words: %d found, %d ambiguous, %d not found\n", len(words), found, ambiguous, missing)
@@ -397,8 +446,20 @@ func extractBriefWords(text string, until time.Time, loc *time.Location) []brief
 
 func extractBriefLinks(row string) []briefWord {
 	var words []briefWord
+	parsed := map[int]bool{}
 	for _, match := range briefLink.FindAllStringSubmatchIndex(row, -1) {
-		words = append(words, briefWord{raw: row[match[0]:match[1]], path: row[match[2]:match[3]], fragment: row[match[4]:match[5]]})
+		parsed[match[0]] = true
+		frag := match[4:6] // 'кусок'
+		if frag[0] < 0 {
+			frag = match[6:8] // "кусок"
+		}
+		fragment := row[frag[0]:frag[1]]
+		words = append(words, briefWord{raw: row[match[0]:match[1]], path: row[match[2]:match[3]], fragment: fragment})
+	}
+	for _, match := range briefLinkLike.FindAllStringIndex(row, -1) {
+		if !parsed[match[0]] {
+			words = append(words, briefWord{raw: row[match[0]:match[1]], invalidCause: "link not in the form user-word /path.jsonl 'fragment' (absolute or ~/ path, quoted fragment)"})
+		}
 	}
 	return words
 }
@@ -407,11 +468,18 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 	var words []briefWord
 	for _, marker := range userMarker.FindAllStringSubmatchIndex(row, -1) {
 		start, ok := quoteStart(row, marker[1])
-		if !ok {
+		end := -1
+		if ok {
+			end = quoteEnd(row, start)
+		}
+		if end < 0 {
+			// Дата пометки без цитаты — пересказ: проверяющему нечего сверить, это видно в итоге.
+			words = append(words, briefWord{raw: row[marker[0]:marker[1]], isQuote: true, invalidCause: "no «quote» after a colon right after the marker"})
 			continue
 		}
-		end := quoteEnd(row, start)
-		if end < 0 {
+		fragment := row[start+len("«") : end-len("»")]
+		if strings.Trim(fragment, "… \t") == "" {
+			words = append(words, briefWord{raw: row[marker[0]:end], isQuote: true, invalidCause: "empty quote"})
 			continue
 		}
 		day, cause := markerDay(row[marker[2]:marker[3]], until, loc)
@@ -419,21 +487,24 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 		if cause == "" && marker[4] >= 0 {
 			markedAt, cause = markerTime(row[marker[4]:marker[5]], day)
 		}
-		words = append(words, briefWord{raw: row[marker[0]:end], fragment: row[start+len("«") : end-len("»")], day: day, markedAt: markedAt, isQuote: true, invalidCause: cause})
+		words = append(words, briefWord{raw: row[marker[0]:end], fragment: fragment, day: day, markedAt: markedAt, isQuote: true, invalidCause: cause})
 	}
 	return words
 }
 
+// quoteStart — начало цитаты пометки: первая «» после пометки, перед ней двоеточие, а между ними ни другой даты, ни
+// «;» — иначе цитата принадлежит другому («пользователь 31.10 просил; лид 31.10: «…»»). Пояс, время и вставка в
+// скобках до двоеточия допустимы.
 func quoteStart(row string, after int) (int, bool) {
-	colon := strings.Index(row[after:], ":")
-	if colon < 0 {
-		return 0, false
-	}
-	open := strings.Index(row[after+colon+1:], "«")
+	open := strings.Index(row[after:], "«")
 	if open < 0 {
 		return 0, false
 	}
-	return after + colon + 1 + open, true
+	between := row[after : after+open]
+	if !strings.HasSuffix(strings.TrimRight(between, " \t"), ":") || strings.Contains(between, ";") || markerDate.MatchString(between) {
+		return 0, false
+	}
+	return after + open, true
 }
 
 func quoteEnd(row string, start int) int {
@@ -467,7 +538,11 @@ func markerDay(dateText string, until time.Time, loc *time.Location) (time.Time,
 	if date.Month() > localUntil.Month() || (date.Month() == localUntil.Month() && date.Day() > localUntil.Day()) {
 		year--
 	}
-	return time.Date(year, date.Month(), date.Day(), 0, 0, 0, 0, loc), ""
+	day := time.Date(year, date.Month(), date.Day(), 0, 0, 0, 0, loc)
+	if day.Day() != date.Day() {
+		return time.Time{}, fmt.Sprintf("invalid marker date %s: no such day in %d", dateText, year)
+	}
+	return day, ""
 }
 
 func markerTime(clockText string, day time.Time) (time.Time, string) {
@@ -529,16 +604,22 @@ func briefPathMatches(path string) ([]string, error) {
 
 func lastBriefLinkHit(path string, lines []line, fragment string) ([]hit, string, error) {
 	var last line
-	matched := false
+	matched := 0
 	for _, l := range lines {
 		if l.user && hasFragment(l.text, fragment) {
-			last, matched = l, true
+			last = l
+			matched++
 		}
 	}
-	if !matched {
+	if matched == 0 {
 		return nil, "fragment not found in transcript", nil
 	}
-	return []hit{{path: path, line: last}}, "", nil
+	// Ссылка указывает на свежую реплику с куском, как и обычный режим; о прежних — заметка.
+	note := ""
+	if matched > 1 {
+		note = fmt.Sprintf("the last of %d user lines with the fragment; a longer fragment for an earlier one", matched)
+	}
+	return []hit{{path: path, line: last}}, note, nil
 }
 
 func briefQuoteHits(word briefWord, e env, contexts map[string][]line) ([]hit, string, error) {
@@ -550,7 +631,7 @@ func briefQuoteHits(word briefWord, e env, contexts map[string][]line) ([]hit, s
 	if err != nil {
 		return nil, "", err
 	}
-	dayHits := hitsOnDay(hits, date, e.loc)
+	dayHits := quoteHitsOnDay(hits, date, word.fragment, e.loc)
 	if len(dayHits) == 0 {
 		return nil, "no matching user line on marker day", nil
 	}
@@ -561,17 +642,19 @@ func briefQuoteHits(word briefWord, e env, contexts map[string][]line) ([]hit, s
 		}
 		dayHits = near
 	}
-	unique := uniqueHitText(dayHits)
-	if err := loadHitContexts(unique, contexts); err != nil {
+	// Одинаковый текст в разное время — разные реплики (два «да» за день): неоднозначность, а не одна находка.
+	// Копию той же записи в продолжении сессии findHits уже свёл.
+	if err := loadHitContexts(dayHits, contexts); err != nil {
 		return nil, "", err
 	}
-	return unique, "", nil
+	return dayHits, "", nil
 }
 
-func hitsOnDay(hits []hit, date string, loc *time.Location) []hit {
+// quoteHitsOnDay — совпадения дня пометки, где цитата стоит целыми словами.
+func quoteHitsOnDay(hits []hit, date, fragment string, loc *time.Location) []hit {
 	var found []hit
 	for _, h := range hits {
-		if h.t.In(loc).Format(time.DateOnly) == date {
+		if h.t.In(loc).Format(time.DateOnly) == date && hasWords(h.text, fragment) {
 			found = append(found, h)
 		}
 	}
@@ -586,18 +669,6 @@ func hitsNearMarker(hits []hit, markedAt time.Time) []hit {
 		}
 	}
 	return found
-}
-
-func uniqueHitText(hits []hit) []hit {
-	unique := make([]hit, 0, len(hits))
-	seen := make(map[string]bool)
-	for _, h := range hits {
-		if !seen[h.text] {
-			seen[h.text] = true
-			unique = append(unique, h)
-		}
-	}
-	return unique
 }
 
 func loadHitContexts(hits []hit, contexts map[string][]line) error {

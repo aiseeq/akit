@@ -206,12 +206,18 @@ minutes. Lines typed or queued by the human and answers in a question dialog cou
 1 not found, 2 usage/IO error. `--brief` finds linked fragments and dated user
 quotes in a brief, showing each matching line with its agent reply and up to 20
 later user lines from the same session through the brief time. Without `--until`,
-the brief file's modification time is used. Quotes on the same marker day that
-match different user lines are shown as ambiguous; `…` matches ordered fragments.
+the brief file's modification time is used. A dated quote is
+`пользователь DD.MM [HH:MM[:SS]] …: «quote»`: the quote right after the colon, with
+no other date or `;` between the marker and the colon, so a colleague's quote on
+the same line is not taken for the user's. It matches whole words, and `…` splits
+it into ordered pieces. More than one user line on the marker day, the same text
+at different times included, is shown as ambiguous. A marker with a clock searches
+within two minutes of that time; without a clock, the whole marked day is searched.
 A transcript reference counts only when its path starts with `/` or `~/`, ends in
-`.jsonl`, and is followed by a quoted fragment. `~` expands only at the start of
-`~/`. A marker with a clock searches within two minutes of that time; without a
-clock, the whole marked day is searched.
+`.jsonl`, and is followed by a fragment in single or double quotes; several lines
+with the fragment give the last one and a note. `~` expands only at the start of
+`~/`. A marker without a quote, an impossible date, an empty quote, or a
+`user-word …jsonl` reference in another form is reported as not found, not skipped.
 
     user-word ~/.claude/projects/-home-x/1a2b3c4d-….jsonl 'да, делай' [MINUTES]
     user-word --search 'да, делай' [--since 2026-10-24] [--project akit]
