@@ -176,7 +176,7 @@ func findPII(root string, files []string, pii []piiRule) ([]string, error) {
 // within — путь p совпадает с dir или лежит внутри него. Кроме текста разрешённых путей сравниваются сами папки:
 // bind mount показывает ту же папку под другим путём, и по тексту её не узнать.
 func within(p, dir string) (bool, error) {
-	if rel, err := filepath.Rel(dir, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if _, ok := under(p, dir); ok {
 		return true, nil
 	}
 	d, err := os.Stat(dir)
@@ -211,26 +211,40 @@ func checkOut(out, src, rules string, m manifest) error {
 	if err != nil {
 		return fmt.Errorf("OUT_DIR: %w", err)
 	}
+	mounts, err := readMounts()
+	if err != nil {
+		return err
+	}
+	outs := aliases(o, mounts)
 	for _, read := range reads {
 		r, err := resolved(read)
 		if err != nil {
 			return err
 		}
-		contains, err := within(r, o)
-		if err != nil {
-			return err
-		}
-		inside := false
-		if read != src {
-			if inside, err = within(o, r); err != nil {
-				return err
+		for _, ra := range aliases(r, mounts) {
+			for _, oa := range outs {
+				bad, err := overlaps(ra, oa, read != src)
+				if err != nil {
+					return err
+				}
+				if bad {
+					return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
+				}
 			}
-		}
-		if contains || inside {
-			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
 		}
 	}
 	return nil
+}
+
+// overlaps — OUT_DIR o содержит читаемое r или (если inside) лежит внутри него.
+func overlaps(r, o string, inside bool) (bool, error) {
+	if contains, err := within(r, o); err != nil || contains {
+		return contains, err
+	}
+	if !inside {
+		return false, nil
+	}
+	return within(o, r)
 }
 
 // physical — абсолютный путь, как его поймёт система. filepath.Abs чистит текст до разрешения ссылок и убирает

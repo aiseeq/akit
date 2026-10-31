@@ -64,7 +64,7 @@ func runExport(t *testing.T, args ...string) (int, string, string) {
 }
 
 func TestParseArgs(t *testing.T) {
-	for _, args := range [][]string{{}, {"a", "b"}, {"--rules"}, {"--frob", "x"}} {
+	for _, args := range [][]string{{}, {"a", "b"}, {"--rules"}, {"--frob", "x"}, {""}, {"--src-home", "", "out"}, {"--rules", "", "out"}} {
 		if _, err := parseArgs(args, "/h"); err == nil {
 			t.Errorf("%q принято", args)
 		}
@@ -301,10 +301,16 @@ func TestExportRefusesBindMount(t *testing.T) {
 		t.Skip("no unshare or user namespaces are off: no mount --bind")
 	}
 	src, rules := fixture(t)
+	write(t, filepath.Join(src, ".claude/hooks/h.sh"), "#!/bin/sh\n", 0o755)
+	write(t, filepath.Join(rules, "extra/x"), "x\n", 0o644)
 	mnt := t.TempDir()
+	// подпапка читаемого под другим путём: у точки монтирования другие предки, папку узнаёт только mountinfo
 	for _, c := range []struct{ name, bound, out string }{
 		{"home", src, "m"},
 		{"inside .claude", filepath.Join(src, ".claude"), "m/x"},
+		{"hooks", filepath.Join(src, ".claude/hooks"), "m"},
+		{"skill not exported", filepath.Join(src, ".claude/skills/secret"), "m"},
+		{"rules subfolder", filepath.Join(rules, "extra"), "m"},
 	} {
 		point := filepath.Join(mnt, c.name)
 		if err := os.MkdirAll(point, 0o755); err != nil {
@@ -317,17 +323,16 @@ func TestExportRefusesBindMount(t *testing.T) {
 		if b, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
 		}
-		if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(src, ".claude/CLAUDE.md")) == "" {
-			t.Fatalf("%s: источник стёрт", c.name)
+		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x"} {
+			if _, err := os.Stat(filepath.Join(src, f)); err != nil {
+				t.Fatalf("%s: источник стёрт: %v", c.name, err)
+			}
 		}
 	}
 }
 
-// userNamespaces — есть unshare и система разрешает свои пространства имён: без них bind mount в тесте не сделать.
+// userNamespaces — среда даёт своё пространство имён с монтированием: без него bind mount в тесте не сделать.
+// Пробный запуск, а не настройка ядра: во вложенной песочнице unshare отказывает и при разрешённых пространствах.
 func userNamespaces() bool {
-	if _, err := exec.LookPath("unshare"); err != nil {
-		return false
-	}
-	n, err := os.ReadFile("/proc/sys/user/max_user_namespaces")
-	return err == nil && strings.TrimSpace(string(n)) != "0"
+	return exec.Command("unshare", "-rm", "true").Run() == nil
 }

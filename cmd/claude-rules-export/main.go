@@ -33,8 +33,9 @@ An OUT_DIR that holds what is read (the source home, its .claude and work, both
 CLAUDE.md, --rules with its manifest and template, an exported skill's folder and the
 targets of links in it) or is or lies in any of it but the home is refused before anything
 is cleared. Paths are taken as the system takes them: symlinks resolved, ".." after a link
-goes from its target, a folder bind-mounted under another path is the same folder. A skill
-folder that is a link is exported as its content.
+goes from its target, a folder shown under another path by a bind mount (by itself or as
+a subfolder, found in /proc/self/mountinfo) is the same folder. An empty path is refused.
+A skill folder that is a link is exported as its content.
 
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).
@@ -99,6 +100,10 @@ func parseArgs(args []string, home string) (options, error) {
 	}
 	if len(rest) != 1 {
 		return opts, errors.New("need one OUT_DIR")
+	}
+	// пустой путь — текущая папка: незаданная переменная в вызове очистила бы её
+	if rest[0] == "" || opts.srcHome == "" || opts.rules == "" {
+		return opts, errors.New("OUT_DIR, --src-home and --rules must not be empty")
 	}
 	opts.out = rest[0]
 	return opts, nil

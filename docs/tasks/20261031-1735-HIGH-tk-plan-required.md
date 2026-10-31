@@ -29,3 +29,4 @@
 - 2026-10-31 18:46 note — akit-master: проверка 6 — FAIL: env SHELLOPTS=noexec tk done закрывает тикет с падающим обязательным пунктом (bash не исполняет команды, выход 0); убираю SHELLOPTS и BASHOPTS из окружения пункта, тест TestPlanItemIgnoresShellStartupEnv красный до фикса
 - 2026-10-31 18:48 note — akit-master: v1.21.8 (f0137f7) на ноуте и PC; проверка 7 — суб-агент, бриф scratchpad/briefs/verify-required7.md
 - 2026-10-31 18:57 note — akit-master: проверка 7 — FAIL: SSH_CLIENT без SHLVL → bash читает ~/.bashrc в -c; LD_PRELOAD/LD_AUDIT подменяют bash. Теперь /bin/bash --norc --noprofile и без LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH; тест расширен (и пробел BASHOPTS закрыт: shopt extdebug), мутанты без --norc и без LD_PRELOAD краснеют. Граница прежняя: программы внутри проверки ищутся по PATH вызывающего
+- 2026-10-31 18:58 note — akit-master: v1.21.9 (5aa7295) на ноуте и PC; проверка 8 — суб-агент, бриф scratchpad/briefs/verify-required8.md
