@@ -528,3 +528,11 @@ func TestBriefQuoteWholeWords(t *testing.T) {
 	}
 	mustHave(t, "целые слова", out, "1 not found")
 }
+
+// Пометка со временем: отказ называет окно, а не весь день — в тот день такие слова могли быть.
+func TestBriefTimedQuoteNotFoundNamesWindow(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-x-a", "w1a10000-0000", human("2026-10-31T15:00:00Z", "да"))
+	_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Ок (пользователь 31.10 10:00 UTC: «да»).\n"), "--until", "2026-10-31 17:00")
+	mustHave(t, "окно", out, "no matching user line within 2m0s of marker time", "1 not found")
+}

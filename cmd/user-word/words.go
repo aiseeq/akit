@@ -958,6 +958,9 @@ func briefHitsUntil(word briefWord, e env, contexts map[string][]line, cached ma
 		return briefLinkHitsUntil(word, e, contexts, until)
 	}
 	dayHits := makeBriefWordHits(word, cached, e.loc)
+	if len(dayHits) == 0 && !word.markedAt.IsZero() {
+		return nil, fmt.Sprintf("no matching user line within %v of marker time", word.window), nil
+	}
 	if len(dayHits) == 0 {
 		return nil, "no matching user line on marker day", nil
 	}
