@@ -176,7 +176,7 @@ func (p *codexParser) events(rec *record) []Event {
 		}
 		return nil
 	case "compacted":
-		return []Event{{Role: Note, Who: "compact", Text: "context compacted"}}
+		return []Event{{Role: Note, Who: compactWho, Text: compactText}}
 	case "event_msg":
 		return p.eventMsg(pl, ev)
 	}
@@ -278,14 +278,20 @@ func (p *codexParser) eventMsg(pl *payload, ev func(Role, string, string) []Even
 	return nil
 }
 
+const (
+	tokenTotalFormat = "tokens total %d"
+	tokenLastFormat  = ", last %d"
+	tokenLimitFormat = "; limit %.0f%% of %d min"
+)
+
 // String — расход строкой для показа.
 func (t *Tokens) String() string {
-	s := fmt.Sprintf("tokens total %d", t.Total.Total)
+	s := fmt.Sprintf(tokenTotalFormat, t.Total.Total)
 	if t.Last != nil {
-		s += fmt.Sprintf(", last %d", t.Last.Total)
+		s += fmt.Sprintf(tokenLastFormat, t.Last.Total)
 	}
 	if t.Limits != nil && t.Limits.Primary != nil {
-		s += fmt.Sprintf("; limit %.0f%% of %d min", t.Limits.Primary.UsedPercent, t.Limits.Primary.WindowMinutes)
+		s += fmt.Sprintf(tokenLimitFormat, t.Limits.Primary.UsedPercent, t.Limits.Primary.WindowMinutes)
 	}
 	return s
 }

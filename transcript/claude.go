@@ -14,6 +14,8 @@ import (
 
 // record — запись транскрипта: поля Claude Code и codex вместе, по полю payload видно, чья.
 type record struct {
+	decodedParts     []part
+	partsReady       bool
 	Type             string          `json:"type"`
 	Subtype          string          `json:"subtype"`
 	Timestamp        string          `json:"timestamp"`
@@ -99,7 +101,8 @@ type part struct {
 
 // claudeParser помнит имена вызванных инструментов: вывод ссылается на вызов по id.
 type claudeParser struct {
-	tools map[string]string
+	tools            map[string]string
+	remindersRemoved bool
 }
 
 func newClaudeParser() *claudeParser { return &claudeParser{tools: map[string]string{}} }
@@ -107,31 +110,40 @@ func newClaudeParser() *claudeParser { return &claudeParser{tools: map[string]st
 // parseLine — события строки с меткой времени записи. Ошибка — строка не JSON (файл дописывается прямо сейчас
 // или испорчен) или у записи с событиями кривая метка.
 func parseLine(raw []byte, claude *claudeParser, codex *codexParser) ([]Event, error) {
+	events, _, err := parseLineKind(raw, claude, codex)
+	return events, err
+}
+
+func parseLineKind(raw []byte, claude *claudeParser, codex *codexParser) ([]Event, bool, error) {
 	var rec record
 	if err := json.Unmarshal(raw, &rec); err != nil {
-		return nil, fmt.Errorf("not a JSON record: %w", err)
+		return nil, false, fmt.Errorf("not a JSON record: %w", err)
 	}
+	return parseRecordKind(&rec, raw, claude, codex)
+}
+
+func parseRecordKind(rec *record, raw []byte, claude *claudeParser, codex *codexParser) ([]Event, bool, error) {
 	var events []Event
 	if rec.Payload != nil {
-		events = codex.parse(&rec)
+		events = codex.parse(rec)
 	} else {
-		events = claude.parse(&rec, raw)
+		events = claude.parse(rec, raw)
 		for i := range events {
 			events[i].UUID, events[i].SessionID, events[i].Cwd = rec.UUID, rec.SessionID, rec.Cwd
 			events[i].Sidechain, events[i].PromptID = rec.IsSidechain, rec.PromptID
 		}
 	}
 	if len(events) == 0 {
-		return nil, nil // у служебных записей метки может не быть, и она не нужна
+		return nil, rec.Payload != nil, nil // у служебных записей метки может не быть, и она не нужна
 	}
 	t, err := time.Parse(time.RFC3339Nano, rec.Timestamp)
 	if err != nil {
-		return nil, fmt.Errorf("record time: %w", err)
+		return nil, rec.Payload != nil, fmt.Errorf("record time: %w", err)
 	}
 	for i := range events {
 		events[i].Time = t
 	}
-	return events, nil
+	return events, rec.Payload != nil, nil
 }
 
 func (p *claudeParser) parse(rec *record, raw []byte) []Event {
@@ -146,7 +158,7 @@ func (p *claudeParser) parse(rec *record, raw []byte) []Event {
 	case "system":
 		// сжатие (compact_boundary и его compactMetadata), «Compacted while idle» (informational), длительность
 		// хода, итог хуков: подробности — в записи целиком
-		e := ev(Note, "system", str(rec.Content))
+		e := ev(Note, systemWho, str(rec.Content))
 		e.Subtype, e.Raw = rec.Subtype, bytes.Clone(raw)
 		return []Event{e}
 	}
@@ -164,7 +176,7 @@ func attached(raw json.RawMessage, ev func(Role, string, string) Event) []Event 
 		if a.Origin != nil {
 			kind = a.Origin.Kind
 		}
-		out := fromOrigin(kind, a.Prompt, ev)
+		out, _ := fromOrigin(kind, a.Prompt, ev)
 		for i := range out {
 			out[i].Queued, out[i].Raw = true, raw
 		}
@@ -184,6 +196,16 @@ func (a *attachment) text() string {
 	}
 	return ""
 }
+
+const (
+	replyWho    = "reply"
+	emptyReply  = "response without text"
+	compactWho  = "compact"
+	compactText = "context compacted"
+	systemWho   = "system"
+	promptWho   = "prompt"
+	metaWho     = "meta"
+)
 
 // assistant — части ответа модели. Каждая запись с расходом даёт хотя бы одно событие: расход считают по записям.
 func (p *claudeParser) assistant(rec *record, ev func(Role, string, string) Event) []Event {
@@ -210,7 +232,7 @@ func (p *claudeParser) assistant(rec *record, ev func(Role, string, string) Even
 		}
 	}
 	if len(out) == 0 && m.Usage != nil {
-		out = append(out, ev(Note, "reply", "response without text"))
+		out = append(out, ev(Note, replyWho, emptyReply))
 	}
 	reply := &Reply{ID: m.ID, RequestID: rec.RequestID, Model: m.Model, StopReason: m.StopReason, Usage: m.Usage.priced()}
 	for i := range out {
@@ -224,12 +246,14 @@ func (p *claudeParser) user(rec *record, ev func(Role, string, string) Event) []
 		return nil
 	}
 	if rec.IsCompactSummary {
-		return []Event{ev(Note, "compact", "context compacted")}
+		return []Event{ev(Note, compactWho, compactText)}
 	}
 	if rec.Origin != nil && rec.Origin.Kind != "" {
-		return fromOrigin(rec.Origin.Kind, rec.Message.Content, ev)
+		events, removed := fromOrigin(rec.Origin.Kind, rec.Message.Content, ev)
+		p.remindersRemoved = removed
+		return events
 	}
-	text, images, ps := content(rec.Message.Content)
+	text, images, ps := rec.messageContent()
 	if !hasResult(ps) {
 		return prompt(rec, text, images, ev)
 	}
@@ -258,6 +282,14 @@ func (p *claudeParser) user(rec *record, ev func(Role, string, string) Event) []
 	return out
 }
 
+// messageContent повторно использует части, уже разобранные для восстановления имён вызовов.
+func (rec *record) messageContent() (string, int, []part) {
+	if !rec.partsReady {
+		return content(rec.Message.Content)
+	}
+	return contentParts(rec.decodedParts)
+}
+
 // prompt — запись user без источника и без вывода инструментов: бриф суб-агента, запрос программы (claude -p),
 // команда «/…» или вставка обвязки (isMeta). Набирал её не человек в окне сессии — это note, но ход (promptId)
 // она начинает, поэтому напоминания в ней не вырезаются: запись из одного напоминания — тоже начало хода.
@@ -266,9 +298,9 @@ func prompt(rec *record, text string, images int, ev func(Role, string, string) 
 	if text == "" && images == 0 {
 		return nil
 	}
-	who := "prompt"
+	who := promptWho
 	if rec.IsMeta {
-		who = "meta"
+		who = metaWho
 	}
 	e := ev(Note, who, text)
 	e.Images = images
@@ -282,21 +314,29 @@ var fromName = regexp.MustCompile(`^\s*(?:Another Claude session sent a message:
 var fromAddr = regexp.MustCompile(`<cross-session-message[^>]*?\sfrom="([^"]*)"`)
 
 // reminder — напоминание обвязки Claude Code внутри реплики: его никто не набирал.
-var reminder = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+const (
+	ReminderOpen  = "<system-reminder>"
+	ReminderClose = "</system-reminder>"
+)
+
+var reminder = regexp.MustCompile(`(?s)` + ReminderOpen + `.*?` + ReminderClose)
 
 // fromOrigin — событие по источнику реплики: человек, другая сессия или уведомление. Реплика человека, в которой
 // после напоминаний не осталось ни слов, ни картинок, — не реплика.
-func fromOrigin(kind string, raw json.RawMessage, ev func(Role, string, string) Event) []Event {
+func fromOrigin(kind string, raw json.RawMessage, ev func(Role, string, string) Event) ([]Event, bool) {
 	text, images, _ := content(raw)
 	var e Event
+	removed := false
 	switch kind {
 	case "human":
+		removed = true
 		text = strings.TrimSpace(reminder.ReplaceAllString(text, ""))
 		if text == "" && images == 0 {
-			return nil
+			return nil, removed
 		}
 		e = ev(User, "", text)
 	case "peer":
+		removed = true
 		text = strings.TrimSpace(reminder.ReplaceAllString(text, ""))
 		who, from := "", ""
 		if m := fromName.FindStringSubmatchIndex(text); m != nil {
@@ -312,7 +352,7 @@ func fromOrigin(kind string, raw json.RawMessage, ev func(Role, string, string) 
 		e = ev(Note, kind, text)
 	}
 	e.Images = images
-	return []Event{e}
+	return []Event{e}, removed
 }
 
 // askAnswers — ответы окна вопроса: «ответ ← вопрос» по строке на вопрос; ответ первым, чтобы его не отрезала
@@ -381,7 +421,10 @@ func content(raw json.RawMessage) (text string, images int, ps []part) {
 			return text, 0, nil
 		}
 	}
-	ps = parts(raw)
+	return contentParts(parts(raw))
+}
+
+func contentParts(ps []part) (text string, images int, _ []part) {
 	var texts []string
 	for i := range ps {
 		switch ps[i].Type {

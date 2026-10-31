@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/price"
 )
@@ -117,16 +119,24 @@ type Reply struct {
 	Usage                            *price.Usage // nil — расхода в записи нет
 }
 
+const imageMarker = "[image]"
+
 // Shown — текст для показа: слова и «[image]» на каждую картинку.
 func (e Event) Shown() string {
 	if e.Images == 0 {
 		return e.Text
 	}
-	marks := strings.TrimSpace(strings.Repeat("[image] ", e.Images))
+	marks := strings.TrimSpace(strings.Repeat(imageMarker+" ", e.Images))
 	if e.Text == "" {
 		return marks
 	}
 	return e.Text + "\n" + marks
+}
+
+// SyntheticText перечисляет фрагменты, создаваемые обвязкой при построении событий.
+func SyntheticText() string {
+	return imageMarker + " " + promptWho + " " + metaWho + " " + compactWho + " " + compactText + " " +
+		replyWho + " " + emptyReply + " " + systemWho + " " + tokenTotalFormat + tokenLastFormat + tokenLimitFormat
 }
 
 // Meta — что известно о файле целиком.
@@ -148,13 +158,73 @@ const maxLine = 256 << 20
 // разбора JSON: так поиск по гигабайтам не разбирает лишнее. Испорченная строка (файл дописывается прямо сейчас)
 // пропускается и считается в Meta.Bad.
 func Read(path string, keep func(raw []byte) bool, fn func(Event)) (Meta, error) {
+	return read(path, keep, nil, fn)
+}
+
+// ToolNames даёт фильтру известные и возможные имена инструментов из предыдущих строк.
+// Возможные имена допускают лишние совпадения; набор действует только во время вызова фильтра.
+type ToolNames struct {
+	names     map[string]struct{}
+	plainType *bool
+	noUnicode *bool
+}
+
+// NoUnicodeEscapes сообщает доказанный фильтром факт: в строке нет JSON-экранирования Unicode.
+func (n ToolNames) NoUnicodeEscapes() {
+	if n.noUnicode != nil {
+		*n.noUnicode = true
+	}
+}
+
+// PlainType сообщает доказанный фильтром факт: экранирование не может скрывать тип события.
+func (n ToolNames) PlainType() {
+	if n.plainType != nil {
+		*n.plainType = true
+	}
+}
+
+// AddPossible добавляет возможное имя для консервативного отбора.
+func (n *ToolNames) AddPossible(name string) {
+	if n.names == nil {
+		n.names = make(map[string]struct{})
+	}
+	n.names[name] = struct{}{}
+}
+
+// Any сообщает, есть ли запомненное имя, для которого выполняется условие.
+func (n ToolNames) Any(match func(string) bool) bool {
+	for name := range n.names {
+		if match(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// RemovesReminders сообщает, вырезает ли разбор этой записи напоминания из её текста.
+func RemovesReminders(raw []byte) bool {
+	claude := newClaudeParser()
+	_, codex, err := parseLineKind(raw, claude, newCodexParser())
+	return err == nil && !codex && claude.remindersRemoved
+}
+
+// ReadWithTools читает как Read, передавая фильтру также имена инструментов из предыдущих строк.
+// Если фильтр отбросил вызов Claude Code, его имена всё равно сохраняются для последующих результатов.
+func ReadWithTools(path string, keep func([]byte, ToolNames) bool, fn func(Event)) (Meta, error) {
+	return read(path, nil, keep, fn)
+}
+
+func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event)) (Meta, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Meta{}, fmt.Errorf("transcript: %w", err)
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
-	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), keep: keep, fn: fn}
+	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), keep: keep, keepWithTools: keepWithTools, fn: fn}
+	if keepWithTools != nil {
+		rd.toolNames = make(map[string]struct{})
+	}
 	head, err := r.Peek(codexHead)
 	if err != nil && !errors.Is(err, io.EOF) { // EOF — файл короче codexHead
 		return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
@@ -166,7 +236,13 @@ func Read(path string, keep func(raw []byte) bool, fn func(Event)) (Meta, error)
 		}
 	}
 	for {
-		raw, err := readLine(r)
+		var raw []byte
+		var err error
+		if keepWithTools == nil {
+			raw, err = readLine(r)
+		} else {
+			raw, err = readLineView(r)
+		}
 		if len(raw) > 0 {
 			rd.line(raw)
 		}
@@ -191,12 +267,20 @@ func WithoutResults(raw []byte) bool { return !bytes.Contains(raw, toolResult) }
 
 // reader — состояние чтения одного файла.
 type reader struct {
-	meta   Meta
-	claude *claudeParser
-	codex  *codexParser
-	keep   func([]byte) bool
-	fn     func(Event)
-	lineNo int
+	meta          Meta
+	claude        *claudeParser
+	codex         *codexParser
+	keep          func([]byte) bool
+	keepWithTools func([]byte, ToolNames) bool
+	toolNames     map[string]struct{}
+	plainType     bool
+	noUnicode     bool
+	pending       []pendingCall
+	pendingByID   map[string][]int
+	indexed       int
+	pendingBytes  int
+	fn            func(Event)
+	lineNo        int
 }
 
 func (rd *reader) line(raw []byte) {
@@ -208,17 +292,367 @@ func (rd *reader) line(raw []byte) {
 	if skipLine(raw) || (rd.keep != nil && !rd.keep(raw)) {
 		return
 	}
-	events, err := parseLine(raw, rd.claude, rd.codex)
-	if err != nil {
-		rd.meta.Bad++
-		if rd.meta.FirstBad == nil {
-			rd.meta.FirstBad = fmt.Errorf("line %d: %w", rd.lineNo, err)
-		}
+	rd.plainType, rd.noUnicode = false, false
+	if rd.keepWithTools != nil && !rd.keepWithTools(raw, ToolNames{rd.toolNames, &rd.plainType, &rd.noUnicode}) {
+		rd.deferCall(raw, rd.plainType, rd.noUnicode)
 		return
 	}
+	var rec record
+	parsed := false
+	if len(rd.pending) > 0 {
+		if MayHideType(raw) {
+			rd.flushCalls()
+		} else if bytes.Contains(raw, []byte(`"tool_result"`)) && json.Unmarshal(raw, &rec) == nil {
+			rd.resolveCalls(&rec)
+			parsed = true
+		}
+	}
+	var events []Event
+	var codex bool
+	var err error
+	if parsed {
+		events, codex, err = parseRecordKind(&rec, raw, rd.claude, rd.codex)
+	} else {
+		events, codex, err = parseLineKind(raw, rd.claude, rd.codex)
+	}
+	if err != nil {
+		rd.badLine(raw, codex, err)
+		return
+	}
+	rd.emitParsed(raw, codex, events)
+}
+
+func (rd *reader) badLine(raw []byte, codex bool, err error) {
+	if len(rd.pending) > 0 {
+		rd.flushCalls()
+		if !codex {
+			rd.rememberTools(raw)
+		}
+	}
+	if rd.toolNames != nil {
+		rd.collectToolNames()
+	}
+	rd.meta.Bad++
+	if rd.meta.FirstBad == nil {
+		rd.meta.FirstBad = fmt.Errorf("line %d: %w", rd.lineNo, err)
+	}
+}
+
+func (rd *reader) emitParsed(raw []byte, codex bool, events []Event) {
+	hasCall := false
+	var changes []savedCall
 	for i := range events {
+		if rd.toolNames != nil && events[i].Role == Cmd {
+			rd.toolNames[events[i].Who] = struct{}{}
+			hasCall = true
+			if !codex && len(rd.pending) > 0 {
+				changes = append(changes, savedCall{events[i].CallID, events[i].Who})
+			}
+		}
 		events[i].Line = rd.lineNo
 		rd.fn(events[i])
+	}
+	if len(changes) > 0 {
+		rd.pending = append(rd.pending, pendingCall{changes: changes, decoded: true})
+		if len(rd.pending) > 32768 {
+			rd.flushCalls()
+		}
+	}
+	// Вызов Codex с пустой командой запоминает имя, но не создаёт событие Cmd.
+	if rd.toolNames != nil && !hasCall && codex && (MayHideType(raw) ||
+		bytes.Contains(raw, []byte(`"function_call"`)) || bytes.Contains(raw, []byte(`"custom_tool_call"`))) {
+		rd.collectToolNames()
+	}
+}
+
+func (rd *reader) collectToolNames() {
+	for _, names := range []map[string]string{rd.claude.tools, rd.codex.tools} {
+		for _, name := range names {
+			rd.toolNames[name] = struct{}{}
+		}
+	}
+}
+
+type savedCall struct{ id, name string }
+type pendingCall struct {
+	raw       []byte
+	changes   []savedCall
+	decoded   bool
+	noUnicode bool
+}
+
+// Отброшенные вызовы индексируются по возможным id до подходящего результата. Уже разобранные вызовы
+// записываются как изменения, чтобы повторное применение сохраняло порядок при повторных id.
+func (rd *reader) deferCall(raw []byte, plainType, noUnicode bool) {
+	if !bytes.Contains(raw, []byte(`"tool_use"`)) && (plainType || !MayHideType(raw)) {
+		return
+	}
+	if len(raw) > 64<<20 {
+		rd.flushCalls()
+		rd.rememberTools(raw)
+		return
+	}
+	rd.pending = append(rd.pending, pendingCall{raw: bytes.Clone(raw), noUnicode: noUnicode})
+	rd.pendingBytes += len(raw)
+	if rd.pendingBytes > 64<<20 || len(rd.pending) > 32768 {
+		rd.flushCalls()
+	}
+}
+
+// indexCalls откладывает поиск id до первого результата; вызовы после последнего результата не разбираются.
+func (rd *reader) indexCalls() bool {
+	if rd.pendingByID == nil {
+		rd.pendingByID = make(map[string][]int)
+	}
+	for rd.indexed < len(rd.pending) {
+		index := rd.indexed
+		call := &rd.pending[index]
+		var ids []string
+		if call.decoded {
+			for _, change := range call.changes {
+				ids = append(ids, change.id)
+			}
+		} else {
+			if !call.noUnicode && MayHideType(call.raw) {
+				rd.flushCalls()
+				return false
+			}
+			var ok bool
+			ids, ok = fastIDs(call.raw)
+			if !ok {
+				rd.flushCalls()
+				return false
+			}
+		}
+		for _, id := range ids {
+			if id != "" {
+				rd.pendingByID[id] = append(rd.pendingByID[id], index)
+			}
+		}
+		rd.indexed++
+	}
+	return true
+}
+
+func (rd *reader) decodeCall(index int) {
+	call := &rd.pending[index]
+	if call.decoded {
+		return
+	}
+	tmp := reader{claude: newClaudeParser(), toolNames: make(map[string]struct{})}
+	tmp.rememberTools(call.raw)
+	for id, name := range tmp.claude.tools {
+		call.changes = append(call.changes, savedCall{id, name})
+	}
+	for name := range tmp.toolNames {
+		rd.toolNames[name] = struct{}{}
+	}
+	rd.pendingBytes -= len(call.raw)
+	call.raw = nil
+	call.decoded = true
+}
+
+func (rd *reader) resolveCalls(rec *record) {
+	ids, ok := resultIDs(rec)
+	if !ok || len(ids) == 0 {
+		rd.flushCalls()
+		return
+	}
+	if slices.Contains(ids, "") {
+		rd.flushCalls()
+		return
+	}
+	if !rd.indexCalls() {
+		return
+	}
+	for _, id := range ids {
+		for _, index := range rd.pendingByID[id] {
+			rd.decodeCall(index)
+			for _, change := range rd.pending[index].changes {
+				if change.id == id {
+					rd.claude.tools[id] = change.name
+				}
+			}
+		}
+		delete(rd.pendingByID, id)
+	}
+}
+
+func (rd *reader) flushCalls() {
+	for i := range rd.pending {
+		rd.decodeCall(i)
+		for _, change := range rd.pending[i].changes {
+			rd.claude.tools[change.id] = change.name
+			rd.toolNames[change.name] = struct{}{}
+		}
+	}
+	rd.pending = nil
+	rd.pendingByID = nil
+	rd.indexed = 0
+	rd.pendingBytes = 0
+}
+
+// fastIDs допускает лишние значения id из вложенных полей; экранированные имена полей идут полным разбором.
+func fastIDs(raw []byte) ([]string, bool) {
+	var ids []string
+	for _, key := range []string{`"id"`, `"iD"`, `"Id"`, `"ID"`} {
+		for offset := 0; offset < len(raw); {
+			n := bytes.Index(raw[offset:], []byte(key))
+			if n < 0 {
+				break
+			}
+			offset += n + len(key)
+			id, found, ok := fastIDValue(raw, offset)
+			if !ok {
+				return nil, false
+			}
+			if found {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids, true
+}
+
+func fastIDValue(raw []byte, pos int) (string, bool, bool) {
+	pos = jsonSpace(raw, pos)
+	if pos == len(raw) || raw[pos] != ':' {
+		return "", false, true
+	}
+	pos = jsonSpace(raw, pos+1)
+	if pos == len(raw) {
+		return "", false, false
+	}
+	if raw[pos] != '"' {
+		return "", false, true
+	}
+	end := jsonStringEnd(raw, pos)
+	if end == 0 {
+		return "", false, false
+	}
+	if bytes.IndexByte(raw[pos+1:end-1], '\\') < 0 && utf8.Valid(raw[pos+1:end-1]) {
+		return string(raw[pos+1 : end-1]), true, true
+	}
+	var id string
+	if json.Unmarshal(raw[pos:end], &id) != nil {
+		return "", false, false
+	}
+	return id, true, true
+}
+
+func jsonSpace(raw []byte, pos int) int {
+	for pos < len(raw) && (raw[pos] == ' ' || raw[pos] == '\t' || raw[pos] == '\r' || raw[pos] == '\n') {
+		pos++
+	}
+	return pos
+}
+
+// resultIDs извлекает id именно частей tool_result; отсутствие id означает пустое имя вызова.
+func resultIDs(rec *record) ([]string, bool) {
+	if rec.Message == nil || len(rec.Message.Content) == 0 || rec.Message.Content[0] != '[' {
+		return nil, false
+	}
+	rec.decodedParts = parts(rec.Message.Content)
+	rec.partsReady = true
+	var ids []string
+	for i := range rec.decodedParts {
+		part := &rec.decodedParts[i]
+		if part.Type == "tool_result" {
+			ids = append(ids, part.ToolUseID)
+		}
+	}
+	return ids, len(ids) > 0
+}
+
+func jsonStringEnd(raw []byte, start int) int {
+	if start < 0 || start >= len(raw) || raw[start] != '"' {
+		return 0
+	}
+	for i := start + 1; i < len(raw); {
+		n := bytes.IndexByte(raw[i:], '"')
+		if n < 0 {
+			return 0
+		}
+		end := i + n
+		backslashes := 0
+		for j := end - 1; j > start && raw[j] == '\\'; j-- {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return end + 1
+		}
+		i = end + 1
+	}
+	return 0
+}
+
+// MayHideType замечает JSON-экранирование ASCII-символов, которые могут входить в имена полей и типов.
+func MayHideType(raw []byte) bool {
+	for offset := 0; offset < len(raw); {
+		n := bytes.Index(raw[offset:], []byte(`\u`))
+		if n < 0 {
+			return false
+		}
+		i := offset + n
+		if i+6 > len(raw) || escapedTypeRune(raw[i+2:i+6]) {
+			return true
+		}
+		offset = i + 6
+	}
+	return false
+}
+
+func escapedTypeRune(encoded []byte) bool {
+	var value rune
+	for _, b := range encoded {
+		value <<= 4
+		switch {
+		case b >= '0' && b <= '9':
+			value += rune(b - '0')
+		case b >= 'a' && b <= 'f':
+			value += rune(b - 'a' + 10)
+		case b >= 'A' && b <= 'F':
+			value += rune(b - 'A' + 10)
+		default:
+			return true
+		}
+	}
+	return value == '_' || value >= '0' && value <= '9' ||
+		value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+}
+
+// rememberTools использует тот же разбор, что и чтение событий, включая повторные поля JSON.
+func (rd *reader) rememberTools(raw []byte) {
+	if !bytes.Contains(raw, []byte(`"tool_use"`)) && !MayHideType(raw) {
+		return
+	}
+	var rec record
+	if json.Unmarshal(raw, &rec) != nil || rec.Payload != nil {
+		return
+	}
+	rd.claude.parse(&rec, raw)
+	for _, name := range rd.claude.tools {
+		rd.toolNames[name] = struct{}{}
+	}
+}
+
+// readLineView использует буфер читателя для короткой строки; длинную собирает как readLine.
+// Полученный срез действует до следующего чтения.
+func readLineView(r *bufio.Reader) ([]byte, error) {
+	chunk, prefix, err := r.ReadLine()
+	if !prefix || err != nil {
+		return chunk, err
+	}
+	buf := bytes.Clone(chunk)
+	for {
+		chunk, prefix, err = r.ReadLine()
+		buf = append(buf, chunk...)
+		if len(buf) > maxLine {
+			return nil, fmt.Errorf("line longer than %d bytes", maxLine)
+		}
+		if err != nil || !prefix {
+			return buf, err
+		}
 	}
 }
 

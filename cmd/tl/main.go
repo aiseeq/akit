@@ -35,6 +35,7 @@ path (Claude Code or codex rollout).
                 or ago: 30m 2h 3d
   --until T     up to time T, same forms
   --grep RE     events whose text matches RE (case-insensitive)
+                Unparsable line counts include only lines retained for parsing.
   --raw RE      raw jsonl lines matching RE (case-insensitive), e.g. --raw '"hook_cancelled"'
   -C N          with --grep: N events around each hit
   --all         all transcripts in ~/.claude/projects, including subagents

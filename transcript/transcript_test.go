@@ -10,6 +10,14 @@ import (
 	"testing"
 )
 
+func TestToolNamesZeroValue(t *testing.T) {
+	var names ToolNames
+	names.AddPossible("example")
+	if !names.Any(func(name string) bool { return name == "example" }) {
+		t.Fatal("нулевое значение не сохранило имя")
+	}
+}
+
 // readAll — события файла строками «строка роль who: текст».
 func readAll(t *testing.T, path string, keep func([]byte) bool) ([]string, Meta) {
 	t.Helper()

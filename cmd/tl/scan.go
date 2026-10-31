@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"regexp"
+	"regexp/syntax"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
 )
@@ -31,9 +35,10 @@ type result struct {
 
 // filter — отбор событий одного файла: роль, время, поиск и окрестность найденного.
 type filter struct {
-	opts  options
-	re    *regexp.Regexp
-	rawRE *regexp.Regexp
+	opts    options
+	re      *regexp.Regexp
+	rawRE   *regexp.Regexp
+	needles [][]string // обязательные условия: внутри условие — варианты, условия выполняются все
 }
 
 func newFilter(opts options) (*filter, error) {
@@ -52,14 +57,569 @@ func newFilter(opts options) (*filter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("--grep: %w", err)
 	}
-	// --grep сырые строки не отсеивает: текст совпадения сборный (Who, пробел, текст, отметки обвязки, Who результата
-	// из строки вызова), и литерал шаблона может не лежать в сырой строке подряд.
 	f.re = re
+	// Отсев возможен только по фрагменту, который после сборки события остаётся в исходном JSON подряд.
+	if parsed, err := syntax.Parse(opts.grep, syntax.Perl); err == nil && opts.context == 0 {
+		for _, group := range requiredLiterals(parsed) {
+			if !syntheticCondition(group) {
+				f.needles = append(f.needles, group)
+			}
+		}
+	}
 	return f, nil
 }
 
-func (f *filter) keepRaw(raw []byte) bool {
-	return f.rawRE.Match(raw)
+// Такие слова могут появиться в событии без соответствующего фрагмента исходной строки.
+func syntheticCondition(group []string) bool {
+	synthetic := transcript.SyntheticText()
+	for _, needle := range group {
+		if hasFolded([]byte(synthetic), needle) || strings.IndexFunc(needle, unicode.IsNumber) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Пропущенный вызов мог дать Who результата: сохраняем как возможные все условия, не опровергнутые строкой.
+func (f *filter) keepWithState(raw []byte, tools transcript.ToolNames) bool {
+	keep, absent := f.keepRawState(raw, tools)
+	if !keep && absent >= 0 {
+		tools.PlainType()
+	}
+	if keep || absent >= 0 && len(f.needles) == 1 ||
+		!bytes.Contains(raw, []byte(`"tool_use"`)) && !bytes.Contains(raw, []byte(`\u`)) {
+		return keep
+	}
+	for i, alternatives := range f.needles {
+		if i == absent {
+			continue
+		}
+		for _, needle := range alternatives {
+			if absent < 0 && bytes.Contains(raw, []byte(`\u`)) || hasFolded(raw, needle) {
+				tools.AddPossible(needle)
+			}
+		}
+	}
+
+	return false
+}
+
+func (f *filter) keepRawState(raw []byte, tools transcript.ToolNames) (bool, int) {
+	for index, alternatives := range f.needles {
+		found := false
+		for _, needle := range alternatives {
+			if hasFolded(raw, needle) {
+				found = true
+				break
+			}
+		}
+
+		if found && bytes.Contains(raw, []byte(transcript.ReminderOpen)) && !unsafeEscapes(raw) &&
+			!outsideReminders(raw, alternatives) && !reminderMayJoin(raw, alternatives) && transcript.RemovesReminders(raw) {
+			return false, -1
+		}
+		if !found {
+			if f.possibleMissing(raw, tools, alternatives) {
+				return f.rawRE == nil || f.rawRE.Match(raw), -1
+			}
+			return false, index
+		}
+	}
+	return f.rawRE == nil || f.rawRE.Match(raw), -1
+}
+
+// possibleMissing сохраняет строки, в которых фрагмент может появиться при сборке события.
+func (f *filter) possibleMissing(raw []byte, tools transcript.ToolNames, alternatives []string) bool {
+	unsafe, hasUnicode := inspectEscapesFor(raw, alternatives)
+	if !hasUnicode {
+		tools.NoUnicodeEscapes()
+	}
+	if unsafe || hasUnicode && transcript.MayHideType(raw) || reminderMayJoin(raw, alternatives) || containsPayload(raw) {
+		return true
+	}
+	return tools.Any(func(name string) bool {
+		for _, needle := range alternatives {
+			if hasFolded([]byte(name), needle) {
+				return true
+			}
+		}
+		return false
+	}) && bytes.Contains(raw, []byte(`"tool_result"`))
+}
+
+// containsPayload учитывает регистронезависимые имена полей, принимаемые encoding/json.
+func containsPayload(raw []byte) bool {
+	for offset := 0; offset < len(raw); {
+		n := bytes.IndexByte(raw[offset:], '"')
+		if n < 0 {
+			return false
+		}
+		i := offset + n
+		if i+9 <= len(raw) && (raw[i+1] == 'p' || raw[i+1] == 'P') && bytes.EqualFold(raw[i:i+9], []byte(`"payload"`)) {
+			return true
+		}
+		offset = i + 1
+	}
+	return false
+}
+
+// Экранированная буква может входить в искомый фрагмент, а суррогат — быть частью такой буквы.
+// Остальная пунктуация лишь разделяет фрагменты; исключение — удаляемое целиком напоминание.
+func unsafeEscapes(raw []byte) bool {
+	unsafe, _ := inspectEscapes(raw)
+	return unsafe
+}
+
+func inspectEscapes(raw []byte) (bool, bool) {
+	return inspectEscapesFor(raw, nil)
+}
+
+func inspectEscapesFor(raw []byte, alternatives []string) (bool, bool) {
+	i := bytes.Index(raw, []byte(`\u`))
+	if i < 0 {
+		return false, false
+	}
+	if bytes.Contains(raw, []byte("reminder")) {
+		return true, true
+	}
+	for i >= 0 {
+		if i+6 > len(raw) {
+			return true, true
+		}
+		var r rune
+		for _, b := range raw[i+2 : i+6] {
+			r <<= 4
+			switch {
+			case b >= '0' && b <= '9':
+				r += rune(b - '0')
+			case b >= 'a' && b <= 'f':
+				r += rune(b - 'a' + 10)
+			case b >= 'A' && b <= 'F':
+				r += rune(b - 'A' + 10)
+			default:
+				return true, true
+			}
+		}
+		if escapedMayMatter(raw, r, alternatives) {
+			return true, true
+		}
+		i += 6
+		next := bytes.Index(raw[i:], []byte(`\u`))
+		if next < 0 {
+			break
+		}
+		i += next
+	}
+	return false, true
+}
+
+func escapedMayMatter(raw []byte, r rune, alternatives []string) bool {
+	if r >= 0xd800 && r <= 0xdfff {
+		return true
+	}
+	return (safeLiteralRune(r) || unicode.SimpleFold(r) != r) &&
+		(alternatives == nil || escapedMatches(r, alternatives) || bytes.Contains(raw, []byte("<")) ||
+			bytes.Contains(raw, []byte(`\u003c`)) || bytes.Contains(raw, []byte(`\u003C`)))
+}
+
+// Экранированная руна опасна, если может входить в обязательный фрагмент с учётом свёртки.
+func escapedMatches(r rune, alternatives []string) bool {
+	for _, needle := range alternatives {
+		for _, want := range needle {
+			if simpleFoldEqual(r, want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// outsideReminders ищет условие вне пар тегов, целиком находящихся в одной строке JSON.
+func outsideReminders(raw []byte, alternatives []string) bool {
+	const open, close = transcript.ReminderOpen, transcript.ReminderClose
+	start, search := 0, 0
+	contains := func(p []byte) bool {
+		for _, needle := range alternatives {
+			if hasFolded(p, needle) {
+				return true
+			}
+		}
+		return false
+	}
+	for search < len(raw) {
+		i := bytes.Index(raw[search:], []byte(open))
+		if i < 0 {
+			break
+		}
+		i += search
+		end := bytes.Index(raw[i+len(open):], []byte(close))
+		if end < 0 {
+			break
+		}
+		end += i + len(open) + len(close)
+		sameString := true
+		for j := i; j < end; j++ {
+			if raw[j] == '\\' {
+				j++
+			} else if raw[j] == '"' {
+				sameString = false
+				break
+			}
+		}
+		if !sameString {
+			search = i + len(open)
+			continue
+		}
+		if contains(raw[start:i]) {
+			return true
+		}
+		start, search = end, end
+	}
+	return contains(raw[start:])
+}
+
+// reminderMayJoin проверяет совпадение, которое могло возникнуть при вырезании одного или нескольких напоминаний.
+func reminderMayJoin(raw []byte, alternatives []string) bool {
+	const open = transcript.ReminderOpen
+	for offset := 0; offset < len(raw); {
+		i := bytes.Index(raw[offset:], []byte(open))
+		if i < 0 {
+			return false
+		}
+		i += offset
+		if bytes.Contains(raw[i+len(open):], []byte(`<\/`+transcript.ReminderClose[2:])) {
+			return true
+		}
+		for _, needle := range alternatives {
+			want := []rune(needle)
+			for split := 1; split < len(want); split++ {
+				if foldedBefore(raw[:i], want[:split]) && foldedAfterReminders(raw[i:], want[split:]) {
+					return true
+				}
+			}
+		}
+		offset = i + len(open)
+	}
+	return false
+}
+
+func foldedBefore(raw []byte, want []rune) bool {
+	for j := len(want) - 1; j >= 0; j-- {
+		if len(raw) == 0 {
+			return false
+		}
+		r, size := utf8.DecodeLastRune(raw)
+		if !simpleFoldEqual(r, want[j]) {
+			return false
+		}
+		raw = raw[:len(raw)-size]
+	}
+	return true
+}
+
+func foldedAfterReminders(raw []byte, want []rune) bool {
+	const open, close = transcript.ReminderOpen, transcript.ReminderClose
+	for _, r := range want {
+		for bytes.HasPrefix(raw, []byte(open)) {
+			end := bytes.Index(raw[len(open):], []byte(close))
+			if end < 0 {
+				return false
+			}
+			raw = raw[len(open)+end+len(close):]
+		}
+		if len(raw) == 0 {
+			return false
+		}
+		got, size := utf8.DecodeRune(raw)
+		if !simpleFoldEqual(got, r) {
+			return false
+		}
+		raw = raw[size:]
+	}
+	return true
+}
+
+// requiredLiterals — обязательные условия совпадения: выполняются все, внутри условия — варианты.
+func requiredLiterals(re *syntax.Regexp) [][]string {
+	switch re.Op {
+	case syntax.OpLiteral:
+		return literalConditions(re.Rune)
+	case syntax.OpCharClass:
+		return classConditions(re.Rune)
+	case syntax.OpCapture, syntax.OpPlus:
+		return requiredLiterals(re.Sub[0])
+	case syntax.OpRepeat:
+		if re.Min > 0 {
+			return requiredLiterals(re.Sub[0])
+		}
+		return nil
+	case syntax.OpConcat:
+		var out [][]string
+		for _, sub := range re.Sub {
+			out = append(out, requiredLiterals(sub)...)
+		}
+		return out
+	case syntax.OpAlternate:
+		return alternateConditions(re.Sub)
+	}
+	return nil
+}
+
+func literalConditions(runes []rune) [][]string {
+	var out [][]string
+	var run []rune
+	flush := func() {
+		if len(run) > 0 {
+			out = append(out, []string{string(run)})
+			run = nil
+		}
+	}
+	for _, r := range runes {
+		if !safeLiteralRune(r) {
+			flush()
+		} else {
+			run = append(run, r)
+		}
+	}
+	flush()
+	return out
+}
+
+// Буквы и цифры не пересекают границы полей и вставленной обвязки; JSON с Unicode-экранированием
+// и строки с вырезанными напоминаниями проверяются отдельно до отсева.
+func safeLiteralRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsNumber(r)
+}
+
+func classConditions(runes []rune) [][]string {
+	var choices []string
+	for i := 0; i+1 < len(runes); i += 2 {
+		lo, hi := runes[i], runes[i+1]
+		// Большие классы оставляем без отсева: проверка каждого варианта
+		// дороже, чем разбор небольшого числа лишних строк.
+		if hi-lo >= 4 || len(choices)+int(hi-lo)+1 > 4 {
+			return nil
+		}
+		for r := lo; r <= hi; r++ {
+			if !safeLiteralRune(r) {
+				return nil
+			}
+			choices = append(choices, string(r))
+		}
+	}
+	if len(choices) == 0 {
+		return nil
+	}
+	return [][]string{choices}
+}
+
+func alternateConditions(subs []*syntax.Regexp) [][]string {
+	var choices []string
+	for _, sub := range subs {
+		groups := requiredLiterals(sub)
+		if len(groups) == 0 {
+			return nil
+		}
+		best := groups[0]
+		for _, group := range groups[1:] {
+			if len(group[0]) > len(best[0]) {
+				best = group
+			}
+		}
+		choices = append(choices, best...)
+	}
+	return [][]string{choices}
+}
+
+// hasFolded ищет pattern в raw с простой свёрткой Unicode, как (?i) в regexp, без свёрнутой копии строки.
+func hasFolded(raw []byte, pattern string) bool {
+	want := []rune(pattern)
+	if len(want) == 0 {
+		return true
+	}
+	if isASCII(want) {
+		if hasFoldedASCII(raw, want) {
+			return true
+		}
+		// ASCII-шаблон совпадает и с не-ASCII вариантами свёртки (ſ для s, знак Кельвина для k) — только они
+		// требуют общего пути.
+		if !hasNonASCIIFoldVariant(raw, want) {
+			return false
+		}
+	}
+	starts := newFoldStarts(want[0])
+	for offset := 0; offset < len(raw); {
+		pos, size := starts.next(raw, offset)
+		if pos == len(raw) {
+			return false
+		}
+		if matchFoldedAt(raw[pos:], want) {
+			return true
+		}
+		offset = pos + size
+	}
+	return false
+}
+
+func isASCII(runes []rune) bool {
+	for _, r := range runes {
+		if r > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
+}
+
+// foldStart — один вариант свёртки первой руны шаблона и его ближайшая позиция в строке.
+type foldStart struct {
+	bytes [utf8.UTFMax]byte
+	size  int
+	pos   int
+}
+
+// foldStarts — варианты свёртки первой руны; позиция варианта пересчитывается, только когда поиск ушёл за неё,
+// поэтому редкий вариант не пробегает строку на каждом кандидате.
+type foldStarts struct {
+	list [8]foldStart
+	n    int
+}
+
+func newFoldStarts(first rune) *foldStarts {
+	s := &foldStarts{}
+	s.add(first)
+	for r := unicode.SimpleFold(first); r != first; r = unicode.SimpleFold(r) {
+		s.add(r)
+	}
+	return s
+}
+
+func (s *foldStarts) add(r rune) {
+	var buf [utf8.UTFMax]byte
+	n := utf8.EncodeRune(buf[:], r)
+	for i := 0; i < s.n; i++ {
+		if s.list[i].size == n && bytes.Equal(s.list[i].bytes[:n], buf[:n]) {
+			return
+		}
+	}
+	if s.n < len(s.list) {
+		s.list[s.n] = foldStart{bytes: buf, size: n, pos: -1}
+		s.n++
+	}
+}
+
+// next — ближайшая с offset позиция любого варианта и его длина в байтах; len(raw), если вариантов дальше нет.
+func (s *foldStarts) next(raw []byte, offset int) (int, int) {
+	pos, size := len(raw), 0
+	for i := 0; i < s.n; i++ {
+		c := &s.list[i]
+		if c.pos < offset {
+			c.pos = indexFrom(raw, offset, c.bytes[:c.size])
+		}
+		if c.pos < pos {
+			pos, size = c.pos, c.size
+		}
+	}
+	return pos, size
+}
+
+func indexFrom(raw []byte, offset int, needle []byte) int {
+	var at int
+	if len(needle) == 1 {
+		at = bytes.IndexByte(raw[offset:], needle[0])
+	} else {
+		at = bytes.Index(raw[offset:], needle)
+	}
+	if at < 0 {
+		return len(raw)
+	}
+	return offset + at
+}
+
+func matchFoldedAt(raw []byte, want []rune) bool {
+	j := 0
+	for _, w := range want {
+		if j >= len(raw) {
+			return false
+		}
+		got, n := utf8.DecodeRune(raw[j:])
+		if !simpleFoldEqual(got, w) {
+			return false
+		}
+		j += n
+	}
+	return true
+}
+
+func hasFoldedASCII(raw []byte, pattern []rune) bool {
+	if len(pattern) == 1 {
+		b := foldASCII(byte(pattern[0]))
+		return bytes.IndexByte(raw, b) >= 0 || b >= 'a' && b <= 'z' && bytes.IndexByte(raw, b-('a'-'A')) >= 0
+	}
+	first := foldASCII(byte(pattern[0]))
+	starts := [2]byte{first, first}
+	if first >= 'a' && first <= 'z' {
+		starts[1] = first - ('a' - 'A')
+	}
+	for _, b := range starts {
+		for offset := 0; offset+len(pattern) <= len(raw); {
+			at := bytes.IndexByte(raw[offset:], b)
+			if at < 0 {
+				break
+			}
+			at += offset
+			if at+len(pattern) > len(raw) {
+				break
+			}
+			i := 1
+			for i < len(pattern) && foldASCII(raw[at+i]) == foldASCII(byte(pattern[i])) {
+				i++
+			}
+			if i == len(pattern) {
+				return true
+			}
+			offset = at + 1
+		}
+	}
+
+	return false
+}
+
+func foldASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func hasNonASCIIFoldVariant(raw []byte, pattern []rune) bool {
+	for _, r := range pattern {
+		for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+			if folded <= unicode.MaxASCII {
+				continue
+			}
+			var encoded [utf8.UTFMax]byte
+			n := utf8.EncodeRune(encoded[:], folded)
+			if bytes.Contains(raw, encoded[:n]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func simpleFoldEqual(a, b rune) bool {
+	if a == b {
+		return true
+	}
+	if unicode.ToLower(a) == unicode.ToLower(b) {
+		return true
+	}
+	for r := unicode.SimpleFold(a); r != a; r = unicode.SimpleFold(r) {
+		if r == b {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *filter) inWindow(ev transcript.Event) bool {
@@ -79,9 +639,9 @@ func (f *filter) match(ev transcript.Event) bool {
 // file читает один файл и отдаёт отобранные события с окрестностью -C; в режиме --wait вместо событий — ожидания
 // вывода: события в памяти не копятся.
 func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, error) {
-	var keep func([]byte) bool
-	if f.rawRE != nil {
-		keep = f.keepRaw
+	var keep func([]byte, transcript.ToolNames) bool
+	if len(f.needles) > 0 || f.rawRE != nil {
+		keep = f.keepWithState
 	}
 	var wt *waitTracker
 	if f.opts.waitProg != "" {
@@ -104,7 +664,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		before []transcript.Event // последние -C событий окна до найденного
 		after  int                // сколько событий после найденного ещё показать
 	)
-	meta, err := transcript.Read(src.path, keep, func(ev transcript.Event) {
+	meta, err := transcript.ReadWithTools(src.path, keep, func(ev transcript.Event) {
 		if !f.inWindow(ev) {
 			return
 		}
