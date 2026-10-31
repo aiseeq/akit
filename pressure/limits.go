@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,7 +64,7 @@ func ReadLimits(path string) (Limits, error) {
 			return Limits{}, fmt.Errorf("%s:%d: %s set twice", path, n, key)
 		}
 		seen[key] = true
-		if err := l.set(key, value); err != nil {
+		if err := l.Set(key, value); err != nil {
 			return Limits{}, fmt.Errorf("%s:%d: %s: %w", path, n, key, err)
 		}
 	}
@@ -76,7 +77,10 @@ func ReadLimits(path string) (Limits, error) {
 // LimitKeys — ключи файла порогов.
 var LimitKeys = []string{"runnable", "max_io_full", "max_mem_some", "max_swap_kbs", "swap_window"}
 
-func (l *Limits) set(key, value string) error {
+// Set — порог key (один из LimitKeys) из текстового значения: одна проверка для файла порогов и флагов
+// потребителей. Число — конечное и больше нуля (NaN и Inf молча выключили бы проверку), окно — длительность
+// больше нуля.
+func (l *Limits) Set(key, value string) error {
 	if key == "swap_window" {
 		d, err := time.ParseDuration(value)
 		if err != nil {
@@ -96,6 +100,9 @@ func (l *Limits) set(key, value string) error {
 	v, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return fmt.Errorf("number: %w", err)
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return errors.New("must be a finite number")
 	}
 	if v <= 0 {
 		return errors.New("must be positive")

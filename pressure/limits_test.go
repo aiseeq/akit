@@ -46,6 +46,9 @@ func TestReadLimits(t *testing.T) {
 		"swap_window: 1\n":           ":1: swap_window: duration",
 		"swap_window: -1s\n":         ":1: swap_window: must be positive",
 		"runnable: 8\nrunnable: 9\n": ":2: runnable set twice",
+		"runnable: NaN\n":            ":1: runnable: must be a finite number",
+		"max_io_full: +Inf\n":        ":1: max_io_full: must be a finite number",
+		"swap_window: 0s\n":          ":1: swap_window: must be positive",
 	} {
 		write(body)
 		if _, err := ReadLimits(path); err == nil || !strings.Contains(err.Error(), path+wantErr) {

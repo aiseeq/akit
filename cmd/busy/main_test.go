@@ -114,7 +114,7 @@ func TestParseArgs(t *testing.T) {
 	if err != nil || opts.limits.SwapWindow != 2*time.Second || opts.limits.Runnable != 16 || opts.limits.MaxMemSome != 5.5 {
 		t.Errorf("parseArgs = %+v, %v", opts, err)
 	}
-	for _, bad := range [][]string{{"--runnable", "0"}, {"--mem-some", "0"}, {"--window"}, {"--nope", "1"}, {"x"}} {
+	for _, bad := range [][]string{{"--runnable", "0"}, {"--mem-some", "0"}, {"--window"}, {"--nope", "1"}, {"x"}, {"--io-full", "NaN"}, {"--mem-some", "Inf"}, {"--runnable", "nan"}, {"--window", "0"}, {"--window", "-1s"}} {
 		if _, err := parseArgs(bad, time.Now()); err == nil {
 			t.Errorf("%v — ждали ошибку", bad)
 		}

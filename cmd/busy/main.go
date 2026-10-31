@@ -132,31 +132,17 @@ func parseArgs(args []string, now time.Time) (options, error) {
 	return opts, nil
 }
 
+// limitFlags — флаги порогов и их ключи в файле порогов: значение проверяет тот же разбор, что и файл.
+var limitFlags = map[string]string{"--runnable": "runnable", "--mem-some": "max_mem_some", "--io-full": "max_io_full", "--window": "swap_window"}
+
 // set разбирает значение флага name.
 func (opts *options) set(name, value string, now time.Time) error {
 	var err error
 	switch name {
-	case "--runnable":
-		var n int
-		n, err = strconv.Atoi(value)
-		if err == nil && n <= 0 {
-			err = errors.New("must be positive")
-		}
-		opts.limits.Runnable = float64(n)
-	case "--mem-some":
-		opts.limits.MaxMemSome, err = strconv.ParseFloat(value, 64)
-		if err == nil && opts.limits.MaxMemSome <= 0 {
-			err = errors.New("must be positive")
-		}
-	case "--io-full":
-		opts.limits.MaxIOFull, err = strconv.ParseFloat(value, 64)
-		if err == nil && opts.limits.MaxIOFull <= 0 {
-			err = errors.New("must be positive")
-		}
+	case "--runnable", "--mem-some", "--io-full", "--window":
+		err = opts.limits.Set(limitFlags[name], value)
 	case "--kind":
 		opts.kind = value
-	case "--window":
-		opts.limits.SwapWindow, err = time.ParseDuration(value)
 	case "--proc":
 		opts.procRoot = value
 	case "--quiet-until", "--quiet", "--why":
