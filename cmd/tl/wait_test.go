@@ -121,6 +121,31 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	if otherBinary.valid(path) {
 		t.Fatal("entry from another binary fingerprint was accepted")
 	}
+	// Ключ ловит каждое поле отдельно. Тот же размер, другой mtime: задержки 1, 5, 6 вместо 1, 2, 3 —
+	// строки той же длины, p50 сдвигается с 2 до 5 с.
+	sameSize := []struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{{"tk done one", 1, false, true}, {"tk done two", 5, false, true}, {"tk done three", 6, false, true}}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(claudeWaitRows(sameSize)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stamp := before.ModTime().Add(time.Hour)
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.Stat(path); err != nil || after.Size() != before.Size() {
+		t.Fatalf("same-size rewrite changed the size: %v", err)
+	}
+	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "5000\n" || errOut != "" {
+		t.Fatalf("same size, new mtime = (%d, %q, %q)", code, out, errOut)
+	}
 	withMore := append(spec, struct {
 		command string
 		delay   int
@@ -135,7 +160,10 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	if err := os.WriteFile(path, []byte(claudeWaitRows(withMore)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Дописанные вызовы сдвигают p50 с 2 до 3 с: устаревшая запись кэша дала бы прежний ответ.
+	// Другой размер, тот же mtime: дописанные вызовы сдвигают p50 с 5 до 3 с.
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
 	code, changed, changedErr := runTL(t, e, args...)
 	if code != 0 || changed != "3000\n" || changedErr != "" || !cache.valid(path) {
 		t.Fatalf("changed = (%d, %q, %q)", code, changed, changedErr)
@@ -189,7 +217,12 @@ func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Заголовок цел, события испорчены: допуск запись примет, но чтение событий даст промах и перечтёт транскрипт.
-	wantCode, wantOut, wantErr := runTL(t, e, queries[0]...)
+	// Запрос — с ответом (tk done 1, 3, 4 с): пустой список событий вместо промаха ответ бы изменил.
+	full := []string{"--wait", "tk done", "--q", "50", path}
+	wantCode, wantOut, wantErr := runTL(t, e, full...)
+	if wantCode != 0 || wantOut != "3000\n" {
+		t.Fatalf("full window = (%d, %q, %q), want 3000", wantCode, wantOut, wantErr)
+	}
 	if _, _, err := cache.load(path, true); err != nil {
 		t.Fatalf("damaged payload was not rewritten: %v", err)
 	}
@@ -199,7 +232,7 @@ func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
 	if _, _, err := cache.load(path, true); !errors.Is(err, errWaitCacheDecode) {
 		t.Fatalf("damaged payload decoded: %v", err)
 	}
-	code, out, errOut := runTL(t, e, queries[0]...)
+	code, out, errOut := runTL(t, e, full...)
 	if code != wantCode || out != wantOut || errOut != wantErr {
 		t.Fatalf("damaged payload result = (%d, %q, %q), want (%d, %q, %q)", code, out, errOut, wantCode, wantOut, wantErr)
 	}

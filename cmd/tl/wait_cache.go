@@ -251,6 +251,9 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 	return events, nil
 }
 
+// saveRecord пишет запись атомарно: временный файл, Sync, переименование — усечённой записи читатель не
+// застанет. Своей суммы у записи нет: порчу носителя ловит файловая система, а сбой чтения или разбора —
+// промах и перечтение транскрипта.
 func (c *waitCache) saveRecord(key waitCacheRecord, events []cachedWaitEvent) {
 	if c == nil || c.dir == "" {
 		return
