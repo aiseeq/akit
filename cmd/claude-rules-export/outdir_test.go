@@ -194,7 +194,7 @@ func TestExportResumesInterrupted(t *testing.T) {
 	for _, stop := range []struct {
 		step string
 		n    int
-	}{{"cleared", 1}, {"journaled", 1}, {"journaled", 4}, {"wrote", 1}, {"wrote", 4}} {
+	}{{"removed", 2}, {"cleared", 1}, {"created", 1}, {"created", 3}, {"journaled", 1}, {"journaled", 4}, {"wrote", 1}, {"wrote", 4}} {
 		t.Run(stop.step, func(t *testing.T) {
 			src, rules := fixture(t)
 			out := filepath.Join(t.TempDir(), "out")
@@ -209,6 +209,15 @@ func TestExportResumesInterrupted(t *testing.T) {
 			}
 			seen := 0
 			transferStep = func(step string) error {
+				if step == "intended" { // случайное имя — в журнале до создания
+					logged, err := loadJournal(journalFile(list))
+					if err != nil || len(logged) == 0 {
+						t.Fatalf("journal: %v %v", logged, err)
+					}
+					if _, err := os.Lstat(filepath.Join(out, logged[len(logged)-1].Path)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("%s created before its journal line: %v", logged[len(logged)-1].Path, err)
+					}
+				}
 				if step == "journaled" { // файл из последней строки журнала ещё без имени
 					logged, err := loadJournal(journalFile(list))
 					if err != nil || len(logged) == 0 {
@@ -230,11 +239,18 @@ func TestExportResumesInterrupted(t *testing.T) {
 			if code == 0 {
 				t.Fatal("interrupted run: code 0")
 			}
+			// после очистки список пуст: новое — только в журнале, обрывы подряд список не растят
+			if entries, err := loadList(list, out); err != nil || stop.step != "removed" && len(entries) != 0 {
+				t.Errorf("list after the cut: %d entries, %v", len(entries), err)
+			}
 			if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
 				t.Fatalf("resumed run: code %d %q", code, stderr)
 			}
 			if read(t, filepath.Join(out, "skills/jira/run.sh")) != "#!/bin/sh\necho new\n" || read(t, filepath.Join(out, ".git/HEAD")) != "ref\n" {
 				t.Error("resumed export incomplete or .git changed")
+			}
+			if s := snapshot(t, out); strings.Contains(s, tempPrefix) {
+				t.Errorf("temporary name left:\n%s", s)
 			}
 		})
 	}
@@ -267,6 +283,145 @@ func TestExportRefusesChangedJournaled(t *testing.T) {
 	}
 	if snapshot(t, out) != before {
 		t.Error("OUT_DIR changed")
+	}
+}
+
+// После обрыва пользователь создаёт или меняет папку и ссылку на месте записей выгрузки: следующий прогон
+// отказывает, их не трогает.
+func TestExportKeepsUserEntriesAfterCut(t *testing.T) {
+	for _, c := range []struct {
+		name, step string
+		n          int
+		change     func(t *testing.T, out string)
+		want       string
+	}{
+		{"own folder after clearing", "cleared", 1, func(t *testing.T, out string) {
+			if err := os.Mkdir(filepath.Join(out, "work"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}, "work"},
+		{"old folder chmod mid-clearing", "removed", 1, func(t *testing.T, out string) {
+			if err := os.Chmod(filepath.Join(out, "skills/jira"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "skills/jira"},
+		// шестая запись — ссылка skills/jira/README.md: под своим именем её ещё нет
+		{"own link before naming", "journaled", 6, func(t *testing.T, out string) {
+			if err := os.Symlink("SKILL.md", filepath.Join(out, "skills/jira/README.md")); err != nil {
+				t.Fatal(err)
+			}
+		}, "skills/jira/README.md"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src, rules := fixture(t)
+			out := filepath.Join(t.TempDir(), "out")
+			if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+				t.Fatalf("first run: code %d %q", code, stderr)
+			}
+			seen := 0
+			transferStep = func(step string) error {
+				if step == c.step {
+					if seen++; seen == c.n {
+						return errors.New("interrupted")
+					}
+				}
+				return nil
+			}
+			code, _, _ := runExport(t, "--src-home", src, "--rules", rules, out)
+			transferStep = nil
+			if code == 0 {
+				t.Fatal("interrupted run: code 0")
+			}
+			c.change(t, out)
+			before := snapshot(t, out)
+			if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != exitUsage || !strings.Contains(stderr, c.want) {
+				t.Errorf("code %d %q", code, stderr)
+			}
+			if snapshot(t, out) != before {
+				t.Error("OUT_DIR changed")
+			}
+		})
+	}
+}
+
+// Запись с тем же inode на другом устройстве или с другим временем рождения (inode отдан заново) — другой файл:
+// отказ.
+func TestExportRefusesOtherIdentity(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		change func(e *entry)
+	}{
+		{"device", func(e *entry) { e.Dev++ }},
+		{"birth", func(e *entry) { e.Birth++ }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src, rules := fixture(t)
+			out := filepath.Join(t.TempDir(), "out")
+			if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+				t.Fatalf("first run: code %d %q", code, stderr)
+			}
+			file, err := listFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := loadList(file, out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.name == "birth" && entries[0].Birth == 0 {
+				t.Skip("no birth time on this file system")
+			}
+			for i := range entries {
+				c.change(&entries[i])
+			}
+			if err := saveList(file, out, entries); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshot(t, out)
+			if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != exitUsage {
+				t.Errorf("code %d %q", code, stderr)
+			}
+			if snapshot(t, out) != before {
+				t.Error("OUT_DIR changed")
+			}
+		})
+	}
+}
+
+// OUT_DIR без O_TMPFILE — отказ до очистки: прошлая выгрузка цела.
+func TestExportRefusesWithoutUnnamedFiles(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("first run: code %d %q", code, stderr)
+	}
+	before := snapshot(t, out)
+	saved := openUnnamed
+	openUnnamed = func(int) (int, error) { return -1, syscall.EOPNOTSUPP }
+	code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+	openUnnamed = saved
+	if code != exitUsage || !strings.Contains(stderr, "O_TMPFILE") {
+		t.Errorf("code %d %q", code, stderr)
+	}
+	if snapshot(t, out) != before {
+		t.Error("OUT_DIR changed")
+	}
+}
+
+// Сборка оборванного прогона убирается следующим.
+func TestExportRemovesOldStage(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	stage, err := stageDir(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(stage, "skills/big/f"), "left\n", 0o644)
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("code %d %q", code, stderr)
+	}
+	if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stage left: %v", err)
 	}
 }
 

@@ -36,10 +36,11 @@ func export(opts options, stdout io.Writer) (err error) {
 	if err := checkOut(out, src, rules, m); err != nil {
 		return err
 	}
-	// выгрузка собирается и проверяется в своей временной папке: ошибка сборки не трогает OUT_DIR
-	stage, err := os.MkdirTemp("", "claude-rules-export-")
+	// выгрузка собирается и проверяется в своей папке рядом со списком: ошибка сборки не трогает OUT_DIR, а сборку
+	// оборванного прогона следующий убирает
+	stage, err := stageDir(out)
 	if err != nil {
-		return fmt.Errorf("stage: %w", err)
+		return err
 	}
 	defer func() {
 		if rerr := os.RemoveAll(stage); rerr != nil && err == nil {

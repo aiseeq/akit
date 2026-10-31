@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,20 +21,24 @@ import (
 )
 
 // Выгрузка удаляет в OUT_DIR только записи своего прошлого прогона, которые с тех пор не менялись: путь, тип,
-// права с битами suid, sgid и sticky, размер и sha256 файла, текст ссылки, xattr (в них и ACL), устройство и
-// inode — как в списке. Список лежит вне OUT_DIR, в каталоге состояния, под ключом физического пути OUT_DIR: под
-// другим путём (ссылка, bind mount, overlay, /proc) его нет, и непустая папка без списка — отказ. Чужой файл с тем
-// же содержимым — другие устройство или inode, тоже отказ. Папки удаляются только пустыми, все операции в OUT_DIR —
-// через os.Root: ни путь из списка, ни ссылка, подменённая на ходу, не выводят за OUT_DIR.
+// права с битами suid, sgid и sticky, размер и sha256 файла, текст ссылки, xattr (в них и ACL), устройство, inode
+// и время рождения — как в списке. Список лежит вне OUT_DIR, в каталоге состояния, под ключом физического пути
+// OUT_DIR: под другим путём (ссылка, bind mount, overlay, /proc) его нет, и непустая папка без списка — отказ. Чужой
+// файл с тем же содержимым — другие устройство, inode или время рождения, тоже отказ. Папки удаляются только
+// пустыми, все операции в OUT_DIR — через os.Root: ни путь из списка, ни ссылка, подменённая на ходу, не выводят
+// за OUT_DIR.
 //
-// Файл пишется без имени (O_TMPFILE) и получает имя, только когда его запись с inode уже в журнале рядом со
-// списком: оборванный прогон не оставляет ни недописанного файла, ни файла, которого нет в журнале.
+// Новое попадает под своё имя только после строки журнала (рядом со списком) с его inode: файл пишется без имени
+// (O_TMPFILE) и получает имя linkat; папка и ссылка создаются под случайным именем, записанным в журнал до
+// создания, и переименовываются без замены. Оборванный прогон не оставляет под именами выгрузки ничего, чего нет
+// в журнале.
 
-// entry — запись выгрузки: f — файл, l — ссылка, d — папка. Ino 0 — запись нового прогона без строки в журнале:
-// файл на её месте выгрузка не создавала, папку и ссылку прогон мог создать перед самым обрывом.
+// entry — запись выгрузки: f — файл, l — ссылка, d — папка; td и tl — папка или ссылка под случайным именем Path,
+// которое прогон записал в журнал до создания. At — где запись лежит до переименования в Path.
 type entry struct {
 	Kind  string      `json:"kind"`
 	Path  string      `json:"path"`
+	At    string      `json:"at,omitempty"`
 	Mode  fs.FileMode `json:"mode,omitempty"`
 	Size  int64       `json:"size,omitempty"`
 	Sum   string      `json:"sha256,omitempty"`
@@ -41,6 +46,15 @@ type entry struct {
 	Xattr string      `json:"xattr,omitempty"`
 	Dev   uint64      `json:"dev,omitempty"`
 	Ino   uint64      `json:"ino,omitempty"`
+	Birth int64       `json:"birth,omitempty"`
+}
+
+// tempPrefix — начало случайного имени, под которым создаются папка и ссылка до переименования.
+const tempPrefix = ".claude-rules-export-"
+
+// openUnnamed открывает файл без имени в папке dirfd; тест подменяет его файловой системой без O_TMPFILE.
+var openUnnamed = func(dirfd int) (int, error) {
+	return unix.Openat(dirfd, ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
 }
 
 // modeBits — права, которые выгрузка сверяет и ставит.
@@ -68,6 +82,25 @@ func listFile(out string) (string, error) {
 	return filepath.Join(state, "claude-rules-export", hex.EncodeToString(sum[:16])+".json"), nil
 }
 
+// stageDir — пустая папка сборки для OUT_DIR out рядом с его списком; сборка оборванного прогона убирается.
+func stageDir(out string) (string, error) {
+	file, err := listFile(out)
+	if err != nil {
+		return "", err
+	}
+	stage := strings.TrimSuffix(file, ".json") + ".stage"
+	if err := os.RemoveAll(stage); err != nil {
+		return "", fmt.Errorf("stage: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(stage), 0o755); err != nil {
+		return "", fmt.Errorf("stage: %w", err)
+	}
+	if err := os.Mkdir(stage, 0o700); err != nil {
+		return "", fmt.Errorf("stage: %w", err)
+	}
+	return stage, nil
+}
+
 // journalFile — журнал записей, созданных прогоном, рядом со списком: по строке JSON на запись.
 func journalFile(list string) string {
 	return strings.TrimSuffix(list, ".json") + ".journal"
@@ -93,8 +126,14 @@ func loadJournal(file string) ([]entry, error) {
 		if err := checkEntryPath(e.Path); err != nil {
 			return nil, fmt.Errorf("export journal %s: %w", file, err)
 		}
-		if e.Ino == 0 {
-			return nil, fmt.Errorf("export journal %s: %s without inode", file, e.Path)
+		if e.At != "" {
+			if err := checkEntryPath(e.At); err != nil {
+				return nil, fmt.Errorf("export journal %s: %w", file, err)
+			}
+		}
+		temp := e.Kind == "td" || e.Kind == "tl"
+		if temp != (e.Ino == 0) || temp && !strings.HasPrefix(path.Base(e.Path), tempPrefix) {
+			return nil, fmt.Errorf("export journal %s: bad line for %s", file, e.Path)
 		}
 		entries = append(entries, e)
 	}
@@ -127,8 +166,8 @@ func loadList(file, out string) ([]entry, error) {
 	if l.Out != out {
 		return nil, fmt.Errorf("export list %s is for %s, not %s", file, l.Out, out)
 	}
-	for _, e := range l.Entries {
-		if err := checkEntryPath(e.Path); err != nil {
+	for i := range l.Entries {
+		if err := checkEntryPath(l.Entries[i].Path); err != nil {
 			return nil, fmt.Errorf("export list %s: %w", file, err)
 		}
 	}
@@ -295,27 +334,36 @@ func xattrSum(f *os.File) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// same — запись на диске совпадает с записью списка. Запись без inode (нового прогона, без строки в журнале):
-// файлом не бывает; папка — любая (удаляется только пустой), ссылка — с тем же текстом.
-func same(have, want entry) bool {
-	if want.Ino == 0 {
-		switch want.Kind {
-		case "d":
-			return have.Kind == "d"
-		case "l":
-			return have.Kind == "l" && have.Link == want.Link
-		}
-		return false
+// same — запись на диске совпадает с записью списка или журнала. Под случайным именем из журнала — папка или
+// ссылка с тем же текстом: прогон оборвался между созданием и строкой с inode; папка удаляется только пустой.
+func same(have, want *entry) bool {
+	switch want.Kind {
+	case "td":
+		return have.Kind == "d"
+	case "tl":
+		return have.Kind == "l" && have.Link == want.Link
 	}
-	return have == want
+	return *have == *want
+}
+
+// birthAt — время рождения записи name в папке dirfd, нс; 0, если файловая система его не даёт.
+func birthAt(dirfd int, name string, flags int) (int64, error) {
+	var st unix.Statx_t
+	if err := unix.Statx(dirfd, name, flags|unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &st); err != nil {
+		return 0, fmt.Errorf("statx %s: %w", name, err)
+	}
+	if st.Mask&unix.STATX_BTIME == 0 {
+		return 0, nil
+	}
+	return st.Btime.Sec*1e9 + int64(st.Btime.Nsec), nil
 }
 
 // verifyOut — каждая запись OUT_DIR, кроме .git верхнего уровня, есть в списке и не менялась. Записи из списка,
 // которых нет, допустимы: прошлый прогон оборвался посреди очистки.
 func verifyOut(root *os.Root, known []entry) error {
-	byPath := map[string][]entry{}
-	for _, e := range known {
-		byPath[e.Path] = append(byPath[e.Path], e)
+	byPath := map[string][]int{}
+	for i := range known {
+		byPath[known[i].Path] = append(byPath[known[i].Path], i)
 	}
 	var walk func(dir string) error
 	walk = func(dir string) error {
@@ -323,8 +371,8 @@ func verifyOut(root *os.Root, known []entry) error {
 		if err != nil {
 			return fmt.Errorf("OUT_DIR: %w", err)
 		}
+		defer func() { _ = f.Close() }()
 		names, err := f.Readdirnames(-1)
-		_ = f.Close()
 		if err != nil {
 			return fmt.Errorf("OUT_DIR: %w", err)
 		}
@@ -340,7 +388,10 @@ func verifyOut(root *os.Root, known []entry) error {
 			if err != nil {
 				return fmt.Errorf("OUT_DIR: %w", err)
 			}
-			if !slices.ContainsFunc(byPath[rel], func(want entry) bool { return same(have, want) }) {
+			if have.Birth, err = birthAt(int(f.Fd()), name, 0); err != nil {
+				return fmt.Errorf("OUT_DIR: %w", err)
+			}
+			if !slices.ContainsFunc(byPath[rel], func(i int) bool { return same(&have, &known[i]) }) {
 				if len(known) == 0 {
 					return fmt.Errorf("OUT_DIR holds %s and has no export list: give an empty folder (only .git is kept) or a previous export", rel)
 				}
@@ -361,9 +412,9 @@ func verifyOut(root *os.Root, known []entry) error {
 // Записи, которой уже нет, — не ошибка.
 func clearOld(root *os.Root, old []entry) error {
 	var paths []string
-	for _, e := range old {
-		if !slices.Contains(paths, e.Path) {
-			paths = append(paths, e.Path)
+	for i := range old {
+		if !slices.Contains(paths, old[i].Path) {
+			paths = append(paths, old[i].Path)
 		}
 	}
 	// глубже — раньше: содержимое папки уходит до неё самой
@@ -371,6 +422,11 @@ func clearOld(root *os.Root, old []entry) error {
 	for _, p := range paths {
 		if err := root.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("clear OUT_DIR: %w", err)
+		}
+		if transferStep != nil {
+			if err := transferStep("removed"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -380,12 +436,12 @@ func clearOld(root *os.Root, old []entry) error {
 // ошибка, не перезапись. Каждую созданную запись пишет в журнал; возвращает их.
 func writeNew(root *os.Root, stage string, entries []entry, journal *os.File) ([]entry, error) {
 	done := make([]entry, 0, len(entries))
-	for _, e := range entries {
+	for i := range entries {
 		var (
 			have entry
 			err  error
 		)
-		if e.Kind == "f" {
+		if e := &entries[i]; e.Kind == "f" {
 			have, err = placeFile(root, filepath.Join(stage, filepath.FromSlash(e.Path)), e, journal)
 		} else {
 			have, err = writeOther(root, e, journal)
@@ -403,31 +459,69 @@ func writeNew(root *os.Root, stage string, entries []entry, journal *os.File) ([
 	return done, nil
 }
 
-// writeOther создаёт папку с её правами или ссылку и пишет её в журнал.
-func writeOther(root *os.Root, e entry, journal *os.File) (entry, error) {
-	var err error
+// writeOther создаёт папку с её правами или ссылку под случайным именем из журнала, пишет в журнал её запись с
+// inode и переименовывает в e.Path без замены.
+func writeOther(root *os.Root, e *entry, journal *os.File) (entry, error) {
+	dir, err := root.Open(path.Dir(e.Path))
+	if err != nil {
+		return entry{}, fmt.Errorf("folder of %s: %w", e.Path, err)
+	}
+	defer func() { _ = dir.Close() }()
+	random := make([]byte, 16)
+	_, _ = rand.Read(random) // crypto/rand.Read не возвращает ошибок
+	name := tempPrefix + hex.EncodeToString(random)
+	tmp := path.Join(path.Dir(e.Path), name)
+	if err := logEntry(journal, entry{Kind: "t" + e.Kind, Path: tmp, Link: e.Link}); err != nil {
+		return entry{}, err
+	}
+	if transferStep != nil {
+		if err := transferStep("intended"); err != nil {
+			return entry{}, err
+		}
+	}
 	if e.Kind == "d" {
-		if err = root.Mkdir(e.Path, 0o700); err == nil {
-			err = root.Chmod(e.Path, e.Mode)
+		if err = root.Mkdir(tmp, 0o700); err == nil {
+			err = root.Chmod(tmp, e.Mode)
 		}
 	} else {
-		err = root.Symlink(e.Link, e.Path)
+		err = root.Symlink(e.Link, tmp)
 	}
 	if err != nil {
 		return entry{}, fmt.Errorf("create %s: %w", e.Path, err)
 	}
-	have, err := describe(func() (fs.FileInfo, error) { return root.Lstat(e.Path) },
-		func() (*os.File, error) { return root.Open(e.Path) },
-		func() (string, error) { return root.Readlink(e.Path) }, e.Path)
+	if transferStep != nil {
+		if err := transferStep("created"); err != nil {
+			return entry{}, err
+		}
+	}
+	have, err := describe(func() (fs.FileInfo, error) { return root.Lstat(tmp) },
+		func() (*os.File, error) { return root.Open(tmp) },
+		func() (string, error) { return root.Readlink(tmp) }, tmp)
 	if err != nil {
 		return entry{}, err
 	}
-	return have, logEntry(journal, have)
+	if have.Birth, err = birthAt(int(dir.Fd()), name, 0); err != nil {
+		return entry{}, err
+	}
+	have.Path, have.At = e.Path, tmp
+	if err := logEntry(journal, have); err != nil {
+		return entry{}, err
+	}
+	if transferStep != nil {
+		if err := transferStep("journaled"); err != nil {
+			return entry{}, err
+		}
+	}
+	if err := unix.Renameat2(int(dir.Fd()), name, int(dir.Fd()), path.Base(e.Path), unix.RENAME_NOREPLACE); err != nil {
+		return entry{}, fmt.Errorf("name %s: %w", e.Path, err)
+	}
+	have.At = ""
+	return have, nil
 }
 
 // placeFile пишет файл без имени в его папке OUT_DIR, ставит права, пишет запись в журнал и только затем даёт
 // файлу имя; занятое имя — ошибка linkat, не перезапись.
-func placeFile(root *os.Root, src string, e entry, journal *os.File) (entry, error) {
+func placeFile(root *os.Root, src string, e *entry, journal *os.File) (entry, error) {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return entry{}, fmt.Errorf("read stage: %w", err)
@@ -437,7 +531,7 @@ func placeFile(root *os.Root, src string, e entry, journal *os.File) (entry, err
 		return entry{}, fmt.Errorf("folder of %s: %w", e.Path, err)
 	}
 	defer func() { _ = dir.Close() }()
-	fd, err := unix.Openat(int(dir.Fd()), ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	fd, err := openUnnamed(int(dir.Fd()))
 	if err != nil {
 		return entry{}, fmt.Errorf("%s: unnamed file: %w", e.Path, err)
 	}
@@ -463,6 +557,9 @@ func placeFile(root *os.Root, src string, e entry, journal *os.File) (entry, err
 	if err != nil {
 		return entry{}, err
 	}
+	if have.Birth, err = birthAt(fd, "", unix.AT_EMPTY_PATH); err != nil {
+		return entry{}, err
+	}
 	if err := logEntry(journal, have); err != nil {
 		return entry{}, err
 	}
@@ -471,16 +568,17 @@ func placeFile(root *os.Root, src string, e entry, journal *os.File) (entry, err
 			return entry{}, err
 		}
 	}
-	if err := unix.Linkat(unix.AT_FDCWD, "/proc/self/fd/"+strconv.Itoa(fd), int(dir.Fd()), path.Base(e.Path), unix.AT_SYMLINK_FOLLOW); err != nil {
+	// по дескриптору, не через /proc/self/fd: подменённый /proc дал бы имя чужому файлу
+	if err := unix.Linkat(fd, "", int(dir.Fd()), path.Base(e.Path), unix.AT_EMPTY_PATH); err != nil {
 		return entry{}, fmt.Errorf("%s: name the file: %w", e.Path, err)
 	}
 	return have, nil
 }
 
-// loadKnown — записи прошлого прогона: список и журнал оборванного. Запись журнала сменяет запись без inode того
-// же пути: созданное оборванным прогоном сверяется целиком.
+// loadKnown — записи прошлого прогона: список и журнал оборванного. Запись журнала, ещё не переименованная, —
+// и под своим именем, и под случайным.
 func loadKnown(file, jfile, out string) ([]entry, error) {
-	old, err := loadList(file, out)
+	known, err := loadList(file, out)
 	if err != nil {
 		return nil, err
 	}
@@ -488,10 +586,31 @@ func loadKnown(file, jfile, out string) ([]entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	old = slices.DeleteFunc(old, func(e entry) bool {
-		return e.Ino == 0 && slices.ContainsFunc(logged, func(l entry) bool { return l.Path == e.Path })
-	})
-	return append(old, logged...), nil
+	for i := range logged {
+		e := logged[i]
+		at := e.At
+		e.At = ""
+		known = append(known, e)
+		if at != "" {
+			e.Path = at
+			known = append(known, e)
+		}
+	}
+	return known, nil
+}
+
+// probeUnnamed — OUT_DIR держит файлы без имени: иначе перенос встал бы уже после очистки своего.
+func probeUnnamed(root *os.Root) error {
+	dir, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("OUT_DIR: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	fd, err := openUnnamed(int(dir.Fd()))
+	if err != nil {
+		return fmt.Errorf("OUT_DIR does not keep unnamed files (O_TMPFILE): %w", err)
+	}
+	return unix.Close(fd)
 }
 
 // writeLogged — перенос с новым журналом jfile.
@@ -535,15 +654,21 @@ func replaceExport(out, stage string) error {
 	if err := verifyOut(root, old); err != nil {
 		return err
 	}
-	// список прошлого и нового прогона, вместе с журналом оборванного, — до первого удаления; журнал после этого
-	// не нужен
-	if err := saveList(file, out, append(slices.Clip(old), fresh...)); err != nil {
+	if err := probeUnnamed(root); err != nil {
+		return err
+	}
+	// список с журналом оборванного прогона — до первого удаления; журнал после этого не нужен, а после очистки —
+	// и список: всё новое прогон держит в журнале
+	if err := saveList(file, out, old); err != nil {
 		return err
 	}
 	if err := os.Remove(jfile); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("export journal: %w", err)
 	}
 	if err := clearOld(root, old); err != nil {
+		return err
+	}
+	if err := saveList(file, out, nil); err != nil {
 		return err
 	}
 	if transferStep != nil {
