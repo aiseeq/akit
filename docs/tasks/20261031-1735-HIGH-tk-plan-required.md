@@ -1,6 +1,6 @@
 # tk: обязательный пункт плана, который нельзя пропустить через tk skip
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -33,3 +33,5 @@
 - 2026-10-31 19:09 note — akit-master: проверка 8 — FAIL: GCONV_PATH с не-UTF-8 локалью грузит модуль в /bin/bash. Класс закрыт целиком: убираются все LD_* и список UNSECURE_ENVVARS glibc (без TMPDIR); тест покрывает BASHOPTS (nullglob), ENV, GCONV_PATH, LOCPATH, LD_BIND_NOW; мутанты без BASHOPTS, ENV, GCONV_PATH краснеют. Граница: программы внутри проверки — по PATH вызывающего
 - 2026-10-31 19:13 note — akit-master: v1.21.10 (ff66922) на ноуте и PC; проверка 9 — суб-агент, бриф scratchpad/briefs/verify-required9.md
 - 2026-10-31 19:29 note — akit-master: проверка 9: обходов нет (командами tk, правкой тикета, окружением — перечень в отчёте); FAIL только сверки: в списке не было 5 MALLOC_* из UNSECURE_ENVVARS glibc 2.43. Теперь убирается весь префикс MALLOC_*, тест покрывает MALLOC_PERTURB_ и TZDIR; короткая проверка 10 — сверка списка
+- 2026-10-31 19:31 note — akit-master: v1.21.11 (27a0edf) на ноуте и PC; проверка 10 — суб-агент, бриф scratchpad/briefs/verify-required10.md
+- 2026-10-31 19:32 готово — суб-агент-проверяющий (session akit-master): проверка 9 (бриф scratchpad/briefs/verify-required9.md): обходов нет — стенды A и A2, skip rc=2, done с падающим accept rc=1, разметка, склейки, окружение (SHELLOPTS, BASHOPTS, SSH_CLIENT+.bashrc, LD_*, GCONV_PATH и др.), 18/20 мутантов красные (2 — пробелы покрытия без дыры); проверка 10 (verify-required10.md): v1.21.11 (27a0edf) на ноуте и PC, список окружения покрывает UNSECURE_ENVVARS glibc 2.43 кроме TMPDIR, README и комментарии сходятся с кодом, мутант без MALLOC_ красный
