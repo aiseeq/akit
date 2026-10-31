@@ -112,7 +112,7 @@ func TestAcceptBriefQuoteByMarkerDay(t *testing.T) {
 // Пометка со временем, поясом и вставкой до двоеточия.
 func TestAcceptBriefQuoteMarkerWithTime(t *testing.T) {
 	e := testEnv(t)
-	writeTranscript(t, e.home, "-home-x-b", "ffff6666-0000", human("2026-10-31T14:19:00Z", "Удали старые логи, кроме продакшена"))
+	writeTranscript(t, e.home, "-home-x-b", "ffff6666-0000", human("2026-10-31T13:19:00Z", "Удали старые логи, кроме продакшена"))
 	b := writeBrief(t, t.TempDir(), "Правило (пользователь 31.10 14:19 CET через коллегу (tl ffff6666:12): «удали старые логи»).\n")
 	code, out := briefRun(t, e, b, "--until", "2026-10-31 15:00")
 	if code != 0 {
@@ -218,7 +218,7 @@ func TestAcceptBriefPlaceholderNotLink(t *testing.T) {
 // Пометка с часами (и секундами) сужает поиск до минут вокруг них, а не до часа: короткое «да» в тот же час — другие ответы.
 func TestAcceptBriefQuoteClockNarrows(t *testing.T) {
 	e := testEnv(t)
-	writeTranscript(t, e.home, "-home-x-a", "acac9999-0000", human("2026-10-31T15:07:51Z", "да"))
+	writeTranscript(t, e.home, "-home-x-a", "acac9999-0000", human("2026-10-31T14:07:51Z", "да"))
 	writeTranscript(t, e.home, "-home-x-b", "bcbc9999-0000",
 		human("2026-10-31T14:40:00Z", "да, но позже"),
 		human("2026-10-31T15:30:00Z", "да, отменяю"))
@@ -279,6 +279,242 @@ func TestBriefLinkDoubleQuotesAndEarlierLines(t *testing.T) {
 	b := writeBrief(t, t.TempDir(), "`user-word "+p+" \"Ускорь сборку\"`\n")
 	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
 	mustHave(t, "двойные кавычки", out, "1 found", "note: the last of 2 user lines", "Ускорь сборку ещё")
+}
+
+func TestR3QuoteFirstAfterColonAndParagraphContinuation(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "10000000-0000", human("2026-10-31T10:00:00Z", "Ускорь сборку"))
+	b := writeBrief(t, t.TempDir(), "пользователь 31.10 про «сборку»:\n«Ускорь сборку»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "первая цитата после двоеточия и перенос", out, "1 found", "Ускорь сборку")
+}
+
+func TestR3ClockColonAndContextQuote(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "11000000-0000", human("2026-10-22T13:43:00Z", "Проверил, вопроса нет"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 22.10 ~15:43 CEST о вопросе «включать ли кэш»: «Проверил, вопроса нет»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "двоеточие времени не считается разделителем пометки", out, "1 found", "Проверил, вопроса нет")
+}
+
+func TestR3SeveralQuotesAndSquareEllipsis(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "20000000-0000",
+		human("2026-10-31T10:00:00Z", "Сделай быструю сборку проекта"),
+		human("2026-10-31T10:05:00Z", "Исправь документацию"),
+		human("2026-10-31T10:10:00Z", "Ускорь компиляцию"))
+	b := writeBrief(t, t.TempDir(), "пользователь 31.10: «Сделай […] проекта», «Исправь документацию», «Ускорь компиляцию».\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "три цитаты", out, "3 user words: 3 found, 0 ambiguous, 0 not found")
+}
+
+func TestR3BracketedQuoteAnnotationIsOmission(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "21000000-0000", human("2026-10-31T10:00:00Z", "Посчитай оба способа"))
+	b := writeBrief(t, t.TempDir(), "пользователь 31.10: «Посчитай оба способа [числа в отчётах]»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "пояснение в скобках пропускается внутри цитаты", out, "1 found", "Посчитай оба способа")
+}
+
+func TestR3QuotePunctuationMayVary(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "22000000-0000", human("2026-10-31T10:00:00Z", "Проверьте вопроса-то нет"))
+	b := writeBrief(t, t.TempDir(), "пользователь 31.10: «вопроса то нет»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "дефис в реплике соответствует пробелу в цитате", out, "1 found", "вопроса то нет")
+}
+
+func TestR3QueuedUserAttachmentIsScanned(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "23000000-0000",
+		`{"type":"attachment","timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"queued_command","origin":{"kind":"human"},"prompt":"Проверь расчёт"}}`)
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Проверь расчёт»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "реплика пользователя из очереди", out, "1 found", "Проверь расчёт")
+}
+
+func TestR3MarkerFormsAndApproximateClock(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "30000000-0000", human("2026-11-01T15:55:00Z", "Собери проект"))
+	b := writeBrief(t, t.TempDir(), "ПОЛЬЗОВАТЕЛЯ, 1.11 ~16:00 UTC: «Собери проект».\n")
+	_, out := briefRun(t, e, b, "--until", "2026-11-01 17:00")
+	mustHave(t, "форма пометки и окно около 15 минут", out, "1 found", "Собери проект")
+}
+
+func TestR3ExactClockWindowAndZones(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "40000000-0000",
+		human("2026-10-31T14:00:00Z", "Точное окно"),
+		human("2026-10-31T14:03:00Z", "Точное окно"),
+		human("2026-10-31T13:00:00Z", "CEST время"),
+		human("2026-10-31T15:00:00Z", "UTC время"))
+	b := writeBrief(t, t.TempDir(),
+		"Пользователь 31.10 15:00 CET: «Точное окно».\n"+
+			"Пользователь 31.10 15:00 CEST: «CEST время».\n"+
+			"Пользователь 31.10 15:00 UTC: «UTC время».\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "точное окно и пояса", out, "3 user words: 3 found, 0 ambiguous, 0 not found", "Точное окно", "CEST время", "UTC время")
+	mustLack(t, "за пределом точного окна", out, "ambiguous:")
+}
+
+func TestR3ExactClockWindowIncludesTwoMinuteEdges(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r3", "41000000-0000",
+		human("2026-10-31T13:58:00Z", "Край окна"),
+		human("2026-10-31T14:02:00Z", "Край окна"),
+		human("2026-10-31T14:02:01Z", "Край окна"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10 15:00 CET: «Край окна»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 17:00")
+	mustHave(t, "точное окно включает обе границы ±2 минуты", out, "1 user words: 0 found, 1 ambiguous, 0 not found", "13:58", "14:02")
+	// The matching window excludes 14:02:01 as a quote hit; later context now continues to --until.
+}
+
+func TestR3LinkUntilAndTranscriptMtime(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r3", "50000000-0000",
+		human("2026-10-31T10:00:00Z", "Ссылка есть"),
+		human("2026-10-31T12:00:00Z", "Позже брифа"))
+	b := writeBrief(t, t.TempDir(), "`user-word "+p+" 'Ссылка есть'`\n")
+	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(p, until.Add(-time.Hour), until.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "реплика после брифа отсечена", out, "1 found")
+	if err := os.Chtimes(p, until.Add(time.Hour), until.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_, out = briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "ранняя реплика в изменённом файле", out, "1 found")
+}
+
+func TestR3ChangedTranscriptDoesNotConfirmLaterReply(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r3", "51000000-0000",
+		human("2026-10-31T12:00:00Z", "Фрагмент только после брифа"))
+	b := writeBrief(t, t.TempDir(), "`user-word "+p+" 'Фрагмент только после брифа'`\n")
+	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(p, until.Add(time.Hour), until.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "поздняя реплика в изменённом транскрипте", out, "1 not found", "fragment not found in transcript")
+}
+
+func TestBriefOtherBracketTextIsLiteral(t *testing.T) {
+	if hasFragment("the feature", "the [hidden] feature") {
+		t.Fatal("ordinary bracket text must not act as an omission")
+	}
+}
+
+func TestR3ShellEscapedApostrophe(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r3", "60000000-0000", human("2026-10-31T10:00:00Z", "don't stop"))
+	b := writeBrief(t, t.TempDir(), "`user-word "+p+" 'don'\\''t stop'`\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "shell escaped apostrophe", out, "1 found", "don't stop")
+}
+
+func TestR4QuoteShowsLinkedTranscriptContext(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r4", "70000000-0000",
+		agent("2026-10-31T09:59:00Z", "Предложу вариант исправления."),
+		human("2026-10-31T10:00:00Z", "Ускорь сборку проекта"),
+		human("2026-10-31T10:01:00Z", "И проверь документацию"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Ускорь сборку»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "цитата показывает контекст найденной реплики", out, "Предложу вариант исправления", "Ускорь сборку проекта", "И проверь документацию")
+}
+
+func TestR4QuoteFindsAnswerInQuestionDialog(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r4", "71000000-0000",
+		ask("2026-10-31T10:00:00Z", "question-1"),
+		answer("2026-10-31T10:01:00Z", "question-1", "Какой режим?", "Запусти мягкий режим"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Запусти мягкий режим»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "ответ в окне вопроса считается словами пользователя", out, "1 found", "Запусти мягкий режим")
+}
+
+func TestR4MarkerZoneControlsDayAndWindowAcrossMidnight(t *testing.T) {
+	t.Run("UTC marker day in local zone", func(t *testing.T) {
+		e := testEnv(t)
+		e.loc = time.FixedZone("CET", 3600)
+		writeTranscript(t, e.home, "-home-r4", "72000000-0000", human("2026-10-30T23:30:00Z", "Ночная дата"))
+		b := writeBrief(t, t.TempDir(), "Пользователь 30.10 23:30 UTC: «Ночная дата»\n")
+		_, out := briefRun(t, e, b, "--until", "2026-10-31 02:00")
+		mustHave(t, "день определяется в поясе пометки", out, "1 found", "Ночная дата")
+	})
+	t.Run("timed window crosses midnight", func(t *testing.T) {
+		e := testEnv(t)
+		writeTranscript(t, e.home, "-home-r4", "73000000-0000", human("2026-10-30T22:59:00Z", "На границе полуночи"))
+		b := writeBrief(t, t.TempDir(), "Пользователь 31.10 00:01 CET: «На границе полуночи»\n")
+		_, out := briefRun(t, e, b, "--until", "2026-10-31 02:00")
+		mustHave(t, "окно с временем и поясом пересекает полночь", out, "1 found", "На границе полуночи")
+	})
+}
+
+func TestR4EmptyLinkFragmentIsNotFound(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r4", "74000000-0000", human("2026-10-31T10:00:00Z", "Любая реплика"))
+	b := writeBrief(t, t.TempDir(), "`user-word "+p+" ''`\n")
+	code, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	if code != exitNone {
+		t.Errorf("пустая ссылка должна быть not found, код %d:\n%s", code, out)
+	}
+	mustHave(t, "пустой фрагмент ссылки", out, "1 not found")
+}
+
+func TestR4MalformedTranscriptLineIsReported(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r4", "75000000-0000",
+		human("2026-10-31T10:00:00Z", "Полезный фрагмент"), "{broken json")
+	b := writeBrief(t, t.TempDir(), "`user-word "+p+" 'Полезный фрагмент'`\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "повреждённая строка транскрипта замечена", out, "malformed", "line 2")
+}
+
+func TestR4BracketedTranscriptTextIsLiteral(t *testing.T) {
+	got := briefTextFragment("сделай X [пояснение] Y")
+	if strings.Contains(got, "…") || !strings.Contains(got, "пояснение") {
+		t.Fatalf("bracketed transcript words must remain literal, got %q", got)
+	}
+}
+
+func TestR5QuoteContextContinuesUntilBriefTime(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r5", "76000000-0000",
+		human("2026-10-31T10:00:00Z", "Начальная цитата"),
+		human("2026-10-31T10:05:00Z", "Продолжение после окна пометки"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10 10:00 UTC: «Начальная цитата»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "контекст цитаты продолжается до времени брифа", out, "1 found", "Продолжение после окна пометки")
+}
+
+func TestR5PrefilterMatchesCaseFoldedQuote(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r5", "77000000-0000", human("2026-10-31T10:00:00Z", "Залей на GitHub"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «залей на github»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "отсев соблюдает сравнение без регистра", out, "1 found", "Залей на GitHub")
+}
+
+func TestR5SpacedJSONSyntaxFallsBackToFullParse(t *testing.T) {
+	e := testEnv(t)
+	raw := strings.ReplaceAll(human("2026-10-31T10:00:00Z", "Найди запись с пробелами"), `":"`, `": "`)
+	writeTranscript(t, e.home, "-home-r5", "78000000-0000", raw)
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Найди запись с пробелами»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "JSON с пробелами разбирается", out, "1 found", "Найди запись с пробелами")
+}
+
+func TestR5QuoteSearchReportsMalformedTranscriptLines(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r5", "79000000-0000",
+		human("2026-10-31T10:00:00Z", "Цитата перед повреждённой строкой"), "{broken json")
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Цитата перед повреждённой строкой»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "путь поиска цитаты сообщает о повреждённой строке", out, "malformed", "line 2")
 }
 
 // Цитата ищется целыми словами: «да» не находит «Удали».

@@ -237,12 +237,16 @@ minutes. Lines typed or queued by the human and answers in a question dialog cou
 quotes in a brief, showing each matching line with its agent reply and up to 20
 later user lines from the same session through the brief time. Without `--until`,
 the brief file's modification time is used. A dated quote is
-`пользователь DD.MM [HH:MM[:SS]] …: «quote»`: the quote right after the colon, with
-no other date or `;` between the marker and the colon, so a colleague's quote on
-the same line is not taken for the user's. It matches whole words, and `…` splits
-it into ordered pieces. More than one user line on the marker day, the same text
-at different times included, is shown as ambiguous. A marker with a clock searches
-within two minutes of that time; without a clock, the whole marked day is searched.
+`пользователь DD.MM [HH:MM[:SS]] …: «quote»`: the first quote after the colon,
+which may start on the next line in the same paragraph. A comma after the marker
+word is accepted, as are one digit for the day or month, any case and grammatical
+form of “пользователь”, and an approximate clock such as `~15:43`. Approximate
+times search within 15 minutes; exact times search within two minutes. `CET`,
+`CEST`, and `UTC` mean UTC offsets +1, +2, and 0; a clock without a zone is local.
+Several consecutive quotes after one marker are checked separately. The quote
+matches whole words; `…` and `[…]` mark omitted text between ordered pieces. More
+than one user line on the marker day, the same text at different times included,
+is shown as ambiguous. Without a clock, the whole marked day is searched.
 A transcript reference counts only when its path starts with `/` or `~/`, ends in
 `.jsonl`, and is followed by a fragment in single or double quotes; several lines
 with the fragment give the last one and a note. `~` expands only at the start of

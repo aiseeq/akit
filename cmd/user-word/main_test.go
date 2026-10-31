@@ -37,6 +37,32 @@ func writeTranscript(t *testing.T, home, project, name string, lines ...string) 
 	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	var first, latest time.Time
+	for _, line := range lines {
+		const key = `"timestamp":"`
+		if at := strings.Index(line, key); at >= 0 {
+			start := at + len(key)
+			if end := strings.IndexByte(line[start:], '"'); end >= 0 {
+				if stamp, err := time.Parse(time.RFC3339Nano, line[start:start+end]); err == nil {
+					if first.IsZero() || stamp.Before(first) {
+						first = stamp
+					}
+					if stamp.After(latest) {
+						latest = stamp
+					}
+				}
+			}
+		}
+	}
+	if !first.IsZero() {
+		mtime := first
+		if first.In(time.Local).Format(time.DateOnly) != latest.In(time.Local).Format(time.DateOnly) {
+			mtime = latest
+		}
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return p
 }
 
