@@ -465,6 +465,30 @@ func TestExportRefusesWithoutBirthTime(t *testing.T) {
 	}
 }
 
+// Первый прогон в OUT_DIR без времени рождения отказывает до записи: сверять было бы нечего, отказ — от пробы.
+func TestExportFirstRunRefusesWithoutBirthTime(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(filepath.Join(out, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, out)
+	saved := statx
+	statx = func(dirfd int, path string, flags, mask int, st *unix.Statx_t) error {
+		err := saved(dirfd, path, flags, mask, st)
+		st.Mask &^= unix.STATX_BTIME
+		return err
+	}
+	code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+	statx = saved
+	if code != exitUsage || !strings.Contains(stderr, "birth time") {
+		t.Errorf("code %d %q", code, stderr)
+	}
+	if snapshot(t, out) != before {
+		t.Error("OUT_DIR changed")
+	}
+}
+
 // Сборка оборванного прогона убирается следующим.
 func TestExportRemovesOldStage(t *testing.T) {
 	src, rules := fixture(t)

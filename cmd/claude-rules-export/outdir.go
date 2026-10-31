@@ -680,8 +680,8 @@ func loadKnown(file, jfile, out string) ([]entry, error) {
 	return known, nil
 }
 
-// probeUnnamed — OUT_DIR держит файлы без имени и даёт время рождения: иначе перенос встал бы уже после очистки
-// своего, а без времени рождения своя копия на месте записи с тем же inode сошла бы за неё.
+// probeUnnamed — OUT_DIR держит файлы без имени: иначе перенос встал бы уже после очистки своего. Время рождения
+// проверять здесь не нужно: записи прошлого прогона без него не пройдут verifyOut, а новый файл узнаёт его до имени.
 func probeUnnamed(root *os.Root) error {
 	dir, err := root.Open(".")
 	if err != nil {
@@ -692,11 +692,7 @@ func probeUnnamed(root *os.Root) error {
 	if err != nil {
 		return fmt.Errorf("OUT_DIR does not keep unnamed files (O_TMPFILE): %w", err)
 	}
-	defer func() { _ = unix.Close(fd) }()
-	if _, err := birthAt(fd, "", unix.AT_EMPTY_PATH); err != nil {
-		return fmt.Errorf("OUT_DIR: %w", err)
-	}
-	return nil
+	return unix.Close(fd)
 }
 
 // writeLogged — перенос с новым журналом jfile.
