@@ -15,7 +15,7 @@ type missingSkill struct{ name string }
 
 func (m missingSkill) Error() string { return "missing skill: " + m.name }
 
-func export(opts options, stdout io.Writer) error {
+func export(opts options, stdout io.Writer) (err error) {
 	// сверяются, читаются и очищаются одни и те же пути — разрешённые так, как их поймёт система
 	out, err := physical(opts.out)
 	if err != nil {
@@ -41,7 +41,11 @@ func export(opts options, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("stage: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(stage) }()
+	defer func() {
+		if rerr := os.RemoveAll(stage); rerr != nil && err == nil {
+			err = fmt.Errorf("remove stage: %w", rerr)
+		}
+	}()
 	if err := assemble(stage, src, rules, m); err != nil {
 		return err
 	}

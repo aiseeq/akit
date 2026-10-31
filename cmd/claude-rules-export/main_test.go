@@ -334,6 +334,9 @@ func TestExportDotDotAfterLink(t *testing.T) {
 func TestExportKeepsMountedData(t *testing.T) {
 	if out := os.Getenv("CRE_BIND_OUT"); out != "" {
 		code, _, stderr := runExport(t, "--src-home", os.Getenv("CRE_BIND_SRC"), "--rules", os.Getenv("CRE_BIND_RULES"), out)
+		if os.Getenv("CRE_BIND_WANT0") != "" && code != 0 {
+			t.Fatalf("OUT_DIR %s: code %d %q", out, code, stderr)
+		}
 		if code != 0 && code != exitDirty && code != exitUsage {
 			t.Fatalf("OUT_DIR %s: code %d %q", out, code, stderr)
 		}
@@ -361,37 +364,44 @@ func TestExportKeepsMountedData(t *testing.T) {
 	if b, err := exec.Command("cp", "-a", filepath.Join(prior, "out/skills/jira"), twin).CombinedOutput(); err != nil {
 		t.Fatalf("cp: %v %s", err, b)
 	}
-	for _, c := range []struct{ name, mount, from, out string }{
-		{"prior", `mount --bind "$1" "$2/out/skills/jira"`, twin, "out"},
-		{"home", bind, src, "m"},
-		{"inside .claude", bind, filepath.Join(src, ".claude"), "m/x"},
+	// две выгрузки на двух свежих tmpfs: одинаковые номера inode, разные устройства; скилл выгрузки b смонтирован
+	// поверх скилла a, b проверяется в том же пространстве имён
+	run := `"$3" -test.run '^TestExportKeepsMountedData$' -test.count=1 >/dev/null`
+	twoFS := `mkdir -p "$2/a" "$2/b" && mount -t tmpfs tmpfs "$2/a" && mount -t tmpfs tmpfs "$2/b" && ` +
+		`CRE_BIND_WANT0=1 CRE_BIND_OUT="$2/a/out" ` + run + ` && CRE_BIND_WANT0=1 CRE_BIND_OUT="$2/b/out" ` + run +
+		` && mount --bind "$2/b/out/skills/jira" "$2/a/out/skills/jira"`
+	for _, c := range []struct{ name, mount, from, out, after string }{
+		{"prior", `mount --bind "$1" "$2/out/skills/jira"`, twin, "out", ""},
+		{"same inode, other device", twoFS, src, "a/out", ` && umount "$2/a/out/skills/jira" && ls "$2/b/out/skills/jira/SKILL.md" "$2/b/out/skills/jira/run.sh"`},
+		{"home", bind, src, "m", ""},
+		{"inside .claude", bind, filepath.Join(src, ".claude"), "m/x", ""},
 		// подпапка читаемого под другим путём: у точки монтирования другие предки
-		{"hooks", bind, filepath.Join(src, ".claude/hooks"), "m"},
-		{"skill not exported", bind, filepath.Join(src, ".claude/skills/secret"), "m"},
-		{"rules subfolder", bind, filepath.Join(rules, "extra"), "m"},
+		{"hooks", bind, filepath.Join(src, ".claude/hooks"), "m", ""},
+		{"skill not exported", bind, filepath.Join(src, ".claude/skills/secret"), "m", ""},
+		{"rules subfolder", bind, filepath.Join(rules, "extra"), "m", ""},
 		// точка монтирования внутри OUT_DIR: очистка зашла бы в неё
-		{"mount inside OUT_DIR", `mkdir -p "$2/o/skills/h" && mount --bind "$1" "$2/o/skills/h"`, filepath.Join(src, ".claude/hooks"), "o"},
+		{"mount inside OUT_DIR", `mkdir -p "$2/o/skills/h" && mount --bind "$1" "$2/o/skills/h"`, filepath.Join(src, ".claude/hooks"), "o", ""},
 		// overlay: источник — верхний слой, OUT_DIR — слитая папка; mountinfo пути к источнику не покажет
 		{"overlay upper", `mkdir -p "$2/l" "$2/w" "$2/o" && mount -t overlay overlay -o lowerdir="$2/l",upperdir="$1",workdir="$2/w" "$2/o"`,
-			filepath.Join(src, ".claude/hooks"), "o"},
+			filepath.Join(src, ".claude/hooks"), "o", ""},
 		// OUT_DIR — сам точка монтирования чужой папки, где только имена выгрузки
 		{"overlay of export-like folder", `mkdir -p "$2/l" "$2/w" "$2/o" && mount -t overlay overlay -o lowerdir="$2/l",upperdir="$1",workdir="$2/w" "$2/o"`,
-			repo, "o"},
+			repo, "o", ""},
 		// папка без учёта регистра: OUT_DIR в другом регистре, чем точка монтирования в mountinfo; код 77 —
 		// ядро без casefold у tmpfs
 		{"casefold mount inside OUT_DIR", casefold + ` && mkdir -p "$2/fs/d/out/skills" && mount --bind "$1" "$2/fs/d/out/skills"`,
-			repo, "fs/d/OUT"},
+			repo, "fs/d/OUT", ""},
 		{"casefold OUT_DIR is a mount point", casefold + ` && mkdir -p "$2/fs/d/out" && mount --bind "$1" "$2/fs/d/out"`,
-			repo, "fs/d/OUT"},
+			repo, "fs/d/OUT", ""},
 		// без /proc точек монтирования не узнать: отказ, а не очистка вслепую
 		{"no /proc", `mkdir -p "$2/o/skills/h" && mount --bind "$1" "$2/o/skills/h" && mount -t tmpfs none /proc`,
-			filepath.Join(src, ".claude/hooks"), "o"},
+			filepath.Join(src, ".claude/hooks"), "o", ""},
 	} {
 		dir := filepath.Join(mnt, c.name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		cmd := exec.Command("unshare", "-rm", "sh", "-c", c.mount+` && exec "$3" -test.run '^TestExportKeepsMountedData$' -test.count=1`,
+		cmd := exec.Command("unshare", "-rm", "sh", "-c", c.mount+` && "$3" -test.run '^TestExportKeepsMountedData$' -test.count=1`+c.after,
 			"sh", c.from, dir, os.Args[0])
 		cmd.Env = append(os.Environ(), "CRE_BIND_SRC="+src, "CRE_BIND_RULES="+rules, "CRE_BIND_OUT="+filepath.Join(dir, c.out))
 		b, err := cmd.CombinedOutput()

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -30,6 +32,28 @@ func TestExportRefusesChangedExport(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "skills/jira/run.sh"},
+		{"setuid", func(t *testing.T, out string) {
+			if err := os.Chmod(filepath.Join(out, "skills/jira/run.sh"), 0o755|os.ModeSetuid); err != nil {
+				t.Fatal(err)
+			}
+		}, "skills/jira/run.sh"},
+		{"sticky", func(t *testing.T, out string) {
+			if err := os.Chmod(filepath.Join(out, "work/CLAUDE.md"), 0o644|os.ModeSticky); err != nil {
+				t.Fatal(err)
+			}
+		}, "work/CLAUDE.md"},
+		{"folder mode", func(t *testing.T, out string) {
+			if err := os.Chmod(filepath.Join(out, "skills/jira"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "skills/jira"},
+		{"xattr", func(t *testing.T, out string) {
+			if err := syscall.Setxattr(filepath.Join(out, "skills/jira/SKILL.md"), "user.note", []byte("своё"), 0); errors.Is(err, syscall.ENOTSUP) {
+				t.Skip("no user xattrs on this file system")
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		}, "skills/jira/SKILL.md"},
 		{"foreign file", func(t *testing.T, out string) {
 			write(t, filepath.Join(out, "skills/jira/notes.md"), "своё\n", 0o644)
 		}, "skills/jira/notes.md"},
@@ -70,12 +94,14 @@ func TestExportRefusesChangedExport(t *testing.T) {
 	}
 }
 
-// Записи прерванного прогона — без inode: их держат хэш и цель ссылки.
+// Записи прерванного прогона без inode в журнале: файл на их месте выгрузка не создавала (файл получает имя только
+// после записи inode), ссылку держит её текст.
 func TestExportRefusesChangedPending(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		change func(t *testing.T, out string)
 	}{
+		{"file with the same content", func(*testing.T, string) {}},
 		{"content, same size", func(t *testing.T, out string) {
 			write(t, filepath.Join(out, "skills/jira/run.sh"), "#!/bin/sh\necho ko\n", 0o755)
 		}},
@@ -168,7 +194,7 @@ func TestExportResumesInterrupted(t *testing.T) {
 	for _, stop := range []struct {
 		step string
 		n    int
-	}{{"cleared", 1}, {"wrote", 1}, {"wrote", 4}} {
+	}{{"cleared", 1}, {"journaled", 1}, {"journaled", 4}, {"wrote", 1}, {"wrote", 4}} {
 		t.Run(stop.step, func(t *testing.T) {
 			src, rules := fixture(t)
 			out := filepath.Join(t.TempDir(), "out")
@@ -177,8 +203,21 @@ func TestExportResumesInterrupted(t *testing.T) {
 				t.Fatalf("first run: code %d %q", code, stderr)
 			}
 			write(t, filepath.Join(src, ".claude/skills/jira/run.sh"), "#!/bin/sh\necho new\n", 0o755)
+			list, err := listFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
 			seen := 0
 			transferStep = func(step string) error {
+				if step == "journaled" { // файл из последней строки журнала ещё без имени
+					logged, err := loadJournal(journalFile(list))
+					if err != nil || len(logged) == 0 {
+						t.Fatalf("journal: %v %v", logged, err)
+					}
+					if _, err := os.Lstat(filepath.Join(out, logged[len(logged)-1].Path)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("%s named before its journal line: %v", logged[len(logged)-1].Path, err)
+					}
+				}
 				if step == stop.step {
 					if seen++; seen == stop.n {
 						return errors.New("interrupted")
@@ -198,6 +237,36 @@ func TestExportResumesInterrupted(t *testing.T) {
 				t.Error("resumed export incomplete or .git changed")
 			}
 		})
+	}
+}
+
+// Папка, которую создал оборванный прогон, сверяется по журналу: её права, сменённые после обрыва, — отказ.
+func TestExportRefusesChangedJournaled(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	seen := 0
+	transferStep = func(step string) error {
+		if step == "wrote" {
+			if seen++; seen == 2 { // README.md, затем папка global
+				return errors.New("interrupted")
+			}
+		}
+		return nil
+	}
+	code, _, _ := runExport(t, "--src-home", src, "--rules", rules, out)
+	transferStep = nil
+	if code == 0 {
+		t.Fatal("interrupted run: code 0")
+	}
+	if err := os.Chmod(filepath.Join(out, "global"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, out)
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != exitUsage || !strings.Contains(stderr, "global") {
+		t.Errorf("code %d %q", code, stderr)
+	}
+	if snapshot(t, out) != before {
+		t.Error("OUT_DIR changed")
 	}
 }
 
@@ -253,7 +322,7 @@ func TestExportRefusesUnsafeNames(t *testing.T) {
 	}
 }
 
-// snapshot — пути, права, содержимое и цели ссылок папки одной строкой.
+// snapshot — пути, права, inode, xattr, содержимое и цели ссылок папки одной строкой.
 func snapshot(t *testing.T, dir string) string {
 	t.Helper()
 	var b strings.Builder
@@ -265,7 +334,10 @@ func snapshot(t *testing.T, dir string) string {
 		if err != nil {
 			return err
 		}
-		b.WriteString(p + " " + st.Mode().String())
+		b.WriteString(p + " " + st.Mode().String() + " " + strconv.FormatUint(st.Sys().(*syscall.Stat_t).Ino, 10))
+		if st.Mode()&os.ModeSymlink == 0 {
+			b.WriteString(" " + xattrs(t, p))
+		}
 		switch {
 		case st.Mode()&os.ModeSymlink != 0:
 			l, err := os.Readlink(p)
@@ -287,6 +359,28 @@ func snapshot(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	return b.String()
+}
+
+func xattrs(t *testing.T, p string) string {
+	t.Helper()
+	buf := make([]byte, 4096)
+	n, err := syscall.Listxattr(p, buf)
+	if errors.Is(err, syscall.ENOTSUP) {
+		return ""
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := strings.Split(strings.TrimSuffix(string(buf[:n]), "\x00"), "\x00")
+	for i, name := range names {
+		v := make([]byte, 4096)
+		m, err := syscall.Getxattr(p, name, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names[i] = name + "=" + string(v[:m])
+	}
+	return strings.Join(names, ",")
 }
 
 // Обычный OUT_DIR — папка внутри ~/work, рядом с выгружаемым work/CLAUDE.md: два прогона подряд проходят, источник цел.

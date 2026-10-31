@@ -31,9 +31,11 @@ ALLOWED is printed as file:line: KIND.
 
 The export is built and checked in a temporary folder first, then put into OUT_DIR. In
 OUT_DIR only the previous run's own entries are removed, and only while unchanged: each
-file's path, mode, size, sha256 and inode and each link's text must match the list that
-run kept in $XDG_STATE_HOME/claude-rules-export (default ~/.local/state), keyed by the
-OUT_DIR path. Folders are removed only when empty; .git at the top is never touched.
+file's and folder's path, mode (setuid, setgid and sticky too), extended attributes (ACLs
+too), device and inode, each file's size and sha256 and each link's text must match the
+list that run kept in $XDG_STATE_HOME/claude-rules-export (default ~/.local/state), keyed
+by the OUT_DIR path. A file gets its name only after it is fully written and logged next
+to that list. Folders are removed only when empty; .git at the top is never touched.
 Anything else (an edited or foreign file, a folder shown there by a mount, an OUT_DIR
 without a list that holds more than .git) is refused before anything is removed, so no
 other path to the same folder (symlink, bind mount, overlay, /proc) can erase it. A run cut

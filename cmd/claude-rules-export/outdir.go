@@ -12,28 +12,39 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Выгрузка удаляет в OUT_DIR только записи своего прошлого прогона, которые с тех пор не менялись: путь, тип,
-// права, размер и sha256 файла, текст ссылки и inode — как в списке. Список лежит вне OUT_DIR, в каталоге
-// состояния, под ключом физического пути OUT_DIR: под другим путём (ссылка, bind mount, overlay, /proc) его нет, и
-// непустая папка без списка — отказ. Чужой файл с тем же содержимым — другой inode, тоже отказ. Папки удаляются
-// только пустыми, все операции в OUT_DIR — через os.Root: ни путь из списка, ни ссылка, подменённая на ходу, не
-// выводят за OUT_DIR.
+// права с битами suid, sgid и sticky, размер и sha256 файла, текст ссылки, xattr (в них и ACL), устройство и
+// inode — как в списке. Список лежит вне OUT_DIR, в каталоге состояния, под ключом физического пути OUT_DIR: под
+// другим путём (ссылка, bind mount, overlay, /proc) его нет, и непустая папка без списка — отказ. Чужой файл с тем
+// же содержимым — другие устройство или inode, тоже отказ. Папки удаляются только пустыми, все операции в OUT_DIR —
+// через os.Root: ни путь из списка, ни ссылка, подменённая на ходу, не выводят за OUT_DIR.
+//
+// Файл пишется без имени (O_TMPFILE) и получает имя, только когда его запись с inode уже в журнале рядом со
+// списком: оборванный прогон не оставляет ни недописанного файла, ни файла, которого нет в журнале.
 
-// entry — запись выгрузки: f — файл, l — ссылка, d — папка. Ino 0 — запись прерванного прогона, inode ещё не
-// записан: сверяется без него.
+// entry — запись выгрузки: f — файл, l — ссылка, d — папка. Ino 0 — запись нового прогона без строки в журнале:
+// файл на её месте выгрузка не создавала, папку и ссылку прогон мог создать перед самым обрывом.
 type entry struct {
-	Kind string      `json:"kind"`
-	Path string      `json:"path"`
-	Mode fs.FileMode `json:"mode,omitempty"`
-	Size int64       `json:"size,omitempty"`
-	Sum  string      `json:"sha256,omitempty"`
-	Link string      `json:"link,omitempty"`
-	Ino  uint64      `json:"ino,omitempty"`
+	Kind  string      `json:"kind"`
+	Path  string      `json:"path"`
+	Mode  fs.FileMode `json:"mode,omitempty"`
+	Size  int64       `json:"size,omitempty"`
+	Sum   string      `json:"sha256,omitempty"`
+	Link  string      `json:"link,omitempty"`
+	Xattr string      `json:"xattr,omitempty"`
+	Dev   uint64      `json:"dev,omitempty"`
+	Ino   uint64      `json:"ino,omitempty"`
 }
+
+// modeBits — права, которые выгрузка сверяет и ставит.
+const modeBits = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
 
 type exportList struct {
 	Out     string  `json:"out"`
@@ -55,6 +66,50 @@ func listFile(out string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(out))
 	return filepath.Join(state, "claude-rules-export", hex.EncodeToString(sum[:16])+".json"), nil
+}
+
+// journalFile — журнал записей, созданных прогоном, рядом со списком: по строке JSON на запись.
+func journalFile(list string) string {
+	return strings.TrimSuffix(list, ".json") + ".journal"
+}
+
+// loadJournal — записи из журнала оборванного прогона. Последняя строка без перевода строки оборвана на записи:
+// её файл ещё не получил имени.
+func loadJournal(file string) ([]entry, error) {
+	data, err := os.ReadFile(file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("export journal: %w", err)
+	}
+	lines := strings.Split(string(data), "\n")
+	var entries []entry
+	for _, line := range lines[:len(lines)-1] {
+		var e entry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			return nil, fmt.Errorf("export journal %s: %w", file, err)
+		}
+		if err := checkEntryPath(e.Path); err != nil {
+			return nil, fmt.Errorf("export journal %s: %w", file, err)
+		}
+		if e.Ino == 0 {
+			return nil, fmt.Errorf("export journal %s: %s without inode", file, e.Path)
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func logEntry(journal *os.File, e entry) error {
+	data, err := json.Marshal(e)
+	if err != nil {
+		return fmt.Errorf("export journal: %w", err)
+	}
+	if _, err := journal.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("export journal: %w", err)
+	}
+	return nil
 }
 
 func loadList(file, out string) ([]entry, error) {
@@ -140,12 +195,16 @@ func scanStage(dir string) ([]entry, error) {
 		}
 		folded[strings.ToLower(rel)] = rel
 		e, err := describe(func() (fs.FileInfo, error) { return os.Lstat(p) },
-			func() (io.ReadCloser, error) { return os.Open(p) },
+			func() (*os.File, error) { return os.Open(p) },
 			func() (string, error) { return os.Readlink(p) }, rel)
 		if err != nil {
 			return err
 		}
-		e.Ino = 0
+		// права нужны при переносе; xattr, устройство и inode — у созданной в OUT_DIR записи, не у сборки
+		if e.Kind == "d" && e.Mode.Perm()&0o700 != 0o700 {
+			return fmt.Errorf("folder %s: mode %v, the owner cannot write into it", rel, e.Mode)
+		}
+		e.Xattr, e.Dev, e.Ino = "", 0, 0
 		entries = append(entries, e)
 		return nil
 	})
@@ -155,8 +214,8 @@ func scanStage(dir string) ([]entry, error) {
 	return entries, nil
 }
 
-// describe — запись по пути rel: тип, права, размер, sha256 файла, текст ссылки, inode.
-func describe(lstat func() (fs.FileInfo, error), open func() (io.ReadCloser, error), readlink func() (string, error), rel string) (entry, error) {
+// describe — запись по пути rel: тип, права, размер, sha256 файла, текст ссылки, xattr, устройство, inode.
+func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), readlink func() (string, error), rel string) (entry, error) {
 	if err := checkEntryPath(rel); err != nil {
 		return entry{}, err
 	}
@@ -164,42 +223,91 @@ func describe(lstat func() (fs.FileInfo, error), open func() (io.ReadCloser, err
 	if err != nil {
 		return entry{}, err
 	}
-	e := entry{Path: rel, Mode: st.Mode().Perm()}
+	e := entry{Path: rel, Mode: st.Mode() & modeBits}
 	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		e.Ino = sys.Ino
+		e.Dev, e.Ino = sys.Dev, sys.Ino
 	}
 	switch {
-	case st.Mode().IsRegular():
-		e.Kind, e.Size = "f", st.Size()
-		f, err := open()
-		if err != nil {
-			return entry{}, err
-		}
-		h := sha256.New()
-		_, err = io.Copy(h, f)
-		_ = f.Close()
-		if err != nil {
-			return entry{}, err
-		}
-		e.Sum = hex.EncodeToString(h.Sum(nil))
 	case st.Mode()&fs.ModeSymlink != 0:
 		e.Kind, e.Mode = "l", 0
 		if e.Link, err = readlink(); err != nil {
 			return entry{}, err
 		}
+		return e, nil
+	case st.Mode().IsRegular():
+		e.Kind, e.Size = "f", st.Size()
 	case st.IsDir():
 		e.Kind = "d"
 	default:
 		return entry{}, fmt.Errorf("%s: not a file, folder or link", rel)
 	}
+	f, err := open()
+	if err != nil {
+		return entry{}, err
+	}
+	defer func() { _ = f.Close() }()
+	if e.Xattr, err = xattrSum(f); err != nil {
+		return entry{}, fmt.Errorf("%s: %w", rel, err)
+	}
+	if e.Kind == "f" {
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			return entry{}, fmt.Errorf("%s: %w", rel, err)
+		}
+		e.Sum = hex.EncodeToString(h.Sum(nil))
+	}
 	return e, nil
 }
 
-// same — запись на диске совпадает с записью списка; inode — если он в списке есть. Права папки не сверяются:
-// оборванный перенос ставит их последними, а пустая папка — всё, что очистка удаляет.
+// xattrSum — sha256 имён и значений всех xattr открытого файла (ACL — тоже xattr); пусто, если их нет или файловая
+// система их не держит.
+func xattrSum(f *os.File) (string, error) {
+	fd := int(f.Fd())
+	size, err := unix.Flistxattr(fd, nil)
+	if errors.Is(err, unix.ENOTSUP) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("xattr: %w", err)
+	}
+	if size == 0 {
+		return "", nil
+	}
+	buf := make([]byte, size)
+	if size, err = unix.Flistxattr(fd, buf); err != nil {
+		return "", fmt.Errorf("xattr: %w", err)
+	}
+	names := strings.Split(strings.TrimSuffix(string(buf[:size]), "\x00"), "\x00")
+	slices.Sort(names)
+	h := sha256.New()
+	for _, name := range names {
+		n, err := unix.Fgetxattr(fd, name, nil)
+		if err != nil {
+			return "", fmt.Errorf("xattr %s: %w", name, err)
+		}
+		v := make([]byte, n)
+		if n, err = unix.Fgetxattr(fd, name, v); err != nil {
+			return "", fmt.Errorf("xattr %s: %w", name, err)
+		}
+		h.Write([]byte(name + "\x00" + strconv.Itoa(n) + "\x00"))
+		h.Write(v[:n])
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// same — запись на диске совпадает с записью списка. Запись без inode (нового прогона, без строки в журнале):
+// файлом не бывает; папка — любая (удаляется только пустой), ссылка — с тем же текстом.
 func same(have, want entry) bool {
-	return have.Kind == want.Kind && (have.Mode == want.Mode || want.Kind == "d") && have.Size == want.Size && have.Sum == want.Sum &&
-		have.Link == want.Link && (want.Ino == 0 || have.Ino == want.Ino)
+	if want.Ino == 0 {
+		switch want.Kind {
+		case "d":
+			return have.Kind == "d"
+		case "l":
+			return have.Kind == "l" && have.Link == want.Link
+		}
+		return false
+	}
+	return have == want
 }
 
 // verifyOut — каждая запись OUT_DIR, кроме .git верхнего уровня, есть в списке и не менялась. Записи из списка,
@@ -227,7 +335,7 @@ func verifyOut(root *os.Root, known []entry) error {
 			}
 			rel := path.Join(dir, name)
 			have, err := describe(func() (fs.FileInfo, error) { return root.Lstat(rel) },
-				func() (io.ReadCloser, error) { return root.Open(rel) },
+				func() (*os.File, error) { return root.Open(rel) },
 				func() (string, error) { return root.Readlink(rel) }, rel)
 			if err != nil {
 				return fmt.Errorf("OUT_DIR: %w", err)
@@ -269,69 +377,139 @@ func clearOld(root *os.Root, old []entry) error {
 }
 
 // writeNew переносит выгрузку из stage в OUT_DIR: каждую папку, файл и ссылку создаёт заново, существующий путь —
-// ошибка, не перезапись. Возвращает записи с inode созданных.
-func writeNew(root *os.Root, stage string, entries []entry) ([]entry, error) {
+// ошибка, не перезапись. Каждую созданную запись пишет в журнал; возвращает их.
+func writeNew(root *os.Root, stage string, entries []entry, journal *os.File) ([]entry, error) {
 	done := make([]entry, 0, len(entries))
 	for _, e := range entries {
-		var err error
-		switch e.Kind {
-		case "d":
-			err = root.Mkdir(e.Path, 0o700)
-		case "l":
-			err = root.Symlink(e.Link, e.Path)
-		case "f":
-			err = copyIn(root, filepath.Join(stage, filepath.FromSlash(e.Path)), e.Path)
-		}
-		if err == nil && e.Kind == "f" {
-			err = root.Chmod(e.Path, e.Mode)
+		var (
+			have entry
+			err  error
+		)
+		if e.Kind == "f" {
+			have, err = placeFile(root, filepath.Join(stage, filepath.FromSlash(e.Path)), e, journal)
+		} else {
+			have, err = writeOther(root, e, journal)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("write OUT_DIR: %w", err)
 		}
-		st, err := root.Lstat(e.Path)
-		if err != nil {
-			return nil, fmt.Errorf("write OUT_DIR: %w", err)
-		}
-		if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-			e.Ino = sys.Ino
-		}
-		done = append(done, e)
+		done = append(done, have)
 		if transferStep != nil {
 			if err := transferStep("wrote"); err != nil {
 				return nil, err
 			}
 		}
 	}
-	// права папок — после их содержимого: папка только для чтения иначе не приняла бы своих файлов
-	for i := len(done) - 1; i >= 0; i-- {
-		if done[i].Kind == "d" {
-			if err := root.Chmod(done[i].Path, done[i].Mode); err != nil {
-				return nil, fmt.Errorf("write OUT_DIR: %w", err)
-			}
-		}
-	}
 	return done, nil
 }
 
-func copyIn(root *os.Root, src, name string) error {
+// writeOther создаёт папку с её правами или ссылку и пишет её в журнал.
+func writeOther(root *os.Root, e entry, journal *os.File) (entry, error) {
+	var err error
+	if e.Kind == "d" {
+		if err = root.Mkdir(e.Path, 0o700); err == nil {
+			err = root.Chmod(e.Path, e.Mode)
+		}
+	} else {
+		err = root.Symlink(e.Link, e.Path)
+	}
+	if err != nil {
+		return entry{}, fmt.Errorf("create %s: %w", e.Path, err)
+	}
+	have, err := describe(func() (fs.FileInfo, error) { return root.Lstat(e.Path) },
+		func() (*os.File, error) { return root.Open(e.Path) },
+		func() (string, error) { return root.Readlink(e.Path) }, e.Path)
+	if err != nil {
+		return entry{}, err
+	}
+	return have, logEntry(journal, have)
+}
+
+// placeFile пишет файл без имени в его папке OUT_DIR, ставит права, пишет запись в журнал и только затем даёт
+// файлу имя; занятое имя — ошибка linkat, не перезапись.
+func placeFile(root *os.Root, src string, e entry, journal *os.File) (entry, error) {
 	data, err := os.ReadFile(src)
 	if err != nil {
-		return err
+		return entry{}, fmt.Errorf("read stage: %w", err)
 	}
-	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	dir, err := root.Open(path.Dir(e.Path))
 	if err != nil {
-		return err
+		return entry{}, fmt.Errorf("folder of %s: %w", e.Path, err)
 	}
+	defer func() { _ = dir.Close() }()
+	fd, err := unix.Openat(int(dir.Fd()), ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return entry{}, fmt.Errorf("%s: unnamed file: %w", e.Path, err)
+	}
+	f := os.NewFile(uintptr(fd), e.Path)
+	defer func() { _ = f.Close() }()
 	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
+		return entry{}, fmt.Errorf("%s: %w", e.Path, err)
 	}
-	return f.Close()
+	if err := f.Chmod(e.Mode); err != nil {
+		return entry{}, fmt.Errorf("%s: %w", e.Path, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return entry{}, fmt.Errorf("%s: %w", e.Path, err)
+	}
+	// describe закрывает то, что открыл: ему — копия дескриптора
+	have, err := describe(func() (fs.FileInfo, error) { return f.Stat() }, func() (*os.File, error) {
+		d, err := unix.Dup(fd)
+		if err != nil {
+			return nil, fmt.Errorf("dup: %w", err)
+		}
+		return os.NewFile(uintptr(d), e.Path), nil
+	}, nil, e.Path)
+	if err != nil {
+		return entry{}, err
+	}
+	if err := logEntry(journal, have); err != nil {
+		return entry{}, err
+	}
+	if transferStep != nil {
+		if err := transferStep("journaled"); err != nil {
+			return entry{}, err
+		}
+	}
+	if err := unix.Linkat(unix.AT_FDCWD, "/proc/self/fd/"+strconv.Itoa(fd), int(dir.Fd()), path.Base(e.Path), unix.AT_SYMLINK_FOLLOW); err != nil {
+		return entry{}, fmt.Errorf("%s: name the file: %w", e.Path, err)
+	}
+	return have, nil
+}
+
+// loadKnown — записи прошлого прогона: список и журнал оборванного. Запись журнала сменяет запись без inode того
+// же пути: созданное оборванным прогоном сверяется целиком.
+func loadKnown(file, jfile, out string) ([]entry, error) {
+	old, err := loadList(file, out)
+	if err != nil {
+		return nil, err
+	}
+	logged, err := loadJournal(jfile)
+	if err != nil {
+		return nil, err
+	}
+	old = slices.DeleteFunc(old, func(e entry) bool {
+		return e.Ino == 0 && slices.ContainsFunc(logged, func(l entry) bool { return l.Path == e.Path })
+	})
+	return append(old, logged...), nil
+}
+
+// writeLogged — перенос с новым журналом jfile.
+func writeLogged(root *os.Root, stage string, fresh []entry, jfile string) ([]entry, error) {
+	journal, err := os.OpenFile(jfile, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("export journal: %w", err)
+	}
+	done, err := writeNew(root, stage, fresh, journal)
+	if cerr := journal.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("export journal: %w", cerr)
+	}
+	return done, err
 }
 
 // replaceExport кладёт собранную в stage выгрузку в OUT_DIR out: сверка, список прошлого и нового прогона,
-// очистка своего, перенос, список с inode. Обрыв на любом шаге оставляет список, по которому следующий прогон
-// узнает и старые записи, и уже перенесённые новые.
+// очистка своего, перенос с журналом, список с inode. Обрыв на любом шаге оставляет список и журнал, по которым
+// следующий прогон узнает и старые записи, и уже перенесённые новые.
 func replaceExport(out, stage string) error {
 	fresh, err := scanStage(stage)
 	if err != nil {
@@ -341,7 +519,8 @@ func replaceExport(out, stage string) error {
 	if err != nil {
 		return err
 	}
-	old, err := loadList(file, out)
+	jfile := journalFile(file)
+	old, err := loadKnown(file, jfile, out)
 	if err != nil {
 		return err
 	}
@@ -356,8 +535,13 @@ func replaceExport(out, stage string) error {
 	if err := verifyOut(root, old); err != nil {
 		return err
 	}
+	// список прошлого и нового прогона, вместе с журналом оборванного, — до первого удаления; журнал после этого
+	// не нужен
 	if err := saveList(file, out, append(slices.Clip(old), fresh...)); err != nil {
 		return err
+	}
+	if err := os.Remove(jfile); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("export journal: %w", err)
 	}
 	if err := clearOld(root, old); err != nil {
 		return err
@@ -367,9 +551,15 @@ func replaceExport(out, stage string) error {
 			return err
 		}
 	}
-	done, err := writeNew(root, stage, fresh)
+	done, err := writeLogged(root, stage, fresh, jfile)
 	if err != nil {
 		return err
 	}
-	return saveList(file, out, done)
+	if err := saveList(file, out, done); err != nil {
+		return err
+	}
+	if err := os.Remove(jfile); err != nil {
+		return fmt.Errorf("export journal: %w", err)
+	}
+	return nil
 }
