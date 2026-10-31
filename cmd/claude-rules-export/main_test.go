@@ -200,6 +200,7 @@ func TestExportRefusesLinkedReads(t *testing.T) {
 		{"global CLAUDE.md", "home/.claude/CLAUDE.md", "CLAUDE.md"},
 		{"work CLAUDE.md", "home/work/CLAUDE.md", "CLAUDE.md"},
 		{"manifest", "rules/manifest", "manifest/skills.txt"},
+		{"manifest file", "rules/manifest/skills.txt", "skills.txt"},
 		{"README template", "rules/README.template.md", "README.template.md"},
 		{"link in a skill", "home/.claude/skills/jira/data", "data/f"},
 	} {
