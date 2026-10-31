@@ -50,6 +50,7 @@ path (Claude Code or codex rollout).
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
   --q N         percentile for --wait, from 1 to 99 (default 50); needs at least
                 3 events for --q 50 and below, 20 above
+  Large reads wait for machine capacity through graft's heavy queue.
 
 Roles: user — typed by the human; ask — the human's answer in a question
 dialog; peer — a message from another session; agent — the agent's text;
@@ -66,28 +67,29 @@ const (
 )
 
 type options struct {
-	roles       map[transcript.Role]bool
-	since       time.Time
-	until       time.Time
-	grep        string
-	raw         string
-	context     int
-	all         bool
-	codex       bool
-	noSubagents bool
-	subagents   bool
-	project     string
-	max         int
-	width       int
-	usage       bool
-	waitProg    string
-	waitSub     string
-	q           int
-	qSet        bool
-	maxSet      bool
-	widthSet    bool
-	rolesSet    bool
-	args        []string
+	roles        map[transcript.Role]bool
+	since        time.Time
+	until        time.Time
+	grep         string
+	raw          string
+	context      int
+	all          bool
+	codex        bool
+	noSubagents  bool
+	subagents    bool
+	project      string
+	max          int
+	width        int
+	usage        bool
+	waitProg     string
+	waitSub      string
+	q            int
+	qSet         bool
+	maxSet       bool
+	widthSet     bool
+	rolesSet     bool
+	args         []string
+	originalArgs []string
 }
 
 var errHelp = errors.New("help")
@@ -119,6 +121,7 @@ type env struct {
 
 func parseArgs(args []string, now time.Time) (options, error) {
 	opts := options{max: 100, width: 300, q: 50}
+	opts.originalArgs = append([]string(nil), args...)
 	if err := setRoles(&opts, "user,ask,peer,agent"); err != nil {
 		return opts, err
 	}
@@ -304,6 +307,13 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
+	}
+	code, done, err := admission(sources, opts.originalArgs, stdout, stderr)
+	if done {
+		if err != nil {
+			fmt.Fprintf(stderr, "tl: %v\n", err)
+		}
+		return code
 	}
 	res, err := scan(sources, opts)
 	if err != nil {

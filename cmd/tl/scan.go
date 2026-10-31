@@ -6,7 +6,6 @@ import (
 	"io"
 	"regexp"
 	"regexp/syntax"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -152,7 +151,7 @@ func scan(sources []source, opts options) (result, error) {
 		wg   sync.WaitGroup
 		jobs = make(chan source)
 	)
-	for range max(1, runtime.NumCPU()/2) {
+	for range scanWorkerCount() {
 		wg.Go(func() {
 			for src := range jobs {
 				hits, waits, meta, err := f.file(src)
