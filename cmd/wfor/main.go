@@ -40,7 +40,7 @@ Flags:
                   to wait longer run the same wfor again
   --every D       check interval (default 1s; ok commands 10s)
   --any           done when one condition is met
-  --new           line: only lines appended after the start count
+  --new           line: only lines appended after the start count (not one begun before it)
   --after N       line: only lines after line N count (to continue a wait)
 
 Exit: 0 done, 1 not yet (timeout), 2 usage error or a check failed (no access, bad file).
@@ -278,7 +278,7 @@ func timeoutReport(conds []cond, met []bool, start time.Time) string {
 		return msg + "; to keep waiting run the same wfor again"
 	case 1:
 		return msg + fmt.Sprintf("; to keep waiting run it again with --after %d in place of --new/--after",
-			skipped[0].lines)
+			skipped[0].resume())
 	}
 	return msg + "; to keep waiting run each line condition again with its own --after (lines read: " +
 		linesRead(skipped) + ")"
@@ -287,7 +287,7 @@ func timeoutReport(conds []cond, met []bool, start time.Time) string {
 func linesRead(conds []*lineCond) string {
 	parts := make([]string, len(conds))
 	for i, c := range conds {
-		parts[i] = fmt.Sprintf("%s %d", c.path, c.lines)
+		parts[i] = fmt.Sprintf("%s %d", c.path, c.resume())
 	}
 	return strings.Join(parts, ", ")
 }

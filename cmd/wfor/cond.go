@@ -123,7 +123,8 @@ func newLineCond(expr, path string, onlyNew bool, after int) (*lineCond, error) 
 	return c, nil
 }
 
-// skipLines пропускает все целые строки файла (all) или первые n.
+// skipLines пропускает все целые строки файла (all) или первые n; неполная последняя строка, которую они
+// покрывают, пропускается целиком, когда допишется.
 func (c *lineCond) skipLines(all bool, n int) error {
 	f, err := os.Open(c.path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -151,7 +152,7 @@ func (c *lineCond) skipLines(all bool, n int) error {
 		lines = n
 	}
 	c.file, c.lines = st, lines
-	c.partial = all && end < len(data)
+	c.partial = end < len(data) && (all || n > lines)
 	c.consumed(data[:end])
 	// последняя строка пропущенного — в ответ по таймауту, пока не дописано новое
 	for line := range bytes.Lines(data[:end]) {
@@ -253,6 +254,14 @@ func (c *lineCond) match(line []byte, n int) bool {
 }
 
 func (c *lineCond) String() string { return fmt.Sprintf("line '%s' in %s", c.re, c.path) }
+
+// resume — сколько строк пропустить повтору (--after): прочитанные и начатая до старта неполная.
+func (c *lineCond) resume() int {
+	if c.partial {
+		return c.lines + 1
+	}
+	return c.lines
+}
 
 func (c *lineCond) state() string {
 	if c.hit != "" {

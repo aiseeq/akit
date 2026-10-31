@@ -311,8 +311,13 @@ func TestNewSkipsPartialLine(t *testing.T) {
 	if err := appendFile(path, "build\nold DONE"); err != nil {
 		t.Fatal(err)
 	}
-	if code, out, _ := wfor(t, "line", "DONE", path, "--new", "--every", "10ms", "--timeout", "50ms"); code != exitTimeout {
-		t.Errorf("прежняя неполная строка засчитана сразу: code %d: %s", code, out)
+	if code, out, _ := wfor(t, "line", "DONE", path, "--new", "--every", "10ms", "--timeout", "50ms"); code != exitTimeout ||
+		!strings.Contains(out, "--after 2 in place of") {
+		t.Errorf("прежняя неполная строка засчитана сразу или не в подсказке --after: code %d: %s", code, out)
+	}
+	// повтор по подсказке, пока строка не дописана, тоже её не засчитывает
+	if code, out, _ := wfor(t, "line", "DONE", path, "--after", "2", "--every", "10ms", "--timeout", "50ms"); code != exitTimeout {
+		t.Errorf("--after 2 засчитал прежнюю неполную строку: code %d: %s", code, out)
 	}
 	c, err := newLineCond("DONE", path, true, 0)
 	if err != nil {

@@ -241,7 +241,8 @@ absent, last line of the log, last exit and output of the command). Exit 0 done,
 
 The default timeout is 4m30s, under the 5-minute life of a sub-agent's prompt cache: a longer wait
 is the same call again (the answer says how; with `--new` it gives `--after N` so lines written
-between the calls still count).
+between the calls still count). A line begun before the start does not count under `--new`, even
+when it is finished later, and `--after N` counts it among the N.
 
     wfor line '^(ok|FAIL)' test.log                # a line in a log (FILE may not exist yet)
     wfor exit 31337 31338                          # processes ended (zombies count as ended)
