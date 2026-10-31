@@ -52,6 +52,10 @@ func TestRule(t *testing.T) {
 		{"процессор раньше диска", Load{Runnable: 30, Threads: 22, IOFull: 50}, l, nil, CPU},
 		{"пропущенная мера не судится", Load{Threads: 22, IOFull: 50}, l, []error{ErrNoIOPressure}, ""},
 		{"без потоков и порога", Load{Runnable: 5}, l, []error{ErrNoRunnable}, ""},
+		{"LA за минуту на пороге при моментальном ниже", Load{Runnable: 10, Threads: 22, Avg1: 22}, l, nil, CPU},
+		{"LA за минуту и моментальное ниже", Load{Runnable: 21, Threads: 22, Avg1: 21.99}, l, nil, ""},
+		{"LA за минуту — свой порог", Load{Runnable: 1, Threads: 22, Avg1: 10}, Limits{Runnable: 10, MaxIOFull: 10, MaxSwapKBs: 1024}, nil, CPU},
+		{"нет loadavg — LA не судится", Load{Runnable: 1, Threads: 22, Avg1: 90}, l, []error{ErrNoLoadAvg}, ""},
 	}
 	for _, c := range cases {
 		v := Rule(c.m, c.l, c.skipped)
@@ -60,6 +64,12 @@ func TestRule(t *testing.T) {
 		}
 	}
 	if why := Rule(Load{Runnable: 31, Threads: 22}, l, nil).Why(); why != "runnable 31 is at or above 22" {
+		t.Errorf("Why = %q", why)
+	}
+	if why := Rule(Load{Runnable: 31, Threads: 22, Avg1: 40}, l, nil).Why(); why != "runnable 31 is at or above 22" {
+		t.Errorf("Why при обоих выше = %q; ждали моментальное", why)
+	}
+	if why := Rule(Load{Runnable: 10, Threads: 22, Avg1: 26.6}, l, nil).Why(); why != "load average 1m 26.60 is at or above 22" {
 		t.Errorf("Why = %q", why)
 	}
 	if why := Rule(Load{Threads: 22, MemSome: 12.5, SwapKBs: 3000}, l, nil).Why(); why != "memory pressure 12.5% is above 10% while swapping 3000 KB/s" {
@@ -132,13 +142,29 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+func TestCheckLoadAvg(t *testing.T) {
+	m, _ := fakeProc(t, map[string]string{"stat": stat, "loadavg": "6.00 2.00 1.00 2/100 1\n"})
+	l := Limits{Runnable: 5, MaxIOFull: 100, MaxSwapKBs: 1024}
+	v, err := m.Check(context.Background(), l, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Measure != CPU || v.Value != 6 || v.Load.Avg1 != 6 || v.Load.Runnable >= 5 {
+		t.Errorf("LA 6 при пороге 5 и моментальном %d = %+v; ждали занята по cpu с LA", v.Load.Runnable, v)
+	}
+	writeProc(t, m.procRoot, "loadavg", "4.99 9.00 9.00 2/100 1\n")
+	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Busy() {
+		t.Errorf("LA 4.99 при пороге 5 = %+v, %v; ждали свободна (5 и 15 минут не судятся)", v, err)
+	}
+}
+
 func TestCheckNoProc(t *testing.T) {
 	m, _ := fakeProc(t, nil)
 	v, err := m.Check(context.Background(), DefaultLimits, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
+	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoLoadAvg) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
 		t.Errorf("без /proc = %+v; ждали свободна и все меры пропущены", v)
 	}
 }

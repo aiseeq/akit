@@ -1,5 +1,6 @@
 // busy — занята ли машина по общему правилу akit/pressure, одной строкой: то же число, по которому
-// graft пускает тяжёлые задачи, вместо `cat /proc/loadavg`: минутный load запаздывает.
+// graft пускает тяжёлые задачи: моментальное число готовых задач и load average за минуту против числа
+// потоков, диск, память со свопом.
 //
 // Коды выхода: 0 — свободна, 1 — занята, 2 — ошибка вызова или замера.
 package main
@@ -26,7 +27,7 @@ Usage:
   busy (--quiet-until TIME | --quiet D) [--why TEXT] | --quiet-off
 
 Busy when quiet mode is on, the tasks ready to run now (procs_running, one reading, without busy
-itself) are at or above the machine's threads, disk IO pressure is at or above 9.6%, or the
+itself) or the 1-minute load average are at or above the machine's threads, disk IO pressure is at or above 9.6%, or the
 memory pressure (some avg10) is above 10% while swapping over the window is above 1024 KB/s.
 Swapping alone is not busy. The same rule graft uses to queue heavy tasks. The limits below are the
 defaults; the user's own are flat "key: value" lines in $XDG_CONFIG_HOME/akit/pressure.yaml
@@ -40,7 +41,7 @@ Claude Code session, from its registry entry) and --why go to quiet-until.note n
 the busy line and in graft's wait: "quiet mode until 14:45 (planner: call)".
 
 Flags:
-  --runnable N    busy at N runnable tasks (default: the machine's threads)
+  --runnable N    busy at N runnable tasks or 1-minute load (default: the machine's threads)
   --mem-some P    memory pressure limit, % (default 10)
   --io-full P     disk IO pressure limit, % (default 9.6; 100 or more disables disk checks)
   --kind K        disk state profile kind to request
@@ -291,6 +292,9 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 			limit = float64(m.Threads)
 		}
 		parts = append(parts, fmt.Sprintf("runnable %d (busy at %v, threads %d)", m.Runnable, limit, m.Threads))
+		if !skipped(pressure.ErrNoLoadAvg) {
+			parts = append(parts, fmt.Sprintf("load average 1m %.2f (busy at %v)", m.Avg1, limit))
+		}
 		parts = append(parts, fmt.Sprintf("CPU pressure %.0f%% (some avg10)", m.CPUSome))
 	}
 	if l.MaxIOFull < 100 && (m.Disk != nil || !skipped(pressure.ErrNoIOPressure)) {

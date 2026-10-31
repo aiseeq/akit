@@ -14,14 +14,15 @@ import (
 )
 
 // Правило «машина занята» — одно на всех: graft пускает по нему тяжёлые задачи, команда
-// busy показывает агентам. Процессор — по числу задач, готовых к работе прямо сейчас, одним чтением:
-// нужно не точное число, а актуальное, а минутный load запаздывает. Обмен со свопом сам по себе
+// busy показывает агентам. Процессор — по числу задач, готовых к работе прямо сейчас, одним чтением, и по
+// load average за минуту, оба с одним порогом — числом потоков: моментальное число ловит всплеск сразу, а
+// минутное не пускает новое в машину, которая уже минуту перегружена и лишь на миг притихла. Обмен со свопом сам по себе
 // не занятость: он идёт и при запасе памяти, а вредит, когда задачи ждут память, — поэтому своп
 // судится только вместе с давлением памяти.
 
 // Мера, по которой машина занята.
 const (
-	CPU   = "cpu"
+	CPU   = "cpu" // готовых к работе задач сейчас или load average за минуту — не меньше порога Runnable
 	IO    = "io"
 	Swap  = "swap"  // обмен со свопом при давлении памяти
 	Quiet = "quiet" // тихий режим: срок в файле QuietPath ещё не прошёл
@@ -57,6 +58,7 @@ var DefaultLimits = Limits{MaxIOFull: 9.6, MaxMemSome: DefaultMemSome, MaxSwapKB
 type Load struct {
 	Runnable       int           // готовых к работе задач без читающего процесса: procs_running из /proc/stat − 1
 	Threads        int           // потоков машины: строки cpuN в /proc/stat
+	Avg1           float64       // load average за минуту из /proc/loadavg
 	CPUSome        float64       // % последних 10 с, когда хоть одна задача ждала процессор (some avg10), для справки
 	IOFull         float64       // % IOWindow, когда все задачи ждали диск, до 0,1; при источнике — его окно 5 с, без него — дельта total PSI io за окно свопа (fresh) или с прошлого Check
 	IOWindow       time.Duration // окно замера IOFull
@@ -88,6 +90,9 @@ func (v Verdict) Busy() bool { return v.Measure != "" }
 func (v Verdict) Why() string {
 	switch v.Measure {
 	case CPU:
+		if float64(v.Load.Runnable) < v.Limit {
+			return fmt.Sprintf("load average 1m %.2f is at or above %v", v.Value, v.Limit)
+		}
 		return fmt.Sprintf("runnable %.0f is at or above %v", v.Value, v.Limit)
 	case IO:
 		if v.Load.Disk != nil && v.Load.Disk.Open {
@@ -134,18 +139,7 @@ func quietClock(until, now time.Time) string {
 // подтверждает его; у Quiet их нет, срок — в Load.QuietUntil.
 func Rule(m Load, l Limits, skipped []error) Verdict {
 	v := Verdict{Load: m, Skipped: skipped}
-	maxIOFull := l.MaxIOFull
-	if maxIOFull <= 0 {
-		maxIOFull = DefaultLimits.MaxIOFull
-	}
-	runnable := l.Runnable
-	if runnable <= 0 {
-		runnable = float64(m.Threads)
-	}
-	memSome := l.MaxMemSome
-	if memSome <= 0 {
-		memSome = DefaultMemSome
-	}
+	maxIOFull, runnable, memSome := effectiveLimits(m, l)
 	ioFull := m.IOFull
 	if m.hasIOFullExact {
 		ioFull = m.ioFullExact
@@ -156,6 +150,8 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 		v.Measure = Quiet
 	case !skippedAny(skipped, ErrNoRunnable) && runnable > 0 && float64(m.Runnable) >= runnable:
 		v.Measure, v.Value, v.Limit = CPU, float64(m.Runnable), runnable
+	case !skippedAny(skipped, ErrNoLoadAvg) && runnable > 0 && m.Avg1 >= runnable:
+		v.Measure, v.Value, v.Limit = CPU, m.Avg1, runnable
 	case maxIOFull < 100 && (m.Disk != nil || !skippedAny(skipped, ErrNoIOPressure)) &&
 		((m.Disk != nil && m.Disk.Open) || ioFull >= maxIOFull):
 		v.Measure, v.Value, v.Limit = IO, m.IOFull, maxIOFull
@@ -163,6 +159,22 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 		v.Measure, v.Value, v.Limit = Swap, m.MemSome, memSome
 	}
 	return v
+}
+
+// effectiveLimits — пороги правила с умолчаниями на месте нулевых: диск, процессор (число потоков машины),
+// память.
+func effectiveLimits(m Load, l Limits) (maxIOFull, runnable, memSome float64) {
+	maxIOFull, runnable, memSome = l.MaxIOFull, l.Runnable, l.MaxMemSome
+	if maxIOFull <= 0 {
+		maxIOFull = DefaultLimits.MaxIOFull
+	}
+	if runnable <= 0 {
+		runnable = float64(m.Threads)
+	}
+	if memSome <= 0 {
+		memSome = DefaultMemSome
+	}
+	return maxIOFull, runnable, memSome
 }
 
 func skippedAny(skipped []error, target error) bool {
@@ -228,6 +240,11 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 				return err
 			}
 			load.Runnable, load.Threads, err = ParseStat(string(stat))
+			return err
+		}),
+		measure(ErrNoLoadAvg, func() error {
+			avg, err := ReadLoadAvg(m.procRoot)
+			load.Avg1 = avg.Avg1
 			return err
 		}),
 		measure(ErrNoMemPressure, func() error {
