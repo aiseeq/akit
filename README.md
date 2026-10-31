@@ -174,7 +174,8 @@ sessions, `agent`, `think` the agent's thinking, `cmd` tool calls, `out` tool ou
 Claude Code attachments (hooks, diagnostics), `note` notices, compaction, briefs and program
 prompts. `assistant` and `tool`, as jsonl names them, mean `agent` and `cmd`. `tl -h` prints
 all flags.
-Large transcript reads wait for machine capacity through graft's heavy queue.
+Large transcript reads wait for machine capacity through graft's heavy queue; smaller ones run at once on two
+threads.
 
 `--wait PROG [SUB]` prints the nearest-rank percentile of milliseconds from a shell command call to
 its output; calls without output, background Bash calls, and commands that also run unrelated programs

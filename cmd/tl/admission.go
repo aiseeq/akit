@@ -14,6 +14,10 @@ import (
 // чтение не стоит ожидания в очереди машины.
 var heavyThreshold int64 = 512 << 20
 
+// lightThreads — потоки лёгкого вызова: он идёт мимо очереди, и десяток таких сразу (тёплый кэш --wait у
+// нескольких агентов) не должен занять все ядра; до порога это не дольше пары секунд.
+const lightThreads = 2
+
 // admission пускает тяжёлый вызов через очередь graft: перезапускает tl под `graft exec --heavy --local` и
 // отдаёт код дочернего; done — вызов уже выполнен там. Под очередью (GRAFT_THREADS задан) и для лёгкого
 // чтения — done false, читать здесь.
@@ -39,6 +43,7 @@ func admission(sources []source, args []string, stdout, stderr io.Writer, cache 
 			}
 		}
 		if size < heavyThreshold {
+			runtime.GOMAXPROCS(min(lightThreads, runtime.NumCPU()))
 			return 0, false, nil
 		}
 		graft, err := exec.LookPath("graft")

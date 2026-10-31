@@ -18,6 +18,9 @@ import (
 
 const waitCacheMaxAge = 30 * 24 * time.Hour
 
+// waitCacheVersion — формат записи: 2 — заголовок и события отдельными значениями gob.
+const waitCacheVersion = 2
+
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
 type cachedWaitEvent struct {
@@ -43,7 +46,6 @@ type waitCacheRecord struct {
 	Size    int64
 	MTime   int64
 	Binary  string
-	Events  []cachedWaitEvent
 }
 
 type waitCacheState uint8
@@ -141,18 +143,20 @@ func (c *waitCache) key(path string) (waitCacheRecord, error) {
 	if c == nil || c.dir == "" || c.binary == "" {
 		return waitCacheRecord{}, fmt.Errorf("cache key unavailable")
 	}
-	return waitCacheRecord{Version: 1, Path: path, Size: info.Size(), MTime: info.ModTime().UnixNano(), Binary: c.binary}, nil
+	return waitCacheRecord{Version: waitCacheVersion, Path: path, Size: info.Size(), MTime: info.ModTime().UnixNano(), Binary: c.binary}, nil
 }
 
 func (c *waitCache) valid(path string) bool {
-	_, state, err := c.load(path)
+	_, state, err := c.load(path, false)
 	if err != nil && !errors.Is(err, errWaitCacheDecode) {
 		c.warn(err)
 	}
 	return state == waitCacheHit
 }
 
-func (c *waitCache) load(path string) ([]cachedWaitEvent, waitCacheState, error) {
+// load сверяет ключ записи с файлом; события декодирует, только если withEvents: заголовок лежит в записи
+// отдельным значением gob, и проверке допуска не нужно разбирать события.
+func (c *waitCache) load(path string, withEvents bool) ([]cachedWaitEvent, waitCacheState, error) {
 	key, err := c.key(path)
 	if err != nil {
 		return nil, waitCacheMiss, err
@@ -165,14 +169,22 @@ func (c *waitCache) load(path string) ([]cachedWaitEvent, waitCacheState, error)
 		return nil, waitCacheMiss, fmt.Errorf("read cache entry: %w", err)
 	}
 	defer f.Close()
+	dec := gob.NewDecoder(f)
 	var record waitCacheRecord
-	if err := gob.NewDecoder(f).Decode(&record); err != nil {
+	if err := dec.Decode(&record); err != nil {
 		return nil, waitCacheMiss, fmt.Errorf("%w: %w", errWaitCacheDecode, err)
 	}
 	if !sameWaitCacheKey(record, key) {
 		return nil, waitCacheMiss, nil
 	}
-	return record.Events, waitCacheHit, nil
+	if !withEvents {
+		return nil, waitCacheHit, nil
+	}
+	var events []cachedWaitEvent
+	if err := dec.Decode(&events); err != nil {
+		return nil, waitCacheMiss, fmt.Errorf("%w: %w", errWaitCacheDecode, err)
+	}
+	return events, waitCacheHit, nil
 }
 
 func sameWaitCacheKey(a, b waitCacheRecord) bool {
@@ -209,7 +221,7 @@ func (c *waitCache) cleanup(now time.Time) {
 }
 
 func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
-	if events, state, err := c.load(path); err == nil && state == waitCacheHit {
+	if events, state, err := c.load(path, true); err == nil && state == waitCacheHit {
 		return events, nil
 	} else if err != nil && !errors.Is(err, errWaitCacheDecode) {
 		c.warn(err)
@@ -254,8 +266,11 @@ func (c *waitCache) saveRecord(key waitCacheRecord, events []cachedWaitEvent) {
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
-	key.Events = events
-	err = gob.NewEncoder(f).Encode(key)
+	enc := gob.NewEncoder(f)
+	err = enc.Encode(key)
+	if err == nil {
+		err = enc.Encode(events)
+	}
 	if err == nil {
 		err = f.Sync()
 	}

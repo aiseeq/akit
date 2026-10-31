@@ -118,7 +118,7 @@ func TestAdmissionSkipsWarmWaitCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := &waitCache{dir: filepath.Join(dir, "cache"), binary: "synthetic"}
-	cache.saveRecord(waitCacheRecord{Version: 1, Path: transcriptPath, Size: int64(len("synthetic transcript")), MTime: func() int64 {
+	cache.saveRecord(waitCacheRecord{Version: waitCacheVersion, Path: transcriptPath, Size: int64(len("synthetic transcript")), MTime: func() int64 {
 		info, err := os.Stat(transcriptPath)
 		if err != nil {
 			t.Fatal(err)

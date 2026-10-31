@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -125,12 +126,18 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 		delay   int
 		bg      bool
 		output  bool
-	}{"tk done four", 4, false, true})
+	}{"tk done four", 4, false, true}, struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{"tk done five", 5, false, true})
 	if err := os.WriteFile(path, []byte(claudeWaitRows(withMore)), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Дописанные вызовы сдвигают p50 с 2 до 3 с: устаревшая запись кэша дала бы прежний ответ.
 	code, changed, changedErr := runTL(t, e, args...)
-	if code != 0 || changed != "2000\n" || changedErr != "" || cache.valid(path) == false {
+	if code != 0 || changed != "3000\n" || changedErr != "" || !cache.valid(path) {
 		t.Fatalf("changed = (%d, %q, %q)", code, changed, changedErr)
 	}
 }
@@ -181,8 +188,23 @@ func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
 	if err := os.WriteFile(cachePath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if cache.valid(path) {
-		t.Fatal("entry with damaged payload was accepted")
+	// Заголовок цел, события испорчены: допуск запись примет, но чтение событий даст промах и перечтёт транскрипт.
+	wantCode, wantOut, wantErr := runTL(t, e, queries[0]...)
+	if _, _, err := cache.load(path, true); err != nil {
+		t.Fatalf("damaged payload was not rewritten: %v", err)
+	}
+	if err := os.WriteFile(cachePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cache.load(path, true); !errors.Is(err, errWaitCacheDecode) {
+		t.Fatalf("damaged payload decoded: %v", err)
+	}
+	code, out, errOut := runTL(t, e, queries[0]...)
+	if code != wantCode || out != wantOut || errOut != wantErr {
+		t.Fatalf("damaged payload result = (%d, %q, %q), want (%d, %q, %q)", code, out, errOut, wantCode, wantOut, wantErr)
+	}
+	if _, state, err := cache.load(path, true); err != nil || state != waitCacheHit {
+		t.Fatalf("damaged payload was not replaced: %v", err)
 	}
 }
 
