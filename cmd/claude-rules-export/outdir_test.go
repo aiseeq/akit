@@ -288,3 +288,18 @@ func snapshot(t *testing.T, dir string) string {
 	}
 	return b.String()
 }
+
+// Обычный OUT_DIR — папка внутри ~/work, рядом с выгружаемым work/CLAUDE.md: два прогона подряд проходят, источник цел.
+func TestExportIntoWorkFolder(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(src, "work", "claude-rules")
+	write(t, filepath.Join(out, ".git/HEAD"), "ref\n", 0o644)
+	for run := 1; run <= 2; run++ {
+		if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+			t.Fatalf("run %d: code %d %q", run, code, stderr)
+		}
+	}
+	if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(out, "work/CLAUDE.md")) != "# Work rules\n" {
+		t.Error("source or export wrong")
+	}
+}

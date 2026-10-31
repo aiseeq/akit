@@ -37,9 +37,9 @@ OUT_DIR path. Folders are removed only when empty; .git at the top is never touc
 Anything else (an edited or foreign file, a folder shown there by a mount, an OUT_DIR
 without a list that holds more than .git) is refused before anything is removed, so no
 other path to the same folder (symlink, bind mount, overlay, /proc) can erase it. A run cut
-short is finished by the next one. An OUT_DIR that holds what is read or lies in it (the
-source home itself aside) is refused early, after symlinks are resolved; an empty path
-is refused. A skill folder that is a link is exported as its content; skills named .git
+short is finished by the next one. An OUT_DIR that is or holds what is read is refused
+early, after symlinks are resolved (lying inside a read folder such as ~/work is fine);
+an empty path is refused. A skill folder that is a link is exported as its content; skills named .git
 and paths differing only in case are refused.
 
 --rules is the folder with manifest/ and README.template.md

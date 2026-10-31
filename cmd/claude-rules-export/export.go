@@ -185,9 +185,10 @@ func under(p, dir string) (string, bool) {
 	return r, err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator))
 }
 
-// checkOut — ранний понятный отказ: OUT_DIR содержит читаемое или лежит внутри него (кроме самого home). Пути
-// сравниваются после разрешения симлинков. Безопасность на этом не держится: под путём, которого сверка не узнаёт
-// (bind mount, overlay, /proc), выгрузка удаляет только записи своего списка (outdir.go).
+// checkOut — ранний понятный отказ: OUT_DIR равен читаемому или содержит его. Пути сравниваются после разрешения
+// симлинков. Лежать внутри читаемой папки можно (обычный OUT_DIR — ~/work/<папка>). Безопасность на этом не
+// держится: под путём, которого сверка не узнаёт (bind mount, overlay, /proc), выгрузка удаляет только записи
+// своего списка (outdir.go).
 func checkOut(out, src, rules string, m manifest) error {
 	reads, err := readPaths(src, rules, m)
 	if err != nil {
@@ -198,10 +199,8 @@ func checkOut(out, src, rules string, m manifest) error {
 		if err != nil {
 			return err
 		}
-		_, contains := under(r, out)
-		_, inside := under(out, r)
-		if contains || inside && read != src {
-			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
+		if _, contains := under(r, out); contains {
+			return fmt.Errorf("OUT_DIR must not contain what it reads: %s", read)
 		}
 	}
 	return nil

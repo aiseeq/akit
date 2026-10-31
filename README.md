@@ -80,8 +80,8 @@ list that run kept in `$XDG_STATE_HOME/claude-rules-export` (default `~/.local/s
 path; folders are removed only when empty and `.git` at the top is never touched. Anything else — an edited
 or foreign file, a folder shown there by a mount, an OUT_DIR without a list holding more than `.git` — is
 refused before anything is removed, so no other path to the same folder (symlink, bind mount, overlay,
-`/proc`) can erase it, and a run cut short is finished by the next one. An OUT_DIR that holds what is read or
-lies in it (the source home itself aside) is refused early, after symlinks are resolved; an empty path is
+`/proc`) can erase it, and a run cut short is finished by the next one. An OUT_DIR that is or holds what is read is
+refused early, after symlinks are resolved (lying inside a read folder, as `~/work/claude-rules` does, is fine); an empty path is
 refused; a skill folder that is a link is exported as its content; skills named `.git` and paths differing
 only in case are refused. What to export and what counts as private is data in the
 `--rules` folder (`manifest/`, `README.template.md`), not code. Exit 0 clean, 1 private data or a
