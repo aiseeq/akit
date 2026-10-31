@@ -167,7 +167,7 @@ edit makes them — leave the item invalid, so `tk done` refuses. Text tk writes
 Unicode line or paragraph separator.
 Each check runs in
 `/bin/bash --norc --noprofile -c` from the repository root, without `BASH_ENV`, `ENV`, `BASH_FUNC_*`, `SHELLOPTS`,
-`BASHOPTS`, `LD_*` and the other variables glibc drops for setuid programs (`GCONV_PATH`, `LOCPATH`, …; `TMPDIR`
+`BASHOPTS`, `LD_*`, `MALLOC_*` and the other variables glibc drops for setuid programs (`GCONV_PATH`, `LOCPATH`, …; `TMPDIR`
 stays) from the caller's environment (what changes bash itself; the
 programs a check calls are found by the caller's `PATH`), with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes

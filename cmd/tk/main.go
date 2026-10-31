@@ -1472,12 +1472,12 @@ type planResult struct {
 	skipped  bool
 }
 
-// shellEnvDropped — переменные, которые убираются из окружения пункта плана вместе с LD_* и BASH_FUNC_* (см.
-// runPlanItem): стартовые bash и список UNSECURE_ENVVARS glibc без TMPDIR — тот кода не грузит, а командам
-// проверки нужен.
+// shellEnvDropped — переменные, которые убираются из окружения пункта плана вместе с LD_*, MALLOC_* и
+// BASH_FUNC_* (см. runPlanItem): стартовые bash и остальной список UNSECURE_ENVVARS glibc без TMPDIR — тот кода
+// не грузит, а командам проверки нужен.
 var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS",
-	"GCONV_PATH", "GETCONF_DIR", "GLIBC_TUNABLES", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH", "MALLOC_ARENA_MAX",
-	"MALLOC_ARENA_TEST", "MALLOC_TRACE", "NIS_PATH", "NLSPATH", "RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR"}
+	"GCONV_PATH", "GETCONF_DIR", "GLIBC_TUNABLES", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH", "NIS_PATH", "NLSPATH",
+	"RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR"}
 
 func runPlanItem(root string, item planJSON) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
@@ -1490,7 +1490,8 @@ func runPlanItem(root string, item planJSON) planResult {
 	cmd := exec.CommandContext(ctx, "/bin/bash", "--norc", "--noprofile", "-c", item.Cmd)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
 		name, _, _ := strings.Cut(kv, "=")
-		return strings.HasPrefix(name, "BASH_FUNC_") || strings.HasPrefix(name, "LD_") || slices.Contains(shellEnvDropped, name)
+		return strings.HasPrefix(name, "BASH_FUNC_") || strings.HasPrefix(name, "LD_") || strings.HasPrefix(name, "MALLOC_") ||
+			slices.Contains(shellEnvDropped, name)
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
