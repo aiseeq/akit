@@ -57,6 +57,9 @@ Flags:
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
 
+show wraps lines longer than 150 characters at spaces (continuation indented
+by two more spaces, ` + "```" + ` blocks as is); the ticket file keeps them whole.
+
 Statuses: открыт, в работе, ждёт, на проверке, готово, отклонён.
 Exit: 0 success, 1 not found or declined, 2 usage or I/O error.
 `
@@ -353,7 +356,7 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		if o.json {
 			return showJSON(root, t, out, errout)
 		}
-		fmt.Fprintf(out, "%s\n%s", relative(root, t.path), t.body)
+		fmt.Fprintf(out, "%s\n%s", relative(root, t.path), wrapLines(t.body, showWidth))
 		if !strings.HasSuffix(t.body, "\n") {
 			fmt.Fprintln(out)
 		}

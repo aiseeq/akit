@@ -149,7 +149,7 @@ completion details. `tk archive --root DIR` archives each repository's tasks to 
 `docs/tasks-archive/` and prints paths relative to DIR. Completion journal entries record the
 checker session when it differs from `--by` (`checker_session` in JSON): a fresh sub-agent runs in its
 parent's session, so the session alone does not tell a self-check apart; `tk done` only warns when it matches the executor. `tk done` refuses tickets with an empty `Приёмка` or `Чем проверить` section.
-`tk show ID` prints the ticket path and full text, or
+`tk show ID` prints the ticket path and full text with lines over 150 characters wrapped at spaces (the file keeps them whole), or
 structured details with `--json`. `tk note ID TEXT` appends a journal entry without changing status.
 `tk lint` checks ticket names, statuses, acceptance sections, and independent completion checks;
 `--root DIR` scans DIR and its first-level repositories. Without `--by`, actor commands use the
