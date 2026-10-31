@@ -1472,16 +1472,20 @@ type planResult struct {
 	skipped  bool
 }
 
+// shellEnvDropped — переменные, которые убираются из окружения пункта плана (см. runPlanItem).
+var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"}
+
 func runPlanItem(root string, item planJSON) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
 	defer cancel()
-	// bash — по абсолютному пути, без файлов старта и опций из окружения: BASH_ENV, ENV или функция BASH_FUNC_*
-	// вызывающего исполнились бы раньше команды и подменили бы её итог, SHELLOPTS=noexec не дал бы ей исполниться
-	// вовсе (выход 0), BASHOPTS так же меняет сам bash
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", item.Cmd)
+	// bash — по абсолютному пути, без файлов старта и без того в окружении, что меняет сам bash, а не команду:
+	// BASH_ENV, ENV, функция BASH_FUNC_* или ~/.bashrc (bash читает его и в -c при SSH_CLIENT без SHLVL)
+	// исполнились бы раньше команды и подменили бы её итог, SHELLOPTS=noexec не дал бы ей исполниться (выход 0),
+	// BASHOPTS меняет опции, LD_PRELOAD, LD_AUDIT и LD_LIBRARY_PATH подкладывают bash свой код
+	cmd := exec.CommandContext(ctx, "/bin/bash", "--norc", "--noprofile", "-c", item.Cmd)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "BASH_ENV=") || strings.HasPrefix(kv, "ENV=") || strings.HasPrefix(kv, "BASH_FUNC_") ||
-			strings.HasPrefix(kv, "SHELLOPTS=") || strings.HasPrefix(kv, "BASHOPTS=")
+		name, _, _ := strings.Cut(kv, "=")
+		return strings.HasPrefix(name, "BASH_FUNC_") || slices.Contains(shellEnvDropped, name)
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
