@@ -736,6 +736,51 @@ func TestNewTextAcceptsAndValidatesPlan(t *testing.T) {
 	}
 }
 
+func TestPlanHeadingLookalikesAreInvalid(t *testing.T) {
+	for _, heading := range []string{"## План\n## План", "## План ", "## План\r", "## план", " ## План", "### План:", "##\u00a0План", "\ufeff## План", "## План\u200b"} {
+		items := planItems("# Task\n\n" + heading + "\n- bad: false\n\n## Журнал\n")
+		invalid := false
+		for _, item := range items {
+			invalid = invalid || item.Invalid != ""
+		}
+		if !invalid {
+			t.Errorf("heading %q: plan items %#v; want an invalid entry", heading, items)
+		}
+	}
+	if items := planItems("# Task\n\n## Планы на потом\n- x\n\n## Журнал\n"); len(items) != 0 {
+		t.Errorf("unrelated heading flagged: %#v", items)
+	}
+}
+
+func TestPlanSkipDoesNotCoverReAddedItem(t *testing.T) {
+	body := "# Task\n\n## План\n- tests: false\n\n## Журнал\n" +
+		"- 2020-01-01 12:00 план — a: добавлен пункт tests\n" +
+		"- 2020-01-01 12:01 план — a: пропущен: tests — old reason\n" +
+		"- 2020-01-01 12:02 план — a: добавлен пункт tests\n"
+	if items := planItems(body); len(items) != 1 || items[0].Skipped {
+		t.Fatalf("re-added item inherited the old skip: %#v", items)
+	}
+}
+
+func TestDoneRefusesTicketChangedDuringChecks(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\ncheck\n\n## План\n- edits: echo '- 2020-01-01 12:00 note — a: added meanwhile' >>docs/tasks/20200101-1200-MEDIUM-task.md\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := transition(task{path: path, slug: "task", body: body}, options{cmd: "done", by: "reviewer", check: "verified", baseRoot: root}, &out, &errOut)
+	updated, err := os.ReadFile(path)
+	if err != nil || code != exitNone || !strings.Contains(errOut.String(), "changed while plan checks ran") || !strings.Contains(string(updated), "added meanwhile") || strings.Contains(string(updated), "Статус: готово") {
+		t.Fatalf("done over a changed ticket: code=%d stderr=%q body=%q", code, errOut.String(), updated)
+	}
+}
+
 func TestPlanFailureBlocksDoneAndReportsFirstStderrLine(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "docs", "tasks")

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/timearg"
@@ -87,6 +88,9 @@ var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 // planSkipRE — строка журнала, которую пишет tk skip (и прежняя форма без автора), целиком с начала:
 // «пропущен:» внутри заметки или причины другого пункта пропуском не считается.
 var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:план — \S+: )?пропущен: ([a-z0-9-]+) — (.*)$`)
+
+// planAddRE — строка журнала tk plan --add.
+var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен пункт ([a-z0-9-]+)$`)
 var errHelp = errors.New("help")
 var session = currentSession
 var planTimeout = 60 * time.Second
@@ -1153,13 +1157,17 @@ func splitPlanItem(value string) (string, string, error) {
 }
 
 func planItems(body string) []planJSON {
+	var items []planJSON
+	exact, alike := planHeadings(body)
+	if exact > 1 {
+		items = append(items, planJSON{Invalid: "plan section appears more than once"})
+	}
+	if alike > 0 {
+		items = append(items, planJSON{Invalid: "plan heading must be exactly '## План'"})
+	}
 	section, ok := sectionBody(body, "## План")
 	if !ok {
-		return nil
-	}
-	var items []planJSON
-	if strings.Count("\n"+body, "\n## План\n") > 1 {
-		items = append(items, planJSON{Invalid: "plan section appears more than once"})
+		return items
 	}
 	seen := make(map[string]bool)
 	for line := range strings.SplitSeq(section, "\n") {
@@ -1185,6 +1193,23 @@ func planItems(body string) []planJSON {
 	return items
 }
 
+// planHeadings считает заголовки «## План» и похожие на него (регистр, пробелы, `\r`, двоеточие, иное число
+// `#`): похожий план не исполнился бы, и тикет закрылся бы мимо него.
+func planHeadings(body string) (exact, alike int) {
+	notLetter := func(r rune) bool { return !unicode.IsLetter(r) }
+	for line := range strings.SplitSeq(body, "\n") {
+		if line == "## План" {
+			exact++
+			continue
+		}
+		s := strings.TrimFunc(line, func(r rune) bool { return notLetter(r) && r != '#' })
+		if rest, ok := strings.CutPrefix(s, "#"); ok && strings.ToLower(strings.TrimFunc(rest, notLetter)) == "план" {
+			alike++
+		}
+	}
+	return exact, alike
+}
+
 func validatePlanSection(body string) error {
 	for _, item := range planItems(body) {
 		if item.Invalid != "" {
@@ -1194,9 +1219,14 @@ func validatePlanSection(body string) error {
 	return nil
 }
 
+// planSkipReason — причина последнего пропуска пункта; пропуск до последнего добавления пункта с тем же
+// именем к новому пункту не относится.
 func planSkipReason(body, name string) (string, bool) {
 	lines := journalLines(body)
 	for i := len(lines) - 1; i >= 0; i-- {
+		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
+			return "", false
+		}
 		if m := planSkipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
 			return strings.TrimSpace(m[2]), true
 		}
@@ -1558,16 +1588,34 @@ func reportGlintFindings(w io.Writer, findings int, issues []struct {
 	}
 }
 
+// checkDone — всё, что done проверяет до записи: прежние условия, план и то, что тикет не изменился за время
+// проверок (они идут до минуты на пункт: новый пункт или пропуск иначе затёрся бы записью или прошёл мимо).
+func checkDone(t *task, o options, errout io.Writer) (int, int) {
+	loaded := t.body
+	findings, code := prepareDone(t, o, errout)
+	if code != 0 {
+		return findings, code
+	}
+	if code = executePlan(o.baseRoot, t, errout); code != 0 {
+		return findings, code
+	}
+	current, err := os.ReadFile(t.path)
+	if err != nil {
+		return findings, fail(errout, err)
+	}
+	if string(current) != loaded {
+		fmt.Fprintf(errout, "tk: %s changed while plan checks ran; run done again\n", t.slug)
+		return findings, exitNone
+	}
+	return findings, 0
+}
+
 func transition(t task, o options, out, errout io.Writer) int {
 	next := map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён"}[o.cmd]
 	glintFindings := 0
 	if o.cmd == "done" {
 		var code int
-		glintFindings, code = prepareDone(&t, o, errout)
-		if code != 0 {
-			return code
-		}
-		if code = executePlan(o.baseRoot, &t, errout); code != 0 {
+		if glintFindings, code = checkDone(&t, o, errout); code != 0 {
 			return code
 		}
 	}
