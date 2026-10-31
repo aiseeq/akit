@@ -1,6 +1,7 @@
 package pressure
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -43,17 +44,44 @@ func ReadQuiet(path string) (time.Time, error) {
 	return until, nil
 }
 
-// SetQuiet пишет срок в path: временный файл рядом и переименование поверх, чтобы читающий не застал
-// половину строки.
-func SetQuiet(path string, until time.Time) error {
+// QuietNote — тихий режим: срок и пометка, кто его поставил и зачем. Пометка лежит рядом со сроком,
+// в QuietNotePath, а не в его строке: читатели срока, не знающие пометки, разбирают файл как раньше.
+type QuietNote struct {
+	Until time.Time `json:"until"`
+	By    string    `json:"by,omitempty"`  // сессия, поставившая режим; пусто — не из сессии
+	Why   string    `json:"why,omitempty"` // зачем
+}
+
+// QuietNotePath — файл пометки тихого режима со сроком в path.
+func QuietNotePath(path string) string { return path + ".note" }
+
+// SetQuiet пишет срок в path и пометку рядом; без By и Why пометку убирает. Каждый файл — временный
+// рядом и переименование поверх, чтобы читающий не застал половину строки.
+func SetQuiet(path string, note QuietNote) error {
+	// Срок в файле — с точностью до секунды; пометка хранит тот же срок, иначе не узнает свой.
+	note.Until = note.Until.Truncate(time.Second)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("quiet mode: %w", err)
 	}
+	if err := writeReplace(path, []byte(note.Until.Format(time.RFC3339)+"\n")); err != nil {
+		return err
+	}
+	if note.By == "" && note.Why == "" {
+		return removeQuiet(QuietNotePath(path))
+	}
+	data, err := json.Marshal(note)
+	if err != nil {
+		return fmt.Errorf("quiet mode note: %w", err)
+	}
+	return writeReplace(QuietNotePath(path), append(data, '\n'))
+}
+
+func writeReplace(path string, data []byte) error {
 	t, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return fmt.Errorf("quiet mode: %w", err)
 	}
-	_, werr := t.WriteString(until.Format(time.RFC3339) + "\n")
+	_, werr := t.Write(data)
 	if cerr := t.Close(); werr == nil {
 		werr = cerr
 	}
@@ -69,19 +97,43 @@ func SetQuiet(path string, until time.Time) error {
 	return werr
 }
 
-// ClearQuiet снимает тихий режим: удаляет path; файла нет — режим уже снят.
+// ClearQuiet снимает тихий режим: удаляет срок в path и пометку; файла нет — режим уже снят.
 func ClearQuiet(path string) error {
+	return errors.Join(removeQuiet(path), removeQuiet(QuietNotePath(path)))
+}
+
+func removeQuiet(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("quiet mode: %w", err)
 	}
 	return nil
 }
 
-// quietUntil — срок тихого режима из path, пока он не прошёл к now; иначе нулевое время.
-func quietUntil(path string, now time.Time) (time.Time, error) {
+// readQuietNote — пометка срока until из файла рядом с path; нет файла или пометка от другого срока
+// (срок переставил тот, кто пометок не пишет) — пустая.
+func readQuietNote(path string, until time.Time) (QuietNote, error) {
+	data, err := os.ReadFile(QuietNotePath(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return QuietNote{Until: until}, nil
+	}
+	if err != nil {
+		return QuietNote{}, fmt.Errorf("quiet mode note: %w", err)
+	}
+	var note QuietNote
+	if err := json.Unmarshal(data, &note); err != nil {
+		return QuietNote{}, fmt.Errorf("quiet mode note %s: %w", QuietNotePath(path), err)
+	}
+	if !note.Until.Equal(until) {
+		return QuietNote{Until: until}, nil
+	}
+	return note, nil
+}
+
+// activeQuiet — тихий режим из path с пометкой, пока срок не прошёл к now; иначе пустой.
+func activeQuiet(path string, now time.Time) (QuietNote, error) {
 	until, err := ReadQuiet(path)
 	if err != nil || !now.Before(until) {
-		return time.Time{}, err
+		return QuietNote{}, err
 	}
-	return until, nil
+	return readQuietNote(path, until)
 }

@@ -26,7 +26,7 @@ func TestQuietFile(t *testing.T) {
 		t.Errorf("нет файла = %v, %v; ждали нулевое время", until, err)
 	}
 	want := time.Date(2026, 10, 29, 14, 45, 0, 0, time.FixedZone("CET", 3600))
-	if err := SetQuiet(path, want); err != nil {
+	if err := SetQuiet(path, QuietNote{Until: want}); err != nil {
 		t.Fatal(err)
 	}
 	if until, err := ReadQuiet(path); err != nil || !until.Equal(want) {
@@ -52,10 +52,78 @@ func TestQuietFile(t *testing.T) {
 	}
 }
 
+func TestQuietNote(t *testing.T) {
+	m, now := fakeProc(t, map[string]string{"stat": "cpu0 1\ncpu1 1\nprocs_running 1\n"})
+	until := now.Add(time.Hour + 500*time.Millisecond) // доли секунды файл срока не хранит
+	if err := SetQuiet(m.quiet, QuietNote{Until: until, By: "planner", Why: "call"}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := m.Check(context.Background(), DefaultLimits, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Load.QuietBy != "planner" || v.Load.QuietWhy != "call" {
+		t.Fatalf("пометка = %q, %q; ждали planner, call", v.Load.QuietBy, v.Load.QuietWhy)
+	}
+	if why := v.Why(); why != "quiet mode until "+quietClock(v.Load.QuietUntil, time.Now())+" (planner: call)" {
+		t.Errorf("Why = %q", why)
+	}
+	// Срок переставил писатель без пометки: старая пометка к новому сроку не относится.
+	if err := os.WriteFile(m.quiet, []byte(now.Add(2*time.Hour).Format(time.RFC3339)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v, err = m.Check(context.Background(), DefaultLimits, "", true); err != nil || v.Load.QuietBy != "" || v.Load.QuietWhy != "" || v.Measure != Quiet {
+		t.Errorf("чужой срок = %+v, %v; ждали тихий режим без пометки", v.Load, err)
+	}
+	for by, want := range map[[2]string]string{{"planner", ""}: " (planner)", {"", "call"}: " (call)", {"", ""}: ""} {
+		if got := quietNoteText(by[0], by[1]); got != want {
+			t.Errorf("quietNoteText(%q, %q) = %q; ждали %q", by[0], by[1], got, want)
+		}
+	}
+	if err := SetQuiet(m.quiet, QuietNote{Until: until}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(QuietNotePath(m.quiet)); !os.IsNotExist(err) {
+		t.Errorf("срок без пометки оставил старую: %v", err)
+	}
+	if err := SetQuiet(m.quiet, QuietNote{Until: until, Why: "call"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearQuiet(m.quiet); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(QuietNotePath(m.quiet)); !os.IsNotExist(err) {
+		t.Errorf("ClearQuiet оставил пометку: %v", err)
+	}
+	if err := SetQuiet(m.quiet, QuietNote{Until: until}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(QuietNotePath(m.quiet), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Check(context.Background(), DefaultLimits, "", true); err == nil {
+		t.Error("битая пометка — ждали ошибку замера")
+	}
+}
+
+func TestVerdictWithoutQuiet(t *testing.T) {
+	quiet := Rule(Load{Runnable: 1, Threads: 2, QuietUntil: time.Now().Add(time.Hour), QuietBy: "planner"}, DefaultLimits, nil)
+	if quiet.Measure != Quiet {
+		t.Fatalf("Measure = %q; ждали quiet", quiet.Measure)
+	}
+	if v := quiet.WithoutQuiet(DefaultLimits); v.Busy() || !v.Load.QuietUntil.IsZero() || v.Load.QuietBy != "" {
+		t.Errorf("без тишины, runnable 1 из 2 = %+v; ждали свободна", v)
+	}
+	busy := Rule(Load{Runnable: 2, Threads: 2, QuietUntil: time.Now().Add(time.Hour)}, DefaultLimits, nil)
+	if v := busy.WithoutQuiet(DefaultLimits); v.Measure != CPU {
+		t.Errorf("без тишины, runnable 2 из 2 = %q; ждали cpu", v.Measure)
+	}
+}
+
 func TestCheckQuiet(t *testing.T) {
 	m, now := fakeProc(t, map[string]string{"stat": "cpu0 1\ncpu1 1\nprocs_running 1\n"})
 	until := now.Add(time.Hour)
-	if err := SetQuiet(m.quiet, until); err != nil {
+	if err := SetQuiet(m.quiet, QuietNote{Until: until}); err != nil {
 		t.Fatal(err)
 	}
 	v, err := m.Check(context.Background(), DefaultLimits, "", true)

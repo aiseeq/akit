@@ -68,6 +68,8 @@ type Load struct {
 	SwapKBs        float64 // обмен со свопом, KB/s
 	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
 	QuietUntil time.Time
+	QuietBy    string // кто поставил тихий режим, из его пометки
+	QuietWhy   string // зачем
 }
 
 // Verdict — ответ правила: Measure пусто — свободна; иначе мера, её значение и порог.
@@ -95,9 +97,27 @@ func (v Verdict) Why() string {
 	case Swap:
 		return fmt.Sprintf("memory pressure %.1f%% is above %v%% while swapping %.0f KB/s", v.Value, v.Limit, v.Load.SwapKBs)
 	case Quiet:
-		return "quiet mode until " + quietClock(v.Load.QuietUntil, time.Now())
+		return "quiet mode until " + quietClock(v.Load.QuietUntil, time.Now()) + quietNoteText(v.Load.QuietBy, v.Load.QuietWhy)
 	}
 	return ""
+}
+
+// quietNoteText — пометка тихого режима в скобках: «(planner: созвон)», «(planner)», «(созвон)».
+func quietNoteText(by, why string) string {
+	switch {
+	case by != "" && why != "":
+		return " (" + by + ": " + why + ")"
+	case by != "" || why != "":
+		return " (" + by + why + ")"
+	}
+	return ""
+}
+
+// WithoutQuiet — вердикт тех же замеров и порогов l без тихого режима: что машина показывает сама.
+func (v Verdict) WithoutQuiet(l Limits) Verdict {
+	m := v.Load
+	m.QuietUntil, m.QuietBy, m.QuietWhy = time.Time{}, "", ""
+	return Rule(m, l, v.Skipped)
 }
 
 // quietClock — срок тихого режима местным временем: часы, а не сегодня — и день.
@@ -187,9 +207,11 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 			return Verdict{}, err
 		}
 	}
-	if load.QuietUntil, err = quietUntil(quiet, m.now()); err != nil {
+	note, err := activeQuiet(quiet, m.now())
+	if err != nil {
 		return Verdict{}, err
 	}
+	load.QuietUntil, load.QuietBy, load.QuietWhy = note.Until, note.By, note.Why
 	// measure кладёт замер или, когда меры нет в системе, её сентинел в skipped.
 	measure := func(none error, read func() error) error {
 		err := read()

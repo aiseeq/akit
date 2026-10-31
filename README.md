@@ -40,7 +40,9 @@ in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to 
 (100 disables disk checks) and `--kind K` to request a profile kind. Use busy instead of `cat
 /proc/loadavg` to decide whether to start heavy work now: the 1-minute load lags. Exit 0 free, 1 busy,
 2 usage or reading error. `pressure.ReadLoadAvg` reads the system load average for watching long
-overload.
+overload. `busy --quiet 2h --why "call"` keeps the machine busy until then, whatever it measures; the
+busy line and graft's wait name the session that set it and why. `--ignore-quiet` judges a
+measurement taken inside quiet mode by the readings alone; `--quiet-off` ends it.
 
 ### Disk state source
 
