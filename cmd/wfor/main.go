@@ -91,7 +91,7 @@ type parsed struct {
 func parseArgs(args []string, now func() time.Time) (options, error) {
 	p := parsed{opts: options{timeout: defaultTimeout, every: defaultEvery}}
 	for i := 0; i < len(args); i++ {
-		n, err := p.arg(args, i, now)
+		n, err := p.arg(args, i)
 		if err != nil {
 			return options{}, err
 		}
@@ -114,7 +114,7 @@ func parseArgs(args []string, now func() time.Time) (options, error) {
 }
 
 // arg разбирает аргумент i и возвращает, сколько следующих аргументов он съел.
-func (p *parsed) arg(args []string, i int, now func() time.Time) (int, error) {
+func (p *parsed) arg(args []string, i int) (int, error) {
 	a := args[i]
 	value := func() (string, error) {
 		if i+1 >= len(args) {

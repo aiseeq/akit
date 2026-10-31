@@ -446,7 +446,7 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		return 0
 	}
 	if o.cmd == "check" {
-		return checkPlan(root, t, out, errout)
+		return checkPlan(root, t, out)
 	}
 	if o.cmd == "plan" {
 		return addPlanItem(t, o, out, errout)
@@ -1390,7 +1390,7 @@ func runPlan(root string, t task) []planResult {
 	return results
 }
 
-func checkPlan(root string, t task, out, errout io.Writer) int {
+func checkPlan(root string, t task, out io.Writer) int {
 	results := runPlan(root, t)
 	if len(results) == 0 {
 		fmt.Fprintln(out, "no plan")

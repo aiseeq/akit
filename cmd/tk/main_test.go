@@ -649,7 +649,7 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "marker"), []byte("ok"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if code := checkPlan(root, task{path: path, body: string(updated)}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "present: ok") {
+	if code := checkPlan(root, task{path: path, body: string(updated)}, &out); code != 0 || !strings.Contains(out.String(), "present: ok") {
 		t.Fatalf("check plan: %d %q %s", code, out.String(), errOut.String())
 	}
 	if code := skipPlanItem(task{path: path, slug: "task", body: string(updated)}, options{by: "planner", item: "present", why: "covered elsewhere"}, &out, &errOut); code != 0 {
@@ -667,7 +667,7 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 		t.Fatalf("skip state = %#v", items)
 	}
 	out.Reset()
-	if code := checkPlan(root, task{path: path, body: string(skipped)}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "present: skipped — covered elsewhere") {
+	if code := checkPlan(root, task{path: path, body: string(skipped)}, &out); code != 0 || !strings.Contains(out.String(), "present: skipped — covered elsewhere") {
 		t.Fatalf("check skipped: %d %q %s", code, out.String(), errOut.String())
 	}
 	obj := taskObject(root, task{path: path, slug: "task", body: string(skipped)}, "", false)
