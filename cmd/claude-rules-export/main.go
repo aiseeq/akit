@@ -36,7 +36,8 @@ is cleared. Paths are taken as the system takes them: symlinks resolved, ".." af
 goes from its target, a folder shown under another path by a bind mount (by itself or as
 a subfolder, found in /proc/self/mountinfo) is the same folder. An empty path is refused.
 Only what the export writes is cleared: an OUT_DIR holding anything but .git, global,
-README.md, skills and work, or a mount point inside, is refused untouched.
+README.md, skills and work, being a mount point or having one inside is refused untouched
+(on Linux without /proc/self/mountinfo too); .git, a folder or a file, is never changed.
 A skill folder that is a link is exported as its content.
 
 --rules is the folder with manifest/ and README.template.md

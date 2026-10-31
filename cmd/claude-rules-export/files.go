@@ -92,8 +92,12 @@ func textFiles(root string) ([]string, error) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
+		// .git очистка не трогает, и правка его не трогает: файл .git (worktree, жёсткая ссылка) — не выгрузка
+		if d.Name() == ".git" && (d.IsDir() || p == filepath.Join(root, ".git")) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if !d.Type().IsRegular() {
 			return nil

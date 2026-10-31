@@ -256,9 +256,10 @@ func checkOutContent(out string, mounts []mount) error {
 			return fmt.Errorf("OUT_DIR holds %s, which the export does not write: give an empty folder or a previous export", e.Name())
 		}
 	}
+	// и сам OUT_DIR не точка монтирования: overlay или fuse показывают чужую папку, и сверка путей её не узнаёт
 	for _, m := range mounts {
-		if r, ok := under(m.point, out); ok && r != "." {
-			return fmt.Errorf("OUT_DIR has a mount point inside: %s", m.point)
+		if _, ok := under(m.point, out); ok {
+			return fmt.Errorf("OUT_DIR is or has inside a mount point: %s", m.point)
 		}
 	}
 	return nil

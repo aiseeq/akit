@@ -107,6 +107,15 @@ func TestExport(t *testing.T) {
 	if read(t, filepath.Join(out, ".git/HEAD")) != "ref\n" {
 		t.Error(".git тронут")
 	}
+	// файл .git (worktree) — не выгрузка: замены его не трогают
+	wt := filepath.Join(t.TempDir(), "wt")
+	write(t, filepath.Join(wt, ".git"), "gitdir: /x/me@corp.example/wt\n", 0o644)
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, wt); code != 0 && code != exitDirty {
+		t.Fatalf("worktree: code %d %q", code, stderr)
+	}
+	if got := read(t, filepath.Join(wt, ".git")); got != "gitdir: /x/me@corp.example/wt\n" {
+		t.Errorf("файл .git тронут: %q", got)
+	}
 	if !strings.Contains(stdout, "no private data") {
 		t.Errorf("итог: %q", stdout)
 	}
@@ -178,7 +187,7 @@ func TestExportErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\njira2\n", 0o644)
-	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, ext); code != exitUsage || read(t, filepath.Join(ext, "jira2/SKILL.md")) != "# jira2\n" {
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, ext); code != exitUsage || !strings.Contains(stderr, "must not contain") || read(t, filepath.Join(ext, "jira2/SKILL.md")) != "# jira2\n" {
 		t.Fatalf("OUT_DIR с исходником скилла: code %d %q", code, stderr)
 	}
 	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\n", 0o644)
@@ -292,7 +301,8 @@ func TestExportDotDotAfterLink(t *testing.T) {
 func TestExportRefusesBindMount(t *testing.T) {
 	if out := os.Getenv("CRE_BIND_OUT"); out != "" {
 		code, _, stderr := runExport(t, "--src-home", os.Getenv("CRE_BIND_SRC"), "--rules", os.Getenv("CRE_BIND_RULES"), out)
-		if code != exitUsage || !strings.Contains(stderr, "OUT_DIR") {
+		// отказ любой проверкой; что источник цел, смотрит запустивший тест
+		if code != exitUsage {
 			t.Fatalf("OUT_DIR %s: code %d %q", out, code, stderr)
 		}
 		return
@@ -304,6 +314,9 @@ func TestExportRefusesBindMount(t *testing.T) {
 	write(t, filepath.Join(src, ".claude/hooks/h.sh"), "#!/bin/sh\n", 0o755)
 	write(t, filepath.Join(rules, "extra/x"), "x\n", 0o644)
 	mnt := t.TempDir()
+	// чужая папка из одних имён выгрузки: проверка содержимого её пропустила бы
+	repo := filepath.Join(t.TempDir(), "repo")
+	write(t, filepath.Join(repo, "skills/z/f"), "z\n", 0o644)
 	// $1 — что монтируется, $2 — папка случая; OUT_DIR — out внутри неё
 	bind := `mkdir -p "$2/m" && mount --bind "$1" "$2/m"`
 	for _, c := range []struct{ name, mount, from, out string }{
@@ -318,6 +331,12 @@ func TestExportRefusesBindMount(t *testing.T) {
 		// overlay: источник — верхний слой, OUT_DIR — слитая папка; mountinfo пути к источнику не покажет
 		{"overlay upper", `mkdir -p "$2/l" "$2/w" "$2/o" && mount -t overlay overlay -o lowerdir="$2/l",upperdir="$1",workdir="$2/w" "$2/o"`,
 			filepath.Join(src, ".claude/hooks"), "o"},
+		// OUT_DIR — сам точка монтирования чужой папки, где только имена выгрузки
+		{"overlay of export-like folder", `mkdir -p "$2/l" "$2/w" "$2/o" && mount -t overlay overlay -o lowerdir="$2/l",upperdir="$1",workdir="$2/w" "$2/o"`,
+			repo, "o"},
+		// без /proc точек монтирования не узнать: отказ, а не очистка вслепую
+		{"no /proc", `mkdir -p "$2/o/skills/h" && mount --bind "$1" "$2/o/skills/h" && mount -t tmpfs none /proc`,
+			filepath.Join(src, ".claude/hooks"), "o"},
 	} {
 		dir := filepath.Join(mnt, c.name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -329,8 +348,11 @@ func TestExportRefusesBindMount(t *testing.T) {
 		if b, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
 		}
-		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x"} {
-			if _, err := os.Stat(filepath.Join(src, f)); err != nil {
+		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x", repo + "/skills/z/f"} {
+			if !filepath.IsAbs(f) {
+				f = filepath.Join(src, f)
+			}
+			if _, err := os.Stat(f); err != nil {
 				t.Fatalf("%s: источник стёрт: %v", c.name, err)
 			}
 		}

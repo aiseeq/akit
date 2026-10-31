@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -16,10 +17,11 @@ type mount struct {
 	dev, root, point string
 }
 
-// readMounts — точки монтирования процесса; без /proc/self/mountinfo (не Linux) — пусто.
+// readMounts — точки монтирования процесса; вне Linux — пусто. На Linux без /proc/self/mountinfo (chroot,
+// песочница без /proc) точек не узнать — это ошибка, а не пустой список: очистка зашла бы в точку монтирования.
 func readMounts() ([]mount, error) {
 	f, err := os.Open("/proc/self/mountinfo")
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) && runtime.GOOS != "linux" {
 		return nil, nil
 	}
 	if err != nil {
