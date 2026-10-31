@@ -31,8 +31,9 @@ ALLOWED is printed as file:line: KIND.
 
 The export is built and checked in a folder of its own first, then put into OUT_DIR. In
 OUT_DIR only the previous run's own entries are removed, and only while unchanged: each
-file's and folder's path, mode (setuid, setgid and sticky too), extended attributes (ACLs
-too), device, inode and birth time, each file's size and sha256 and each link's text must
+file's and folder's path, mode (setuid, setgid and sticky too), owner and group, extended
+attributes (ACLs too), device, inode and birth time, each file's size and sha256 and each
+link's text must
 match the list that run kept in $XDG_STATE_HOME/claude-rules-export (default
 ~/.local/state), keyed by the OUT_DIR path; the build lies there too. Nothing new gets its
 name in OUT_DIR before it is logged next to that list: a file is written unnamed, a folder
@@ -41,7 +42,8 @@ or link is made under a random name logged first. Folders are removed only when 
 Anything else (an edited or foreign file, a folder shown there by a mount, an OUT_DIR
 without a list that holds more than .git) is refused before anything is removed, so no
 other path to the same folder (symlink, bind mount, overlay, /proc) can erase it. A run cut
-short is finished by the next one. An OUT_DIR that is or holds what is read is refused
+short is finished by the next one. Not told apart: a copy that keeps all of these (a file
+system snapshot restored in place). An OUT_DIR that is or holds what is read is refused
 early, after symlinks are resolved (lying inside a read folder such as ~/work is fine);
 an empty path is refused. A skill folder that is a link is exported as its content; skills named .git
 and paths differing only in case are refused.

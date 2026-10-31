@@ -441,3 +441,27 @@ func TestExportRefusesForeignContent(t *testing.T) {
 		t.Error("OUT_DIR тронут до отказа")
 	}
 }
+
+// Файл источника без права записи выгружается с заменами и с теми же правами.
+func TestExportReadOnlySource(t *testing.T) {
+	src, rules := fixture(t)
+	if err := os.Chmod(filepath.Join(src, ".claude/skills/jira/SKILL.md"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "out")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("code %d %q", code, stderr)
+	}
+	p := filepath.Join(out, "skills/jira/SKILL.md")
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o444 || !strings.Contains(string(data), "<твоя почта>") {
+		t.Errorf("mode %v, content %q", st.Mode().Perm(), data)
+	}
+}

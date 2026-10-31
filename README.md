@@ -75,7 +75,7 @@ Claude Code rules and skills exported for colleagues and checked for private dat
 skills, the chosen sections of the global CLAUDE.md and the workspace rules are built in a folder
 next to the export list (below), literal replacements are made, listed lines dropped, the build is searched for private data
 patterns and then put into OUT_DIR. In OUT_DIR only the previous run's own entries are removed, and only
-while unchanged: path, mode (setuid, setgid and sticky too), extended attributes (ACLs too), device, inode and
+while unchanged: path, mode (setuid, setgid and sticky too), owner and group, extended attributes (ACLs too), device, inode and
 birth time of each file and folder, size and sha256 of each file and the text of each link must match the list
 that run kept in `$XDG_STATE_HOME/claude-rules-export` (default `~/.local/state`), keyed by the OUT_DIR path;
 the build lies there too. Nothing new gets its name in OUT_DIR before it is logged next to that list: a file is
@@ -83,7 +83,8 @@ written unnamed (`O_TMPFILE`) and linked by its descriptor, a folder or link is 
 first and renamed without replacing. Folders are removed only when empty and `.git` at the top is never touched. Anything else — an edited
 or foreign file, a folder shown there by a mount, an OUT_DIR without a list holding more than `.git` — is
 refused before anything is removed, so no other path to the same folder (symlink, bind mount, overlay,
-`/proc`) can erase it, and a run cut short is finished by the next one. An OUT_DIR that is or holds what is read is
+`/proc`) can erase it, and a run cut short is finished by the next one. A copy that keeps all of these (a file system
+snapshot restored in place) is not told apart. An OUT_DIR that is or holds what is read is
 refused early, after symlinks are resolved (lying inside a read folder, as `~/work/claude-rules` does, is fine); an empty path is
 refused; a skill folder that is a link is exported as its content; skills named `.git` and paths differing
 only in case are refused. What to export and what counts as private is data in the

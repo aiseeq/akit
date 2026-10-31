@@ -311,6 +311,16 @@ func TestExportKeepsUserEntriesAfterCut(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "skills/jira/README.md"},
+		// вторая запись — папка global: строка с inode её случайного имени уже в журнале, переименования нет
+		{"temp folder chmod after its line", "journaled", 2, func(t *testing.T, out string) {
+			tmp, err := filepath.Glob(filepath.Join(out, tempPrefix+"*"))
+			if err != nil || len(tmp) != 1 {
+				t.Fatalf("temp names %v %v", tmp, err)
+			}
+			if err := os.Chmod(tmp[0], 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}, tempPrefix},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			src, rules := fixture(t)
@@ -353,6 +363,9 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 	}{
 		{"device", func(e *entry) { e.Dev++ }},
 		{"birth", func(e *entry) { e.Birth++ }},
+		// у root владелец и группа и так 0: случай ничего бы не менял
+		{"owner", func(e *entry) { e.Uid = 0 }},
+		{"group", func(e *entry) { e.Gid = 0 }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			src, rules := fixture(t)
@@ -370,6 +383,9 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 			}
 			if c.name == "birth" && entries[0].Birth == 0 {
 				t.Skip("no birth time on this file system")
+			}
+			if (c.name == "owner" || c.name == "group") && (os.Getuid() == 0 || os.Getgid() == 0) {
+				t.Skip("root: owner and group are already 0")
 			}
 			for i := range entries {
 				c.change(&entries[i])

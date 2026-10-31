@@ -44,6 +44,8 @@ type entry struct {
 	Sum   string      `json:"sha256,omitempty"`
 	Link  string      `json:"link,omitempty"`
 	Xattr string      `json:"xattr,omitempty"`
+	Uid   uint32      `json:"uid,omitempty"`
+	Gid   uint32      `json:"gid,omitempty"`
 	Dev   uint64      `json:"dev,omitempty"`
 	Ino   uint64      `json:"ino,omitempty"`
 	Birth int64       `json:"birth,omitempty"`
@@ -239,11 +241,11 @@ func scanStage(dir string) ([]entry, error) {
 		if err != nil {
 			return err
 		}
-		// права нужны при переносе; xattr, устройство и inode — у созданной в OUT_DIR записи, не у сборки
+		// права нужны при переносе; владелец, xattr, устройство и inode — у созданной в OUT_DIR записи, не у сборки
 		if e.Kind == "d" && e.Mode.Perm()&0o700 != 0o700 {
 			return fmt.Errorf("folder %s: mode %v, the owner cannot write into it", rel, e.Mode)
 		}
-		e.Xattr, e.Dev, e.Ino = "", 0, 0
+		e.Uid, e.Gid, e.Xattr, e.Dev, e.Ino = 0, 0, "", 0, 0
 		entries = append(entries, e)
 		return nil
 	})
@@ -253,7 +255,8 @@ func scanStage(dir string) ([]entry, error) {
 	return entries, nil
 }
 
-// describe — запись по пути rel: тип, права, размер, sha256 файла, текст ссылки, xattr, устройство, inode.
+// describe — запись по пути rel: тип, права, владелец и группа, размер, sha256 файла, текст ссылки, xattr,
+// устройство, inode.
 func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), readlink func() (string, error), rel string) (entry, error) {
 	if err := checkEntryPath(rel); err != nil {
 		return entry{}, err
@@ -264,7 +267,7 @@ func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), 
 	}
 	e := entry{Path: rel, Mode: st.Mode() & modeBits}
 	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		e.Dev, e.Ino = sys.Dev, sys.Ino
+		e.Uid, e.Gid, e.Dev, e.Ino = sys.Uid, sys.Gid, sys.Dev, sys.Ino
 	}
 	switch {
 	case st.Mode()&fs.ModeSymlink != 0:
@@ -576,7 +579,8 @@ func placeFile(root *os.Root, src string, e *entry, journal *os.File) (entry, er
 }
 
 // loadKnown — записи прошлого прогона: список и журнал оборванного. Запись журнала, ещё не переименованная, —
-// и под своим именем, и под случайным.
+// и под своим именем, и под случайным. Строка td или tl, за которой в журнале есть строка с inode под тем же
+// случайным именем, снята ею: иначе под этим именем подошла бы любая папка.
 func loadKnown(file, jfile, out string) ([]entry, error) {
 	known, err := loadList(file, out)
 	if err != nil {
@@ -586,8 +590,17 @@ func loadKnown(file, jfile, out string) ([]entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	named := map[string]bool{}
+	for i := range logged {
+		if logged[i].At != "" {
+			named[logged[i].At] = true
+		}
+	}
 	for i := range logged {
 		e := logged[i]
+		if (e.Kind == "td" || e.Kind == "tl") && named[e.Path] {
+			continue
+		}
 		at := e.At
 		e.At = ""
 		known = append(known, e)

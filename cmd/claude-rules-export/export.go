@@ -150,7 +150,17 @@ func rewrite(path string, m manifest) error {
 			b.WriteString(line + "\n")
 		}
 	}
-	return putFile(path, []byte(b.String()), st.Mode().Perm(), os.O_TRUNC)
+	// копия файла источника без права записи (0444) пишется с ним и получает прежние права обратно
+	if err := os.Chmod(path, st.Mode().Perm()|0o200); err != nil {
+		return fmt.Errorf("rewrite: %w", err)
+	}
+	if err := putFile(path, []byte(b.String()), st.Mode().Perm(), os.O_TRUNC); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, st.Mode()&modeBits); err != nil {
+		return fmt.Errorf("rewrite: %w", err)
+	}
+	return nil
 }
 
 func dropped(line string, drop []string) bool {
