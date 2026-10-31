@@ -325,6 +325,7 @@ func TestExportRefusesBindMount(t *testing.T) {
 	write(t, filepath.Join(repo, "skills/z/f"), "z\n", 0o644)
 	// $1 — что монтируется, $2 — папка случая; OUT_DIR — out внутри неё
 	bind := `mkdir -p "$2/m" && mount --bind "$1" "$2/m"`
+	casefold := `{ mkdir -p "$2/fs" && mount -t tmpfs -o casefold tmpfs "$2/fs" && mkdir "$2/fs/d" && chattr +F "$2/fs/d" || exit 77; }`
 	for _, c := range []struct{ name, mount, from, out string }{
 		{"home", bind, src, "m"},
 		{"inside .claude", bind, filepath.Join(src, ".claude"), "m/x"},
@@ -340,6 +341,12 @@ func TestExportRefusesBindMount(t *testing.T) {
 		// OUT_DIR — сам точка монтирования чужой папки, где только имена выгрузки
 		{"overlay of export-like folder", `mkdir -p "$2/l" "$2/w" "$2/o" && mount -t overlay overlay -o lowerdir="$2/l",upperdir="$1",workdir="$2/w" "$2/o"`,
 			repo, "o"},
+		// папка без учёта регистра: OUT_DIR в другом регистре, чем точка монтирования в mountinfo; код 77 —
+		// ядро без casefold у tmpfs
+		{"casefold mount inside OUT_DIR", casefold + ` && mkdir -p "$2/fs/d/out/skills" && mount --bind "$1" "$2/fs/d/out/skills"`,
+			repo, "fs/d/OUT"},
+		{"casefold OUT_DIR is a mount point", casefold + ` && mkdir -p "$2/fs/d/out" && mount --bind "$1" "$2/fs/d/out"`,
+			repo, "fs/d/OUT"},
 		// без /proc точек монтирования не узнать: отказ, а не очистка вслепую
 		{"no /proc", `mkdir -p "$2/o/skills/h" && mount --bind "$1" "$2/o/skills/h" && mount -t tmpfs none /proc`,
 			filepath.Join(src, ".claude/hooks"), "o"},
@@ -354,7 +361,10 @@ func TestExportRefusesBindMount(t *testing.T) {
 		if c.mount == bind {
 			cmd.Env = append(cmd.Env, "CRE_BIND_SAME="+c.from)
 		}
-		if b, err := cmd.CombinedOutput(); err != nil {
+		b, err := cmd.CombinedOutput()
+		if code := cmd.ProcessState.ExitCode(); code == 77 {
+			t.Logf("%s: no casefold tmpfs: %s", c.name, b)
+		} else if err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
 		}
 		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x", repo + "/skills/z/f"} {

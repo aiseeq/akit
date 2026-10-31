@@ -33,7 +33,8 @@ An OUT_DIR that holds what is read (the source home, its .claude and work, both
 CLAUDE.md, --rules with its manifest and template, an exported skill's folder and the
 targets of links in it) or is or lies in any of it but the home is refused before anything
 is cleared. Paths are taken as the system takes them: symlinks resolved, ".." after a link
-goes from its target, a folder shown under another path by a bind mount (by itself or as
+goes from its target, the name is the kernel's (case as on disk on a case-insensitive
+folder), a folder shown under another path by a bind mount (by itself or as
 a subfolder, found in /proc/self/mountinfo) is the same folder. An empty path is refused.
 Only what the export writes is cleared: an OUT_DIR holding anything but .git, global,
 README.md, skills and work, being a mount point or having one inside is refused untouched

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // mount — строка /proc/self/mountinfo: файловая система dev, её папка root видна в точке point.
@@ -49,6 +50,29 @@ func parseMounts(r io.Reader) ([]mount, error) {
 		return nil, fmt.Errorf("mounts: %w", err)
 	}
 	return mounts, nil
+}
+
+// kernelName — путь p так, как его пишет ядро и в mountinfo: на папке без учёта регистра EvalSymlinks оставляет
+// регистр, как его написали (…/OUT), а точка монтирования в mountinfo — с регистром на диске (…/out), и сверка по
+// тексту их бы не сошлась. Вне Linux — p как есть.
+func kernelName(p string) (string, error) {
+	if runtime.GOOS != "linux" {
+		return p, nil
+	}
+	// O_NONBLOCK: канал на месте файла не повесит открытие
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", p, err)
+	}
+	defer func() { _ = f.Close() }()
+	name, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if err != nil {
+		return "", fmt.Errorf("kernel path of %s: %w", p, err)
+	}
+	if !filepath.IsAbs(name) || strings.HasSuffix(name, " (deleted)") {
+		return "", fmt.Errorf("kernel path of %s: %q", p, name)
+	}
+	return name, nil
 }
 
 // unescapeMount — поле mountinfo с восьмеричными \040, \011, \012, \134 вместо пробела, таба, перевода строки и \.

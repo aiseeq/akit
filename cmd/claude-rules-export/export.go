@@ -294,7 +294,7 @@ func physical(p string) (string, error) {
 func resolved(p string) (string, error) {
 	r, err := filepath.EvalSymlinks(p)
 	if err == nil {
-		return r, nil
+		return kernelName(r)
 	}
 	sep := string(filepath.Separator)
 	trimmed := strings.TrimRight(p, sep)

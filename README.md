@@ -76,7 +76,8 @@ skills, the chosen sections of the global CLAUDE.md and the workspace rules are 
 (cleared but for `.git`; an OUT_DIR that holds or lies in what is read — the source home, its
 `.claude` and `work`, both CLAUDE.md, the `--rules` folder with its manifest and template, an exported
 skill's folder and the targets of links in it; lying in the home itself is fine; paths are taken as the
-system takes them, symlinks resolved and `..` after a link going from its target, and a folder shown under
+system takes them, symlinks resolved, `..` after a link going from its target and the name as the kernel
+reports it (case as on disk on a case-insensitive folder), and a folder shown under
 another path by a bind mount (by itself or as a subfolder, found in `/proc/self/mountinfo`) is recognised as
 the same folder; an empty path is refused — is refused first; so is an OUT_DIR holding anything the
 export does not write (anything but `.git`, `global`, `README.md`, `skills`, `work`), being a mount
