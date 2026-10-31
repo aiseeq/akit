@@ -1,6 +1,6 @@
 # Разбор тестов akit по содержанию
 
-Статус: в работе
+Статус: готово
 Исполнитель: akit-master
 
 ## Что сделать
@@ -24,3 +24,6 @@
 - 2026-10-31 02:33 в работе — akit-master
 - 2026-10-31 02:33 note — akit-master: боец Luna 1031-0233-tests-review (разбор-данных): бриф /home/aisee/.cache/worktrees/akit-accept/tests-review-brief.md, приёмка tests-review.sh там же, отчёт → /home/aisee/.claude/improve/state/tests-review/akit-20261031.md; поправки — вторым этапом после ревью
 - 2026-10-31 02:59 note — akit-master: отчёт бойца принят с поправками мастера (в самом отчёте: «ловил» — TDD-тест фикса, а не stats; правило 6 через unshare -rm; govulncheck в гейт снят). Мастер повторил: тест cdc5209 на cdc5209^ — TestCalls FAIL; откаты cdc5209/11289f5 на HEAD — TestCalls/TestSubagentsAndRawFilter FAIL. Поправки 1–4 (тесты tk, codex, shellcmd) — боец 1031-03xx-tests-fixes, приёмка tests-fixes.sh (10 функций ≥ 80 %, только тесты). Не делаю: 6 (пороги 300 мс/2 с — красных test за 7 дней 0, флейков нет), 8 (ForHome — однострочник), 9 (page-shot с Chrome — проверка по наличию браузера, есть Skip)
+- 2026-10-31 03:50 note — akit-master: поправки 1–4 влиты 73977c2 (v1.15.0): 10 функций 0–67 % → 80,8–100 %, мутации в отчёте бойца; мутация duration (d<0) повторена мастером — TestDuration FAIL
+- 2026-10-31 03:50 на проверке — akit-master — отчёт /home/aisee/.claude/improve/state/tests-review/akit-20261031.md, коммит 73977c2
+- 2026-10-31 04:00 готово — akit-master-verify-subagent (session akit-master): Суб-агент Opus со свежим контекстом, 31.10 ~03:55 CET: отчёт — 15 строк, разделы 2–5 (часть ссылок съехала после f23f2c7/73977c2, отчёт на b4a92ac); свои откаты 885b465 → TestOffset FAIL, cea1750 (wait.go) → TestWaitCodexAndInsufficientData FAIL; 73977c2 только _test.go, 10 функций 80,8–100 %; своя мутация validateList --slug → TestValidateList/bad_slug_prefix FAIL; webtext под unshare -rn с поднятым lo — ok (снятие поправки 5 верно). Логи /home/aisee/.cache/claude-tmp/claude-1000/-home-aisee-git-akit/45f17164-e30c-46e6-a55f-54365795eb5d/scratchpad/verify-tests/

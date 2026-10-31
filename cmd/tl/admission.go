@@ -18,9 +18,14 @@ var heavyThreshold int64 = 512 << 20
 // отдаёт код дочернего; done — вызов уже выполнен там. Под очередью (GRAFT_THREADS задан) и для лёгкого
 // чтения — done false, читать здесь.
 func admission(sources []source, args []string, stdout, stderr io.Writer) (int, bool, error) {
-	_, set, err := configuredThreads()
+	threads, set, err := configuredThreads()
 	if err != nil {
 		return exitUsage, true, err
+	}
+	if set {
+		// Под очередью потоки — столько, сколько дала очередь: иначе фоновые и простаивающие воркеры GC
+		// займут все ядра сверх воркеров scan.
+		runtime.GOMAXPROCS(threads)
 	}
 	if !set {
 		var size int64

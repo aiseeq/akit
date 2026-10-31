@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -81,6 +82,10 @@ func TestConfiguredThreads(t *testing.T) {
 	threads, set, err := configuredThreads()
 	if err != nil || !set || threads != min(3, runtime.NumCPU()) || scanWorkerCount() != threads {
 		t.Fatalf("configured workers = %d, set %t, err %v", threads, set, err)
+	}
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	if _, done, err := admission(nil, nil, io.Discard, io.Discard); done || err != nil || runtime.GOMAXPROCS(0) != threads {
+		t.Fatalf("admission under the queue: done %t, err %v, GOMAXPROCS %d, want %d", done, err, runtime.GOMAXPROCS(0), threads)
 	}
 	t.Setenv("GRAFT_THREADS", "invalid")
 	if _, _, err := configuredThreads(); err == nil {
