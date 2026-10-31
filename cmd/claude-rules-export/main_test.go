@@ -80,6 +80,10 @@ func TestExport(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out")
 	write(t, filepath.Join(out, ".git/HEAD"), "ref\n", 0o644)
 	write(t, filepath.Join(out, "skills/old/SKILL.md"), "старое\n", 0o644)
+	// висячая ссылка в скилле — не ошибка: выгружается ссылкой, как у cp -R
+	if err := os.Symlink("gone", filepath.Join(src, ".claude/skills/jira/stale")); err != nil {
+		t.Fatal(err)
+	}
 	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
 	if code != 0 {
 		t.Fatalf("code %d\n%s%s", code, stdout, stderr)
@@ -95,6 +99,9 @@ func TestExport(t *testing.T) {
 	}
 	if link, err := os.Readlink(filepath.Join(out, "skills/jira/README.md")); err != nil || link != "SKILL.md" {
 		t.Errorf("ссылка: %q %v", link, err)
+	}
+	if link, err := os.Readlink(filepath.Join(out, "skills/jira/stale")); err != nil || link != "gone" {
+		t.Errorf("висячая ссылка: %q %v", link, err)
 	}
 	if got := read(t, filepath.Join(out, "skills/jira/logo.png")); !strings.Contains(got, "me@corp.example") {
 		t.Error("двоичный файл тронут")
