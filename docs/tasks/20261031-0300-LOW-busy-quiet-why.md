@@ -1,6 +1,7 @@
 # busy --quiet: кто и зачем; мерить без тишины; пороги в одном месте с graft
 
-Статус: ждёт
+Статус: готово
+Исполнитель: akit-master
 Ждёт: graft-master пришлёт версию graft на pressure.UserLimits (боец 1031-1217-fix-pressure-user-limits, тикет graft pressure-user-limits); затем независимая проверка п.7–9 и tk done
 
 ## Что сделать
@@ -24,3 +25,5 @@
 - 2026-10-31 13:20 note — akit-master: graft v2.67.0 (e8ce532) берёт пороги из pressure.UserLimits; моя проверка 13:17–13:19 CET: busy и graft на одном pressure.yaml совпали (runnable 1/500, max_io_full 0.01, битый файл — обе ошибки), итог graft-master. Независимая проверка пунктов 7–9 — суб-агент ~13:21 (scratchpad verify-busy/).
 - 2026-10-31 13:30 note — akit-master: независимая проверка (суб-агент 13:20–13:28 CET): п.8, 9, 7 и приёмка прошли; ошибки: NaN/Inf в pressure.yaml и флагах busy молча выключали проверку, --window 0/-1s принимались. Правка: pressure.Limits.Set — одна проверка для файла и флагов (конечное >0, окно >0), флаги busy идут через неё (--runnable теперь и дробный, как в файле). Мутант красный, glint чист.
 - 2026-10-31 13:43 note — akit-master: проверка правки db3cddb (суб-агент ~13:33–13:37 CET): обещание выполнено (NaN/Inf/0/-1/1e309 в файле и флагах → 2; 2.5, 500, 2s работают; тесты зелёные). Найдено: при битом pressure.yaml не работали busy -h и --quiet-off (тишину не снять). Правка: файл порогов читается только для замера, флаги поверх (loadLimits); мёртвая ветка MaxIOFull<=0 убрана; README — pressure.yaml. Мутант красный, glint чист.
+- 2026-10-31 13:45 note — akit-master: проверка v1.18.7 (суб-агент, 13:45 CET): 4/4. Мелочи, не чиню (обещание не нарушают): при тишине и битом файле код 2, а не 1; флаг порога с --quiet проверяется, но не применяется (без ошибки); -h после битого флага — ошибка флага; «(busy -h for usage)» и при ошибке файла.
+- 2026-10-31 13:45 готово — akit-master-verifier (session akit-master): суб-агенты, свежий контекст, 3 круга: п.8 (кто/зачем в строке busy и в ожидании graft v2.67.0, --quiet-off, прошедший срок, --why без срока → 2), п.9 (--ignore-quiet: код по замеру — runnable 1 → 1, 500 → 0), п.7 (busy и graft на одном pressure.yaml — одно решение; ошибки файла у обоих одинаковы; флаг поверх файла); после правок db3cddb/6374aaa v1.18.7: NaN/Inf/0/-1/--window 0 → 2, битый файл не блокирует -h/--quiet/--quiet-off; go test ./pressure ./cmd/busy ok. Отчёты: scratchpad verify-busy/, verify-limits/, verify-busy2/
