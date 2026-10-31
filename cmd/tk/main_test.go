@@ -262,6 +262,8 @@ func TestOutsideRepositoryBaseSearch(t *testing.T) {
 	}
 	oldHome := os.Getenv("HOME")
 	base := t.TempDir()
+	// Временная папка может лежать внутри чужого git-репо: база ищется от HOME, не от его корня.
+	t.Setenv("GIT_CEILING_DIRECTORIES", base)
 	home := filepath.Join(base, "home")
 	work := filepath.Join(home, "work", "nested")
 	if err := os.MkdirAll(filepath.Join(home, "docs", "tasks"), 0755); err != nil {
@@ -607,6 +609,12 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 		{"skip", "ticket", "valid", "--by", "worker"},
 		{"plan", "ticket", "--add", "one: true\n- two: false", "--by", "worker"},
 		{"skip", "ticket", "valid", "--why", "a\nb", "--by", "worker"},
+		{"note", "ticket", "x\n- 2020-01-01 12:00 пропущен: valid — forged"},
+		{"review", "ticket", "--note", "x\ry"},
+		{"wait", "ticket", "--until", "x\ny"},
+		{"reject", "ticket", "--why", "x\ny"},
+		{"done", "ticket", "--check", "x\ny"},
+		{"new", "ticket", "--title", "T\n## Журнал"},
 	} {
 		if _, err := parseArgs(args); err == nil {
 			t.Errorf("parseArgs(%q) accepted invalid plan arguments", args)
@@ -686,9 +694,13 @@ func TestInvalidPlanItemAppearsInJSON(t *testing.T) {
 	}
 	for _, line := range []string{"  - tests: false", "* more: false", "-x: false"} {
 		items := planItems("# Task\n\n## План\n" + line + "\n\n## Журнал\n")
-		if len(items) != 1 || !strings.Contains(items[0].Invalid, "plan lines must use") {
+		if len(items) != 1 || !strings.Contains(items[0].Invalid, "plan lines must use") || items[0].label() != strconv.Quote(strings.TrimSpace(line)) {
 			t.Errorf("plan line %q = %#v; want invalid", line, items)
 		}
+	}
+	twice := planItems("# Task\n\n## План\n- a: true\n\n## План\n- b: false\n\n## Журнал\n")
+	if len(twice) == 0 || !strings.Contains(twice[0].Invalid, "plan section appears more than once") {
+		t.Fatalf("second plan section = %#v", twice)
 	}
 }
 

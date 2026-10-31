@@ -130,7 +130,21 @@ func parseArgs(a []string) (options, error) {
 	if err := validateCommand(&o, pos); err != nil {
 		return o, err
 	}
+	if err := validateOneLine(o); err != nil {
+		return o, err
+	}
 	return o, nil
+}
+
+// validateOneLine — текст, который ложится в строку журнала или заголовок, — одна строка: перевод строки
+// вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел.
+func validateOneLine(o options) error {
+	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}} {
+		if strings.ContainsAny(f.value, "\r\n") {
+			return fmt.Errorf("%s must be one line", f.flag)
+		}
+	}
+	return nil
 }
 
 func parseOptions(args []string, o *options) ([]string, error) {
@@ -257,9 +271,7 @@ func validateSkipCommand(o *options, pos []string) error {
 	if strings.TrimSpace(o.why) == "" {
 		return errors.New("skip requires --why")
 	}
-	if strings.ContainsAny(o.why, "\r\n") {
-		return errors.New("skip --why must be one line")
-	}
+
 	return validateActorFlag(o)
 }
 
@@ -1133,9 +1145,7 @@ func journal(s, line string) string {
 func splitPlanItem(value string) (string, string, error) {
 	name, command, ok := strings.Cut(value, ":")
 	name, command = strings.TrimSpace(name), strings.TrimSpace(command)
-	if strings.ContainsAny(value, "\r\n") {
-		return name, command, errors.New("plan item must be one line")
-	}
+
 	if !ok || !planNameRE.MatchString(name) || command == "" {
 		return name, command, errors.New("plan item needs 'NAME: COMMAND' with a lowercase name and non-empty command")
 	}
@@ -1148,6 +1158,9 @@ func planItems(body string) []planJSON {
 		return nil
 	}
 	var items []planJSON
+	if strings.Count("\n"+body, "\n## План\n") > 1 {
+		items = append(items, planJSON{Invalid: "plan section appears more than once"})
+	}
 	seen := make(map[string]bool)
 	for line := range strings.SplitSeq(section, "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -1357,7 +1370,7 @@ func checkPlan(root string, t task, out, errout io.Writer) int {
 	for _, result := range results {
 		if result.item.Invalid != "" {
 			failed = true
-			fmt.Fprintf(out, "%s: invalid, %s\n", result.item.Name, result.item.Invalid)
+			fmt.Fprintf(out, "%s: invalid, %s\n", result.item.label(), result.item.Invalid)
 			continue
 		}
 		if result.skipped {
@@ -1379,7 +1392,7 @@ func checkPlan(root string, t task, out, errout io.Writer) int {
 
 func planFailure(result planResult) string {
 	if result.item.Invalid != "" {
-		return fmt.Sprintf("%s: invalid, %s\n", result.item.Name, result.stderr)
+		return fmt.Sprintf("%s: invalid, %s\n", result.item.label(), result.stderr)
 	}
 	if result.timedOut {
 		return fmt.Sprintf("%s: timeout\n", result.item.Name)
@@ -1630,6 +1643,14 @@ type planJSON struct {
 	Skipped bool   `json:"skipped"`
 	Why     string `json:"why"`
 	Invalid string `json:"invalid,omitempty"`
+}
+
+// label — имя пункта в отчёте; у строки, из которой имя не прочлось, — сама строка.
+func (p planJSON) label() string {
+	if p.Name != "" {
+		return p.Name
+	}
+	return strconv.Quote(p.Cmd)
 }
 
 func taskObject(root string, t task, repo string, details bool) taskJSON {
