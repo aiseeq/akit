@@ -288,7 +288,9 @@ func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), 
 		return entry{}, err
 	}
 	defer func() { _ = f.Close() }()
-	if e.Xattr, err = xattrSum(f); err != nil {
+	fd := int(f.Fd())
+	if e.Xattr, err = xattrSum(func(b []byte) (int, error) { return unix.Flistxattr(fd, b) },
+		func(name string, b []byte) (int, error) { return unix.Fgetxattr(fd, name, b) }); err != nil {
 		return entry{}, fmt.Errorf("%s: %w", rel, err)
 	}
 	if e.Kind == "f" {
@@ -303,9 +305,8 @@ func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), 
 
 // xattrSum — sha256 имён и значений всех xattr открытого файла (ACL — тоже xattr); пусто, если их нет или файловая
 // система их не держит.
-func xattrSum(f *os.File) (string, error) {
-	fd := int(f.Fd())
-	size, err := unix.Flistxattr(fd, nil)
+func xattrSum(list func([]byte) (int, error), get func(string, []byte) (int, error)) (string, error) {
+	size, err := list(nil)
 	if errors.Is(err, unix.ENOTSUP) {
 		return "", nil
 	}
@@ -316,19 +317,19 @@ func xattrSum(f *os.File) (string, error) {
 		return "", nil
 	}
 	buf := make([]byte, size)
-	if size, err = unix.Flistxattr(fd, buf); err != nil {
+	if size, err = list(buf); err != nil {
 		return "", fmt.Errorf("xattr: %w", err)
 	}
 	names := strings.Split(strings.TrimSuffix(string(buf[:size]), "\x00"), "\x00")
 	slices.Sort(names)
 	h := sha256.New()
 	for _, name := range names {
-		n, err := unix.Fgetxattr(fd, name, nil)
+		n, err := get(name, nil)
 		if err != nil {
 			return "", fmt.Errorf("xattr %s: %w", name, err)
 		}
 		v := make([]byte, n)
-		if n, err = unix.Fgetxattr(fd, name, v); err != nil {
+		if n, err = get(name, v); err != nil {
 			return "", fmt.Errorf("xattr %s: %w", name, err)
 		}
 		h.Write([]byte(name + "\x00" + strconv.Itoa(n) + "\x00"))
@@ -359,6 +360,23 @@ func birthAt(dirfd int, name string, flags int) (int64, error) {
 		return 0, nil
 	}
 	return st.Btime.Sec*1e9 + int64(st.Btime.Nsec), nil
+}
+
+// linkXattr — xattr ссылки name в папке dirfd (метку SELinux ссылки обычный пользователь меняет chcon -h). Ссылку
+// открывает O_PATH без перехода по ней; f*xattr такой дескриптор не берут, а /proc/self/fd/N ведёт на саму ссылку.
+func linkXattr(dirfd int, name string) (string, error) {
+	fd, err := unix.Openat(dirfd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", fmt.Errorf("open link %s: %w", name, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	at := "/proc/self/fd/" + strconv.Itoa(fd)
+	sum, err := xattrSum(func(b []byte) (int, error) { return unix.Listxattr(at, b) },
+		func(name string, b []byte) (int, error) { return unix.Getxattr(at, name, b) })
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", name, err)
+	}
+	return sum, nil
 }
 
 // verifyOut — каждая запись OUT_DIR, кроме .git верхнего уровня, есть в списке и не менялась. Записи из списка,
@@ -393,6 +411,11 @@ func verifyOut(root *os.Root, known []entry) error {
 			}
 			if have.Birth, err = birthAt(int(f.Fd()), name, 0); err != nil {
 				return fmt.Errorf("OUT_DIR: %w", err)
+			}
+			if have.Kind == "l" {
+				if have.Xattr, err = linkXattr(int(f.Fd()), name); err != nil {
+					return fmt.Errorf("OUT_DIR: %w", err)
+				}
 			}
 			if !slices.ContainsFunc(byPath[rel], func(i int) bool { return same(&have, &known[i]) }) {
 				if len(known) == 0 {
@@ -505,6 +528,11 @@ func writeOther(root *os.Root, e *entry, journal *os.File) (entry, error) {
 	}
 	if have.Birth, err = birthAt(int(dir.Fd()), name, 0); err != nil {
 		return entry{}, err
+	}
+	if have.Kind == "l" {
+		if have.Xattr, err = linkXattr(int(dir.Fd()), name); err != nil {
+			return entry{}, err
+		}
 	}
 	have.Path, have.At = e.Path, tmp
 	if err := logEntry(journal, have); err != nil {

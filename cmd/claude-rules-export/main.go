@@ -32,7 +32,7 @@ ALLOWED is printed as file:line: KIND.
 The export is built and checked in a folder of its own first, then put into OUT_DIR. In
 OUT_DIR only the previous run's own entries are removed, and only while unchanged: each
 file's and folder's path, mode (setuid, setgid and sticky too), owner and group, extended
-attributes (ACLs too), device, inode and birth time, each file's size and sha256 and each
+attributes (ACLs and SELinux labels too, links' as well), device, inode and birth time, each file's size and sha256 and each
 link's text must
 match the list that run kept in $XDG_STATE_HOME/claude-rules-export (default
 ~/.local/state), keyed by the OUT_DIR path; the build lies there too. Nothing new gets its

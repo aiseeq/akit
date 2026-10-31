@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -366,6 +367,12 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 		// у root владелец и группа и так 0: случай ничего бы не менял
 		{"owner", func(e *entry) { e.Uid = 0 }},
 		{"group", func(e *entry) { e.Gid = 0 }},
+		// у ссылки xattr — метка SELinux; без неё на этой системе случай пропускается
+		{"link xattr", func(e *entry) {
+			if e.Kind == "l" {
+				e.Xattr = ""
+			}
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			src, rules := fixture(t)
@@ -386,6 +393,9 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 			}
 			if (c.name == "owner" || c.name == "group") && (os.Getuid() == 0 || os.Getgid() == 0) {
 				t.Skip("root: owner and group are already 0")
+			}
+			if c.name == "link xattr" && !slices.ContainsFunc(entries, func(e entry) bool { return e.Kind == "l" && e.Xattr != "" }) {
+				t.Skip("no xattrs on links on this file system")
 			}
 			for i := range entries {
 				c.change(&entries[i])

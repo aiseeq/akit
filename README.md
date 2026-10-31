@@ -75,7 +75,7 @@ Claude Code rules and skills exported for colleagues and checked for private dat
 skills, the chosen sections of the global CLAUDE.md and the workspace rules are built in a folder
 next to the export list (below), literal replacements are made, listed lines dropped, the build is searched for private data
 patterns and then put into OUT_DIR. In OUT_DIR only the previous run's own entries are removed, and only
-while unchanged: path, mode (setuid, setgid and sticky too), owner and group, extended attributes (ACLs too), device, inode and
+while unchanged: path, mode (setuid, setgid and sticky too), owner and group, extended attributes (ACLs and SELinux labels too, links' as well), device, inode and
 birth time of each file and folder, size and sha256 of each file and the text of each link must match the list
 that run kept in `$XDG_STATE_HOME/claude-rules-export` (default `~/.local/state`), keyed by the OUT_DIR path;
 the build lies there too. Nothing new gets its name in OUT_DIR before it is logged next to that list: a file is
