@@ -312,7 +312,7 @@ func TestNewSkipsPartialLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	if code, out, _ := wfor(t, "line", "DONE", path, "--new", "--every", "10ms", "--timeout", "50ms"); code != exitTimeout ||
-		!strings.Contains(out, "--after 2 in place of") {
+		!strings.Contains(out, "--after 2 in place of") || !strings.Contains(out, "(1 lines and one begun before the start, last: build)") {
 		t.Errorf("прежняя неполная строка засчитана сразу или не в подсказке --after: code %d: %s", code, out)
 	}
 	// повтор по подсказке, пока строка не дописана, тоже её не засчитывает
@@ -334,5 +334,31 @@ func TestNewSkipsPartialLine(t *testing.T) {
 	}
 	if hit, err := c.check(t.Context()); !hit || err != nil || c.hitLine != 3 || c.hit != "DONE new" {
 		t.Errorf("hit %v %v: line %d %q", hit, err, c.hitLine, c.hit)
+	}
+}
+
+// Файл заменён (новый inode), пока ждали конца прежней неполной строки: новое содержимое — не прежнее, его первая
+// строка в счёт.
+func TestNewPartialLineThenReplaced(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "log")
+	if err := appendFile(path, "a\nold DONE"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := newLineCond("DONE", path, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := c.check(t.Context()); hit || err != nil {
+		t.Fatalf("прежняя неполная строка: hit %v %v", hit, err)
+	}
+	if err := appendFile(filepath.Join(dir, "new"), "DONE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "new"), path); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := c.check(t.Context()); !hit || err != nil || c.hitLine != 1 {
+		t.Errorf("новый файл: hit %v %v, line %d", hit, err, c.hitLine)
 	}
 }

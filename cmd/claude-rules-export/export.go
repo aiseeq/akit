@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,17 +28,11 @@ func export(opts options, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("--rules: %w", err)
 	}
-	if out == "/" || out == src {
-		return errors.New("OUT_DIR must not be / or the source home")
-	}
-	// OUT_DIR очищается: папка, где лежит читаемое или внутри читаемого, стёрла бы источник
-	for _, read := range []string{src, filepath.Join(src, ".claude"), filepath.Join(src, "work"), rules} {
-		if within(read, out) || (read != src && within(out, read)) {
-			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
-		}
-	}
 	m, err := readManifest(opts.rules)
 	if err != nil {
+		return err
+	}
+	if err := checkOut(out, src, rules, m); err != nil {
 		return err
 	}
 	if err := assemble(out, src, opts.rules, m); err != nil {
@@ -176,4 +171,45 @@ func findPII(root string, files []string, pii []piiRule) ([]string, error) {
 func within(p, dir string) bool {
 	rel, err := filepath.Rel(dir, p)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// checkOut — OUT_DIR очищается: папка, где лежит читаемое (home, его .claude и work, папка правил, папка каждого
+// скилла), или папка внутри читаемого стёрла бы источник. Пути сравниваются после разрешения симлинков: ссылка
+// на читаемое ведёт туда же.
+func checkOut(out, src, rules string, m manifest) error {
+	reads := []string{src, filepath.Join(src, ".claude"), filepath.Join(src, "work"), rules}
+	for _, s := range m.skills {
+		reads = append(reads, filepath.Join(src, ".claude", "skills", s))
+	}
+	o, err := resolved(out)
+	if err != nil {
+		return fmt.Errorf("OUT_DIR: %w", err)
+	}
+	for _, read := range reads {
+		r, err := resolved(read)
+		if err != nil {
+			return err
+		}
+		if within(r, o) || (read != src && within(o, r)) {
+			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
+		}
+	}
+	return nil
+}
+
+// resolved — путь с разрешёнными симлинками; у несуществующего — по ближайшему существующему предку.
+func resolved(p string) (string, error) {
+	for q := p; ; q = filepath.Dir(q) {
+		r, err := filepath.EvalSymlinks(q)
+		if err == nil {
+			rel, err := filepath.Rel(q, p)
+			if err != nil {
+				return "", fmt.Errorf("%s relative to %s: %w", p, q, err)
+			}
+			return filepath.Join(r, rel), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) || q == filepath.Dir(q) {
+			return "", err
+		}
+	}
 }

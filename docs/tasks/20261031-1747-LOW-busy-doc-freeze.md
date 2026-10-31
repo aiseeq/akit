@@ -1,6 +1,6 @@
 # busy: справка и README называют зависание диска как причину занятости
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -16,3 +16,4 @@
 - 2026-10-31 17:47 открыт — akit-master
 - 2026-10-31 17:56 note — akit-master: сделано в 06c6c34, выпуск v1.21.2 (ноут и PC); тест красный до фикса (кроме busy — справка), go test пакета зелёный
 - 2026-10-31 17:56 на проверке — akit-master
+- 2026-10-31 18:05 готово — verify-three (session akit-master): свежий суб-агент: go run ./cmd/busy -h | grep -i freeze → «or the disk state source reports a disk freeze in progress»; README строки 36, 41; условие сверено с Rule pressure/busy.go:155-156; glint чистый

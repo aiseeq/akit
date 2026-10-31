@@ -151,6 +151,36 @@ func TestExportErrors(t *testing.T) {
 			t.Fatalf("OUT_DIR %s: источник или правила стёрты", out)
 		}
 	}
+	// то же через симлинки: OUT_DIR — ссылка на читаемое или путь через ссылку на него, источник — ссылка
+	links := t.TempDir()
+	for name, target := range map[string]string{"home": src, "root": root, "rules": rules, "claude": filepath.Join(src, ".claude")} {
+		if err := os.Symlink(target, filepath.Join(links, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range [][2]string{
+		{src, filepath.Join(links, "home")}, {src, filepath.Join(links, "root")}, {src, filepath.Join(links, "rules")},
+		{src, filepath.Join(links, "claude")}, {src, filepath.Join(links, "root", "home")}, {filepath.Join(links, "home"), src},
+	} {
+		code, _, stderr := runExport(t, "--src-home", c[0], "--rules", rules, c[1])
+		if code != exitUsage || !strings.Contains(stderr, "must not contain") {
+			t.Errorf("--src-home %s, OUT_DIR %s: code %d %q", c[0], c[1], code, stderr)
+		}
+		if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(rules, "manifest/skills.txt")) != "jira\n" {
+			t.Fatalf("--src-home %s, OUT_DIR %s: источник или правила стёрты", c[0], c[1])
+		}
+	}
+	// скилл — ссылка на папку вне home: OUT_DIR, где она лежит, стёр бы исходник скилла
+	ext := filepath.Join(t.TempDir(), "ext")
+	write(t, filepath.Join(ext, "jira2/SKILL.md"), "# jira2\n", 0o644)
+	if err := os.Symlink(filepath.Join(ext, "jira2"), filepath.Join(src, ".claude/skills/jira2")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\njira2\n", 0o644)
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, ext); code != exitUsage || read(t, filepath.Join(ext, "jira2/SKILL.md")) != "# jira2\n" {
+		t.Fatalf("OUT_DIR с исходником скилла: code %d %q", code, stderr)
+	}
+	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\n", 0o644)
 	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(src, "export")); code != 0 {
 		t.Errorf("OUT_DIR внутри home, вне читаемого: code %d %q", code, stderr)
 	}

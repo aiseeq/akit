@@ -270,6 +270,9 @@ func (c *lineCond) state() string {
 	if c.absent {
 		return "file absent"
 	}
+	if c.partial {
+		return fmt.Sprintf("%d lines and one begun before the start, last: %s", c.lines, short(c.last))
+	}
 	return fmt.Sprintf("%d lines, last: %s", c.lines, short(c.last))
 }
 
