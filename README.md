@@ -151,11 +151,14 @@ after an independent review.
 journal by hand does not count, and `tk done` refuses a ticket whose plan no longer has it (the
 section removed or renamed included) or runs another command under its name. The journal line
 `добавлен обязательный пункт NAME: COMMAND` marks it wherever it stands in the ticket, so editing the
-journal headings or line breaks around it does not drop it. The first such line pins the command: a
-later one does not change it, and `tk plan --add` of that name with another command is refused (exit
-2); with the same command it brings a removed item back.
+journal headings or line breaks around it does not drop it. The line pins the command: `tk plan --add`
+of that name with another command is refused (exit 2), with the same command it brings a removed item
+back, and lines that disagree on the command (only a hand edit makes them) leave the item invalid, so
+`tk done` refuses. Text tk writes into a ticket (note, `--add`, `--why`, `--check`, `--title`) must be
+one line under any line break, U+2028 included.
 Each check runs in
-`bash -c` from the repository root with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
+`/bin/bash -c` from the repository root, without `BASH_ENV`, `ENV` and `BASH_FUNC_*` from the caller's
+environment, with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.
 

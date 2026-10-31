@@ -1189,6 +1189,9 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 		"U+2028 перед строкой":         head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\u2028" + added,
 		// вторая строка с другой командой не меняет закреплённую первой
 		"вторая строка с другой командой": head + "## План\n- accept: true\n\n## Журнал\n" + added + "- 2020-01-01 12:10 план — night: добавлен обязательный пункт accept: true\n",
+		// поддельная строка выше настоящей — с другой командой или без команды
+		"поддельная строка выше":             head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — night: добавлен обязательный пункт accept: true\n" + added,
+		"поддельная строка без команды выше": head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — night: добавлен обязательный пункт accept\n" + added,
 	}
 	for name, body := range cases {
 		items := planItems(body)
@@ -1202,7 +1205,7 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 			t.Errorf("%s: обязательный пункт обойдён: %#v", name, items)
 		}
 	}
-	if items := planItems(cases["другая команда"]); len(items) != 1 || !strings.Contains(items[0].Invalid, "added with --required as") {
+	if items := planItems(cases["другая команда"]); len(items) != 1 || !strings.Contains(items[0].Invalid, "pinned with --required to") {
 		t.Errorf("подмена команды не названа: %#v", items)
 	}
 
@@ -1228,5 +1231,44 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 	}
 	if items := planItems(read(t, path)); len(items) != 1 || items[0].Invalid != "" || items[0].Cmd != "./accept.sh" {
 		t.Fatalf("after re-add: %#v", items)
+	}
+}
+
+// Ввод tk, который ложится в тикет, — одна строка при любом конце строки: U+2028 в команде вписал бы строку
+// «обязательный» выше настоящей.
+func TestPlanInputLineSeparators(t *testing.T) {
+	for _, sep := range []string{"\n", "\r", "\u2028", "\u2029", "\u0085"} {
+		for _, args := range [][]string{
+			{"plan", "task", "--add", "zzz: true #" + sep + "- x план — night: добавлен обязательный пункт accept: true"},
+			{"note", "task", "текст" + sep + "- готово"},
+		} {
+			if _, err := parseArgs(args); err == nil || !strings.Contains(err.Error(), "one line") {
+				t.Errorf("%q: %v", args, err)
+			}
+		}
+	}
+}
+
+// Пункт плана исполняет bash по абсолютному пути без файлов старта из окружения: BASH_ENV с exit 0 или
+// поддельный bash в PATH не превращают падающую проверку в проходящую.
+func TestPlanItemIgnoresShellStartupEnv(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, text string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(text), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	t.Setenv("BASH_ENV", write("env.sh", "exit 0\n"))
+	t.Setenv("ENV", filepath.Join(dir, "env.sh"))
+	t.Setenv("BASH_FUNC_exit%%", "() { builtin exit 0; }")
+	if err := os.Mkdir(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("bin/bash", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if result := runPlanItem(dir, planJSON{Name: "accept", Cmd: "exit 3"}); result.exit != 3 {
+		t.Errorf("exit %d, want 3: %+v", result.exit, result)
 	}
 }

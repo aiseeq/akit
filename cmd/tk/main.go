@@ -149,7 +149,7 @@ func parseArgs(a []string) (options, error) {
 // вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел.
 func validateOneLine(o options) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}} {
-		if strings.ContainsAny(f.value, "\r\n") {
+		if strings.ContainsFunc(f.value, isLineEnd) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
 	}
@@ -1248,14 +1248,12 @@ func planItems(body string) []planJSON {
 		}
 		seen[name] = true
 		why, skipped := planSkipReason(body, name)
-		pinned, required := requiredPlan(body)[name]
+		pin, required := requiredPlan(body)[name]
 		item := planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why, Required: required}
 		if required {
 			// Пропуск обязательного пункта не действует, даже вписанный в журнал руками; команда — та, что добавлена.
 			item.Skipped, item.Why = false, ""
-			if pinned != "" && command != pinned {
-				item.Invalid = fmt.Sprintf("required plan item %q runs %q, but it was added with --required as %q", name, command, pinned)
-			}
+			item.Invalid = pin.invalid(name, command)
 		}
 		items = append(items, item)
 	}
@@ -1268,24 +1266,49 @@ func missingRequired(body string, present map[string]bool) []planJSON {
 	req := requiredPlan(body)
 	for _, name := range slices.Sorted(maps.Keys(req)) {
 		if !present[name] {
-			items = append(items, planJSON{Name: name, Cmd: req[name], Required: true, Missing: true, Invalid: fmt.Sprintf("required plan item %q is missing from ## План", name)})
+			items = append(items, planJSON{Name: name, Cmd: req[name].cmd, Required: true, Missing: true, Invalid: fmt.Sprintf("required plan item %q is missing from ## План", name)})
 		}
 	}
 	return items
 }
 
-// requiredPlan — пункты, добавленные с --required, и их команды (первое добавление: дописанная позже строка
-// команду не меняет); однажды обязательный остаётся обязательным. Строки ищутся по всему тикету и делятся
-// любым концом строки: правка разметки журнала (заголовок, лишний раздел, `\r` или U+2028 перед строкой)
-// не должна снимать обязательность, а лишняя строка её только добавляет.
-func requiredPlan(body string) map[string]string {
-	req := map[string]string{}
-	lineEnd := func(r rune) bool { return r == '\n' || r == '\r' || r == ' ' || r == ' ' || r == '\u0085' }
-	for _, l := range strings.FieldsFunc(body, lineEnd) {
-		if m := planAddRE.FindStringSubmatch(l); m != nil && m[1] != "" {
-			if _, ok := req[m[2]]; !ok {
-				req[m[2]] = m[3]
-			}
+// isLineEnd — любой конец строки, который редактор или Markdown покажет переносом.
+func isLineEnd(r rune) bool {
+	return r == '\n' || r == '\r' || r == '\u2028' || r == '\u2029' || r == '\u0085'
+}
+
+// requiredPin — команда обязательного пункта; conflict — строки «обязательный» расходятся в команде: tk таких
+// не пишет (повтор с другой командой он отвергает), значит, тикет правлен руками, и верной команды не знает.
+type requiredPin struct {
+	cmd      string
+	conflict bool
+}
+
+// invalid — почему пункт name с командой command не годится как обязательный; пусто — годится.
+func (p requiredPin) invalid(name, command string) string {
+	switch {
+	case p.conflict:
+		return fmt.Sprintf("required plan item %q has --required lines with different commands: the ticket was edited by hand", name)
+	case p.cmd != "" && command != p.cmd:
+		return fmt.Sprintf("required plan item %q runs %q, but it is pinned with --required to %q", name, command, p.cmd)
+	}
+	return ""
+}
+
+// requiredPlan — пункты, добавленные с --required, и их команды; однажды обязательный остаётся обязательным.
+// Строки ищутся по всему тикету и делятся любым концом строки: правка разметки журнала (заголовок, лишний
+// раздел, `\r` или U+2028 перед строкой) не должна снимать обязательность, а лишняя строка её только добавляет.
+func requiredPlan(body string) map[string]requiredPin {
+	req := map[string]requiredPin{}
+	for _, l := range strings.FieldsFunc(body, isLineEnd) {
+		m := planAddRE.FindStringSubmatch(l)
+		if m == nil || m[1] == "" {
+			continue
+		}
+		if p, ok := req[m[2]]; !ok {
+			req[m[2]] = requiredPin{cmd: m[3]}
+		} else if p.cmd != m[3] {
+			req[m[2]] = requiredPin{cmd: p.cmd, conflict: true}
 		}
 	}
 	return req
@@ -1343,9 +1366,11 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 			return exitUsage
 		}
 	}
-	if pinned, ok := requiredPlan(t.body)[name]; ok && pinned != command {
-		fmt.Fprintf(errout, "tk: plan item %q is required and pinned to %q by its first --required add; it keeps that command\n", name, pinned)
-		return exitUsage
+	if pin, ok := requiredPlan(t.body)[name]; ok {
+		if why := pin.invalid(name, command); why != "" {
+			fmt.Fprintf(errout, "tk: %s; a required item keeps its command\n", why)
+			return exitUsage
+		}
 	}
 	line := "- " + name + ": " + command
 	entry := fmt.Sprintf("- %s план — %s: добавлен пункт %s", time.Now().Format("2006-01-02 15:04"), o.by, name)
@@ -1426,7 +1451,12 @@ type planResult struct {
 func runPlanItem(root string, item planJSON) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", item.Cmd)
+	// bash — по абсолютному пути и без файлов старта из окружения: BASH_ENV, ENV или функция BASH_FUNC_*
+	// вызывающего исполнились бы раньше команды и подменили бы её итог
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", item.Cmd)
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "BASH_ENV=") || strings.HasPrefix(kv, "ENV=") || strings.HasPrefix(kv, "BASH_FUNC_")
+	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
