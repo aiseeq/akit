@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -28,11 +29,17 @@ func readMounts() ([]mount, error) {
 		return nil, fmt.Errorf("mounts: %w", err)
 	}
 	defer func() { _ = f.Close() }()
+	return parseMounts(f)
+}
+
+// parseMounts — строки mountinfo. Поля разделяет ровно один пробел, а пробел, таб и перевод строки внутри поля
+// экранированы; прочие пробельные символы (U+00A0, \v) — часть пути, поэтому делить по " ", не strings.Fields.
+func parseMounts(r io.Reader) ([]mount, error) {
 	var mounts []mount
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
+		fields := strings.Split(sc.Text(), " ")
 		if len(fields) < 5 {
 			return nil, fmt.Errorf("mounts: short line %q", sc.Text())
 		}

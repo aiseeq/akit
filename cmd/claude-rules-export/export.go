@@ -139,7 +139,7 @@ func rewrite(path string, m manifest) error {
 			b.WriteString(line + "\n")
 		}
 	}
-	return writeFile(path, []byte(b.String()), st.Mode().Perm())
+	return putFile(path, []byte(b.String()), st.Mode().Perm(), os.O_TRUNC)
 }
 
 func dropped(line string, drop []string) bool {

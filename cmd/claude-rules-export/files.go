@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // clearDir создаёт папку или очищает её, кроме .git: история выгрузки остаётся.
@@ -28,8 +29,13 @@ func clearDir(dir string) error {
 	return nil
 }
 
-// copyTree копирует папку как cp -R: ссылки остаются ссылками, права файлов сохраняются.
+// copyTree копирует папку как cp -R: ссылки остаются ссылками, права файлов сохраняются. Каждую папку, файл и
+// ссылку создаёт заново и отказывает, если путь уже есть: на OUT_DIR без учёта регистра два скилла или два имени
+// внутри скилла иначе сошлись бы в одном пути и запись пошла бы сквозь ссылку, скопированную раньше.
 func copyTree(src, dst string) error {
+	if err := mkdir(filepath.Dir(dst)); err != nil {
+		return err
+	}
 	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -41,7 +47,10 @@ func copyTree(src, dst string) error {
 		to := filepath.Join(dst, rel)
 		switch {
 		case d.IsDir():
-			return mkdir(to)
+			if err := os.Mkdir(to, 0o755); err != nil {
+				return fmt.Errorf("copy folder: %w", err)
+			}
+			return nil
 		case d.Type()&os.ModeSymlink != 0:
 			link, err := os.Readlink(p)
 			if err != nil {
@@ -68,11 +77,25 @@ func copyFile(src, dst string) error {
 	return writeFile(dst, data, st.Mode().Perm())
 }
 
+// writeFile создаёт новый файл: существующий путь или ссылка на его месте — ошибка, не перезапись.
 func writeFile(path string, data []byte, perm os.FileMode) error {
 	if err := mkdir(filepath.Dir(path)); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, perm); err != nil {
+	return putFile(path, data, perm, os.O_CREATE|os.O_EXCL)
+}
+
+// putFile пишет файл, не проходя по ссылке на его месте.
+func putFile(path string, data []byte, perm os.FileMode, flag int) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW|flag, perm)
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write: %w", err)
+	}
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	return nil

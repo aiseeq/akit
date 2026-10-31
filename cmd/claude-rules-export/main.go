@@ -38,7 +38,9 @@ a subfolder, found in /proc/self/mountinfo) is the same folder. An empty path is
 Only what the export writes is cleared: an OUT_DIR holding anything but .git, global,
 README.md, skills and work, being a mount point or having one inside is refused untouched
 (on Linux without /proc/self/mountinfo too); .git, a folder or a file, is never changed.
-A skill folder that is a link is exported as its content.
+A skill folder that is a link is exported as its content. Every folder, file and link is
+created anew: two paths that meet in one (skills differing only in case on a
+case-insensitive OUT_DIR) are an error, never a write through a link.
 
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).

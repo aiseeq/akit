@@ -2,6 +2,7 @@ package main
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,27 @@ func TestAliases(t *testing.T) {
 		if got := aliases(c.p, mounts); !slices.Equal(got, c.want) {
 			t.Errorf("%s: %q, want %q", c.p, got, c.want)
 		}
+	}
+}
+
+// Поля mountinfo разделяет один пробел: неразрывный пробел, узкий неразрывный и \v остаются частью пути.
+func TestParseMounts(t *testing.T) {
+	in := "36 1 0:2 /r oot /home/u/a b rw - ext4 /dev/x rw\n" +
+		"37 1 0:3 / /home/u/n o\vp rw - tmpfs t rw\n" +
+		"38 1 0:4 / /s\\040p rw - tmpfs t rw\n"
+	got, err := parseMounts(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []mount{
+		{dev: "0:2", root: "/r oot", point: "/home/u/a b"},
+		{dev: "0:3", root: "/", point: "/home/u/n o\vp"},
+		{dev: "0:4", root: "/", point: "/s p"},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("%q, want %q", got, want)
+	}
+	if _, err := parseMounts(strings.NewReader("36 1 0:2 /\n")); err == nil {
+		t.Error("short line: no error")
 	}
 }

@@ -300,6 +300,12 @@ func TestExportDotDotAfterLink(t *testing.T) {
 // источник. Монтирование — в своём пространстве имён (unshare -rm), где тест запускает сам себя.
 func TestExportRefusesBindMount(t *testing.T) {
 	if out := os.Getenv("CRE_BIND_OUT"); out != "" {
+		// второй рубеж без mountinfo: та же папка под путём bind mount узнаётся сравнением самих папок
+		if from := os.Getenv("CRE_BIND_SAME"); from != "" {
+			if ok, err := within(out, from); !ok || err != nil {
+				t.Errorf("within(%s, %s) = %v, %v", out, from, ok, err)
+			}
+		}
 		code, _, stderr := runExport(t, "--src-home", os.Getenv("CRE_BIND_SRC"), "--rules", os.Getenv("CRE_BIND_RULES"), out)
 		// отказ любой проверкой; что источник цел, смотрит запустивший тест
 		if code != exitUsage {
@@ -345,6 +351,9 @@ func TestExportRefusesBindMount(t *testing.T) {
 		cmd := exec.Command("unshare", "-rm", "sh", "-c", c.mount+` && exec "$3" -test.run '^TestExportRefusesBindMount$' -test.count=1`,
 			"sh", c.from, dir, os.Args[0])
 		cmd.Env = append(os.Environ(), "CRE_BIND_SRC="+src, "CRE_BIND_RULES="+rules, "CRE_BIND_OUT="+filepath.Join(dir, c.out))
+		if c.mount == bind {
+			cmd.Env = append(cmd.Env, "CRE_BIND_SAME="+c.from)
+		}
 		if b, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
 		}
