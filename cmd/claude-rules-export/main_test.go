@@ -79,7 +79,7 @@ func TestExport(t *testing.T) {
 	src, rules := fixture(t)
 	out := filepath.Join(t.TempDir(), "out")
 	write(t, filepath.Join(out, ".git/HEAD"), "ref\n", 0o644)
-	write(t, filepath.Join(out, "stale.md"), "старое\n", 0o644)
+	write(t, filepath.Join(out, "skills/old/SKILL.md"), "старое\n", 0o644)
 	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
 	if code != 0 {
 		t.Fatalf("code %d\n%s%s", code, stdout, stderr)
@@ -99,7 +99,7 @@ func TestExport(t *testing.T) {
 	if got := read(t, filepath.Join(out, "skills/jira/logo.png")); !strings.Contains(got, "me@corp.example") {
 		t.Error("двоичный файл тронут")
 	}
-	for _, p := range []string{"skills/secret", "stale.md"} {
+	for _, p := range []string{"skills/secret", "skills/old"} {
 		if _, err := os.Stat(filepath.Join(out, p)); err == nil {
 			t.Errorf("лишнее в выгрузке: %s", p)
 		}
@@ -292,7 +292,7 @@ func TestExportDotDotAfterLink(t *testing.T) {
 func TestExportRefusesBindMount(t *testing.T) {
 	if out := os.Getenv("CRE_BIND_OUT"); out != "" {
 		code, _, stderr := runExport(t, "--src-home", os.Getenv("CRE_BIND_SRC"), "--rules", os.Getenv("CRE_BIND_RULES"), out)
-		if code != exitUsage || !strings.Contains(stderr, "must not contain") {
+		if code != exitUsage || !strings.Contains(stderr, "OUT_DIR") {
 			t.Fatalf("OUT_DIR %s: code %d %q", out, code, stderr)
 		}
 		return
@@ -304,22 +304,28 @@ func TestExportRefusesBindMount(t *testing.T) {
 	write(t, filepath.Join(src, ".claude/hooks/h.sh"), "#!/bin/sh\n", 0o755)
 	write(t, filepath.Join(rules, "extra/x"), "x\n", 0o644)
 	mnt := t.TempDir()
-	// подпапка читаемого под другим путём: у точки монтирования другие предки, папку узнаёт только mountinfo
-	for _, c := range []struct{ name, bound, out string }{
-		{"home", src, "m"},
-		{"inside .claude", filepath.Join(src, ".claude"), "m/x"},
-		{"hooks", filepath.Join(src, ".claude/hooks"), "m"},
-		{"skill not exported", filepath.Join(src, ".claude/skills/secret"), "m"},
-		{"rules subfolder", filepath.Join(rules, "extra"), "m"},
+	// $1 — что монтируется, $2 — папка случая; OUT_DIR — out внутри неё
+	bind := `mkdir -p "$2/m" && mount --bind "$1" "$2/m"`
+	for _, c := range []struct{ name, mount, from, out string }{
+		{"home", bind, src, "m"},
+		{"inside .claude", bind, filepath.Join(src, ".claude"), "m/x"},
+		// подпапка читаемого под другим путём: у точки монтирования другие предки
+		{"hooks", bind, filepath.Join(src, ".claude/hooks"), "m"},
+		{"skill not exported", bind, filepath.Join(src, ".claude/skills/secret"), "m"},
+		{"rules subfolder", bind, filepath.Join(rules, "extra"), "m"},
+		// точка монтирования внутри OUT_DIR: очистка зашла бы в неё
+		{"mount inside OUT_DIR", `mkdir -p "$2/o/skills/h" && mount --bind "$1" "$2/o/skills/h"`, filepath.Join(src, ".claude/hooks"), "o"},
+		// overlay: источник — верхний слой, OUT_DIR — слитая папка; mountinfo пути к источнику не покажет
+		{"overlay upper", `mkdir -p "$2/l" "$2/w" "$2/o" && mount -t overlay overlay -o lowerdir="$2/l",upperdir="$1",workdir="$2/w" "$2/o"`,
+			filepath.Join(src, ".claude/hooks"), "o"},
 	} {
-		point := filepath.Join(mnt, c.name)
-		if err := os.MkdirAll(point, 0o755); err != nil {
+		dir := filepath.Join(mnt, c.name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		out := filepath.Join(point, strings.TrimPrefix(c.out, "m"))
-		cmd := exec.Command("unshare", "-rm", "sh", "-c", `mount --bind "$1" "$2" && exec "$3" -test.run '^TestExportRefusesBindMount$' -test.count=1`,
-			"sh", c.bound, point, os.Args[0])
-		cmd.Env = append(os.Environ(), "CRE_BIND_SRC="+src, "CRE_BIND_RULES="+rules, "CRE_BIND_OUT="+out)
+		cmd := exec.Command("unshare", "-rm", "sh", "-c", c.mount+` && exec "$3" -test.run '^TestExportRefusesBindMount$' -test.count=1`,
+			"sh", c.from, dir, os.Args[0])
+		cmd.Env = append(os.Environ(), "CRE_BIND_SRC="+src, "CRE_BIND_RULES="+rules, "CRE_BIND_OUT="+filepath.Join(dir, c.out))
 		if b, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
 		}
@@ -335,4 +341,19 @@ func TestExportRefusesBindMount(t *testing.T) {
 // Пробный запуск, а не настройка ядра: во вложенной песочнице unshare отказывает и при разрешённых пространствах.
 func userNamespaces() bool {
 	return exec.Command("unshare", "-rm", "true").Run() == nil
+}
+
+// Очищается только то, что пишет выгрузка: чужое в OUT_DIR — отказ до очистки, файл цел.
+func TestExportRefusesForeignContent(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	write(t, filepath.Join(out, "skills/x/SKILL.md"), "# x\n", 0o644)
+	write(t, filepath.Join(out, "notes.md"), "своё\n", 0o644)
+	code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+	if code != exitUsage || !strings.Contains(stderr, "OUT_DIR holds notes.md") {
+		t.Errorf("code %d %q", code, stderr)
+	}
+	if read(t, filepath.Join(out, "notes.md")) != "своё\n" || read(t, filepath.Join(out, "skills/x/SKILL.md")) != "# x\n" {
+		t.Error("OUT_DIR тронут до отказа")
+	}
 }

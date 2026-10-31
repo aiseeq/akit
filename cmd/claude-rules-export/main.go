@@ -35,6 +35,8 @@ targets of links in it) or is or lies in any of it but the home is refused befor
 is cleared. Paths are taken as the system takes them: symlinks resolved, ".." after a link
 goes from its target, a folder shown under another path by a bind mount (by itself or as
 a subfolder, found in /proc/self/mountinfo) is the same folder. An empty path is refused.
+Only what the export writes is cleared: an OUT_DIR holding anything but .git, global,
+README.md, skills and work, or a mount point inside, is refused untouched.
 A skill folder that is a link is exported as its content.
 
 --rules is the folder with manifest/ and README.template.md

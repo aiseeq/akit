@@ -78,7 +78,9 @@ skills, the chosen sections of the global CLAUDE.md and the workspace rules are 
 skill's folder and the targets of links in it; lying in the home itself is fine; paths are taken as the
 system takes them, symlinks resolved and `..` after a link going from its target, and a folder shown under
 another path by a bind mount (by itself or as a subfolder, found in `/proc/self/mountinfo`) is recognised as
-the same folder; an empty path is refused — is refused first; a skill folder that
+the same folder; an empty path is refused — is refused first; so is an OUT_DIR holding anything the
+export does not write (anything but `.git`, `global`, `README.md`, `skills`, `work`) or a mount point
+inside, since only what the export writes is cleared; a skill folder that
 is a link is exported as its content), literal replacements are made, listed lines dropped, then the export is
 searched for private data patterns. What to export and what counts as private is data in the
 `--rules` folder (`manifest/`, `README.template.md`), not code. Exit 0 clean, 1 private data or a

@@ -233,6 +233,34 @@ func checkOut(out, src, rules string, m manifest) error {
 			}
 		}
 	}
+	// сверка путей называет, что задето; содержимое — рубеж для путей, которых сверка не узнаёт
+	return checkOutContent(o, mounts)
+}
+
+// exportEntries — всё, что выгрузка пишет в OUT_DIR верхним уровнем; .git — история выгрузки, её не трогают.
+var exportEntries = map[string]bool{".git": true, "global": true, "README.md": true, "skills": true, "work": true}
+
+// checkOutContent — очищается только то, что выгрузка пишет сама: в OUT_DIR нет ничего другого и ни одной точки
+// монтирования внутри. Так источник не стереть ни под каким другим путём — ссылкой, bind mount, overlay, /proc:
+// в нём лежит своё, и выгрузка откажет, не тронув ни файла.
+func checkOutContent(out string, mounts []mount) error {
+	entries, err := os.ReadDir(out)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("list OUT_DIR: %w", err)
+	}
+	for _, e := range entries {
+		if !exportEntries[e.Name()] {
+			return fmt.Errorf("OUT_DIR holds %s, which the export does not write: give an empty folder or a previous export", e.Name())
+		}
+	}
+	for _, m := range mounts {
+		if r, ok := under(m.point, out); ok && r != "." {
+			return fmt.Errorf("OUT_DIR has a mount point inside: %s", m.point)
+		}
+	}
 	return nil
 }
 
