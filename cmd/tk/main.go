@@ -877,7 +877,7 @@ func printTask(out io.Writer, t task, label string) {
 	if wait != "" {
 		shown := wait
 		if at, ok := waitDue(wait, time.Now()); ok {
-			shown = "до " + at.Format("2006-01-02 15:04")
+			shown = "до " + at.Local().Format("2006-01-02 15:04")
 			if !at.After(time.Now()) {
 				shown += " overdue"
 			}
@@ -901,8 +901,8 @@ var waitClock = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
 // waitAgo — «назад» (30m, 2h): timearg его понимает, сроком ожидания он не бывает.
 var waitAgo = regexp.MustCompile(`^[0-9]+[smhd]$`)
 
-// waitISO — дата и часы через T без пояса (2026-10-31T12:00), не RFC3339.
-var waitISO = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{1,2}:[0-9]{2}(:[0-9]{2})?)$`)
+// waitISO — дата и часы через T, без пояса или с Z (2026-10-31T12:00, 2026-10-31T12:00Z), не RFC3339.
+var waitISO = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{1,2}:[0-9]{2}(:[0-9]{2})?)(Z?)$`)
 
 // waitDue — срок ожидания: время в начале строки «Ждёт:» (дата, дата с часами, «ДД.ММ ЧЧ:ММ», ISO с T, RFC3339,
 // часы; UTC после часов — в UTC, иначе местное), дальше — текст. Без времени в начале — условие, срока нет.
@@ -912,11 +912,18 @@ func waitDue(wait string, now time.Time) (time.Time, bool) {
 	if len(f) == 0 || waitAgo.MatchString(f[0]) {
 		return time.Time{}, false
 	}
+	// «2026-10-31 17:30: текст», «2026-11-06, после…» — знак после срока к сроку не относится.
+	for i := range min(2, len(f)) {
+		f[i] = strings.TrimRight(f[i], ":,;")
+	}
 	if t, err := time.Parse(time.RFC3339, f[0]); err == nil {
 		return t, true
 	}
 	if m := waitISO.FindStringSubmatch(f[0]); m != nil {
 		f = append([]string{m[1], m[2]}, f[1:]...)
+		if m[4] == "Z" {
+			f = append(f[:2], append([]string{"UTC"}, f[2:]...)...)
+		}
 	}
 	for n := min(2, len(f)); n >= 1; n-- {
 		t, err := timearg.Parse(strings.Join(f[:n], " "), now)
