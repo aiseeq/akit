@@ -926,14 +926,13 @@ func waitDue(wait string, now time.Time) (time.Time, bool) {
 		}
 	}
 	for n := min(2, len(f)); n >= 1; n-- {
-		t, err := timearg.Parse(strings.Join(f[:n], " "), now)
-		if err != nil {
-			continue
+		// Без двух слов срока пробуем одно: «2026-11-06 итог» — срок одним словом, второе — заметка.
+		if t, err := timearg.Parse(strings.Join(f[:n], " "), now); err == nil {
+			if len(f) > n && (f[n] == "UTC" || f[n] == "Z") {
+				t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+			}
+			return t, true
 		}
-		if len(f) > n && (f[n] == "UTC" || f[n] == "Z") {
-			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
-		}
-		return t, true
 	}
 	return time.Time{}, false
 }
