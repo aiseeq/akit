@@ -93,6 +93,11 @@ var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:пла�
 
 // planAddRE — строка журнала tk plan --add; «обязательный» — с --required, тогда после имени — команда пункта.
 var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
+
+// requiredMentionRE — запись «обязательный» где угодно в тексте, без привязки к строке: сверка с целыми строками
+// журнала ловит запись, спрятанную склейкой или невидимым символом.
+var requiredMentionRE = regexp.MustCompile(`план — \S+: добавлен обязательный пункт ([a-z0-9-]+)`)
+
 var errHelp = errors.New("help")
 var session = currentSession
 var planTimeout = 60 * time.Second
@@ -149,7 +154,7 @@ func parseArgs(a []string) (options, error) {
 // вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел.
 func validateOneLine(o options) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}} {
-		if strings.ContainsFunc(f.value, isLineEnd) {
+		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
 	}
@@ -1277,6 +1282,12 @@ func isLineEnd(r rune) bool {
 	return r == '\n' || r == '\r' || r == '\u2028' || r == '\u2029' || r == '\u0085'
 }
 
+// notInLine — символ, которому не место в однострочном вводе: управляющий (кроме табуляции) или разделитель
+// строк и абзацев Unicode.
+func notInLine(r rune) bool {
+	return r != '\t' && unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp)
+}
+
 // requiredPin — команда обязательного пункта; conflict — строки «обязательный» расходятся в команде: tk таких
 // не пишет (повтор с другой командой он отвергает), значит, тикет правлен руками, и верной команды не знает.
 type requiredPin struct {
@@ -1288,7 +1299,7 @@ type requiredPin struct {
 func (p requiredPin) invalid(name, command string) string {
 	switch {
 	case p.conflict:
-		return fmt.Sprintf("required plan item %q has --required lines with different commands: the ticket was edited by hand", name)
+		return fmt.Sprintf("required plan item %q has --required lines with different commands or not on a journal line of their own: the ticket was edited by hand", name)
 	case p.cmd != "" && command != p.cmd:
 		return fmt.Sprintf("required plan item %q runs %q, but it is pinned with --required to %q", name, command, p.cmd)
 	}
@@ -1300,15 +1311,28 @@ func (p requiredPin) invalid(name, command string) string {
 // раздел, `\r` или U+2028 перед строкой) не должна снимать обязательность, а лишняя строка её только добавляет.
 func requiredPlan(body string) map[string]requiredPin {
 	req := map[string]requiredPin{}
+	clean := map[string]int{}
 	for _, l := range strings.FieldsFunc(body, isLineEnd) {
 		m := planAddRE.FindStringSubmatch(l)
 		if m == nil || m[1] == "" {
 			continue
 		}
+		clean[m[2]]++
 		if p, ok := req[m[2]]; !ok {
 			req[m[2]] = requiredPin{cmd: m[3]}
 		} else if p.cmd != m[3] {
 			req[m[2]] = requiredPin{cmd: p.cmd, conflict: true}
+		}
+	}
+	// Запись «обязательный» в любом месте текста, которая не разбирается целой строкой журнала (склеена с соседней
+	// любым символом, с невидимым символом в начале), — правка руками: пункт неверен, а не снят.
+	mentions := map[string]int{}
+	for _, m := range requiredMentionRE.FindAllStringSubmatch(body, -1) {
+		mentions[m[1]]++
+	}
+	for name, n := range mentions {
+		if n != clean[name] {
+			req[name] = requiredPin{cmd: req[name].cmd, conflict: true}
 		}
 	}
 	return req

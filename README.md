@@ -155,9 +155,11 @@ section removed or renamed included) or runs another command under its name. The
 `добавлен обязательный пункт NAME: COMMAND` marks it wherever it stands in the ticket, so editing the
 journal headings or line breaks around it does not drop it. The line pins the command: `tk plan --add`
 of that name with another command is refused (exit 2), with the same command it brings a removed item
-back, and lines that disagree on the command (only a hand edit makes them) leave the item invalid, so
-`tk done` refuses. Text tk writes into a ticket (note, `--add`, `--why`, `--check`, `--title`) must be
-one line under any line break, U+2028 included.
+back. Lines that disagree on the command, or a record of the add that does not stand as a journal line
+of its own (glued to the line before by any character, an invisible character in front) — only a hand
+edit makes them — leave the item invalid, so `tk done` refuses. Text tk writes into a ticket (note,
+`--add`, `--why`, `--check`, `--title`, `--until`) must be one line: no control character but a tab, no
+Unicode line or paragraph separator.
 Each check runs in
 `/bin/bash -c` from the repository root, without `BASH_ENV`, `ENV` and `BASH_FUNC_*` from the caller's
 environment, with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section

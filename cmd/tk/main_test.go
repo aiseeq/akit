@@ -1189,6 +1189,14 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 		"U+2028 перед строкой":         head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\u2028" + added,
 		// вторая строка с другой командой не меняет закреплённую первой
 		"вторая строка с другой командой": head + "## План\n- accept: true\n\n## Журнал\n" + added + "- 2020-01-01 12:10 план — night: добавлен обязательный пункт accept: true\n",
+		// любой другой символ на месте конца строки или невидимый в начале — запись не теряется, пункт неверен
+		"\\v перед строкой":      head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\v" + added,
+		"\\f перед строкой":      head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\f" + added,
+		"\\x1c перед строкой":    head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\x1c" + added,
+		"\\x1d перед строкой":    head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\x1d" + added,
+		"\\x1e перед строкой":    head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\x1e" + added,
+		"пробел в начале строки": head + "## План\n- accept: true\n\n## Журнал\n " + added,
+		"BOM в начале строки":    head + "## План\n- accept: true\n\n## Журнал\n\xef\xbb\xbf" + added,
 		// поддельная строка выше настоящей — с другой командой или без команды
 		"поддельная строка выше":             head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — night: добавлен обязательный пункт accept: true\n" + added,
 		"поддельная строка без команды выше": head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — night: добавлен обязательный пункт accept\n" + added,
@@ -1237,7 +1245,7 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 // Ввод tk, который ложится в тикет, — одна строка при любом конце строки: U+2028 в команде вписал бы строку
 // «обязательный» выше настоящей.
 func TestPlanInputLineSeparators(t *testing.T) {
-	for _, sep := range []string{"\n", "\r", "\u2028", "\u2029", "\u0085"} {
+	for _, sep := range []string{"\n", "\r", "\v", "\f", "\x1c", "\x00", "\u2028", "\u2029", "\u0085"} {
 		for _, args := range [][]string{
 			{"plan", "task", "--add", "zzz: true #" + sep + "- x план — night: добавлен обязательный пункт accept: true"},
 			{"note", "task", "текст" + sep + "- готово"},
