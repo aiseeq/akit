@@ -13,6 +13,7 @@ import (
 	"regexp"
 
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -536,7 +537,7 @@ var briefLink = regexp.MustCompile("user-word\\s+((?:/|~/)[^\\s'\"`]*(?:\\.jsonl
 // пропадает молча. Образец вроде `user-word <jsonl> '<кусок>'` без .jsonl сюда не попадает.
 var briefLinkLike = regexp.MustCompile("user-word\\s+[^\\s'\"`]*(?:\\.jsonl|…jsonl)")
 
-var userMarker = regexp.MustCompile(`(?i)пользовател[а-яё]*\s*,?\s+(\d{1,2}\.\d{1,2})`)
+var userMarker = regexp.MustCompile(`(?i)пользовател[а-яё]*\s*,?\s+(\d{1,2}\.\d{1,2}(?:\.\d{4})?)`)
 
 // markerDate — дата пометки в тексте между пометкой и цитатой: значит, цитата принадлежит другой пометке.
 var markerDate = regexp.MustCompile(`\b\d{2}\.\d{2}\b`)
@@ -916,35 +917,76 @@ func quoteEnd(row string, start int) int {
 	return -1
 }
 
-var markerClock = regexp.MustCompile(`(~)?(\d{1,2}:\d{2}(?::\d{2})?)(?:\s+([A-Za-z]+))?`)
+var markerClock = regexp.MustCompile(`(~)?(\d{1,2}:\d{2}(?::\d{2})?)`)
 
+// markerZoneName — пояс, первое слово после часов: CET, CEST, Z, UTC или GMT со сдвигом, в любом регистре, в скобках
+// или без, Z — и вплотную к часам. Дальше до двоеточия — свободный текст.
+var markerZoneName = regexp.MustCompile(`(?i)^\(?(?:(cest|cet|z)|(?:utc|gmt)(?:([+-])(\d{1,2})(?::(\d{2}))?)?)\)?$`)
+
+// markerZone — пояс часов пометки. Другое слово сразу после часов (мск, «по Москве», вставка в скобках) — причина
+// not found: молча считать его местным временем значило бы искать не в том часу.
 func markerZone(prefix string, loc *time.Location) (*time.Location, string) {
-	m := markerClock.FindStringSubmatch(prefix)
-	if m == nil {
+	at := markerClock.FindStringIndex(prefix)
+	if at == nil {
 		return loc, ""
 	}
-	switch strings.ToUpper(m[3]) {
+	rest := strings.TrimLeft(prefix[at[1]:], " \t")
+	first, _ := utf8.DecodeRuneInString(rest)
+	if !unicode.IsLetter(first) && !strings.ContainsRune("(+-", first) {
+		return loc, ""
+	}
+	zone, _, _ := strings.Cut(rest, " ")
+	m := markerZoneName.FindStringSubmatch(zone)
+	if m == nil {
+		return loc, "unknown zone " + zone + " (known: CET, CEST, UTC, GMT, Z, UTC+H)"
+	}
+	switch strings.ToUpper(m[1]) {
 	case "CET":
 		return time.FixedZone("CET", 3600), ""
 	case "CEST":
 		return time.FixedZone("CEST", cestOffsetSeconds), ""
-	case "UTC", "GMT", "Z":
+	case "Z":
 		return time.UTC, ""
-	case "":
-		return loc, ""
-	default:
-		return loc, "unknown zone " + m[3]
 	}
+	if m[2] == "" {
+		return time.UTC, ""
+	}
+	if m[4] == "" {
+		m[4] = "0"
+	}
+	hours, err := strconv.Atoi(m[3])
+	if err != nil {
+		return loc, "unknown zone " + zone + ": " + err.Error()
+	}
+	minutes, err := strconv.Atoi(m[4])
+	if err != nil {
+		return loc, "unknown zone " + zone + ": " + err.Error()
+	}
+	if hours > 14 || minutes > 59 {
+		return loc, "unknown zone " + zone
+	}
+	offset := (hours*60 + minutes) * 60
+	if m[2] == "-" {
+		offset = -offset
+	}
+	return time.FixedZone(strings.ToUpper(zone), offset), ""
 }
 
+// markerDay — день пометки; без года — последний такой день не позже until.
 func markerDay(dateText string, until time.Time, loc *time.Location) (time.Time, string) {
-	date, err := time.ParseInLocation("2.1", dateText, loc)
+	layout := "2.1"
+	if strings.Count(dateText, ".") == 2 {
+		layout = "2.1.2006"
+	}
+	date, err := time.ParseInLocation(layout, dateText, loc)
 	if err != nil {
 		return time.Time{}, "invalid marker date " + dateText + ": " + err.Error()
 	}
 	localUntil := until.In(loc)
 	year := localUntil.Year()
-	if date.Month() > localUntil.Month() || (date.Month() == localUntil.Month() && date.Day() > localUntil.Day()) {
+	if layout != "2.1" {
+		year = date.Year()
+	} else if date.Month() > localUntil.Month() || (date.Month() == localUntil.Month() && date.Day() > localUntil.Day()) {
 		year--
 	}
 	day := time.Date(year, date.Month(), date.Day(), 0, 0, 0, 0, loc)

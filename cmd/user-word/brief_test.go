@@ -553,3 +553,41 @@ func TestR6MarkerZonesCaseAndUnknownZone(t *testing.T) {
 		t.Errorf("MSK ошибочно трактован как местное время:\n%s", out)
 	}
 }
+
+// Текст после часов пометки — только известный пояс: остальное не местное время, а not found с причиной; год
+// в дате пометки учитывается.
+func TestBriefMarkerZoneTextAndYear(t *testing.T) {
+	e := testEnv(t)
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.loc = loc
+	writeTranscript(t, e.home, "-home-x-a", "zt000000-0000",
+		human("2026-10-20T08:00:00Z", "первая строка"),
+		human("2026-10-31T10:12:00Z", "вторая строка"))
+	for _, c := range []struct {
+		marker, quote, want string
+	}{
+		{"20.10 10:00 мск", "первая строка", "zone мск"},
+		{"20.10 11:00 мск", "первая строка", "zone мск"},
+		{"20.10 10:00 (MSK)", "первая строка", "zone (MSK)"},
+		{"20.10 10:00 по Москве", "первая строка", "zone по "},
+		{"20.10 10:00, через коллегу", "первая строка", "1 found"},
+		{"20.10 08:00 UTC+3", "первая строка", "1 not found"},
+		{"20.10 11:00 UTC+3", "первая строка", "1 found"},
+		{"20.10 10:00 GMT+2", "первая строка", "1 found"},
+		{"20.10 06:00 utc-2", "первая строка", "1 found"},
+		{"20.10 09:00 (CET)", "первая строка", "1 found"},
+		{"31.10 10:12Z", "вторая строка", "1 found"},
+		{"31.10 11:12Z", "вторая строка", "1 not found"},
+		{"31.10.2025", "вторая строка", "1 not found"},
+		{"31.10.2026", "вторая строка", "1 found"},
+	} {
+		_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Итог (пользователь "+c.marker+": «"+c.quote+"»).\n"), "--until", "2026-10-31 17:00")
+		mustHave(t, c.marker, out, c.want)
+		if strings.Contains(c.want, "zone") {
+			mustHave(t, c.marker, out, "1 not found")
+		}
+	}
+}
