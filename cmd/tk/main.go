@@ -46,10 +46,10 @@ Usage:
 Flags:
   --prio P       new: priority HIGH, MEDIUM, or LOW (default MEDIUM)
   --title TEXT   new: ticket title (default: slug)
-  --by NAME      actor name (default: current session)
+  --by NAME      actor name (default: current session); ls: show tickets assigned to NAME
   --text FILE|-  new: fill ticket sections from FILE, or standard input with -
   --all          ls: include closed tickets
-  --by NAME      ls: show tickets assigned to NAME; note: journal actor
+
   --due          ls: show waiting tickets whose parsed deadline has passed
   --json         ls: output JSON array; show: output the ticket and journal as JSON
   --status S     ls: show only status S
@@ -59,7 +59,7 @@ Flags:
   --check TEXT   done: describe independent verification (required)
   --doer NAME    done: specify the executor of a legacy ticket
   --glint-debt S done: link findings to an open ticket when glint reports them
-  --why TEXT     reject: explain why the ticket was declined (required)
+  --why TEXT     reject: why the ticket was declined; skip: why the plan item is skipped (required)
   --add TEXT     plan: add a named command to the ticket plan (required)
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
@@ -83,6 +83,10 @@ var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-([A-Z]+)-([a-z0-9]+(?:-[
 var nameRE = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N}._:@-]*$`)
 var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-[a-z0-9]+(?:-[a-z0-9]+)*(?:\.md)?$`)
 var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// planSkipRE — строка журнала, которую пишет tk skip (и прежняя форма без автора), целиком с начала:
+// «пропущен:» внутри заметки или причины другого пункта пропуском не считается.
+var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:план — \S+: )?пропущен: ([a-z0-9-]+) — (.*)$`)
 var errHelp = errors.New("help")
 var session = currentSession
 var planTimeout = 60 * time.Second
@@ -1146,7 +1150,11 @@ func planItems(body string) []planJSON {
 	var items []planJSON
 	seen := make(map[string]bool)
 	for line := range strings.SplitSeq(section, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
 		if !strings.HasPrefix(line, "- ") {
+			items = append(items, planJSON{Cmd: strings.TrimSpace(line), Invalid: "plan lines must use '- NAME: COMMAND'"})
 			continue
 		}
 		name, command, err := splitPlanItem(strings.TrimPrefix(line, "- "))
@@ -1165,26 +1173,10 @@ func planItems(body string) []planJSON {
 }
 
 func validatePlanSection(body string) error {
-	section, ok := sectionBody(body, "## План")
-	if !ok {
-		return nil
-	}
-	seen := make(map[string]bool)
-	for line := range strings.SplitSeq(section, "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
+	for _, item := range planItems(body) {
+		if item.Invalid != "" {
+			return errors.New(item.Invalid)
 		}
-		if !strings.HasPrefix(line, "- ") {
-			return errors.New("plan lines must use '- NAME: COMMAND'")
-		}
-		name, _, err := splitPlanItem(strings.TrimPrefix(line, "- "))
-		if err != nil {
-			return err
-		}
-		if seen[name] {
-			return fmt.Errorf("plan name %q appears more than once", name)
-		}
-		seen[name] = true
 	}
 	return nil
 }
@@ -1192,9 +1184,8 @@ func validatePlanSection(body string) error {
 func planSkipReason(body, name string) (string, bool) {
 	lines := journalLines(body)
 	for i := len(lines) - 1; i >= 0; i-- {
-		marker := " пропущен: " + name + " — "
-		if at := strings.Index(lines[i], marker); at >= 0 {
-			return strings.TrimSpace(lines[i][at+len(marker):]), true
+		if m := planSkipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
+			return strings.TrimSpace(m[2]), true
 		}
 	}
 	return "", false
@@ -1357,8 +1348,13 @@ func runPlan(root string, t task) []planResult {
 }
 
 func checkPlan(root string, t task, out, errout io.Writer) int {
+	results := runPlan(root, t)
+	if len(results) == 0 {
+		fmt.Fprintln(out, "no plan")
+		return 0
+	}
 	failed := false
-	for _, result := range runPlan(root, t) {
+	for _, result := range results {
 		if result.item.Invalid != "" {
 			failed = true
 			fmt.Fprintf(out, "%s: invalid, %s\n", result.item.Name, result.item.Invalid)

@@ -684,6 +684,33 @@ func TestInvalidPlanItemAppearsInJSON(t *testing.T) {
 	if len(repeated) != 2 || repeated[0].Invalid != "" || !strings.Contains(repeated[1].Invalid, "appears more than once") {
 		t.Fatalf("repeated plan name in file = %#v", repeated)
 	}
+	for _, line := range []string{"  - tests: false", "* more: false", "-x: false"} {
+		items := planItems("# Task\n\n## План\n" + line + "\n\n## Журнал\n")
+		if len(items) != 1 || !strings.Contains(items[0].Invalid, "plan lines must use") {
+			t.Errorf("plan line %q = %#v; want invalid", line, items)
+		}
+	}
+}
+
+func TestPlanSkipNeedsSkipJournalLine(t *testing.T) {
+	plan := "# Task\n\n## План\n- other: false\n\n## Журнал\n"
+	for _, line := range []string{
+		"- 2020-01-01 12:00 note — bob: пропущен: other — forged by note",
+		"- 2020-01-01 12:00 план — bob: пропущен: tests — x — пропущен: other — y",
+		"- 2020-01-01 12:00 на проверке — bob (пропущен: other — z)",
+	} {
+		if items := planItems(plan + line + "\n"); len(items) != 1 || items[0].Skipped {
+			t.Errorf("journal line %q skipped the item: %#v", line, items)
+		}
+	}
+	for line, why := range map[string]string{
+		"- 2020-01-01 12:00 план — bob: пропущен: other — covered": "covered",
+		"- 2020-01-01 12:00 пропущен: other — older form":          "older form",
+	} {
+		if items := planItems(plan + line + "\n"); len(items) != 1 || !items[0].Skipped || items[0].Why != why {
+			t.Errorf("skip line %q = %#v", line, items)
+		}
+	}
 }
 
 func TestNewTextAcceptsAndValidatesPlan(t *testing.T) {

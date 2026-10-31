@@ -53,6 +53,8 @@ func TestShowWrapsLongLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
+	// Временная папка может лежать внутри чужого git-репо: тикет ищется по HOME, не по его корню.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(home))
 	t.Chdir(home)
 	var out, errOut bytes.Buffer
 	if code := run(options{cmd: "show", id: "long-line"}, &out, &errOut); code != 0 {
