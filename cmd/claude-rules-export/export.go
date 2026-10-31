@@ -36,14 +36,20 @@ func export(opts options, stdout io.Writer) error {
 	if err := checkOut(out, src, rules, m); err != nil {
 		return err
 	}
-	if err := assemble(out, src, rules, m); err != nil {
+	// выгрузка собирается и проверяется в своей временной папке: ошибка сборки не трогает OUT_DIR
+	stage, err := os.MkdirTemp("", "claude-rules-export-")
+	if err != nil {
+		return fmt.Errorf("stage: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stage) }()
+	if err := assemble(stage, src, rules, m); err != nil {
 		return err
 	}
-	files, err := textFiles(out)
+	files, err := textFiles(stage)
 	if err != nil {
 		return err
 	}
-	readme := filepath.Join(out, "README.md")
+	readme := filepath.Join(stage, "README.md")
 	for _, f := range files {
 		if f == readme {
 			continue // шаблон README — как есть, проверка на личные данные его видит
@@ -52,8 +58,11 @@ func export(opts options, stdout io.Writer) error {
 			return err
 		}
 	}
-	hits, err := findPII(out, files, m.pii)
+	hits, err := findPII(stage, files, m.pii)
 	if err != nil {
+		return err
+	}
+	if err := replaceExport(out, stage); err != nil {
 		return err
 	}
 	for _, h := range hits {
@@ -69,11 +78,8 @@ func export(opts options, stdout io.Writer) error {
 
 // assemble собирает выгрузку из источника: скиллы, правила рабочего пространства, разделы общего CLAUDE.md, README.
 func assemble(out, src, rules string, m manifest) error {
-	if err := clearDir(out); err != nil {
-		return err
-	}
 	for _, s := range m.skills {
-		if strings.Contains(s, "/") || s == "." || s == ".." {
+		if strings.Contains(s, "/") || s == "." || s == ".." || strings.EqualFold(s, ".git") {
 			return fmt.Errorf("invalid skill name in manifest: %s", s)
 		}
 		dir := filepath.Join(src, ".claude", "skills", s)
@@ -173,107 +179,32 @@ func findPII(root string, files []string, pii []piiRule) ([]string, error) {
 	return hits, nil
 }
 
-// within — путь p совпадает с dir или лежит внутри него. Кроме текста разрешённых путей сравниваются сами папки:
-// bind mount показывает ту же папку под другим путём, и по тексту её не узнать.
-func within(p, dir string) (bool, error) {
-	if _, ok := under(p, dir); ok {
-		return true, nil
-	}
-	d, err := os.Stat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat %s: %w", dir, err)
-	}
-	for q := p; ; q = filepath.Dir(q) {
-		s, err := os.Stat(q)
-		if err == nil && os.SameFile(s, d) {
-			return true, nil
-		}
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return false, fmt.Errorf("stat %s: %w", q, err)
-		}
-		if q == filepath.Dir(q) {
-			return false, nil
-		}
-	}
+// under — путь p относительно dir, если p совпадает с dir или лежит внутри него, по тексту.
+func under(p, dir string) (string, bool) {
+	r, err := filepath.Rel(dir, p)
+	return r, err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator))
 }
 
-// checkOut — OUT_DIR очищается: папка, где лежит читаемое, или папка внутри читаемого стёрла бы источник. Пути
-// сравниваются после разрешения симлинков: ссылка на читаемое ведёт туда же.
+// checkOut — ранний понятный отказ: OUT_DIR содержит читаемое или лежит внутри него (кроме самого home). Пути
+// сравниваются после разрешения симлинков. Безопасность на этом не держится: под путём, которого сверка не узнаёт
+// (bind mount, overlay, /proc), выгрузка удаляет только записи своего списка (outdir.go).
 func checkOut(out, src, rules string, m manifest) error {
 	reads, err := readPaths(src, rules, m)
 	if err != nil {
 		return err
 	}
-	o, err := resolved(out)
-	if err != nil {
-		return fmt.Errorf("OUT_DIR: %w", err)
-	}
-	mounts, err := readMounts()
-	if err != nil {
-		return err
-	}
-	outs := aliases(o, mounts)
 	for _, read := range reads {
 		r, err := resolved(read)
 		if err != nil {
 			return err
 		}
-		for _, ra := range aliases(r, mounts) {
-			for _, oa := range outs {
-				bad, err := overlaps(ra, oa, read != src)
-				if err != nil {
-					return err
-				}
-				if bad {
-					return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
-				}
-			}
-		}
-	}
-	// сверка путей называет, что задето; содержимое — рубеж для путей, которых сверка не узнаёт
-	return checkOutContent(o, mounts)
-}
-
-// exportEntries — всё, что выгрузка пишет в OUT_DIR верхним уровнем; .git — история выгрузки, её не трогают.
-var exportEntries = map[string]bool{".git": true, "global": true, "README.md": true, "skills": true, "work": true}
-
-// checkOutContent — очищается только то, что выгрузка пишет сама: в OUT_DIR нет ничего другого и ни одной точки
-// монтирования внутри. Так источник не стереть ни под каким другим путём — ссылкой, bind mount, overlay, /proc:
-// в нём лежит своё, и выгрузка откажет, не тронув ни файла.
-func checkOutContent(out string, mounts []mount) error {
-	entries, err := os.ReadDir(out)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("list OUT_DIR: %w", err)
-	}
-	for _, e := range entries {
-		if !exportEntries[e.Name()] {
-			return fmt.Errorf("OUT_DIR holds %s, which the export does not write: give an empty folder or a previous export", e.Name())
-		}
-	}
-	// и сам OUT_DIR не точка монтирования: overlay или fuse показывают чужую папку, и сверка путей её не узнаёт
-	for _, m := range mounts {
-		if _, ok := under(m.point, out); ok {
-			return fmt.Errorf("OUT_DIR is or has inside a mount point: %s", m.point)
+		_, contains := under(r, out)
+		_, inside := under(out, r)
+		if contains || inside && read != src {
+			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
 		}
 	}
 	return nil
-}
-
-// overlaps — OUT_DIR o содержит читаемое r или (если inside) лежит внутри него.
-func overlaps(r, o string, inside bool) (bool, error) {
-	if contains, err := within(r, o); err != nil || contains {
-		return contains, err
-	}
-	if !inside {
-		return false, nil
-	}
-	return within(o, r)
 }
 
 // physical — абсолютный путь, как его поймёт система. filepath.Abs чистит текст до разрешения ссылок и убирает
@@ -294,7 +225,7 @@ func physical(p string) (string, error) {
 func resolved(p string) (string, error) {
 	r, err := filepath.EvalSymlinks(p)
 	if err == nil {
-		return kernelName(r)
+		return r, nil
 	}
 	sep := string(filepath.Separator)
 	trimmed := strings.TrimRight(p, sep)

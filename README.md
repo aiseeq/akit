@@ -72,21 +72,18 @@ change in `full total` from `/proc/pressure/io` over the sampling interval.
 ## claude-rules-export
 
 Claude Code rules and skills exported for colleagues and checked for private data: the chosen
-skills, the chosen sections of the global CLAUDE.md and the workspace rules are copied into OUT_DIR
-(cleared but for `.git`; an OUT_DIR that holds or lies in what is read — the source home, its
-`.claude` and `work`, both CLAUDE.md, the `--rules` folder with its manifest and template, an exported
-skill's folder and the targets of links in it; lying in the home itself is fine; paths are taken as the
-system takes them, symlinks resolved, `..` after a link going from its target and the name as the kernel
-reports it (case as on disk on a case-insensitive folder), and a folder shown under
-another path by a bind mount (by itself or as a subfolder, found in `/proc/self/mountinfo`) is recognised as
-the same folder; an empty path is refused — is refused first; so is an OUT_DIR holding anything the
-export does not write (anything but `.git`, `global`, `README.md`, `skills`, `work`), being a mount
-point or having one inside (on Linux without `/proc/self/mountinfo` too), since only what the export
-writes is cleared, and `.git`, a folder or a file, is never changed; a skill folder that
-is a link is exported as its content; every folder, file and link is created anew, so two paths that meet
-in one — skills differing only in case on a case-insensitive OUT_DIR — are an error, never a write through a
-link), literal replacements are made, listed lines dropped, then the export is
-searched for private data patterns. What to export and what counts as private is data in the
+skills, the chosen sections of the global CLAUDE.md and the workspace rules are built in a temporary
+folder, literal replacements are made, listed lines dropped, the build is searched for private data
+patterns and then put into OUT_DIR. In OUT_DIR only the previous run's own entries are removed, and only
+while unchanged: path, mode, size, sha256 and inode of each file and the text of each link must match the
+list that run kept in `$XDG_STATE_HOME/claude-rules-export` (default `~/.local/state`), keyed by the OUT_DIR
+path; folders are removed only when empty and `.git` at the top is never touched. Anything else — an edited
+or foreign file, a folder shown there by a mount, an OUT_DIR without a list holding more than `.git` — is
+refused before anything is removed, so no other path to the same folder (symlink, bind mount, overlay,
+`/proc`) can erase it, and a run cut short is finished by the next one. An OUT_DIR that holds what is read or
+lies in it (the source home itself aside) is refused early, after symlinks are resolved; an empty path is
+refused; a skill folder that is a link is exported as its content; skills named `.git` and paths differing
+only in case are refused. What to export and what counts as private is data in the
 `--rules` folder (`manifest/`, `README.template.md`), not code. Exit 0 clean, 1 private data or a
 missing skill, 2 usage/IO error.
 

@@ -29,19 +29,18 @@ line of manifest/drop-lines.txt are dropped. Last, manifest/pii.tsv
 (KIND<TAB>REGEXP<TAB>ALLOWED REGEXP) is searched for: each hit not fully matching
 ALLOWED is printed as file:line: KIND.
 
-An OUT_DIR that holds what is read (the source home, its .claude and work, both
-CLAUDE.md, --rules with its manifest and template, an exported skill's folder and the
-targets of links in it) or is or lies in any of it but the home is refused before anything
-is cleared. Paths are taken as the system takes them: symlinks resolved, ".." after a link
-goes from its target, the name is the kernel's (case as on disk on a case-insensitive
-folder), a folder shown under another path by a bind mount (by itself or as
-a subfolder, found in /proc/self/mountinfo) is the same folder. An empty path is refused.
-Only what the export writes is cleared: an OUT_DIR holding anything but .git, global,
-README.md, skills and work, being a mount point or having one inside is refused untouched
-(on Linux without /proc/self/mountinfo too); .git, a folder or a file, is never changed.
-A skill folder that is a link is exported as its content. Every folder, file and link is
-created anew: two paths that meet in one (skills differing only in case on a
-case-insensitive OUT_DIR) are an error, never a write through a link.
+The export is built and checked in a temporary folder first, then put into OUT_DIR. In
+OUT_DIR only the previous run's own entries are removed, and only while unchanged: each
+file's path, mode, size, sha256 and inode and each link's text must match the list that
+run kept in $XDG_STATE_HOME/claude-rules-export (default ~/.local/state), keyed by the
+OUT_DIR path. Folders are removed only when empty; .git at the top is never touched.
+Anything else (an edited or foreign file, a folder shown there by a mount, an OUT_DIR
+without a list that holds more than .git) is refused before anything is removed, so no
+other path to the same folder (symlink, bind mount, overlay, /proc) can erase it. A run cut
+short is finished by the next one. An OUT_DIR that holds what is read or lies in it (the
+source home itself aside) is refused early, after symlinks are resolved; an empty path
+is refused. A skill folder that is a link is exported as its content; skills named .git
+and paths differing only in case are refused.
 
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).

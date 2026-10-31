@@ -9,26 +9,6 @@ import (
 	"syscall"
 )
 
-// clearDir создаёт папку или очищает её, кроме .git: история выгрузки остаётся.
-func clearDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create OUT_DIR: %w", err)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("list OUT_DIR: %w", err)
-	}
-	for _, e := range entries {
-		if e.Name() == ".git" {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
-			return fmt.Errorf("clear OUT_DIR: %w", err)
-		}
-	}
-	return nil
-}
-
 // copyTree копирует папку как cp -R: ссылки остаются ссылками, права файлов сохраняются. Каждую папку, файл и
 // ссылку создаёт заново и отказывает, если путь уже есть: на OUT_DIR без учёта регистра два скилла или два имени
 // внутри скилла иначе сошлись бы в одном пути и запись пошла бы сквозь ссылку, скопированную раньше.

@@ -9,6 +9,24 @@ import (
 	"testing"
 )
 
+// TestMain — свой каталог состояния (списки выгрузок) на весь прогон; перезапуск теста в пространстве имён
+// наследует каталог запустившего.
+func TestMain(m *testing.M) {
+	if os.Getenv("CRE_BIND_OUT") != "" {
+		os.Exit(m.Run())
+	}
+	dir, err := os.MkdirTemp("", "cre-state-")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("XDG_STATE_HOME", dir); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 func write(t *testing.T, path, text string, mode os.FileMode) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -79,7 +97,13 @@ func TestExport(t *testing.T) {
 	src, rules := fixture(t)
 	out := filepath.Join(t.TempDir(), "out")
 	write(t, filepath.Join(out, ".git/HEAD"), "ref\n", 0o644)
-	write(t, filepath.Join(out, "skills/old/SKILL.md"), "старое\n", 0o644)
+	// скилл, убранный из манифеста, уходит из выгрузки на следующем прогоне
+	write(t, filepath.Join(src, ".claude/skills/old/SKILL.md"), "старое\n", 0o644)
+	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\nold\n", 0o644)
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("first run: code %d %q", code, stderr)
+	}
+	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\n", 0o644)
 	// висячая ссылка в скилле — не ошибка: выгружается ссылкой, как у cp -R
 	if err := os.Symlink("gone", filepath.Join(src, ".claude/skills/jira/stale")); err != nil {
 		t.Fatal(err)
@@ -303,19 +327,14 @@ func TestExportDotDotAfterLink(t *testing.T) {
 	}
 }
 
-// OUT_DIR — та же папка, показанная bind mount под другим путём: по тексту путей её не узнать, очистка стёрла бы
-// источник. Монтирование — в своём пространстве имён (unshare -rm), где тест запускает сам себя.
-func TestExportRefusesBindMount(t *testing.T) {
+// OUT_DIR — папка, показанная монтированием под другим путём (bind mount, overlay, tmpfs без учёта регистра): по
+// тексту путей её не узнать, а очистка не должна стереть ни источник, ни чужую папку. Отказ или выгрузка в новую
+// папку — оба допустимы; что всё цело, смотрит запустивший тест. Монтирование — в своём пространстве имён
+// (unshare -rm), где тест запускает сам себя.
+func TestExportKeepsMountedData(t *testing.T) {
 	if out := os.Getenv("CRE_BIND_OUT"); out != "" {
-		// второй рубеж без mountinfo: та же папка под путём bind mount узнаётся сравнением самих папок
-		if from := os.Getenv("CRE_BIND_SAME"); from != "" {
-			if ok, err := within(out, from); !ok || err != nil {
-				t.Errorf("within(%s, %s) = %v, %v", out, from, ok, err)
-			}
-		}
 		code, _, stderr := runExport(t, "--src-home", os.Getenv("CRE_BIND_SRC"), "--rules", os.Getenv("CRE_BIND_RULES"), out)
-		// отказ любой проверкой; что источник цел, смотрит запустивший тест
-		if code != exitUsage {
+		if code != 0 && code != exitDirty && code != exitUsage {
 			t.Fatalf("OUT_DIR %s: code %d %q", out, code, stderr)
 		}
 		return
@@ -333,7 +352,17 @@ func TestExportRefusesBindMount(t *testing.T) {
 	// $1 — что монтируется, $2 — папка случая; OUT_DIR — out внутри неё
 	bind := `mkdir -p "$2/m" && mount --bind "$1" "$2/m"`
 	casefold := `{ mkdir -p "$2/fs" && mount -t tmpfs -o casefold tmpfs "$2/fs" && mkdir "$2/fs/d" && chattr +F "$2/fs/d" || exit 77; }`
+	// прошлая выгрузка, поверх скилла которой смонтирована чужая копия того же содержимого: те же хэши, другие inode
+	prior := filepath.Join(mnt, "prior")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(prior, "out")); code != 0 {
+		t.Fatalf("prior export: code %d %q", code, stderr)
+	}
+	twin := filepath.Join(t.TempDir(), "twin")
+	if b, err := exec.Command("cp", "-a", filepath.Join(prior, "out/skills/jira"), twin).CombinedOutput(); err != nil {
+		t.Fatalf("cp: %v %s", err, b)
+	}
 	for _, c := range []struct{ name, mount, from, out string }{
+		{"prior", `mount --bind "$1" "$2/out/skills/jira"`, twin, "out"},
 		{"home", bind, src, "m"},
 		{"inside .claude", bind, filepath.Join(src, ".claude"), "m/x"},
 		// подпапка читаемого под другим путём: у точки монтирования другие предки
@@ -362,19 +391,16 @@ func TestExportRefusesBindMount(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		cmd := exec.Command("unshare", "-rm", "sh", "-c", c.mount+` && exec "$3" -test.run '^TestExportRefusesBindMount$' -test.count=1`,
+		cmd := exec.Command("unshare", "-rm", "sh", "-c", c.mount+` && exec "$3" -test.run '^TestExportKeepsMountedData$' -test.count=1`,
 			"sh", c.from, dir, os.Args[0])
 		cmd.Env = append(os.Environ(), "CRE_BIND_SRC="+src, "CRE_BIND_RULES="+rules, "CRE_BIND_OUT="+filepath.Join(dir, c.out))
-		if c.mount == bind {
-			cmd.Env = append(cmd.Env, "CRE_BIND_SAME="+c.from)
-		}
 		b, err := cmd.CombinedOutput()
 		if code := cmd.ProcessState.ExitCode(); code == 77 {
 			t.Logf("%s: no casefold tmpfs: %s", c.name, b)
 		} else if err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
 		}
-		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x", repo + "/skills/z/f"} {
+		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x", repo + "/skills/z/f", twin + "/SKILL.md"} {
 			if !filepath.IsAbs(f) {
 				f = filepath.Join(src, f)
 			}
