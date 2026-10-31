@@ -241,8 +241,10 @@ the brief file's modification time is used. A dated quote is
 which may start on the next line in the same paragraph. A comma after the marker
 word is accepted, as are one digit for the day or month, any case and grammatical
 form of “пользователь”, and an approximate clock such as `~15:43`. Approximate
-times search within 15 minutes; exact times search within two minutes. `CET`,
-`CEST`, and `UTC` mean UTC offsets +1, +2, and 0; a clock without a zone is local.
+times search within 15 minutes; exact times search within two minutes. `CET` and
+`CEST` (in any case) mean UTC offsets +1 and +2; `UTC`, `GMT`, and `Z` (in any
+case) mean UTC. A clock without a zone is local; an unrecognized zone such as
+`MSK` is reported as not found with the zone named in the reason.
 Several consecutive quotes after one marker are checked separately. The quote
 matches whole words; `…` and `[…]` mark omitted text between ordered pieces. More
 than one user line on the marker day, the same text at different times included,

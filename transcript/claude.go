@@ -241,8 +241,9 @@ func (p *claudeParser) user(rec *record, ev func(Role, string, string) Event) []
 		}
 		name := p.tools[pt.ToolUseID]
 		if name == "AskUserQuestion" {
-			if answers := askAnswers(rec.ToolUseResult); answers != "" {
+			if answers, match := askAnswers(rec.ToolUseResult); answers != "" {
 				e := ev(Ask, "", answers)
+				e.Answer = match
 				e.CallID, e.Error, e.Raw, e.Result = pt.ToolUseID, pt.IsError, pt.Content, rec.ToolUseResult
 				out = append(out, e)
 				continue
@@ -316,12 +317,12 @@ func fromOrigin(kind string, raw json.RawMessage, ev func(Role, string, string) 
 
 // askAnswers — ответы окна вопроса: «ответ ← вопрос» по строке на вопрос; ответ первым, чтобы его не отрезала
 // короткая строка.
-func askAnswers(raw json.RawMessage) string {
+func askAnswers(raw json.RawMessage) (string, string) {
 	var r struct {
 		Answers map[string]string `json:"answers"`
 	}
 	if len(raw) == 0 || json.Unmarshal(raw, &r) != nil || len(r.Answers) == 0 {
-		return ""
+		return "", ""
 	}
 	qs := make([]string, 0, len(r.Answers))
 	for q := range r.Answers {
@@ -329,10 +330,12 @@ func askAnswers(raw json.RawMessage) string {
 	}
 	sort.Strings(qs)
 	lines := make([]string, 0, len(qs))
+	answers := make([]string, 0, len(qs))
 	for _, q := range qs {
+		answers = append(answers, r.Answers[q])
 		lines = append(lines, r.Answers[q]+" ← "+q)
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), strings.Join(answers, "\n")
 }
 
 // toolInput — ввод инструмента для показа: команда Bash как есть, письмо — «→ кому: текст», иначе JSON.

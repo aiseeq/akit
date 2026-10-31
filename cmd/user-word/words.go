@@ -30,6 +30,7 @@ type line struct {
 	user    bool
 	ask     bool // ответ в окне вопроса
 	text    string
+	match   string
 	warning string
 }
 
@@ -39,7 +40,11 @@ func readLines(path string, keep func([]byte) bool) ([]line, error) {
 	meta, err := transcript.Read(path, keep, func(ev transcript.Event) {
 		switch ev.Role {
 		case transcript.User, transcript.Ask:
-			out = append(out, line{no: ev.Line, t: ev.Time, user: true, ask: ev.Role == transcript.Ask, text: ev.Text})
+			l := line{no: ev.Line, t: ev.Time, user: true, ask: ev.Role == transcript.Ask, text: ev.Text, match: ev.Text}
+			if l.ask {
+				l.match = ev.Answer
+			}
+			out = append(out, l)
 		case transcript.Agent:
 			out = append(out, line{no: ev.Line, t: ev.Time, text: ev.Text})
 		}
@@ -50,6 +55,13 @@ func readLines(path string, keep func([]byte) bool) ([]line, error) {
 	return out, err
 }
 
+func searchableText(l line) string {
+	if l.ask {
+		return l.match
+	}
+	return l.text
+}
+
 func malformedTranscriptWarning(count int, first error) line {
 	return line{warning: fmt.Sprintf("skipped %d malformed transcript lines (%v)", count, first)}
 }
@@ -57,7 +69,7 @@ func malformedTranscriptWarning(count int, first error) line {
 // lastWith — индекс последней реплики пользователя с куском, -1 — нет такой.
 func lastWith(lines []line, frag string) int {
 	for i := len(lines) - 1; i >= 0; i-- {
-		if lines[i].user && hasFragment(lines[i].text, frag) {
+		if lines[i].user && hasFragment(searchableText(lines[i]), frag) {
 			return i
 		}
 	}
@@ -382,12 +394,13 @@ type briefQuoteContext struct {
 const fullHits = 5
 
 func search(opts options, e env, stdout, stderr io.Writer) int {
-	hits, err := findHits(opts, e)
+	hits, warnings, err := findHits(opts, e)
 	if err != nil {
 		fmt.Fprintf(stderr, "user-word: %v\n", err)
 		return exitUsage
 	}
 	if len(hits) == 0 {
+		writeWarnings(stderr, warnings)
 		fmt.Fprintf(stderr, "user-word: no user line with %q\n", opts.frag)
 		return exitNone
 	}
@@ -411,27 +424,36 @@ func search(opts options, e env, stdout, stderr io.Writer) int {
 }
 
 // findHits — реплики пользователя с куском по всем транскриптам, по времени.
-func findHits(opts options, e env) ([]hit, error) {
+func findHits(opts options, e env) ([]hit, []line, error) {
+	return findHitsUsing(opts, e, readLines)
+}
+
+func findHitsUsing(opts options, e env, read func(string, func([]byte) bool) ([]line, error)) ([]hit, []line, error) {
 	paths, err := transcripts(e.home, opts.since, opts.project, e.loc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	has := prefilter(opts.frag)
 	// Вызов окна вопроса нужен парсеру, чтобы узнать в его результате ответ человека, а не вывод инструмента.
 	ask := []byte(`"name":"AskUserQuestion"`)
 	keep := func(raw []byte) bool { return bytes.Contains(raw, ask) || has(raw) }
 	var hits []hit
+	var warnings []line
 	seen := map[string]bool{} // запись, повторённая в другом транскрипте (продолжение сессии), — один раз
 	for _, p := range paths {
-		lines, err := readLines(p, keep)
+		lines, err := read(p, keep)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // файл ушёл между списком и чтением
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, l := range lines {
-			if !l.user || !hasFragment(l.text, opts.frag) {
+			if l.warning != "" {
+				warnings = append(warnings, l)
+				continue
+			}
+			if !l.user || !hasFragment(searchableText(l), opts.frag) {
 				continue
 			}
 			if opts.since != "" && l.t.In(e.loc).Format(time.DateOnly) < opts.since {
@@ -446,7 +468,15 @@ func findHits(opts options, e env) ([]hit, error) {
 		}
 	}
 	sort.SliceStable(hits, func(i, j int) bool { return hits[i].t.Before(hits[j].t) })
-	return hits, nil
+	return hits, warnings, nil
+}
+
+func writeWarnings(w io.Writer, lines []line) {
+	for _, l := range lines {
+		if l.warning != "" {
+			fmt.Fprintf(w, "user-word: warning: %s\n", l.warning)
+		}
+	}
 }
 
 // showHit — совпадение целиком: файл перечитывается полностью, ради ответа агента перед репликой.
@@ -552,15 +582,15 @@ func runBrief(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "no user words in %s\n", opts.path)
 		return 0
 	}
-	dayHits, err := briefQuoteHitsByDay(words, e, until)
+	dayHits, warnings, err := briefQuoteHitsByDay(words, e, until)
 	if err != nil {
 		fmt.Fprintf(stderr, "user-word: %v\n", err)
 		return exitUsage
 	}
-	return reportBriefWords(words, dayHits, e, until, stdout, stderr)
+	return reportBriefWords(words, dayHits, warnings, e, until, stdout, stderr)
 }
 
-func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string][]hit, error) {
+func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string][]hit, []line, error) {
 	dayFragments := make(map[string][]string)
 	daySeen := make(map[string]map[string]bool)
 	for _, word := range words {
@@ -579,11 +609,11 @@ func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string]
 		}
 	}
 	if len(dayFragments) == 0 {
-		return map[string][]hit{}, nil
+		return map[string][]hit{}, nil, nil
 	}
 	inventory, err := briefTranscriptInventory(e.home)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return scanBriefQuotes(inventory, dayFragments, until, e.loc)
 }
@@ -609,7 +639,8 @@ func localDate(t time.Time, loc *time.Location) time.Time {
 	return time.Date(year, month, day, 0, 0, 0, 0, loc)
 }
 
-func reportBriefWords(words []briefWord, dayHits map[string][]hit, e env, until time.Time, stdout, stderr io.Writer) int {
+func reportBriefWords(words []briefWord, dayHits map[string][]hit, warnings []line, e env, until time.Time, stdout, stderr io.Writer) int {
+	writeWarnings(stderr, warnings)
 	contexts := make(map[string][]line)
 	quoteContexts := make(map[string]briefQuoteContext)
 	found, ambiguous, missing := 0, 0, 0
@@ -791,8 +822,11 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 			words = append(words, briefWord{raw: row[marker[0]:marker[1]], isQuote: true, invalidCause: "no «quote» after a colon right after the marker"})
 			continue
 		}
-		zone := markerZone(row[marker[1]:colon], loc)
+		zone, zoneCause := markerZone(row[marker[1]:colon], loc)
 		day, cause := markerDay(row[marker[2]:marker[3]], until, zone)
+		if cause == "" {
+			cause = zoneCause
+		}
 		markedAt := time.Time{}
 		window := markerWindow
 		if cause == "" {
@@ -882,22 +916,24 @@ func quoteEnd(row string, start int) int {
 	return -1
 }
 
-var markerClock = regexp.MustCompile(`(~)?(\d{1,2}:\d{2}(?::\d{2})?)(?:\s+(CET|CEST|UTC))?`)
+var markerClock = regexp.MustCompile(`(~)?(\d{1,2}:\d{2}(?::\d{2})?)(?:\s+([A-Za-z]+))?`)
 
-func markerZone(prefix string, loc *time.Location) *time.Location {
+func markerZone(prefix string, loc *time.Location) (*time.Location, string) {
 	m := markerClock.FindStringSubmatch(prefix)
 	if m == nil {
-		return loc
+		return loc, ""
 	}
-	switch m[3] {
+	switch strings.ToUpper(m[3]) {
 	case "CET":
-		return time.FixedZone("CET", 3600)
+		return time.FixedZone("CET", 3600), ""
 	case "CEST":
-		return time.FixedZone("CEST", cestOffsetSeconds)
-	case "UTC":
-		return time.UTC
+		return time.FixedZone("CEST", cestOffsetSeconds), ""
+	case "UTC", "GMT", "Z":
+		return time.UTC, ""
+	case "":
+		return loc, ""
 	default:
-		return loc
+		return loc, "unknown zone " + m[3]
 	}
 }
 
@@ -972,7 +1008,7 @@ func makeBriefWordHits(word briefWord, cached map[string][]hit, loc *time.Locati
 	seen := make(map[string]bool)
 	for _, day := range briefWordScanDays(word, loc) {
 		for _, h := range cached[day.Format(time.DateOnly)] {
-			if !hasWords(briefTextFragment(h.text), briefQuoteFragment(word.fragment)) || !hitOnMarkerDay(h, word) {
+			if !hasWords(briefTextFragment(searchableText(h.line)), briefQuoteFragment(word.fragment)) || !hitOnMarkerDay(h, word) {
 				continue
 			}
 			key := h.path + "\x00" + h.t.String() + "\x00" + h.text
@@ -1036,26 +1072,27 @@ func makeBriefQuoteFilters(fragments map[string][]string, loc *time.Location) (b
 }
 
 type briefQuoteScanResult struct {
-	path string
-	hits []hit
-	err  error
+	path     string
+	hits     []hit
+	warnings []line
+	err      error
 }
 
-func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string, until time.Time, loc *time.Location) (map[string][]hit, error) {
+func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string, until time.Time, loc *time.Location) (map[string][]hit, []line, error) {
 	filters, err := makeBriefQuoteFilters(fragments, loc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if filters.from.IsZero() {
-		return map[string][]hit{}, nil
+		return map[string][]hit{}, nil, nil
 	}
 	paths := recentBriefTranscripts(inventory, filters.from)
 	results := scanBriefTranscriptPaths(paths, filters, fragments, until, loc)
-	hits, err := mergeBriefQuoteResults(results, len(fragments), loc)
+	hits, warnings, err := mergeBriefQuoteResults(results, len(fragments), loc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return hits, nil
+	return hits, warnings, nil
 }
 
 const briefContextLookback = 24 * time.Hour
@@ -1192,7 +1229,13 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 		return briefQuoteScanResult{path: path, err: err}
 	}
 	hits := matchBriefQuoteLines(path, lines, filters.byDay, fragments, until, loc)
-	return briefQuoteScanResult{path: path, hits: hits}
+	var warnings []line
+	for _, l := range lines {
+		if l.warning != "" {
+			warnings = append(warnings, l)
+		}
+	}
+	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings}
 }
 
 func keepBriefQuoteRecord(raw []byte, filters map[string][]func([]byte) bool) bool {
@@ -1253,20 +1296,22 @@ func matchBriefQuoteLines(path string, lines []line, byDay map[string][]func([]b
 
 func matchesBriefQuote(line line, fragments []string) bool {
 	for _, fragment := range fragments {
-		if hasWords(briefTextFragment(line.text), briefQuoteFragment(fragment)) {
+		if hasWords(briefTextFragment(searchableText(line)), briefQuoteFragment(fragment)) {
 			return true
 		}
 	}
 	return false
 }
 
-func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *time.Location) (map[string][]hit, error) {
+func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *time.Location) (map[string][]hit, []line, error) {
 	out := make(map[string][]hit, capacity)
+	var warnings []line
 	seen := make(map[string]bool)
 	for _, result := range results {
 		if result.err != nil {
-			return nil, fmt.Errorf("read transcript %s: %w", result.path, result.err)
+			return nil, nil, fmt.Errorf("read transcript %s: %w", result.path, result.err)
 		}
+		warnings = append(warnings, result.warnings...)
 		for _, h := range result.hits {
 			date := h.t.In(loc).Format(time.DateOnly)
 			key := date + "\x00" + h.t.String() + "\x00" + h.text
@@ -1277,7 +1322,7 @@ func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *t
 			out[date] = append(out[date], h)
 		}
 	}
-	return out, nil
+	return out, warnings, nil
 }
 
 func briefUserRecord(raw []byte) bool {
@@ -1451,7 +1496,11 @@ func appendBriefEvents(out *[]line, events []transcript.Event, until time.Time) 
 			return true
 		}
 		if ev.Role == transcript.User || ev.Role == transcript.Ask {
-			*out = append(*out, line{t: ev.Time, user: true, ask: ev.Role == transcript.Ask, text: ev.Text})
+			l := line{t: ev.Time, user: true, ask: ev.Role == transcript.Ask, text: ev.Text, match: ev.Text}
+			if l.ask {
+				l.match = ev.Answer
+			}
+			*out = append(*out, l)
 			continue
 		}
 		if ev.Role == transcript.Agent {
@@ -1706,13 +1755,20 @@ func lastBriefLinkHit(path string, lines []line, fragment string) ([]hit, string
 	var last line
 	matched := 0
 	for _, l := range lines {
-		if l.user && hasFragment(l.text, fragment) {
+		if l.user && hasFragment(searchableText(l), fragment) {
 			last = l
 			matched++
 		}
 	}
 	if matched == 0 {
-		return nil, "fragment not found in transcript", nil
+		var note strings.Builder
+		note.WriteString("fragment not found in transcript")
+		for _, l := range lines {
+			if l.warning != "" {
+				note.WriteString("; " + l.warning)
+			}
+		}
+		return nil, note.String(), nil
 	}
 	// Ссылка указывает на свежую реплику с куском, как и обычный режим; о прежних — заметка.
 	note := ""

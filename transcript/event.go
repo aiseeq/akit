@@ -47,7 +47,9 @@ type Event struct {
 	From string // для peer — адрес отправителя (from, uds:…): SendMessage пишет в to имя или адрес
 	// Text — слова: напоминания обвязки (<system-reminder>) из реплик человека и писем вырезаны, картинки — не текст,
 	// их число в Images.
-	Text   string
+	Text string
+	// Answer — только ответы человека в AskUserQuestion, без текста вопросов.
+	Answer string
 	Images int
 	// Поля записи Claude Code; у codex UUID пуст, SessionID и Cwd — из session_meta, Cwd меняет turn_context.
 	// Cwd — папка сессии в момент записи: меняется внутри сессии.

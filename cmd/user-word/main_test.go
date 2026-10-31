@@ -248,3 +248,75 @@ func TestBriefLaterLinesCapped(t *testing.T) {
 		t.Errorf("обычный режим урезал поздние реплики:\n%s", out)
 	}
 }
+
+func TestR6AskQuestionIsNotUserWords(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r6", "ask00000-0000",
+		ask("2026-10-31T10:00:00Z", "t1"),
+		answer("2026-10-31T10:01:00Z", "t1", "Перенести выкатку на понедельник?", "Нет"),
+	)
+	if code, out, errOut := runUW(t, e, p, "Перенести выкатку на понедельник"); code != exitNone {
+		t.Errorf("вопрос не должен считаться ответом: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if code, out, errOut := runUW(t, e, "--search", "Перенести выкатку на понедельник"); code != exitNone {
+		t.Errorf("--search не должен считать вопрос словами: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	brief := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Перенести выкатку на понедельник»\n`user-word "+p+" 'Перенести выкатку на понедельник'`\n")
+	code, out := briefRun(t, e, brief, "--until", "2026-10-31 11:00")
+	if code != exitNone || !strings.Contains(out, "2 user words: 0 found, 0 ambiguous, 2 not found") {
+		t.Errorf("цитата и ссылка не должны считать вопрос словами: code %d\n%s", code, out)
+	}
+}
+
+func TestR6MalformedTranscriptWarningWhenNotFound(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r6", "bad00000-0000", `{"text":"absent fragment", broken`)
+	if code, out, errOut := runUW(t, e, p, "absent fragment"); code != exitNone || !strings.Contains(out+errOut, "malformed") {
+		t.Errorf("direct not found должен предупредить о битой строке: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if code, out, errOut := runUW(t, e, "--search", "absent fragment"); code != exitNone || !strings.Contains(out+errOut, "malformed") {
+		t.Errorf("search not found должен предупредить о битой строке: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	brief := writeBrief(t, t.TempDir(), "`user-word "+p+" 'absent fragment'`\n")
+	code, out := briefRun(t, e, brief, "--until", "2026-10-31 11:00")
+	if code != exitNone || !strings.Contains(out, "malformed") {
+		t.Errorf("brief not found должен предупредить о битой строке: code %d\n%s", code, out)
+	}
+}
+
+func TestR6SearchDoesNotRereadOnMiss(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r6", "read0001-0000", human("2026-10-31T10:00:00Z", "другие слова"))
+	reads := 0
+	opts, err := parseArgs([]string{"--search", "zz no such fragment q9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, warnings, err := findHitsUsing(opts, e, func(path string, keep func([]byte) bool) ([]line, error) {
+		reads++
+		return readLines(path, keep)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads != 1 {
+		t.Errorf("поиск перечитал транскрипт: readLines вызван %d раз", reads)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("неожиданное предупреждение, получили %d", len(warnings))
+	}
+}
+
+func TestSearchMultilineAskAnswerSeparatesQuestion(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-r6", "ask00001-0000",
+		ask("2026-10-31T10:00:00Z", "t1"),
+		answer("2026-10-31T10:01:00Z", "t1", "Удалить ветки?\nвсе архивные сразу", "Нет ← сначала спроси"),
+	)
+	if code, out, errOut := runUW(t, e, p, "все архивные сразу"); code != exitNone || strings.Contains(out, "Нет ← сначала спроси") {
+		t.Errorf("строка вопроса не должна находиться: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if code, out, errOut := runUW(t, e, p, "Нет ← сначала спроси"); code != 0 || !strings.Contains(out, "Нет ← сначала спроси") {
+		t.Errorf("ответ целиком должен находиться: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}

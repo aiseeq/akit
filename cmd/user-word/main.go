@@ -37,6 +37,9 @@ Without --until, the brief file's modification time is used.
 
 FRAGMENT matches ignoring case, ё/е and line breaks or runs of spaces.
 User lines: typed or queued by the human, and answers in a question dialog.
+Question dialog searches match only the human's answer; the question is shown
+as context. A zone after a brief marker clock accepts CET/CEST and UTC/GMT/Z
+(case-insensitive); an unknown zone is reported as not found.
 Exit: 0 found, 1 not found, 2 usage/IO error.
 `
 
@@ -179,6 +182,7 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 	}
 	at := lastWith(lines, opts.frag)
 	if at < 0 {
+		writeWarnings(stderr, lines)
 		fmt.Fprintf(stderr, "user-word: no user line with %q in %s\nin other sessions: user-word --search %q\n", opts.frag, opts.path, opts.frag)
 		return exitNone
 	}

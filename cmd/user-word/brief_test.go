@@ -536,3 +536,20 @@ func TestBriefTimedQuoteNotFoundNamesWindow(t *testing.T) {
 	_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Ок (пользователь 31.10 10:00 UTC: «да»).\n"), "--until", "2026-10-31 17:00")
 	mustHave(t, "окно", out, "no matching user line within 2m0s of marker time", "1 not found")
 }
+
+func TestR6MarkerZonesCaseAndUnknownZone(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r6", "zone0000-0000",
+		human("2026-10-31T10:00:00Z", "UTC нижний регистр"),
+		human("2026-10-31T09:00:00Z", "Местное время CET"),
+	)
+	b := writeBrief(t, t.TempDir(),
+		"Пользователь 31.10 10:00 utc: «UTC нижний регистр»\n"+
+			"Пользователь 31.10 10:00 MSK: «Неизвестный пояс»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "utc без регистра найден в UTC", out, "1 found", "UTC нижний регистр")
+	mustHave(t, "неизвестный пояс отвергнут с причиной", out, "zone MSK", "1 not found")
+	if strings.Contains(out, "Местное время CET") {
+		t.Errorf("MSK ошибочно трактован как местное время:\n%s", out)
+	}
+}
