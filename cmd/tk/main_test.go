@@ -1184,6 +1184,11 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 		"пустой журнал раньше": head + "## Журнал\n\n## План\n- accept: true\n\n## Журнал\n" + added,
 		"заголовок в журнале":  head + "## План\n- accept: true\n\n## Журнал\n## x\n" + added,
 		"\\r в заголовке":      head + "## План\n- accept: true\n\n## Журнал\r\n" + added,
+		// строка «обязательный» на месте, но склеена с предыдущей другим концом строки
+		"\\r вместо \\n перед строкой": head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\r" + added,
+		"U+2028 перед строкой":         head + "## План\n- accept: true\n\n## Журнал\n- 2020-01-01 11:00 план — planner: добавлен пункт digest\u2028" + added,
+		// вторая строка с другой командой не меняет закреплённую первой
+		"вторая строка с другой командой": head + "## План\n- accept: true\n\n## Журнал\n" + added + "- 2020-01-01 12:10 план — night: добавлен обязательный пункт accept: true\n",
 	}
 	for name, body := range cases {
 		items := planItems(body)
@@ -1211,6 +1216,13 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
+	for _, required := range []bool{true, false} {
+		if code := addPlanItem(task{path: path, slug: "task", body: body}, options{by: "night", add: "accept: true", required: required}, &out, &errOut); code != exitUsage ||
+			!strings.Contains(errOut.String(), "pinned") || read(t, path) != body {
+			t.Fatalf("re-add with another command (required %v): %d %s", required, code, errOut.String())
+		}
+		errOut.Reset()
+	}
 	if code := addPlanItem(task{path: path, slug: "task", body: body}, options{by: "planner", add: "accept: ./accept.sh", required: true}, &out, &errOut); code != 0 {
 		t.Fatalf("re-add of a removed required item: %d %s", code, errOut.String())
 	}

@@ -63,7 +63,7 @@ Flags:
   --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject: why the ticket was declined; skip: why the plan item is skipped (required)
   --add TEXT     plan: add a named command to the ticket plan (required)
-  --required     plan: the item cannot be skipped (tk skip refuses, exit 2) or dropped from the plan
+  --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
 
@@ -1274,14 +1274,18 @@ func missingRequired(body string, present map[string]bool) []planJSON {
 	return items
 }
 
-// requiredPlan — пункты, добавленные с --required, и их команды (последнее добавление); однажды обязательный
-// остаётся обязательным. Строки ищутся по всему тикету, не только в журнале: правка разметки журнала
-// (заголовок, лишний раздел) не должна снимать обязательность, а лишняя строка её только добавляет.
+// requiredPlan — пункты, добавленные с --required, и их команды (первое добавление: дописанная позже строка
+// команду не меняет); однажды обязательный остаётся обязательным. Строки ищутся по всему тикету и делятся
+// любым концом строки: правка разметки журнала (заголовок, лишний раздел, `\r` или U+2028 перед строкой)
+// не должна снимать обязательность, а лишняя строка её только добавляет.
 func requiredPlan(body string) map[string]string {
 	req := map[string]string{}
-	for l := range strings.SplitSeq(body, "\n") {
+	lineEnd := func(r rune) bool { return r == '\n' || r == '\r' || r == ' ' || r == ' ' || r == '\u0085' }
+	for _, l := range strings.FieldsFunc(body, lineEnd) {
 		if m := planAddRE.FindStringSubmatch(l); m != nil && m[1] != "" {
-			req[m[2]] = m[3]
+			if _, ok := req[m[2]]; !ok {
+				req[m[2]] = m[3]
+			}
 		}
 	}
 	return req
@@ -1338,6 +1342,10 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 			fmt.Fprintf(errout, "tk: plan name %q already exists\n", name)
 			return exitUsage
 		}
+	}
+	if pinned, ok := requiredPlan(t.body)[name]; ok && pinned != command {
+		fmt.Fprintf(errout, "tk: plan item %q is required and pinned to %q by its first --required add; it keeps that command\n", name, pinned)
+		return exitUsage
 	}
 	line := "- " + name + ": " + command
 	entry := fmt.Sprintf("- %s план — %s: добавлен пункт %s", time.Now().Format("2006-01-02 15:04"), o.by, name)

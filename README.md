@@ -151,7 +151,9 @@ after an independent review.
 journal by hand does not count, and `tk done` refuses a ticket whose plan no longer has it (the
 section removed or renamed included) or runs another command under its name. The journal line
 `добавлен обязательный пункт NAME: COMMAND` marks it wherever it stands in the ticket, so editing the
-journal headings around it does not drop it; `tk plan --add` brings a removed one back.
+journal headings or line breaks around it does not drop it. The first such line pins the command: a
+later one does not change it, and `tk plan --add` of that name with another command is refused (exit
+2); with the same command it brings a removed item back.
 Each check runs in
 `bash -c` from the repository root with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
