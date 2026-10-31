@@ -1475,11 +1475,13 @@ type planResult struct {
 func runPlanItem(root string, item planJSON) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
 	defer cancel()
-	// bash — по абсолютному пути и без файлов старта из окружения: BASH_ENV, ENV или функция BASH_FUNC_*
-	// вызывающего исполнились бы раньше команды и подменили бы её итог
+	// bash — по абсолютному пути, без файлов старта и опций из окружения: BASH_ENV, ENV или функция BASH_FUNC_*
+	// вызывающего исполнились бы раньше команды и подменили бы её итог, SHELLOPTS=noexec не дал бы ей исполниться
+	// вовсе (выход 0), BASHOPTS так же меняет сам bash
 	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", item.Cmd)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "BASH_ENV=") || strings.HasPrefix(kv, "ENV=") || strings.HasPrefix(kv, "BASH_FUNC_")
+		return strings.HasPrefix(kv, "BASH_ENV=") || strings.HasPrefix(kv, "ENV=") || strings.HasPrefix(kv, "BASH_FUNC_") ||
+			strings.HasPrefix(kv, "SHELLOPTS=") || strings.HasPrefix(kv, "BASHOPTS=")
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

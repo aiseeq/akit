@@ -1271,6 +1271,8 @@ func TestPlanItemIgnoresShellStartupEnv(t *testing.T) {
 	t.Setenv("BASH_ENV", write("env.sh", "exit 0\n"))
 	t.Setenv("ENV", filepath.Join(dir, "env.sh"))
 	t.Setenv("BASH_FUNC_exit%%", "() { builtin exit 0; }")
+	t.Setenv("SHELLOPTS", "noexec") // команды разбираются, но не исполняются: выход 0
+	t.Setenv("BASHOPTS", "extdebug")
 	if err := os.Mkdir(filepath.Join(dir, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}

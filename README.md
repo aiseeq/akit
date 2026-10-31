@@ -163,7 +163,7 @@ edit makes them — leave the item invalid, so `tk done` refuses. Text tk writes
 `--add`, `--why`, `--check`, `--title`, `--until`) must be one line: no control character but a tab, no
 Unicode line or paragraph separator.
 Each check runs in
-`/bin/bash -c` from the repository root, without `BASH_ENV`, `ENV` and `BASH_FUNC_*` from the caller's
+`/bin/bash -c` from the repository root, without `BASH_ENV`, `ENV`, `BASH_FUNC_*`, `SHELLOPTS` and `BASHOPTS` from the caller's
 environment, with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.
