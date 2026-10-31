@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,8 +91,8 @@ var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 // «пропущен:» внутри заметки или причины другого пункта пропуском не считается.
 var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:план — \S+: )?пропущен: ([a-z0-9-]+) — (.*)$`)
 
-// planAddRE — строка журнала tk plan --add; «обязательный» — с --required.
-var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен (обязательный )?пункт ([a-z0-9-]+)$`)
+// planAddRE — строка журнала tk plan --add; «обязательный» — с --required, тогда после имени — команда пункта.
+var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
 var errHelp = errors.New("help")
 var session = currentSession
 var planTimeout = 60 * time.Second
@@ -1225,7 +1226,8 @@ func planItems(body string) []planJSON {
 	}
 	section, ok := sectionBody(body, "## План")
 	if !ok {
-		return items
+		// Без раздела план пуст, но обязательные пункты из журнала никуда не деваются.
+		return append(items, missingRequired(body, nil)...)
 	}
 	seen := make(map[string]bool)
 	for line := range strings.SplitSeq(section, "\n") {
@@ -1246,36 +1248,43 @@ func planItems(body string) []planJSON {
 		}
 		seen[name] = true
 		why, skipped := planSkipReason(body, name)
-		required := planRequired(body, name)
-		// Пропуск обязательного пункта не действует, даже вписанный в журнал руками.
+		pinned, required := requiredPlan(body)[name]
+		item := planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why, Required: required}
 		if required {
-			why, skipped = "", false
+			// Пропуск обязательного пункта не действует, даже вписанный в журнал руками; команда — та, что добавлена.
+			item.Skipped, item.Why = false, ""
+			if pinned != "" && command != pinned {
+				item.Invalid = fmt.Sprintf("required plan item %q runs %q, but it was added with --required as %q", name, command, pinned)
+			}
 		}
-		items = append(items, planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why, Required: required})
+		items = append(items, item)
 	}
-	// Обязательный пункт, убранный из плана правкой текста, закрытие не пропускает.
-	for _, name := range requiredNames(body) {
-		if !seen[name] {
-			items = append(items, planJSON{Name: name, Required: true, Invalid: fmt.Sprintf("required plan item %q is missing from ## План", name)})
+	return append(items, missingRequired(body, seen)...)
+}
+
+// missingRequired — обязательные пункты, убранные из плана правкой текста: закрытие их не пропускает.
+func missingRequired(body string, present map[string]bool) []planJSON {
+	var items []planJSON
+	req := requiredPlan(body)
+	for _, name := range slices.Sorted(maps.Keys(req)) {
+		if !present[name] {
+			items = append(items, planJSON{Name: name, Cmd: req[name], Required: true, Missing: true, Invalid: fmt.Sprintf("required plan item %q is missing from ## План", name)})
 		}
 	}
 	return items
 }
 
-// requiredNames — пункты, добавленные с --required, по журналу; однажды обязательный остаётся обязательным.
-func requiredNames(body string) []string {
-	var names []string
-	seen := map[string]bool{}
+// requiredPlan — пункты, добавленные с --required, по журналу, и их команды (последнее добавление); однажды
+// обязательный остаётся обязательным.
+func requiredPlan(body string) map[string]string {
+	req := map[string]string{}
 	for _, l := range journalLines(body) {
-		if m := planAddRE.FindStringSubmatch(l); m != nil && m[1] != "" && !seen[m[2]] {
-			seen[m[2]] = true
-			names = append(names, m[2])
+		if m := planAddRE.FindStringSubmatch(l); m != nil && m[1] != "" {
+			req[m[2]] = m[3]
 		}
 	}
-	return names
+	return req
 }
-
-func planRequired(body, name string) bool { return slices.Contains(requiredNames(body), name) }
 
 // planHeadings считает заголовки «## План» и похожие на него (регистр, пробелы, `\r`, двоеточие, иное число
 // `#`): похожий план не исполнился бы, и тикет закрылся бы мимо него.
@@ -1324,18 +1333,18 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	for _, item := range planItems(t.body) {
-		if item.Name == name {
+		if item.Name == name && !item.Missing {
 			fmt.Fprintf(errout, "tk: plan name %q already exists\n", name)
 			return exitUsage
 		}
 	}
 	line := "- " + name + ": " + command
-	kind := ""
+	entry := fmt.Sprintf("- %s план — %s: добавлен пункт %s", time.Now().Format("2006-01-02 15:04"), o.by, name)
 	if o.required {
-		kind = "обязательный "
+		entry = fmt.Sprintf("- %s план — %s: добавлен обязательный пункт %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, name, command)
 	}
 	t.body = insertPlanLine(t.body, line)
-	t.body = journal(t.body, fmt.Sprintf("- %s план — %s: добавлен %sпункт %s", time.Now().Format("2006-01-02 15:04"), o.by, kind, name))
+	t.body = journal(t.body, entry)
 	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
 		return fail(errout, err)
 	}
@@ -1787,6 +1796,7 @@ type planJSON struct {
 	Skipped  bool   `json:"skipped"`
 	Why      string `json:"why"`
 	Required bool   `json:"required,omitempty"`
+	Missing  bool   `json:"missing,omitempty"`
 	Invalid  string `json:"invalid,omitempty"`
 }
 

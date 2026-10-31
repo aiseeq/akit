@@ -1124,7 +1124,7 @@ func TestRequiredPlanItemCannotBeSkipped(t *testing.T) {
 		t.Fatalf("add required: %d %s", code, errOut.String())
 	}
 	added := read(t, path)
-	if !strings.Contains(added, "план — planner: добавлен обязательный пункт accept") {
+	if !strings.Contains(added, "план — planner: добавлен обязательный пункт accept: exit 3") {
 		t.Fatalf("journal without the required mark:\n%s", added)
 	}
 	errOut.Reset()
@@ -1167,4 +1167,49 @@ func read(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// Обходы обязательного пункта правкой текста: пропуск, вписанный руками и ничем не перекрытый; удалённый или
+// переименованный раздел плана; та же строка с другой командой. Удалённый пункт возвращается через tk plan.
+func TestRequiredPlanItemTextEdits(t *testing.T) {
+	const added = "- 2020-01-01 12:00 план — planner: добавлен обязательный пункт accept: ./accept.sh\n"
+	head := "# Task\n\nСтатус: на проверке\n\n"
+	cases := map[string]string{
+		"вписанный пропуск": head + "## План\n- accept: ./accept.sh\n\n## Журнал\n" + added + "- 2020-01-01 12:05 план — worker: пропущен: accept — forged\n",
+		"нет раздела":       head + "## Журнал\n" + added,
+		"другой заголовок":  head + "## Plan\n- accept: ./accept.sh\n\n## Журнал\n" + added,
+		"другая команда":    head + "## План\n- accept: true\n\n## Журнал\n" + added,
+	}
+	for name, body := range cases {
+		items := planItems(body)
+		blocked := false
+		for _, it := range items {
+			if it.Name == "accept" && !it.Skipped && it.Required {
+				blocked = it.Invalid != "" || it.Cmd == "./accept.sh"
+			}
+		}
+		if !blocked {
+			t.Errorf("%s: обязательный пункт обойдён: %#v", name, items)
+		}
+	}
+	if items := planItems(cases["другая команда"]); len(items) != 1 || !strings.Contains(items[0].Invalid, "added with --required as") {
+		t.Errorf("подмена команды не названа: %#v", items)
+	}
+
+	dir := filepath.Join(t.TempDir(), "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
+	body := cases["нет раздела"]
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := addPlanItem(task{path: path, slug: "task", body: body}, options{by: "planner", add: "accept: ./accept.sh", required: true}, &out, &errOut); code != 0 {
+		t.Fatalf("re-add of a removed required item: %d %s", code, errOut.String())
+	}
+	if items := planItems(read(t, path)); len(items) != 1 || items[0].Invalid != "" || items[0].Cmd != "./accept.sh" {
+		t.Fatalf("after re-add: %#v", items)
+	}
 }

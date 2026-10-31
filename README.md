@@ -146,8 +146,10 @@ after an independent review.
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. A check added with
 `--required` cannot be skipped: `tk skip` refuses it with exit 2, a skip line written into the
-journal by hand does not count, and `tk done` refuses a ticket whose `## План` no longer has it
-(the journal line `добавлен обязательный пункт NAME` marks it). Each check runs in
+journal by hand does not count, and `tk done` refuses a ticket whose plan no longer has it (the
+section removed or renamed included) or runs another command under its name. The journal line
+`добавлен обязательный пункт NAME: COMMAND` marks it; `tk plan --add` brings a removed one back.
+Each check runs in
 `bash -c` from the repository root with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.
