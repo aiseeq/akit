@@ -141,6 +141,19 @@ func TestExportErrors(t *testing.T) {
 	if code, _, _ := runExport(t, "--src-home", src, "--rules", rules, src); code != exitUsage {
 		t.Errorf("OUT_DIR = источник: code %d", code)
 	}
+	root := filepath.Dir(src)
+	for _, out := range []string{root, rules, filepath.Join(src, ".claude")} {
+		code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+		if code != exitUsage || !strings.Contains(stderr, "must not contain") {
+			t.Errorf("OUT_DIR %s содержит источник или правила: code %d %q", out, code, stderr)
+		}
+		if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(rules, "manifest/skills.txt")) != "jira\n" {
+			t.Fatalf("OUT_DIR %s: источник или правила стёрты", out)
+		}
+	}
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(src, "export")); code != 0 {
+		t.Errorf("OUT_DIR внутри home, вне читаемого: code %d %q", code, stderr)
+	}
 	write(t, filepath.Join(rules, "manifest/pii.tsv"), "# пусто\n", 0o644)
 	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(t.TempDir(), "o")); code != exitUsage || !strings.Contains(stderr, "no rules") {
 		t.Errorf("пустой pii.tsv: code %d %q", code, stderr)

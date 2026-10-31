@@ -23,8 +23,18 @@ func export(opts options, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("--src-home: %w", err)
 	}
+	rules, err := filepath.Abs(opts.rules)
+	if err != nil {
+		return fmt.Errorf("--rules: %w", err)
+	}
 	if out == "/" || out == src {
 		return errors.New("OUT_DIR must not be / or the source home")
+	}
+	// OUT_DIR очищается: папка, где лежит читаемое или внутри читаемого, стёрла бы источник
+	for _, read := range []string{src, filepath.Join(src, ".claude"), filepath.Join(src, "work"), rules} {
+		if within(read, out) || (read != src && within(out, read)) {
+			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
+		}
 	}
 	m, err := readManifest(opts.rules)
 	if err != nil {
@@ -160,4 +170,10 @@ func findPII(root string, files []string, pii []piiRule) ([]string, error) {
 		}
 	}
 	return hits, nil
+}
+
+// within — путь p совпадает с dir или лежит внутри него.
+func within(p, dir string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

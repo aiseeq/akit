@@ -304,3 +304,30 @@ func TestRerunContinues(t *testing.T) {
 		t.Errorf("two line conditions: code %d: %s", code, out)
 	}
 }
+
+// Неполная последняя строка, бывшая в файле до старта, с --new не в счёт ни сразу, ни дописанная.
+func TestNewSkipsPartialLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	if err := appendFile(path, "build\nold DONE"); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := wfor(t, "line", "DONE", path, "--new", "--every", "10ms", "--timeout", "50ms"); code != exitTimeout {
+		t.Errorf("прежняя неполная строка засчитана сразу: code %d: %s", code, out)
+	}
+	c, err := newLineCond("DONE", path, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendFile(path, " tail"); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := c.check(t.Context()); hit || err != nil {
+		t.Fatalf("недописанная прежняя строка: hit %v %v", hit, err)
+	}
+	if err := appendFile(path, "\nDONE new\n"); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := c.check(t.Context()); !hit || err != nil || c.hitLine != 3 || c.hit != "DONE new" {
+		t.Errorf("hit %v %v: line %d %q", hit, err, c.hitLine, c.hit)
+	}
+}

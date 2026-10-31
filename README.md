@@ -33,11 +33,12 @@ script with a `NestedError` that identifies the script and unwraps its parse err
 
 Is the machine busy, in one line, by the rule graft uses to queue heavy tasks
 (`akit/pressure`): tasks ready to run now (`procs_running`, one reading) or the 1-minute load average
-at or above the machine's threads, disk IO pressure at or above 9.6% over 5 seconds, or memory pressure (some avg10) above
+at or above the machine's threads, disk IO pressure at or above 9.6% over 5 seconds or a disk freeze in
+progress reported by the disk state source, or memory pressure (some avg10) above
 10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
 from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
 in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to change the threshold
-(100 disables disk checks) and `--kind K` to request a profile kind. Your own thresholds go in
+(100 disables disk checks, the freeze too) and `--kind K` to request a profile kind. Your own thresholds go in
 `$XDG_CONFIG_HOME/akit/pressure.yaml` as `key: value` lines (`runnable`, `max_io_full`, `max_mem_some`,
 `max_swap_kbs`, `swap_window`), shared with graft; flags override the file, and a value that is not a
 finite positive number (or a positive duration) is an error. Use busy instead of reading `/proc/loadavg`
@@ -72,7 +73,8 @@ change in `full total` from `/proc/pressure/io` over the sampling interval.
 
 Claude Code rules and skills exported for colleagues and checked for private data: the chosen
 skills, the chosen sections of the global CLAUDE.md and the workspace rules are copied into OUT_DIR
-(cleared but for `.git`), literal replacements are made, listed lines dropped, then the export is
+(cleared but for `.git`; an OUT_DIR that holds or lies in what is read — the source home, its
+`.claude` and `work`, the `--rules` folder — is refused first), literal replacements are made, listed lines dropped, then the export is
 searched for private data patterns. What to export and what counts as private is data in the
 `--rules` folder (`manifest/`, `README.template.md`), not code. Exit 0 clean, 1 private data or a
 missing skill, 2 usage/IO error.

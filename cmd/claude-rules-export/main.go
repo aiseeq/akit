@@ -29,6 +29,9 @@ line of manifest/drop-lines.txt are dropped. Last, manifest/pii.tsv
 (KIND<TAB>REGEXP<TAB>ALLOWED REGEXP) is searched for: each hit not fully matching
 ALLOWED is printed as file:line: KIND.
 
+An OUT_DIR that holds the source home or --rules, or is or lies in --rules,
+<home>/.claude or <home>/work, is refused before anything is cleared.
+
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).
 Exit: 0 clean, 1 private data or a missing skill, 2 usage/IO error.

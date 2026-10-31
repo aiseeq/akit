@@ -99,6 +99,8 @@ type lineCond struct {
 	hitLine int
 	absent  bool
 	skipped bool // начато с --new или --after: повтор вызова должен продолжить с той же строки
+	// partial — с --new файл кончался неполной строкой: она начата до старта и не в счёт, пока не кончится
+	partial bool
 }
 
 // markLen — сколько байт начала и края прочитанного сверяется, чтобы узнать перезапись на месте.
@@ -149,6 +151,7 @@ func (c *lineCond) skipLines(all bool, n int) error {
 		lines = n
 	}
 	c.file, c.lines = st, lines
+	c.partial = all && end < len(data)
 	c.consumed(data[:end])
 	// последняя строка пропущенного — в ответ по таймауту, пока не дописано новое
 	for line := range bytes.Lines(data[:end]) {
@@ -211,7 +214,7 @@ func (c *lineCond) check(context.Context) (bool, error) {
 		return false, err
 	}
 	if replaced {
-		c.off, c.lines, c.tail, c.head, c.edge = 0, 0, nil, nil, nil
+		c.off, c.lines, c.tail, c.head, c.edge, c.partial = 0, 0, nil, nil, nil, false
 	}
 	c.file = st
 	if _, err := f.Seek(c.off, io.SeekStart); err != nil {
@@ -222,15 +225,20 @@ func (c *lineCond) check(context.Context) (bool, error) {
 		return false, fmt.Errorf("%s: %w", c, err)
 	}
 	end := bytes.LastIndexByte(data, '\n') + 1
+	first := c.partial
 	for line := range bytes.Lines(data[:end]) {
 		c.lines++
+		if first {
+			first, c.partial = false, false
+			continue
+		}
 		if c.match(bytes.TrimRight(line, "\r\n"), c.lines) {
 			return true, nil
 		}
 	}
 	c.consumed(data[:end])
 	c.tail = data[end:]
-	return len(c.tail) > 0 && c.match(c.tail, c.lines+1), nil
+	return len(c.tail) > 0 && !c.partial && c.match(c.tail, c.lines+1), nil
 }
 
 func (c *lineCond) match(line []byte, n int) bool {

@@ -27,8 +27,9 @@ Usage:
   busy (--quiet-until TIME | --quiet D) [--why TEXT] | --quiet-off
 
 Busy when quiet mode is on, the tasks ready to run now (procs_running, one reading, without busy
-itself) or the 1-minute load average are at or above the machine's threads, disk IO pressure is at or above 9.6%, or the
-memory pressure (some avg10) is above 10% while swapping over the window is above 1024 KB/s.
+itself) or the 1-minute load average are at or above the machine's threads, disk IO pressure is at or above 9.6%
+or the disk state source reports a disk freeze in progress, or the memory pressure (some avg10) is above 10%
+while swapping over the window is above 1024 KB/s.
 Swapping alone is not busy. The same rule graft uses to queue heavy tasks. The limits below are the
 defaults; the user's own are flat "key: value" lines in $XDG_CONFIG_HOME/akit/pressure.yaml
 (~/.config/akit/pressure.yaml; keys runnable, max_io_full, max_mem_some, max_swap_kbs, swap_window),
