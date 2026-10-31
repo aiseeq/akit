@@ -132,6 +132,9 @@ func parseArgs(a []string) (options, error) {
 	if err != nil {
 		return o, err
 	}
+	if o.required && o.cmd != "plan" {
+		return o, errors.New("--required is a flag of tk plan --add")
+	}
 	if err := validateCommand(&o, pos); err != nil {
 		return o, err
 	}
@@ -202,9 +205,6 @@ func parseOptions(args []string, o *options) ([]string, error) {
 }
 
 func validateCommand(o *options, pos []string) error {
-	if o.required && o.cmd != "plan" {
-		return errors.New("--required is a flag of tk plan --add")
-	}
 	switch o.cmd {
 	case "plan":
 		return validatePlanCommand(o, pos)
