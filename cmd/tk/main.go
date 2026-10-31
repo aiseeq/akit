@@ -851,8 +851,8 @@ func matchesListFilters(t task, o options) bool {
 		if t.status != "ждёт" {
 			return false
 		}
-		at, err := timearg.Parse(waiting(t.body), time.Now())
-		if err != nil || at.After(time.Now()) {
+		at, ok := waitDue(waiting(t.body), time.Now())
+		if !ok || at.After(time.Now()) {
 			return false
 		}
 	}
@@ -876,7 +876,7 @@ func printTask(out io.Writer, t task, label string) {
 	wait := waiting(t.body)
 	if wait != "" {
 		shown := wait
-		if at, err := timearg.Parse(wait, time.Now()); err == nil {
+		if at, ok := waitDue(wait, time.Now()); ok {
 			shown = "до " + at.Format("2006-01-02 15:04")
 			if !at.After(time.Now()) {
 				shown += " overdue"
@@ -893,6 +893,51 @@ func printTask(out io.Writer, t task, label string) {
 
 func waiting(s string) string {
 	return lineValue(s, "Ждёт: ")
+}
+
+// waitClock — ведущее время без даты: «12:00» в строке ожидания значит день, когда её записали.
+var waitClock = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
+
+// waitAgo — «назад» (30m, 2h): timearg его понимает, сроком ожидания он не бывает.
+var waitAgo = regexp.MustCompile(`^[0-9]+[smhd]$`)
+
+// waitISO — дата и часы через T без пояса (2026-10-31T12:00), не RFC3339.
+var waitISO = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{1,2}:[0-9]{2}(:[0-9]{2})?)$`)
+
+// waitDue — срок ожидания: время в начале строки «Ждёт:» (дата, дата с часами, «ДД.ММ ЧЧ:ММ», ISO с T, RFC3339,
+// часы; UTC после часов — в UTC, иначе местное), дальше — текст. Без времени в начале — условие, срока нет.
+// «Назад» (30m) сроком не бывает.
+func waitDue(wait string, now time.Time) (time.Time, bool) {
+	f := strings.Fields(wait)
+	if len(f) == 0 || waitAgo.MatchString(f[0]) {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, f[0]); err == nil {
+		return t, true
+	}
+	if m := waitISO.FindStringSubmatch(f[0]); m != nil {
+		f = append([]string{m[1], m[2]}, f[1:]...)
+	}
+	for n := min(2, len(f)); n >= 1; n-- {
+		t, err := timearg.Parse(strings.Join(f[:n], " "), now)
+		if err != nil {
+			continue
+		}
+		if len(f) > n && (f[n] == "UTC" || f[n] == "Z") {
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+		}
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+// datedWait дописывает дату к ожиданию, которое начинается с часов: иначе срок сдвигался бы на каждый новый день.
+func datedWait(wait string, now time.Time) string {
+	f := strings.Fields(wait)
+	if len(f) > 0 && waitClock.MatchString(f[0]) {
+		return now.Format("2006-01-02 ") + strings.TrimSpace(wait)
+	}
+	return wait
 }
 
 func setWaiting(s, value string) string {
@@ -1623,6 +1668,10 @@ func transition(t task, o options, out, errout io.Writer) int {
 		t.body = setExecutor(t.body, o.by)
 	}
 	if o.cmd == "wait" {
+		o.until = datedWait(o.until, time.Now())
+		if _, ok := waitDue(o.until, time.Now()); !ok {
+			fmt.Fprintln(errout, "tk: --until has no time at the start: a condition, tk ls --due will not show it")
+		}
 		t.body = setWaiting(setStatus(t.body, next), o.until)
 	}
 	if o.cmd == "start" {
@@ -1705,7 +1754,7 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	waits := waiting(t.body)
 	overdue := false
 	if t.status == "ждёт" {
-		if at, err := timearg.Parse(waits, time.Now()); err == nil && !at.After(time.Now()) {
+		if at, ok := waitDue(waits, time.Now()); ok && !at.After(time.Now()) {
 			overdue = true
 		}
 	}

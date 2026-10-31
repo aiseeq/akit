@@ -1020,3 +1020,81 @@ func TestArchiveRootAndListSlugJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestWaitDueForms(t *testing.T) {
+	now := time.Date(2026, 10, 31, 15, 0, 0, 0, time.Local)
+	at := func(m, d, h int) time.Time { return time.Date(2026, time.Month(m), d, h, 0, 0, 0, time.Local) }
+	for _, c := range []struct {
+		wait string
+		want time.Time
+		ok   bool
+	}{
+		{"2026-10-31 12:00", at(10, 31, 12), true},
+		{"2026-10-31T12:00", at(10, 31, 12), true},
+		{"2026-10-31 12:00 итог замера", at(10, 31, 12), true},
+		{"2026-11-02 09:00 CET (выходные)", at(11, 2, 9), true},
+		{"2026-11-01 09:00 - ночь 01.11: шаг прошёл", at(11, 1, 9), true},
+		{"31.10 12:00 после замера", at(10, 31, 12), true},
+		{"2026-11-01 (днём)", at(11, 1, 0), true},
+		{"2026-10-31T11:00:00Z", time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC), true},
+		{"2026-10-31 11:00 UTC", time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC), true},
+		{"после ответа", time.Time{}, false},
+		{"ночь 30.10: файл есть", time.Time{}, false},
+		{"2h после деплоя", time.Time{}, false},
+		{"", time.Time{}, false},
+	} {
+		got, ok := waitDue(c.wait, now)
+		if ok != c.ok || !got.Equal(c.want) {
+			t.Errorf("waitDue(%q) = %v, %v; ждали %v, %v", c.wait, got, ok, c.want, c.ok)
+		}
+	}
+	if got := datedWait("12:00 итог", now); got != "2026-10-31 12:00 итог" {
+		t.Errorf("datedWait = %q", got)
+	}
+	if got := datedWait("после ответа", now); got != "после ответа" {
+		t.Errorf("datedWait условия = %q", got)
+	}
+}
+
+func TestDueWithTextAndISO(t *testing.T) {
+	for _, wait := range []string{"2020-01-01T12:00", "2020-01-01 12:00 итог замера", "2020-01-01 12:00 CET (x)"} {
+		waiting := task{status: "ждёт", body: "Статус: ждёт\nЖдёт: " + wait}
+		if !matchesListFilters(waiting, options{cmd: "ls", due: true}) {
+			t.Errorf("--due пропустил просроченное %q", wait)
+		}
+		if !taskObject("", waiting, "", false).Overdue {
+			t.Errorf("overdue false у %q", wait)
+		}
+	}
+	for _, wait := range []string{"2999-01-01 12:00 итог", "после ответа"} {
+		if matchesListFilters(task{status: "ждёт", body: "Статус: ждёт\nЖдёт: " + wait}, options{cmd: "ls", due: true}) {
+			t.Errorf("--due показал непросроченное %q", wait)
+		}
+	}
+}
+
+func TestWaitDatesBareClockAndWarnsOnCondition(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20200101-1200-MEDIUM-clock.md")
+	body := "# Clock\n\nСтатус: открыт\n\n## Что сделать\nx\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := transition(task{path: path, slug: "clock", body: body}, options{cmd: "wait", by: "worker", until: "23:59 итог"}, &out, &errOut); code != 0 {
+		t.Fatalf("wait %d: %s", code, errOut.String())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), "Ждёт: "+time.Now().Format("2006-01-02")+" 23:59 итог") {
+		t.Fatalf("часы без даты не получили дату: %s, %v", data, err)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("лишнее предупреждение: %q", errOut.String())
+	}
+	errOut.Reset()
+	if code := transition(task{path: path, slug: "clock", body: string(data)}, options{cmd: "wait", by: "worker", until: "после ответа"}, &out, &errOut); code != 0 {
+		t.Fatalf("wait %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "tk ls --due will not show it") {
+		t.Errorf("нет предупреждения про условие: %q", errOut.String())
+	}
+}

@@ -152,7 +152,9 @@ Ticket IDs accept the slug, the full file name, or the file name without `.md`. 
 repository, `tk` uses the nearest `docs/tasks/` up to `$HOME`; `new` creates it in the current
 directory when none exists. `tk ls --all` includes closed tickets; `--status STATUS` filters by
 status, `--by NAME` filters by executor (or opening actor on older tickets), and `--due` lists
-waiting tickets whose parsed deadline has passed. Empty acceptance sections are marked `no-check`.
+waiting tickets whose deadline has passed: the time at the start of `--until` (`2026-10-28 09:00`, `2026-10-28T09:00`,
+`28.10 09:00`, a date, RFC3339; `UTC` after it means UTC), any text after it is a note. A clock time without a date
+gets today's date when written; `--until` without a time is a condition and never due. Empty acceptance sections are marked `no-check`.
 When `.glint.yaml` exists at the task base, `tk done` checks all glint severities; findings block
 completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
