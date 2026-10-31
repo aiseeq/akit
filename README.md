@@ -203,10 +203,19 @@ directory when `XDG_CACHE_HOME` is unset); changing the transcript or the `tl` b
 The user's own words from another session's transcript around a fragment: the end of the agent's
 reply before it (what the user answered), the line itself and the user's next lines within N
 minutes. Lines typed or queued by the human and answers in a question dialog count. Exit 0 found,
-1 not found, 2 usage/IO error.
+1 not found, 2 usage/IO error. `--brief` finds linked fragments and dated user
+quotes in a brief, showing each matching line with its agent reply and up to 20
+later user lines from the same session through the brief time. Without `--until`,
+the brief file's modification time is used. Quotes on the same marker day that
+match different user lines are shown as ambiguous; `…` matches ordered fragments.
+A transcript reference counts only when its path starts with `/` or `~/`, ends in
+`.jsonl`, and is followed by a quoted fragment. `~` expands only at the start of
+`~/`. A marker with a clock searches within two minutes of that time; without a
+clock, the whole marked day is searched.
 
     user-word ~/.claude/projects/-home-x/1a2b3c4d-….jsonl 'да, делай' [MINUTES]
     user-word --search 'да, делай' [--since 2026-10-24] [--project akit]
+    user-word --brief task.md [--until '2026-10-31 15:00']
 
 ## wfor
 

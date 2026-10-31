@@ -21,6 +21,7 @@ const usage = `user-word — the user's own words from another session's transcr
 Usage:
   user-word TRANSCRIPT.jsonl 'FRAGMENT' [MINUTES]
   user-word --search 'FRAGMENT' [--since YYYY-MM-DD] [--project S]
+  user-word --brief FILE [--until 'YYYY-MM-DD HH:MM']
 
 The first form prints the end of the agent's reply before the user's line with
 FRAGMENT (what the user answered), the line itself and the user's next lines
@@ -30,6 +31,9 @@ the sender refers to the fresh decision; for an earlier one, a longer fragment.
 --search looks through all session transcripts in ~/.claude/projects: up to 5
 hits in full, more — a list by time. --project keeps project folders whose path
 contains S (a project path like ~/git/akit works too).
+
+--brief finds user words cited in a brief and prints their transcript context.
+Without --until, the brief file's modification time is used.
 
 FRAGMENT matches ignoring case, ё/е and line breaks or runs of spaces.
 User lines: typed or queued by the human, and answers in a question dialog.
@@ -48,6 +52,8 @@ type options struct {
 	mins    int
 	since   string // YYYY-MM-DD, местная дата
 	project string
+	brief   bool
+	until   string
 }
 
 var errHelp = errors.New("help")
@@ -80,54 +86,85 @@ var dateArg = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
 
 func parseArgs(args []string) (options, error) {
 	opts := options{mins: 30}
-	for _, a := range args {
-		if a == "-h" || a == "--help" {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
 			return opts, errHelp
 		}
 	}
+	if len(args) > 0 && args[0] == "--brief" {
+		return parseBriefArgs(args)
+	}
 	if len(args) > 0 && args[0] == "--search" {
-		opts.search = true
-		if len(args) < 2 {
-			return opts, errors.New("--search needs a fragment")
+		return parseSearchArgs(args)
+	}
+	return parseTranscriptArgs(args)
+}
+
+func parseBriefArgs(args []string) (options, error) {
+	opts := options{mins: 30, brief: true}
+	if len(args) < 2 || len(args) > 4 {
+		return opts, errors.New("--brief needs FILE and optional --until time")
+	}
+	opts.path = args[1]
+	if len(args) == 2 {
+		return opts, nil
+	}
+	if len(args) != 4 || args[2] != "--until" {
+		return opts, errors.New("--brief accepts only --until 'YYYY-MM-DD HH:MM'")
+	}
+	if _, err := time.ParseInLocation("2006-01-02 15:04", args[3], time.Local); err != nil {
+		return opts, fmt.Errorf("--until needs YYYY-MM-DD HH:MM, got %q", args[3])
+	}
+	opts.until = args[3]
+	return opts, nil
+}
+
+func parseSearchArgs(args []string) (options, error) {
+	opts := options{mins: 30, search: true}
+	if len(args) < 2 || args[1] == "" {
+		return opts, errors.New("--search needs a fragment")
+	}
+	opts.frag = args[1]
+	for i := 2; i < len(args); i += 2 {
+		if i+1 >= len(args) {
+			return opts, fmt.Errorf("%s needs a value", args[i])
 		}
-		opts.frag = args[1]
-		rest := args[2:]
-		for i := 0; i < len(rest); i += 2 {
-			if i+1 >= len(rest) {
-				return opts, fmt.Errorf("%s needs a value", rest[i])
+		value := args[i+1]
+		switch args[i] {
+		case "--since":
+			if !dateArg.MatchString(value) {
+				return opts, fmt.Errorf("--since needs a date YYYY-MM-DD, got %q", value)
 			}
-			switch rest[i] {
-			case "--since":
-				if !dateArg.MatchString(rest[i+1]) {
-					return opts, fmt.Errorf("--since needs a date YYYY-MM-DD, got %q", rest[i+1])
-				}
-				opts.since = rest[i+1]
-			case "--project":
-				opts.project = rest[i+1]
-			default:
-				return opts, fmt.Errorf("unknown flag %s", rest[i])
-			}
-		}
-	} else {
-		if len(args) < 2 || len(args) > 3 {
-			return opts, errors.New("need TRANSCRIPT.jsonl and FRAGMENT")
-		}
-		opts.path, opts.frag = args[0], args[1]
-		if len(args) == 3 {
-			n, err := strconv.Atoi(args[2])
-			if err != nil || n < 0 {
-				return opts, fmt.Errorf("MINUTES needs a number >= 0, got %q", args[2])
-			}
-			opts.mins = n
+			opts.since = value
+		case "--project":
+			opts.project = value
+		default:
+			return opts, fmt.Errorf("unknown flag %s", args[i])
 		}
 	}
-	if opts.frag == "" {
-		return opts, errors.New("empty fragment")
+	return opts, nil
+}
+
+func parseTranscriptArgs(args []string) (options, error) {
+	opts := options{mins: 30}
+	if len(args) < 2 || len(args) > 3 || args[1] == "" {
+		return opts, errors.New("need TRANSCRIPT.jsonl and FRAGMENT")
+	}
+	opts.path, opts.frag = args[0], args[1]
+	if len(args) == 3 {
+		n, err := strconv.Atoi(args[2])
+		if err != nil || n < 0 {
+			return opts, fmt.Errorf("MINUTES needs a number >= 0, got %q", args[2])
+		}
+		opts.mins = n
 	}
 	return opts, nil
 }
 
 func run(opts options, e env, stdout, stderr io.Writer) int {
+	if opts.brief {
+		return runBrief(opts, e, stdout, stderr)
+	}
 	if opts.search {
 		return search(opts, e, stdout, stderr)
 	}

@@ -200,3 +200,25 @@ func TestFragmentFolded(t *testing.T) {
 		t.Errorf("промах в файле подсказывает поиск по всем: code %d, %q", code, errOut)
 	}
 }
+
+// Поздние реплики до времени брифа — не больше briefLater, о скрытых сказано; в обычном режиме предела по числу нет.
+func TestBriefLaterLinesCapped(t *testing.T) {
+	e := testEnv(t)
+	recs := []string{human("2026-10-31T10:00:00Z", "Можешь удалить таблицу")}
+	for i := range briefLater + 2 {
+		recs = append(recs, human(fmt.Sprintf("2026-10-31T10:%02d:00Z", i+1), fmt.Sprintf("потом %d", i)))
+	}
+	p := writeTranscript(t, e.home, "-home-x-proj", "cap00000-0000", recs...)
+	brief := filepath.Join(t.TempDir(), "brief.md")
+	if err := os.WriteFile(brief, []byte("`user-word "+p+" 'удалить таблицу'`\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := runUW(t, e, "--brief", brief, "--until", "2026-10-31 11:00")
+	if !strings.Contains(out, "--- 2 more user lines not shown") || strings.Contains(out, fmt.Sprintf("потом %d\n", briefLater)) {
+		t.Errorf("brief: ждали %d показанных и 2 скрытых:\n%s", briefLater, out)
+	}
+	_, out, _ = runUW(t, e, p, "удалить таблицу", "30")
+	if !strings.Contains(out, fmt.Sprintf("потом %d\n", briefLater+1)) || strings.Contains(out, "not shown") {
+		t.Errorf("обычный режим урезал поздние реплики:\n%s", out)
+	}
+}
