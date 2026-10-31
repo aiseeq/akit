@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -603,6 +605,8 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 		{"plan", "ticket", "--add", "Bad_Name: true", "--by", "worker"},
 		{"plan", "ticket", "--add", "valid:   ", "--by", "worker"},
 		{"skip", "ticket", "valid", "--by", "worker"},
+		{"plan", "ticket", "--add", "one: true\n- two: false", "--by", "worker"},
+		{"skip", "ticket", "valid", "--why", "a\nb", "--by", "worker"},
 	} {
 		if _, err := parseArgs(args); err == nil {
 			t.Errorf("parseArgs(%q) accepted invalid plan arguments", args)
@@ -640,12 +644,15 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 	if code := checkPlan(root, task{path: path, body: string(updated)}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "present: ok") {
 		t.Fatalf("check plan: %d %q %s", code, out.String(), errOut.String())
 	}
-	if code := skipPlanItem(task{path: path, slug: "task", body: string(updated)}, options{item: "present", why: "covered elsewhere"}, &out, &errOut); code != 0 {
+	if code := skipPlanItem(task{path: path, slug: "task", body: string(updated)}, options{by: "planner", item: "present", why: "covered elsewhere"}, &out, &errOut); code != 0 {
 		t.Fatalf("skip plan: %d %s", code, errOut.String())
 	}
 	skipped, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(skipped), "план — planner: пропущен: present — covered elsewhere") {
+		t.Fatalf("skip journal line without author:\n%s", skipped)
 	}
 	items := planItems(string(skipped))
 	if len(items) != 1 || !items[0].Skipped || items[0].Why != "covered elsewhere" {
@@ -672,6 +679,10 @@ func TestInvalidPlanItemAppearsInJSON(t *testing.T) {
 	data, err := json.Marshal(obj)
 	if err != nil || !strings.Contains(string(data), `"invalid":"`) {
 		t.Fatalf("invalid plan JSON = %s, %v", data, err)
+	}
+	repeated := planItems("# Task\n\n## План\n- build: true\n- build: false\n\n## Журнал\n")
+	if len(repeated) != 2 || repeated[0].Invalid != "" || !strings.Contains(repeated[1].Invalid, "appears more than once") {
+		t.Fatalf("repeated plan name in file = %#v", repeated)
 	}
 }
 
@@ -712,6 +723,31 @@ func TestPlanTimeoutKillsProcessGroup(t *testing.T) {
 	result := runPlanItem(t.TempDir(), planJSON{Name: "slow", Cmd: "sleep 5 & wait"})
 	if !result.timedOut {
 		t.Fatalf("expected timeout, got %#v", result)
+	}
+}
+
+func TestPlanItemDoesNotWaitForLeftoverChild(t *testing.T) {
+	oldTimeout := planTimeout
+	planTimeout = 5 * time.Second
+	t.Cleanup(func() { planTimeout = oldTimeout })
+	dir := t.TempDir()
+	start := time.Now()
+	result := runPlanItem(dir, planJSON{Name: "bg", Cmd: "sleep 3 & echo $! >pid; echo first >&2"})
+	if elapsed := time.Since(start); elapsed > time.Second || result.exit != 0 || result.timedOut || result.stderr != "first" {
+		t.Fatalf("leftover child: %v %#v", elapsed, result)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("leftover child %d still alive", pid)
+		}
 	}
 }
 
@@ -765,6 +801,16 @@ func TestLintEmptyCheck(t *testing.T) {
 	}
 	if issues, err := lintTicket(p, "empty"); err != nil || len(issues) != 1 || !strings.Contains(issues[0], "empty Приёмка") {
 		t.Fatalf("lint пустой «Приёмки»: %v %v", issues, err)
+	}
+}
+
+func TestLintBadPlan(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "20200101-1200-LOW-plan.md")
+	if err := os.WriteFile(p, []byte("# P\n\nСтатус: открыт\n\n## Приёмка\n- x\n\n## План\n- Bad: true\n\n## Журнал\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if issues, err := lintTicket(p, "plan"); err != nil || len(issues) != 1 || !strings.Contains(issues[0], "plan: plan item needs") {
+		t.Fatalf("lint плохого плана: %v %v", issues, err)
 	}
 }
 

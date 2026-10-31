@@ -139,7 +139,8 @@ after an independent review.
 
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
-`tk check` runs them, and `tk done` runs every unskipped check before closing. A `## План` section
+`tk check` runs them, and `tk done` runs every unskipped check before closing. Each check runs in
+`bash -c` from the repository root with 60 seconds to finish; processes it leaves behind are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.
 

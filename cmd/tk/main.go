@@ -253,6 +253,9 @@ func validateSkipCommand(o *options, pos []string) error {
 	if strings.TrimSpace(o.why) == "" {
 		return errors.New("skip requires --why")
 	}
+	if strings.ContainsAny(o.why, "\r\n") {
+		return errors.New("skip --why must be one line")
+	}
 	return validateActorFlag(o)
 }
 
@@ -1126,8 +1129,11 @@ func journal(s, line string) string {
 func splitPlanItem(value string) (string, string, error) {
 	name, command, ok := strings.Cut(value, ":")
 	name, command = strings.TrimSpace(name), strings.TrimSpace(command)
+	if strings.ContainsAny(value, "\r\n") {
+		return name, command, errors.New("plan item must be one line")
+	}
 	if !ok || !planNameRE.MatchString(name) || command == "" {
-		return name, command, errors.New("--add needs 'NAME: COMMAND' with a lowercase name and non-empty command")
+		return name, command, errors.New("plan item needs 'NAME: COMMAND' with a lowercase name and non-empty command")
 	}
 	return name, command, nil
 }
@@ -1138,15 +1144,20 @@ func planItems(body string) []planJSON {
 		return nil
 	}
 	var items []planJSON
+	seen := make(map[string]bool)
 	for line := range strings.SplitSeq(section, "\n") {
 		if !strings.HasPrefix(line, "- ") {
 			continue
 		}
 		name, command, err := splitPlanItem(strings.TrimPrefix(line, "- "))
+		if err == nil && seen[name] {
+			err = fmt.Errorf("plan name %q appears more than once", name)
+		}
 		if err != nil {
 			items = append(items, planJSON{Name: name, Cmd: command, Invalid: err.Error()})
 			continue
 		}
+		seen[name] = true
 		why, skipped := planSkipReason(body, name)
 		items = append(items, planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why})
 	}
@@ -1251,7 +1262,7 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 		fmt.Fprintf(errout, "tk: plan name %q not found\n", o.item)
 		return exitNone
 	}
-	line := fmt.Sprintf("- %s пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.item, o.why)
+	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, o.why)
 	body := journal(t.body, line)
 	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
 		return fail(errout, err)
@@ -1275,10 +1286,23 @@ func runPlanItem(root string, item planJSON) planResult {
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	result := planResult{item: item, stderr: firstLine(stderr.String())}
+	// stderr — в файл, не в трубу: оставленный пунктом фоновый процесс держал бы трубу открытой, и Wait
+	// ждал бы его мимо таймаута. Остаток группы после выхода bash убивается: проверка не оставляет процессов.
+	stderr, err := os.CreateTemp("", "tk-plan-*")
+	if err != nil {
+		return planResult{item: item, exit: 1, stderr: firstLine(err.Error())}
+	}
+	defer os.Remove(stderr.Name())
+	defer stderr.Close()
+	cmd.Stderr = stderr
+	err = cmd.Run()
+	if cmd.Process != nil {
+		// ESRCH — группа уже пуста: остатков нет.
+		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			return planResult{item: item, exit: 1, stderr: "kill leftover processes: " + killErr.Error()}
+		}
+	}
+	result := planResult{item: item, stderr: firstLine(readHead(stderr.Name()))}
 	if err == nil {
 		return result
 	}
@@ -1295,6 +1319,21 @@ func runPlanItem(root string, item planJSON) planResult {
 		result.stderr = firstLine(err.Error())
 	}
 	return result
+}
+
+// readHead — начало файла вывода: пункту нужна только первая строка stderr.
+func readHead(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return err.Error()
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return err.Error()
+	}
+	return string(buf[:n])
 }
 
 func firstLine(value string) string {
@@ -1743,6 +1782,9 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	if noCheck(body) {
 		issues = append(issues, shown+": empty Приёмка")
+	}
+	if err := validatePlanSection(body); err != nil {
+		issues = append(issues, shown+": "+err.Error())
 	}
 	if statusValue == "готово" {
 		checker, check, _ := completion(body)
