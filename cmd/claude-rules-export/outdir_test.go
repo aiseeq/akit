@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -396,8 +395,14 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 			if (c.name == "owner" || c.name == "group") && (os.Getuid() == 0 || os.Getgid() == 0) {
 				t.Skip("root: owner and group are already 0")
 			}
-			if c.name == "link xattr" && !slices.ContainsFunc(entries, func(e entry) bool { return e.Kind == "l" && e.Xattr != "" }) {
-				t.Skip("no xattrs on links on this file system")
+			if c.name == "link xattr" {
+				n, err := unix.Llistxattr(filepath.Join(out, "skills/jira/README.md"), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n == 0 {
+					t.Skip("no xattrs on links on this file system")
+				}
 			}
 			for i := range entries {
 				c.change(&entries[i])
