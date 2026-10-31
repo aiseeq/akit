@@ -1274,11 +1274,12 @@ func missingRequired(body string, present map[string]bool) []planJSON {
 	return items
 }
 
-// requiredPlan — пункты, добавленные с --required, по журналу, и их команды (последнее добавление); однажды
-// обязательный остаётся обязательным.
+// requiredPlan — пункты, добавленные с --required, и их команды (последнее добавление); однажды обязательный
+// остаётся обязательным. Строки ищутся по всему тикету, не только в журнале: правка разметки журнала
+// (заголовок, лишний раздел) не должна снимать обязательность, а лишняя строка её только добавляет.
 func requiredPlan(body string) map[string]string {
 	req := map[string]string{}
-	for _, l := range journalLines(body) {
+	for l := range strings.SplitSeq(body, "\n") {
 		if m := planAddRE.FindStringSubmatch(l); m != nil && m[1] != "" {
 			req[m[2]] = m[3]
 		}

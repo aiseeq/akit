@@ -1179,6 +1179,11 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 		"нет раздела":       head + "## Журнал\n" + added,
 		"другой заголовок":  head + "## Plan\n- accept: ./accept.sh\n\n## Журнал\n" + added,
 		"другая команда":    head + "## План\n- accept: true\n\n## Журнал\n" + added,
+		// разметка журнала вокруг нетронутой строки «обязательный»
+		"журнал переименован":  head + "## План\n- accept: true\n\n## Journal\n" + added,
+		"пустой журнал раньше": head + "## Журнал\n\n## План\n- accept: true\n\n## Журнал\n" + added,
+		"заголовок в журнале":  head + "## План\n- accept: true\n\n## Журнал\n## x\n" + added,
+		"\\r в заголовке":      head + "## План\n- accept: true\n\n## Журнал\r\n" + added,
 	}
 	for name, body := range cases {
 		items := planItems(body)
