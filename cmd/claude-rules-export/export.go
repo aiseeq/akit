@@ -79,7 +79,12 @@ func assemble(out, src, rules string, m manifest) error {
 		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 			return missingSkill{s}
 		}
-		if err := copyTree(dir, filepath.Join(out, "skills", s)); err != nil {
+		// папка скилла может быть ссылкой: в выгрузку — её содержимое, а не ссылка, висящая вне home
+		real, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return fmt.Errorf("skill %s: %w", s, err)
+		}
+		if err := copyTree(real, filepath.Join(out, "skills", s)); err != nil {
 			return err
 		}
 	}
@@ -173,13 +178,12 @@ func within(p, dir string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// checkOut — OUT_DIR очищается: папка, где лежит читаемое (home, его .claude и work, папка правил, папка каждого
-// скилла), или папка внутри читаемого стёрла бы источник. Пути сравниваются после разрешения симлинков: ссылка
-// на читаемое ведёт туда же.
+// checkOut — OUT_DIR очищается: папка, где лежит читаемое, или папка внутри читаемого стёрла бы источник. Пути
+// сравниваются после разрешения симлинков: ссылка на читаемое ведёт туда же.
 func checkOut(out, src, rules string, m manifest) error {
-	reads := []string{src, filepath.Join(src, ".claude"), filepath.Join(src, "work"), rules}
-	for _, s := range m.skills {
-		reads = append(reads, filepath.Join(src, ".claude", "skills", s))
+	reads, err := readPaths(src, rules, m)
+	if err != nil {
+		return err
 	}
 	o, err := resolved(out)
 	if err != nil {
@@ -212,4 +216,57 @@ func resolved(p string) (string, error) {
 			return "", err
 		}
 	}
+}
+
+// readPaths — всё, что выгрузка читает или до чего дотянется из источника: home, его .claude и work, оба
+// CLAUDE.md, папка правил, её манифест и шаблон, папка каждого скилла и цели ссылок внутри скиллов. Ссылкой
+// может быть любой из них: сравнивается разрешённый путь.
+func readPaths(src, rules string, m manifest) ([]string, error) {
+	reads := []string{src, filepath.Join(src, ".claude"), filepath.Join(src, "work"), rules,
+		filepath.Join(src, ".claude", "CLAUDE.md"), filepath.Join(src, "work", "CLAUDE.md"),
+		filepath.Join(rules, "manifest"), filepath.Join(rules, "README.template.md")}
+	manifestDir, err := resolved(filepath.Join(rules, "manifest"))
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(manifestDir)
+	if err != nil {
+		return nil, fmt.Errorf("--rules manifest: %w", err)
+	}
+	for _, e := range entries {
+		reads = append(reads, filepath.Join(rules, "manifest", e.Name()))
+	}
+	for _, s := range m.skills {
+		dir := filepath.Join(src, ".claude", "skills", s)
+		reads = append(reads, dir)
+		links, err := skillLinks(dir)
+		if err != nil {
+			return nil, err
+		}
+		reads = append(reads, links...)
+	}
+	return reads, nil
+}
+
+// skillLinks — ссылки внутри папки скилла (сама папка может быть ссылкой); нет папки — пусто, её отсутствие
+// назовёт сборка.
+func skillLinks(dir string) ([]string, error) {
+	root, err := resolved(dir)
+	if err != nil {
+		return nil, err
+	}
+	var links []string
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) && p == root {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return fmt.Errorf("skill %s: %w", dir, err)
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			links = append(links, p)
+		}
+		return nil
+	})
+	return links, err
 }

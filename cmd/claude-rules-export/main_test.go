@@ -193,3 +193,65 @@ func TestExportErrors(t *testing.T) {
 		t.Errorf("кривая замена: code %d", code)
 	}
 }
+
+// Читаемый файл или папка — ссылка вне home и правил: OUT_DIR с её целью стёр бы цель; ссылка внутри скилла — так же.
+func TestExportRefusesLinkedReads(t *testing.T) {
+	for _, c := range []struct{ name, link, file string }{
+		{"global CLAUDE.md", "home/.claude/CLAUDE.md", "CLAUDE.md"},
+		{"work CLAUDE.md", "home/work/CLAUDE.md", "CLAUDE.md"},
+		{"manifest", "rules/manifest", "manifest/skills.txt"},
+		{"README template", "rules/README.template.md", "README.template.md"},
+		{"link in a skill", "home/.claude/skills/jira/data", "data/f"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src, rules := fixture(t)
+			root := filepath.Dir(src)
+			link := filepath.Join(root, c.link)
+			target := filepath.Join(t.TempDir(), "target")
+			moved := filepath.Join(target, filepath.Base(link))
+			if _, err := os.Lstat(link); err == nil {
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(link, moved); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				write(t, filepath.Join(moved, "f"), "data\n", 0o644)
+			}
+			if err := os.Symlink(moved, link); err != nil {
+				t.Fatal(err)
+			}
+			want := read(t, filepath.Join(target, c.file))
+			code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, target)
+			if code != exitUsage || !strings.Contains(stderr, "must not contain") {
+				t.Errorf("code %d %q", code, stderr)
+			}
+			if got := read(t, filepath.Join(target, c.file)); got != want {
+				t.Errorf("цель ссылки стёрта: %q", got)
+			}
+		})
+	}
+}
+
+// Папка скилла — ссылка: в выгрузку идёт её содержимое, а не ссылка, висящая вне home.
+func TestExportLinkedSkillCopiesContent(t *testing.T) {
+	src, rules := fixture(t)
+	ext := filepath.Join(t.TempDir(), "ext")
+	write(t, filepath.Join(ext, "jira3/SKILL.md"), "# jira3\n", 0o644)
+	if err := os.Symlink(filepath.Join(ext, "jira3"), filepath.Join(src, ".claude/skills/jira3")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(rules, "manifest/skills.txt"), "jira\njira3\n", 0o644)
+	out := filepath.Join(t.TempDir(), "o")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("code %d %q", code, stderr)
+	}
+	st, err := os.Lstat(filepath.Join(out, "skills/jira3"))
+	if err != nil || !st.IsDir() {
+		t.Fatalf("skills/jira3 не папка: %v %v", st, err)
+	}
+	if got := read(t, filepath.Join(out, "skills/jira3/SKILL.md")); got != "# jira3\n" {
+		t.Errorf("SKILL.md: %q", got)
+	}
+}

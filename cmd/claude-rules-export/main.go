@@ -29,9 +29,10 @@ line of manifest/drop-lines.txt are dropped. Last, manifest/pii.tsv
 (KIND<TAB>REGEXP<TAB>ALLOWED REGEXP) is searched for: each hit not fully matching
 ALLOWED is printed as file:line: KIND.
 
-An OUT_DIR that holds what is read (the source home, its .claude and work, --rules,
-an exported skill's folder) or is or lies in any of it but the home, symlinks resolved,
-is refused before anything is cleared.
+An OUT_DIR that holds what is read (the source home, its .claude and work, both
+CLAUDE.md, --rules with its manifest and template, an exported skill's folder and the
+targets of links in it) or is or lies in any of it but the home, symlinks resolved, is
+refused before anything is cleared. A skill folder that is a link is exported as its content.
 
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).
