@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -35,5 +38,27 @@ func TestWrapLinesKeepsText(t *testing.T) {
 	}
 	if joined := strings.ReplaceAll(strings.TrimSuffix(got, "\n"), "\n  ", " "); joined != long {
 		t.Fatalf("text changed:\n%q\nwant\n%q", joined, long)
+	}
+}
+
+func TestShowWrapsLongLines(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	long := "- 2026-01-01 10:00 note — a: " + strings.Repeat("слово ", 60) + "конец"
+	text := "# Длинная строка\n\nСтатус: открыт\n\n## Журнал\n" + long + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "20260101-1000-LOW-long-line.md"), []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Chdir(home)
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "show", id: "long-line"}, &out, &errOut); code != 0 {
+		t.Fatalf("show %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), wrapLines(long, showWidth)) || strings.Contains(out.String(), long) {
+		t.Fatalf("show does not wrap the journal:\n%s", out.String())
 	}
 }
