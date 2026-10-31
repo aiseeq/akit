@@ -1102,3 +1102,69 @@ func TestWaitDatesBareClockAndWarnsOnCondition(t *testing.T) {
 		t.Errorf("нет предупреждения про условие: %q", errOut.String())
 	}
 }
+
+// Обязательный пункт: tk skip отказывает, вписанный руками пропуск не действует, tk done прогоняет пункт, а убранный
+// из плана пункт закрытие не пропускает.
+func TestRequiredPlanItemCannotBeSkipped(t *testing.T) {
+	if _, err := parseArgs([]string{"skip", "ticket", "accept", "--why", "x", "--by", "a", "--required"}); err == nil {
+		t.Error("--required accepted outside tk plan")
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\ncheck\n\n## План\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := addPlanItem(task{path: path, slug: "task", body: body}, options{by: "planner", add: "accept: exit 3", required: true}, &out, &errOut); code != 0 {
+		t.Fatalf("add required: %d %s", code, errOut.String())
+	}
+	added := read(t, path)
+	if !strings.Contains(added, "план — planner: добавлен обязательный пункт accept") {
+		t.Fatalf("journal without the required mark:\n%s", added)
+	}
+	errOut.Reset()
+	if code := skipPlanItem(task{path: path, slug: "task", body: added}, options{by: "worker", item: "accept", why: "later"}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "is required") {
+		t.Fatalf("skip of a required item: %d %q", code, errOut.String())
+	}
+	if read(t, path) != added {
+		t.Fatal("refused skip changed the ticket")
+	}
+
+	forged := added + "- 2020-01-01 12:05 план — worker: пропущен: accept — forged\n" +
+		"- 2020-01-01 12:06 план — worker: добавлен пункт accept\n"
+	if items := planItems(forged); len(items) != 1 || items[0].Skipped || !items[0].Required {
+		t.Fatalf("hand-written skip or plain re-add changed a required item: %#v", items)
+	}
+	if err := os.WriteFile(path, []byte(forged), 0644); err != nil {
+		t.Fatal(err)
+	}
+	errOut.Reset()
+	code := transition(task{path: path, slug: "task", body: forged}, options{cmd: "done", by: "reviewer", check: "verified", baseRoot: root}, &out, &errOut)
+	if code != exitNone || !strings.Contains(errOut.String(), "accept: exit 3") || strings.Contains(read(t, path), "Статус: готово") {
+		t.Fatalf("done over a failing required item: %d %q", code, errOut.String())
+	}
+
+	dropped := strings.Replace(forged, "- accept: exit 3\n", "", 1)
+	if err := os.WriteFile(path, []byte(dropped), 0644); err != nil {
+		t.Fatal(err)
+	}
+	errOut.Reset()
+	code = transition(task{path: path, slug: "task", body: dropped}, options{cmd: "done", by: "reviewer", check: "verified", baseRoot: root}, &out, &errOut)
+	if code != exitNone || !strings.Contains(errOut.String(), "missing from ## План") || strings.Contains(read(t, path), "Статус: готово") {
+		t.Fatalf("done with the required item removed from the plan: %d %q", code, errOut.String())
+	}
+}
+
+func read(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}

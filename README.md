@@ -131,6 +131,7 @@ after an independent review.
 
     tk new fix-login --prio HIGH --title 'Fix login' --by agent
     tk plan fix-login --add 'tests: go test ./...'
+    tk plan fix-login --add 'accept: ./accept.sh' --required   # tk skip refuses it
     tk check fix-login                  # run plan checks without closing
     tk skip fix-login tests --why 'covered by another check'
     tk ls                              # open tickets, oldest first
@@ -143,7 +144,10 @@ after an independent review.
 
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
-`tk check` runs them, and `tk done` runs every unskipped check before closing. Each check runs in
+`tk check` runs them, and `tk done` runs every unskipped check before closing. A check added with
+`--required` cannot be skipped: `tk skip` refuses it with exit 2, a skip line written into the
+journal by hand does not count, and `tk done` refuses a ticket whose `## План` no longer has it
+(the journal line `добавлен обязательный пункт NAME` marks it). Each check runs in
 `bash -c` from the repository root with 60 seconds to finish; processes it leaves in its process group are killed. A `## План` section
 can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.

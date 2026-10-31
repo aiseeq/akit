@@ -32,7 +32,7 @@ Usage:
   tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME] [--text FILE|-]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
-  tk plan ID --add 'NAME: COMMAND' [--by NAME]
+  tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
   tk skip ID NAME --why TEXT [--by NAME]
   tk check ID
   tk lint [--root DIR]
@@ -62,6 +62,7 @@ Flags:
   --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject: why the ticket was declined; skip: why the plan item is skipped (required)
   --add TEXT     plan: add a named command to the ticket plan (required)
+  --required     plan: the item cannot be skipped (tk skip refuses, exit 2) or dropped from the plan
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
 
@@ -89,15 +90,15 @@ var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 // «пропущен:» внутри заметки или причины другого пункта пропуском не считается.
 var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:план — \S+: )?пропущен: ([a-z0-9-]+) — (.*)$`)
 
-// planAddRE — строка журнала tk plan --add.
-var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен пункт ([a-z0-9-]+)$`)
+// planAddRE — строка журнала tk plan --add; «обязательный» — с --required.
+var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен (обязательный )?пункт ([a-z0-9-]+)$`)
 var errHelp = errors.New("help")
 var session = currentSession
 var planTimeout = 60 * time.Second
 
 type options struct {
 	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, item string
-	all, due, json                                                                                                    bool
+	all, due, json, required                                                                                          bool
 	older                                                                                                             time.Duration
 }
 type task struct {
@@ -167,6 +168,9 @@ func parseOptions(args []string, o *options) ([]string, error) {
 		case "--json":
 			o.json = true
 			continue
+		case "--required":
+			o.required = true
+			continue
 		}
 		if p, ok := values[v]; ok {
 			if seen[v] || i+1 == len(args) || strings.HasPrefix(args[i+1], "--") {
@@ -198,6 +202,9 @@ func parseOptions(args []string, o *options) ([]string, error) {
 }
 
 func validateCommand(o *options, pos []string) error {
+	if o.required && o.cmd != "plan" {
+		return errors.New("--required is a flag of tk plan --add")
+	}
 	switch o.cmd {
 	case "plan":
 		return validatePlanCommand(o, pos)
@@ -1239,10 +1246,36 @@ func planItems(body string) []planJSON {
 		}
 		seen[name] = true
 		why, skipped := planSkipReason(body, name)
-		items = append(items, planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why})
+		required := planRequired(body, name)
+		// Пропуск обязательного пункта не действует, даже вписанный в журнал руками.
+		if required {
+			why, skipped = "", false
+		}
+		items = append(items, planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why, Required: required})
+	}
+	// Обязательный пункт, убранный из плана правкой текста, закрытие не пропускает.
+	for _, name := range requiredNames(body) {
+		if !seen[name] {
+			items = append(items, planJSON{Name: name, Required: true, Invalid: fmt.Sprintf("required plan item %q is missing from ## План", name)})
+		}
 	}
 	return items
 }
+
+// requiredNames — пункты, добавленные с --required, по журналу; однажды обязательный остаётся обязательным.
+func requiredNames(body string) []string {
+	var names []string
+	seen := map[string]bool{}
+	for _, l := range journalLines(body) {
+		if m := planAddRE.FindStringSubmatch(l); m != nil && m[1] != "" && !seen[m[2]] {
+			seen[m[2]] = true
+			names = append(names, m[2])
+		}
+	}
+	return names
+}
+
+func planRequired(body, name string) bool { return slices.Contains(requiredNames(body), name) }
 
 // planHeadings считает заголовки «## План» и похожие на него (регистр, пробелы, `\r`, двоеточие, иное число
 // `#`): похожий план не исполнился бы, и тикет закрылся бы мимо него.
@@ -1275,7 +1308,7 @@ func validatePlanSection(body string) error {
 func planSkipReason(body, name string) (string, bool) {
 	lines := journalLines(body)
 	for i := len(lines) - 1; i >= 0; i-- {
-		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
+		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[2] == name {
 			return "", false
 		}
 		if m := planSkipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
@@ -1297,8 +1330,12 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 		}
 	}
 	line := "- " + name + ": " + command
+	kind := ""
+	if o.required {
+		kind = "обязательный "
+	}
 	t.body = insertPlanLine(t.body, line)
-	t.body = journal(t.body, fmt.Sprintf("- %s план — %s: добавлен пункт %s", time.Now().Format("2006-01-02 15:04"), o.by, name))
+	t.body = journal(t.body, fmt.Sprintf("- %s план — %s: добавлен %sпункт %s", time.Now().Format("2006-01-02 15:04"), o.by, kind, name))
 	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
 		return fail(errout, err)
 	}
@@ -1340,6 +1377,10 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 	for _, item := range planItems(t.body) {
 		if item.Name == o.item {
 			found = true
+			if item.Required {
+				fmt.Fprintf(errout, "tk: plan item %q is required (added with --required) and cannot be skipped; make it pass, tk done runs it\n", o.item)
+				return exitUsage
+			}
 			break
 		}
 	}
@@ -1741,11 +1782,12 @@ type taskJSON struct {
 }
 
 type planJSON struct {
-	Name    string `json:"name"`
-	Cmd     string `json:"cmd"`
-	Skipped bool   `json:"skipped"`
-	Why     string `json:"why"`
-	Invalid string `json:"invalid,omitempty"`
+	Name     string `json:"name"`
+	Cmd      string `json:"cmd"`
+	Skipped  bool   `json:"skipped"`
+	Why      string `json:"why"`
+	Required bool   `json:"required,omitempty"`
+	Invalid  string `json:"invalid,omitempty"`
 }
 
 // label — имя пункта в отчёте; у строки, из которой имя не прочлось, — сама строка.
