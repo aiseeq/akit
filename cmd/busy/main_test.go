@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,6 +109,15 @@ func TestParseArgs(t *testing.T) {
 	}
 	if _, err := parseArgs(nil, time.Now()); err == nil || !strings.Contains(err.Error(), "runable") {
 		t.Errorf("опечатка в ключе = %v; ждали ошибку с ключом", err)
+	}
+	// Битый файл нужен только замеру: справка и тихий режим работают.
+	for _, args := range [][]string{{"-h"}, {"--quiet-off"}, {"--quiet", "5m", "--why", "call"}} {
+		if _, err := parseArgs(args, time.Now()); err != nil && !errors.Is(err, errHelp) {
+			t.Errorf("parseArgs(%q) с битым файлом = %v", args, err)
+		}
+	}
+	if _, err := parseArgs([]string{"--runnable", "500"}, time.Now()); err == nil {
+		t.Error("флаг порога обошёл битый файл")
 	}
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	opts, err := parseArgs([]string{"--window", "2s", "--runnable=16", "--mem-some", "5.5"}, time.Now())

@@ -37,7 +37,10 @@ threads, disk IO pressure at or above 9.6% over 5 seconds, or memory pressure (s
 10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
 from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
 in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to change the threshold
-(100 disables disk checks) and `--kind K` to request a profile kind. Use busy instead of `cat
+(100 disables disk checks) and `--kind K` to request a profile kind. Your own thresholds go in
+`$XDG_CONFIG_HOME/akit/pressure.yaml` as `key: value` lines (`runnable`, `max_io_full`, `max_mem_some`,
+`max_swap_kbs`, `swap_window`), shared with graft; flags override the file, and a value that is not a
+finite positive number (or a positive duration) is an error. Use busy instead of `cat
 /proc/loadavg` to decide whether to start heavy work now: the 1-minute load lags. Exit 0 free, 1 busy,
 2 usage or reading error. `pressure.ReadLoadAvg` reads the system load average for watching long
 overload. `busy --quiet 2h --why "call"` keeps the machine busy until then, whatever it measures; the

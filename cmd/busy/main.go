@@ -63,6 +63,7 @@ const (
 
 type options struct {
 	limits      pressure.Limits
+	overrides   [][2]string // флаги порогов (ключ файла, значение) — поверх файла порогов
 	procRoot    string
 	kind        string
 	quiet       time.Time // срок тихого режима, который поставить
@@ -87,11 +88,7 @@ func main() {
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
-	limits, err := pressure.UserLimits()
-	if err != nil {
-		return options{}, err
-	}
-	opts := options{limits: limits, procRoot: "/proc"}
+	opts := options{procRoot: "/proc"}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "-h" || a == "--help" {
@@ -129,7 +126,27 @@ func parseArgs(args []string, now time.Time) (options, error) {
 	if opts.ignoreQuiet && (opts.quietOff || !opts.quiet.IsZero()) {
 		return opts, errors.New("--ignore-quiet is for a check, not for setting quiet mode")
 	}
-	return opts, nil
+	if opts.quietOff || !opts.quiet.IsZero() {
+		return opts, nil
+	}
+	err := opts.loadLimits()
+	return opts, err
+}
+
+// loadLimits — пороги файла пользователя и поверх них флаги. Файл нужен только замеру: справку и тихий режим
+// битый файл не блокирует.
+func (opts *options) loadLimits() error {
+	limits, err := pressure.UserLimits()
+	if err != nil {
+		return err
+	}
+	for _, o := range opts.overrides {
+		if err := limits.Set(o[0], o[1]); err != nil {
+			return err
+		}
+	}
+	opts.limits = limits
+	return nil
 }
 
 // limitFlags — флаги порогов и их ключи в файле порогов: значение проверяет тот же разбор, что и файл.
@@ -140,7 +157,11 @@ func (opts *options) set(name, value string, now time.Time) error {
 	var err error
 	switch name {
 	case "--runnable", "--mem-some", "--io-full", "--window":
-		err = opts.limits.Set(limitFlags[name], value)
+		// Значение проверяется сразу, ошибка — с именем флага; ложится поверх файла в конце parseArgs.
+		probe := pressure.DefaultLimits
+		if err = probe.Set(limitFlags[name], value); err == nil {
+			opts.overrides = append(opts.overrides, [2]string{limitFlags[name], value})
+		}
 	case "--kind":
 		opts.kind = value
 	case "--proc":
@@ -188,9 +209,6 @@ func (opts *options) setQuiet(name, value string, now time.Time) error {
 func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	if opts.quietOff || !opts.quiet.IsZero() {
 		return setQuiet(opts, stdout, stderr)
-	}
-	if opts.limits.MaxIOFull <= 0 {
-		opts.limits.MaxIOFull = pressure.DefaultLimits.MaxIOFull
 	}
 	v, err := pressure.Check(ctx, opts.procRoot, opts.limits, opts.kind)
 	if err != nil {
