@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 func TestCalls(t *testing.T) {
@@ -479,6 +481,105 @@ func TestCorpus(t *testing.T) {
 }
 
 var backticks = regexp.MustCompile("`[^`]*`")
+
+func TestAddTimeRejectsInvalidSourceSpan(t *testing.T) {
+	file, _, err := parseShell("time rg x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clause *syntax.TimeClause
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if got, ok := node.(*syntax.TimeClause); ok {
+			clause = got
+		}
+		return true
+	})
+	if clause == nil {
+		t.Fatal("parsed time clause is missing")
+	}
+	var calls []Call
+	walker := callWalker{src: "", calls: &calls}
+	walker.addTime(clause)
+	if walker.parseErr == nil || walker.parseErr.Error() != "shellcmd: invalid source span for time clause" || len(calls) != 0 {
+		t.Fatalf("addTime result = calls %#v, error %v", calls, walker.parseErr)
+	}
+}
+
+func TestTimeClauseDetails(t *testing.T) {
+	tests := []struct {
+		command, raw string
+		offset       int
+		via          []string
+	}{
+		{command: `time -p rg x`, raw: `time -p rg x`, offset: 0},
+		{command: `/usr/bin/time -f '%e' rg x`, raw: `/usr/bin/time -f '%e' rg x`, offset: 0},
+		{command: `time -f '%e' time rg x`, raw: `time -f '%e' time rg x`, offset: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) == 0 || calls[0].Name != "time" || calls[0].Raw != tt.raw || calls[0].Offset != tt.offset || !reflect.DeepEqual(calls[0].Via, tt.via) {
+				t.Fatalf("time call = %#v, want raw %q offset %d via %q", calls, tt.raw, tt.offset, tt.via)
+			}
+		})
+	}
+}
+
+func TestHeredocBodyLen(t *testing.T) {
+	tests := []struct {
+		name, text, delimiter string
+		want                  int
+	}{
+		{name: "delimiter line", text: "body\nEND", delimiter: "END", want: len("body\n")},
+		{name: "other last line", text: "body\nOTHER", delimiter: "END", want: len("body\nOTHER")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := heredocBodyLen(tt.text, tt.delimiter); got != tt.want {
+				t.Fatalf("body length = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHeredocBodyEdges(t *testing.T) {
+	tests := []struct {
+		name, command, wantBody string
+	}{
+		{name: "delimiter at EOF", command: `cat <<EOF
+body
+EOF`, wantBody: "body\n"},
+		{name: "unterminated at EOF", command: `cat <<EOF
+body
+last`, wantBody: "body\nlast"},
+		{name: "continued body line", command: `cat <<EOF
+first \
+second
+EOF
+`, wantBody: "first " + string([]byte{92}) + "\nsecond\n"},
+		{name: "nested heredoc", command: `cat <<OUT
+outer
+cat <<IN
+inner
+IN
+OUT
+`, wantBody: "outer\ncat <<IN\ninner\nIN\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.command, "cat")
+			if err != nil || len(calls) != 1 || len(calls[0].Redirs) != 1 || calls[0].Redirs[0].Op != "<<" {
+				t.Fatalf("Find = %#v, %v", calls, err)
+			}
+			if got := calls[0].Redirs[0].Body; got != tt.wantBody {
+				t.Errorf("body = %q, want %q", got, tt.wantBody)
+			}
+		})
+	}
+}
 
 func TestNestedHeredocBounds(t *testing.T) {
 	tests := []struct {

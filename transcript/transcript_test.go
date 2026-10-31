@@ -395,6 +395,42 @@ func TestReadCodexSlices(t *testing.T) {
 }
 
 // exec_command с пустой командой (так пишут бойцы codex): событие cmd с кодом вызова как есть, вывод — к нему.
+func TestCodexPayloadParsingEdges(t *testing.T) {
+	tests := []struct {
+		name string
+		fn   func() string
+		want string
+	}{
+		{name: "args JSON object", fn: func() string { return string(argsJSON(`{"cmd":"echo"}`, json.RawMessage(`"fallback"`))) }, want: `{"cmd":"echo"}`},
+		{name: "args malformed fallback", fn: func() string { return string(argsJSON(`not json`, json.RawMessage(`"record"`))) }, want: `"record"`},
+		{name: "args empty fallback", fn: func() string { return string(argsJSON("", nil)) }, want: ""},
+		{name: "command string", fn: func() string { return argsCommand(`{"cmd":"echo hi"}`) }, want: "echo hi"},
+		{name: "command array", fn: func() string { return argsCommand(`{"cmd":["echo","hi"]}`) }, want: "echo hi"},
+		{name: "alternate command array", fn: func() string { return argsCommand(`{"cmd":false,"command":["git","status"]}`) }, want: "git status"},
+		{name: "malformed command fallback", fn: func() string { return argsCommand(`{`) }, want: "{"},
+		{name: "empty output object fallback", fn: func() string {
+			got, failed := outputText(json.RawMessage(`{"output":""}`))
+			return fmt.Sprintf("%s|%t", got, failed)
+		}, want: `{"output":""}|false`},
+		{name: "wrong output type fallback", fn: func() string {
+			got, failed := outputText(json.RawMessage(`{"output":7}`))
+			return fmt.Sprintf("%s|%t", got, failed)
+		}, want: `{"output":7}|false`},
+		{name: "failed output text", fn: func() string {
+			got, failed := outputText(json.RawMessage(`[{"type":"input_text","text":"Script failed with code 2\\nOutput:\\nno"}]`))
+			return fmt.Sprintf("%s|%t", got, failed)
+		}, want: `Script failed with code 2\nOutput:\nno|true`},
+		{name: "empty raw output", fn: func() string { got, failed := outputText(nil); return fmt.Sprintf("%s|%t", got, failed) }, want: "|false"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fn(); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestReadCodexEmptyCmd(t *testing.T) {
 	evs, _ := events(t,
 		`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"s1"}}`,

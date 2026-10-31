@@ -5,10 +5,167 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestParseOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantPos []string
+		want    options
+		wantErr string
+	}{
+		{name: "values and switches", args: []string{"--title", "A task", "--all", "--due", "--json", "--root", "/repo", "task"}, wantPos: []string{"task"}, want: options{title: "A task", all: true, due: true, json: true, root: "/repo"}},
+		{name: "flag missing value", args: []string{"--title"}, wantErr: "--title needs one value"},
+		{name: "flag followed by flag", args: []string{"--title", "--all"}, wantErr: "--title needs one value"},
+		{name: "duplicate value flag", args: []string{"--by", "one", "--by", "two"}, wantErr: "--by needs one value"},
+		{name: "unknown flag", args: []string{"--unknown"}, wantErr: "unknown flag --unknown"},
+		{name: "older missing value", args: []string{"--older"}, wantErr: "--older needs a value"},
+		{name: "older duration", args: []string{"--older", "2d"}, want: options{older: 48 * time.Hour}},
+		{name: "positionals retained", args: []string{"one", "two"}, wantPos: []string{"one", "two"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := options{}
+			pos, err := parseOptions(tt.args, &got)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || !reflect.DeepEqual(pos, tt.wantPos) {
+				t.Fatalf("parseOptions = %q, %v; want %q", pos, err, tt.wantPos)
+			}
+			if got.title != tt.want.title || got.all != tt.want.all || got.due != tt.want.due || got.json != tt.want.json || got.root != tt.want.root || got.older != tt.want.older {
+				t.Fatalf("options = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateCommand(t *testing.T) {
+	tests := []struct {
+		name                      string
+		o                         options
+		pos                       []string
+		wantID, wantNote, wantErr string
+	}{
+		{name: "note assigns arguments", o: options{cmd: "note"}, pos: []string{"ticket", "progress"}, wantID: "ticket", wantNote: "progress"},
+		{name: "note argument count", o: options{cmd: "note"}, pos: []string{"ticket"}, wantErr: "note needs a ticket ID and text"},
+		{name: "note invalid id", o: options{cmd: "note"}, pos: []string{"Bad ID", "x"}, wantErr: "ID is the ticket slug (e.g. graft-hooks) or its file name"},
+		{name: "note empty text", o: options{cmd: "note"}, pos: []string{"ticket", "  "}, wantErr: "note text must not be empty"},
+		{name: "too many args", o: options{cmd: "show"}, pos: []string{"a", "b"}, wantErr: "too many arguments"},
+		{name: "ticket id", o: options{cmd: "show"}, pos: []string{"ticket"}, wantID: "ticket"},
+		{name: "ticket action invalid id", o: options{cmd: "start"}, pos: []string{"Bad ID"}, wantErr: "ID is the ticket slug (e.g. graft-hooks) or its file name"},
+		{name: "unknown command", o: options{cmd: "other"}, wantErr: "unknown command \"other\""},
+		{name: "lint positional", o: options{cmd: "lint"}, pos: []string{"id"}, wantErr: "lint takes no id"},
+		{name: "archive positional", o: options{cmd: "archive"}, pos: []string{"id"}, wantErr: "archive takes no id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCommand(&tt.o, tt.pos)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || tt.o.id != tt.wantID || tt.o.note != tt.wantNote {
+				t.Fatalf("result = %+v, %v", tt.o, err)
+			}
+		})
+	}
+}
+
+func TestValidateNew(t *testing.T) {
+	tests := []struct {
+		name              string
+		o                 options
+		pos               []string
+		wantPrio, wantErr string
+	}{
+		{name: "default priority", o: options{id: "new-task"}, pos: []string{"new-task"}, wantPrio: "MEDIUM"},
+		{name: "all priorities", o: options{id: "new-task", prio: "HIGH"}, pos: []string{"new-task"}, wantPrio: "HIGH"},
+		{name: "bad slug", o: options{id: "Bad"}, pos: []string{"Bad"}, wantErr: "new needs a lowercase slug"},
+		{name: "extra positional", o: options{id: "new-task"}, pos: []string{"new-task", "extra"}, wantErr: "new needs a lowercase slug"},
+		{name: "bad priority", o: options{id: "new-task", prio: "urgent"}, pos: []string{"new-task"}, wantErr: "--prio must be HIGH, MEDIUM, or LOW"},
+		{name: "bad actor", o: options{id: "new-task", by: "two words"}, pos: []string{"new-task"}, wantErr: "--by must be a name without spaces; use --by NAME"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateNew(&tt.o, tt.pos)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || tt.o.prio != tt.wantPrio {
+				t.Fatalf("priority = %q, error = %v", tt.o.prio, err)
+			}
+		})
+	}
+}
+
+func TestValidateList(t *testing.T) {
+	tests := []struct {
+		name    string
+		o       options
+		pos     []string
+		wantErr string
+	}{
+		{name: "filters accepted", o: options{status: "готово", by: "agent", slug: "Task-"}},
+		{name: "positional rejected", pos: []string{"id"}, wantErr: "ls takes no id"},
+		{name: "bad status", o: options{status: "unknown"}, wantErr: "unknown status \"unknown\""},
+		{name: "bad actor", o: options{by: "two words"}, wantErr: "--by must be a name without spaces; use --by NAME"},
+		{name: "bad slug prefix", o: options{slug: "Bad/"}, wantErr: "--slug must be a lowercase slug prefix"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateList(&tt.o, tt.pos)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDuration(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    time.Duration
+		wantErr string
+	}{
+		{input: "2h30m", want: 150 * time.Minute}, {input: "1.5d", want: 36 * time.Hour}, {input: "0s", want: 0},
+		{input: "0d", want: 0}, {input: "-1h", wantErr: "invalid duration \"-1h\""}, {input: "-1d", wantErr: "invalid duration \"-1d\""},
+		{input: "nope", wantErr: "invalid duration \"nope\""}, {input: "1x", wantErr: "invalid duration \"1x\""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := duration(tt.input)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("duration = %v, %v; want %v", got, err, tt.want)
+			}
+		})
+	}
+}
 
 func TestNoteListJSONAndDue(t *testing.T) {
 	base := t.TempDir()
