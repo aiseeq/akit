@@ -12,10 +12,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -362,21 +364,55 @@ func birthAt(dirfd int, name string, flags int) (int64, error) {
 	return st.Btime.Sec*1e9 + int64(st.Btime.Nsec), nil
 }
 
-// linkXattr — xattr ссылки name в папке dirfd (метку SELinux ссылки обычный пользователь меняет chcon -h). Ссылку
-// открывает O_PATH без перехода по ней; f*xattr такой дескриптор не берут, а /proc/self/fd/N ведёт на саму ссылку.
+// linkXattr — xattr ссылки name в папке dirfd (метку SELinux ссылки обычный пользователь меняет chcon -h): listxattrat
+// и getxattrat (Linux 6.13) без перехода по ссылке. f*xattr не берут дескриптор O_PATH, а путь /proc/self/fd/N
+// зависит от того, что смонтировано на /proc.
 func linkXattr(dirfd int, name string) (string, error) {
-	fd, err := unix.Openat(dirfd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	p, err := unix.BytePtrFromString(name)
 	if err != nil {
-		return "", fmt.Errorf("open link %s: %w", name, err)
+		return "", fmt.Errorf("%s: %w", name, err)
 	}
-	defer func() { _ = unix.Close(fd) }()
-	at := "/proc/self/fd/" + strconv.Itoa(fd)
-	sum, err := xattrSum(func(b []byte) (int, error) { return unix.Listxattr(at, b) },
-		func(name string, b []byte) (int, error) { return unix.Getxattr(at, name, b) })
+	list := func(b []byte) (int, error) {
+		n, _, errno := unix.Syscall6(unix.SYS_LISTXATTRAT, uintptr(dirfd), uintptr(unsafe.Pointer(p)),
+			unix.AT_SYMLINK_NOFOLLOW, uintptr(bufPtr(b)), uintptr(len(b)), 0)
+		if errno != 0 {
+			return 0, errno
+		}
+		return int(n), nil
+	}
+	get := func(attr string, b []byte) (int, error) {
+		a, err := unix.BytePtrFromString(attr)
+		if err != nil {
+			return 0, err
+		}
+		args := xattrArgs{Value: uint64(uintptr(bufPtr(b))), Size: uint32(len(b))}
+		n, _, errno := unix.Syscall6(unix.SYS_GETXATTRAT, uintptr(dirfd), uintptr(unsafe.Pointer(p)),
+			unix.AT_SYMLINK_NOFOLLOW, uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(&args)), unsafe.Sizeof(args))
+		runtime.KeepAlive(b)
+		if errno != 0 {
+			return 0, errno
+		}
+		return int(n), nil
+	}
+	sum, err := xattrSum(list, get)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", name, err)
 	}
 	return sum, nil
+}
+
+// xattrArgs — struct xattr_args ядра для getxattrat.
+type xattrArgs struct {
+	Value uint64
+	Size  uint32
+	Flags uint32
+}
+
+func bufPtr(b []byte) unsafe.Pointer {
+	if len(b) == 0 {
+		return nil
+	}
+	return unsafe.Pointer(&b[0])
 }
 
 // verifyOut — каждая запись OUT_DIR, кроме .git верхнего уровня, есть в списке и не менялась. Записи из списка,

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Повторный прогон удаляет только записи прошлого, которые не менялись: любая правка, чужой файл или копия того же
@@ -576,5 +578,35 @@ func TestExportIntoWorkFolder(t *testing.T) {
 	}
 	if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(out, "work/CLAUDE.md")) != "# Work rules\n" {
 		t.Error("source or export wrong")
+	}
+}
+
+// xattr ссылки читаются без перехода по ней и совпадают с прочитанными по пути (llistxattr).
+func TestLinkXattrMatchesPath(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "l")
+	if err := os.Symlink("missing", link); err != nil {
+		t.Fatal(err)
+	}
+	n, err := unix.Llistxattr(link, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Skip("no xattrs on links on this file system")
+	}
+	want, err := xattrSum(func(b []byte) (int, error) { return unix.Llistxattr(link, b) },
+		func(name string, b []byte) (int, error) { return unix.Lgetxattr(link, name, b) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	got, err := linkXattr(int(d.Fd()), "l")
+	if err != nil || got != want || got == "" {
+		t.Errorf("linkXattr = %q, %v; want %q", got, err, want)
 	}
 }
