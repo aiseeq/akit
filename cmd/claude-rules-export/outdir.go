@@ -352,14 +352,18 @@ func same(have, want *entry) bool {
 	return *have == *want
 }
 
-// birthAt — время рождения записи name в папке dirfd, нс; 0, если файловая система его не даёт.
+// statx — тест подменяет его файловой системой без времени рождения.
+var statx = unix.Statx
+
+// birthAt — время рождения записи name в папке dirfd, нс. Без него новая запись с повторённым inode не отличима от
+// записи прошлого прогона — ошибка.
 func birthAt(dirfd int, name string, flags int) (int64, error) {
 	var st unix.Statx_t
-	if err := unix.Statx(dirfd, name, flags|unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &st); err != nil {
+	if err := statx(dirfd, name, flags|unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &st); err != nil {
 		return 0, fmt.Errorf("statx %s: %w", name, err)
 	}
 	if st.Mask&unix.STATX_BTIME == 0 {
-		return 0, nil
+		return 0, fmt.Errorf("statx %s: the file system gives no birth time", name)
 	}
 	return st.Btime.Sec*1e9 + int64(st.Btime.Nsec), nil
 }
@@ -676,7 +680,8 @@ func loadKnown(file, jfile, out string) ([]entry, error) {
 	return known, nil
 }
 
-// probeUnnamed — OUT_DIR держит файлы без имени: иначе перенос встал бы уже после очистки своего.
+// probeUnnamed — OUT_DIR держит файлы без имени и даёт время рождения: иначе перенос встал бы уже после очистки
+// своего, а без времени рождения своя копия на месте записи с тем же inode сошла бы за неё.
 func probeUnnamed(root *os.Root) error {
 	dir, err := root.Open(".")
 	if err != nil {
@@ -687,7 +692,11 @@ func probeUnnamed(root *os.Root) error {
 	if err != nil {
 		return fmt.Errorf("OUT_DIR does not keep unnamed files (O_TMPFILE): %w", err)
 	}
-	return unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
+	if _, err := birthAt(fd, "", unix.AT_EMPTY_PATH); err != nil {
+		return fmt.Errorf("OUT_DIR: %w", err)
+	}
+	return nil
 }
 
 // writeLogged — перенос с новым журналом jfile.

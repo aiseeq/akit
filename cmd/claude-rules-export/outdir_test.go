@@ -441,6 +441,30 @@ func TestExportRefusesWithoutUnnamedFiles(t *testing.T) {
 	}
 }
 
+// OUT_DIR без времени рождения — отказ до очистки: своя копия с повторённым inode не сойдёт за запись выгрузки.
+func TestExportRefusesWithoutBirthTime(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("first run: code %d %q", code, stderr)
+	}
+	before := snapshot(t, out)
+	saved := statx
+	statx = func(dirfd int, path string, flags, mask int, st *unix.Statx_t) error {
+		err := saved(dirfd, path, flags, mask, st)
+		st.Mask &^= unix.STATX_BTIME
+		return err
+	}
+	code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+	statx = saved
+	if code != exitUsage || !strings.Contains(stderr, "birth time") {
+		t.Errorf("code %d %q", code, stderr)
+	}
+	if snapshot(t, out) != before {
+		t.Error("OUT_DIR changed")
+	}
+}
+
 // Сборка оборванного прогона убирается следующим.
 func TestExportRemovesOldStage(t *testing.T) {
 	src, rules := fixture(t)

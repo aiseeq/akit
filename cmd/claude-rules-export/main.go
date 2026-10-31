@@ -37,7 +37,8 @@ link's text must
 match the list that run kept in $XDG_STATE_HOME/claude-rules-export (default
 ~/.local/state), keyed by the OUT_DIR path; the build lies there too. Nothing new gets its
 name in OUT_DIR before it is logged next to that list: a file is written unnamed, a folder
-or link is made under a random name logged first. Folders are removed only when empty;
+or link is made under a random name logged first; an OUT_DIR whose file system lacks
+unnamed files or birth times is refused. Folders are removed only when empty;
 .git at the top is never touched.
 Anything else (an edited or foreign file, a folder shown there by a mount, an OUT_DIR
 without a list that holds more than .git) is refused before anything is removed, so no
