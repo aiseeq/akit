@@ -170,6 +170,48 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	}
 }
 
+func TestWaitCacheSkipsTranscriptChangedDuringRead(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	spec := []struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{{"tk done one", 1, false, true}, {"tk done two", 2, false, true}, {"tk done three", 3, false, true}}
+	more := append(spec, struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{"tk done four", 4, false, true}, struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{"tk done five", 5, false, true})
+	path := writeWaitTranscript(t, e, "live.jsonl", claudeWaitRows(spec))
+	appended := false
+	afterWaitRead = func(read string) {
+		if read == path && !appended {
+			appended = true
+			if err := os.WriteFile(path, []byte(claudeWaitRows(more)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Cleanup(func() { afterWaitRead = func(string) {} })
+	args := []string{"--wait", "tk done", "--q", "50", path}
+	// Первый вызов прочёл три вызова, файл тем временем дописан до пяти: его ответ — по прочитанному,
+	// а запись не сохраняется, и второй вызов читает файл заново.
+	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "2000\n" || errOut != "" {
+		t.Fatalf("during append = (%d, %q, %q)", code, out, errOut)
+	}
+	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "3000\n" || errOut != "" {
+		t.Fatalf("after append = (%d, %q, %q), want 3000 from a fresh read", code, out, errOut)
+	}
+}
+
 func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
 	e := fakeHome(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())

@@ -18,6 +18,9 @@ import (
 
 const waitCacheMaxAge = 30 * 24 * time.Hour
 
+// afterWaitRead — точка между чтением транскрипта и сверкой его ключа; тест дописывает в ней файл.
+var afterWaitRead = func(string) {}
+
 // waitCacheVersion — формат записи: 2 — заголовок и события отдельными значениями gob.
 const waitCacheVersion = 2
 
@@ -245,6 +248,8 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	afterWaitRead(path)
+	// Транскрипт живой: дописанный за время чтения файл дал бы записи неполный список под новым ключом.
 	if current, err := c.key(path); err == nil && current.Size == key.Size && current.MTime == key.MTime {
 		c.saveRecord(key, events)
 	}
