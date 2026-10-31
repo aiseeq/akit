@@ -48,6 +48,7 @@ path (Claude Code or codex rollout).
                 row per session and the total (--role defaults to all)
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
+                Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
   --q N         percentile for --wait, from 1 to 99 (default 50); needs at least
                 3 events for --q 50 and below, 20 above
   Large reads wait for machine capacity through graft's heavy queue.
@@ -90,6 +91,7 @@ type options struct {
 	rolesSet     bool
 	args         []string
 	originalArgs []string
+	waitCache    *waitCache
 }
 
 var errHelp = errors.New("help")
@@ -308,7 +310,11 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	code, done, err := admission(sources, opts.originalArgs, stdout, stderr)
+	if opts.waitProg != "" {
+		opts.waitCache = newWaitCache(stderr)
+		opts.waitCache.cleanup(e.now)
+	}
+	code, done, err := admission(sources, opts.originalArgs, stdout, stderr, opts.waitCache)
 	if done {
 		if err != nil {
 			fmt.Fprintf(stderr, "tl: %v\n", err)

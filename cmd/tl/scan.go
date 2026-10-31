@@ -87,6 +87,18 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 	if f.opts.waitProg != "" {
 		wt = newWaitTracker(f.opts)
 	}
+	if wt != nil && f.opts.waitCache != nil {
+		events, err := f.opts.waitCache.events(src.path)
+		if err != nil {
+			return nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.path, err)
+		}
+		for _, event := range events {
+			if f.inWindow(transcript.Event{Role: event.Role, Time: event.Time, CallID: event.CallID}) {
+				wt.cachedEvent(event)
+			}
+		}
+		return nil, wt.waits, transcript.Meta{}, nil
+	}
 	var (
 		out    []hit
 		before []transcript.Event // последние -C событий окна до найденного

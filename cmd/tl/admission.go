@@ -17,7 +17,7 @@ var heavyThreshold int64 = 512 << 20
 // admission пускает тяжёлый вызов через очередь graft: перезапускает tl под `graft exec --heavy --local` и
 // отдаёт код дочернего; done — вызов уже выполнен там. Под очередью (GRAFT_THREADS задан) и для лёгкого
 // чтения — done false, читать здесь.
-func admission(sources []source, args []string, stdout, stderr io.Writer) (int, bool, error) {
+func admission(sources []source, args []string, stdout, stderr io.Writer, cache *waitCache) (int, bool, error) {
 	threads, set, err := configuredThreads()
 	if err != nil {
 		return exitUsage, true, err
@@ -30,6 +30,9 @@ func admission(sources []source, args []string, stdout, stderr io.Writer) (int, 
 	if !set {
 		var size int64
 		for _, src := range sources {
+			if cache != nil && cache.valid(src.path) {
+				continue
+			}
 			// Файл, пропавший после выбора, не в счёт: его ошибку чтения scan отдаст в итог, как раньше.
 			if info, err := os.Stat(src.path); err == nil {
 				size += info.Size()

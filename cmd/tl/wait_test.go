@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,7 @@ func claudeWaitRows(specs []struct {
 
 func TestWaitClaudePercentilesAndFiltering(t *testing.T) {
 	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	specs := make([]struct {
 		command string
 		delay   int
@@ -88,6 +90,122 @@ func TestWaitClaudePercentilesAndFiltering(t *testing.T) {
 	code, out, errOut = runTL(t, e, "--wait", "tk note", "--q", "95", path)
 	if code != 3 || out != "" || !strings.Contains(errOut, "0 wait event") {
 		t.Errorf("SUB code=%d out=%q stderr=%q", code, out, errOut)
+	}
+}
+
+func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	spec := []struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{{"tk done one", 1, false, true}, {"tk done two", 2, false, true}, {"tk done three", 3, false, true}}
+	path := writeWaitTranscript(t, e, "cache.jsonl", claudeWaitRows(spec))
+	args := []string{"--wait", "tk done", "--q", "50", path}
+	code, cold, coldErr := runTL(t, e, args...)
+	if code != 0 || cold != "2000\n" || coldErr != "" {
+		t.Fatalf("cold = (%d, %q, %q)", code, cold, coldErr)
+	}
+	code, warm, warmErr := runTL(t, e, args...)
+	if code != 0 || warm != cold || warmErr != "" {
+		t.Fatalf("warm = (%d, %q, %q), cold %q", code, warm, warmErr, cold)
+	}
+	cache := newWaitCache(io.Discard)
+	if !cache.valid(path) {
+		t.Fatal("cold call did not save a usable entry")
+	}
+	otherBinary := &waitCache{dir: cache.dir, binary: "different-binary"}
+	if otherBinary.valid(path) {
+		t.Fatal("entry from another binary fingerprint was accepted")
+	}
+	withMore := append(spec, struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{"tk done four", 4, false, true})
+	if err := os.WriteFile(path, []byte(claudeWaitRows(withMore)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, changed, changedErr := runTL(t, e, args...)
+	if code != 0 || changed != "2000\n" || changedErr != "" || cache.valid(path) == false {
+		t.Fatalf("changed = (%d, %q, %q)", code, changed, changedErr)
+	}
+}
+
+func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	specs := []struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{
+		{"tk done one", 1, false, true}, {"busy two", 2, false, true},
+		{"tk done three", 3, false, true}, {"tk done four", 4, false, true},
+	}
+	path := writeWaitTranscript(t, e, "window.jsonl", claudeWaitRows(specs))
+	queries := [][]string{
+		{"--wait", "tk done", "--since", "10:00:02", "--until", "10:00:08", "--q", "50", path},
+		{"--wait", "busy", "--since", "10:00:02", "--until", "10:00:08", "--q", "50", path},
+		{"--wait", "tk done", "--since", "10:00:00", "--until", "10:00:01", "--q", "50", path},
+	}
+	for _, args := range queries {
+		codeCold, outCold, errCold := runTL(t, e, args...)
+		codeWarm, outWarm, errWarm := runTL(t, e, args...)
+		if codeCold != codeWarm || outCold != outWarm || errCold != errWarm {
+			t.Errorf("query %q cold=(%d,%q,%q) warm=(%d,%q,%q)", args, codeCold, outCold, errCold, codeWarm, outWarm, errWarm)
+		}
+	}
+	cache := newWaitCache(io.Discard)
+	record := cache.recordPath(path)
+	if err := os.WriteFile(record, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut := runTL(t, e, queries[0]...)
+	if code != 3 || strings.Contains(errOut, "cache") {
+		t.Fatalf("corrupt entry result = (%d, %q)", code, errOut)
+	}
+	if !cache.valid(path) {
+		t.Fatal("corrupt entry was not replaced")
+	}
+	cachePath := cache.recordPath(path)
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 1
+	if err := os.WriteFile(cachePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cache.valid(path) {
+		t.Fatal("entry with damaged payload was accepted")
+	}
+}
+
+func TestWaitCachePreservesRepeatedCallIDSemantics(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	duplicate := strings.Join([]string{
+		`{"type":"assistant","timestamp":"2026-10-25T09:59:58Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"same","name":"Bash","input":{"command":"tk done duplicate"}}]}}`,
+		`{"type":"assistant","timestamp":"2026-10-25T09:59:59Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"same","name":"Bash","input":{"command":"tk done duplicate"}}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"same","content":"ok"}]}}`,
+	}, "\n")
+	specs := []struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{{"tk done one", 1, false, true}, {"tk done two", 2, false, true}, {"tk done three", 3, false, true}}
+	path := writeWaitTranscript(t, e, "repeat.jsonl", duplicate+"\n"+claudeWaitRows(specs))
+	args := []string{"--wait", "tk done", "--q", "50", path}
+	codeCold, cold, errCold := runTL(t, e, args...)
+	codeWarm, warm, errWarm := runTL(t, e, args...)
+	if codeCold != 0 || codeWarm != codeCold || cold != "2000\n" || warm != cold || errCold != "" || errWarm != "" {
+		t.Fatalf("cold=(%d,%q,%q) warm=(%d,%q,%q)", codeCold, cold, errCold, codeWarm, warm, errWarm)
 	}
 }
 

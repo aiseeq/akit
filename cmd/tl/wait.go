@@ -24,6 +24,9 @@ type waitCall struct {
 	at      time.Time
 	bg      bool
 	count   int
+	calls   []cachedShellCall
+	invalid bool
+	parsed  bool
 }
 
 // waitTracker сводит вызов команды с его выводом по ходу чтения одного файла: в памяти только вызовы, ждущие
@@ -39,29 +42,52 @@ func newWaitTracker(opts options) *waitTracker {
 }
 
 func (t *waitTracker) event(ev transcript.Event) {
-	switch ev.Role {
+	command, bg := "", false
+	if ev.Role == transcript.Cmd {
+		command, bg = waitCommand(ev)
+	}
+	t.eventCall(ev.Role, ev.CallID, ev.Time, command, bg)
+}
+
+func (t *waitTracker) eventCall(role transcript.Role, callID string, at time.Time, command string, bg bool) {
+	switch role {
 	case transcript.Cmd:
-		command, bg := waitCommand(ev)
 		if command != "" {
-			call := t.calls[ev.CallID]
+			call := t.calls[callID]
 			if call.count == 0 {
-				call.command, call.at = command, ev.Time
+				call.command, call.at = command, at
 			}
 			call.count++
 			call.bg = call.bg || bg
-			t.calls[ev.CallID] = call
+			t.calls[callID] = call
 		}
 	case transcript.Out:
-		call, ok := t.calls[ev.CallID]
+		call, ok := t.calls[callID]
 		if !ok || call.count != 1 || call.bg {
 			return
 		}
-		if matchedWaitCommand(call.command, t.prog, t.sub) {
-			if d := ev.Time.Sub(call.at); d >= 0 {
+		matched := false
+		if call.parsed {
+			matched = matchedWaitCallData(call.calls, call.invalid, t.prog, t.sub)
+		} else {
+			matched = matchedWaitCommand(call.command, t.prog, t.sub)
+		}
+		if matched {
+			if d := at.Sub(call.at); d >= 0 {
 				t.waits = append(t.waits, d)
 			}
 		}
-		delete(t.calls, ev.CallID)
+		delete(t.calls, callID)
+	}
+}
+
+func (t *waitTracker) cachedEvent(event cachedWaitEvent) {
+	first := event.Role == transcript.Cmd && t.calls[event.CallID].count == 0
+	t.eventCall(event.Role, event.CallID, event.Time, event.Command, event.BG)
+	if first && event.Role == transcript.Cmd {
+		call := t.calls[event.CallID]
+		call.calls, call.invalid, call.parsed = event.Calls, event.Invalid, true
+		t.calls[event.CallID] = call
 	}
 }
 
@@ -119,14 +145,32 @@ func waitCommand(ev transcript.Event) (string, bool) {
 }
 
 func matchedWaitCommand(command, prog, sub string) bool {
+	calls, invalid := parseWaitCalls(command)
+	return matchedWaitCallData(calls, invalid, prog, sub)
+}
+
+func parseWaitCalls(command string) ([]cachedShellCall, bool) {
 	found, err := shellcmd.Calls(command)
 	var nested *shellcmd.NestedError
-	if err != nil && !errors.As(err, &nested) {
+	invalid := err != nil && !errors.As(err, &nested)
+	calls := make([]cachedShellCall, 0, len(found))
+	for _, call := range found {
+		c := cachedShellCall{Name: call.Name, Background: call.Background}
+		if len(call.Args) > 0 {
+			c.Arg0, c.HasArg = call.Args[0], true
+		}
+		calls = append(calls, c)
+	}
+	return calls, invalid
+}
+
+func matchedWaitCallData(found []cachedShellCall, invalid bool, prog, sub string) bool {
+	if invalid {
 		return false
 	}
 	programs := 0
 	for _, call := range found {
-		if call.Name == prog && (sub == "" || len(call.Args) > 0 && call.Args[0] == sub) && !call.Background {
+		if call.Name == prog && (sub == "" || call.HasArg && call.Arg0 == sub) && !call.Background {
 			programs++
 			continue
 		}

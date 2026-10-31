@@ -180,7 +180,8 @@ Large transcript reads wait for machine capacity through graft's heavy queue.
 its output; calls without output, background Bash calls, and commands that also run unrelated programs
 are excluded. The default percentile is 50; `--q` accepts 1–99. Fewer matching events than the
 percentile needs (3 for `--q` 50 and below, 20 above) returns exit 3 with the count in stderr and no
-stdout.
+stdout. Completed calls are cached per transcript in `$XDG_CACHE_HOME/akit/tl-wait` (or the user cache
+directory when `XDG_CACHE_HOME` is unset); changing the transcript or the `tl` binary invalidates its entry.
 
 ## user-word
 

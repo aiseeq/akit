@@ -29,7 +29,7 @@ func TestAdmissionQueuesHeavyReadAndPropagatesGraft125(t *testing.T) {
 	heavyThreshold = 1
 	t.Cleanup(func() { heavyThreshold = oldThreshold })
 	var stdout, stderr bytes.Buffer
-	code, done, err := admission([]source{{path: transcriptPath}}, []string{"-test.run=TestGraftHelper"}, &stdout, &stderr)
+	code, done, err := admission([]source{{path: transcriptPath}}, []string{"-test.run=TestGraftHelper"}, &stdout, &stderr, nil)
 	if !done || code != 125 || err != nil {
 		t.Fatalf("admission = (%d, %t, %v), want (125, true, nil); stderr: %s", code, done, err, stderr.String())
 	}
@@ -84,7 +84,7 @@ func TestConfiguredThreads(t *testing.T) {
 		t.Fatalf("configured workers = %d, set %t, err %v", threads, set, err)
 	}
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
-	if _, done, err := admission(nil, nil, io.Discard, io.Discard); done || err != nil || runtime.GOMAXPROCS(0) != threads {
+	if _, done, err := admission(nil, nil, io.Discard, io.Discard, nil); done || err != nil || runtime.GOMAXPROCS(0) != threads {
 		t.Fatalf("admission under the queue: done %t, err %v, GOMAXPROCS %d, want %d", done, err, runtime.GOMAXPROCS(0), threads)
 	}
 	t.Setenv("GRAFT_THREADS", "invalid")
@@ -105,8 +105,42 @@ func TestAdmissionWithoutGraftWarnsAndContinues(t *testing.T) {
 	heavyThreshold = 1
 	t.Cleanup(func() { heavyThreshold = oldThreshold })
 	var stdout, stderr bytes.Buffer
-	code, done, err := admission([]source{{path: transcriptPath}}, nil, &stdout, &stderr)
+	code, done, err := admission([]source{{path: transcriptPath}}, nil, &stdout, &stderr, nil)
 	if done || code != 0 || err != nil || stderr.String() != "tl: graft not in PATH, reading without the machine queue\n" {
 		t.Fatalf("admission = (%d, %t, %v), stderr %q", code, done, err, stderr.String())
+	}
+}
+
+func TestAdmissionSkipsWarmWaitCache(t *testing.T) {
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "transcript.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte("synthetic transcript"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cache := &waitCache{dir: filepath.Join(dir, "cache"), binary: "synthetic"}
+	cache.saveRecord(waitCacheRecord{Version: 1, Path: transcriptPath, Size: int64(len("synthetic transcript")), MTime: func() int64 {
+		info, err := os.Stat(transcriptPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.ModTime().UnixNano()
+	}(), Binary: "synthetic"}, []cachedWaitEvent{})
+	marker := filepath.Join(dir, "graft-called")
+	graft := filepath.Join(dir, "graft")
+	if err := os.WriteFile(graft, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin:/bin")
+	unsetEnv(t, "GRAFT_THREADS")
+	oldThreshold := heavyThreshold
+	heavyThreshold = 1
+	t.Cleanup(func() { heavyThreshold = oldThreshold })
+	var stdout, stderr bytes.Buffer
+	code, done, err := admission([]source{{path: transcriptPath}}, nil, &stdout, &stderr, cache)
+	if code != 0 || done || err != nil || stderr.Len() != 0 {
+		t.Fatalf("warm admission = (%d, %t, %v), stderr %q", code, done, err, stderr.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("graft was called for a warm entry: %v", err)
 	}
 }
