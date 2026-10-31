@@ -126,6 +126,9 @@ Repository task files live in `docs/tasks/`; closed tickets can be moved to `doc
 after an independent review.
 
     tk new fix-login --prio HIGH --title 'Fix login' --by agent
+    tk plan fix-login --add 'tests: go test ./...'
+    tk check fix-login                  # run plan checks without closing
+    tk skip fix-login tests --why 'covered by another check'
     tk ls                              # open tickets, oldest first
     tk start fix-login --by agent
     tk wait fix-login --until '2026-10-28 09:00' --by agent
@@ -134,9 +137,11 @@ after an independent review.
     tk archive                         # closed tickets older than 14 days
     tk archive --root DIR              # archive tasks in DIR and its first-level repositories
 
-`tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. A `## Вход` section
-in `--text` (context: where the request came from, facts behind it) goes before `Что сделать`;
-without it the ticket has none.
+`tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
+`## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
+`tk check` runs them, and `tk done` runs every unskipped check before closing. A `## План` section
+can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
+before `Что сделать` and is omitted when absent.
 
 Ticket IDs accept the slug, the full file name, or the file name without `.md`. Outside a Git
 repository, `tk` uses the nearest `docs/tasks/` up to `$HOME`; `new` creates it in the current

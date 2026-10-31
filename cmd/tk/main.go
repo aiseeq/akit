@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +14,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aiseeq/akit/proc"
@@ -28,6 +31,9 @@ Usage:
   tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME] [--text FILE|-]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
+  tk plan ID --add 'NAME: COMMAND' [--by NAME]
+  tk skip ID NAME --why TEXT [--by NAME]
+  tk check ID
   tk lint [--root DIR]
   tk start ID [--by NAME]
   tk wait ID --until TEXT [--by NAME]
@@ -54,6 +60,7 @@ Flags:
   --doer NAME    done: specify the executor of a legacy ticket
   --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject: explain why the ticket was declined (required)
+  --add TEXT     plan: add a named command to the ticket plan (required)
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
 
@@ -75,13 +82,15 @@ var slugPrefixRE = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*-?$`)
 var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-([A-Z]+)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$`)
 var nameRE = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N}._:@-]*$`)
 var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-[a-z0-9]+(?:-[a-z0-9]+)*(?:\.md)?$`)
+var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 var errHelp = errors.New("help")
 var session = currentSession
+var planTimeout = 60 * time.Second
 
 type options struct {
-	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot string
-	all, due, json                                                                                         bool
-	older                                                                                                  time.Duration
+	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, item string
+	all, due, json                                                                                                    bool
+	older                                                                                                             time.Duration
 }
 type task struct {
 	path, slug, status, prio, title, body string
@@ -121,7 +130,7 @@ func parseArgs(a []string) (options, error) {
 }
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt}
+	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -167,6 +176,14 @@ func parseOptions(args []string, o *options) ([]string, error) {
 }
 
 func validateCommand(o *options, pos []string) error {
+	switch o.cmd {
+	case "plan":
+		return validatePlanCommand(o, pos)
+	case "skip":
+		return validateSkipCommand(o, pos)
+	case "check":
+		return validateCheckCommand(o, pos)
+	}
 	if o.cmd == "note" {
 		if len(pos) != 2 {
 			return errors.New("note needs a ticket ID and text")
@@ -207,6 +224,49 @@ func validateCommand(o *options, pos []string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", o.cmd)
+	}
+	return nil
+}
+
+func validatePlanCommand(o *options, pos []string) error {
+	if len(pos) != 1 || !validID(pos[0]) {
+		return errors.New("plan needs a ticket ID")
+	}
+	o.id = pos[0]
+	if o.add == "" {
+		return errors.New("plan requires --add 'NAME: COMMAND'")
+	}
+	if _, _, err := splitPlanItem(o.add); err != nil {
+		return err
+	}
+	return validateActorFlag(o)
+}
+
+func validateSkipCommand(o *options, pos []string) error {
+	if len(pos) != 2 || !validID(pos[0]) {
+		return errors.New("skip needs a ticket ID and plan name")
+	}
+	o.id, o.item = pos[0], pos[1]
+	if !planNameRE.MatchString(o.item) {
+		return errors.New("skip needs a valid plan name")
+	}
+	if strings.TrimSpace(o.why) == "" {
+		return errors.New("skip requires --why")
+	}
+	return validateActorFlag(o)
+}
+
+func validateCheckCommand(o *options, pos []string) error {
+	if len(pos) != 1 || !validID(pos[0]) {
+		return errors.New("check needs a ticket ID")
+	}
+	o.id = pos[0]
+	return nil
+}
+
+func validateActorFlag(o *options) error {
+	if o.by != "" && !nameRE.MatchString(o.by) {
+		return errors.New("--by must be a name without spaces; use --by NAME")
 	}
 	return nil
 }
@@ -362,6 +422,15 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		}
 		return 0
 	}
+	if o.cmd == "check" {
+		return checkPlan(root, t, out, errout)
+	}
+	if o.cmd == "plan" {
+		return addPlanItem(t, o, out, errout)
+	}
+	if o.cmd == "skip" {
+		return skipPlanItem(t, o, out, errout)
+	}
 	if o.cmd == "note" {
 		return addNote(t, o, out, errout)
 	}
@@ -405,7 +474,7 @@ func resolveTaskBase() (string, string, bool, error) {
 	return cwd, filepath.Join(cwd, "docs/tasks"), false, nil
 }
 func prepareActor(o *options, errout io.Writer) int {
-	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" || o.cmd == "lint" {
+	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" || o.cmd == "lint" || o.cmd == "check" {
 		return 0
 	}
 	if o.by == "" {
@@ -483,6 +552,9 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		title, now.Format("2006-01-02 15:04"), o.by)
 	if o.text != "" {
 		body = fillTicket(body, o.text)
+	}
+	if err := validatePlanSection(body); err != nil {
+		return fail(errout, err)
 	}
 	p := filepath.Join(dir, now.Format("20060102-1504")+"-"+o.prio+"-"+o.id+".md")
 	if e = os.WriteFile(p, []byte(body), fileMode); e != nil {
@@ -867,11 +939,12 @@ func parseTicketSections(text string) (map[string][]string, []string) {
 var sectionAliases = map[string]string{"## Постановка": "## Вход", "## Чем проверить": "## Приёмка"}
 
 func standardTicketSection(section string) bool {
-	return section == "## Что сделать" || section == "## Приёмка" || section == "## Вход"
+	return section == "## Что сделать" || section == "## Приёмка" || section == "## Вход" || section == "## План"
 }
 
 func replaceTicketSections(template string, sections map[string][]string, extra []string) string {
 	lines := strings.Split(template, "\n")
+	hasPlan := slices.Contains(lines, "## План")
 	var out []string
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -893,6 +966,13 @@ func replaceTicketSections(template string, sections map[string][]string, extra 
 		if line == "## Журнал" && len(extra) > 0 {
 			out = append(out, extra...)
 			out = append(out, "")
+		}
+		if line == "## Журнал" && !hasPlan {
+			if plan := trimBlankEdges(sections["## План"]); len(plan) > 0 {
+				out = append(out, "## План")
+				out = append(out, plan...)
+				out = append(out, "")
+			}
 		}
 		out = append(out, line)
 	}
@@ -1043,6 +1123,258 @@ func journal(s, line string) string {
 	return strings.Join(ls, "\n")
 }
 
+func splitPlanItem(value string) (string, string, error) {
+	name, command, ok := strings.Cut(value, ":")
+	name, command = strings.TrimSpace(name), strings.TrimSpace(command)
+	if !ok || !planNameRE.MatchString(name) || command == "" {
+		return name, command, errors.New("--add needs 'NAME: COMMAND' with a lowercase name and non-empty command")
+	}
+	return name, command, nil
+}
+
+func planItems(body string) []planJSON {
+	section, ok := sectionBody(body, "## План")
+	if !ok {
+		return nil
+	}
+	var items []planJSON
+	for line := range strings.SplitSeq(section, "\n") {
+		if !strings.HasPrefix(line, "- ") {
+			continue
+		}
+		name, command, err := splitPlanItem(strings.TrimPrefix(line, "- "))
+		if err != nil {
+			items = append(items, planJSON{Name: name, Cmd: command, Invalid: err.Error()})
+			continue
+		}
+		why, skipped := planSkipReason(body, name)
+		items = append(items, planJSON{Name: name, Cmd: command, Skipped: skipped, Why: why})
+	}
+	return items
+}
+
+func validatePlanSection(body string) error {
+	section, ok := sectionBody(body, "## План")
+	if !ok {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for line := range strings.SplitSeq(section, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "- ") {
+			return errors.New("plan lines must use '- NAME: COMMAND'")
+		}
+		name, _, err := splitPlanItem(strings.TrimPrefix(line, "- "))
+		if err != nil {
+			return err
+		}
+		if seen[name] {
+			return fmt.Errorf("plan name %q appears more than once", name)
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+func planSkipReason(body, name string) (string, bool) {
+	lines := journalLines(body)
+	for i := len(lines) - 1; i >= 0; i-- {
+		marker := " пропущен: " + name + " — "
+		if at := strings.Index(lines[i], marker); at >= 0 {
+			return strings.TrimSpace(lines[i][at+len(marker):]), true
+		}
+	}
+	return "", false
+}
+
+func addPlanItem(t task, o options, out, errout io.Writer) int {
+	name, command, err := splitPlanItem(o.add)
+	if err != nil {
+		return fail(errout, err)
+	}
+	for _, item := range planItems(t.body) {
+		if item.Name == name {
+			fmt.Fprintf(errout, "tk: plan name %q already exists\n", name)
+			return exitUsage
+		}
+	}
+	line := "- " + name + ": " + command
+	t.body = insertPlanLine(t.body, line)
+	t.body = journal(t.body, fmt.Sprintf("- %s план — %s: добавлен пункт %s", time.Now().Format("2006-01-02 15:04"), o.by, name))
+	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintf(out, "%s plan added\n", t.slug)
+	return 0
+}
+
+func insertPlanLine(body, line string) string {
+	lines := strings.Split(body, "\n")
+	start, end := -1, len(lines)
+	for i, current := range lines {
+		if current == "## План" {
+			start = i + 1
+			continue
+		}
+		if start >= 0 && strings.HasPrefix(current, "## ") {
+			end = i
+			break
+		}
+	}
+	if start < 0 {
+		for i, current := range lines {
+			if current == "## Журнал" {
+				lines = append(lines[:i], append([]string{"## План", line, ""}, lines[i:]...)...)
+				return strings.Join(lines, "\n")
+			}
+		}
+		return strings.TrimRight(body, "\n") + "\n\n## План\n" + line + "\n"
+	}
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	lines = append(lines[:end], append([]string{line}, lines[end:]...)...)
+	return strings.Join(lines, "\n")
+}
+
+func skipPlanItem(t task, o options, out, errout io.Writer) int {
+	found := false
+	for _, item := range planItems(t.body) {
+		if item.Name == o.item {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fmt.Fprintf(errout, "tk: plan name %q not found\n", o.item)
+		return exitNone
+	}
+	line := fmt.Sprintf("- %s пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.item, o.why)
+	body := journal(t.body, line)
+	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintf(out, "%s plan skipped\n", t.slug)
+	return 0
+}
+
+type planResult struct {
+	item     planJSON
+	exit     int
+	stderr   string
+	timedOut bool
+	skipped  bool
+}
+
+func runPlanItem(root string, item planJSON) planResult {
+	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "-c", item.Cmd)
+	cmd.Dir = root
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	result := planResult{item: item, stderr: firstLine(stderr.String())}
+	if err == nil {
+		return result
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		result.timedOut = true
+		result.exit = -1
+		return result
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.exit = exitErr.ExitCode()
+	} else {
+		result.exit = 1
+		result.stderr = firstLine(err.Error())
+	}
+	return result
+}
+
+func firstLine(value string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(value), "\n")
+	return strings.TrimSpace(line)
+}
+
+func runPlan(root string, t task) []planResult {
+	items := planItems(t.body)
+	results := make([]planResult, 0, len(items))
+	for _, item := range items {
+		if item.Invalid != "" {
+			results = append(results, planResult{item: item, stderr: item.Invalid})
+		} else if item.Skipped {
+			results = append(results, planResult{item: item, skipped: true})
+		} else {
+			results = append(results, runPlanItem(root, item))
+		}
+	}
+	return results
+}
+
+func checkPlan(root string, t task, out, errout io.Writer) int {
+	failed := false
+	for _, result := range runPlan(root, t) {
+		if result.item.Invalid != "" {
+			failed = true
+			fmt.Fprintf(out, "%s: invalid, %s\n", result.item.Name, result.item.Invalid)
+			continue
+		}
+		if result.skipped {
+			fmt.Fprintf(out, "%s: skipped — %s\n", result.item.Name, result.item.Why)
+			continue
+		}
+		if result.exit == 0 {
+			fmt.Fprintf(out, "%s: ok\n", result.item.Name)
+			continue
+		}
+		failed = true
+		fmt.Fprint(out, planFailure(result))
+	}
+	if failed {
+		return exitNone
+	}
+	return 0
+}
+
+func planFailure(result planResult) string {
+	if result.item.Invalid != "" {
+		return fmt.Sprintf("%s: invalid, %s\n", result.item.Name, result.stderr)
+	}
+	if result.timedOut {
+		return fmt.Sprintf("%s: timeout\n", result.item.Name)
+	}
+	if result.stderr != "" {
+		return fmt.Sprintf("%s: exit %d, %s\n", result.item.Name, result.exit, result.stderr)
+	}
+	return fmt.Sprintf("%s: exit %d\n", result.item.Name, result.exit)
+}
+
+func executePlan(root string, t *task, errout io.Writer) int {
+	var failed []planResult
+	for _, result := range runPlan(root, *t) {
+		if result.skipped {
+			continue
+		}
+		if result.item.Invalid != "" || result.exit != 0 || result.timedOut {
+			failed = append(failed, result)
+		}
+	}
+	if len(failed) == 0 {
+		return 0
+	}
+	fmt.Fprintln(errout, "tk: plan checks failed:")
+	for _, result := range failed {
+		fmt.Fprint(errout, strings.TrimSuffix(planFailure(result), "\n"), "\n")
+	}
+	return exitNone
+}
+
 type glintReport struct {
 	Summary *struct {
 		Total *int `json:"total"`
@@ -1187,6 +1519,9 @@ func transition(t task, o options, out, errout io.Writer) int {
 		if code != 0 {
 			return code
 		}
+		if code = executePlan(o.baseRoot, &t, errout); code != 0 {
+			return code
+		}
 	}
 	if o.cmd == "start" || o.cmd == "review" && executor(t.body) == "" {
 		t.body = setExecutor(t.body, o.by)
@@ -1235,22 +1570,31 @@ func addNote(t task, o options, out, errout io.Writer) int {
 }
 
 type taskJSON struct {
-	Repo           string   `json:"repo,omitempty"`
-	Slug           string   `json:"slug"`
-	Status         string   `json:"status"`
-	Prio           string   `json:"prio"`
-	Title          string   `json:"title"`
-	Created        string   `json:"created"`
-	Changed        string   `json:"changed"`
-	Path           string   `json:"path"`
-	Executor       string   `json:"executor"`
-	Waits          string   `json:"waits"`
-	Overdue        bool     `json:"overdue"`
-	NoCheck        bool     `json:"no_check"`
-	Check          string   `json:"check"`
-	Checker        string   `json:"checker"`
-	CheckerSession string   `json:"checker_session"`
-	Journal        []string `json:"journal"`
+	Repo           string     `json:"repo,omitempty"`
+	Slug           string     `json:"slug"`
+	Status         string     `json:"status"`
+	Prio           string     `json:"prio"`
+	Title          string     `json:"title"`
+	Created        string     `json:"created"`
+	Changed        string     `json:"changed"`
+	Path           string     `json:"path"`
+	Executor       string     `json:"executor"`
+	Waits          string     `json:"waits"`
+	Overdue        bool       `json:"overdue"`
+	NoCheck        bool       `json:"no_check"`
+	Check          string     `json:"check"`
+	Checker        string     `json:"checker"`
+	CheckerSession string     `json:"checker_session"`
+	Journal        []string   `json:"journal"`
+	Plan           []planJSON `json:"plan,omitempty"`
+}
+
+type planJSON struct {
+	Name    string `json:"name"`
+	Cmd     string `json:"cmd"`
+	Skipped bool   `json:"skipped"`
+	Why     string `json:"why"`
+	Invalid string `json:"invalid,omitempty"`
 }
 
 func taskObject(root string, t task, repo string, details bool) taskJSON {
@@ -1268,6 +1612,7 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 		obj.Journal = journalLines(t.body)
 	}
 	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
+	obj.Plan = planItems(t.body)
 	return obj
 }
 

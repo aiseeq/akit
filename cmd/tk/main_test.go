@@ -112,6 +112,28 @@ func TestValidateNew(t *testing.T) {
 	}
 }
 
+func TestNewPlanSectionIsOptionalAndTextAddsItBeforeJournal(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	var out, errOut bytes.Buffer
+	if code := create(root, dir, options{id: "no-plan", by: "worker", prio: "MEDIUM"}, &out, &errOut); code != 0 {
+		t.Fatalf("new without plan: %d %s", code, errOut.String())
+	}
+	plain, err := os.ReadFile(filepath.Join(root, strings.TrimSpace(out.String())))
+	if err != nil || strings.Contains(string(plain), "## План") {
+		t.Fatalf("new without plan contains a plan section: %s, %v", plain, err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := create(root, dir, options{id: "with-plan", by: "worker", prio: "MEDIUM", text: "## План\n- build: go build ./cmd/tk"}, &out, &errOut); code != 0 {
+		t.Fatalf("new with plan text: %d %s", code, errOut.String())
+	}
+	withPlan, err := os.ReadFile(filepath.Join(root, strings.TrimSpace(out.String())))
+	if err != nil || !strings.Contains(string(withPlan), "## План\n- build: go build ./cmd/tk\n\n## Журнал") {
+		t.Fatalf("--text plan placement: %s, %v", withPlan, err)
+	}
+}
+
 func TestValidateList(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -573,6 +595,123 @@ func TestListSkipsLinkedWorktreesAndReportsBadNames(t *testing.T) {
 	}
 	if !strings.Contains(text, "skipped 1 files not named YYYYMMDD-HHMM-PRIO-slug.md: notes.md") {
 		t.Fatalf("malformed file not reported: %s", text)
+	}
+}
+
+func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
+	for _, args := range [][]string{
+		{"plan", "ticket", "--add", "Bad_Name: true", "--by", "worker"},
+		{"plan", "ticket", "--add", "valid:   ", "--by", "worker"},
+		{"skip", "ticket", "valid", "--by", "worker"},
+	} {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%q) accepted invalid plan arguments", args)
+		}
+	}
+	if _, err := parseArgs([]string{"plan", "ticket", "--add", "valid: true", "--by", "worker"}); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\nСтатус: в работе\n\n## План\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ticket := task{path: path, slug: "task", body: body}
+	var out, errOut bytes.Buffer
+	if code := addPlanItem(ticket, options{by: "worker", add: "present: test -f marker"}, &out, &errOut); code != 0 {
+		t.Fatalf("add plan: %d %s", code, errOut.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(updated), "## План\n- present: test -f marker\n\n## Журнал") || !strings.Contains(string(updated), "план — worker: добавлен пункт present") {
+		t.Fatalf("plan insertion: %s, %v", updated, err)
+	}
+	if code := addPlanItem(task{path: path, slug: "task", body: string(updated)}, options{by: "worker", add: "present: true"}, &out, &errOut); code != exitUsage {
+		t.Fatalf("duplicate plan entry returned %d", code)
+	}
+	if err := os.WriteFile(filepath.Join(root, "marker"), []byte("ok"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if code := checkPlan(root, task{path: path, body: string(updated)}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "present: ok") {
+		t.Fatalf("check plan: %d %q %s", code, out.String(), errOut.String())
+	}
+	if code := skipPlanItem(task{path: path, slug: "task", body: string(updated)}, options{item: "present", why: "covered elsewhere"}, &out, &errOut); code != 0 {
+		t.Fatalf("skip plan: %d %s", code, errOut.String())
+	}
+	skipped, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := planItems(string(skipped))
+	if len(items) != 1 || !items[0].Skipped || items[0].Why != "covered elsewhere" {
+		t.Fatalf("skip state = %#v", items)
+	}
+	out.Reset()
+	if code := checkPlan(root, task{path: path, body: string(skipped)}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "present: skipped — covered elsewhere") {
+		t.Fatalf("check skipped: %d %q %s", code, out.String(), errOut.String())
+	}
+	obj := taskObject(root, task{path: path, slug: "task", body: string(skipped)}, "", false)
+	if len(obj.Plan) != 1 || !obj.Plan[0].Skipped || obj.Plan[0].Cmd != "test -f marker" {
+		t.Fatalf("plan JSON data = %#v", obj.Plan)
+	}
+}
+
+func TestInvalidPlanItemAppearsInJSON(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "tasks", "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\n## План\n- Bad_Name: go test ./...\n\n## Журнал\n"
+	obj := taskObject(root, task{path: path, slug: "task", body: body}, "", false)
+	if len(obj.Plan) != 1 || obj.Plan[0].Name != "Bad_Name" || obj.Plan[0].Cmd != "go test ./..." || obj.Plan[0].Invalid == "" {
+		t.Fatalf("invalid plan item = %#v", obj.Plan)
+	}
+	data, err := json.Marshal(obj)
+	if err != nil || !strings.Contains(string(data), `"invalid":"`) {
+		t.Fatalf("invalid plan JSON = %s, %v", data, err)
+	}
+}
+
+func TestNewTextAcceptsAndValidatesPlan(t *testing.T) {
+	valid := fillTicket("# Task\n\nСтатус: открыт\n\n## Что сделать\n\n## Приёмка\n\n## План\n\n## Журнал\n", "## План\n- build: go build ./cmd/tk\n")
+	if err := validatePlanSection(valid); err != nil || !strings.Contains(valid, "## План\n- build: go build ./cmd/tk\n") {
+		t.Fatalf("valid --text plan = %q, %v", valid, err)
+	}
+	duplicate := fillTicket("# Task\n\nСтатус: открыт\n\n## План\n\n## Журнал\n", "## План\n- build: go build\n- build: go test\n")
+	if err := validatePlanSection(duplicate); err == nil || !strings.Contains(err.Error(), "appears more than once") {
+		t.Fatalf("duplicate --text plan accepted: %v", err)
+	}
+}
+
+func TestPlanFailureBlocksDoneAndReportsFirstStderrLine(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Приёмка\ncheck\n\n## План\n- broken: echo first >&2; echo second >&2; exit 7\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := transition(task{path: path, slug: "task", body: body}, options{cmd: "done", by: "reviewer", check: "verified", baseRoot: root}, &out, &errOut)
+	updated, err := os.ReadFile(path)
+	if err != nil || code != exitNone || string(updated) != body || !strings.Contains(errOut.String(), "broken: exit 7, first") || strings.Contains(errOut.String(), "second") {
+		t.Fatalf("done failure code=%d stderr=%q body=%q readErr=%v", code, errOut.String(), updated, err)
+	}
+}
+
+func TestPlanTimeoutKillsProcessGroup(t *testing.T) {
+	oldTimeout := planTimeout
+	planTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { planTimeout = oldTimeout })
+	result := runPlanItem(t.TempDir(), planJSON{Name: "slow", Cmd: "sleep 5 & wait"})
+	if !result.timedOut {
+		t.Fatalf("expected timeout, got %#v", result)
 	}
 }
 
