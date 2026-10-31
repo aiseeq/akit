@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -255,4 +256,78 @@ func TestExportLinkedSkillCopiesContent(t *testing.T) {
 	if got := read(t, filepath.Join(out, "skills/jira3/SKILL.md")); got != "# jira3\n" {
 		t.Errorf("SKILL.md: %q", got)
 	}
+}
+
+// «..» после ссылки система берёт от цели ссылки, а filepath.Abs стёр бы ссылку по тексту: проверка и чтение идут
+// по тому же пути, что очистка, — по пути, как его поймёт система.
+func TestExportDotDotAfterLink(t *testing.T) {
+	src, rules := fixture(t)
+	links := t.TempDir()
+	if err := os.Symlink(filepath.Join(src, ".claude"), filepath.Join(links, "claude")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(src, filepath.Join(links, "home")); err != nil {
+		t.Fatal(err)
+	}
+	// по тексту links/rules — двойник правил; система читает настоящие правила рядом с home
+	if err := copyTree(rules, filepath.Join(links, "rules")); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range [][2]string{
+		{rules, filepath.Join(links, "claude") + "/.."},
+		{filepath.Join(links, "home") + "/../rules", rules},
+	} {
+		code, _, stderr := runExport(t, "--src-home", src, "--rules", c[0], c[1])
+		if code != exitUsage || !strings.Contains(stderr, "must not contain") {
+			t.Errorf("--rules %s, OUT_DIR %s: code %d %q", c[0], c[1], code, stderr)
+		}
+		if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(rules, "manifest/skills.txt")) != "jira\n" {
+			t.Fatalf("--rules %s, OUT_DIR %s: источник или правила стёрты", c[0], c[1])
+		}
+	}
+}
+
+// OUT_DIR — та же папка, показанная bind mount под другим путём: по тексту путей её не узнать, очистка стёрла бы
+// источник. Монтирование — в своём пространстве имён (unshare -rm), где тест запускает сам себя.
+func TestExportRefusesBindMount(t *testing.T) {
+	if out := os.Getenv("CRE_BIND_OUT"); out != "" {
+		code, _, stderr := runExport(t, "--src-home", os.Getenv("CRE_BIND_SRC"), "--rules", os.Getenv("CRE_BIND_RULES"), out)
+		if code != exitUsage || !strings.Contains(stderr, "must not contain") {
+			t.Fatalf("OUT_DIR %s: code %d %q", out, code, stderr)
+		}
+		return
+	}
+	if !userNamespaces() {
+		t.Skip("no unshare or user namespaces are off: no mount --bind")
+	}
+	src, rules := fixture(t)
+	mnt := t.TempDir()
+	for _, c := range []struct{ name, bound, out string }{
+		{"home", src, "m"},
+		{"inside .claude", filepath.Join(src, ".claude"), "m/x"},
+	} {
+		point := filepath.Join(mnt, c.name)
+		if err := os.MkdirAll(point, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out := filepath.Join(point, strings.TrimPrefix(c.out, "m"))
+		cmd := exec.Command("unshare", "-rm", "sh", "-c", `mount --bind "$1" "$2" && exec "$3" -test.run '^TestExportRefusesBindMount$' -test.count=1`,
+			"sh", c.bound, point, os.Args[0])
+		cmd.Env = append(os.Environ(), "CRE_BIND_SRC="+src, "CRE_BIND_RULES="+rules, "CRE_BIND_OUT="+out)
+		if b, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s: %v\n%s", c.name, err, b)
+		}
+		if read(t, filepath.Join(src, "work/CLAUDE.md")) != "# Work rules\n" || read(t, filepath.Join(src, ".claude/CLAUDE.md")) == "" {
+			t.Fatalf("%s: источник стёрт", c.name)
+		}
+	}
+}
+
+// userNamespaces — есть unshare и система разрешает свои пространства имён: без них bind mount в тесте не сделать.
+func userNamespaces() bool {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		return false
+	}
+	n, err := os.ReadFile("/proc/sys/user/max_user_namespaces")
+	return err == nil && strings.TrimSpace(string(n)) != "0"
 }

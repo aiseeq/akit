@@ -31,8 +31,10 @@ ALLOWED is printed as file:line: KIND.
 
 An OUT_DIR that holds what is read (the source home, its .claude and work, both
 CLAUDE.md, --rules with its manifest and template, an exported skill's folder and the
-targets of links in it) or is or lies in any of it but the home, symlinks resolved, is
-refused before anything is cleared. A skill folder that is a link is exported as its content.
+targets of links in it) or is or lies in any of it but the home is refused before anything
+is cleared. Paths are taken as the system takes them: symlinks resolved, ".." after a link
+goes from its target, a folder bind-mounted under another path is the same folder. A skill
+folder that is a link is exported as its content.
 
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).

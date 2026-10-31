@@ -16,26 +16,27 @@ type missingSkill struct{ name string }
 func (m missingSkill) Error() string { return "missing skill: " + m.name }
 
 func export(opts options, stdout io.Writer) error {
-	out, err := filepath.Abs(opts.out)
+	// сверяются, читаются и очищаются одни и те же пути — разрешённые так, как их поймёт система
+	out, err := physical(opts.out)
 	if err != nil {
 		return fmt.Errorf("OUT_DIR: %w", err)
 	}
-	src, err := filepath.Abs(opts.srcHome)
+	src, err := physical(opts.srcHome)
 	if err != nil {
 		return fmt.Errorf("--src-home: %w", err)
 	}
-	rules, err := filepath.Abs(opts.rules)
+	rules, err := physical(opts.rules)
 	if err != nil {
 		return fmt.Errorf("--rules: %w", err)
 	}
-	m, err := readManifest(opts.rules)
+	m, err := readManifest(rules)
 	if err != nil {
 		return err
 	}
 	if err := checkOut(out, src, rules, m); err != nil {
 		return err
 	}
-	if err := assemble(out, src, opts.rules, m); err != nil {
+	if err := assemble(out, src, rules, m); err != nil {
 		return err
 	}
 	files, err := textFiles(out)
@@ -172,10 +173,31 @@ func findPII(root string, files []string, pii []piiRule) ([]string, error) {
 	return hits, nil
 }
 
-// within — путь p совпадает с dir или лежит внутри него.
-func within(p, dir string) bool {
-	rel, err := filepath.Rel(dir, p)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+// within — путь p совпадает с dir или лежит внутри него. Кроме текста разрешённых путей сравниваются сами папки:
+// bind mount показывает ту же папку под другим путём, и по тексту её не узнать.
+func within(p, dir string) (bool, error) {
+	if rel, err := filepath.Rel(dir, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return true, nil
+	}
+	d, err := os.Stat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", dir, err)
+	}
+	for q := p; ; q = filepath.Dir(q) {
+		s, err := os.Stat(q)
+		if err == nil && os.SameFile(s, d) {
+			return true, nil
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("stat %s: %w", q, err)
+		}
+		if q == filepath.Dir(q) {
+			return false, nil
+		}
+	}
 }
 
 // checkOut — OUT_DIR очищается: папка, где лежит читаемое, или папка внутри читаемого стёрла бы источник. Пути
@@ -194,28 +216,58 @@ func checkOut(out, src, rules string, m manifest) error {
 		if err != nil {
 			return err
 		}
-		if within(r, o) || (read != src && within(o, r)) {
+		contains, err := within(r, o)
+		if err != nil {
+			return err
+		}
+		inside := false
+		if read != src {
+			if inside, err = within(o, r); err != nil {
+				return err
+			}
+		}
+		if contains || inside {
 			return fmt.Errorf("OUT_DIR must not contain or be inside what it reads: %s", read)
 		}
 	}
 	return nil
 }
 
-// resolved — путь с разрешёнными симлинками; у несуществующего — по ближайшему существующему предку.
-func resolved(p string) (string, error) {
-	for q := p; ; q = filepath.Dir(q) {
-		r, err := filepath.EvalSymlinks(q)
-		if err == nil {
-			rel, err := filepath.Rel(q, p)
-			if err != nil {
-				return "", fmt.Errorf("%s relative to %s: %w", p, q, err)
-			}
-			return filepath.Join(r, rel), nil
+// physical — абсолютный путь, как его поймёт система. filepath.Abs чистит текст до разрешения ссылок и убирает
+// «..» вместе со ссылкой перед ним, а система идёт от цели ссылки: здесь путь не чистится до EvalSymlinks.
+func physical(p string) (string, error) {
+	if !filepath.IsAbs(p) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("current folder: %w", err)
 		}
-		if !errors.Is(err, fs.ErrNotExist) || q == filepath.Dir(q) {
-			return "", err
-		}
+		p = wd + string(filepath.Separator) + p
 	}
+	return resolved(p)
+}
+
+// resolved — путь с разрешёнными симлинками; у несуществующего — по ближайшему существующему предку. Предок
+// берётся срезом текста, не filepath.Dir: тот чистит «..» по тексту.
+func resolved(p string) (string, error) {
+	r, err := filepath.EvalSymlinks(p)
+	if err == nil {
+		return r, nil
+	}
+	sep := string(filepath.Separator)
+	trimmed := strings.TrimRight(p, sep)
+	i := strings.LastIndex(trimmed, sep)
+	base := trimmed[i+1:]
+	if !errors.Is(err, fs.ErrNotExist) || i < 0 || base == "." || base == ".." {
+		return "", err
+	}
+	parent := trimmed[:i]
+	if parent == "" {
+		parent = sep
+	}
+	if r, err = resolved(parent); err != nil {
+		return "", err
+	}
+	return filepath.Join(r, base), nil
 }
 
 // readPaths — всё, что выгрузка читает или до чего дотянется из источника: home, его .claude и work, оба
