@@ -1272,7 +1272,7 @@ func TestPlanItemIgnoresShellStartupEnv(t *testing.T) {
 	t.Setenv("ENV", filepath.Join(dir, "env.sh"))
 	t.Setenv("BASH_FUNC_exit%%", "() { builtin exit 0; }")
 	t.Setenv("SHELLOPTS", "noexec") // команды разбираются, но не исполняются: выход 0
-	t.Setenv("BASHOPTS", "extdebug")
+	t.Setenv("BASHOPTS", "nullglob")
 	// с SSH_CLIENT и без SHLVL bash читает ~/.bashrc и в -c
 	write(".bashrc", "exit 0\n")
 	t.Setenv("HOME", dir)
@@ -1281,12 +1281,15 @@ func TestPlanItemIgnoresShellStartupEnv(t *testing.T) {
 	t.Setenv("LD_PRELOAD", filepath.Join(dir, "none.so"))
 	t.Setenv("LD_AUDIT", filepath.Join(dir, "none.so"))
 	t.Setenv("LD_LIBRARY_PATH", dir)
+	t.Setenv("LD_BIND_NOW", "1")
+	t.Setenv("GCONV_PATH", dir) // с не-UTF-8 локалью glibc грузит отсюда модуль в сам bash
+	t.Setenv("LOCPATH", dir)
 	if err := os.Mkdir(filepath.Join(dir, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	write("bin/bash", "#!/bin/sh\nexit 0\n")
 	t.Setenv("PATH", filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
-	cmd := `shopt -q extdebug && exit 5; [ -n "${LD_PRELOAD-}${LD_AUDIT-}${LD_LIBRARY_PATH-}" ] && exit 4; exit 3`
+	cmd := `shopt -q nullglob && exit 5; [ -n "${ENV-}" ] && exit 6; [ -n "${LD_PRELOAD-}${LD_AUDIT-}${LD_LIBRARY_PATH-}${LD_BIND_NOW-}${GCONV_PATH-}${LOCPATH-}" ] && exit 4; exit 3`
 	if result := runPlanItem(dir, planJSON{Name: "accept", Cmd: cmd}); result.exit != 3 {
 		t.Errorf("exit %d, want 3: %+v", result.exit, result)
 	}

@@ -1472,8 +1472,12 @@ type planResult struct {
 	skipped  bool
 }
 
-// shellEnvDropped — переменные, которые убираются из окружения пункта плана (см. runPlanItem).
-var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"}
+// shellEnvDropped — переменные, которые убираются из окружения пункта плана вместе с LD_* и BASH_FUNC_* (см.
+// runPlanItem): стартовые bash и список UNSECURE_ENVVARS glibc без TMPDIR — тот кода не грузит, а командам
+// проверки нужен.
+var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS",
+	"GCONV_PATH", "GETCONF_DIR", "GLIBC_TUNABLES", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH", "MALLOC_ARENA_MAX",
+	"MALLOC_ARENA_TEST", "MALLOC_TRACE", "NIS_PATH", "NLSPATH", "RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR"}
 
 func runPlanItem(root string, item planJSON) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
@@ -1481,11 +1485,12 @@ func runPlanItem(root string, item planJSON) planResult {
 	// bash — по абсолютному пути, без файлов старта и без того в окружении, что меняет сам bash, а не команду:
 	// BASH_ENV, ENV, функция BASH_FUNC_* или ~/.bashrc (bash читает его и в -c при SSH_CLIENT без SHLVL)
 	// исполнились бы раньше команды и подменили бы её итог, SHELLOPTS=noexec не дал бы ей исполниться (выход 0),
-	// BASHOPTS меняет опции, LD_PRELOAD, LD_AUDIT и LD_LIBRARY_PATH подкладывают bash свой код
+	// BASHOPTS меняет опции; LD_* и прочие переменные, которые glibc сама убирает у setuid-программ (GCONV_PATH,
+	// LOCPATH, …), подкладывают bash свой код
 	cmd := exec.CommandContext(ctx, "/bin/bash", "--norc", "--noprofile", "-c", item.Cmd)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
 		name, _, _ := strings.Cut(kv, "=")
-		return strings.HasPrefix(name, "BASH_FUNC_") || slices.Contains(shellEnvDropped, name)
+		return strings.HasPrefix(name, "BASH_FUNC_") || strings.HasPrefix(name, "LD_") || slices.Contains(shellEnvDropped, name)
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
