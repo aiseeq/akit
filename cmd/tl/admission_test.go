@@ -29,7 +29,7 @@ func TestAdmissionQueuesHeavyReadAndPropagatesGraft125(t *testing.T) {
 	heavyThreshold = 1
 	t.Cleanup(func() { heavyThreshold = oldThreshold })
 	var stdout, stderr bytes.Buffer
-	code, done, err := admission([]source{{path: transcriptPath}}, []string{"-test.run=TestGraftHelper"}, &stdout, &stderr, nil)
+	code, done, err := admission([]source{{Path: transcriptPath}}, []string{"-test.run=TestGraftHelper"}, &stdout, &stderr, nil)
 	if !done || code != 125 || err != nil {
 		t.Fatalf("admission = (%d, %t, %v), want (125, true, nil); stderr: %s", code, done, err, stderr.String())
 	}
@@ -105,7 +105,7 @@ func TestAdmissionWithoutGraftWarnsAndContinues(t *testing.T) {
 	heavyThreshold = 1
 	t.Cleanup(func() { heavyThreshold = oldThreshold })
 	var stdout, stderr bytes.Buffer
-	code, done, err := admission([]source{{path: transcriptPath}}, nil, &stdout, &stderr, nil)
+	code, done, err := admission([]source{{Path: transcriptPath}}, nil, &stdout, &stderr, nil)
 	if done || code != 0 || err != nil || stderr.String() != "tl: graft not in PATH, reading without the machine queue\n" {
 		t.Fatalf("admission = (%d, %t, %v), stderr %q", code, done, err, stderr.String())
 	}
@@ -136,7 +136,7 @@ func TestAdmissionSkipsWarmWaitCache(t *testing.T) {
 	heavyThreshold = 1
 	t.Cleanup(func() { heavyThreshold = oldThreshold })
 	var stdout, stderr bytes.Buffer
-	code, done, err := admission([]source{{path: transcriptPath}}, nil, &stdout, &stderr, cache)
+	code, done, err := admission([]source{{Path: transcriptPath}}, nil, &stdout, &stderr, cache)
 	if code != 0 || done || err != nil || stderr.Len() != 0 {
 		t.Fatalf("warm admission = (%d, %t, %v), stderr %q", code, done, err, stderr.String())
 	}

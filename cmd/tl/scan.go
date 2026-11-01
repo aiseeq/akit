@@ -633,9 +633,9 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		wt = newWaitTracker(f.opts)
 	}
 	if wt != nil && f.opts.waitCache != nil {
-		events, err := f.opts.waitCache.events(src.path)
+		events, err := f.opts.waitCache.events(src.Path)
 		if err != nil {
-			return nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.path, err)
+			return nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
 		}
 		for _, event := range events {
 			if f.inWindow(transcript.Event{Role: event.Role, Time: event.Time, CallID: event.CallID}) {
@@ -649,7 +649,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		before []transcript.Event // последние -C событий окна до найденного
 		after  int                // сколько событий после найденного ещё показать
 	)
-	meta, err := transcript.ReadWithTools(src.path, keep, func(ev transcript.Event) {
+	meta, err := transcript.ReadWithTools(src.Path, keep, func(ev transcript.Event) {
 		if !f.inWindow(ev) {
 			return
 		}
@@ -680,7 +680,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		waits = wt.waits
 	}
 	if err != nil {
-		return out, waits, meta, fmt.Errorf("read %s: %w", src.path, err)
+		return out, waits, meta, fmt.Errorf("read %s: %w", src.Path, err)
 	}
 	return out, waits, meta, nil
 }
@@ -706,10 +706,10 @@ func scan(sources []source, opts options) (result, error) {
 				res.waits = append(res.waits, waits...)
 				res.bad += meta.Bad
 				if meta.FirstBad != nil && res.firstBad == nil {
-					res.firstBad = fmt.Errorf("%s %w", src.id, meta.FirstBad)
+					res.firstBad = fmt.Errorf("%s %w", src.ID, meta.FirstBad)
 				}
 				if meta.Name != "" {
-					res.names[src.id] = meta.Name
+					res.names[src.ID] = meta.Name
 				}
 				if err != nil {
 					res.errs = append(res.errs, err)
@@ -728,8 +728,8 @@ func scan(sources []source, opts options) (result, error) {
 		if !a.ev.Time.Equal(b.ev.Time) {
 			return a.ev.Time.Before(b.ev.Time)
 		}
-		if a.src.path != b.src.path {
-			return a.src.path < b.src.path
+		if a.src.Path != b.src.Path {
+			return a.src.Path < b.src.Path
 		}
 		return a.ev.Line < b.ev.Line
 	})
@@ -766,28 +766,28 @@ func report(res result, opts options, e env, w io.Writer) int {
 	seen := map[string]bool{}
 	for i := range hits {
 		h := &hits[i]
-		if seen[h.src.id] {
+		if seen[h.src.ID] {
 			continue
 		}
-		seen[h.src.id] = true
-		name := res.names[h.src.id]
-		if h.src.parentID != "" {
-			parentName := res.names[h.src.parentID]
+		seen[h.src.ID] = true
+		name := res.names[h.src.ID]
+		if h.src.ParentID != "" {
+			parentName := res.names[h.src.ParentID]
 			if parentName != "" {
 				parentName = " " + parentName
 			}
 			description := ""
-			if h.src.description != "" {
-				description = fmt.Sprintf(" %q", h.src.description)
+			if h.src.Description != "" {
+				description = fmt.Sprintf(" %q", h.src.Description)
 			}
-			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", h.src.id, h.src.parentID, parentName, description, tilde(h.src.path, e.home))
+			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", h.src.ID, h.src.ParentID, parentName, description, tilde(h.src.Path, e.home))
 			continue
 		}
 		if name != "" {
 			name += " "
 		}
-		if h.src.id != h.src.path {
-			fmt.Fprintf(w, "== %s %s%s\n", h.src.id, name, tilde(h.src.path, e.home))
+		if h.src.ID != h.src.Path {
+			fmt.Fprintf(w, "== %s %s%s\n", h.src.ID, name, tilde(h.src.Path, e.home))
 		}
 	}
 	for i := range hits {
@@ -807,7 +807,7 @@ func line(h *hit, width int) string {
 	if h.ev.Who != "" {
 		who = strings.TrimSpace(h.ev.Who+" "+h.ev.Subtype) + ": "
 	}
-	return fmt.Sprintf("%s %s:%d %s %s%s", h.ev.Time.Local().Format("02.01 15:04:05"), h.src.id, h.ev.Line, h.ev.Role,
+	return fmt.Sprintf("%s %s:%d %s %s%s", h.ev.Time.Local().Format("02.01 15:04:05"), h.src.ID, h.ev.Line, h.ev.Role,
 		who, transcript.Short(h.ev.Shown(), width))
 }
 
@@ -851,7 +851,7 @@ func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	src, err := sourceAt(path)
+	src, err := transcript.SourceAt(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
@@ -867,7 +867,7 @@ func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
 		return exitUsage
 	}
 	if len(found) == 0 {
-		fmt.Fprintf(w, "tl: no event at %s:%d (service record, unparsable line or out of range)\n", src.id, lineNo)
+		fmt.Fprintf(w, "tl: no event at %s:%d (service record, unparsable line or out of range)\n", src.ID, lineNo)
 		return exitNone
 	}
 	for i := range found {
@@ -876,7 +876,7 @@ func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
 		if ev.Who != "" {
 			who = " " + ev.Who
 		}
-		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), src.id, ev.Line, ev.Role, who, ev.Shown())
+		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), src.ID, ev.Line, ev.Role, who, ev.Shown())
 	}
 	return 0
 }

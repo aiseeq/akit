@@ -74,6 +74,10 @@ change in `full total` from `/proc/pressure/io` over the sampling interval.
     busy                        # busy: runnable 31 is at or above 22; runnable 31 (busy at 22, threads 22); …
     busy --runnable 16          # busy from 16 runnable tasks instead of the thread count
 
+## uptake
+
+Measures calls to akit tools and their earlier equivalents in Claude and Codex transcripts over a time window. It writes count, example, outcome, repeat, pairing, empty-search, and edit-cost TSV tables plus a Markdown report. The default window covers the previous seven days; `--since` and `--until` accept RFC3339 timestamps, `--seed` fixes example selection, and `--out` selects the output directory.
+
 ## claude-rules-export
 
 Claude Code rules and skills exported for colleagues and checked for private data: the chosen

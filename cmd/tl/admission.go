@@ -34,11 +34,11 @@ func admission(sources []source, args []string, stdout, stderr io.Writer, cache 
 	if !set {
 		var size int64
 		for _, src := range sources {
-			if cache != nil && cache.valid(src.path) {
+			if cache != nil && cache.valid(src.Path) {
 				continue
 			}
 			// Файл, пропавший после выбора, не в счёт: его ошибку чтения scan отдаст в итог, как раньше.
-			if info, err := os.Stat(src.path); err == nil {
+			if info, err := os.Stat(src.Path); err == nil {
 				size += info.Size()
 			}
 		}
