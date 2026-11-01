@@ -109,7 +109,7 @@ func (p *Plan) load(name string) (*file, error) {
 		return nil, fmt.Errorf("stat %s: unexpected file metadata", name)
 	}
 	f := &file{
-		path: path, orig: string(data), cur: string(data), mode: st.Mode().Perm(),
+		path: path, orig: string(data), cur: string(data), mode: st.Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky),
 		size: st.Size(), modTime: st.ModTime(), uid: int(sys.Uid), gid: int(sys.Gid),
 	}
 	// Один файл под двумя именами (симлинк и цель) — одно содержимое, иначе вторая запись затрёт первую.

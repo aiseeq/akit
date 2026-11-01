@@ -1,6 +1,7 @@
 package edit
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -408,5 +409,29 @@ func TestWriteDropsInheritedDefaultACL(t *testing.T) {
 	}
 	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o640 {
 		t.Errorf("mode: %v %v", st.Mode(), err)
+	}
+}
+
+// Особые биты режима (setuid, setgid, sticky) переживают замену, как и обычные.
+func TestWriteKeepsSpecialModeBits(t *testing.T) {
+	dir := writeFiles(t, map[string]string{"a.txt": "old\n"})
+	path := filepath.Join(dir, "a.txt")
+	want := fs.FileMode(0o755) | fs.ModeSetuid | fs.ModeSetgid
+	if err := os.Chmod(path, want); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Build([]Edit{{Files: []string{path}, Old: "old", New: "new", Want: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Write(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky); got != want {
+		t.Errorf("mode %v, want %v", got, want)
 	}
 }
