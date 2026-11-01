@@ -153,10 +153,6 @@ func quietClock(until, now time.Time) string {
 func Rule(m Load, l Limits, skipped []error) Verdict {
 	v := Verdict{Load: m, Skipped: skipped}
 	maxIOFull, runnable, memSome := effectiveLimits(m, l)
-	ioFull := m.IOFull
-	if m.hasIOFullExact {
-		ioFull = m.ioFullExact
-	}
 	memory := !skippedAny(skipped, ErrNoMemPressure) && !skippedAny(skipped, ErrNoVMStat)
 	switch {
 	case !m.QuietUntil.IsZero():
@@ -165,8 +161,7 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 		v.Measure, v.Value, v.Limit = CPU, float64(m.Runnable), runnable
 	case !skippedAny(skipped, ErrNoLoadAvg) && runnable > 0 && m.Avg1 >= runnable:
 		v.Measure, v.Value, v.Limit = CPU, m.Avg1, runnable
-	case maxIOFull < 100 && (m.Disk != nil || !skippedAny(skipped, ErrNoIOPressure)) &&
-		((m.Disk != nil && m.Disk.Open) || ioFull >= maxIOFull):
+	case diskBusy(m, maxIOFull, skipped):
 		v.Measure, v.Value, v.Limit = IO, m.IOFull, maxIOFull
 	case !skippedAny(skipped, ErrNoMemInfo) && m.DirtyMB >= l.WritebackLimit():
 		v.Measure, v.Value, v.Limit = Writeback, m.DirtyMB, l.WritebackLimit()
@@ -174,6 +169,19 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 		v.Measure, v.Value, v.Limit = Swap, m.MemSome, memSome
 	}
 	return v
+}
+
+// diskBusy — занята ли машина по диску: заморозка от источника или давление IO на пороге maxIOFull;
+// порог 100 и выше выключает проверку, пропущенная мера без источника не судится.
+func diskBusy(m Load, maxIOFull float64, skipped []error) bool {
+	if maxIOFull >= 100 || (m.Disk == nil && skippedAny(skipped, ErrNoIOPressure)) {
+		return false
+	}
+	ioFull := m.IOFull
+	if m.hasIOFullExact {
+		ioFull = m.ioFullExact
+	}
+	return (m.Disk != nil && m.Disk.Open) || ioFull >= maxIOFull
 }
 
 // effectiveLimits — пороги правила с умолчаниями на месте нулевых: диск, процессор (число потоков машины),
@@ -376,7 +384,6 @@ func (m *Meter) socketPath() string {
 	return diskPath()
 }
 
-// read читает файл procRoot; файла нет — мера none.
 // ParseDirty — грязные и пишущиеся на диск страницы из текста /proc/meminfo, MiB: Dirty+Writeback.
 // Нет любого из полей или не число — ошибка.
 func ParseDirty(meminfo string) (float64, error) {
@@ -406,6 +413,7 @@ func ParseDirty(meminfo string) (float64, error) {
 	return sum / 1024, nil
 }
 
+// read читает файл procRoot; файла нет — мера none.
 func (m *Meter) read(name string, none error) ([]byte, error) {
 	data, err := os.ReadFile(filepath.Join(m.procRoot, name))
 	if errors.Is(err, os.ErrNotExist) {
