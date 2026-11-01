@@ -225,6 +225,64 @@ func TestExternalStorePlanAndSkipCommitTicket(t *testing.T) {
 	}
 }
 
+func TestExternalStoreCheckRunsPlanInCodeTree(t *testing.T) {
+	main, _, _ := setupExternalStore(t)
+	if err := os.WriteFile(filepath.Join(main, "code-marker"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "plan", id: "seed", add: "tree: test -f code-marker", by: "worker"}, &out, &errOut); code != 0 {
+		t.Fatalf("plan %d: %s", code, errOut.String())
+	}
+	out.Reset()
+	if code := run(options{cmd: "check", id: "seed"}, &out, &errOut); code != 0 {
+		t.Fatalf("check ran outside the code tree: %d: %s%s", code, out.String(), errOut.String())
+	}
+}
+
+func TestExternalStoreArchiveCommitsMovedBeforeError(t *testing.T) {
+	main, store, ticket := setupExternalStore(t)
+	closed := "# T\n\nСтатус: готово\n\n## Приёмка\n- проверить\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer: проверено\n"
+	second := filepath.Join(store, "proj/docs/tasks/20260102-1200-LOW-second.md")
+	taken := filepath.Join(store, "proj/docs/tasks-archive", filepath.Base(second))
+	if err := os.MkdirAll(filepath.Dir(taken), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{ticket, second, taken} {
+		if err := os.WriteFile(p, []byte(closed), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitTest(t, store, "add", "-A")
+	gitTest(t, store, "commit", "-m", "closed tickets")
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "archive", older: time.Second}, &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "archive destination exists") {
+		t.Fatalf("archive with a taken destination: %d: %s", code, errOut.String())
+	}
+	if _, err = os.Stat(filepath.Join(store, "proj/docs/tasks-archive", filepath.Base(ticket))); err != nil {
+		t.Fatalf("first ticket was not moved: %v", err)
+	}
+	if got := gitTest(t, store, "status", "--porcelain"); got != "" {
+		t.Fatalf("store left dirty after a partial archive: %s", got)
+	}
+}
+
 func TestExternalStoreRetriesIndexLock(t *testing.T) {
 	main, store, _ := setupExternalStore(t)
 	old, err := os.Getwd()
