@@ -380,6 +380,44 @@ func TestWorktreeKeepsOwnTasksWhenMainTracksThem(t *testing.T) {
 	}
 }
 
+func TestWorktreeDoneUsesCodeTreeAndDebtNextToTicket(t *testing.T) {
+	main, wt := sharedTasksRepo(t, true)
+	writeTestFile(t, filepath.Join(wt, "wt-marker"), "x\n")
+	writeTestFile(t, filepath.Join(main, "docs/tasks/20260103-1200-LOW-debt.md"), "# Debt\n\nСтатус: открыт\n")
+	bin := t.TempDir()
+	writeTestFile(t, filepath.Join(bin, "glint"), "#!/bin/sh\nprintf '%s' '{\"summary\":{\"total\":1},\"issues\":[{\"rule\":\"r\",\"severity\":\"low\",\"file\":\"a.go\",\"line\":1,\"message\":\"m\"}]}'\n")
+	if err := os.Chmod(filepath.Join(bin, "glint"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "plan", id: "shared", add: "tree: test -f wt-marker", by: "t"}, &out, &errOut); code != 0 {
+		t.Fatalf("plan %d: %s", code, errOut.String())
+	}
+	if code := run(options{cmd: "done", id: "shared", by: "reviewer", doer: "t", check: "c", glintDebt: "debt"}, &out, &errOut); code != 0 {
+		t.Fatalf("done from the worktree %d: %s", code, errOut.String())
+	}
+	if body := read(t, filepath.Join(main, "docs/tasks/20260102-1200-LOW-shared.md")); !strings.Contains(body, "Статус: готово") {
+		t.Fatalf("shared ticket not closed: %s", body)
+	}
+}
+
+func TestWorktreeOfBareRepoInDotGitKeepsOwnTasks(t *testing.T) {
+	main, _ := sharedTasksRepo(t, true)
+	bare := filepath.Join(t.TempDir(), "dots")
+	gitTest(t, main, "clone", "-q", "--bare", main, filepath.Join(bare, ".git"))
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitTest(t, bare, "worktree", "add", "-q", wt, "main")
+	writeTestFile(t, filepath.Join(wt, "docs/tasks/20260104-1200-LOW-own.md"), "# Own\n\nСтатус: открыт\n")
+	if err := os.Chdir(wt); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "ls", all: true}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "own") {
+		t.Fatalf("ls from a worktree of a bare repo %d: %s%s", code, out.String(), errOut.String())
+	}
+}
+
 func TestWorktreeCheckRunsPlanInCodeTree(t *testing.T) {
 	_, wt := sharedTasksRepo(t, true)
 	writeTestFile(t, filepath.Join(wt, "wt-marker"), "x\n")

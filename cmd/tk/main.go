@@ -491,7 +491,15 @@ func sharedTaskRoot(root, main string) (string, error) {
 	if main == "" || main == root {
 		return "", nil
 	}
-	err := exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", "docs/tasks/").Run()
+	// Каталог .git бывает и bare-репо (рабочего дерева у него нет): тогда тикеты в worktree.
+	bare, err := exec.Command("git", "-C", main, "rev-parse", "--is-bare-repository").Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse in %s: %w", main, err)
+	}
+	if strings.TrimSpace(string(bare)) == "true" {
+		return "", nil
+	}
+	err = exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", "docs/tasks/").Run()
 	if err == nil {
 		return main, nil
 	}

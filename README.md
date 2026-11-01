@@ -165,7 +165,9 @@ after an independent review.
 
 In a linked worktree of a repository whose main tree ignores `docs/tasks/`, `tk` uses the main tree's
 `docs/tasks/`, so every branch sees the same tickets; plan checks and glint still run in the current
-worktree. Where `docs/tasks/` is not ignored, each worktree keeps its own tickets.
+worktree. Where `docs/tasks/` is not ignored, each worktree keeps its own tickets, as do worktrees
+of a bare repository or of a submodule. The whole directory is meant to be ignored: a negated
+pattern that lets some ticket files back into git is not honoured.
 
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
