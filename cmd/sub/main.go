@@ -26,7 +26,8 @@ Usage:
 
 If any edit finds a different number of matches, no file is changed and the
 answer says where: expected/found counts and line numbers, or near-misses
-that differ only in indentation. Exit: 0 written, 1 mismatch, 2 usage/IO error.
+that differ only in indentation. File ownership and extended attributes (including ACLs) are kept;
+files with hard links are refused because replacement would break those links. Exit: 0 written, 1 mismatch, 2 usage/IO error.
 
   -n N        expected matches (args mode)
   -F SPEC     read the spec from file SPEC ("-" = stdin)

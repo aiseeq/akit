@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +38,8 @@ type file struct {
 	mode    fs.FileMode
 	size    int64
 	modTime time.Time
+	uid     int
+	gid     int
 }
 
 // Plan — все правки, посчитанные в памяти. Файлы не тронуты, пока не вызван Write.
@@ -101,7 +104,14 @@ func (p *Plan) load(name string) (*file, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", name, err)
 	}
-	f := &file{path: path, orig: string(data), cur: string(data), mode: st.Mode().Perm(), size: st.Size(), modTime: st.ModTime()}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("stat %s: unexpected file metadata", name)
+	}
+	f := &file{
+		path: path, orig: string(data), cur: string(data), mode: st.Mode().Perm(),
+		size: st.Size(), modTime: st.ModTime(), uid: int(sys.Uid), gid: int(sys.Gid),
+	}
 	// Один файл под двумя именами (симлинк и цель) — одно содержимое, иначе вторая запись затрёт первую.
 	for _, other := range p.files {
 		if other.path == path {

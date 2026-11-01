@@ -120,7 +120,9 @@ stale cards, `daydigest` to append replies) are called by path in `~/.claude/imp
 
 Exact-text replace with an expected match count, all or nothing: if any edit finds a different
 number of matches, no file changes and the answer names the mismatch (counts, line numbers, or a
-near-miss that differs only in indentation). Exit 0 written, 1 mismatch, 2 usage/IO error.
+near-miss that differs only in indentation). Replacements preserve extended attributes (including ACLs)
+and ownership; files with hard links are refused because replacing them would break those links. Exit 0
+written, 1 mismatch, 2 usage/IO error.
 
     sub OLD NEW FILE... [-n N]         # exactly N matches across all FILEs (default 1)
     sub [--dry-run] <<'EOF'            # many edits, files and lines in one call

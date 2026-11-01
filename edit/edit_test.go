@@ -2,9 +2,12 @@ package edit
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func writeFiles(t *testing.T, files map[string]string) string {
@@ -142,6 +145,92 @@ func TestBuildWriteAllOrNothing(t *testing.T) {
 	}
 	if got := plan.Summary(); !strings.HasPrefix(got, "4 replacements in 2 files:") {
 		t.Errorf("summary: %q", got)
+	}
+}
+
+func TestWritePreservesXattr(t *testing.T) {
+	dir := writeFiles(t, map[string]string{"a.txt": "old\n"})
+	path := filepath.Join(dir, "a.txt")
+	if err := unix.Setxattr(path, "user.test", []byte("value"), 0); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Build([]Edit{{Files: []string{path}, Old: "old", New: "new", Want: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Write(); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 100)
+	n, err := unix.Getxattr(path, "user.test", buf)
+	if err != nil {
+		t.Fatalf("Getxattr: %v", err)
+	}
+	if string(buf[:n]) != "value" {
+		t.Errorf("xattr = %q", buf[:n])
+	}
+}
+
+func TestWritePreservesACL(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/setfacl"); err != nil {
+		t.Skip("setfacl is unavailable")
+	}
+	if _, err := os.Stat("/usr/bin/getfacl"); err != nil {
+		t.Skip("getfacl is unavailable")
+	}
+	dir, err := os.MkdirTemp(".", ".acl-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("old\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("setfacl", "-m", "u:12345:rw", path).CombinedOutput(); err != nil {
+		t.Fatalf("setfacl: %v: %s", err, out)
+	}
+	plan, err := Build([]Edit{{Files: []string{path}, Old: "old", New: "new", Want: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Write(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("getfacl", "-cp", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("getfacl: %v: %s", err, out)
+	}
+	if !strings.Contains(string(out), "user:12345:rw-") {
+		t.Errorf("ACL was not preserved:\n%s", out)
+	}
+}
+
+func TestWriteHardLinkAbortsAllFiles(t *testing.T) {
+	dir := writeFiles(t, map[string]string{"a.txt": "old\n", "other.txt": "old\n"})
+	path, alias := filepath.Join(dir, "a.txt"), filepath.Join(dir, "alias.txt")
+	if err := os.Link(path, alias); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "other.txt")
+	plan, err := Build([]Edit{{Files: []string{other, path}, Old: "old", New: "new", Want: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Write(); err == nil || !strings.Contains(err.Error(), "hard link") || !strings.Contains(err.Error(), "nothing written") {
+		t.Fatalf("want hard-link refusal, got %v", err)
+	}
+	for _, name := range []string{path, alias, other} {
+		if got := readFile(t, name); got != "old\n" {
+			t.Errorf("%s changed: %q", name, got)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("temporary files left: %d entries", len(entries))
 	}
 }
 

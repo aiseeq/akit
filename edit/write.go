@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Write записывает изменённые файлы: сначала все во временные рядом с целью, затем переименованием поверх. Если файл
@@ -31,6 +34,13 @@ func (p *Plan) Write() ([]string, error) {
 		}
 		if st.Size() != f.size || !st.ModTime().Equal(f.modTime) {
 			return nil, fmt.Errorf("%s changed on disk while editing, nothing written", names[i])
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil, fmt.Errorf("stat %s: unexpected file metadata", names[i])
+		}
+		if sys.Nlink > 1 {
+			return nil, fmt.Errorf("%s has %d hard links; sub replaces the file and would break them, nothing written", names[i], sys.Nlink)
 		}
 	}
 	temps := make([]string, 0, len(changed))
@@ -67,7 +77,20 @@ func writeTemp(f *file) (string, error) {
 	name := t.Name()
 	_, werr := t.WriteString(f.cur)
 	if werr == nil {
+		st, err := t.Stat()
+		if err != nil {
+			werr = err
+		} else if sys, ok := st.Sys().(*syscall.Stat_t); !ok {
+			werr = errors.New("unexpected temp file metadata")
+		} else if int(sys.Uid) != f.uid || int(sys.Gid) != f.gid {
+			werr = unix.Fchown(int(t.Fd()), f.uid, f.gid)
+		}
+	}
+	if werr == nil {
 		werr = t.Chmod(f.mode)
+	}
+	if werr == nil {
+		werr = copyXattrs(f.path, name)
 	}
 	if werr == nil {
 		werr = t.Sync()
@@ -83,4 +106,37 @@ func writeTemp(f *file) (string, error) {
 		return "", werr
 	}
 	return name, nil
+}
+
+func copyXattrs(source, target string) error {
+	size, err := unix.Listxattr(source, nil)
+	if err != nil {
+		return fmt.Errorf("list extended attributes: %w", err)
+	}
+	if size == 0 {
+		return nil
+	}
+	list := make([]byte, size)
+	n, err := unix.Listxattr(source, list)
+	if err != nil {
+		return fmt.Errorf("list extended attributes: %w", err)
+	}
+	for attr := range strings.SplitSeq(string(list[:n]), "\x00") {
+		if attr == "" {
+			continue
+		}
+		size, err := unix.Getxattr(source, attr, nil)
+		if err != nil {
+			return fmt.Errorf("get attribute %s: %w", attr, err)
+		}
+		value := make([]byte, size)
+		got, err := unix.Getxattr(source, attr, value)
+		if err != nil {
+			return fmt.Errorf("get attribute %s: %w", attr, err)
+		}
+		if err := unix.Setxattr(target, attr, value[:got], 0); err != nil {
+			return fmt.Errorf("set attribute %s: %w", attr, err)
+		}
+	}
+	return nil
 }
