@@ -38,9 +38,10 @@ Without --until, the brief file's modification time is used.
 FRAGMENT matches ignoring case, ё/е and line breaks or runs of spaces.
 User lines: typed or queued by the human, and answers in a question dialog.
 Question dialog searches match only the human's answer; the question is shown
-as context. The word right after a brief marker clock is its zone: CET, CEST,
-UTC, GMT, Z, UTC+H (any case, parentheses allowed); another word there is
-reported as not found.
+as context. A brief marker zone may follow its date or clock: CET, CEST, UTC,
+GMT, Z, UTC+H (any case, optional parentheses and trailing punctuation). Two-
+digit marker years use the usual 00–68 and 69–99 year ranges; another word
+after the clock is reported as not found.
 Exit: 0 found, 1 not found, 2 usage/IO error.
 `
 

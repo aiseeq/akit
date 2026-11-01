@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -589,5 +590,66 @@ func TestBriefMarkerZoneTextAndYear(t *testing.T) {
 		if strings.Contains(c.want, "zone") {
 			mustHave(t, c.marker, out, "1 not found")
 		}
+	}
+}
+
+func TestRound7LaterUserLinesAfterNotifications(t *testing.T) {
+	e := testEnv(t)
+	records := []string{human("2026-10-31T10:00:00Z", "Исходная цитата")}
+	for i := range 25 {
+		records = append(records, fmt.Sprintf(`{"type":"attachment","timestamp":"2026-10-31T10:%02d:00Z","attachment":{"type":"hook_success","stdout":"уведомление %d"}}`, i+1, i))
+	}
+	records = append(records, human("2026-10-31T10:30:00Z", "Поздняя реплика после уведомлений"))
+	writeTranscript(t, e.home, "-home-r7", "later000-0000", records...)
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Исходная цитата»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "поздняя реплика после уведомлений", out, "Поздняя реплика после уведомлений")
+}
+
+func TestRound7AgentBeforeSecondQuote(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r7", "agents00-0000",
+		agent("2026-10-31T09:59:00Z", "Ответ агента перед первой цитатой"),
+		human("2026-10-31T10:00:00Z", "Первая цитата в разговоре"),
+		agent("2026-10-31T10:09:00Z", "Ответ агента перед второй цитатой"),
+		human("2026-10-31T10:10:00Z", "Вторая цитата в разговоре"))
+	b := writeBrief(t, t.TempDir(),
+		"Пользователь 31.10 10:00 UTC: «Первая цитата в разговоре»\n"+
+			"Пользователь 31.10 10:10 UTC: «Вторая цитата в разговоре»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	if !strings.Contains(out, "Ответ агента перед первой цитатой") || !strings.Contains(out, "Ответ агента перед второй цитатой") {
+		t.Errorf("перед каждой цитатой нужен свой ответ агента:\n%s", out)
+	}
+	if strings.Count(out, "Ответ агента перед первой цитатой") != 1 {
+		t.Errorf("ответ первой цитаты повторён для второй:\n%s", out)
+	}
+}
+
+func TestRound7MarkerZoneForms(t *testing.T) {
+	e := testEnv(t)
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.loc = loc
+	writeTranscript(t, e.home, "-home-r7", "zones000-0000",
+		human("2026-10-31T00:30:00Z", "Зона перед часами в UTC"),
+		human("2026-10-31T09:00:00Z", "UTC в скобках перед часами"),
+		human("2026-10-31T08:00:00Z", "Пунктуация после CET"),
+		human("2026-10-31T08:00:00Z", "Пунктуация после скобок CET"),
+		human("2026-10-31T08:00:00Z", "Пунктуация после UTC offset"),
+		human("2026-10-30T14:00:00Z", "Дата без часов в UTC"),
+		human("2025-10-31T08:00:00Z", "Двузначный год"))
+	for _, c := range []struct{ marker, quote string }{
+		{"31.10 UTC 00:30", "Зона перед часами в UTC"},
+		{"31.10 (UTC) 09:00", "UTC в скобках перед часами"},
+		{"31.10 09:00 CET,", "Пунктуация после CET"},
+		{"31.10 (CET), 09:00", "Пунктуация после скобок CET"},
+		{"31.10 09:00 UTC+1,", "Пунктуация после UTC offset"},
+		{"30.10 UTC", "Дата без часов в UTC"},
+		{"31.10.25", "Двузначный год"},
+	} {
+		_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Пользователь "+c.marker+": «"+c.quote+"»\n"), "--until", "2026-10-31 17:00")
+		mustHave(t, c.marker, out, "1 found", c.quote)
 	}
 }

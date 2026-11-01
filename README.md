@@ -241,12 +241,14 @@ the brief file's modification time is used. A dated quote is
 which may start on the next line in the same paragraph. A comma after the marker
 word is accepted, as are one digit for the day or month, any case and grammatical
 form of “пользователь”, and an approximate clock such as `~15:43`. Approximate
-times search within 15 minutes; exact times search within two minutes. The word
-right after the clock is its zone: `CET` and `CEST` mean UTC offsets +1 and +2;
-`UTC`, `GMT`, and `Z` mean UTC, with an offset such as `UTC+3` or `GMT-2:30`; any
-case, in parentheses or not, `Z` also right after the clock. A clock followed by
-no word is local; any other word (`MSK`, `мск`, `по`) is reported as not found
-with the zone named in the reason. A year after the day (`31.10.2025`) is used.
+times search within 15 minutes; exact times search within two minutes. A zone
+may follow the date or clock: `CET` and `CEST` mean UTC offsets +1 and +2;
+`UTC`, `GMT`, and `Z` mean UTC, with an offset such as `UTC+3` or `GMT-2:30`;
+all forms accept any case, optional parentheses and trailing punctuation. A zone
+without a clock sets the timezone for the whole day. A clock followed by no zone
+is local; any other word (`MSK`, `мск`, `по`) is reported as not found with the
+zone named in the reason. A year after the day (`31.10.2025` or `31.10.25`) is
+used; two-digit years follow Go's 00–68 = 2000–2068 and 69–99 = 1969–1999 rule.
 Several consecutive quotes after one marker are checked separately. The quote
 matches whole words; `…` and `[…]` mark omitted text between ordered pieces. More
 than one user line on the marker day, the same text at different times included,
