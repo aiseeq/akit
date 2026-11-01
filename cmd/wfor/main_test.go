@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -199,6 +200,45 @@ func TestOk(t *testing.T) {
 	code, out, _ = wfor(t, "ok", "echo not yet; exit 3", "--every", "10ms", "--timeout", "100ms")
 	if code != exitTimeout || !strings.Contains(out, "last exit 3, output: not yet") {
 		t.Errorf("code %d: %s", code, out)
+	}
+}
+
+func TestOkTimeoutKillsProcessGroup(t *testing.T) {
+	start := time.Now()
+	code, out, _ := wfor(t, "ok", "sleep 2 & wait", "--timeout", "100ms")
+	if elapsed := time.Since(start); elapsed > time.Second || code != exitTimeout {
+		t.Errorf("timeout returned after %s with code %d: %s", elapsed, code, out)
+	}
+}
+
+func TestOkKillsLeftoverProcesses(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "pid")
+	start := time.Now()
+	code, out, _ := wfor(t, "ok", "sleep 2 & echo $! >"+pidPath+"; exit 0", "--timeout", "5s")
+	if elapsed := time.Since(start); elapsed > time.Second || code != 0 {
+		t.Errorf("successful command returned after %s with code %d: %s", elapsed, code, out)
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(time.Second)
+	for {
+		stat, readErr := os.ReadFile(filepath.Join("/proc", itoa(pid), "stat"))
+		fields := strings.Fields(string(stat[strings.LastIndex(string(stat), ")")+1:]))
+		if readErr != nil || len(fields) > 0 && fields[0] == "Z" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("background process %d is still alive", pid)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aiseeq/akit/proc"
@@ -393,8 +394,23 @@ func (c *okCond) check(ctx context.Context) (bool, error) {
 	}
 	c.next = c.now().Add(c.every)
 	cmd := exec.CommandContext(ctx, "bash", "-c", c.cmd)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()
-	if err == nil {
+	if cmd.Process != nil {
+		// Bash may have exited while commands it started are still running.
+		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			return false, fmt.Errorf("%s: kill leftover processes: %w", c, killErr)
+		}
+	}
+	if err == nil || errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
 		c.runs, c.code, c.out = c.runs+1, 0, lastLine(out)
 		return true, nil
 	}
