@@ -91,6 +91,23 @@ func TestLineIOWindow(t *testing.T) {
 	}
 }
 
+func TestLineWriteback(t *testing.T) {
+	// Значение выброса — в строке и у свободной машины, как прочие меры; нет meminfo — пометка.
+	free := line(pressure.Rule(pressure.Load{DirtyMB: 12.4}, pressure.Limits{MaxIOFull: 100}, nil), pressure.Limits{MaxIOFull: 100})
+	if !strings.HasPrefix(free, "free;") || !strings.Contains(free, "dirty+writeback 12 MiB (busy at 64)") {
+		t.Errorf("свободная = %q", free)
+	}
+	l := pressure.Limits{MaxIOFull: 100, MaxDirtyMB: 32}
+	busy := line(pressure.Rule(pressure.Load{DirtyMB: 40}, l, nil), l)
+	if !strings.HasPrefix(busy, "busy: write-out in progress") || !strings.Contains(busy, "(busy at 32)") {
+		t.Errorf("занятая = %q", busy)
+	}
+	none := line(pressure.Rule(pressure.Load{DirtyMB: 40}, l, []error{pressure.ErrNoMemInfo}), l)
+	if strings.Contains(none, "dirty+writeback") || !strings.Contains(none, "not checked: no /proc/meminfo") {
+		t.Errorf("без meminfo = %q", none)
+	}
+}
+
 func TestParseArgs(t *testing.T) {
 	cfg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", cfg)
@@ -120,11 +137,11 @@ func TestParseArgs(t *testing.T) {
 		t.Error("флаг порога обошёл битый файл")
 	}
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	opts, err := parseArgs([]string{"--window", "2s", "--runnable=16", "--mem-some", "5.5"}, time.Now())
-	if err != nil || opts.limits.SwapWindow != 2*time.Second || opts.limits.Runnable != 16 || opts.limits.MaxMemSome != 5.5 {
+	opts, err := parseArgs([]string{"--window", "2s", "--runnable=16", "--mem-some", "5.5", "--dirty-mb", "128"}, time.Now())
+	if err != nil || opts.limits.SwapWindow != 2*time.Second || opts.limits.Runnable != 16 || opts.limits.MaxMemSome != 5.5 || opts.limits.MaxDirtyMB != 128 {
 		t.Errorf("parseArgs = %+v, %v", opts, err)
 	}
-	for _, bad := range [][]string{{"--runnable", "0"}, {"--mem-some", "0"}, {"--window"}, {"--nope", "1"}, {"x"}, {"--io-full", "NaN"}, {"--mem-some", "Inf"}, {"--runnable", "nan"}, {"--window", "0"}, {"--window", "-1s"}} {
+	for _, bad := range [][]string{{"--runnable", "0"}, {"--mem-some", "0"}, {"--window"}, {"--nope", "1"}, {"x"}, {"--io-full", "NaN"}, {"--mem-some", "Inf"}, {"--runnable", "nan"}, {"--window", "0"}, {"--window", "-1s"}, {"--dirty-mb", "0"}} {
 		if _, err := parseArgs(bad, time.Now()); err == nil {
 			t.Errorf("%v — ждали ошибку", bad)
 		}

@@ -23,16 +23,18 @@ import (
 const usage = `busy — is the machine busy by the shared rule (akit/pressure), in one line.
 
 Usage:
-  busy [--runnable N] [--mem-some P] [--io-full P] [--kind K] [--window D] [--proc DIR] [--ignore-quiet]
+  busy [--runnable N] [--mem-some P] [--io-full P] [--dirty-mb M] [--kind K] [--window D] [--proc DIR] [--ignore-quiet]
   busy (--quiet-until TIME | --quiet D) [--why TEXT] | --quiet-off
 
 Busy when quiet mode is on, the tasks ready to run now (procs_running, one reading, without busy
 itself) or the 1-minute load average are at or above the machine's threads, disk IO pressure is at or above 9.6%
-or the disk state source reports a disk freeze in progress, or the memory pressure (some avg10) is above 10%
-while swapping over the window is above 1024 KB/s.
+or the disk state source reports a disk freeze in progress, dirty and writeback memory (Dirty+Writeback
+in /proc/meminfo, one reading) is at or above 64 MiB — a write-out to disk in progress — or the memory
+pressure (some avg10) is above 10% while swapping over the window is above 1024 KB/s.
 Swapping alone is not busy. The same rule graft uses to queue heavy tasks. The limits below are the
 defaults; the user's own are flat "key: value" lines in $XDG_CONFIG_HOME/akit/pressure.yaml
-(~/.config/akit/pressure.yaml; keys runnable, max_io_full, max_mem_some, max_swap_kbs, swap_window),
+(~/.config/akit/pressure.yaml; keys runnable, max_io_full, max_mem_some, max_swap_kbs, swap_window,
+max_dirty_mb),
 which graft reads too; flags override both for one check.
 
 Quiet mode keeps the machine busy until a time, whatever it measures: heavy work waits while
@@ -45,6 +47,7 @@ Flags:
   --runnable N    busy at N runnable tasks or 1-minute load (default: the machine's threads)
   --mem-some P    memory pressure limit, % (default 10)
   --io-full P     disk IO pressure limit, % (default 9.6; 100 or more disables disk checks)
+  --dirty-mb M    write-out limit: dirty and writeback memory, MiB (default 64)
   --kind K        disk state profile kind to request
   --window D      swapping measured over D (default 1s)
   --proc DIR      read DIR instead of /proc
@@ -152,13 +155,13 @@ func (opts *options) loadLimits() error {
 }
 
 // limitFlags — флаги порогов и их ключи в файле порогов: значение проверяет тот же разбор, что и файл.
-var limitFlags = map[string]string{"--runnable": "runnable", "--mem-some": "max_mem_some", "--io-full": "max_io_full", "--window": "swap_window"}
+var limitFlags = map[string]string{"--runnable": "runnable", "--mem-some": "max_mem_some", "--io-full": "max_io_full", "--window": "swap_window", "--dirty-mb": "max_dirty_mb"}
 
 // set разбирает значение флага name.
 func (opts *options) set(name, value string, now time.Time) error {
 	var err error
 	switch name {
-	case "--runnable", "--mem-some", "--io-full", "--window":
+	case "--runnable", "--mem-some", "--io-full", "--window", "--dirty-mb":
 		// Значение проверяется сразу, ошибка — с именем флага; ложится поверх файла в конце parseArgs.
 		probe := pressure.DefaultLimits
 		if err = probe.Set(limitFlags[name], value); err == nil {
@@ -307,6 +310,9 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 		} else {
 			parts = append(parts, fmt.Sprintf("IO pressure %.1f%% of %s, /proc/pressure/io total (limit %v%%)", m.IOFull, m.IOWindow.String(), l.MaxIOFull))
 		}
+	}
+	if !skipped(pressure.ErrNoMemInfo) {
+		parts = append(parts, fmt.Sprintf("dirty+writeback %.0f MiB (busy at %v)", m.DirtyMB, l.WritebackLimit()))
 	}
 	if !skipped(pressure.ErrNoMemPressure) {
 		parts = append(parts, fmt.Sprintf("memory pressure %.1f%% (some avg10, limit %v%%)", m.MemSome, l.MaxMemSome))

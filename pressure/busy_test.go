@@ -56,6 +56,13 @@ func TestRule(t *testing.T) {
 		{"LA за минуту и моментальное ниже", Load{Runnable: 21, Threads: 22, Avg1: 21.99}, l, nil, ""},
 		{"LA за минуту — свой порог", Load{Runnable: 1, Threads: 22, Avg1: 10}, Limits{Runnable: 10, MaxIOFull: 10, MaxSwapKBs: 1024}, nil, CPU},
 		{"нет loadavg — LA не судится", Load{Runnable: 1, Threads: 22, Avg1: 90}, l, []error{ErrNoLoadAvg}, ""},
+		{"выброс записи на пороге", Load{Runnable: 1, Threads: 22, DirtyMB: 64}, l, nil, Writeback},
+		{"запись ниже порога", Load{Runnable: 1, Threads: 22, DirtyMB: 63.9}, l, nil, ""},
+		{"порог записи 0 — по умолчанию", Load{Runnable: 1, Threads: 22, DirtyMB: 64}, Limits{MaxSwapKBs: 1024}, nil, Writeback},
+		{"свой порог записи", Load{Runnable: 1, Threads: 22, DirtyMB: 100}, Limits{MaxDirtyMB: 128, MaxSwapKBs: 1024}, nil, ""},
+		{"нет meminfo — запись не судится", Load{Runnable: 1, Threads: 22, DirtyMB: 500}, l, []error{ErrNoMemInfo}, ""},
+		{"диск раньше записи", Load{Runnable: 1, Threads: 22, IOFull: 50, DirtyMB: 500}, l, nil, IO},
+		{"запись раньше свопа", Load{Runnable: 1, Threads: 22, DirtyMB: 500, MemSome: 12, SwapKBs: 3000}, l, nil, Writeback},
 	}
 	for _, c := range cases {
 		v := Rule(c.m, c.l, c.skipped)
@@ -74,6 +81,20 @@ func TestRule(t *testing.T) {
 	}
 	if why := Rule(Load{Threads: 22, MemSome: 12.5, SwapKBs: 3000}, l, nil).Why(); why != "memory pressure 12.5% is above 10% while swapping 3000 KB/s" {
 		t.Errorf("Why = %q", why)
+	}
+	if why := Rule(Load{Threads: 22, DirtyMB: 130.4}, l, nil).Why(); why != "write-out in progress: dirty and writeback memory 130 MiB is at or above 64 MiB" {
+		t.Errorf("Why = %q", why)
+	}
+}
+
+func TestParseDirty(t *testing.T) {
+	if mb, err := ParseDirty("MemTotal:  100 kB\nDirty:     65536 kB\nWriteback:  1024 kB\nWritebackTmp: 9999 kB\n"); err != nil || mb != 65 {
+		t.Errorf("ParseDirty = %v, %v; ждали 65 MiB (WritebackTmp не в счёт)", mb, err)
+	}
+	for _, bad := range []string{"Dirty: 1 kB\n", "Writeback: 1 kB\n", "Dirty: x kB\nWriteback: 1 kB\n", "Dirty: 1 MB\nWriteback: 1 kB\n", ""} {
+		if _, err := ParseDirty(bad); err == nil {
+			t.Errorf("ParseDirty(%q) — ждали ошибку", bad)
+		}
 	}
 }
 
@@ -142,6 +163,26 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+func TestCheckWriteback(t *testing.T) {
+	m, _ := fakeProc(t, map[string]string{"stat": stat, "meminfo": "Dirty: 60000 kB\nWriteback: 10000 kB\n"})
+	l := Limits{Runnable: 100, MaxIOFull: 100, MaxSwapKBs: 1024}
+	v, err := m.Check(context.Background(), l, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Measure != Writeback || v.Load.DirtyMB != 70000.0/1024 || slices.Contains(v.Skipped, ErrNoMemInfo) {
+		t.Errorf("Dirty+Writeback 68 MiB = %+v; ждали занята по writeback", v)
+	}
+	writeProc(t, m.procRoot, "meminfo", "Dirty: 1000 kB\nWriteback: 0 kB\n")
+	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Busy() {
+		t.Errorf("1 MiB = %+v, %v; ждали свободна", v, err)
+	}
+	writeProc(t, m.procRoot, "meminfo", "MemTotal: 1 kB\n")
+	if _, err = m.Check(context.Background(), l, "", true); err == nil {
+		t.Error("meminfo без Dirty — ждали ошибку, а не пропуск меры")
+	}
+}
+
 func TestCheckLoadAvg(t *testing.T) {
 	m, _ := fakeProc(t, map[string]string{"stat": stat, "loadavg": "6.00 2.00 1.00 2/100 1\n"})
 	l := Limits{Runnable: 5, MaxIOFull: 100, MaxSwapKBs: 1024}
@@ -164,7 +205,7 @@ func TestCheckNoProc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoLoadAvg) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
+	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoLoadAvg) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.Contains(v.Skipped, ErrNoMemInfo) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
 		t.Errorf("без /proc = %+v; ждали свободна и все меры пропущены", v)
 	}
 }

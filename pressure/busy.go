@@ -22,10 +22,11 @@ import (
 
 // Мера, по которой машина занята.
 const (
-	CPU   = "cpu" // готовых к работе задач сейчас или load average за минуту — не меньше порога Runnable
-	IO    = "io"
-	Swap  = "swap"  // обмен со свопом при давлении памяти
-	Quiet = "quiet" // тихий режим: срок в файле QuietPath ещё не прошёл
+	CPU       = "cpu" // готовых к работе задач сейчас или load average за минуту — не меньше порога Runnable
+	IO        = "io"
+	Writeback = "writeback" // выброс записи: грязных и пишущихся страниц сейчас не меньше порога MaxDirtyMB
+	Swap      = "swap"      // обмен со свопом при давлении памяти
+	Quiet     = "quiet"     // тихий режим: срок в файле QuietPath ещё не прошёл
 )
 
 // Меры, которых нет в системе (не Linux, ядро без PSI): потребитель пропускает меру и говорит об этом.
@@ -34,6 +35,7 @@ var (
 	ErrNoIOPressure  = errors.New("no /proc/pressure/io to read the IO pressure from")
 	ErrNoMemPressure = errors.New("no /proc/pressure/memory to read the memory pressure from")
 	ErrNoVMStat      = errors.New("no /proc/vmstat to count swapping from")
+	ErrNoMemInfo     = errors.New("no /proc/meminfo to read dirty and writeback memory from")
 )
 
 // Limits — пороги правила. MaxIOFull 100 и выше выключает проверку диска. Runnable 0 — число потоков машины, у которой procRoot: так машины с разным
@@ -45,7 +47,15 @@ type Limits struct {
 	MaxMemSome float64       // память: % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	MaxSwapKBs float64       // и при этом обмен со свопом выше, KB/s; один обмен, без давления, — не занята
 	SwapWindow time.Duration // окно замера обмена при свежем замере
+	MaxDirtyMB float64       // выброс записи: Dirty+Writeback из /proc/meminfo, MiB; 0 — DefaultDirtyMB
 }
+
+// DefaultDirtyMB — порог выброса записи по умолчанию, MiB: столько грязных и пишущихся страниц ядро
+// по умолчанию сбрасывает в фоне (vm.dirty_background_bytes 64 MiB). Мера моментальная: выброс длится
+// секунды, и новое тяжёлое, начатое посреди него, добавляет запись в очередь, которая уже держит
+// диск. По замерам машины выше порога — около 10% времени, а за 3 с до заморозки диска — в 43% случаев,
+// в 4,5 раза чаще, чем в случайный момент.
+const DefaultDirtyMB = 64
 
 // DefaultMemSome — порог давления памяти по умолчанию, %. По замерам машины за неделю: some avg10
 // выше 10 — в 0,4% замеров, все — в эпизодах нехватки памяти; обычный фон — доли процента.
@@ -68,6 +78,7 @@ type Load struct {
 	hasIOFullExact bool
 	MemSome        float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	SwapKBs        float64 // обмен со свопом, KB/s
+	DirtyMB        float64 // грязных и пишущихся на диск страниц сейчас (Dirty+Writeback из /proc/meminfo), MiB
 	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
 	QuietUntil time.Time
 	QuietBy    string // кто поставил тихий режим, из его пометки
@@ -99,6 +110,8 @@ func (v Verdict) Why() string {
 			return fmt.Sprintf("disk freeze in progress for %d ms", v.Load.Disk.OpenMs)
 		}
 		return fmt.Sprintf("IO pressure %.1f%% of the last %s is at or above %v%%", v.Value, v.Load.IOWindow.String(), v.Limit)
+	case Writeback:
+		return fmt.Sprintf("write-out in progress: dirty and writeback memory %.0f MiB is at or above %v MiB", v.Value, v.Limit)
 	case Swap:
 		return fmt.Sprintf("memory pressure %.1f%% is above %v%% while swapping %.0f KB/s", v.Value, v.Limit, v.Load.SwapKBs)
 	case Quiet:
@@ -155,6 +168,8 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 	case maxIOFull < 100 && (m.Disk != nil || !skippedAny(skipped, ErrNoIOPressure)) &&
 		((m.Disk != nil && m.Disk.Open) || ioFull >= maxIOFull):
 		v.Measure, v.Value, v.Limit = IO, m.IOFull, maxIOFull
+	case !skippedAny(skipped, ErrNoMemInfo) && m.DirtyMB >= l.WritebackLimit():
+		v.Measure, v.Value, v.Limit = Writeback, m.DirtyMB, l.WritebackLimit()
 	case memory && m.MemSome > memSome && m.SwapKBs > l.MaxSwapKBs:
 		v.Measure, v.Value, v.Limit = Swap, m.MemSome, memSome
 	}
@@ -175,6 +190,14 @@ func effectiveLimits(m Load, l Limits) (maxIOFull, runnable, memSome float64) {
 		memSome = DefaultMemSome
 	}
 	return maxIOFull, runnable, memSome
+}
+
+// WritebackLimit — порог выброса записи, MiB, с умолчанием на месте нулевого.
+func (l Limits) WritebackLimit() float64 {
+	if l.MaxDirtyMB <= 0 {
+		return DefaultDirtyMB
+	}
+	return l.MaxDirtyMB
 }
 
 func skippedAny(skipped []error, target error) bool {
@@ -253,6 +276,14 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 				return err
 			}
 			load.MemSome, err = psiField(string(psi), "some", "avg10")
+			return err
+		}),
+		measure(ErrNoMemInfo, func() error {
+			info, err := m.read("meminfo", ErrNoMemInfo)
+			if err != nil {
+				return err
+			}
+			load.DirtyMB, err = ParseDirty(string(info))
 			return err
 		}),
 	)
@@ -346,6 +377,35 @@ func (m *Meter) socketPath() string {
 }
 
 // read читает файл procRoot; файла нет — мера none.
+// ParseDirty — грязные и пишущиеся на диск страницы из текста /proc/meminfo, MiB: Dirty+Writeback.
+// Нет любого из полей или не число — ошибка.
+func ParseDirty(meminfo string) (float64, error) {
+	var sum float64
+	found := map[string]bool{}
+	for line := range strings.SplitSeq(meminfo, "\n") {
+		name, rest, ok := strings.Cut(line, ":")
+		if !ok || (name != "Dirty" && name != "Writeback") {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) != 2 || fields[1] != "kB" {
+			return 0, fmt.Errorf("meminfo %s: want `<number> kB`, got %q", name, strings.TrimSpace(rest))
+		}
+		kb, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil {
+			return 0, fmt.Errorf("meminfo %s: %w", name, err)
+		}
+		sum += kb
+		found[name] = true
+	}
+	for _, name := range []string{"Dirty", "Writeback"} {
+		if !found[name] {
+			return 0, fmt.Errorf("meminfo: no %s line", name)
+		}
+	}
+	return sum / 1024, nil
+}
+
 func (m *Meter) read(name string, none error) ([]byte, error) {
 	data, err := os.ReadFile(filepath.Join(m.procRoot, name))
 	if errors.Is(err, os.ErrNotExist) {

@@ -34,13 +34,15 @@ script with a `NestedError` that identifies the script and unwraps its parse err
 Is the machine busy, in one line, by the rule graft uses to queue heavy tasks
 (`akit/pressure`): tasks ready to run now (`procs_running`, one reading) or the 1-minute load average
 at or above the machine's threads, disk IO pressure at or above 9.6% over 5 seconds or a disk freeze in
-progress reported by the disk state source, or memory pressure (some avg10) above
+progress reported by the disk state source, dirty and writeback memory (`Dirty`+`Writeback` in
+`/proc/meminfo`, one reading) at or above 64 MiB — a write-out to disk in progress, which a new heavy
+task would only lengthen — or memory pressure (some avg10) above
 10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
 from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
 in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to change the threshold
 (100 disables disk checks, the freeze too) and `--kind K` to request a profile kind. Your own thresholds go in
 `$XDG_CONFIG_HOME/akit/pressure.yaml` as `key: value` lines (`runnable`, `max_io_full`, `max_mem_some`,
-`max_swap_kbs`, `swap_window`), shared with graft; flags override the file, and a value that is not a
+`max_swap_kbs`, `swap_window`, `max_dirty_mb`), shared with graft; flags override the file, and a value that is not a
 finite positive number (or a positive duration) is an error. Use busy instead of reading `/proc/loadavg`
 by hand to decide whether to start heavy work now: it applies both CPU numbers and the rest of the rule
 in one call. Exit 0 free, 1 busy,

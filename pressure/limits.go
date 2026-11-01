@@ -75,7 +75,7 @@ func ReadLimits(path string) (Limits, error) {
 }
 
 // LimitKeys — ключи файла порогов.
-var LimitKeys = []string{"runnable", "max_io_full", "max_mem_some", "max_swap_kbs", "swap_window"}
+var LimitKeys = []string{"runnable", "max_io_full", "max_mem_some", "max_swap_kbs", "swap_window", "max_dirty_mb"}
 
 // Set — порог key (один из LimitKeys) из текстового значения: одна проверка для файла порогов и флагов
 // потребителей. Число — конечное и больше нуля (NaN и Inf молча выключили бы проверку), окно — длительность
@@ -92,7 +92,7 @@ func (l *Limits) Set(key, value string) error {
 		l.SwapWindow = d
 		return nil
 	}
-	fields := map[string]*float64{"runnable": &l.Runnable, "max_io_full": &l.MaxIOFull, "max_mem_some": &l.MaxMemSome, "max_swap_kbs": &l.MaxSwapKBs}
+	fields := map[string]*float64{"runnable": &l.Runnable, "max_io_full": &l.MaxIOFull, "max_mem_some": &l.MaxMemSome, "max_swap_kbs": &l.MaxSwapKBs, "max_dirty_mb": &l.MaxDirtyMB}
 	field, ok := fields[key]
 	if !ok {
 		return fmt.Errorf("unknown key (keys: %s)", strings.Join(LimitKeys, ", "))
