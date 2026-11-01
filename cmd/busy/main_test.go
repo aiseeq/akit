@@ -102,6 +102,10 @@ func TestLineWriteback(t *testing.T) {
 	if !strings.HasPrefix(busy, "busy: write-out in progress") || !strings.Contains(busy, "(busy at 32)") {
 		t.Errorf("занятая = %q", busy)
 	}
+	other := line(pressure.Rule(pressure.Load{Runnable: 5, Threads: 4, DirtyMB: 40}, l, nil), l)
+	if !strings.HasPrefix(other, "busy: runnable") || !strings.Contains(other, "dirty+writeback 40 MiB") {
+		t.Errorf("занятая по другой мере = %q; ждали и значение выброса", other)
+	}
 	none := line(pressure.Rule(pressure.Load{DirtyMB: 40}, l, []error{pressure.ErrNoMemInfo}), l)
 	if strings.Contains(none, "dirty+writeback") || !strings.Contains(none, "not checked: no /proc/meminfo") {
 		t.Errorf("без meminfo = %q", none)
@@ -115,10 +119,10 @@ func TestParseArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 	limits := filepath.Join(cfg, "akit", "pressure.yaml")
-	if err := os.WriteFile(limits, []byte("runnable: 12\nmax_io_full: 50\n"), 0o644); err != nil {
+	if err := os.WriteFile(limits, []byte("runnable: 12\nmax_io_full: 50\nmax_dirty_mb: 200\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if opts, err := parseArgs([]string{"--io-full", "20"}, time.Now()); err != nil || opts.limits.Runnable != 12 || opts.limits.MaxIOFull != 20 {
+	if opts, err := parseArgs([]string{"--io-full", "20"}, time.Now()); err != nil || opts.limits.Runnable != 12 || opts.limits.MaxIOFull != 20 || opts.limits.MaxDirtyMB != 200 {
 		t.Errorf("пороги пользователя под флагами = %+v, %v; ждали runnable 12 из файла, io 20 из флага", opts.limits, err)
 	}
 	if err := os.WriteFile(limits, []byte("runable: 12\n"), 0o644); err != nil {

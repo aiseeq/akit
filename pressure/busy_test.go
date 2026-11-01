@@ -91,7 +91,9 @@ func TestParseDirty(t *testing.T) {
 	if mb, err := ParseDirty("MemTotal:  100 kB\nDirty:     65536 kB\nWriteback:  1024 kB\nWritebackTmp: 9999 kB\n"); err != nil || mb != 65 {
 		t.Errorf("ParseDirty = %v, %v; ждали 65 MiB (WritebackTmp не в счёт)", mb, err)
 	}
-	for _, bad := range []string{"Dirty: 1 kB\n", "Writeback: 1 kB\n", "Dirty: x kB\nWriteback: 1 kB\n", "Dirty: 1 MB\nWriteback: 1 kB\n", ""} {
+	for _, bad := range []string{"Dirty: 1 kB\n", "Writeback: 1 kB\n", "Dirty: x kB\nWriteback: 1 kB\n", "Dirty: 1 MB\nWriteback: 1 kB\n", "",
+		"Dirty: NaN kB\nWriteback: 1 kB\n", "Dirty: Inf kB\nWriteback: 1 kB\n", "Dirty: -5 kB\nWriteback: 1 kB\n", "Dirty: 1.5 kB\nWriteback: 1 kB\n",
+		"Dirty: 1 kB\nWriteback: 1 kB\nDirty: 1 kB\n"} {
 		if _, err := ParseDirty(bad); err == nil {
 			t.Errorf("ParseDirty(%q) — ждали ошибку", bad)
 		}

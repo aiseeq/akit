@@ -385,7 +385,7 @@ func (m *Meter) socketPath() string {
 }
 
 // ParseDirty — грязные и пишущиеся на диск страницы из текста /proc/meminfo, MiB: Dirty+Writeback.
-// Нет любого из полей или не число — ошибка.
+// Нет любого из полей, поле дважды или не целое число kB — ошибка.
 func ParseDirty(meminfo string) (float64, error) {
 	var sum float64
 	found := map[string]bool{}
@@ -398,11 +398,14 @@ func ParseDirty(meminfo string) (float64, error) {
 		if len(fields) != 2 || fields[1] != "kB" {
 			return 0, fmt.Errorf("meminfo %s: want `<number> kB`, got %q", name, strings.TrimSpace(rest))
 		}
-		kb, err := strconv.ParseFloat(fields[0], 64)
+		if found[name] {
+			return 0, fmt.Errorf("meminfo: %s twice", name)
+		}
+		kb, err := strconv.ParseUint(fields[0], 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("meminfo %s: %w", name, err)
 		}
-		sum += kb
+		sum += float64(kb)
 		found[name] = true
 	}
 	for _, name := range []string{"Dirty", "Writeback"} {
