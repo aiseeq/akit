@@ -122,7 +122,7 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 
 // usageScope — что прочитано: расход вне этих журналов (запуск `claude -p --no-session-persistence` журнала не
 // пишет, у других клиентов он свой) в итог не входит, и читатель итога должен это видеть.
-// Rollout codex пишет только нарастающий счёт токенов сессии, без расхода на ответ: в итог он не входит.
+// Счёт токенов rollout codex (token_count) --usage не читает: rollout в итог не входит.
 func usageScope(sources []source, opts options, e env) string {
 	var read string
 	switch {
@@ -142,7 +142,7 @@ func usageScope(sources []source, opts options, e env) string {
 	}
 	scope := "read: " + read + "; not counted: runs without a transcript (claude -p --no-session-persistence)"
 	if opts.codex || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.path) }) {
-		scope += " and codex rollouts (no per-reply usage)"
+		scope += " and codex rollouts (their token counts are not read)"
 	}
 	return scope
 }

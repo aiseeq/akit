@@ -92,7 +92,7 @@ func TestUsageScopeAll(t *testing.T) {
 	}
 }
 
-// Rollout codex по пути: расхода на ответ в нём нет, итог говорит, что он не входит.
+// Rollout codex по пути: его счёт токенов не читается, итог говорит, что он не входит.
 func TestUsageScopeCodexRollout(t *testing.T) {
 	e := fakeHome(t)
 	data, err := os.ReadFile("../../transcript/testdata/codex.jsonl")
@@ -104,7 +104,7 @@ func TestUsageScopeCodexRollout(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, out, _ := runTL(t, e, "--usage", path)
-	if last := lastLine(out); !strings.Contains(last, "read: "+path+";") || !strings.Contains(last, "codex rollouts (no per-reply usage)") {
+	if last := lastLine(out); !strings.Contains(last, "read: "+path+";") || !strings.Contains(last, "codex rollouts (their token counts are not read)") {
 		t.Errorf("codex rollout: summary %q", last)
 	}
 }
