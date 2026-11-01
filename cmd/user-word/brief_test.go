@@ -625,6 +625,79 @@ func TestRound7AgentBeforeSecondQuote(t *testing.T) {
 	}
 }
 
+func TestR10LaterLinesAcrossMidnight(t *testing.T) {
+	e := testEnv(t)
+	recs := []string{human("2026-10-30T22:58:00Z", "Цитата перед полуночью")}
+	for i := range 25 {
+		recs = append(recs, human(time.Date(2026, 10, 31, 0, i+1, 0, 0, time.UTC).Format(time.RFC3339), fmt.Sprintf("Поздняя реплика следующего дня %d", i+1)))
+	}
+	writeTranscript(t, e.home, "-home-r10", "midnight10-0000", recs...)
+	b := writeBrief(t, t.TempDir(), "Пользователь 30.10 23:58 CET: «Цитата перед полуночью»\\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 04:00")
+	mustHave(t, "поздние реплики после полуночи", out,
+		"Поздняя реплика следующего дня 1", "Поздняя реплика следующего дня 20",
+		"--- 5 more user lines not shown")
+	mustLack(t, "лимит показа", out, "Поздняя реплика следующего дня 21")
+}
+
+func TestR9LateUserLineCounts(t *testing.T) {
+	for _, total := range []int{30, 90} {
+		e := testEnv(t)
+		recs := []string{human("2026-10-31T09:00:00Z", "Начальная цитата для подсчёта")}
+		for i := range total {
+			recs = append(recs, human(time.Date(2026, 10, 31, 9, i+1, 0, 0, time.UTC).Format(time.RFC3339), fmt.Sprintf("Поздняя реплика %d", i+1)))
+		}
+		writeTranscript(t, e.home, "-home-r9", fmt.Sprintf("count%04d-0000", total), recs...)
+		b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Начальная цитата для подсчёта»\\n")
+		_, out := briefRun(t, e, b, "--until", "2026-10-31 12:00")
+		if !strings.Contains(out, fmt.Sprintf("--- %d more user lines not shown", total-briefLater)) {
+			t.Errorf("%d поздних реплик: неверный скрытый счётчик:\\n%s", total, out)
+		}
+	}
+}
+
+func TestR9LateCountsAreIndependentForQuotes(t *testing.T) {
+	e := testEnv(t)
+	recs := []string{
+		human("2026-10-31T09:00:00Z", "Первая цитата с отдельным счётчиком"),
+		human("2026-10-31T09:10:00Z", "Вторая цитата с отдельным счётчиком"),
+	}
+	for i := range 30 {
+		recs = append(recs, human(time.Date(2026, 10, 31, 9, 11+i, 0, 0, time.UTC).Format(time.RFC3339), fmt.Sprintf("После второй цитаты %d", i+1)))
+	}
+	writeTranscript(t, e.home, "-home-r9", "twocount-0000", recs...)
+	b := writeBrief(t, t.TempDir(),
+		"Пользователь 31.10 09:00 UTC: «Первая цитата с отдельным счётчиком»\\n"+
+			"Пользователь 31.10 09:10 UTC: «Вторая цитата с отдельным счётчиком»\\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 12:00")
+	if strings.Count(out, "--- 11 more user lines not shown") != 1 || strings.Count(out, "--- 10 more user lines not shown") != 1 {
+		t.Errorf("для каждой цитаты должен быть собственный полный счётчик:\\n%s", out)
+	}
+}
+
+func TestR9ParenthesizedMarkerDate(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r9", "paren000-0000", human("2026-10-31T09:00:00Z", "Ответ при скобочной пометке"))
+	for _, marker := range []string{"Пользователь (31.10)", "Пользователя (31.10 ~10:00 CET)"} {
+		b := writeBrief(t, t.TempDir(), marker+": «Ответ при скобочной пометке»\\n")
+		_, out := briefRun(t, e, b, "--until", "2026-10-31 12:00")
+		mustHave(t, marker, out, "1 found", "Ответ при скобочной пометке")
+	}
+}
+
+func TestR9ApproximateClock(t *testing.T) {
+	e := testEnv(t)
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.loc = loc
+	writeTranscript(t, e.home, "-home-r9", "approx00-0000", human("2026-10-31T08:50:00Z", "Ответ около времени пометки"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10 ≈10:00 CET: «Ответ около времени пометки»\\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 12:00")
+	mustHave(t, "приблизительное время", out, "1 found", "Ответ около времени пометки")
+}
+
 func TestRound7MarkerZoneForms(t *testing.T) {
 	e := testEnv(t)
 	loc, err := time.LoadLocation("Europe/Berlin")
@@ -652,4 +725,22 @@ func TestRound7MarkerZoneForms(t *testing.T) {
 		_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Пользователь "+c.marker+": «"+c.quote+"»\n"), "--until", "2026-10-31 17:00")
 		mustHave(t, c.marker, out, "1 found", c.quote)
 	}
+}
+
+// Схема инструмента AskUserQuestion в снимке запроса тоже содержит ключ "answers", но это не ответ человека.
+func TestBriefLaterCountSkipsToolSchemas(t *testing.T) {
+	e := testEnv(t)
+	start := time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC)
+	lines := []string{human(start.Format(time.RFC3339), "Склад считаем по средам")}
+	for i := range briefLater {
+		lines = append(lines, human(start.Add(time.Duration(i+1)*time.Minute).Format(time.RFC3339), fmt.Sprintf("ещё %d", i+1)))
+	}
+	schema := start.Add(time.Hour).Format(time.RFC3339)
+	lines = append(lines,
+		`{"type":"attachment","timestamp":"`+schema+`","attachment":{"type":"prompt_snapshot","tools":[{"name":"AskUserQuestion","input_schema":{"properties":{"answers":{"type":"object"}}}}]}}`,
+		`{"type":"api-request-shape","timestamp":"`+schema+`","tools":{"answers":{"type":"object"}}}`)
+	writeTranscript(t, e.home, "-home-schema", "schema00-0000", lines...)
+	_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Пользователь 31.10: «Склад считаем по средам»\n"), "--until", "2026-10-31 17:00")
+	mustHave(t, "схема инструмента", out, "1 found", fmt.Sprintf("ещё %d", briefLater))
+	mustLack(t, "схема инструмента", out, "more user lines not shown")
 }

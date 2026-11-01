@@ -34,6 +34,7 @@ type line struct {
 	match        string
 	warning      string
 	contextHuman bool
+	moreLater    int
 }
 
 // readLines — реплики пользователя и ответы агента по порядку; keep отсеивает сырые строки до разбора.
@@ -536,15 +537,18 @@ func showBrief(w io.Writer, lines []line, at int, until time.Time, loc *time.Loc
 }
 
 func showBriefQuote(w io.Writer, lines []line, at int, word briefWord, until time.Time, loc *time.Location) {
+	none := "--- no other user lines within marker time window"
 	if word.markedAt.IsZero() {
-		showBrief(w, lines, at, until, loc)
-		return
+		none = "--- no other user lines before brief time"
 	}
 	showContext(w, lines, at, loc, laterView{
 		include: func(l, u line) bool { return !l.t.Before(u.t) && !l.t.After(until) },
 		max:     briefLater,
-		none:    "--- no other user lines within marker time window",
+		none:    none,
 	})
+	if lines[at].moreLater > 0 {
+		fmt.Fprintf(w, "--- %d more user lines not shown (user-word TRANSCRIPT 'FRAGMENT' MINUTES for a window)\n", lines[at].moreLater)
+	}
 }
 
 func showContext(w io.Writer, lines []line, at int, loc *time.Location, view laterView) {
@@ -752,7 +756,7 @@ var briefLink = regexp.MustCompile("user-word\\s+((?:/|~/)[^\\s'\"`]*(?:\\.jsonl
 // пропадает молча. Образец вроде `user-word <jsonl> '<кусок>'` без .jsonl сюда не попадает.
 var briefLinkLike = regexp.MustCompile("user-word\\s+[^\\s'\"`]*(?:\\.jsonl|…jsonl)")
 
-var userMarker = regexp.MustCompile(`(?i)пользовател[а-яё]*\s*,?\s+(\d{1,2}\.\d{1,2}(?:\.(?:\d{4}|\d{2}))?)`)
+var userMarker = regexp.MustCompile(`(?i)пользовател[а-яё]*\s*,?\s+\(?\s*(\d{1,2}\.\d{1,2}(?:\.(?:\d{4}|\d{2}))?)`)
 
 // markerDate — дата пометки в тексте между пометкой и цитатой: значит, цитата принадлежит другой пометке.
 var markerDate = regexp.MustCompile(`\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b`)
@@ -948,12 +952,20 @@ func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteC
 	return contextLines(h.path, contexts)
 }
 
+// briefAskAnswer — ответ человека в окне вопроса: ключ "answers" внутри toolUseResult. Тот же ключ есть
+// в схеме AskUserQuestion в снимках запроса (prompt_snapshot, api-request-shape), но не после toolUseResult;
+// в тексте вывода инструментов кавычки экранированы.
+func briefAskAnswer(raw []byte) bool {
+	_, rest, ok := bytes.Cut(raw, []byte(`"toolUseResult":`))
+	return ok && bytes.Contains(rest, []byte(`"answers":`))
+}
+
 func briefContextUser(raw []byte) bool {
-	return briefUserRecord(raw) || bytes.Contains(raw, []byte(`"answers":`))
+	return briefUserRecord(raw) || briefAskAnswer(raw)
 }
 
 func briefContextHuman(raw []byte) bool {
-	if bytes.Contains(raw, []byte(`"answers":`)) ||
+	if briefAskAnswer(raw) ||
 		bytes.Contains(raw, []byte(`"type":"event_msg","payload":{"type":"user_message"`)) {
 		return true
 	}
@@ -986,7 +998,7 @@ func briefContextHuman(raw []byte) bool {
 		record.Role == "user" && record.Origin.Kind == "human" ||
 		record.Type == "attachment" && record.Attachment.Type == "queued_command" && record.Attachment.Origin.Kind == "human" ||
 		record.Type == "event_msg" && record.Payload.Type == "user_message" ||
-		bytes.Contains(raw, []byte(`"answers":`))
+		briefAskAnswer(raw)
 }
 
 func briefAgentRecord(raw []byte) bool {
@@ -1173,7 +1185,7 @@ func quoteEnd(row string, start int) int {
 	return -1
 }
 
-var markerClock = regexp.MustCompile(`(~)?(\d{1,2}:\d{2}(?::\d{2})?)`)
+var markerClock = regexp.MustCompile(`([~≈])?(\d{1,2}:\d{2}(?::\d{2})?)`)
 
 // markerZoneName — поддерживаемые пояса в любом регистре, с необязательными скобками.
 var markerZoneName = regexp.MustCompile(`(?i)^\(?(?:(cest|cet|z)|(?:utc|gmt)(?:([+-])(\d{1,2})(?::(\d{2}))?)?)\)?$`)
@@ -1553,22 +1565,33 @@ func scanBriefTranscriptPaths(paths []string, filters briefQuoteFilters, fragmen
 }
 
 type briefQuoteCollector struct {
-	filters      briefQuoteFilters
-	fragments    map[string][]string
-	loc          *time.Location
-	until        time.Time
-	parser       *transcript.Parser
-	humanStamps  map[string]bool
-	agentRaw     map[string][]byte
-	lastAgent    []byte
-	timestampErr error
-	laterUsers   int
-	parsedRaw    []byte
-	parsedEvents []transcript.Event
-	parsedErr    error
-	hasParsed    bool
-	quoteChecks  map[briefQuoteLineKey]uint8
-	rawDay       []byte
+	filters        briefQuoteFilters
+	fragments      map[string][]string
+	loc            *time.Location
+	until          time.Time
+	parser         *transcript.Parser
+	humanStamps    map[string]bool
+	agentRaw       map[string][]byte
+	lastAgent      []byte
+	timestampErr   error
+	parsedRaw      []byte
+	parsedEvents   []transcript.Event
+	parsedErr      error
+	hasParsed      bool
+	quoteChecks    map[briefQuoteLineKey]uint8
+	lateCounts     map[briefQuoteLineKey]int
+	lateQuotes     []briefLateQuote
+	lateQuoteIndex map[briefQuoteLineKey]int
+	lateShown      map[briefQuoteLineKey]map[string]bool
+	lateRawFrom    string
+	lateRawUntil   string
+	rawDay         []byte
+}
+
+type briefLateQuote struct {
+	key   briefQuoteLineKey
+	time  time.Time
+	count int
 }
 
 type briefQuoteLineKey struct {
@@ -1586,23 +1609,33 @@ func (c *briefQuoteCollector) setRawDay(day []byte) {
 }
 
 func (c *briefQuoteCollector) keep(raw []byte) bool {
-	if keepBriefQuoteRecord(raw, c.filters, c.rawDay) {
+	userKnown, userRecord := false, false
+	isUserRecord := func() bool {
+		if !userKnown {
+			userRecord = briefUserRecord(raw)
+			userKnown = true
+		}
+		return userRecord
+	}
+	if keepBriefQuoteRecord(raw, c.filters, c.rawDay, isUserRecord) {
 		askCall := bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`))
 		if askCall {
+			// Запоминаем связь вызова и результата для разбора ответа AskUserQuestion.
+			if _, err := c.parser.Parse(raw); err != nil {
+				return true
+			}
 			if stamp, err := transcriptTimestamp(raw); err == nil {
 				c.agentRaw[stamp.Format(time.RFC3339Nano)] = c.lastAgent
 			}
-			c.laterUsers = briefLater
 			return true
 		}
 		if c.keepQuote(raw) {
 			return true
 		}
-		if bytes.Contains(raw, []byte(`"answers":`)) {
+		if briefAskAnswer(raw) {
 			if stamp, err := transcriptTimestamp(raw); err == nil {
 				c.agentRaw[stamp.Format(time.RFC3339Nano)] = c.lastAgent
 			}
-			c.laterUsers = briefLater
 			return true
 		}
 	}
@@ -1610,10 +1643,10 @@ func (c *briefQuoteCollector) keep(raw []byte) bool {
 		c.lastAgent = raw
 		return false
 	}
-	if c.keepMalformed(raw) {
+	if c.keepMalformed(raw, isUserRecord) {
 		return true
 	}
-	return c.keepLaterUser(raw)
+	return c.keepLaterUser(raw, isUserRecord)
 }
 
 func (c *briefQuoteCollector) keepQuote(raw []byte) bool {
@@ -1643,14 +1676,34 @@ func (c *briefQuoteCollector) keepQuote(raw []byte) bool {
 				matched = true
 				check = 2
 				c.agentRaw[ev.Time.Format(time.RFC3339Nano)] = c.lastAgent
+				if c.trackLateUser(l) {
+					c.humanStamps[ev.Time.Format(time.RFC3339Nano)] = true
+				}
+				key := quoteLineKey(l)
+				if _, exists := c.lateQuoteIndex[key]; !exists {
+					c.lateQuoteIndex[key] = len(c.lateQuotes)
+					c.lateQuotes = append(c.lateQuotes, briefLateQuote{key: key, time: ev.Time})
+					c.lateShown[key] = make(map[string]bool)
+					c.enableLateRawDays(ev.Time)
+				}
 			}
 			c.quoteChecks[quoteLineKey(l)] = check
 		}
 	}
-	if matched {
-		c.laterUsers = briefLater
-	}
 	return matched
+}
+
+func (c *briefQuoteCollector) keepMalformed(raw []byte, isUserRecord func() bool) bool {
+	day := c.rawDay
+	if len(day) < len(time.DateOnly) {
+		_, stamp, ok := bytes.Cut(raw, []byte(`"timestamp":"`))
+		if !ok || len(stamp) < len(time.DateOnly) {
+			return false
+		}
+		day = stamp[:len(time.DateOnly)]
+	}
+	_, relevant := c.filters.byRawDay[string(day[:len(time.DateOnly)])]
+	return relevant && isUserRecord() && !json.Valid(raw)
 }
 
 func (c *briefQuoteCollector) takeParsed(raw []byte) ([]transcript.Event, error, bool) {
@@ -1661,21 +1714,14 @@ func (c *briefQuoteCollector) takeParsed(raw []byte) ([]transcript.Event, error,
 	return c.parsedEvents, c.parsedErr, true
 }
 
-func (c *briefQuoteCollector) keepMalformed(raw []byte) bool {
-	day := c.rawDay
-	if len(day) < len(time.DateOnly) {
-		_, stamp, ok := bytes.Cut(raw, []byte(`"timestamp":"`))
-		if !ok || len(stamp) < len(time.DateOnly) {
-			return false
-		}
-		day = stamp[:len(time.DateOnly)]
+func (c *briefQuoteCollector) keepLaterUser(raw []byte, isUserRecord func() bool) bool {
+	if len(c.lateQuotes) == 0 {
+		return false
 	}
-	_, relevant := c.filters.byRawDay[string(day[:len(time.DateOnly)])]
-	return relevant && briefUserRecord(raw) && !json.Valid(raw)
-}
-
-func (c *briefQuoteCollector) keepLaterUser(raw []byte) bool {
-	if c.laterUsers == 0 || !briefContextUser(raw) || !briefContextHuman(raw) {
+	if len(c.rawDay) >= len(time.DateOnly) && (string(c.rawDay[:len(time.DateOnly)]) < c.lateRawFrom || string(c.rawDay[:len(time.DateOnly)]) > c.lateRawUntil) {
+		return false
+	}
+	if (!isUserRecord() && !briefAskAnswer(raw)) || !briefContextHuman(raw) {
 		return false
 	}
 	stamp, err := transcriptTimestamp(raw)
@@ -1686,21 +1732,54 @@ func (c *briefQuoteCollector) keepLaterUser(raw []byte) bool {
 	if stamp.After(c.until) {
 		return false
 	}
+	l := line{t: stamp, user: true}
+	keep := c.trackLateUser(l)
+	if !keep {
+		return false
+	}
 	c.humanStamps[stamp.Format(time.RFC3339Nano)] = true
-	c.laterUsers--
 	return true
+}
+
+func (c *briefQuoteCollector) enableLateRawDays(stamp time.Time) {
+	from := localDate(stamp, c.loc).AddDate(0, 0, -1).Format(time.DateOnly)
+	until := localDate(c.until, c.loc).AddDate(0, 0, 1).Format(time.DateOnly)
+	if c.lateRawFrom == "" || from < c.lateRawFrom {
+		c.lateRawFrom = from
+	}
+	c.lateRawUntil = until
+}
+
+func (c *briefQuoteCollector) trackLateUser(l line) bool {
+	stamp := l.t.Format(time.RFC3339Nano)
+	keep := false
+	for i := range c.lateQuotes {
+		quote := &c.lateQuotes[i]
+		if !l.t.After(quote.time) {
+			continue
+		}
+		quote.count++
+		if quote.count <= briefLater {
+			c.lateShown[quote.key][stamp] = true
+			keep = true
+		}
+	}
+	return keep
 }
 
 func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location) briefQuoteScanResult {
 	collector := briefQuoteCollector{
-		filters:     filters,
-		fragments:   fragments,
-		loc:         loc,
-		until:       until,
-		parser:      transcript.NewParser(),
-		humanStamps: make(map[string]bool),
-		agentRaw:    make(map[string][]byte),
-		quoteChecks: make(map[briefQuoteLineKey]uint8),
+		filters:        filters,
+		fragments:      fragments,
+		loc:            loc,
+		until:          until,
+		parser:         transcript.NewParser(),
+		humanStamps:    make(map[string]bool),
+		agentRaw:       make(map[string][]byte),
+		quoteChecks:    make(map[briefQuoteLineKey]uint8),
+		lateCounts:     make(map[briefQuoteLineKey]int),
+		lateQuoteIndex: make(map[briefQuoteLineKey]int),
+		lateShown:      make(map[briefQuoteLineKey]map[string]bool),
 	}
 	keep := collector.keep
 	// Один хронологический проход собирает цитаты и строки их контекста, включая прежние ответы агента.
@@ -1731,6 +1810,11 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 		lines[i].contextHuman = collector.humanStamps[lines[i].t.Format(time.RFC3339Nano)]
 	}
 	for i := range hits {
+		key := quoteLineKey(hits[i].line)
+		if index, ok := collector.lateQuoteIndex[key]; ok {
+			collector.lateCounts[key] = collector.lateQuotes[index].count
+		}
+		hits[i].moreLater = max(0, collector.lateCounts[key]-briefLater)
 		var agent *line
 		if raw := collector.agentRaw[hits[i].t.Format(time.RFC3339Nano)]; len(raw) > 0 {
 			var parseErr error
@@ -1742,7 +1826,10 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 		at := findLine(lines, hits[i].line)
 		var contextLines []line
 		if at >= 0 {
-			contextLines = briefQuoteContextWithAgent(lines, at, hits[i].t, agent)
+			contextLines = briefQuoteContextWithAgent(lines, at, hits[i].t, agent, collector.lateShown[key])
+			if contextAt := findLine(contextLines, hits[i].line); contextAt >= 0 {
+				contextLines[contextAt].moreLater = max(0, collector.lateCounts[quoteLineKey(hits[i].line)]-briefLater)
+			}
 		}
 		hits[i].context = &briefQuoteContext{lines: contextLines}
 	}
@@ -1755,7 +1842,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings}
 }
 
-func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line) []line {
+func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line, shownForQuote ...map[string]bool) []line {
 	out := make([]line, 0, briefLater+2)
 	if agent != nil {
 		out = append(out, *agent)
@@ -1764,6 +1851,15 @@ func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agen
 	for _, l := range lines[at:] {
 		if !l.user {
 			continue
+		}
+		if !l.t.Equal(targetTime) {
+			shown := l.contextHuman
+			if len(shownForQuote) > 0 {
+				shown = shownForQuote[0][l.t.Format(time.RFC3339Nano)]
+			}
+			if !shown {
+				continue
+			}
 		}
 		out = append(out, l)
 		if l.contextHuman && !l.t.Equal(targetTime) {
@@ -1789,10 +1885,10 @@ func briefAgentFromRaw(raw []byte) (*line, error) {
 	return nil, nil
 }
 
-func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay ...[]byte) bool {
+func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay []byte, isUserRecord func() bool) bool {
 	var dayBytes []byte
-	if len(cachedDay) > 0 && len(cachedDay[0]) >= len(time.DateOnly) {
-		dayBytes = cachedDay[0][:len(time.DateOnly)]
+	if len(cachedDay) >= len(time.DateOnly) {
+		dayBytes = cachedDay[:len(time.DateOnly)]
 	} else {
 		_, stamp, ok := bytes.Cut(raw, []byte(`"timestamp":"`))
 		if !ok {
@@ -1809,7 +1905,7 @@ func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay ...[]
 		return false
 	}
 	ask := bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`))
-	if !ask && !briefUserRecord(raw) {
+	if !ask && !isUserRecord() {
 		if !bytes.Contains(raw, []byte(`"type":"`)) && !bytes.Contains(raw, []byte(`"role":"`)) {
 			return true // Whitespace or another valid JSON layout needs full parsing.
 		}
@@ -1817,6 +1913,9 @@ func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay ...[]
 	}
 	if ask {
 		return transcript.WithoutResults(raw)
+	}
+	if briefAskAnswer(raw) {
+		return true
 	}
 
 	for _, filter := range dayFilters {
