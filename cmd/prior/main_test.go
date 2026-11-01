@@ -99,6 +99,28 @@ func TestSources(t *testing.T) {
 	}
 }
 
+func TestRunsSelectionAndTruncation(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".claude/improve/runs")
+	for _, day := range []string{"2026-10-28", "2026-10-27", "2026-10-26"} {
+		for _, name := range []string{"a", "b", "c", "d"} {
+			write(t, filepath.Join(dir, day, name+".md"), "слово "+name+"\n")
+		}
+	}
+
+	got := sectionOf(runPrior(t, home, "слово"), "отчёты")
+	want := []string{
+		"2026-10-28/d.md: слово d", "2026-10-28/c.md: слово c", "2026-10-28/b.md: слово b",
+		"2026-10-28/a.md: слово a", "2026-10-27/d.md: слово d", "2026-10-27/c.md: слово c",
+		"2026-10-27/b.md: слово b", "2026-10-26/d.md: слово d", "2026-10-26/c.md: слово c",
+		"2026-10-26/b.md: слово b",
+		"… ещё 2 с совпадением, старейший: 2026-10-26/a.md",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("отчёты:\n%s", strings.Join(got, "\n"))
+	}
+}
+
 func TestMechanisms(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(home, ".claude/improve/mechanisms")

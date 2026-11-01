@@ -133,7 +133,7 @@ func run(q query, home string, w io.Writer) {
 	if !found {
 		fmt.Fprintln(w, "(нет)")
 	}
-	section(w, "отчёты ночного разбора (~/.claude/improve/runs), свежие сверху, до 10 файлов")
+	section(w, "отчёты ночного разбора (~/.claude/improve/runs), свежие сверху, до 3 за день, затем заполнение до 10 файлов")
 	runs(w, q, s.runs)
 	section(w, "реплики пользователя (~/.claude/user-replies.md), последние 8")
 	replies(w, q, s)

@@ -180,6 +180,14 @@ func bestHits(hits []cardHit) []cardHit {
 // maxRuns — сколько отчётов ночного разбора показывать, свежие сверху.
 const maxRuns = 10
 
+const maxRunsPerDay = 3
+
+type runMatch struct {
+	path string
+	line string
+	day  string
+}
+
 // runs — отчёты ночного разбора с совпадением: путь от runs и первая совпавшая строка.
 func runs(w io.Writer, q query, dir string) {
 	var files []string
@@ -198,24 +206,74 @@ func runs(w io.Writer, q query, dir string) {
 		fmt.Fprintf(w, "(отчёты не прочитались: %v)\n", err)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(files)))
-	shown := 0
+
+	var matches []runMatch
 	for _, f := range files {
-		if shown == maxRuns {
-			break
-		}
 		line, err := firstMatch(q, f)
 		if err != nil {
 			fmt.Fprintf(w, "(%v)\n", err)
 			continue
 		}
-		if line != "" {
-			fmt.Fprintf(w, "%s: %s\n", strings.TrimPrefix(f, dir+"/"), cut(line))
-			shown++
+		if line == "" {
+			continue
+		}
+		rel, err := filepath.Rel(dir, f)
+		if err != nil {
+			fmt.Fprintf(w, "(путь отчёта не вычислился: %v)\n", err)
+			continue
+		}
+		day := strings.Split(filepath.ToSlash(rel), "/")[0]
+		matches = append(matches, runMatch{path: f, line: line, day: day})
+	}
+
+	selected, shown := selectRuns(matches)
+	for i, m := range matches {
+		if selected[i] {
+			fmt.Fprintf(w, "%s: %s\n", strings.TrimPrefix(m.path, dir+"/"), cut(m.line))
 		}
 	}
 	if shown == 0 {
 		fmt.Fprintln(w, "(нет)")
+		return
 	}
+	if omitted := len(matches) - shown; omitted > 0 {
+		fmt.Fprintf(w, "… ещё %d с совпадением, старейший: %s\n", omitted, oldestOmitted(matches, selected, dir))
+	}
+}
+
+func selectRuns(matches []runMatch) ([]bool, int) {
+	selected := make([]bool, len(matches))
+	perDay := make(map[string]int)
+	shown := 0
+	for i, m := range matches {
+		if shown == maxRuns {
+			break
+		}
+		if perDay[m.day] < maxRunsPerDay {
+			selected[i] = true
+			perDay[m.day]++
+			shown++
+		}
+	}
+	for i := range matches {
+		if shown == maxRuns {
+			break
+		}
+		if !selected[i] {
+			selected[i] = true
+			shown++
+		}
+	}
+	return selected, shown
+}
+
+func oldestOmitted(matches []runMatch, selected []bool, dir string) string {
+	for i := len(matches) - 1; i >= 0; i-- {
+		if !selected[i] {
+			return strings.TrimPrefix(matches[i].path, dir+"/")
+		}
+	}
+	return ""
 }
 
 // firstMatch — первая строка файла со словом, пусто — нет такой.
