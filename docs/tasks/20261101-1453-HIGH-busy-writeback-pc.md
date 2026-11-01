@@ -15,3 +15,4 @@
 ## Журнал
 - 2026-11-01 14:53 открыт — akit-master
 - 2026-11-01 14:53 в работе — akit-master
+- 2026-11-01 14:57 note — akit-master: akit-master: 527d1d7 — порог от машины (MemAvailable). Terra 1 FAIL (/home/aisee/.cache/claude-tmp/claude-1000/-home-aisee-git-akit/45f17164-e30c-46e6-a55f-54365795eb5d/scratchpad/wb/check-pc-answer.txt): доля у ядра — от dirtyable memory, не MemAvailable (сверено: mm/page-writeback.c global_dirtyable_memory = MemFree − totalreserve + Active(file) + Inactive(file)); оба 0 — молчаливый пропуск; неверная пометка при нет файла доли; MemAvailable обязателен без нужды; тесты и приёмка не ловили. Исправлено: dirtyableMB по формуле ядра (резерв в meminfo не виден — порог выше на его долю), оба 0 и нет файла — ErrNoDirtyLimit с пометкой, поля доли читаются только при доле, тесты на каждый случай, приёмка проверяет строку PC (порог ≥1024, не занят по writeback) и код scp/ssh. Живой PC: 26 MiB при пороге 2341, free.

@@ -30,7 +30,7 @@ Busy when quiet mode is on, the tasks ready to run now (procs_running, one readi
 itself) or the 1-minute load average are at or above the machine's threads, disk IO pressure is at or above 9.6%
 or the disk state source reports a disk freeze in progress, dirty and writeback memory (Dirty+Writeback
 in /proc/meminfo, one reading) is at or above the machine's background write-out threshold
-(vm.dirty_background_bytes, or vm.dirty_background_ratio of MemAvailable when the bytes are 0) — a
+(vm.dirty_background_bytes, or vm.dirty_background_ratio of free and file memory when the bytes are 0) — a
 write-out to disk in progress — or the memory pressure (some avg10) is above 10% while swapping over
 the window is above 1024 KB/s.
 Swapping alone is not busy. The same rule graft uses to queue heavy tasks. The limits below are the

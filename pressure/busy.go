@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ var (
 	ErrNoMemPressure = errors.New("no /proc/pressure/memory to read the memory pressure from")
 	ErrNoVMStat      = errors.New("no /proc/vmstat to count swapping from")
 	ErrNoMemInfo     = errors.New("no /proc/meminfo to read dirty and writeback memory from")
-	ErrNoDirtyLimit  = errors.New("no /proc/sys/vm/dirty_background_bytes to take the write-out threshold from")
+	ErrNoDirtyLimit  = errors.New("no background write-out threshold in /proc/sys/vm (dirty_background_bytes or dirty_background_ratio)")
 )
 
 // Limits — пороги правила. MaxIOFull 100 и выше выключает проверку диска. Runnable 0 — число потоков машины, у которой procRoot: так машины с разным
@@ -82,7 +83,7 @@ type Load struct {
 	SwapKBs        float64 // обмен со свопом, KB/s
 	DirtyMB        float64 // грязных и пишущихся на диск страниц сейчас (Dirty+Writeback из /proc/meminfo), MiB
 	// DirtyLimitMB — порог фонового сброса машины, MiB: vm.dirty_background_bytes, а если он 0 —
-	// vm.dirty_background_ratio % от MemAvailable (ядро считает от свободной и файловой памяти, MemAvailable к ней близка).
+	// vm.dirty_background_ratio % от свободной и файловой памяти, как считает ядро.
 	DirtyLimitMB float64
 	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
 	QuietUntil time.Time
@@ -248,7 +249,7 @@ func NewMeter(procRoot string) *Meter {
 // режима не читается или не разбирается, мера есть, но не читается.
 func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (Verdict, error) {
 	var load Load
-	var available float64 // MemAvailable, MiB: от неё порог фонового сброса по доле
+	var meminfo string // текст /proc/meminfo: из него и порог фонового сброса по доле
 	var skipped []error
 	quiet := m.quiet
 	var err error
@@ -298,15 +299,16 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 			if err != nil {
 				return err
 			}
-			load.DirtyMB, available, err = ParseMemInfo(string(info))
+			meminfo = string(info)
+			load.DirtyMB, err = ParseDirty(meminfo)
 			return err
 		}),
 		measure(ErrNoDirtyLimit, func() error {
-			if l.MaxDirtyMB > 0 { // свой порог: порог машины не нужен
+			if l.MaxDirtyMB > 0 || meminfo == "" { // свой порог или нечего судить: порог машины не нужен
 				return nil
 			}
 			var err error
-			load.DirtyLimitMB, err = m.dirtyLimit(available)
+			load.DirtyLimitMB, err = m.dirtyLimit(meminfo)
 			return err
 		}),
 	)
@@ -399,36 +401,52 @@ func (m *Meter) socketPath() string {
 	return diskPath()
 }
 
-// ParseMemInfo — из текста /proc/meminfo, MiB: грязные и пишущиеся на диск страницы (Dirty+Writeback)
-// и доступная память (MemAvailable). Нет любого из полей, поле дважды или не целое число kB — ошибка.
-func ParseMemInfo(meminfo string) (dirtyMB, availableMB float64, err error) {
+// meminfoKB — поля names из текста /proc/meminfo, kB. Нет поля, поле дважды или не целое число kB — ошибка.
+func meminfoKB(meminfo string, names ...string) (map[string]uint64, error) {
 	kb := map[string]uint64{}
 	for line := range strings.SplitSeq(meminfo, "\n") {
 		name, rest, ok := strings.Cut(line, ":")
-		if !ok || (name != "Dirty" && name != "Writeback" && name != "MemAvailable") {
+		if !ok || !slices.Contains(names, name) {
 			continue
 		}
 		fields := strings.Fields(rest)
 		if len(fields) != 2 || fields[1] != "kB" {
-			return 0, 0, fmt.Errorf("meminfo %s: want `<number> kB`, got %q", name, strings.TrimSpace(rest))
+			return nil, fmt.Errorf("meminfo %s: want `<number> kB`, got %q", name, strings.TrimSpace(rest))
 		}
 		if _, twice := kb[name]; twice {
-			return 0, 0, fmt.Errorf("meminfo: %s twice", name)
+			return nil, fmt.Errorf("meminfo: %s twice", name)
 		}
-		if kb[name], err = strconv.ParseUint(fields[0], 10, 64); err != nil {
-			return 0, 0, fmt.Errorf("meminfo %s: %w", name, err)
+		v, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("meminfo %s: %w", name, err)
 		}
+		kb[name] = v
 	}
-	for _, name := range []string{"Dirty", "Writeback", "MemAvailable"} {
+	for _, name := range names {
 		if _, ok := kb[name]; !ok {
-			return 0, 0, fmt.Errorf("meminfo: no %s line", name)
+			return nil, fmt.Errorf("meminfo: no %s line", name)
 		}
 	}
-	return float64(kb["Dirty"]+kb["Writeback"]) / 1024, float64(kb["MemAvailable"]) / 1024, nil
+	return kb, nil
 }
 
-// dirtyLimit — порог фонового сброса машины, MiB (Load.DirtyLimitMB) при доступной памяти availableMB.
-func (m *Meter) dirtyLimit(availableMB float64) (float64, error) {
+// ParseDirty — грязные и пишущиеся на диск страницы из текста /proc/meminfo, MiB: Dirty+Writeback.
+func ParseDirty(meminfo string) (float64, error) {
+	kb, err := meminfoKB(meminfo, "Dirty", "Writeback")
+	return float64(kb["Dirty"]+kb["Writeback"]) / 1024, err
+}
+
+// dirtyableMB — память, от которой ядро берёт долю dirty_background_ratio (global_dirtyable_memory в
+// mm/page-writeback.c): свободная и файловая, MiB. Резерва ядра (totalreserve_pages) в meminfo нет, и он
+// не вычтен: порог выходит выше ядерного на его долю.
+func dirtyableMB(meminfo string) (float64, error) {
+	kb, err := meminfoKB(meminfo, "MemFree", "Active(file)", "Inactive(file)")
+	return float64(kb["MemFree"]+kb["Active(file)"]+kb["Inactive(file)"]) / 1024, err
+}
+
+// dirtyLimit — порог фонового сброса машины, MiB (Load.DirtyLimitMB): dirty_background_bytes, при 0 —
+// dirty_background_ratio % от памяти dirtyableMB текста meminfo. Нет файла или оба 0 — ErrNoDirtyLimit.
+func (m *Meter) dirtyLimit(meminfo string) (float64, error) {
 	read := func(name string) (uint64, error) {
 		data, err := m.read(filepath.Join("sys", "vm", name), ErrNoDirtyLimit)
 		if err != nil {
@@ -445,7 +463,14 @@ func (m *Meter) dirtyLimit(availableMB float64) (float64, error) {
 		return float64(bytes) / (1 << 20), err
 	}
 	ratio, err := read("dirty_background_ratio")
-	return float64(ratio) / 100 * availableMB, err
+	if err != nil {
+		return 0, err
+	}
+	if ratio == 0 {
+		return 0, ErrNoDirtyLimit
+	}
+	dirtyable, err := dirtyableMB(meminfo)
+	return float64(ratio) / 100 * dirtyable, err
 }
 
 // read читает файл procRoot; файла нет — мера none.

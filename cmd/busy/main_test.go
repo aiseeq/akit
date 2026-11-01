@@ -106,6 +106,10 @@ func TestLineWriteback(t *testing.T) {
 	if !strings.HasPrefix(other, "busy: runnable") || !strings.Contains(other, "dirty+writeback 40 MiB") {
 		t.Errorf("занятая по другой мере = %q; ждали и значение выброса", other)
 	}
+	noLimit := line(pressure.Rule(pressure.Load{DirtyMB: 40}, pressure.Limits{MaxIOFull: 100}, []error{pressure.ErrNoDirtyLimit}), pressure.Limits{MaxIOFull: 100})
+	if strings.Contains(noLimit, "dirty+writeback") || !strings.Contains(noLimit, "not checked: no background write-out threshold") {
+		t.Errorf("без порога машины = %q", noLimit)
+	}
 	none := line(pressure.Rule(pressure.Load{DirtyMB: 40}, l, []error{pressure.ErrNoMemInfo}), l)
 	if strings.Contains(none, "dirty+writeback") || !strings.Contains(none, "not checked: no /proc/meminfo") {
 		t.Errorf("без meminfo = %q", none)
