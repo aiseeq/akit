@@ -163,6 +163,11 @@ after an independent review.
     tk archive                         # closed tickets older than 14 days
     tk archive --root DIR              # archive tasks in DIR and its first-level repositories
 
+When a matching `docs/tasks/` directory exists in the sibling `tasks` store, `tk` uses
+`<store>/<repository>/docs/tasks/` and `docs/tasks-archive/`; `TK_STORE` selects another store.
+Writes to a store are locked and committed there as individual ticket changes. Repositories without
+a matching store directory keep tickets in their own `docs/tasks/`.
+
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. A check added with
