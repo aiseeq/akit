@@ -95,6 +95,11 @@ func AllSourcesWalkOrder(home string, since time.Time, project string, codex, in
 	}
 	out := make([]Source, 0, len(sources))
 	for _, root := range roots {
+		if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, fmt.Errorf("stat transcript root %s: %w", root, err)
+		}
 		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr

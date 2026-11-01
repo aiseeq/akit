@@ -55,11 +55,13 @@ type run struct {
 	utilityNames                                            []string
 	errorStats                                              map[string]*errorStat
 	editAttempts                                            []editAttempt
+	unreadFiles, badLines                                   int
+	firstUnread, firstBad                                   string
 }
 
 func newRun(since, until time.Time, seed int, out, home string) *run {
 	return &run{
-		start: since.Format(time.RFC3339), end: until.Format(time.RFC3339), seed: seed,
+		start: since.Format(time.RFC3339Nano), end: until.Format(time.RFC3339Nano), seed: seed,
 		outputDir: out, home: home,
 		counts: map[string]int{}, habitCandidates: map[string][]example{}, refusalSamples: map[string][]example{},
 		tkPair: map[string]*[2]int{}, utilityNames: []string{"busy", "prior", "tk", "user-word", "page-shot", "webtext", "claude-rules-export", "sub", "tl", "wfor"},
@@ -88,8 +90,8 @@ func (u *run) inc(day, agent, tool, metric string, n int) {
 }
 func (u *run) day(t time.Time) string { return t.In(time.Local).Format("2006-01-02") }
 func (u *run) valid(t time.Time) bool {
-	a, errA := time.Parse(time.RFC3339, u.start)
-	b, errB := time.Parse(time.RFC3339, u.end)
+	a, errA := time.Parse(time.RFC3339Nano, u.start)
+	b, errB := time.Parse(time.RFC3339Nano, u.end)
 	return errA == nil && errB == nil && !t.Before(a) && t.Before(b)
 }
 func (u *run) clean(s string) string {
@@ -290,7 +292,7 @@ func (u *run) singleUtilityCommand(tool, cmd string) bool {
 
 func (u *run) toolFault(tool, out string, code int, cmd string, ordinal int) string {
 	ownError, toolFaultLines, usageMarkers := u.toolOutputFlags(tool, out)
-	framesAkit := regexp.MustCompile(`(?m)^\s+[^\n]*cmd/uptake/[^\n]*\.go:\d+`).MatchString(out)
+	framesAkit := regexp.MustCompile(`(?m)^\s+[^\n]*github\.com/aiseeq/akit/[^\n]*\.go:\d+`).MatchString(out)
 	trimmed := strings.TrimSpace(out)
 	startsPanic := strings.HasPrefix(trimmed, "panic:") || strings.HasPrefix(trimmed, "fatal error:")
 	if ordinal < toolFaultLines || ordinal == 0 && startsPanic && framesAkit {
@@ -542,13 +544,21 @@ func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transc
 		models = u.modelMap(path)
 	}
 	var evs []transcript.Event
-	_, err := transcript.Read(path, nil, func(e transcript.Event) {
+	meta, err := transcript.Read(path, nil, func(e transcript.Event) {
 		if u.valid(e.Time) {
 			evs = append(evs, e)
 		}
 	})
+	u.badLines += meta.Bad
+	if meta.Bad > 0 && u.firstBad == "" {
+		u.firstBad = path
+	}
 	if err != nil {
 		slog.Error("read transcript", "path", path, "error", err)
+		u.unreadFiles++
+		if u.firstUnread == "" {
+			u.firstUnread = path
+		}
 		return false, nil, nil, nil, false
 	}
 	if len(evs) == 0 {
@@ -584,6 +594,7 @@ func (u *run) scanProcessEvents(path string, isClaude bool, models map[int]strin
 
 func (u *run) resolveCallCodes(calls []call, outs map[string]transcript.Event) {
 	for i := range calls {
+		calls[i].code = -1
 		o, ok := outs[calls[i].ev.CallID]
 		if ok {
 			calls[i].output = o.Text
@@ -1214,7 +1225,7 @@ func parseUptakeArgs(args []string, now time.Time) (time.Time, time.Time, int, s
 		}
 		switch name {
 		case "--since", "--until":
-			t, err := time.Parse(time.RFC3339, value)
+			t, err := time.Parse(time.RFC3339Nano, value)
 			if err != nil {
 				return time.Time{}, time.Time{}, 0, "", fmt.Errorf("%s must be RFC3339: %w", name, err)
 			}
@@ -1267,6 +1278,10 @@ func (u *run) runUptake(since, until time.Time) error {
 		return fmt.Errorf("write report: %w", err)
 	}
 	fmt.Printf("Окно: %s — %s (%s)\nТранскриптов: %d\nОтчёт: %s\n", since.In(time.Local).Format("2006-01-02 15:04 MST"), until.In(time.Local).Format("2006-01-02 15:04 MST"), time.Local, len(sources), filepath.Join(u.outputDir, "report.md"))
+	if u.unreadFiles > 0 || u.badLines > 0 {
+		fmt.Printf("Не прочитано файлов: %d; повреждённых строк: %d\n", u.unreadFiles, u.badLines)
+		return fmt.Errorf("incomplete transcripts: %d unread files, %d damaged lines", u.unreadFiles, u.badLines)
+	}
 	return nil
 }
 
@@ -1481,11 +1496,6 @@ func (u *run) sampleReason(e example) string {
 	low := strings.ToLower(e.command)
 	if e.kind == "habit-anchor" {
 		return "(а) якоря/regex требуют участка или шаблона"
-	}
-	if e.kind == "habit-wait" {
-		if strings.HasPrefix(e.agent, "codex-terra") || strings.HasPrefix(e.agent, "codex-sol") || strings.HasPrefix(e.agent, "claude-") && e.day < "2026-10-28" {
-			return "(б) строки wfor ещё нет в правилах этого агента"
-		}
 	}
 	if strings.Contains(e.command, `\n`) || strings.Contains(low, "old=") || strings.Contains(low, "old =") {
 		return "(в) длинный текст или экранирование"
