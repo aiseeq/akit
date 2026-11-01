@@ -69,14 +69,43 @@ func TestUsageScopeAll(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projects, "-home-x-proj", "usage.jsonl"), []byte(rec+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, out, errOut := runTL(t, e, "--all", "--usage")
-	last := lastLine(out)
-	if !strings.Contains(last, "read: "+projects) || strings.Contains(last, "codex") {
-		t.Errorf("--all: summary %q, stderr %s", last, errOut)
+	cases := []struct {
+		args       []string
+		read       string
+		codex      bool
+		noUsageRow bool
+	}{
+		{[]string{"--all", "--usage"}, "read: " + projects + "/*;", false, false},
+		{[]string{"--all", "--codex", "--usage"}, "read: " + projects + "/*;", true, false},
+		{[]string{"--all", "--project", "proj", "--usage"}, "read: " + projects + "/*proj*;", false, false},
+		{[]string{"--all", "--no-subagents", "--usage"}, "read: " + projects + "/* without subagents;", false, false},
+		// пустое окно: расхода нет, но охват и то, что не входит, всё равно названы
+		{[]string{"--all", "--since", "1m", "--usage"}, "read: " + projects + "/*;", false, true},
 	}
-	_, out, _ = runTL(t, e, "--all", "--codex", "--usage")
-	if last := lastLine(out); !strings.Contains(last, "read: "+projects) || !strings.Contains(last, "codex rollouts of worker fighters") {
-		t.Errorf("--all --codex: summary %q", last)
+	for _, c := range cases {
+		_, out, errOut := runTL(t, e, c.args...)
+		last := lastLine(out)
+		if !strings.Contains(last, c.read) || !strings.Contains(last, "--no-session-persistence") ||
+			strings.Contains(last, "codex rollouts") != c.codex || strings.Contains(last, "no model replies") != c.noUsageRow {
+			t.Errorf("%v: summary %q, stderr %s", c.args, last, errOut)
+		}
+	}
+}
+
+// Rollout codex по пути: расхода на ответ в нём нет, итог говорит, что он не входит.
+func TestUsageScopeCodexRollout(t *testing.T) {
+	e := fakeHome(t)
+	data, err := os.ReadFile("../../transcript/testdata/codex.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "rollout-2026-10-25T10-00-00-0000.jsonl")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := runTL(t, e, "--usage", path)
+	if last := lastLine(out); !strings.Contains(last, "read: "+path+";") || !strings.Contains(last, "codex rollouts (no per-reply usage)") {
+		t.Errorf("codex rollout: summary %q", last)
 	}
 }
 

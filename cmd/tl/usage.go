@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -46,7 +47,7 @@ func (t *tally) merge(o *tally) {
 // reportUsage печатает расход отобранных событий: строка на сессию и итог. Ответ модели, разложенный Claude Code
 // на несколько записей, считается один раз — по id сообщения, без него — по id запроса; расход растёт к последней
 // записи, берётся запись с наибольшим Output.
-func reportUsage(res result, opts options, e env, w io.Writer) int {
+func reportUsage(res result, sources []source, opts options, e env, w io.Writer) int {
 	type reply struct {
 		session string
 		r       *transcript.Reply
@@ -84,8 +85,8 @@ func reportUsage(res result, opts options, e env, w io.Writer) int {
 		t.add(rp.r.Model, rp.r.Usage)
 	}
 	if len(per) == 0 {
-		fmt.Fprintf(w, "tl: no model replies with usage in %d transcript(s)%s%s\n", res.files, windowNote(opts, e),
-			res.problems())
+		fmt.Fprintf(w, "tl: no model replies with usage in %d transcript(s)%s; %s%s\n", res.files, windowNote(opts, e),
+			usageScope(sources, opts, e), res.problems())
 		if len(res.errs) > 0 {
 			return exitUsage
 		}
@@ -115,31 +116,40 @@ func reportUsage(res result, opts options, e env, w io.Writer) int {
 	if total.unpriced > 0 {
 		summary += fmt.Sprintf("; %d reply(ies) without a price not in usd_api", total.unpriced)
 	}
-	fmt.Fprintln(w, summary+"; "+usageScope(res, opts, e)+res.problems())
+	fmt.Fprintln(w, summary+"; "+usageScope(sources, opts, e)+res.problems())
 	return 0
 }
 
 // usageScope — что прочитано: расход вне этих журналов (запуск `claude -p --no-session-persistence` журнала не
 // пишет, у других клиентов он свой) в итог не входит, и читатель итога должен это видеть.
-func usageScope(res result, opts options, e env) string {
+// Rollout codex пишет только нарастающий счёт токенов сессии, без расхода на ответ: в итог он не входит.
+func usageScope(sources []source, opts options, e env) string {
 	var read string
 	switch {
-	case opts.all && opts.codex:
-		read = session.ProjectsDir(e.home) + " and codex rollouts of worker fighters (" + workerSessions(e.home) + ")"
 	case opts.all:
-		read = session.ProjectsDir(e.home)
-	default:
-		var paths []string
-		for i := range res.hits {
-			if p := res.hits[i].src.path; !slices.Contains(paths, p) {
-				paths = append(paths, p)
-			}
+		read = filepath.Join(session.ProjectsDir(e.home), "*")
+		if opts.project != "" {
+			read += opts.project + "*"
 		}
-		read = strings.Join(paths, ", ")
+		if opts.noSubagents {
+			read += " without subagents"
+		}
+	case len(sources) > 0:
+		read = sources[0].path
+		if len(sources) > 1 {
+			read += fmt.Sprintf(" and %d subagent transcript(s)", len(sources)-1)
+		}
 	}
-	return "read: " + read + "; runs without a transcript (claude -p --no-session-persistence) not counted"
+	scope := "read: " + read + "; not counted: runs without a transcript (claude -p --no-session-persistence)"
+	if opts.codex || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.path) }) {
+		scope += " and codex rollouts (no per-reply usage)"
+	}
+	return scope
 }
 
 func usageRow(name string, t *tally) string {
 	return fmt.Sprintf("%s\t%d\t%d\t%d\t%d\t%d\t%.2f", name, t.replies, t.input, t.cacheWrite, t.cacheRead, t.outp, t.usd)
 }
+
+// isCodexRollout — файл codex: codex называет журналы сессий rollout-<время>-<id>.jsonl.
+func isCodexRollout(path string) bool { return strings.HasPrefix(filepath.Base(path), "rollout-") }

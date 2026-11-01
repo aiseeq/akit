@@ -48,7 +48,8 @@ path (Claude Code or codex rollout).
   --usage       tokens and API cost of model replies instead of events: a TSV
                 row per session and the total (--role defaults to all); the
                 summary names the transcripts read: runs that leave none
-                (claude -p --no-session-persistence) are not in it
+                (claude -p --no-session-persistence) and codex rollouts
+                (no per-reply usage) are not in it
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
@@ -333,7 +334,7 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 		return reportWait(res, opts, stdout, stderr)
 	}
 	if opts.usage {
-		return reportUsage(res, opts, e, stdout)
+		return reportUsage(res, sources, opts, e, stdout)
 	}
 	return report(res, opts, e, stdout)
 }

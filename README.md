@@ -222,7 +222,9 @@ prompts. `assistant` and `tool`, as jsonl names them, mean `agent` and `cmd`. `t
 all flags.
 
 The `--usage` summary names the transcripts it read. Runs that write no transcript, such as
-`claude -p --no-session-persistence`, are not counted.
+`claude -p --no-session-persistence`, are not counted, nor are codex rollouts: they hold a running
+token total, not usage per reply.
+
 Large transcript reads wait for machine capacity through graft's heavy queue; smaller ones run at once on two
 threads.
 
