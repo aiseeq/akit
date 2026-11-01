@@ -499,7 +499,12 @@ func sharedTaskRoot(root, main string) (string, error) {
 	if strings.TrimSpace(string(bare)) == "true" {
 		return "", nil
 	}
-	err = exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", "docs/tasks/").Run()
+	// Симлинк для git — файл: путь со слешем за ним git отвергает (код 128), спрашивать без слеша.
+	query := "docs/tasks/"
+	if info, lerr := os.Lstat(filepath.Join(main, "docs/tasks")); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+		query = "docs/tasks"
+	}
+	err = exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", query).Run()
 	if err == nil {
 		return main, nil
 	}
@@ -2099,6 +2104,20 @@ func explicitStatus(s string) (string, bool) {
 	return "", false
 }
 
+// archiveDir — куда tk archive переносит закрытые тикеты репо. docs/tasks-симлинк
+// ведёт в отдельное хранилище: архив — внутри него (docs/tasks/archive), иначе
+// он лёг бы в само репо мимо хранилища.
+func archiveDir(repo string) (string, error) {
+	info, err := os.Lstat(filepath.Join(repo, "docs/tasks"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return filepath.Join(repo, "docs/tasks", "archive"), nil
+	}
+	return filepath.Join(repo, "docs/tasks-archive"), nil
+}
+
 func archive(root, _ string, o options, out, errout io.Writer) int {
 	repos, err := taskRepos(root, o.root)
 	if err != nil {
@@ -2119,7 +2138,10 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 		if err != nil {
 			return fail(errout, err)
 		}
-		dstDir := filepath.Join(repo, "docs/tasks-archive")
+		dstDir, err := archiveDir(repo)
+		if err != nil {
+			return fail(errout, err)
+		}
 		for i := range ts {
 			t := ts[i]
 			if (t.status != "готово" && t.status != "отклонён") || t.changed.After(cut) {

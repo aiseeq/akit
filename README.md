@@ -169,6 +169,11 @@ worktree. Where `docs/tasks/` is not ignored, each worktree keeps its own ticket
 of a bare repository or of a submodule. The whole directory is meant to be ignored: a negated
 pattern that lets some ticket files back into git is not honoured.
 
+`docs/tasks` may also be a symlink into a separate task store (ignore it as `/docs/tasks`, without
+the trailing slash: git treats a symlink as a file). Worktrees then use the main tree's link, and
+`tk archive` moves closed tickets to `docs/tasks/archive/` inside the store instead of
+`docs/tasks-archive/` in the repository.
+
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. A check added with

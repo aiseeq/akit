@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -369,6 +370,67 @@ func TestWorktreeUsesIgnoredTasksOfMainTree(t *testing.T) {
 	}
 	if got := gitTest(t, main, "status", "--porcelain") + gitTest(t, wt, "status", "--porcelain"); got != "" {
 		t.Fatalf("trees changed in git: %q", got)
+	}
+}
+
+// symlinkTasks переносит docs/tasks основного дерева в отдельное хранилище и
+// оставляет на месте относительный симлинк, игнорируемый шаблоном /docs/tasks.
+func symlinkTasks(t *testing.T, main string) string {
+	t.Helper()
+	store := filepath.Join(filepath.Dir(main), "store", "proj")
+	if err := os.MkdirAll(filepath.Dir(store), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(main, "docs/tasks"), store); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../store/proj", filepath.Join(main, "docs/tasks")); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(main, ".gitignore"), "/docs/tasks\n")
+	gitTest(t, main, "add", ".gitignore")
+	gitTest(t, main, "commit", "-qm", "ignore the tasks symlink")
+	return store
+}
+
+func TestWorktreeUsesSymlinkedTasksOfMainTree(t *testing.T) {
+	main, wt := sharedTasksRepo(t, true)
+	store := symlinkTasks(t, main)
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "ls", all: true}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "shared") || strings.Contains(out.String(), "branch-only") {
+		t.Fatalf("ls from the worktree %d: %s%s", code, out.String(), errOut.String())
+	}
+	if code := run(options{cmd: "new", id: "from-wt", prio: "LOW", by: "t"}, &out, &errOut); code != 0 {
+		t.Fatalf("new from the worktree %d: %s", code, errOut.String())
+	}
+	if got, _ := filepath.Glob(filepath.Join(store, "*-from-wt.md")); len(got) != 1 {
+		t.Fatalf("new did not write into the store: %v (%s)", got, out.String())
+	}
+	if got := gitTest(t, main, "status", "--porcelain") + gitTest(t, wt, "status", "--porcelain"); got != "" {
+		t.Fatalf("trees changed in git: %q", got)
+	}
+}
+
+func TestArchiveKeepsSymlinkedTasksInTheStore(t *testing.T) {
+	base := t.TempDir()
+	store := filepath.Join(base, "store", "one")
+	body := "# Closed\n\nСтатус: готово\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer: verified\n"
+	writeTestFile(t, filepath.Join(store, "20200101-1200-LOW-closed.md"), body)
+	if err := os.MkdirAll(filepath.Join(base, "one", "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../store/one", filepath.Join(base, "one", "docs", "tasks")); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := archive("", "", options{root: filepath.Join(base, "one"), older: time.Hour}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "archived 1") {
+		t.Fatalf("archive %d: %q %s", code, out.String(), errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(store, "archive", "20200101-1200-LOW-closed.md")); err != nil {
+		t.Fatalf("closed ticket is not archived inside the store: %v (%s)", err, out.String())
+	}
+	if _, err := os.Stat(filepath.Join(base, "one", "docs", "tasks-archive")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("archive went into the repository: %v", err)
 	}
 }
 
