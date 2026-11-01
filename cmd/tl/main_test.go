@@ -123,6 +123,21 @@ func TestAllSinceAndNone(t *testing.T) {
 	}
 }
 
+func TestAllMissingTranscriptRootsRemainEmpty(t *testing.T) {
+	e := env{home: t.TempDir(), now: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}
+	opts, err := parseArgs([]string{"--all"}, e.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := resolve(opts, e)
+	if err != nil {
+		t.Fatalf("resolve with absent roots: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("sources = %v, want none", sources)
+	}
+}
+
 func TestSubagentsAndRawFilter(t *testing.T) {
 	e := fakeHome(t)
 	parentPath := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", sessionID+".jsonl")

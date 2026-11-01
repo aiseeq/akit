@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,5 +238,159 @@ func TestRunAnalysisHelpers(t *testing.T) {
 	searchRun.recordNewEmptyCall(filepath.Join(home, ".claude", "projects", "demo.jsonl"), searchEvents, nil, searchCall)
 	if searchRun.tlNewRetries != 1 {
 		t.Error("unmatched line did not retain zero-slot retry sampling")
+	}
+}
+
+func TestUptakeReviewRegressions(t *testing.T) {
+	t.Run("akit panic frame", func(t *testing.T) {
+		u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+		stack := "panic: unexpected\n\tgithub.com/aiseeq/akit/cmd/sub/run.go:12 +0x1"
+		if got := u.toolFault("sub", stack, 2, "sub", 0); got != "crash" {
+			t.Fatalf("toolFault = %q, want crash", got)
+		}
+	})
+	t.Run("fractional window boundaries", func(t *testing.T) {
+		since := time.Date(2026, 10, 31, 23, 0, 0, 500_000_000, time.UTC)
+		until := since.Add(time.Hour)
+		u := newRun(since, until, 1, t.TempDir(), t.TempDir())
+		parsedSince, parsedUntil, _, _, err := parseUptakeArgs([]string{"--since", since.Format(time.RFC3339Nano), "--until", until.Format(time.RFC3339Nano)}, until)
+		if err != nil || !parsedSince.Equal(since) || !parsedUntil.Equal(until) {
+			t.Fatalf("fractional flag parse = (%s, %s, %v)", parsedSince, parsedUntil, err)
+		}
+		if u.valid(since.Add(-250 * time.Millisecond)) {
+			t.Fatal("event before since accepted")
+		}
+		if !u.valid(until.Add(-250 * time.Millisecond)) {
+			t.Fatal("event before until rejected")
+		}
+	})
+	t.Run("report counters and ending calendar date", func(t *testing.T) {
+		// Use local midnight as the boundary: the event 35 hours earlier is the prior date,
+		// while the event 23 hours earlier belongs to the ending date.
+		loc := time.Local
+		until := time.Date(2026, 11, 1, 23, 30, 0, 0, loc)
+		since := until.Add(-72 * time.Hour)
+		u := newRun(since, until, 1, t.TempDir(), t.TempDir())
+		priorDay := until.Add(-35 * time.Hour).Format("2006-01-02")
+		endingDay := until.Add(-23 * time.Hour).Format("2006-01-02")
+		u.inc(priorDay, "claude-main", "page-shot", "calls", 1)
+		u.inc(endingDay, "claude-main", "page-shot", "calls", 1)
+		u.inc(endingDay, "claude-main", "busy", "calls", 1)
+		u.inc(endingDay, "claude-main", "busy", "crash", 1)
+		u.inc(endingDay, "claude-main", "busy", "killed", 2)
+		u.errorStats["busy\tnew"] = &errorStat{calls: 2, fail: 2}
+		if err := u.writeReport(); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(u.outputDir, "report.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		for _, want := range []string{"| утилита | 01.11 / окно |", "| page-shot | 1 / 2 | пары нет |", "| busy | 1 / 1 | пары нет | 1/2 | 2 |"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("report missing %q:\n%s", want, text)
+			}
+		}
+	})
+	t.Run("resultless call is unknown", func(t *testing.T) {
+		u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+		calls := []call{{ev: transcript.Event{CallID: "missing"}, tool: "sub", command: "sub old new f"}}
+		u.resolveCallCodes(calls, map[string]transcript.Event{})
+		if calls[0].code != -1 || u.callMetric(calls[0].code) != "exit-unknown" {
+			t.Fatalf("resultless call code = %d, metric %q", calls[0].code, u.callMetric(calls[0].code))
+		}
+		calls[0].ev.Time = time.Now()
+		calls[0].agent = "claude-main"
+		u.recordOneProcessCall("synthetic.jsonl", nil, nil, calls, 0)
+		if u.errorStats["sub\tnew"].unknown != 1 {
+			t.Fatal("resultless call not recorded as unknown")
+		}
+		if err := u.writeErrors(); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(u.outputDir, "errors.tsv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "sub\tnew\t1\t0\t0\t1") {
+			t.Fatalf("resultless call not written as unknown: %s", data)
+		}
+		if err := u.writeCounts(); err != nil {
+			t.Fatal(err)
+		}
+		counts, err := os.ReadFile(filepath.Join(u.outputDir, "counts.tsv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(counts), "sub\texit-unknown\t1") || strings.Contains(string(counts), "sub\texit-0\t1") {
+			t.Fatalf("resultless call not counted as unknown: %s", counts)
+		}
+	})
+	t.Run("generic wait reason", func(t *testing.T) {
+		u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+		got := u.sampleReason(example{kind: "habit-wait", agent: "codex-terra", day: "2020-01-01"})
+		if got != "(г) привычка без видимой причины" {
+			t.Fatalf("sampleReason = %q", got)
+		}
+	})
+}
+
+func TestUptakeTranscriptReadProblemsAreReported(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	since := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	until := since.Add(24 * time.Hour)
+	bad := filepath.Join(home, ".claude", "projects", "demo", "bad.jsonl")
+	writeTranscript(t, bad, "not json")
+	good := filepath.Join(home, ".claude", "projects", "demo", "good.jsonl")
+	writeTranscript(t, good, `{"parentUuid":null,"type":"user","timestamp":"2026-10-31T12:00:00Z","message":{"role":"user","content":"run"}}`+"\n"+
+		`{"parentUuid":"a","type":"assistant","timestamp":"2026-10-31T12:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"busy"}}]}}`+"\n"+
+		`{"parentUuid":"b","type":"user","timestamp":"2026-10-31T12:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","content":"busy: available"}]}}`)
+	unread := filepath.Join(home, ".claude", "projects", "demo", "unread.jsonl")
+	if err := os.MkdirAll(unread, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u := newRun(since, until, 1, filepath.Join(root, "out"), home)
+	u.process(unread)
+	oldStdout := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writePipe
+	runErr := u.runUptake(since, until)
+	os.Stdout = oldStdout
+	if closeErr := writePipe.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	stdout, readErr := io.ReadAll(readPipe)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if closeErr := readPipe.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), "1 unread files, 1 damaged lines") {
+		t.Fatalf("runUptake error = %v", runErr)
+	}
+	if !strings.Contains(string(stdout), "Не прочитано файлов: 1; повреждённых строк: 1") {
+		t.Fatalf("stdout missing issue counts: %s", stdout)
+	}
+	report, readErr := os.ReadFile(filepath.Join(u.outputDir, "report.md"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, want := range []string{"Не прочитано файлов: 1; повреждённых строк: 1", bad, unread} {
+		if !strings.Contains(string(report), want) {
+			t.Errorf("report missing %q:\n%s", want, report)
+		}
+	}
+	counts, readErr := os.ReadFile(filepath.Join(u.outputDir, "counts.tsv"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(counts), "busy\tcalls\t1") {
+		t.Fatalf("valid transcript after read errors was not processed: %s", counts)
 	}
 }
