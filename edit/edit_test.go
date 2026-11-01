@@ -97,6 +97,22 @@ func TestParseSpecErrors(t *testing.T) {
 	}
 }
 
+// Лишний ======= прямо перед >>>>>>> REPLACE — частая ошибка: сообщение называет её и как исправить.
+func TestParseSpecDividerBeforeReplace(t *testing.T) {
+	_, err := ParseSpec(strings.NewReader("f\n<<<<<<< SEARCH\na\n=======\nb\n=======\n>>>>>>> REPLACE\n"))
+	if err == nil || !strings.Contains(err.Error(), "line 6") || !strings.Contains(err.Error(), `REPLACE part ends with ">>>>>>> REPLACE" alone`) {
+		t.Fatalf("divider before REPLACE: %v", err)
+	}
+	_, err = ParseSpec(strings.NewReader("f\n<<<<<<< SEARCH\na\n=======\nb\n=======\nc\n>>>>>>> REPLACE\n"))
+	if err == nil || !strings.Contains(err.Error(), `line 6: "=======" inside the REPLACE part`) || strings.Contains(err.Error(), "alone") {
+		t.Fatalf("divider mid REPLACE: %v", err)
+	}
+	_, err = ParseSpec(strings.NewReader("f\n<<<<<<< SEARCH\na\n=======\nb\n=======\n"))
+	if err == nil || !strings.Contains(err.Error(), `line 6: "=======" inside the REPLACE part`) {
+		t.Fatalf("divider at the end: %v", err)
+	}
+}
+
 func TestBuildWriteAllOrNothing(t *testing.T) {
 	dir := writeFiles(t, map[string]string{"a.txt": "foo\nbar\nfoo\n", "b.txt": "baz\n"})
 	a, b := filepath.Join(dir, "a.txt"), filepath.Join(dir, "b.txt")

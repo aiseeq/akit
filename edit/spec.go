@@ -73,6 +73,9 @@ func parseSpec(r io.Reader, fixed string) ([]Edit, error) {
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("read spec: %w", err)
 	}
+	if p.divider != 0 {
+		return nil, p.dividerErr()
+	}
 	if p.section != outside {
 		return nil, fmt.Errorf("%s: not closed with %q", p.cur.Origin, markReplace)
 	}
@@ -98,6 +101,7 @@ type specParser struct {
 	oldBuf  []string
 	newBuf  []string
 	lineNo  int
+	divider int // строка лишнего ======= в части REPLACE: ошибка ждёт следующей строки ради подсказки
 }
 
 func (p *specParser) line(line string) error {
@@ -159,8 +163,22 @@ func (p *specParser) searchLine(line, mark string) error {
 	return nil
 }
 
+func (p *specParser) dividerErr() error {
+	return fmt.Errorf("line %d: %q inside the REPLACE part of %s", p.divider, markDivider, p.cur.Origin)
+}
+
 func (p *specParser) replaceLine(line, mark string) error {
-	if mark == markDivider || strings.HasPrefix(mark, markSearch) {
+	if p.divider != 0 {
+		if mark == markReplace {
+			return fmt.Errorf("%s; the REPLACE part ends with %q alone, drop this %q line", p.dividerErr(), markReplace, markDivider)
+		}
+		return p.dividerErr()
+	}
+	if mark == markDivider {
+		p.divider = p.lineNo
+		return nil
+	}
+	if strings.HasPrefix(mark, markSearch) {
 		return fmt.Errorf("line %d: %q inside the REPLACE part of %s", p.lineNo, mark, p.cur.Origin)
 	}
 	if mark != markReplace {
