@@ -56,13 +56,15 @@ func TestRule(t *testing.T) {
 		{"LA за минуту и моментальное ниже", Load{Runnable: 21, Threads: 22, Avg1: 21.99}, l, nil, ""},
 		{"LA за минуту — свой порог", Load{Runnable: 1, Threads: 22, Avg1: 10}, Limits{Runnable: 10, MaxIOFull: 10, MaxSwapKBs: 1024}, nil, CPU},
 		{"нет loadavg — LA не судится", Load{Runnable: 1, Threads: 22, Avg1: 90}, l, []error{ErrNoLoadAvg}, ""},
-		{"выброс записи на пороге", Load{Runnable: 1, Threads: 22, DirtyMB: 64}, l, nil, Writeback},
-		{"запись ниже порога", Load{Runnable: 1, Threads: 22, DirtyMB: 63.9}, l, nil, ""},
-		{"порог записи 0 — по умолчанию", Load{Runnable: 1, Threads: 22, DirtyMB: 64}, Limits{MaxSwapKBs: 1024}, nil, Writeback},
-		{"свой порог записи", Load{Runnable: 1, Threads: 22, DirtyMB: 100}, Limits{MaxDirtyMB: 128, MaxSwapKBs: 1024}, nil, ""},
-		{"нет meminfo — запись не судится", Load{Runnable: 1, Threads: 22, DirtyMB: 500}, l, []error{ErrNoMemInfo}, ""},
-		{"диск раньше записи", Load{Runnable: 1, Threads: 22, IOFull: 50, DirtyMB: 500}, l, nil, IO},
-		{"запись раньше свопа", Load{Runnable: 1, Threads: 22, DirtyMB: 500, MemSome: 12, SwapKBs: 3000}, l, nil, Writeback},
+		{"выброс записи на пороге машины", Load{Runnable: 1, Threads: 22, DirtyMB: 64, DirtyLimitMB: 64}, l, nil, Writeback},
+		{"запись ниже порога машины", Load{Runnable: 1, Threads: 22, DirtyMB: 63.9, DirtyLimitMB: 64}, l, nil, ""},
+		{"большой порог машины", Load{Runnable: 1, Threads: 22, DirtyMB: 250, DirtyLimitMB: 2000}, l, nil, ""},
+		{"свой порог записи выше машины", Load{Runnable: 1, Threads: 22, DirtyMB: 100, DirtyLimitMB: 64}, Limits{MaxDirtyMB: 128, MaxSwapKBs: 1024}, nil, ""},
+		{"свой порог записи без порога машины", Load{Runnable: 1, Threads: 22, DirtyMB: 130}, Limits{MaxDirtyMB: 128, MaxSwapKBs: 1024}, nil, Writeback},
+		{"порога нет — запись не судится", Load{Runnable: 1, Threads: 22, DirtyMB: 500}, l, []error{ErrNoDirtyLimit}, ""},
+		{"нет meminfo — запись не судится", Load{Runnable: 1, Threads: 22, DirtyMB: 500, DirtyLimitMB: 64}, l, []error{ErrNoMemInfo}, ""},
+		{"диск раньше записи", Load{Runnable: 1, Threads: 22, IOFull: 50, DirtyMB: 500, DirtyLimitMB: 64}, l, nil, IO},
+		{"запись раньше свопа", Load{Runnable: 1, Threads: 22, DirtyMB: 500, DirtyLimitMB: 64, MemSome: 12, SwapKBs: 3000}, l, nil, Writeback},
 	}
 	for _, c := range cases {
 		v := Rule(c.m, c.l, c.skipped)
@@ -82,20 +84,22 @@ func TestRule(t *testing.T) {
 	if why := Rule(Load{Threads: 22, MemSome: 12.5, SwapKBs: 3000}, l, nil).Why(); why != "memory pressure 12.5% is above 10% while swapping 3000 KB/s" {
 		t.Errorf("Why = %q", why)
 	}
-	if why := Rule(Load{Threads: 22, DirtyMB: 130.4}, l, nil).Why(); why != "write-out in progress: dirty and writeback memory 130 MiB is at or above 64 MiB" {
+	if why := Rule(Load{Threads: 22, DirtyMB: 130.4, DirtyLimitMB: 64}, l, nil).Why(); why != "write-out in progress: dirty and writeback memory 130 MiB is at or above 64 MiB" {
 		t.Errorf("Why = %q", why)
 	}
 }
 
-func TestParseDirty(t *testing.T) {
-	if mb, err := ParseDirty("MemTotal:  100 kB\nDirty:     65536 kB\nWriteback:  1024 kB\nWritebackTmp: 9999 kB\n"); err != nil || mb != 65 {
-		t.Errorf("ParseDirty = %v, %v; ждали 65 MiB (WritebackTmp не в счёт)", mb, err)
+func TestParseMemInfo(t *testing.T) {
+	dirty, avail, err := ParseMemInfo("MemTotal:  100 kB\nMemAvailable: 2048 kB\nDirty:     65536 kB\nWriteback:  1024 kB\nWritebackTmp: 9999 kB\n")
+	if err != nil || dirty != 65 || avail != 2 {
+		t.Errorf("ParseMemInfo = %v, %v, %v; ждали 65 MiB грязных (WritebackTmp не в счёт) и 2 MiB доступной", dirty, avail, err)
 	}
-	for _, bad := range []string{"Dirty: 1 kB\n", "Writeback: 1 kB\n", "Dirty: x kB\nWriteback: 1 kB\n", "Dirty: 1 MB\nWriteback: 1 kB\n", "",
-		"Dirty: NaN kB\nWriteback: 1 kB\n", "Dirty: Inf kB\nWriteback: 1 kB\n", "Dirty: -5 kB\nWriteback: 1 kB\n", "Dirty: 1.5 kB\nWriteback: 1 kB\n",
-		"Dirty: 1 kB\nWriteback: 1 kB\nDirty: 1 kB\n"} {
-		if _, err := ParseDirty(bad); err == nil {
-			t.Errorf("ParseDirty(%q) — ждали ошибку", bad)
+	const a = "MemAvailable: 1 kB\n"
+	for _, bad := range []string{a + "Dirty: 1 kB\n", a + "Writeback: 1 kB\n", "Dirty: 1 kB\nWriteback: 1 kB\n", a + "Dirty: x kB\nWriteback: 1 kB\n", a + "Dirty: 1 MB\nWriteback: 1 kB\n", "",
+		a + "Dirty: NaN kB\nWriteback: 1 kB\n", a + "Dirty: Inf kB\nWriteback: 1 kB\n", a + "Dirty: -5 kB\nWriteback: 1 kB\n", a + "Dirty: 1.5 kB\nWriteback: 1 kB\n",
+		a + "Dirty: 1 kB\nWriteback: 1 kB\nDirty: 1 kB\n"} {
+		if _, _, err := ParseMemInfo(bad); err == nil {
+			t.Errorf("ParseMemInfo(%q) — ждали ошибку", bad)
 		}
 	}
 }
@@ -166,21 +170,50 @@ func TestCheck(t *testing.T) {
 }
 
 func TestCheckWriteback(t *testing.T) {
-	m, _ := fakeProc(t, map[string]string{"stat": stat, "meminfo": "Dirty: 60000 kB\nWriteback: 10000 kB\n"})
+	// Ранний сброс байтами: 64 MiB.
+	m, _ := fakeProc(t, map[string]string{"stat": stat, "meminfo": "MemAvailable: 20480000 kB\nDirty: 60000 kB\nWriteback: 10000 kB\n",
+		"sys/vm/dirty_background_bytes": "67108864\n", "sys/vm/dirty_background_ratio": "0\n"})
 	l := Limits{Runnable: 100, MaxIOFull: 100, MaxSwapKBs: 1024}
 	v, err := m.Check(context.Background(), l, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Measure != Writeback || v.Load.DirtyMB != 70000.0/1024 || slices.Contains(v.Skipped, ErrNoMemInfo) {
-		t.Errorf("Dirty+Writeback 68 MiB = %+v; ждали занята по writeback", v)
+	if v.Measure != Writeback || v.Load.DirtyMB != 70000.0/1024 || v.Limit != 64 || slices.Contains(v.Skipped, ErrNoMemInfo) {
+		t.Errorf("Dirty+Writeback 68 MiB при сбросе с 64 MiB = %+v; ждали занята по writeback", v)
 	}
-	writeProc(t, m.procRoot, "meminfo", "Dirty: 1000 kB\nWriteback: 0 kB\n")
+	writeProc(t, m.procRoot, "meminfo", "MemAvailable: 20480000 kB\nDirty: 1000 kB\nWriteback: 0 kB\n")
 	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Busy() {
 		t.Errorf("1 MiB = %+v, %v; ждали свободна", v, err)
 	}
-	writeProc(t, m.procRoot, "meminfo", "MemTotal: 1 kB\n")
+	// Настройки ядра по умолчанию: 10% от 20000 MiB доступной — 2000 MiB; 205 MiB не выброс.
+	writeProc(t, m.procRoot, "sys/vm/dirty_background_bytes", "0\n")
+	writeProc(t, m.procRoot, "sys/vm/dirty_background_ratio", "10\n")
+	writeProc(t, m.procRoot, "meminfo", "MemAvailable: 20480000 kB\nDirty: 200000 kB\nWriteback: 10000 kB\n")
+	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Busy() || v.Load.DirtyLimitMB != 2000 {
+		t.Errorf("205 MiB при сбросе с 10%% от 20000 MiB = %+v, %v; ждали свободна и порог 2000", v, err)
+	}
+	writeProc(t, m.procRoot, "meminfo", "MemAvailable: 2048000 kB\nDirty: 200000 kB\nWriteback: 10000 kB\n")
+	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Measure != Writeback || v.Limit != 200 {
+		t.Errorf("205 MiB при сбросе с 10%% от 2000 MiB = %+v, %v; ждали занята, порог 200", v, err)
+	}
+	// Свой порог — без порога машины, даже если его не прочесть.
+	if err := os.RemoveAll(filepath.Join(m.procRoot, "sys")); err != nil {
+		t.Fatal(err)
+	}
+	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Busy() || !slices.Contains(v.Skipped, ErrNoDirtyLimit) {
+		t.Errorf("без /proc/sys/vm = %+v, %v; ждали свободна, порог пропущен", v, err)
+	}
+	own := l
+	own.MaxDirtyMB = 100
+	if v, err = m.Check(context.Background(), own, "", true); err != nil || v.Measure != Writeback || slices.Contains(v.Skipped, ErrNoDirtyLimit) {
+		t.Errorf("свой порог 100 без /proc/sys/vm = %+v, %v; ждали занята, без пометки о пороге машины", v, err)
+	}
+	writeProc(t, m.procRoot, "sys/vm/dirty_background_bytes", "lots\n")
 	if _, err = m.Check(context.Background(), l, "", true); err == nil {
+		t.Error("нечисловой dirty_background_bytes — ждали ошибку")
+	}
+	writeProc(t, m.procRoot, "meminfo", "MemTotal: 1 kB\n")
+	if _, err = m.Check(context.Background(), own, "", true); err == nil {
 		t.Error("meminfo без Dirty — ждали ошибку, а не пропуск меры")
 	}
 }
@@ -207,7 +240,7 @@ func TestCheckNoProc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoLoadAvg) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.Contains(v.Skipped, ErrNoMemInfo) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
+	if v.Busy() || !slices.Contains(v.Skipped, ErrNoRunnable) || !slices.Contains(v.Skipped, ErrNoLoadAvg) || !slices.Contains(v.Skipped, ErrNoIOPressure) || !slices.Contains(v.Skipped, ErrNoMemPressure) || !slices.Contains(v.Skipped, ErrNoVMStat) || !slices.Contains(v.Skipped, ErrNoMemInfo) || !slices.Contains(v.Skipped, ErrNoDirtyLimit) || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
 		t.Errorf("без /proc = %+v; ждали свободна и все меры пропущены", v)
 	}
 }

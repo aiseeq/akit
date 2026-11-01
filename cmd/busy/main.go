@@ -29,8 +29,10 @@ Usage:
 Busy when quiet mode is on, the tasks ready to run now (procs_running, one reading, without busy
 itself) or the 1-minute load average are at or above the machine's threads, disk IO pressure is at or above 9.6%
 or the disk state source reports a disk freeze in progress, dirty and writeback memory (Dirty+Writeback
-in /proc/meminfo, one reading) is at or above 64 MiB — a write-out to disk in progress — or the memory
-pressure (some avg10) is above 10% while swapping over the window is above 1024 KB/s.
+in /proc/meminfo, one reading) is at or above the machine's background write-out threshold
+(vm.dirty_background_bytes, or vm.dirty_background_ratio of MemAvailable when the bytes are 0) — a
+write-out to disk in progress — or the memory pressure (some avg10) is above 10% while swapping over
+the window is above 1024 KB/s.
 Swapping alone is not busy. The same rule graft uses to queue heavy tasks. The limits below are the
 defaults; the user's own are flat "key: value" lines in $XDG_CONFIG_HOME/akit/pressure.yaml
 (~/.config/akit/pressure.yaml; keys runnable, max_io_full, max_mem_some, max_swap_kbs, swap_window,
@@ -47,7 +49,7 @@ Flags:
   --runnable N    busy at N runnable tasks or 1-minute load (default: the machine's threads)
   --mem-some P    memory pressure limit, % (default 10)
   --io-full P     disk IO pressure limit, % (default 9.6; 100 or more disables disk checks)
-  --dirty-mb M    write-out limit: dirty and writeback memory, MiB (default 64)
+  --dirty-mb M    write-out limit: dirty and writeback memory, MiB (default: the background write-out threshold)
   --kind K        disk state profile kind to request
   --window D      swapping measured over D (default 1s)
   --proc DIR      read DIR instead of /proc
@@ -311,8 +313,8 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 			parts = append(parts, fmt.Sprintf("IO pressure %.1f%% of %s, /proc/pressure/io total (limit %v%%)", m.IOFull, m.IOWindow.String(), l.MaxIOFull))
 		}
 	}
-	if !skipped(pressure.ErrNoMemInfo) {
-		parts = append(parts, fmt.Sprintf("dirty+writeback %.0f MiB (busy at %v)", m.DirtyMB, l.WritebackLimit()))
+	if !skipped(pressure.ErrNoMemInfo) && l.WritebackLimit(m) > 0 {
+		parts = append(parts, fmt.Sprintf("dirty+writeback %.0f MiB (busy at %.0f)", m.DirtyMB, l.WritebackLimit(m)))
 	}
 	if !skipped(pressure.ErrNoMemPressure) {
 		parts = append(parts, fmt.Sprintf("memory pressure %.1f%% (some avg10, limit %v%%)", m.MemSome, l.MaxMemSome))

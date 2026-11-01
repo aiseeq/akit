@@ -35,8 +35,9 @@ Is the machine busy, in one line, by the rule graft uses to queue heavy tasks
 (`akit/pressure`): tasks ready to run now (`procs_running`, one reading) or the 1-minute load average
 at or above the machine's threads, disk IO pressure at or above 9.6% over 5 seconds or a disk freeze in
 progress reported by the disk state source, dirty and writeback memory (`Dirty`+`Writeback` in
-`/proc/meminfo`, one reading) at or above 64 MiB — a write-out to disk in progress, which a new heavy
-task would only lengthen — or memory pressure (some avg10) above
+`/proc/meminfo`, one reading) at or above the machine's background write-out threshold
+(`vm.dirty_background_bytes`, or `vm.dirty_background_ratio` of `MemAvailable` when the bytes are 0) —
+a write-out to disk in progress, which a new heavy task would only lengthen — or memory pressure (some avg10) above
 10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
 from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
 in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to change the threshold

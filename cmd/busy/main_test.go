@@ -93,7 +93,7 @@ func TestLineIOWindow(t *testing.T) {
 
 func TestLineWriteback(t *testing.T) {
 	// Значение выброса — в строке и у свободной машины, как прочие меры; нет meminfo — пометка.
-	free := line(pressure.Rule(pressure.Load{DirtyMB: 12.4}, pressure.Limits{MaxIOFull: 100}, nil), pressure.Limits{MaxIOFull: 100})
+	free := line(pressure.Rule(pressure.Load{DirtyMB: 12.4, DirtyLimitMB: 64}, pressure.Limits{MaxIOFull: 100}, nil), pressure.Limits{MaxIOFull: 100})
 	if !strings.HasPrefix(free, "free;") || !strings.Contains(free, "dirty+writeback 12 MiB (busy at 64)") {
 		t.Errorf("свободная = %q", free)
 	}
