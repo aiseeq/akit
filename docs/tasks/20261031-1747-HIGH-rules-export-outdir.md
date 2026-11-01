@@ -1,6 +1,6 @@
 # claude-rules-export: OUT_DIR, содержащий источник, отклоняется до очистки
 
-Статус: на проверке
+Статус: готово
 Исполнитель: akit-master
 
 ## Вход
@@ -50,3 +50,4 @@
 - 2026-11-01 00:15 note — akit-master: проверка 16 (v1.22.2): verdict ok; гипотеза H1 по коду — ФС без времени рождения (ext4 -I 128, f2fs без inode_crtime) с повтором inode: своя копия сошла бы за запись. Закрыто отказом: probeUnnamed и birthAt требуют STATX_BTIME, тест TestExportRefusesWithoutBirthTime, мутант 'return 0, nil' пойман
 - 2026-11-01 00:23 note — akit-master: v1.22.4 с 0ae74d0 установлен; ревью Terra (worker ask, бриф scratchpad/briefs/review-export-btime.md)
 - 2026-11-01 00:25 note — akit-master: ревью Terra 0ae74d0: 1) td/tl, подменённые до строки с inode, — принятая граница (обрыв между созданием и строкой журнала); 2) btime у файла есть, у папки/ссылки нет — застревание после очистки своего, чужое не удаляется, вне меры; 3) тест не ловил снятие проверки в probeUnnamed — проверка там лишняя (verifyOut сверяет старые записи до очистки, новый файл получает btime до linkat): мутант выжил, проверка снята; добавлен TestExportFirstRunRefusesWithoutBirthTime, мутант birthAt 'return 0, nil' валит оба теста
+- 2026-11-01 00:25 готово — verify-export16 (session akit-master): проверка 16 (суб-агент, бриф scratchpad/briefs/verify-export16.md, 31.10 23:45–01.11 00:13 CET) на v1.22.2: verdict ok — симлинки, bind, overlay, casefold, /proc и подменённый /proc, обрывы kill -9 (154, застреваний 0), права/ACL/xattr/chcon, повтор dev+inode; единственная гипотеза H1 (ФС без btime) закрыта 0ae74d0+db3d32d (v1.22.5), тесты TestExportRefusesWithoutBirthTime и TestExportFirstRunRefusesWithoutBirthTime, мутант birthAt валит оба; ревью Terra правки — находки в принятых границах или сняты. Вне меры (записано): NFC/NFD при casefold, chattr +d, touch -d, ядро < 6.13. Настоящей /home/aisee/work/claude-rules нужна разовая миграция (списка нет — первый прогон откажет)
