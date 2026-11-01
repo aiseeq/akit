@@ -20,13 +20,19 @@ tasks:
     deps: [build]
     run:
       - {install: bin/*}
+  glint:
+    desc: static analysis
+    heavy: true
+    remote: true
+    env: {GOWORK: "off"}
+    run: [glint check .]
 
 # Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок.
 gate:
   - sh: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
   - task: test
   # glint падает кодом выхода на находке high (умолчание fail_on); остальные проверяет tk done.
-  - sh: GOWORK=off ~/bin/glint check .
+  - task: glint
 
 version:
   mode: git-tag
