@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 
 	"github.com/aiseeq/akit/price"
+	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -113,8 +115,29 @@ func reportUsage(res result, opts options, e env, w io.Writer) int {
 	if total.unpriced > 0 {
 		summary += fmt.Sprintf("; %d reply(ies) without a price not in usd_api", total.unpriced)
 	}
-	fmt.Fprintln(w, summary+res.problems())
+	fmt.Fprintln(w, summary+"; "+usageScope(res, opts, e)+res.problems())
 	return 0
+}
+
+// usageScope — что прочитано: расход вне этих журналов (запуск `claude -p --no-session-persistence` журнала не
+// пишет, у других клиентов он свой) в итог не входит, и читатель итога должен это видеть.
+func usageScope(res result, opts options, e env) string {
+	var read string
+	switch {
+	case opts.all && opts.codex:
+		read = session.ProjectsDir(e.home) + " and codex rollouts of worker fighters (" + workerSessions(e.home) + ")"
+	case opts.all:
+		read = session.ProjectsDir(e.home)
+	default:
+		var paths []string
+		for i := range res.hits {
+			if p := res.hits[i].src.path; !slices.Contains(paths, p) {
+				paths = append(paths, p)
+			}
+		}
+		read = strings.Join(paths, ", ")
+	}
+	return "read: " + read + "; runs without a transcript (claude -p --no-session-persistence) not counted"
 }
 
 func usageRow(name string, t *tally) string {

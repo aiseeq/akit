@@ -220,6 +220,9 @@ sessions, `agent`, `think` the agent's thinking, `cmd` tool calls, `out` tool ou
 Claude Code attachments (hooks, diagnostics), `note` notices, compaction, briefs and program
 prompts. `assistant` and `tool`, as jsonl names them, mean `agent` and `cmd`. `tl -h` prints
 all flags.
+
+The `--usage` summary names the transcripts it read. Runs that write no transcript, such as
+`claude -p --no-session-persistence`, are not counted.
 Large transcript reads wait for machine capacity through graft's heavy queue; smaller ones run at once on two
 threads.
 

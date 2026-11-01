@@ -46,7 +46,9 @@ path (Claude Code or codex rollout).
   --max N       last N events (default 100, 0 = all)
   --width N     characters of text per event (default 300, 0 = whole)
   --usage       tokens and API cost of model replies instead of events: a TSV
-                row per session and the total (--role defaults to all)
+                row per session and the total (--role defaults to all); the
+                summary names the transcripts read: runs that leave none
+                (claude -p --no-session-persistence) are not in it
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)

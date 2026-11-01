@@ -53,7 +53,34 @@ func TestUsage(t *testing.T) {
 	if !strings.Contains(rows[3], "1 reply(ies) without a price") {
 		t.Errorf("unpriced reply not reported: %q", rows[3])
 	}
+	if !strings.Contains(rows[3], "read: "+path) || !strings.Contains(rows[3], "--no-session-persistence") {
+		t.Errorf("summary does not name what was read and what is left out: %q", rows[3])
+	}
 	if code, _, _ := runTL(t, e, "--usage", "--role", "user", path); code != exitNone {
 		t.Errorf("--role user has no replies, code %d", code)
 	}
+}
+
+// Итог --all называет прочитанные папки: расход запусков без журнала в нём не виден.
+func TestUsageScopeAll(t *testing.T) {
+	e := fakeHome(t)
+	projects := filepath.Join(e.home, ".claude", "projects")
+	rec := usageRecord("m1", "claude-opus-5-5", "reply", 10, 0, 0, 1)
+	if err := os.WriteFile(filepath.Join(projects, "-home-x-proj", "usage.jsonl"), []byte(rec+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, out, errOut := runTL(t, e, "--all", "--usage")
+	last := lastLine(out)
+	if !strings.Contains(last, "read: "+projects) || strings.Contains(last, "codex") {
+		t.Errorf("--all: summary %q, stderr %s", last, errOut)
+	}
+	_, out, _ = runTL(t, e, "--all", "--codex", "--usage")
+	if last := lastLine(out); !strings.Contains(last, "read: "+projects) || !strings.Contains(last, "codex rollouts of worker fighters") {
+		t.Errorf("--all --codex: summary %q", last)
+	}
+}
+
+func lastLine(s string) string {
+	rows := strings.Split(strings.TrimSpace(s), "\n")
+	return rows[len(rows)-1]
 }
