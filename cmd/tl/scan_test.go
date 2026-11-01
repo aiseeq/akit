@@ -10,7 +10,6 @@ import (
 	"regexp/syntax"
 	"strings"
 	"testing"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
@@ -418,26 +417,68 @@ func TestDeferredEscapedTypeWithRawFilter(t *testing.T) {
 	}
 }
 
-func TestPayloadAllCases(t *testing.T) {
-	for _, r := range "payloadidtype" {
-		for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
-			if folded > unicode.MaxASCII {
-				t.Fatalf("payload: не-ASCII вариант %U", folded)
-			}
-		}
+func TestCodexSkippedState(t *testing.T) {
+	rows := []string{
+		`{"type":"session_meta","payload":{"id":"one","cwd":"/first"}}`,
+		`{"type":"turn_context","payload":{"cwd":"/context"}}`,
+		`{"type":"response_item","timestamp":"2001-02-03T10:00:00Z","payload":{"type":"function_call","name":" Other ","call_id":"a","arguments":"{}"}}`,
+		`{"type":"response_item","timestamp":"2001-02-03T10:00:01Z","payload":{"type":"function_call_output","call_id":"a","output":"target"}}`,
+		`{"type":"session_meta","payload":{"id":"two","cwd":"/second"}}`,
+		`{"type":"response_item","timestamp":"2001-02-03T10:00:02Z","payload":{"type":"custom_tool_call","name":"Custom","call_id":"b","input":"nothing"}}`,
+		`{"type":"response_item","timestamp":"2001-02-03T10:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"b","output":"target"}}`,
 	}
-	for mask := range 1 << 7 {
-		key := []byte("payload")
-		for i := range key {
-			if mask&(1<<i) != 0 {
-				key[i] -= 'a' - 'A'
-			}
-		}
-		raw := append([]byte(`{"`), key...)
-		raw = append(raw, []byte(`":{}}`)...)
-		if !containsPayload(raw) {
-			t.Fatalf("не найден %q", raw)
-		}
+	f, err := newFilter(options{grep: "target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := readMatched(t, rows, true, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := readMatched(t, rows, false, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 2 || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("filtered=%q full=%q", got, want)
+	}
+	if !strings.Contains(want[0], `"Who":" Other "`) || !strings.Contains(want[0], `"Cwd":"/context"`) ||
+		!strings.Contains(want[1], `"Who":"Custom"`) || !strings.Contains(want[1], `"SessionID":"two"`) {
+		t.Fatalf("состояние Codex: %q", want)
+	}
+}
+
+func TestCodexRawPreservesState(t *testing.T) {
+	rows := []string{
+		`{"type":"session_meta","payload":{"id":"session","cwd":"/dir"}}`,
+		`{"type":"response_item","timestamp":"2001-02-03T10:00:00Z","payload":{"type":"function_call","name":"Bash","call_id":"a","arguments":"{}"}}`,
+		`{"type":"response_item","timestamp":"2001-02-03T10:00:01Z","payload":{"type":"function_call_output","call_id":"a","output":"include"}}`,
+	}
+	f, err := newFilter(options{raw: "include"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := readMatched(t, rows, true, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := readMatched(t, rows, false, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 2 || len(got) != 1 || got[0] != want[1] || !strings.Contains(got[0], `"Who":"Bash"`) {
+		t.Fatalf("filtered=%q full=%q", got, want)
+	}
+}
+
+func TestCodexOrdinaryLineDiscarded(t *testing.T) {
+	f, err := newFilter(options{grep: "target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"type":"event_msg","payload":{"type":"agent_message","message":"unrelated"}}`)
+	if f.keepWithState(raw, transcript.ToolNames{}) {
+		t.Fatal("строка без совпадения не отсеялась")
 	}
 }
 

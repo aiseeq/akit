@@ -294,6 +294,7 @@ func (rd *reader) line(raw []byte) {
 	}
 	rd.plainType, rd.noUnicode = false, false
 	if rd.keepWithTools != nil && !rd.keepWithTools(raw, ToolNames{rd.toolNames, &rd.plainType, &rd.noUnicode}) {
+		rd.rememberCodex(raw)
 		rd.deferCall(raw, rd.plainType, rd.noUnicode)
 		return
 	}
@@ -320,6 +321,42 @@ func (rd *reader) line(raw []byte) {
 		return
 	}
 	rd.emitParsed(raw, codex, events)
+}
+
+// Отсев не должен терять состояние Codex: вызовы, контекст и отметку первого события после session_meta.
+func (rd *reader) rememberCodex(raw []byte) {
+	if !containsPayload(raw) && (rd.noUnicode || !MayHideType(raw)) {
+		return
+	}
+	if !rd.codex.named && !bytes.Contains(raw, []byte(`"session_meta"`)) &&
+		!bytes.Contains(raw, []byte(`"turn_context"`)) && !bytes.Contains(raw, []byte(`_call`)) &&
+		(rd.noUnicode || !MayHideType(raw)) {
+		return
+	}
+	var rec record
+	if json.Unmarshal(raw, &rec) != nil || rec.Payload == nil {
+		return
+	}
+	rd.codex.parse(&rec)
+	for _, name := range rd.codex.tools {
+		rd.toolNames[name] = struct{}{}
+	}
+}
+
+// containsPayload узнаёт имя поля с любым регистром, принимаемым encoding/json.
+func containsPayload(raw []byte) bool {
+	for offset := 0; offset < len(raw); {
+		n := bytes.IndexByte(raw[offset:], '"')
+		if n < 0 {
+			return false
+		}
+		i := offset + n
+		if i+9 <= len(raw) && (raw[i+1] == 'p' || raw[i+1] == 'P') && bytes.EqualFold(raw[i:i+9], []byte(`"payload"`)) {
+			return true
+		}
+		offset = i + 1
+	}
+	return false
 }
 
 func (rd *reader) badLine(raw []byte, codex bool, err error) {

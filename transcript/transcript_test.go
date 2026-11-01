@@ -8,7 +8,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
 )
+
+func TestPayloadAllCases(t *testing.T) {
+	for _, r := range "payloadidtype" {
+		for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+			if folded > unicode.MaxASCII {
+				t.Fatalf("payload: не-ASCII вариант %U", folded)
+			}
+		}
+	}
+	for mask := range 1 << 7 {
+		key := []byte("payload")
+		for i := range key {
+			if mask&(1<<i) != 0 {
+				key[i] -= 'a' - 'A'
+			}
+		}
+		raw := append([]byte(`{"`), key...)
+		raw = append(raw, []byte(`":{}}`)...)
+		if !containsPayload(raw) {
+			t.Fatalf("не найден %q", raw)
+		}
+	}
+}
 
 func TestToolNamesZeroValue(t *testing.T) {
 	var names ToolNames

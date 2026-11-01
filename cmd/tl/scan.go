@@ -134,7 +134,7 @@ func (f *filter) possibleMissing(raw []byte, tools transcript.ToolNames, alterna
 	if !hasUnicode {
 		tools.NoUnicodeEscapes()
 	}
-	if unsafe || hasUnicode && transcript.MayHideType(raw) || reminderMayJoin(raw, alternatives) || containsPayload(raw) {
+	if unsafe || hasUnicode && transcript.MayHideType(raw) || reminderMayJoin(raw, alternatives) {
 		return true
 	}
 	return tools.Any(func(name string) bool {
@@ -144,23 +144,8 @@ func (f *filter) possibleMissing(raw []byte, tools transcript.ToolNames, alterna
 			}
 		}
 		return false
-	}) && bytes.Contains(raw, []byte(`"tool_result"`))
-}
-
-// containsPayload учитывает регистронезависимые имена полей, принимаемые encoding/json.
-func containsPayload(raw []byte) bool {
-	for offset := 0; offset < len(raw); {
-		n := bytes.IndexByte(raw[offset:], '"')
-		if n < 0 {
-			return false
-		}
-		i := offset + n
-		if i+9 <= len(raw) && (raw[i+1] == 'p' || raw[i+1] == 'P') && bytes.EqualFold(raw[i:i+9], []byte(`"payload"`)) {
-			return true
-		}
-		offset = i + 1
-	}
-	return false
+	}) && (bytes.Contains(raw, []byte(`"tool_result"`)) || bytes.Contains(raw, []byte(`"function_call_output"`)) ||
+		bytes.Contains(raw, []byte(`"custom_tool_call_output"`)))
 }
 
 // Экранированная буква может входить в искомый фрагмент, а суррогат — быть частью такой буквы.
