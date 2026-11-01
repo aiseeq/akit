@@ -104,11 +104,13 @@ var planTimeout = 60 * time.Second
 
 type options struct {
 	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, item string
+	store                                                                                                             taskStore
 	all, due, json, required                                                                                          bool
 	older                                                                                                             time.Duration
 }
 type task struct {
 	path, slug, status, prio, title, body string
+	store                                 taskStore
 	created, changed                      time.Time
 }
 
@@ -400,7 +402,7 @@ func run(o options, out, errout io.Writer) int {
 	if (o.cmd == "ls" || o.cmd == "lint" || o.cmd == "archive") && o.root != "" {
 		return runRootScan(o, out, errout)
 	}
-	root, dir, found, err := resolveTaskBase()
+	root, dir, main, found, err := resolveTaskBase()
 	if err != nil {
 		return fail(errout, err)
 	}
@@ -414,6 +416,15 @@ func run(o options, out, errout io.Writer) int {
 			return fail(errout, fmt.Errorf("get current directory: %w", err))
 		}
 		dir = filepath.Join(root, "docs/tasks")
+	}
+	// Дерево кода (glint, команды плана) остаётся текущим, тикеты берутся из хранилища.
+	o.baseRoot = root
+	if store, err := externalTaskStore(main); err != nil {
+		return fail(errout, err)
+	} else if store.root != "" {
+		root = store.repo
+		dir = filepath.Join(root, "docs/tasks")
+		o.store = store
 	}
 	return runAtBase(root, dir, o, out, errout)
 }
@@ -429,6 +440,13 @@ func runRootScan(o options, out, errout io.Writer) int {
 }
 
 func runAtBase(root, dir string, o options, out, errout io.Writer) int {
+	if o.store.root != "" && o.cmd != "done" && isWriteCommand(o.cmd) {
+		unlock, err := lockStore(o.store.root)
+		if err != nil {
+			return fail(errout, err)
+		}
+		defer unlock()
+	}
 	switch o.cmd {
 	case "new":
 		return create(root, dir, o, out, errout)
@@ -448,6 +466,7 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		fmt.Fprintln(errout, "tk:", err)
 		return exitUsage
 	}
+	t.store = o.store
 	if o.cmd == "show" {
 		if o.json {
 			return showJSON(root, t, out, errout)
@@ -470,44 +489,62 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	if o.cmd == "note" {
 		return addNote(t, o, out, errout)
 	}
-	o.baseRoot = root
+	if o.baseRoot == "" {
+		o.baseRoot = root
+	}
 	return transition(t, o, out, errout)
 }
 
-func resolveTaskBase() (string, string, bool, error) {
-	b, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+func isWriteCommand(cmd string) bool {
+	switch cmd {
+	case "new", "archive", "note", "plan", "skip", "start", "wait", "review", "done", "reject":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveTaskBase возвращает корень дерева кода, папку тикетов в нём и основное
+// дерево репо (родитель общего git-каталога: одно и то же из любого worktree;
+// вне git — пусто).
+func resolveTaskBase() (string, string, string, bool, error) {
+	b, err := exec.Command("git", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir").Output()
 	if err == nil {
-		root := strings.TrimSpace(string(b))
-		return root, filepath.Join(root, "docs/tasks"), true, nil
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		if len(lines) != 2 {
+			return "", "", "", false, fmt.Errorf("git rev-parse: want toplevel and common dir, got %q", b)
+		}
+		root := lines[0]
+		return root, filepath.Join(root, "docs/tasks"), filepath.Dir(lines[1]), true, nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "", "", false, fmt.Errorf("get current directory: %w", err)
+		return "", "", "", false, fmt.Errorf("get current directory: %w", err)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", "", false, fmt.Errorf("get home directory: %w", err)
+		return "", "", "", false, fmt.Errorf("get home directory: %w", err)
 	}
 	cwd, err = filepath.Abs(cwd)
 	if err != nil {
-		return "", "", false, fmt.Errorf("resolve current directory: %w", err)
+		return "", "", "", false, fmt.Errorf("resolve current directory: %w", err)
 	}
 	home, err = filepath.Abs(home)
 	if err != nil {
-		return "", "", false, fmt.Errorf("resolve home directory: %w", err)
+		return "", "", "", false, fmt.Errorf("resolve home directory: %w", err)
 	}
 	for candidate := cwd; ; candidate = filepath.Dir(candidate) {
 		if _, err := os.Stat(filepath.Join(candidate, "docs/tasks")); err == nil {
-			return candidate, filepath.Join(candidate, "docs/tasks"), true, nil
+			return candidate, filepath.Join(candidate, "docs/tasks"), "", true, nil
 		}
 		if candidate == home || candidate == filepath.Dir(candidate) {
 			break
 		}
 	}
 	if _, err := os.Stat(filepath.Join(home, "docs/tasks")); err == nil {
-		return home, filepath.Join(home, "docs/tasks"), true, nil
+		return home, filepath.Join(home, "docs/tasks"), "", true, nil
 	}
-	return cwd, filepath.Join(cwd, "docs/tasks"), false, nil
+	return cwd, filepath.Join(cwd, "docs/tasks"), "", false, nil
 }
 func prepareActor(o *options, errout io.Writer) int {
 	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" || o.cmd == "lint" || o.cmd == "check" {
@@ -593,7 +630,7 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	p := filepath.Join(dir, now.Format("20060102-1504")+"-"+o.prio+"-"+o.id+".md")
-	if e = os.WriteFile(p, []byte(body), fileMode); e != nil {
+	if e = writeTicket(p, o.store, body, "tk new "+o.id); e != nil {
 		return fail(errout, e)
 	}
 	fmt.Fprintln(out, relative(root, p))
@@ -642,7 +679,7 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 			}
 			st, _ = explicitStatus(s)
 		}
-		ts = append(ts, task{p, m[4], st, m[3], title(s), s, created, lastChange(s, info.ModTime())})
+		ts = append(ts, task{path: p, slug: m[4], status: st, prio: m[3], title: title(s), body: s, created: created, changed: lastChange(s, info.ModTime())})
 	}
 	return ts, nil
 }
@@ -1403,7 +1440,7 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	t.body = insertPlanLine(t.body, line)
 	t.body = journal(t.body, entry)
-	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
+	if err := writeTicket(t.path, t.store, t.body, "tk plan "+t.slug); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s plan added\n", t.slug)
@@ -1457,7 +1494,7 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, o.why)
 	body := journal(t.body, line)
-	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+	if err := writeTicket(t.path, t.store, body, "tk skip "+t.slug); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s plan skipped\n", t.slug)
@@ -1719,7 +1756,7 @@ func prepareDone(t *task, o options, errout io.Writer) (int, int) {
 		fmt.Fprintf(errout, "tk: checked from the executor's session %s: counts only as a fresh sub-agent's check\n", s)
 	}
 	if o.glintDebt != "" {
-		valid, err := openDebtTicket(filepath.Join(o.baseRoot, "docs/tasks"), o.glintDebt)
+		valid, err := openDebtTicket(filepath.Dir(t.path), o.glintDebt)
 		if err != nil {
 			return 0, fail(errout, err)
 		}
@@ -1766,24 +1803,37 @@ func reportGlintFindings(w io.Writer, findings int, issues []struct {
 
 // checkDone — всё, что done проверяет до записи: прежние условия, план и то, что тикет не изменился за время
 // проверок (они идут до минуты на пункт: новый пункт или пропуск иначе затёрся бы записью или прошёл мимо).
-func checkDone(t *task, o options, errout io.Writer) (int, int) {
+// checkDone идёт по проверкам без замка хранилища (glint и план — минуты), а
+// перечитывание тикета, запись и коммит — под замком: его снимает возвращённая
+// функция.
+func checkDone(t *task, o options, errout io.Writer) (int, func(), int) {
+	none := func() {}
 	loaded := t.body
 	findings, code := prepareDone(t, o, errout)
 	if code != 0 {
-		return findings, code
+		return findings, none, code
 	}
 	if code = executePlan(o.baseRoot, t, errout); code != 0 {
-		return findings, code
+		return findings, none, code
+	}
+	unlock := none
+	if t.store.root != "" {
+		var err error
+		if unlock, err = lockStore(t.store.root); err != nil {
+			return findings, none, fail(errout, err)
+		}
 	}
 	current, err := os.ReadFile(t.path)
 	if err != nil {
-		return findings, fail(errout, err)
+		unlock()
+		return findings, none, fail(errout, err)
 	}
 	if string(current) != loaded {
+		unlock()
 		fmt.Fprintf(errout, "tk: %s changed while plan checks ran; run done again\n", t.slug)
-		return findings, exitNone
+		return findings, none, exitNone
 	}
-	return findings, 0
+	return findings, unlock, 0
 }
 
 func transition(t task, o options, out, errout io.Writer) int {
@@ -1791,9 +1841,11 @@ func transition(t task, o options, out, errout io.Writer) int {
 	glintFindings := 0
 	if o.cmd == "done" {
 		var code int
-		if glintFindings, code = checkDone(&t, o, errout); code != 0 {
+		var unlock func()
+		if glintFindings, unlock, code = checkDone(&t, o, errout); code != 0 {
 			return code
 		}
+		defer unlock()
 	}
 	if o.cmd == "start" || o.cmd == "review" && executor(t.body) == "" {
 		t.body = setExecutor(t.body, o.by)
@@ -1829,7 +1881,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 		line += " — " + o.until
 	}
 	t.body = journal(setStatus(t.body, next), line)
-	if e := os.WriteFile(t.path, []byte(t.body), fileMode); e != nil {
+	if e := writeTicket(t.path, t.store, t.body, "tk "+o.cmd+" "+t.slug); e != nil {
 		return fail(errout, e)
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
@@ -1838,7 +1890,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 func addNote(t task, o options, out, errout io.Writer) int {
 	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, o.note)
 	body := journal(t.body, line)
-	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+	if err := writeTicket(t.path, t.store, body, "tk note "+t.slug); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s noted\n", t.slug)
@@ -2067,6 +2119,7 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 	}
 	cut := time.Now().Add(-o.older)
 	var moved []string
+	var changedPaths []string
 	for _, repo := range repos {
 		taskDir := filepath.Join(repo, "docs/tasks")
 		ts, err := load(taskDir)
@@ -2092,6 +2145,14 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 				return fail(errout, err)
 			}
 			moved = append(moved, relative(base, dst))
+			if o.store.root != "" {
+				changedPaths = append(changedPaths, t.path, dst)
+			}
+		}
+	}
+	if len(changedPaths) > 0 {
+		if err := commitStorePaths(o.store, changedPaths, "tk archive"); err != nil {
+			return fail(errout, err)
 		}
 	}
 	fmt.Fprintf(out, "archived %d\n", len(moved))

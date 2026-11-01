@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -48,6 +52,329 @@ func TestParseOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExternalStoreConcurrentNotesAndCommitIsolation(t *testing.T) {
+	main, store, ticket := setupExternalStore(t)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err = os.WriteFile(filepath.Join(store, "untracked.txt"), []byte("outside change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const count = 10
+	var wg sync.WaitGroup
+	results := make(chan string, count)
+	for i := range count {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var out, errOut bytes.Buffer
+			code := run(options{cmd: "note", id: "seed", note: fmt.Sprintf("parallel-%d", i), by: "worker"}, &out, &errOut)
+			if code != 0 {
+				results <- errOut.String()
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	for result := range results {
+		t.Errorf("note failed: %s", result)
+	}
+	body, err := os.ReadFile(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range count {
+		if !strings.Contains(string(body), fmt.Sprintf("parallel-%d", i)) {
+			t.Errorf("note %d missing", i)
+		}
+	}
+	if got := gitTest(t, store, "show", "--format=", "--name-only", "HEAD"); strings.TrimSpace(got) != "proj/docs/tasks/20260101-1200-LOW-seed.md" {
+		t.Fatalf("last commit paths %q", got)
+	}
+	if got := gitTest(t, store, "status", "--porcelain"); strings.TrimSpace(got) != "?? untracked.txt" {
+		t.Fatalf("unrelated worktree change was altered: %q", got)
+	}
+}
+
+func TestExternalStoreRejectedHookLeavesWrittenTicket(t *testing.T) {
+	main, store, ticket := setupExternalStore(t)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	before, err := os.ReadFile(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hookDir := strings.TrimSpace(gitTest(t, store, "rev-parse", "--git-path", "hooks"))
+	if !filepath.IsAbs(hookDir) {
+		hookDir = filepath.Join(store, hookDir)
+	}
+	hook := filepath.Join(hookDir, "pre-commit")
+	if err = os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := run(options{cmd: "note", id: "seed", note: "retained", by: "worker"}, &out, &errOut)
+	if code == 0 || !strings.Contains(errOut.String(), "written, not committed") {
+		t.Fatalf("result %d: %s", code, errOut.String())
+	}
+	after, err := os.ReadFile(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, after) || !strings.Contains(string(after), "retained") {
+		t.Fatalf("ticket write was rolled back: %s", after)
+	}
+	if got := gitTest(t, store, "rev-list", "--count", "HEAD"); strings.TrimSpace(got) != "1" {
+		t.Fatalf("hook failure created a commit: %s", got)
+	}
+}
+
+func TestExternalStoreDefaultLocationFromLinkedWorktree(t *testing.T) {
+	main, store, _ := setupExternalStore(t)
+	t.Setenv("TK_STORE", "")
+	worktree := filepath.Join(t.TempDir(), "linked")
+	gitTest(t, main, "worktree", "add", "-q", "-b", "linked", worktree)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(worktree); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	root, _, mainRoot, found, err := resolveTaskBase()
+	if err != nil || !found || root != worktree || mainRoot != main {
+		t.Fatalf("task base %q main %q found=%v err=%v", root, mainRoot, found, err)
+	}
+	got, err := externalTaskStore(mainRoot)
+	if err != nil || got != (taskStore{root: store, repo: filepath.Join(store, "proj")}) {
+		t.Fatalf("external store %+v err=%v", got, err)
+	}
+}
+
+func TestExternalStoreArchiveCommitsRename(t *testing.T) {
+	main, store, ticket := setupExternalStore(t)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	body := "# Seed\n\nСтатус: готово\n\n## Приёмка\n- проверить результат\n\n## Журнал\n- 2020-01-01 12:00 готово — reviewer: проверено\n"
+	if err = os.WriteFile(ticket, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, store, "add", "--", "proj/docs/tasks/20260101-1200-LOW-seed.md")
+	gitTest(t, store, "commit", "-m", "close seed")
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "archive", older: time.Second}, &out, &errOut); code != 0 {
+		t.Fatalf("archive %d: %s", code, errOut.String())
+	}
+	archive := filepath.Join(store, "proj/docs/tasks-archive", filepath.Base(ticket))
+	if _, err = os.Stat(archive); err != nil {
+		t.Fatalf("archive file missing: %v", err)
+	}
+	if got := gitTest(t, store, "show", "--format=", "--summary", "HEAD"); !strings.Contains(got, "rename") {
+		t.Fatalf("archive commit is not a rename: %s", got)
+	}
+}
+
+func TestExternalStorePlanAndSkipCommitTicket(t *testing.T) {
+	main, store, ticket := setupExternalStore(t)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "plan", id: "seed", add: "verify: echo ok", by: "worker"}, &out, &errOut); code != 0 {
+		t.Fatalf("plan %d: %s", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := run(options{cmd: "skip", id: "seed", item: "verify", why: "not needed", by: "worker"}, &out, &errOut); code != 0 {
+		t.Fatalf("skip %d: %s", code, errOut.String())
+	}
+	if got := strings.TrimSpace(gitTest(t, store, "log", "-2", "--format=%s")); got != "tk skip seed\ntk plan seed" {
+		t.Fatalf("unexpected plan/skip commits: %s", got)
+	}
+	body, err := os.ReadFile(ticket)
+	if err != nil || !strings.Contains(string(body), "пропущен: verify — not needed") {
+		t.Fatalf("skip was not written: %s, %v", body, err)
+	}
+}
+
+func TestExternalStoreRetriesIndexLock(t *testing.T) {
+	main, store, _ := setupExternalStore(t)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	indexLock := filepath.Join(strings.TrimSpace(gitTest(t, store, "rev-parse", "--git-path", "index")) + ".lock")
+	if err = os.WriteFile(indexLock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() { time.Sleep(600 * time.Millisecond); _ = os.Remove(indexLock) }()
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "note", id: "seed", note: "after lock", by: "worker"}, &out, &errOut); code != 0 {
+		t.Fatalf("note %d: %s", code, errOut.String())
+	}
+}
+
+func TestExternalStoreRejectsNonGitBeforeWriting(t *testing.T) {
+	main, _, _ := setupExternalStore(t)
+	nonGit := filepath.Join(t.TempDir(), "store")
+	dir := filepath.Join(nonGit, "proj/docs/tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ticket := filepath.Join(dir, "20260101-1200-LOW-seed.md")
+	original := "# Seed\n\nСтатус: открыт\n\n## Приёмка\n- проверить\n\n## Журнал\n"
+	if err := os.WriteFile(ticket, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TK_STORE", nonGit)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "note", id: "seed", note: "must not write", by: "worker"}, &out, &errOut); code == 0 {
+		t.Fatal("note unexpectedly succeeded")
+	}
+	got, err := os.ReadFile(ticket)
+	if err != nil || string(got) != original {
+		t.Fatalf("ticket changed before git validation: %s, %v", got, err)
+	}
+}
+
+func TestExternalStoreFallsBackWhenRepositoryDirectoryIsMissing(t *testing.T) {
+	base := t.TempDir()
+	main, store := filepath.Join(base, "proj"), filepath.Join(base, "tasks")
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(base, "gitconfig")
+	home := filepath.Join(base, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_PARAMETERS", "")
+	t.Setenv("GIT_CEILING_DIRECTORIES", base)
+	t.Setenv("TK_STORE", store)
+	if err := os.WriteFile(global, []byte("[user]\n\tname = test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initGitTest(t, main)
+	initGitTest(t, store)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chdir(main); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "new", id: "local-task", by: "worker"}, &out, &errOut); code != 0 {
+		t.Fatalf("new %d: %s", code, errOut.String())
+	}
+	if _, err = os.Stat(filepath.Join(main, "docs/tasks")); err != nil {
+		t.Fatalf("ticket was not written in the code repository: %v", err)
+	}
+	if got := gitTest(t, store, "status", "--porcelain"); strings.TrimSpace(got) != "" {
+		t.Fatalf("store was changed without a repository directory: %s", got)
+	}
+}
+
+func setupExternalStore(t *testing.T) (string, string, string) {
+	t.Helper()
+	base := t.TempDir()
+	main, store := filepath.Join(base, "proj"), filepath.Join(base, "tasks")
+	if err := os.MkdirAll(filepath.Join(store, "proj/docs/tasks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(base, "gitconfig")
+	home := filepath.Join(base, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_PARAMETERS", "")
+	t.Setenv("GIT_CEILING_DIRECTORIES", base)
+	t.Setenv("TK_STORE", store)
+	if err := os.WriteFile(global, []byte("[user]\n\tname = test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initGitTest(t, main)
+	initGitTest(t, store)
+	ticket := filepath.Join(store, "proj/docs/tasks/20260101-1200-LOW-seed.md")
+	body := "# Seed\n\nСтатус: открыт\n\n## Приёмка\n- проверить результат\n\n## Журнал\n"
+	if err := os.WriteFile(ticket, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, store, "add", "-A")
+	gitTest(t, store, "commit", "-m", "seed")
+	return main, store, ticket
+}
+
+func initGitTest(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, dir, "init", "-q")
+	if dir != filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, "proj")); errors.Is(err, os.ErrNotExist) {
+			if err := os.WriteFile(filepath.Join(dir, "source"), []byte("source\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, dir, "add", "source")
+			gitTest(t, dir, "commit", "-m", "seed")
+		}
+	}
+}
+
+func gitTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %s: %v", args, b, err)
+	}
+	return string(b)
 }
 
 func TestValidateCommand(t *testing.T) {
@@ -280,9 +607,9 @@ func TestOutsideRepositoryBaseSearch(t *testing.T) {
 		_ = os.Chdir(oldWD)
 		_ = os.Setenv("HOME", oldHome)
 	})
-	root, dir, found, err := resolveTaskBase()
-	if err != nil || !found || root != home || dir != filepath.Join(home, "docs", "tasks") {
-		t.Fatalf("resolved base %q %q %v %v", root, dir, found, err)
+	root, dir, mainRoot, found, err := resolveTaskBase()
+	if err != nil || !found || root != home || dir != filepath.Join(home, "docs", "tasks") || mainRoot != "" {
+		t.Fatalf("resolved base %q %q %q %v %v", root, dir, mainRoot, found, err)
 	}
 }
 
