@@ -440,6 +440,9 @@ func runRootScan(o options, out, errout io.Writer) int {
 }
 
 func runAtBase(root, dir string, o options, out, errout io.Writer) int {
+	if o.baseRoot == "" {
+		o.baseRoot = root
+	}
 	if o.store.root != "" && o.cmd != "done" && isWriteCommand(o.cmd) {
 		unlock, err := lockStore(o.store.root)
 		if err != nil {
@@ -478,7 +481,7 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		return 0
 	}
 	if o.cmd == "check" {
-		return checkPlan(root, t, out)
+		return checkPlan(o.baseRoot, t, out)
 	}
 	if o.cmd == "plan" {
 		return addPlanItem(t, o, out, errout)
@@ -488,9 +491,6 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	}
 	if o.cmd == "note" {
 		return addNote(t, o, out, errout)
-	}
-	if o.baseRoot == "" {
-		o.baseRoot = root
 	}
 	return transition(t, o, out, errout)
 }
@@ -2117,14 +2117,31 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 			return fail(errout, err)
 		}
 	}
-	cut := time.Now().Add(-o.older)
-	var moved []string
-	var changedPaths []string
+	changed, err := moveClosed(repos, time.Now().Add(-o.older))
+	// Перенесённое до ошибки тоже коммитится: иначе хранилище осталось бы грязным.
+	if o.store.root != "" && len(changed) > 0 {
+		if cerr := commitStorePaths(o.store, changed, "tk archive"); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}
+	if err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintf(out, "archived %d\n", len(changed)/2)
+	for i := 1; i < len(changed); i += 2 {
+		fmt.Fprintln(out, relative(base, changed[i]))
+	}
+	return 0
+}
+
+// moveClosed переносит закрытые до cut тикеты в docs/tasks-archive и
+// возвращает пары «старый путь, новый путь» перенесённых, в том числе до ошибки.
+func moveClosed(repos []string, cut time.Time) ([]string, error) {
+	var changed []string
 	for _, repo := range repos {
-		taskDir := filepath.Join(repo, "docs/tasks")
-		ts, err := load(taskDir)
+		ts, err := load(filepath.Join(repo, "docs/tasks"))
 		if err != nil {
-			return fail(errout, err)
+			return changed, err
 		}
 		dstDir := filepath.Join(repo, "docs/tasks-archive")
 		for i := range ts {
@@ -2133,31 +2150,19 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 				continue
 			}
 			if err = os.MkdirAll(dstDir, dirMode); err != nil {
-				return fail(errout, err)
+				return changed, fmt.Errorf("create archive directory: %w", err)
 			}
 			dst := filepath.Join(dstDir, filepath.Base(t.path))
 			if _, err = os.Stat(dst); err == nil {
-				return fail(errout, fmt.Errorf("archive destination exists: %s", dst))
+				return changed, fmt.Errorf("archive destination exists: %s", dst)
 			} else if !errors.Is(err, os.ErrNotExist) {
-				return fail(errout, err)
+				return changed, err
 			}
 			if err = os.Rename(t.path, dst); err != nil {
-				return fail(errout, err)
+				return changed, fmt.Errorf("move to archive: %w", err)
 			}
-			moved = append(moved, relative(base, dst))
-			if o.store.root != "" {
-				changedPaths = append(changedPaths, t.path, dst)
-			}
+			changed = append(changed, t.path, dst)
 		}
 	}
-	if len(changedPaths) > 0 {
-		if err := commitStorePaths(o.store, changedPaths, "tk archive"); err != nil {
-			return fail(errout, err)
-		}
-	}
-	fmt.Fprintf(out, "archived %d\n", len(moved))
-	for _, p := range moved {
-		fmt.Fprintln(out, p)
-	}
-	return 0
+	return changed, nil
 }
