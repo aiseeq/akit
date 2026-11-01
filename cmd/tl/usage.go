@@ -62,10 +62,10 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 		}
 		key := cmp.Or(r.ID, r.RequestID)
 		if key == "" {
-			replies = append(replies, reply{h.src.id, r})
+			replies = append(replies, reply{h.src.ID, r})
 			continue
 		}
-		key = h.src.id + "\x00" + key
+		key = h.src.ID + "\x00" + key
 		if j, ok := last[key]; ok {
 			if r.Usage.Output > replies[j].r.Usage.Output {
 				replies[j].r = r
@@ -73,7 +73,7 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 			continue
 		}
 		last[key] = len(replies)
-		replies = append(replies, reply{h.src.id, r})
+		replies = append(replies, reply{h.src.ID, r})
 	}
 	per := map[string]*tally{}
 	for _, rp := range replies {
@@ -135,13 +135,13 @@ func usageScope(sources []source, opts options, e env) string {
 			read += " without subagents"
 		}
 	case len(sources) > 0:
-		read = sources[0].path
+		read = sources[0].Path
 		if len(sources) > 1 {
 			read += fmt.Sprintf(" and %d subagent transcript(s)", len(sources)-1)
 		}
 	}
 	scope := "read: " + read + "; not counted: runs without a transcript (claude -p --no-session-persistence)"
-	if opts.codex || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.path) }) {
+	if opts.codex || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.Path) }) {
 		scope += " and codex rollouts (their token counts are not read)"
 	}
 	return scope

@@ -111,7 +111,7 @@ func TestWaitStartsAfterEarlierSerialCallInSameMessage(t *testing.T) {
 	}
 	path := writeWaitTranscript(t, e, "sequential.jsonl", strings.Join(rows, "\n")+"\n")
 	roles := map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}
-	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{path: path})
+	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func readWaits(t *testing.T, e env, name string, rows []string) []time.Duration 
 	t.Helper()
 	path := writeWaitTranscript(t, e, name, strings.Join(rows, "\n")+"\n")
 	roles := map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}
-	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{path: path})
+	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
