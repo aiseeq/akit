@@ -67,6 +67,11 @@ func TestExternalStoreConcurrentNotesAndCommitIsolation(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(store, "untracked.txt"), []byte("outside change\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err = os.WriteFile(filepath.Join(store, "staged.txt"), []byte("staged elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, store, "add", "--", "staged.txt")
+	base := strings.TrimSpace(gitTest(t, store, "rev-parse", "HEAD"))
 
 	const count = 10
 	var wg sync.WaitGroup
@@ -96,11 +101,11 @@ func TestExternalStoreConcurrentNotesAndCommitIsolation(t *testing.T) {
 			t.Errorf("note %d missing", i)
 		}
 	}
-	if got := gitTest(t, store, "show", "--format=", "--name-only", "HEAD"); strings.TrimSpace(got) != "proj/docs/tasks/20260101-1200-LOW-seed.md" {
-		t.Fatalf("last commit paths %q", got)
+	if got := gitTest(t, store, "diff", "--name-only", base, "HEAD"); strings.TrimSpace(got) != "proj/docs/tasks/20260101-1200-LOW-seed.md" {
+		t.Fatalf("tk commits changed paths %q", got)
 	}
-	if got := gitTest(t, store, "status", "--porcelain"); strings.TrimSpace(got) != "?? untracked.txt" {
-		t.Fatalf("unrelated worktree change was altered: %q", got)
+	if got := gitTest(t, store, "status", "--porcelain"); strings.TrimSpace(got) != "A  staged.txt\n?? untracked.txt" {
+		t.Fatalf("unrelated store changes were altered: %q", got)
 	}
 }
 
@@ -293,7 +298,10 @@ func TestExternalStoreRetriesIndexLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
-	indexLock := filepath.Join(strings.TrimSpace(gitTest(t, store, "rev-parse", "--git-path", "index")) + ".lock")
+	indexLock := strings.TrimSpace(gitTest(t, store, "rev-parse", "--path-format=absolute", "--git-path", "index")) + ".lock"
+	if !strings.HasPrefix(indexLock, store+string(filepath.Separator)) {
+		t.Fatalf("index lock %s is outside the store", indexLock)
+	}
 	if err = os.WriteFile(indexLock, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -301,6 +309,9 @@ func TestExternalStoreRetriesIndexLock(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := run(options{cmd: "note", id: "seed", note: "after lock", by: "worker"}, &out, &errOut); code != 0 {
 		t.Fatalf("note %d: %s", code, errOut.String())
+	}
+	if got := gitTest(t, store, "status", "--porcelain"); got != "" {
+		t.Fatalf("note under index.lock left the store dirty: %q", got)
 	}
 }
 
