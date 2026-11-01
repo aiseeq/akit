@@ -744,3 +744,18 @@ func TestBriefLaterCountSkipsToolSchemas(t *testing.T) {
 	mustHave(t, "схема инструмента", out, "1 found", fmt.Sprintf("ещё %d", briefLater))
 	mustLack(t, "схема инструмента", out, "more user lines not shown")
 }
+
+// Ответ в окне вопроса после цитаты — поздняя реплика: показывается и входит в счёт непоказанных.
+func TestBriefLaterCountsQuestionAnswers(t *testing.T) {
+	e := testEnv(t)
+	start := time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC)
+	stamp := func(min int) string { return start.Add(time.Duration(min) * time.Minute).Format(time.RFC3339) }
+	lines := []string{human(stamp(0), "Склад считаем по четвергам"),
+		ask(stamp(1), "q1"), answer(stamp(2), "q1", "Какой склад?", "Северный")}
+	for i := range briefLater {
+		lines = append(lines, human(stamp(i+3), fmt.Sprintf("реплика %d", i+1)))
+	}
+	writeTranscript(t, e.home, "-home-ask", "askl0000-0000", lines...)
+	_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Пользователь 31.10: «Склад считаем по четвергам»\n"), "--until", "2026-10-31 17:00")
+	mustHave(t, "ответ в окне вопроса", out, "1 found", "answer in a question dialog", "Северный", "--- 1 more user lines not shown")
+}

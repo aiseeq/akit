@@ -1636,6 +1636,8 @@ func (c *briefQuoteCollector) keep(raw []byte) bool {
 			if stamp, err := transcriptTimestamp(raw); err == nil {
 				c.agentRaw[stamp.Format(time.RFC3339Nano)] = c.lastAgent
 			}
+			// Ответ в окне вопроса после цитаты — тоже поздняя реплика: в показ и в счёт.
+			c.keepLaterUser(raw, isUserRecord)
 			return true
 		}
 	}
