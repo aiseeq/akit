@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -15,33 +16,9 @@ import (
 // изменился на диске после чтения, или временный не записался — не меняется ни один файл. Возвращает имена
 // записанных файлов.
 func (p *Plan) Write() ([]string, error) {
-	if !p.OK() {
-		return nil, errors.New("plan has mismatched match counts, nothing written")
-	}
-	var changed []*file
-	var names []string
-	for _, name := range p.order {
-		f := p.files[name]
-		if f.cur != f.orig {
-			changed = append(changed, f)
-			names = append(names, name)
-		}
-	}
-	for i, f := range changed {
-		st, err := os.Stat(f.path)
-		if err != nil {
-			return nil, fmt.Errorf("stat %s: %w", names[i], err)
-		}
-		if st.Size() != f.size || !st.ModTime().Equal(f.modTime) {
-			return nil, fmt.Errorf("%s changed on disk while editing, nothing written", names[i])
-		}
-		sys, ok := st.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil, fmt.Errorf("stat %s: unexpected file metadata", names[i])
-		}
-		if sys.Nlink > 1 {
-			return nil, fmt.Errorf("%s has %d hard links; sub replaces the file and would break them, nothing written", names[i], sys.Nlink)
-		}
+	changed, names, err := p.check()
+	if err != nil {
+		return nil, err
 	}
 	temps := make([]string, 0, len(changed))
 	// cleanup убирает временные файлы; не удалившийся называется в ошибке, чтобы агент убрал его сам.
@@ -67,6 +44,46 @@ func (p *Plan) Write() ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// Check — отказы Write, которые видны до записи: расхождение числа совпадений, файл изменился на диске, жёсткие
+// ссылки. Сухой прогон зовёт его, чтобы обещать только то, что Write сделает.
+func (p *Plan) Check() error {
+	_, _, err := p.check()
+	return err
+}
+
+// check возвращает изменённые файлы и их имена или отказ.
+func (p *Plan) check() ([]*file, []string, error) {
+	if !p.OK() {
+		return nil, nil, errors.New("plan has mismatched match counts, nothing written")
+	}
+	var changed []*file
+	var names []string
+	for _, name := range p.order {
+		f := p.files[name]
+		if f.cur != f.orig {
+			changed = append(changed, f)
+			names = append(names, name)
+		}
+	}
+	for i, f := range changed {
+		st, err := os.Stat(f.path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("stat %s: %w", names[i], err)
+		}
+		if st.Size() != f.size || !st.ModTime().Equal(f.modTime) {
+			return nil, nil, fmt.Errorf("%s changed on disk while editing, nothing written", names[i])
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil, nil, fmt.Errorf("stat %s: unexpected file metadata", names[i])
+		}
+		if sys.Nlink > 1 {
+			return nil, nil, fmt.Errorf("%s has %d hard links; sub replaces the file and would break them, nothing written", names[i], sys.Nlink)
+		}
+	}
+	return changed, names, nil
 }
 
 func writeTemp(f *file) (string, error) {
@@ -108,23 +125,25 @@ func writeTemp(f *file) (string, error) {
 	return name, nil
 }
 
+// copyXattrs делает атрибуты target такими же, как у source: переносит атрибуты source и снимает те, что target
+// получил сам (ACL по умолчанию папки достаётся новому файлу, а у исходного его не было).
 func copyXattrs(source, target string) error {
-	size, err := unix.Listxattr(source, nil)
+	have, err := listXattrs(source)
 	if err != nil {
-		return fmt.Errorf("list extended attributes: %w", err)
+		return err
 	}
-	if size == 0 {
-		return nil
-	}
-	list := make([]byte, size)
-	n, err := unix.Listxattr(source, list)
+	inherited, err := listXattrs(target)
 	if err != nil {
-		return fmt.Errorf("list extended attributes: %w", err)
+		return err
 	}
-	for attr := range strings.SplitSeq(string(list[:n]), "\x00") {
-		if attr == "" {
-			continue
+	for _, attr := range inherited {
+		if !slices.Contains(have, attr) {
+			if err := unix.Removexattr(target, attr); err != nil {
+				return fmt.Errorf("remove inherited attribute %s: %w", attr, err)
+			}
 		}
+	}
+	for _, attr := range have {
 		size, err := unix.Getxattr(source, attr, nil)
 		if err != nil {
 			return fmt.Errorf("get attribute %s: %w", attr, err)
@@ -139,4 +158,26 @@ func copyXattrs(source, target string) error {
 		}
 	}
 	return nil
+}
+
+func listXattrs(path string) ([]string, error) {
+	size, err := unix.Listxattr(path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list extended attributes of %s: %w", path, err)
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	list := make([]byte, size)
+	n, err := unix.Listxattr(path, list)
+	if err != nil {
+		return nil, fmt.Errorf("list extended attributes of %s: %w", path, err)
+	}
+	var attrs []string
+	for attr := range strings.SplitSeq(string(list[:n]), "\x00") {
+		if attr != "" {
+			attrs = append(attrs, attr)
+		}
+	}
+	return attrs, nil
 }

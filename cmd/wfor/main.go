@@ -31,7 +31,8 @@ Conditions:
   exit PID...     the processes have exited (any processes, not only children)
   time T          local time T: 14:45, "26.10 09:00", 2026-10-26T09:00:00Z
   ok CMD          bash -c CMD exits 0 (one string; run every 10s, or --every);
-                  descendants are killed when it exits and on timeout
+                  its process group is killed when it exits and on timeout;
+                  a process that leaves the group (setsid, a daemon) keeps running
   idle            the machine is calm by graft's rule (graft exec --heavy --local);
                   for a heavy command after the wait run graft exec --heavy -- CMD
                   instead: it waits the same way and keeps its place in the queue

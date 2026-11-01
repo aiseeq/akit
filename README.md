@@ -280,8 +280,9 @@ when it is finished later, and `--after N` counts it among the N.
     wfor file result.tsv ok 'worker status | grep -q done' --any
     wfor idle                                      # machine calm by graft's rule
 
-Conditions: `file PATH`, `gone PATH`, `line RE FILE`, `exit PID...`, `time T`, `ok CMD`, `idle`. Descendants
-of an `ok` command are killed when it exits and on timeout.
+Conditions: `file PATH`, `gone PATH`, `line RE FILE`, `exit PID...`, `time T`, `ok CMD`, `idle`. The `ok`
+command runs in a process group of its own, killed when it exits and on timeout; a process that leaves the
+group (`setsid`, a daemon) is left running, and the timeout still holds.
 A heavy command after the wait goes as `graft exec --heavy -- CMD`, not `wfor idle && CMD`: graft
 waits the same way and keeps the command in its queue. `wfor -h` prints all flags.
 

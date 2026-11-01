@@ -374,3 +374,39 @@ func TestParseSpecFor(t *testing.T) {
 		t.Errorf("other path: %v", err)
 	}
 }
+
+// Временный файл наследует ACL по умолчанию папки; у исходного его не было — после замены его быть не должно.
+func TestWriteDropsInheritedDefaultACL(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/setfacl"); err != nil {
+		t.Skip("setfacl is unavailable")
+	}
+	dir, err := os.MkdirTemp(".", ".acl-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("old\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("setfacl", "-d", "-m", "u:12345:rwx", dir).CombinedOutput(); err != nil {
+		t.Fatalf("setfacl: %v: %s", err, out)
+	}
+	plan, err := Build([]Edit{{Files: []string{path}, Old: "old", New: "new", Want: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Write(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("getfacl", "-cp", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("getfacl: %v: %s", err, out)
+	}
+	if strings.Contains(string(out), "12345") {
+		t.Errorf("file got the directory's default ACL:\n%s", out)
+	}
+	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o640 {
+		t.Errorf("mode: %v %v", st.Mode(), err)
+	}
+}

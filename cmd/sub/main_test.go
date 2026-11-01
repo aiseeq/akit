@@ -111,3 +111,15 @@ func TestFileArgWithSpec(t *testing.T) {
 		t.Errorf("-n with FILE and spec: code %d", code)
 	}
 }
+
+// Сухой прогон обещает только то, что сделает запись: файл с жёсткой ссылкой — тот же отказ.
+func TestDryRunRefusesHardLink(t *testing.T) {
+	f := tempFile(t, "hello\n")
+	if err := os.Link(f, f+".link"); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runSub(t, "", "--dry-run", "hello", "bye", f)
+	if code != exitUsage || out != "" || !strings.Contains(errOut, "hard link") {
+		t.Fatalf("code %d, out %q, err %q", code, out, errOut)
+	}
+}

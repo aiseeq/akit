@@ -146,6 +146,10 @@ func run(opts options, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitMismatch
 	}
 	if opts.dryRun {
+		if err := plan.Check(); err != nil {
+			fmt.Fprintf(stderr, "sub: %v\n", err)
+			return exitUsage
+		}
 		fmt.Fprintf(stdout, "sub: dry run, would make %s\n", plan.Summary())
 		return 0
 	}
