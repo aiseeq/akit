@@ -384,8 +384,10 @@ func TestWorktreeDoneUsesCodeTreeAndDebtNextToTicket(t *testing.T) {
 	main, wt := sharedTasksRepo(t, true)
 	writeTestFile(t, filepath.Join(wt, "wt-marker"), "x\n")
 	writeTestFile(t, filepath.Join(main, "docs/tasks/20260103-1200-LOW-debt.md"), "# Debt\n\nСтатус: открыт\n")
+	writeTestFile(t, filepath.Join(wt, ".glint.yaml"), "rules: {}\n")
 	bin := t.TempDir()
-	writeTestFile(t, filepath.Join(bin, "glint"), "#!/bin/sh\nprintf '%s' '{\"summary\":{\"total\":1},\"issues\":[{\"rule\":\"r\",\"severity\":\"low\",\"file\":\"a.go\",\"line\":1,\"message\":\"m\"}]}'\n")
+	glintCwd := filepath.Join(bin, "cwd")
+	writeTestFile(t, filepath.Join(bin, "glint"), "#!/bin/sh\npwd > '"+glintCwd+"'\nprintf '%s' '{\"summary\":{\"total\":1},\"issues\":[{\"rule\":\"r\",\"severity\":\"low\",\"file\":\"a.go\",\"line\":1,\"message\":\"m\"}]}'\n")
 	if err := os.Chmod(filepath.Join(bin, "glint"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -397,8 +399,11 @@ func TestWorktreeDoneUsesCodeTreeAndDebtNextToTicket(t *testing.T) {
 	if code := run(options{cmd: "done", id: "shared", by: "reviewer", doer: "t", check: "c", glintDebt: "debt"}, &out, &errOut); code != 0 {
 		t.Fatalf("done from the worktree %d: %s", code, errOut.String())
 	}
-	if body := read(t, filepath.Join(main, "docs/tasks/20260102-1200-LOW-shared.md")); !strings.Contains(body, "Статус: готово") {
-		t.Fatalf("shared ticket not closed: %s", body)
+	if body := read(t, filepath.Join(main, "docs/tasks/20260102-1200-LOW-shared.md")); !strings.Contains(body, "Статус: готово") || !strings.Contains(body, "glint: 1 findings, debt debt") {
+		t.Fatalf("shared ticket not closed with the glint debt: %s", body)
+	}
+	if got := strings.TrimSpace(read(t, glintCwd)); got != wt {
+		t.Fatalf("glint ran in %q, want the worktree %q", got, wt)
 	}
 }
 
