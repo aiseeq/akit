@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // human, agent, ask, answer — строки транскрипта Claude Code: реплика человека, ответ агента, окно вопроса и ответ в нём.
@@ -304,6 +306,84 @@ func TestR6SearchDoesNotRereadOnMiss(t *testing.T) {
 	}
 	if len(warnings) != 0 {
 		t.Errorf("неожиданное предупреждение, получили %d", len(warnings))
+	}
+}
+
+func naiveRawPrefilter(raw []byte, fragment string) bool {
+	best, bestWord := prefilterBest(fragment)
+	if best == "" {
+		return true
+	}
+	if len([]rune(best)) == 1 && len([]rune(bestWord)) <= 3 {
+		for _, variant := range wordVariants([]rune(bestWord)) {
+			term := jsonEscaped(variant)
+			for from := 0; from <= len(raw)-len(term); {
+				at := bytes.Index(raw[from:], term)
+				if at < 0 {
+					break
+				}
+				at += from
+				if rawWordEdge(raw[:at], true) && rawWordEdge(raw[at+len(term):], false) {
+					return true
+				}
+				from = at + len(term)
+			}
+		}
+		return false
+	}
+	term := foldRawBytes(jsonEscaped(best))
+	return bytes.Contains(foldRawBytes(raw), term)
+}
+
+func foldRawBytes(raw []byte) []byte {
+	var folded []byte
+	for len(raw) > 0 {
+		r, size := utf8.DecodeRune(raw)
+		folded = utf8.AppendRune(folded, prefilterRune(r))
+		raw = raw[size:]
+	}
+	return folded
+}
+
+func TestPrefilterAnyMatchesNaiveByteSearch(t *testing.T) {
+	rng := rand.New(rand.NewSource(8))
+	fragments := [][]string{
+		{"ab", "abc", "bc", "a"}, // перекрытие, вложение и короткие фрагменты
+		{"северный ветер", "котёл и 界", "граница"},
+		{"слово внутри длинного предложения"},
+		{}, // пустой список
+	}
+	for _, fragment := range []string{"abcde", "котёл", "граница"} {
+		best, _ := prefilterBest(fragment)
+		raw := jsonEscaped(best)
+		if got, want := prefilterAny([]string{fragment})(raw), naiveRawPrefilter(raw, fragment); got != want || !got {
+			t.Fatalf("fragment at raw boundary %q: got %v, want %v", fragment, got, want)
+		}
+	}
+	alphabet := []string{"a", "b", "c", "x", " ", "\\", "\"", "ё", "Е", "кот", "界", "🌿"}
+	for i := range 10000 {
+		group := fragments[i%len(fragments)]
+		raw := make([]byte, 0, 128)
+		count := rng.Intn(40)
+		for range count {
+			raw = append(raw, alphabet[rng.Intn(len(alphabet))]...)
+		}
+		if len(group) > 0 && i%2 == 0 {
+			insert := []byte(group[rng.Intn(len(group))])
+			at := rng.Intn(len(raw) + 1)
+			raw = append(append(append([]byte(nil), raw[:at]...), insert...), raw[at:]...)
+		}
+		got := prefilterAny(group)(raw)
+		want := false
+		for _, fragment := range group {
+			if naiveRawPrefilter(raw, fragment) {
+				want = true
+				break
+			}
+		}
+		if got != want {
+			t.Fatalf("case %d: prefilterAny(%q) = %v, naive bytes.Contains oracle = %v for %q", i, group, got, want, raw)
+		}
 	}
 }
 
