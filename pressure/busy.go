@@ -82,8 +82,8 @@ type Load struct {
 	MemSome        float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	SwapKBs        float64 // обмен со свопом, KB/s
 	DirtyMB        float64 // грязных и пишущихся на диск страниц сейчас (Dirty+Writeback из /proc/meminfo), MiB
-	// DirtyLimitMB — порог фонового сброса машины, MiB: vm.dirty_background_bytes, а если он 0 —
-	// vm.dirty_background_ratio % от свободной и файловой памяти, как считает ядро.
+	// DirtyLimitMB — порог фонового сброса машины, MiB, приближённо: vm.dirty_background_bytes, а если
+	// он 0 — vm.dirty_background_ratio % от свободной и файловой памяти (см. dirtyLimit).
 	DirtyLimitMB float64
 	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
 	QuietUntil time.Time
@@ -446,6 +446,9 @@ func dirtyableMB(meminfo string) (float64, error) {
 
 // dirtyLimit — порог фонового сброса машины, MiB (Load.DirtyLimitMB): dirty_background_bytes, при 0 —
 // dirty_background_ratio % от памяти dirtyableMB текста meminfo. Нет файла или оба 0 — ErrNoDirtyLimit.
+// Это приближение порога ядра: резерв страниц не вычтен (dirtyableMB), и не повторено ядерное снижение
+// фонового порога до половины общего, когда фоновый не ниже общего (dirty_bytes, dirty_ratio) —
+// такая настройка ошибочна сама по себе.
 func (m *Meter) dirtyLimit(meminfo string) (float64, error) {
 	read := func(name string) (uint64, error) {
 		data, err := m.read(filepath.Join("sys", "vm", name), ErrNoDirtyLimit)
