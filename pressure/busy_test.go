@@ -202,6 +202,10 @@ func TestCheckWriteback(t *testing.T) {
 	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Measure != Writeback || v.Limit != 200 {
 		t.Errorf("205 MiB при сбросе с 10%% от 2000 MiB = %+v, %v; ждали занята, порог 200", v, err)
 	}
+	writeProc(t, m.procRoot, "meminfo", "MemFree: 0 kB\nActive(file): 0 kB\nInactive(file): 0 kB\n"+dirty205)
+	if v, err = m.Check(context.Background(), l, "", true); err != nil || v.Busy() || !slices.Contains(v.Skipped, ErrNoDirtyLimit) {
+		t.Errorf("доля от нулевой памяти = %+v, %v; ждали свободна, порог пропущен с пометкой", v, err)
+	}
 	writeProc(t, m.procRoot, "meminfo", "MemFree: 1024000 kB\n"+dirty205)
 	if _, err = m.Check(context.Background(), l, "", true); err == nil {
 		t.Error("доля без файловой памяти в meminfo — ждали ошибку")

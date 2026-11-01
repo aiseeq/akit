@@ -470,7 +470,13 @@ func (m *Meter) dirtyLimit(meminfo string) (float64, error) {
 		return 0, ErrNoDirtyLimit
 	}
 	dirtyable, err := dirtyableMB(meminfo)
-	return float64(ratio) / 100 * dirtyable, err
+	if err != nil {
+		return 0, err
+	}
+	if dirtyable == 0 {
+		return 0, ErrNoDirtyLimit
+	}
+	return float64(ratio) / 100 * dirtyable, nil
 }
 
 // read читает файл procRoot; файла нет — мера none.
