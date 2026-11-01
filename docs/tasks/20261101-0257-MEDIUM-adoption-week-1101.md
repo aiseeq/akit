@@ -16,3 +16,5 @@
 
 ## Журнал
 - 2026-11-01 02:57 открыт — akit-master
+- 2026-11-01 03:03 note — akit-master: Боец Luna 1101-0303-adoption-week (класс разбор-данных, маршрут luna-мера), бриф /home/aisee/.cache/worktrees/akit-accept/adoption-week/brief.md, приёмка /home/aisee/.cache/worktrees/akit-accept/adoption-accept.sh (файлы, шапки, run.sh воспроизводит counts.tsv). Дальше мастер: сверка 5 примеров examples.tsv с транскриптами, пересчёт пары чисел своим tl, раздел в round-software.md, решение user-word→tl, итог git-admin.
+- 2026-11-01 03:12 note — akit-master: Вопрос лида 01.11 (срок 18:00 CET): выполнено ли условие backlog.md:22 (слово пользователя 25.10, tl 0bbcc980:7759). Нужна строка на КАЖДУЮ внедрённую утилиту akit (не только sub/tl/wfor): (1) вызовы за день и неделю, доля от старого способа; (2) замер экономии токенов или снижения ошибок — есть или «замера нет»; (3) свои сбои за неделю. Итог «выполнено / не хватает X». План: после сдачи Luna — worker continue с расширением на busy, prior, tk, user-word, page-shot, webtext, claude-rules-export (вызовы, коды выхода, падения), польза — из замеров llmark (sub-pitch, tl-pitch, wfor-pitch) и этого замера.

@@ -1,6 +1,6 @@
 # tl --grep: отсев сырых строк без ToLower и по литералам регулярки
 
-Статус: в работе
+Статус: готово
 Исполнитель: akit-master
 
 ## Что сделать
@@ -35,3 +35,4 @@
 - 2026-11-01 01:23 note — akit-master: независимая проверка 23913e1 (суб-агент, 00:23–01:22 CET): потерь нет (synth 14, 30 запросов, ~145 ручных, 12600 случайных, 20 настоящих шаблонов байт в байт); FAIL по CPU с --codex: wfor main 34 → 40–46, Kelvin 36–38 → 49–56 (containsPayload в possibleMissing оставляет все строки codex). Счёт битых строк только по кандидатам — описан в -h, принят (битая строка без литерала совпадения не даст; то же правило в user-word); --raw больше не теряет Who — принято. perf-приёмка дополнена codex:wfor, codex:Kelvin (≤1.1× main). Terra продолжена с grep-prefilter-review3.md
 - 2026-11-01 02:09 note — akit-master: 02:09 CET: Terra раунд по review3 принят: containsPayload убран из possibleMissing, rememberCodex в transcript/event.go; приёмка ok, codex:wfor 37.1→32.2, codex:Kelvin 35→29.9 CPU-с. Коммит f8820e1 на ветке (sync пересадил 23913e1 → 736f4de на db3d32d; пуш ветки отклонён non-ff, force-push не делал). Повторная проверка тем же суб-агентом (resume) на f8820e1
 - 2026-11-01 02:58 note — akit-master: Повторная независимая проверка f8820e1 (суб-агент a94bf352, бриф verify-grep-prefilter3 с правкой коммита): verdict ok. 6300 случайных сравнений с эталоном (?:P)|\x{10FFFF} на tl-main — 0 расхождений, скрытое состояние тоже 0; мутант без rememberCodex ловится (8/900); 22 ручных случая codex совпали (k1 — только счёт битых строк, принято); 20 настоящих шаблонов × с/без --codex — 40 выводов байт в байт. CPU --codex, 3 чередующихся прогона main/new: Kelvin 52.7/42.9, 46.2/40.1, 39.5/33.8; wfor 39.0/35.4, 46.1/39.8, 52.0/38.3. Без --codex wfor 27.9/15.5, 34.3/11.4; Kelvin 21.9/7.8, 21.1/6.8. Утечек в git show нет. Дальше: ff main, push, release, install.
+- 2026-11-01 03:01 готово — verify-gp-a94bf352 (session akit-master): Независимая повторная проверка f8820e1 суб-агентом a94bf352 (бриф verify-grep-prefilter3): verdict ok — 6300 случайных сравнений и 40 выводов настоящих шаблонов байт в байт с эталоном без отсева, CPU с --codex ниже tl-main во всех 6 парах. Выпущено v1.22.6 (main 4852c0c), установлено; wall --all --grep wfor 22.2→5.8 с, wfor|wfoz 16.8→7.3 с (perf akit.tsv, claude-config 495dfaf).
