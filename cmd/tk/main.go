@@ -213,8 +213,9 @@ func futureTime(flag, value string, ix []int, now time.Time) error {
 		return fmt.Errorf("%s: minute %q: %w", flag, m[3], err)
 	}
 	// По часам на стене, не по длительности: в день перевода часов сутки не 24 часа.
-	ahead := ((h*60+mi-now.Hour()*60-now.Minute())%1440 + 1440) % 1440
-	if ahead > 1 && ahead < 12*60 {
+	const minutesPerHour, minutesPerDay = 60, 24 * 60
+	ahead := ((h*minutesPerHour+mi-now.Hour()*minutesPerHour-now.Minute())%minutesPerDay + minutesPerDay) % minutesPerDay
+	if ahead > 1 && ahead < minutesPerDay/2 {
 		return fmt.Errorf("%s: %q is later than the entry time %s; the time of the entry is its journal stamp, write the exact time from date or drop it", flag, strings.TrimSpace(value[ix[0]:ix[1]]), now.Format("15:04"))
 	}
 	return nil
