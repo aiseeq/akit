@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,8 +41,8 @@ func (u *run) readWebtextHookLogs(since, until time.Time) {
 	}
 }
 
-// hookMessagePrefix — начало сообщений хука webtext; строки других хуков в том же логе — не наши, их формат не проверяется.
-const hookMessagePrefix = `msg="webfetch fallback`
+// hookMessage — сообщения хука webtext целиком; строки других хуков в том же логе — не наши, их формат не проверяется.
+var hookMessage = regexp.MustCompile(`(?:^|\s)msg="webfetch fallback(?: skipped)?"(?:\s|$)`)
 
 func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 	f, err := os.Open(path)
@@ -53,7 +54,7 @@ func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for n := 1; scanner.Scan(); n++ {
 		line := scanner.Text()
-		ours := strings.Contains(line, hookMessagePrefix)
+		ours := hookMessage.MatchString(line)
 		if !ours && u.hookSummary.hasCoverage {
 			continue
 		}
@@ -76,36 +77,57 @@ func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 		if msg != "webfetch fallback" && msg != "webfetch fallback skipped" {
 			continue
 		}
+		record, err := hookOutcome(msg, fields)
+		if err != nil {
+			u.recordBadHookLine(path, n, err)
+			continue
+		}
 		if at.Before(since) || !at.Before(until) {
 			continue
 		}
-		record := hookRecord{day: at.Format("2006-01-02")}
-		switch msg {
-		case "webfetch fallback skipped":
-			record.opened = "skipped"
-			u.hookSummary.skipped++
-		default:
-			if fields["opened"] == "true" {
-				record.opened = "true"
-				u.hookSummary.opened++
-				if fields["source"] == "wayback" {
-					record.source = "wayback"
-					u.hookSummary.wayback++
-				} else {
-					record.source = "direct"
-					u.hookSummary.direct++
-				}
-			} else {
-				record.opened = "false"
-			}
-			u.hookSummary.total++
-		}
-		u.hookCounts[strings.Join([]string{record.day, record.opened, record.source}, "\t")]++
+		record.day = at.Format("2006-01-02")
+		u.countHookRecord(record)
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read hook log: %w", err)
 	}
 	return nil
+}
+
+// hookOutcome — исход строки хука: skipped, false или true с источником direct|wayback; иное значение — ошибка
+// формата, а не исход.
+func hookOutcome(msg string, fields map[string]string) (hookRecord, error) {
+	if msg == "webfetch fallback skipped" {
+		return hookRecord{opened: "skipped"}, nil
+	}
+	switch opened, source := fields["opened"], fields["source"]; {
+	case opened == "false":
+		return hookRecord{opened: "false"}, nil
+	case opened == "true" && (source == "direct" || source == "wayback"):
+		return hookRecord{opened: "true", source: source}, nil
+	case opened == "true":
+		return hookRecord{}, fmt.Errorf("unknown source %q", source)
+	default:
+		return hookRecord{}, fmt.Errorf("unknown opened %q", opened)
+	}
+}
+
+func (u *run) countHookRecord(record hookRecord) {
+	switch record.opened {
+	case "skipped":
+		u.hookSummary.skipped++
+	case "true":
+		u.hookSummary.opened++
+		u.hookSummary.total++
+		if record.source == "wayback" {
+			u.hookSummary.wayback++
+		} else {
+			u.hookSummary.direct++
+		}
+	default:
+		u.hookSummary.total++
+	}
+	u.hookCounts[strings.Join([]string{record.day, record.opened, record.source}, "\t")]++
 }
 
 func (u *run) recordBadHookLine(path string, line int, err error) {
