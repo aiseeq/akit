@@ -1508,3 +1508,28 @@ func TestPlanItemIgnoresShellStartupEnv(t *testing.T) {
 		t.Errorf("exit %d, want 3: %+v", result.exit, result)
 	}
 }
+
+// Угаданное время вида «06:4x» в тексте журнала — отказ: время записи даёт её метка, догадка ломает хронологию.
+func TestJournalTextRejectsGuessedTime(t *testing.T) {
+	for _, args := range [][]string{
+		{"note", "task", "06:4x найдено"},
+		{"note", "task", "в 06:4х найдено"},
+		{"note", "task", "найдено (14:5x)"},
+		{"done", "task", "--check", "прошло 06:4x"},
+		{"reject", "task", "--why", "06:4x не нужно"},
+		{"review", "task", "--note", "06:4X сдано"},
+	} {
+		if _, err := parseArgs(args); err == nil || !strings.Contains(err.Error(), "time of the entry") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"note", "task", "06:41 найдено"},
+		{"note", "task", "box 06:4xyz"},
+		{"note", "task", "шаг 1:4x"},
+	} {
+		if _, err := parseArgs(args); err != nil {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}

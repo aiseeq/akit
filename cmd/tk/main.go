@@ -151,15 +151,25 @@ func parseArgs(a []string) (options, error) {
 }
 
 // validateOneLine — текст, который ложится в строку журнала или заголовок, — одна строка: перевод строки
-// вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел.
+// вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел. Текст журнала без
+// угаданного времени: у записи есть точная метка.
 func validateOneLine(o options) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}} {
 		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
 	}
+	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}} {
+		if m := guessedTime.FindString(f.value); m != "" {
+			return fmt.Errorf("%s: %q looks like a guessed time; the time of the entry is its journal stamp, write the exact time from date or drop it", f.flag, strings.TrimSpace(m))
+		}
+	}
 	return nil
 }
+
+// guessedTime — время с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные классы:
+// \b в regexp Go знает только ASCII-буквы и не видит конец слова после кириллицы.
+var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}:])\d\d:\d[xх](?:$|[^\p{L}\p{N}])`)
 
 func parseOptions(args []string, o *options) ([]string, error) {
 	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add}
