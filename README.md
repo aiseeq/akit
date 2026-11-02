@@ -106,7 +106,9 @@ missing skill, 2 usage/IO error.
 
 Frames of an HTML page in headless Chrome before publishing: windows 1440×900, 1536×860 at scale
 1.25, 1366×768, 390×844 and the full height. On every window it checks for a horizontal scroll and
-for labels drawn over each other. Exit 0 frames clean, 1 shooting failed, 2 frames taken but a
+for labels drawn over each other, and for small icons (svg, img, a symbol glyph, an `ic`/`icon` class, an empty
+decorated box) whose center is more than 2 px off the first text line next to them in the same row; text
+farther than 3em from the icon is not its line (table cells, chart columns). Exit 0 frames clean, 1 shooting failed, 2 frames taken but a
 layout fault found (window and culprits in stderr).
 
     page-shot page.html                 # frames into page-shots/ next to the page
