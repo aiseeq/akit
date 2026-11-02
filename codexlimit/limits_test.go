@@ -328,11 +328,13 @@ func TestConsumeContextDeadlineKillsServer(t *testing.T) {
 // block past the context: the write would hang and the server would stay alive.
 func TestConsumeLargeRequestServerNotReading(t *testing.T) {
 	cmd := helperCommand(t, "noread", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	// One second leaves room to encode the key and start the server even under -race;
+	// 1 MiB is well above a pipe buffer, so the write blocks.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	started := time.Now()
-	got, err := Consume(ctx, cmd, strings.Repeat("k", 4<<20), "")
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
+	got, err := Consume(ctx, cmd, strings.Repeat("k", 1<<20), "")
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("Consume took %v", elapsed)
 	}
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) || got != "" {

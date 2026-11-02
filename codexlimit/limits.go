@@ -169,9 +169,35 @@ func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context, 
 		}
 	}()
 
+	// take handles one scanned line; done is false for a line that is not the answer.
+	take := func(got scanResult) (a answer, done bool, err error) {
+		if got.err != nil {
+			return answer{}, true, fmt.Errorf("codexlimit: read app-server output: %w", got.err)
+		}
+		if got.line == nil {
+			return answer{}, true, errors.New("codexlimit: app-server closed stdout without an answer")
+		}
+		if json.Unmarshal(got.line, &a) != nil || a.ID != 2 {
+			return answer{}, false, nil
+		}
+		return a, true, nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			// select picks at random among ready cases, so lines already scanned are
+			// taken first: an answer that arrived before the context ended wins.
+			for {
+				select {
+				case got := <-lines:
+					if a, done, err := take(got); done {
+						return a, err
+					}
+					continue
+				default:
+				}
+				break
+			}
 			return answer{}, fmt.Errorf("codexlimit: no answer before context ended: %w", ctx.Err())
 		case err := <-written:
 			if err != nil {
@@ -179,17 +205,9 @@ func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context, 
 			}
 			written = nil // a nil channel never fires again
 		case got := <-lines:
-			if got.err != nil {
-				return answer{}, fmt.Errorf("codexlimit: read app-server output: %w", got.err)
+			if a, done, err := take(got); done {
+				return a, err
 			}
-			if got.line == nil {
-				return answer{}, errors.New("codexlimit: app-server closed stdout without an answer")
-			}
-			var a answer
-			if json.Unmarshal(got.line, &a) != nil || a.ID != 2 {
-				continue
-			}
-			return a, nil
 		}
 	}
 }
