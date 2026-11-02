@@ -861,7 +861,7 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "marker"), []byte("ok"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if code := checkPlan(root, task{path: path, body: string(updated)}, &out); code != 0 || !strings.Contains(out.String(), "present: ok") {
+	if code := checkPlan(root, task{path: path, body: string(updated)}, planTimeout, &out); code != 0 || !strings.Contains(out.String(), "present: ok") {
 		t.Fatalf("check plan: %d %q %s", code, out.String(), errOut.String())
 	}
 	if code := skipPlanItem(task{path: path, slug: "task", body: string(updated)}, options{by: "planner", item: "present", why: "covered elsewhere"}, &out, &errOut); code != 0 {
@@ -879,7 +879,7 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 		t.Fatalf("skip state = %#v", items)
 	}
 	out.Reset()
-	if code := checkPlan(root, task{path: path, body: string(skipped)}, &out); code != 0 || !strings.Contains(out.String(), "present: skipped — covered elsewhere") {
+	if code := checkPlan(root, task{path: path, body: string(skipped)}, planTimeout, &out); code != 0 || !strings.Contains(out.String(), "present: skipped — covered elsewhere") {
 		t.Fatalf("check skipped: %d %q %s", code, out.String(), errOut.String())
 	}
 	obj := taskObject(root, task{path: path, slug: "task", body: string(skipped)}, "", false)
@@ -1013,22 +1013,47 @@ func TestPlanFailureBlocksDoneAndReportsFirstStderrLine(t *testing.T) {
 }
 
 func TestPlanTimeoutKillsProcessGroup(t *testing.T) {
-	oldTimeout := planTimeout
-	planTimeout = 30 * time.Millisecond
-	t.Cleanup(func() { planTimeout = oldTimeout })
-	result := runPlanItem(t.TempDir(), planJSON{Name: "slow", Cmd: "sleep 5 & wait"})
+	result := runPlanItem(t.TempDir(), planJSON{Name: "slow", Cmd: "sleep 5 & wait"}, 30*time.Millisecond)
 	if !result.timedOut {
 		t.Fatalf("expected timeout, got %#v", result)
+	}
+	if msg := planFailure(result); !strings.Contains(msg, "timeout after 30ms") || !strings.Contains(msg, "--timeout") {
+		t.Fatalf("timeout message %q does not name the limit and the flag", msg)
+	}
+}
+
+func TestPlanTimeoutFlag(t *testing.T) {
+	for _, args := range [][]string{{"check", "20260101-0000-LOW-x"}, {"done", "20260101-0000-LOW-x", "--check", "ok"}} {
+		o, err := parseArgs(args)
+		if err != nil || o.planLimit() != 8*time.Minute {
+			t.Fatalf("%v: default timeout %v, err %v", args, o.timeout, err)
+		}
+		o, err = parseArgs(append(append([]string{}, args...), "--timeout", "15m"))
+		if err != nil || o.planLimit() != 15*time.Minute {
+			t.Fatalf("%v --timeout 15m: %v, err %v", args, o.timeout, err)
+		}
+	}
+	for _, args := range [][]string{{"note", "20260101-0000-LOW-x", "text", "--timeout", "1m"}, {"check", "20260101-0000-LOW-x", "--timeout", "0s"}, {"check", "20260101-0000-LOW-x", "--timeout"}} {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("%v accepted", args)
+		}
+	}
+	root := t.TempDir()
+	path := filepath.Join(root, "20260101-0000-LOW-x.md")
+	body := "# x\n\n## План\n- slow: sleep 2\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if code := checkPlan(root, task{path: path, body: body}, 50*time.Millisecond, &out); code == 0 || !strings.Contains(out.String(), "slow: timeout after 50ms") {
+		t.Fatalf("check with short limit: code %d, %q", code, out.String())
 	}
 }
 
 func TestPlanItemDoesNotWaitForLeftoverChild(t *testing.T) {
-	oldTimeout := planTimeout
-	planTimeout = 5 * time.Second
-	t.Cleanup(func() { planTimeout = oldTimeout })
 	dir := t.TempDir()
 	start := time.Now()
-	result := runPlanItem(dir, planJSON{Name: "bg", Cmd: "sleep 3 & echo $! >pid; echo first >&2"})
+	result := runPlanItem(dir, planJSON{Name: "bg", Cmd: "sleep 3 & echo $! >pid; echo first >&2"}, 5*time.Second)
 	if elapsed := time.Since(start); elapsed > time.Second || result.exit != 0 || result.timedOut || result.stderr != "first" {
 		t.Fatalf("leftover child: %v %#v", elapsed, result)
 	}
@@ -1824,7 +1849,7 @@ func TestPlanItemIgnoresShellStartupEnv(t *testing.T) {
 	write("bin/bash", "#!/bin/sh\nexit 0\n")
 	t.Setenv("PATH", filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
 	cmd := `shopt -q nullglob && exit 5; [ -n "${ENV-}" ] && exit 6; [ -n "${LD_PRELOAD-}${LD_AUDIT-}${LD_LIBRARY_PATH-}${LD_BIND_NOW-}${GCONV_PATH-}${LOCPATH-}${MALLOC_PERTURB_-}${TZDIR-}" ] && exit 4; exit 3`
-	if result := runPlanItem(dir, planJSON{Name: "accept", Cmd: cmd}); result.exit != 3 {
+	if result := runPlanItem(dir, planJSON{Name: "accept", Cmd: cmd}, planTimeout); result.exit != 3 {
 		t.Errorf("exit %d, want 3: %+v", result.exit, result)
 	}
 }

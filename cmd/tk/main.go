@@ -36,12 +36,12 @@ Usage:
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
   tk plan ID --repin 'NAME: COMMAND' --why TEXT [--by NAME]
   tk skip ID NAME --why TEXT [--by NAME]
-  tk check ID
+  tk check ID [--timeout D]
   tk lint [--root DIR]
   tk start ID [--by NAME]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
-  tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG]
+  tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]
   tk reject ID --why TEXT [--by NAME]
   tk show ID [--json]
   tk archive [--older DURATION] [--root DIR]
@@ -68,6 +68,7 @@ Flags:
   --repin TEXT   plan: replace a required command from another session; current and previous executors and pin authors are refused; the session and old/new commands are journaled
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
+  --timeout D    check, done: limit for each plan command (default 8m)
 
 show wraps lines longer than 150 characters at spaces (continuation indented
 by two more spaces, ` + "```" + ` blocks as is); the ticket file keeps them whole.
@@ -104,13 +105,25 @@ var requiredMentionRE = regexp.MustCompile(`план — \S+: (?:добавле�
 
 var errHelp = errors.New("help")
 var session = currentSession
-var planTimeout = 60 * time.Second
+
+// planTimeout — предел одного пункта плана по умолчанию: проверка вроде гейта проекта ждёт очереди тяжёлых задач
+// и идёт минуты, а вызов агента на переднем плане длится не дольше 10 минут. Свой предел — check/done --timeout.
+var planTimeout = 8 * time.Minute
 
 type options struct {
 	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, repin, item string
 	all, due, json, required                                                                                                 bool
-	older                                                                                                                    time.Duration
+	older, timeout                                                                                                           time.Duration
 }
+
+// planLimit — предел пункта плана: --timeout или умолчание.
+func (o options) planLimit() time.Duration {
+	if o.timeout > 0 {
+		return o.timeout
+	}
+	return planTimeout
+}
+
 type task struct {
 	path, slug, status, prio, title, body string
 	created, changed                      time.Time
@@ -145,6 +158,10 @@ func parseArgs(a []string) (options, error) {
 	if err != nil {
 		return o, err
 	}
+	if o.timeout != 0 && o.cmd != "check" && o.cmd != "done" {
+		return o, errors.New("--timeout is a flag of tk check and tk done")
+	}
+
 	if o.required && (o.cmd != "plan" || o.repin != "") {
 		return o, errors.New("--required is a flag of tk plan --add")
 	}
@@ -268,16 +285,22 @@ func parseOptions(args []string, o *options) ([]string, error) {
 			*p = args[i]
 			continue
 		}
-		if v == "--older" {
+		if v == "--older" || v == "--timeout" {
 			if i+1 == len(args) {
-				return nil, errors.New("--older needs a value")
+				return nil, fmt.Errorf("%s needs a value", v)
 			}
 			i++
 			d, err := duration(args[i])
 			if err != nil {
 				return nil, err
 			}
-			o.older = d
+			if v == "--older" {
+				o.older = d
+			} else if d <= 0 {
+				return nil, errors.New("--timeout must be positive")
+			} else {
+				o.timeout = d
+			}
 			continue
 		}
 		if strings.HasPrefix(v, "-") {
@@ -555,7 +578,7 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		return 0
 	}
 	if o.cmd == "check" {
-		return checkPlan(o.baseRoot, t, out)
+		return checkPlan(o.baseRoot, t, o.planLimit(), out)
 	}
 	if o.cmd == "plan" {
 		if o.repin != "" {
@@ -1814,6 +1837,7 @@ type planResult struct {
 	stderr   string
 	timedOut bool
 	skipped  bool
+	limit    time.Duration
 }
 
 // shellEnvDropped — переменные, которые убираются из окружения пункта плана вместе с LD_*, MALLOC_* и
@@ -1823,8 +1847,8 @@ var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS",
 	"GCONV_PATH", "GETCONF_DIR", "GLIBC_TUNABLES", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH", "NIS_PATH", "NLSPATH",
 	"RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR"}
 
-func runPlanItem(root string, item planJSON) planResult {
-	ctx, cancel := context.WithTimeout(context.Background(), planTimeout)
+func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	// bash — по абсолютному пути, без файлов старта и без того в окружении, что меняет сам bash, а не команду:
 	// BASH_ENV, ENV, функция BASH_FUNC_* или ~/.bashrc (bash читает его и в -c при SSH_CLIENT без SHLVL)
@@ -1862,6 +1886,7 @@ func runPlanItem(root string, item planJSON) planResult {
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		result.timedOut = true
+		result.limit = timeout
 		result.exit = -1
 		return result
 	}
@@ -1895,7 +1920,7 @@ func firstLine(value string) string {
 	return strings.TrimSpace(line)
 }
 
-func runPlan(root string, t task) []planResult {
+func runPlan(root string, t task, timeout time.Duration) []planResult {
 	items := planItems(t.body)
 	results := make([]planResult, 0, len(items))
 	for _, item := range items {
@@ -1904,14 +1929,14 @@ func runPlan(root string, t task) []planResult {
 		} else if item.Skipped {
 			results = append(results, planResult{item: item, skipped: true})
 		} else {
-			results = append(results, runPlanItem(root, item))
+			results = append(results, runPlanItem(root, item, timeout))
 		}
 	}
 	return results
 }
 
-func checkPlan(root string, t task, out io.Writer) int {
-	results := runPlan(root, t)
+func checkPlan(root string, t task, timeout time.Duration, out io.Writer) int {
+	results := runPlan(root, t, timeout)
 	if len(results) == 0 {
 		fmt.Fprintln(out, "no plan")
 		return 0
@@ -1945,7 +1970,7 @@ func planFailure(result planResult) string {
 		return fmt.Sprintf("%s: invalid, %s\n", result.item.label(), result.stderr)
 	}
 	if result.timedOut {
-		return fmt.Sprintf("%s: timeout\n", result.item.Name)
+		return fmt.Sprintf("%s: timeout after %s (raise with --timeout)\n", result.item.Name, result.limit)
 	}
 	if result.stderr != "" {
 		return fmt.Sprintf("%s: exit %d, %s\n", result.item.Name, result.exit, result.stderr)
@@ -1953,9 +1978,9 @@ func planFailure(result planResult) string {
 	return fmt.Sprintf("%s: exit %d\n", result.item.Name, result.exit)
 }
 
-func executePlan(root string, t *task, errout io.Writer) int {
+func executePlan(root string, t *task, timeout time.Duration, errout io.Writer) int {
 	var failed []planResult
-	for _, result := range runPlan(root, *t) {
+	for _, result := range runPlan(root, *t, timeout) {
 		if result.skipped {
 			continue
 		}
@@ -2116,7 +2141,7 @@ func checkDone(t *task, o options, errout io.Writer) (int, int) {
 	if code != 0 {
 		return findings, code
 	}
-	if code = executePlan(o.baseRoot, t, errout); code != 0 {
+	if code = executePlan(o.baseRoot, t, o.planLimit(), errout); code != 0 {
 		return findings, code
 	}
 	current, err := os.ReadFile(t.path)
