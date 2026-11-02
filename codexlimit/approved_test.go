@@ -17,7 +17,8 @@ func TestReadApprovedMissingFile(t *testing.T) {
 
 func TestApprovalsForMinuteUTC(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "approvals.tsv")
-	// The second line carries seconds and a zone: the file side is truncated to the UTC minute too.
+	// The second line carries seconds and a zone: it is kept to the second in UTC and
+	// matches a reset time less than a minute away.
 	data := "2026-11-02T15:39:00Z\tsynthetic source\n\n2026-11-03T18:12:41+01:00\tsecond source\n"
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)

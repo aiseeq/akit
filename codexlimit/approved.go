@@ -9,9 +9,10 @@ import (
 	"time"
 )
 
-// ApprovalTolerance is how far a reset time may be from an approval line and still
-// match it: the app server reports the same window with seconds that drift by one,
-// while a reset moves the window by days.
+// ApprovalTolerance bounds how far a reset time may be from an approval line: a line
+// matches only when the distance is strictly less, so exactly one minute apart is no
+// match. The app server reports the same window with seconds that drift by one, while
+// a reset moves the window by days.
 const ApprovalTolerance = time.Minute
 
 // Approvals maps the planned reset times of approval lines, in UTC, to their sources.
