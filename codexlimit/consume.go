@@ -18,7 +18,10 @@ const (
 	OutcomeAlreadyRedeemed Outcome = "alreadyRedeemed"
 )
 
-// Consume redeems a reset credit through the Codex app server.
+// Consume redeems a reset credit through the Codex app server. An ended context
+// never starts the server. After a context error the request may still have been
+// served, so a retry passes the same idempotency key: a spent credit then answers
+// OutcomeAlreadyRedeemed instead of spending another.
 func Consume(ctx context.Context, cmd *exec.Cmd, idempotencyKey, creditID string) (Outcome, error) {
 	if idempotencyKey == "" {
 		return "", errors.New("codexlimit: idempotency key is empty")

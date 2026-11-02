@@ -80,7 +80,14 @@ func Read(ctx context.Context, cmd *exec.Cmd) (Limits, error) {
 
 // exchange sends an app-server request and returns the raw result of its answer,
 // stopping cmd on every started path.
+//
+// An answer read before the context ended is returned even if stopping the server
+// outlives the context: for a consume request that answer means the credit is spent.
 func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json.RawMessage, retErr error) {
+	// A context that has already ended never starts the server, so no request is sent.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("codexlimit: context ended before start: %w", err)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("codexlimit: stdin pipe: %w", err)

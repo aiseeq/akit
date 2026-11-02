@@ -373,3 +373,17 @@ func TestReadContextDeadlineGrandchildHoldsStderr(t *testing.T) {
 		t.Fatalf("Read = %+v, %v", got, err)
 	}
 }
+
+// A cancelled context must not start the server: a consume request would spend a credit.
+func TestConsumeCancelledContextDoesNotStart(t *testing.T) {
+	cmd := consumeCommand(t, `{"id":2,"result":{"outcome":"reset"}}`, "synthetic-key", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, err := Consume(ctx, cmd, "synthetic-key", "")
+	if err == nil || !errors.Is(err, context.Canceled) || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+	if cmd.Process != nil {
+		t.Fatalf("server was started (pid %d)", cmd.Process.Pid)
+	}
+}
