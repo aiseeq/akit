@@ -57,13 +57,29 @@ func TestParseArgsErrors(t *testing.T) {
 }
 
 func TestRoleAliases(t *testing.T) {
-	opts, err := parseArgs([]string{"--role", "assistant, tool,tool_use,bash,result,user"}, time.Now())
-	if err != nil {
+	for alias, role := range map[string]transcript.Role{"assistant": transcript.Agent, "tool": transcript.Cmd, "tool_use": transcript.Cmd, "bash": transcript.Cmd, "result": transcript.Out} {
+		opts, err := parseArgs([]string{"--role", alias}, time.Now())
+		if err != nil {
+			t.Fatalf("%s: %v", alias, err)
+		}
+		if want := map[transcript.Role]bool{role: true}; !maps.Equal(opts.roles, want) {
+			t.Errorf("%s: roles %v, want %v", alias, opts.roles, want)
+		}
+	}
+}
+
+// REF без --width печатает событие целиком, даже длиннее ширины списка по умолчанию.
+func TestRefWithoutWidthIsWhole(t *testing.T) {
+	e := fakeHome(t)
+	long := strings.Repeat("длинный текст ", 40)
+	line := `{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:00:00.000Z","message":{"role":"user","content":"` + long + `"}}` + "\n"
+	path := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", "9f8e7d6c-0000-4000-8000-000000000001.jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	want := map[transcript.Role]bool{transcript.Agent: true, transcript.Cmd: true, transcript.Out: true, transcript.User: true}
-	if !maps.Equal(opts.roles, want) {
-		t.Errorf("roles %v, want %v", opts.roles, want)
+	code, out, errOut := runTL(t, e, "9f8e7d6c:1")
+	if code != 0 || !strings.Contains(out, strings.TrimSpace(long)) {
+		t.Errorf("code %d, stderr %q, event cut:\n%s", code, errOut, out)
 	}
 }
 

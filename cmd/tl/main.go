@@ -317,9 +317,14 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if len(refs) > 0 {
+		// REF — событие целиком; режет его только явный --width, не ширина списка по умолчанию.
+		width := 0
+		if opts.widthSet {
+			width = opts.width
+		}
 		code := 0
 		for _, ref := range refs {
-			if result := showRef(ref.id, ref.line, opts.width, e, stdout, stderr); result > code {
+			if result := showRef(ref.id, ref.line, width, e, stdout, stderr); result > code {
 				code = result
 			}
 		}
