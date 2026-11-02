@@ -175,7 +175,16 @@ func validateOneLine(o options) error {
 // прошлое; будущим считается сдвиг больше минуты и меньше 12 часов.
 func validateApproxTime(o options, now time.Time) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}} {
-		for _, m := range approxTime.FindAllStringSubmatch(f.value, -1) {
+		for _, ix := range approxTime.FindAllStringSubmatchIndex(f.value, -1) {
+			if end := ix[1]; end < len(f.value) && f.value[end] >= '0' && f.value[end] <= '9' {
+				continue // не время: «~03:001»
+			}
+			m := make([]string, 4)
+			for g := range m {
+				if ix[2*g] >= 0 {
+					m[g] = f.value[ix[2*g]:ix[2*g+1]]
+				}
+			}
 			if m[1] != "" && m[1] != now.Format("02.01") && m[1] != now.Format("2006-01-02") {
 				continue // время другого дня
 			}
@@ -195,7 +204,7 @@ func validateApproxTime(o options, now time.Time) error {
 }
 
 // approxTime — «~ЧЧ:ММ», приблизительное время в тексте, с датой перед ним, если она есть («31.10 ~03:00»).
-var approxTime = regexp.MustCompile(`(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?~\s?([01]\d|2[0-3]):([0-5]\d)\b`)
+var approxTime = regexp.MustCompile(`(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?~\s?([01]\d|2[0-3]):([0-5]\d)`)
 
 // guessedTime — время суток с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные
 // классы: \b в regexp Go знает только ASCII-буквы. Справа не ASCII-буква и не цифра: «06:4xМСК» — время,
