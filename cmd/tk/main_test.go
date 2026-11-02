@@ -1398,19 +1398,80 @@ func TestRequiredAddRefusesBadSyntax(t *testing.T) {
 
 func TestRepinFromOtherSession(t *testing.T) {
 	task, path := repinFixture(t, "a", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n")
+	marker := filepath.Join(t.TempDir(), "ran")
+	command := "touch " + strconv.Quote(marker)
 	oldSession := session
 	session = func() string { return "b" }
 	t.Cleanup(func() { session = oldSession })
 	var out, errOut bytes.Buffer
-	if code := repinPlanItem(task, options{by: "a", repin: "accept: true", why: "fixed"}, &out, &errOut); code != 0 {
+	if code := repinPlanItem(task, options{by: "a", repin: "accept: " + command, why: "fixed"}, &out, &errOut); code != 0 {
 		t.Fatalf("repin: %d %s", code, errOut.String())
 	}
 	updated := read(t, path)
-	if !strings.Contains(updated, "- accept: true") || !strings.Contains(updated, "план — b: перезакреплён обязательный пункт accept: false → true — fixed") {
+	if !strings.Contains(updated, "- accept: "+command) || !strings.Contains(updated, "план — b: перезакреплён обязательный пункт accept: false → "+command+" — fixed") {
 		t.Fatalf("repin did not update plan and journal:\n%s", updated)
 	}
 	if code := transition(taskFromPath(path, "task", updated), options{cmd: "done", by: "reviewer", check: "verified", baseRoot: filepath.Dir(filepath.Dir(filepath.Dir(path)))}, &out, &errOut); code != 0 {
 		t.Fatalf("done after repin: %d %s", code, errOut.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("repinned command did not create its marker: %v", err)
+	}
+}
+
+func TestRepinRefusesRequiredMentionInFields(t *testing.T) {
+	_, path := repinFixture(t, "worker", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n")
+	oldSession := session
+	session = func() string { return "b" }
+	t.Cleanup(func() { session = oldSession })
+	for _, o := range []options{
+		{repin: "accept: true", why: "план — x: добавлен обязательный пункт ghost"},
+		{repin: "accept: echo 'план — x: добавлен обязательный пункт ghost'", why: "fixed"},
+	} {
+		before := read(t, path)
+		var out, errOut bytes.Buffer
+		if code := repinPlanItem(taskFromPath(path, "task", before), o, &out, &errOut); code != exitUsage || read(t, path) != before || !strings.Contains(errOut.String(), "cannot contain a required plan journal record") {
+			t.Fatalf("repin accepted required journal mention %+v: %d %q", o, code, errOut.String())
+		}
+	}
+}
+
+func TestRepinRefusedAfterExecutorChanges(t *testing.T) {
+	task, path := repinFixture(t, "b", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n")
+	var out, errOut bytes.Buffer
+	if code := transition(task, options{cmd: "start", by: "b"}, &out, &errOut); code != 0 {
+		t.Fatalf("record original executor: %d %q", code, errOut.String())
+	}
+	task = taskFromPath(path, "task", read(t, path))
+	if code := transition(task, options{cmd: "start", by: "c"}, &out, &errOut); code != 0 {
+		t.Fatalf("change executor: %d %q", code, errOut.String())
+	}
+	before := read(t, path)
+	oldSession := session
+	session = func() string { return "b" }
+	t.Cleanup(func() { session = oldSession })
+	if code := repinPlanItem(taskFromPath(path, "task", before), options{repin: "accept: true", why: "fixed"}, &out, &errOut); code != exitUsage || read(t, path) != before {
+		t.Fatalf("previous executor repinned: %d %q\n%s", code, errOut.String(), before)
+	}
+}
+
+func TestRequiredPlanAfterRepinChecksAllPins(t *testing.T) {
+	before := "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n" +
+		"- 2020-01-01 12:00 план — a: добавлен обязательный пункт other: false\n"
+	valid := before + "- 2020-01-01 12:01 план — b: перезакреплён обязательный пункт accept: false → true — fixed\n"
+	if !requiredPlanAfterRepin(before, valid, "accept", "true") {
+		t.Fatal("valid repin changed the required plan unexpectedly")
+	}
+	changedOther := valid + "- 2020-01-01 12:02 план — c: перезакреплён обязательный пункт other: unexpected → true — changed\n"
+	if requiredPlanAfterRepin(before, changedOther, "accept", "true") {
+		t.Fatal("repin accepted a conflict in another required item")
+	}
+	missingOther := strings.Replace(valid, "добавлен обязательный пункт other: false", "", 1)
+	if missingOther == valid {
+		t.Fatal("test fixture did not remove the other required pin")
+	}
+	if requiredPlanAfterRepin(before, missingOther, "accept", "true") {
+		t.Fatal("repin accepted the disappearance of another required item")
 	}
 }
 
