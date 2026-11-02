@@ -14,38 +14,50 @@ import (
 
 const waitCacheCodeFile = "wait_cache_code.go"
 
-// waitCacheSourcesHash — хеш кода, который пишет запись кэша: файлы пакетов модуля (путь от корня модуля и
-// содержимое) и path@version внешних модулей. Сам файл хеша в него не входит.
+// waitCacheListFormat — поля go list для хеша: модуль, его замена (replace, go.work) и файлы пакета под любые
+// ОС и теги сборки (IgnoredGoFiles), со встроенными (embed) и C-файлами.
+const waitCacheListFormat = `{{if .Module}}{{.Module.Path}}|{{.Module.Version}}|{{.Module.Dir}}|` +
+	`{{with .Module.Replace}}{{.Path}}|{{.Version}}|{{.Dir}}{{else}}||{{end}}|{{.Dir}}|` +
+	`{{join .GoFiles ","}},{{join .CgoFiles ","}},{{join .IgnoredGoFiles ","}},{{join .EmbedFiles ","}},` +
+	`{{join .CFiles ","}},{{join .HFiles ","}}{{end}}`
+
+// waitCacheSourcesHash — хеш кода, который пишет запись кэша. Пакет из исходников на диске (модуль akit, замена
+// на папку) входит файлами: путь от корня модуля и содержимое; пакет из версии модуля — строкой path@version
+// с заменой. Сам файл хеша и тесты в него не входят.
 func waitCacheSourcesHash(t *testing.T) string {
 	t.Helper()
-	out, err := exec.Command("go", "list", "-deps", "-f",
-		`{{if .Module}}{{.Module.Path}}|{{.Module.Version}}|{{.Module.Dir}}|{{.Dir}}|{{join .GoFiles ","}}{{end}}`, ".").Output()
+	out, err := exec.Command("go", "list", "-deps", "-f", waitCacheListFormat, ".").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}
 	hash := sha256.New()
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		f := strings.Split(line, "|")
-		if len(f) != 5 {
+		if len(f) != 8 {
 			t.Fatalf("go list line %q", line)
 		}
-		if f[1] != "" {
-			fmt.Fprintf(hash, "module %s@%s\n", f[0], f[1])
+		modPath, modVersion, modDir, replPath, replVersion, replDir, dir, files := f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]
+		if replPath != "" && replVersion != "" || replPath == "" && modVersion != "" {
+			fmt.Fprintf(hash, "module %s@%s => %s@%s\n", modPath, modVersion, replPath, replVersion)
 			continue
 		}
-		rel, err := filepath.Rel(f[2], f[3])
+		root := modDir
+		if replPath != "" {
+			root = replDir
+		}
+		rel, err := filepath.Rel(root, dir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for name := range strings.SplitSeq(f[4], ",") {
-			if rel == filepath.Join("cmd", "tl") && name == waitCacheCodeFile {
+		for name := range strings.SplitSeq(files, ",") {
+			if name == "" || strings.HasSuffix(name, "_test.go") || modPath == "github.com/aiseeq/akit" && rel == filepath.Join("cmd", "tl") && name == waitCacheCodeFile {
 				continue
 			}
-			data, err := os.ReadFile(filepath.Join(f[3], name))
+			data, err := os.ReadFile(filepath.Join(dir, name))
 			if err != nil {
 				t.Fatal(err)
 			}
-			fmt.Fprintf(hash, "file %s %d\n", filepath.ToSlash(filepath.Join(rel, name)), len(data))
+			fmt.Fprintf(hash, "file %s/%s %d\n", modPath, filepath.ToSlash(filepath.Join(rel, name)), len(data))
 			hash.Write(data)
 		}
 	}

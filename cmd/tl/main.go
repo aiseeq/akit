@@ -355,7 +355,7 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 		if n := opts.waitCache.misses.Load(); n > 0 {
 			// Причина промаха — для того, кто разбирает медленный вызов: запись под этот код ещё не писалась или
 			// транскрипт с тех пор дописан.
-			fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (new tl code or a changed transcript)\n", n, len(sources))
+			fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
 		}
 		return reportWait(res, opts, stdout, stderr)
 	}
