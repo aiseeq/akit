@@ -117,14 +117,14 @@ func TestAdmissionSkipsWarmWaitCache(t *testing.T) {
 	if err := os.WriteFile(transcriptPath, []byte("synthetic transcript"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cache := &waitCache{dir: filepath.Join(dir, "cache"), binary: "synthetic"}
+	cache := &waitCache{dir: filepath.Join(dir, "cache"), code: "synthetic"}
 	cache.saveRecord(waitCacheRecord{Version: waitCacheVersion, Path: transcriptPath, Size: int64(len("synthetic transcript")), MTime: func() int64 {
 		info, err := os.Stat(transcriptPath)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return info.ModTime().UnixNano()
-	}(), Binary: "synthetic"}, []cachedWaitEvent{})
+	}(), Code: "synthetic"}, []cachedWaitEvent{})
 	marker := filepath.Join(dir, "graft-called")
 	graft := filepath.Join(dir, "graft")
 	if err := os.WriteFile(graft, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o700); err != nil {

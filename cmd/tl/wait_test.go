@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -184,7 +185,7 @@ func readWaits(t *testing.T, e env, name string, rows []string) []time.Duration 
 	return waits
 }
 
-func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
+func TestWaitCacheColdWarmChangedAndCodeFingerprint(t *testing.T) {
 	e := fakeHome(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	spec := []struct {
@@ -216,9 +217,9 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	if cache.valid(path) {
 		t.Fatal("cache entry from the previous wait rule version was accepted")
 	}
-	otherBinary := &waitCache{dir: cache.dir, binary: "different-binary"}
-	if otherBinary.valid(path) {
-		t.Fatal("entry from another binary fingerprint was accepted")
+	otherCode := &waitCache{dir: cache.dir, code: "different-code"}
+	if otherCode.valid(path) {
+		t.Fatal("entry from another code fingerprint was accepted")
 	}
 	// Ключ ловит каждое поле отдельно. Тот же размер, другой mtime: задержки 1, 5, 6 вместо 1, 2, 3 —
 	// строки той же длины, p50 сдвигается с 2 до 5 с.
@@ -329,11 +330,15 @@ func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
 		{"--wait", "busy", "--since", "10:00:02", "--until", "10:00:08", "--q", "50", path},
 		{"--wait", "tk done", "--since", "10:00:00", "--until", "10:00:01", "--q", "50", path},
 	}
-	for _, args := range queries {
+	missLine := regexp.MustCompile(`(?m)^tl: wait cache: \d+ of \d+ transcript\(s\) read without cache.*\n`)
+	for i, args := range queries {
 		codeCold, outCold, errCold := runTL(t, e, args...)
 		codeWarm, outWarm, errWarm := runTL(t, e, args...)
-		if codeCold != codeWarm || outCold != outWarm || errCold != errWarm {
+		if codeCold != codeWarm || outCold != outWarm || missLine.ReplaceAllString(errCold, "") != errWarm {
 			t.Errorf("query %q cold=(%d,%q,%q) warm=(%d,%q,%q)", args, codeCold, outCold, errCold, codeWarm, outWarm, errWarm)
+		}
+		if i == 0 && !missLine.MatchString(errCold) {
+			t.Errorf("first cold call does not report the cache miss: %q", errCold)
 		}
 	}
 	cache := newWaitCache(io.Discard)
@@ -342,7 +347,7 @@ func TestWaitCacheCorruptionAndWindowSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, _, errOut := runTL(t, e, queries[0]...)
-	if code != 3 || strings.Contains(errOut, "cache") {
+	if code != 3 || strings.Contains(errOut, "unavailable") || !missLine.MatchString(errOut) {
 		t.Fatalf("corrupt entry result = (%d, %q)", code, errOut)
 	}
 	if !cache.valid(path) {

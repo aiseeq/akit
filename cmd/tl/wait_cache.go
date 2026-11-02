@@ -9,8 +9,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
@@ -22,8 +24,8 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 var afterWaitRead = func(string) {}
 
 // waitCacheVersion — формат записи: 3 добавляет данные для начала вызова по соседнему результату, 4 — последовательные
-// инструменты без команды и вывод только у ошибок.
-const waitCacheVersion = 4
+// инструменты без команды и вывод только у ошибок, 5 — ключ по коду (waitCacheCode) вместо отпечатка бинаря.
+const waitCacheVersion = 5
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
@@ -55,7 +57,7 @@ type waitCacheRecord struct {
 	Path    string
 	Size    int64
 	MTime   int64
-	Binary  string
+	Code    string
 }
 
 type waitCacheState uint8
@@ -67,17 +69,14 @@ const (
 
 type waitCache struct {
 	dir      string
-	binary   string
+	code     string
 	stderr   io.Writer
 	warnOnce sync.Once
+	misses   atomic.Int64 // транскрипты, прочитанные мимо кэша
 }
 
-var (
-	binaryFingerprintOnce sync.Once
-	binaryFingerprint     string
-	binaryFingerprintErr  error
-)
-
+// newWaitCache — кэш под код этой сборки: исходники, от которых зависит запись (waitCacheCode), и версия Go.
+// Отпечаток всего бинаря менялся бы с каждой установкой: в бинарь вшиты ревизия и пути сборки.
 func newWaitCache(stderr io.Writer) *waitCache {
 	dir, err := waitCacheDir()
 	if err != nil {
@@ -85,13 +84,7 @@ func newWaitCache(stderr io.Writer) *waitCache {
 		cache.warn(err)
 		return cache
 	}
-	binary, err := currentBinaryFingerprint()
-	if err != nil {
-		cache := &waitCache{stderr: stderr, dir: dir}
-		cache.warn(err)
-		return cache
-	}
-	return &waitCache{dir: dir, binary: binary, stderr: stderr}
+	return &waitCache{dir: dir, code: waitCacheCode + " " + runtime.Version(), stderr: stderr}
 }
 
 func waitCacheDir() (string, error) {
@@ -104,33 +97,6 @@ func waitCacheDir() (string, error) {
 		}
 	}
 	return filepath.Join(base, "akit", "tl-wait"), nil
-}
-
-func currentBinaryFingerprint() (string, error) {
-	binaryFingerprintOnce.Do(func() {
-		path, err := os.Executable()
-		if err != nil {
-			binaryFingerprintErr = err
-			return
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			binaryFingerprintErr = err
-			return
-		}
-		hash := sha256.New()
-		if _, err := io.Copy(hash, file); err != nil {
-			binaryFingerprintErr = err
-			file.Close()
-			return
-		}
-		if err := file.Close(); err != nil {
-			binaryFingerprintErr = err
-			return
-		}
-		binaryFingerprint = hex.EncodeToString(hash.Sum(nil))
-	})
-	return binaryFingerprint, binaryFingerprintErr
 }
 
 func (c *waitCache) warn(err error) {
@@ -150,10 +116,10 @@ func (c *waitCache) key(path string) (waitCacheRecord, error) {
 	if err != nil {
 		return waitCacheRecord{}, fmt.Errorf("stat transcript: %w", err)
 	}
-	if c == nil || c.dir == "" || c.binary == "" {
+	if c == nil || c.dir == "" || c.code == "" {
 		return waitCacheRecord{}, fmt.Errorf("cache key unavailable")
 	}
-	return waitCacheRecord{Version: waitCacheVersion, Path: path, Size: info.Size(), MTime: info.ModTime().UnixNano(), Binary: c.binary}, nil
+	return waitCacheRecord{Version: waitCacheVersion, Path: path, Size: info.Size(), MTime: info.ModTime().UnixNano(), Code: c.code}, nil
 }
 
 func (c *waitCache) valid(path string) bool {
@@ -198,7 +164,7 @@ func (c *waitCache) load(path string, withEvents bool) ([]cachedWaitEvent, waitC
 }
 
 func sameWaitCacheKey(a, b waitCacheRecord) bool {
-	return a.Version == b.Version && a.Path == b.Path && a.Size == b.Size && a.MTime == b.MTime && a.Binary == b.Binary
+	return a.Version == b.Version && a.Path == b.Path && a.Size == b.Size && a.MTime == b.MTime && a.Code == b.Code
 }
 
 func (c *waitCache) cleanup(now time.Time) {
@@ -240,6 +206,7 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.misses.Add(1)
 	events := make([]cachedWaitEvent, 0)
 	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
 		if ev.Role == transcript.Cmd {

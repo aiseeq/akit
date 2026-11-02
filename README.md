@@ -253,7 +253,7 @@ its output; calls without output, background Bash calls, and commands that also 
 are excluded. The default percentile is 50; `--q` accepts 1–99. Fewer matching events than the
 percentile needs (3 for `--q` 50 and below, 20 above) returns exit 3 with the count in stderr and no
 stdout. Completed calls are cached per transcript in `$XDG_CACHE_HOME/akit/tl-wait` (or the user cache
-directory when `XDG_CACHE_HOME` is unset); changing the transcript or the `tl` binary invalidates its entry.
+directory when `XDG_CACHE_HOME` is unset); changing the transcript, the code that fills the entry (the `cmd/tl` sources and the module packages and versions it builds from) or the Go version invalidates its entry; reinstalling an unchanged `tl` keeps it. When some transcripts were read without the cache, stderr says how many.
 
 ## user-word
 
