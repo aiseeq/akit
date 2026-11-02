@@ -150,3 +150,11 @@ func TestApprovalsForNearestLine(t *testing.T) {
 		}
 	}
 }
+
+func TestApprovalsForFarLines(t *testing.T) {
+	// More than ~292 years apart, Time.Sub saturates; such lines must still be far.
+	approvals := approvalsFrom(t, "2500-01-01T00:00:00Z\tfuture\n1700-01-01T00:00:00Z\tpast\n")
+	if source, ok := approvals.For(time.Date(2026, 11, 9, 17, 42, 0, 0, time.UTC)); ok {
+		t.Fatalf("For = %q, want no match for lines centuries away", source)
+	}
+}

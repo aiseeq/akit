@@ -54,12 +54,13 @@ func (approvals Approvals) For(resetsAt time.Time) (string, bool) {
 		ok     bool
 	)
 	for at, src := range approvals {
+		// Compare times first: Sub saturates for lines centuries away.
+		if !at.After(resetsAt.Add(-ApprovalTolerance)) || !at.Before(resetsAt.Add(ApprovalTolerance)) {
+			continue
+		}
 		d := resetsAt.Sub(at)
 		if d < 0 {
 			d = -d
-		}
-		if d >= ApprovalTolerance {
-			continue
 		}
 		if !ok || d < best || d == best && at.Before(bestAt) {
 			source, best, bestAt, ok = src, d, at, true
