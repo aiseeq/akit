@@ -477,22 +477,39 @@ func TestWaitUsageErrors(t *testing.T) {
 	}
 }
 
-// Сообщение, все вызовы которого получили результат, не остаётся в памяти трекера.
-func TestWaitTrackerForgetsFinishedMessages(t *testing.T) {
+// В памяти трекера — только текущее сообщение: следующее модель пишет, получив все результаты прошлого.
+// Вызов без результата не держит своё сообщение после появления следующего.
+func TestWaitTrackerKeepsOnlyCurrentMessage(t *testing.T) {
 	tr := newWaitTracker(options{waitProg: "worker", waitSub: "run"})
 	at := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
 	for i, id := range []string{"c1", "c2"} {
 		tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: id, Time: at, Line: i + 1, MessageID: "m1", Who: "Bash", Command: "worker run x"})
 	}
 	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c1", Time: at.Add(10 * time.Second), Line: 3})
-	if len(tr.messages) != 1 {
-		t.Fatalf("message forgotten before its last result: %d", len(tr.messages))
-	}
 	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c2", Time: at.Add(25 * time.Second), Line: 4})
-	if len(tr.messages) != 0 {
-		t.Errorf("finished message kept: %d", len(tr.messages))
-	}
 	if len(tr.waits) != 2 || tr.waits[1] != 15*time.Second {
 		t.Errorf("waits %v, want [10s 15s]", tr.waits)
+	}
+	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "c3", Time: at.Add(30 * time.Second), Line: 5, MessageID: "m2", Who: "Bash", Command: "worker run y"})
+	if len(tr.messages) != 1 || len(tr.messages["m2"]) != 1 {
+		t.Errorf("messages after the next one: %v", tr.messages)
+	}
+	// Подагент (sidechain) со своим сообщением не сбрасывает сообщение родителя.
+	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "s1", Time: at.Add(31 * time.Second), Line: 6, MessageID: "sub", Who: "Bash", Command: "ls", Sidechain: true})
+	if len(tr.messages["m2"]) != 1 {
+		t.Errorf("sidechain message dropped the parent one: %v", tr.messages)
+	}
+}
+
+// Последовательный инструмент без команды (Edit) — предшественник; порядок — по появлению, не по номеру строки.
+func TestWaitStartAfterEditAndSameLine(t *testing.T) {
+	tr := newWaitTracker(options{waitProg: "worker", waitSub: "run"})
+	at := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "e1", Time: at, Line: 7, MessageID: "m1", Who: "Edit"})
+	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "c1", Time: at, Line: 7, MessageID: "m1", Who: "Bash", Command: "worker run x"})
+	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "e1", Time: at.Add(4 * time.Second), Line: 8})
+	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c1", Time: at.Add(19 * time.Second), Line: 9})
+	if len(tr.waits) != 1 || tr.waits[0] != 15*time.Second {
+		t.Errorf("waits %v, want [15s]: Edit of the same message and line comes first", tr.waits)
 	}
 }

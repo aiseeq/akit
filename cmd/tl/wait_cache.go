@@ -21,8 +21,9 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 // afterWaitRead — точка между чтением транскрипта и сверкой его ключа; тест дописывает в ней файл.
 var afterWaitRead = func(string) {}
 
-// waitCacheVersion — формат записи: 3 добавляет данные для начала вызова по соседнему результату.
-const waitCacheVersion = 3
+// waitCacheVersion — формат записи: 3 добавляет данные для начала вызова по соседнему результату, 4 — последовательные
+// инструменты без команды и вывод только у ошибок.
+const waitCacheVersion = 4
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
@@ -243,12 +244,21 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
 		if ev.Role == transcript.Cmd {
 			command, bg := waitCommand(ev)
+			if command == "" && ev.MessageID != "" && !ev.Sidechain && isSerialTool(ev.Who) {
+				// Последовательный инструмент без команды (Edit, Write) — предшественник для начала соседа.
+				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who})
+			}
 			if command != "" {
 				cachedCalls, invalid := parseWaitCalls(command)
 				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: append([]byte(nil), ev.Raw...), Command: command, BG: bg, Calls: cachedCalls, Invalid: invalid})
 			}
 		} else if ev.Role == transcript.Out {
-			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: append([]byte(nil), ev.Raw...)})
+			// Текст вывода нужен только ошибке: по нему узнаётся отказ разрешения; весь вывод раздул бы кэш.
+			var raw []byte
+			if ev.Error {
+				raw = append([]byte(nil), ev.Raw...)
+			}
+			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw})
 		}
 	})
 	if err != nil {

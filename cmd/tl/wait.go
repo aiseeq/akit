@@ -23,7 +23,7 @@ var waitWrappers = map[string]bool{
 type waitCall struct {
 	command   string
 	at        time.Time
-	line      int
+	line      int // порядок вызова в файле (seq трекера)
 	message   string
 	tool      string
 	sidechain bool
@@ -41,8 +41,10 @@ type waitCall struct {
 // вывода, и найденные ожидания.
 type waitTracker struct {
 	prog, sub string
-	calls     map[string]*waitCall // CallID → вызов
-	messages  map[string][]*waitCall
+	calls     map[string]*waitCall   // CallID → вызов
+	messages  map[string][]*waitCall // вызовы текущего сообщения: предшественники для начала соседей
+	current   string                 // id текущего сообщения
+	seq       int                    // порядок вызовов: номер строки у нескольких вызовов одной строки совпал бы
 	waits     []time.Duration
 }
 
@@ -71,7 +73,13 @@ func (t *waitTracker) eventCall(event cachedWaitEvent) {
 }
 
 func (t *waitTracker) trackCall(event cachedWaitEvent) {
-	if event.Command == "" {
+	if event.MessageID != "" && !event.Sidechain && event.MessageID != t.current {
+		// Следующее сообщение модель пишет, получив все результаты прошлого: его вызовы больше ничьё начало не
+		// сдвинут, и в памяти остаётся одно сообщение.
+		clear(t.messages)
+		t.current = event.MessageID
+	}
+	if event.Command == "" && (event.MessageID == "" || event.Sidechain || !isSerialTool(event.Who)) {
 		return
 	}
 	call := t.calls[event.CallID]
@@ -79,7 +87,8 @@ func (t *waitTracker) trackCall(event cachedWaitEvent) {
 		call = &waitCall{}
 	}
 	if call.count == 0 {
-		call.command, call.at, call.line = event.Command, event.Time, event.Line
+		t.seq++
+		call.command, call.at, call.line = event.Command, event.Time, t.seq
 		call.message, call.tool, call.sidechain = event.MessageID, event.Who, event.Sidechain
 	}
 	call.count++
@@ -98,30 +107,13 @@ func (t *waitTracker) trackResult(event cachedWaitEvent) {
 	call.done, call.result = true, event.Time
 	call.refused = event.Error && permissionRefusal(event.Raw)
 	delete(t.calls, event.CallID)
-	defer t.forgetMessage(call.message)
-	if call.count != 1 || call.bg || call.refused || !call.matches(t.prog, t.sub) {
+	if call.command == "" || call.count != 1 || call.bg || call.refused || !call.matches(t.prog, t.sub) {
 		return
 	}
 	start := call.start(t.messages[call.message], event.Time)
 	if duration := event.Time.Sub(start); duration >= 0 {
 		t.waits = append(t.waits, duration)
 	}
-}
-
-// forgetMessage убирает сообщение, все вызовы которого уже получили результат: его вызовы больше ничьё начало не
-// сдвинут, а держать их в памяти на чтении всех транскриптов — расти без предела. Вызов того же сообщения, записанный
-// позже результата предшественника, начинается после него и без записи.
-func (t *waitTracker) forgetMessage(id string) {
-	calls, ok := t.messages[id]
-	if !ok {
-		return
-	}
-	for _, c := range calls {
-		if !c.done {
-			return
-		}
-	}
-	delete(t.messages, id)
 }
 
 func (call *waitCall) matches(prog, sub string) bool {
@@ -148,10 +140,8 @@ func (t *waitTracker) cachedEvent(event cachedWaitEvent) {
 	call := t.calls[event.CallID]
 	first := event.Role == transcript.Cmd && (call == nil || call.count == 0)
 	t.eventCall(event)
-	if first && event.Role == transcript.Cmd {
-		call := t.calls[event.CallID]
+	if call := t.calls[event.CallID]; first && call != nil && event.Command != "" {
 		call.calls, call.invalid, call.parsed = event.Calls, event.Invalid, true
-		t.calls[event.CallID] = call
 	}
 }
 
