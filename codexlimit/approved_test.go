@@ -117,9 +117,11 @@ func TestApprovalsForAcrossMinuteBoundary(t *testing.T) {
 			t.Fatalf("For(%s) = %q, %v", at, source, ok)
 		}
 	}
-	reverse := approvalsFrom(t, "2026-11-09T17:42:00Z\tsynthetic source\n")
-	if source, ok := reverse.For(time.Date(2026, 11, 9, 17, 41, 59, 0, time.UTC)); !ok || source != "synthetic source" {
-		t.Fatalf("For one second before the line = %q, %v", source, ok)
+	for _, line := range []string{"2026-11-09T17:42:00Z", "2026-11-09T17:42:01Z"} {
+		reverse := approvalsFrom(t, line+"\tsynthetic source\n")
+		if source, ok := reverse.For(time.Date(2026, 11, 9, 17, 41, 59, 0, time.UTC)); !ok || source != "synthetic source" {
+			t.Fatalf("For before line %s = %q, %v", line, source, ok)
+		}
 	}
 }
 
