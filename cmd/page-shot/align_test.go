@@ -10,7 +10,7 @@ func TestCheckAlign(t *testing.T) {
 	cases := []layoutTestCase{
 		{
 			name:     "inline svg shifted down",
-			html:     `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="margin:0"><svg width="16" height="16" style="position:relative;top:4px"><rect width="16" height="16"/></svg>Текст рядом со значком</p></body>`,
+			html:     `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="margin:0"><svg width="16" height="16" style="position:relative;top:4px;transform:translateY(4px)"><rect width="16" height="16"/></svg>Текст рядом со значком</p></body>`,
 			pairs:    1,
 			contains: "(вниз)",
 		},
@@ -21,9 +21,27 @@ func TestCheckAlign(t *testing.T) {
 			contains: "(вверх)",
 		},
 		{
+			name:     "inline svg in centered flex shifted by transform",
+			html:     `<!doctype html><body style="font:16px/1.55 sans-serif"><div style="display:flex;align-items:center;gap:8px"><svg width="16" height="16" style="transform:translateY(4px)"><rect width="16" height="16"/></svg><span>Текст рядом со значком</span></div></body>`,
+			pairs:    1,
+			contains: "(вниз)",
+		},
+		{
+			name:     "inline svg shifted down with unit line height",
+			html:     `<!doctype html><body style="font:16px/1 sans-serif"><p style="margin:0"><svg width="16" height="16" style="position:relative;top:4px;transform:translateY(4px)"><rect width="16" height="16"/></svg>Текст рядом со значком</p></body>`,
+			pairs:    1,
+			contains: "+5.5 px (вниз)",
+		},
+		{
 			name:  "inline svg aligned",
-			html:  `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="margin:0"><svg width="16" height="16" style="position:relative;top:0"><rect width="16" height="16"/></svg>Текст рядом со значком</p></body>`,
+			html:  `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="margin:0"><svg width="1em" height="1em" style="vertical-align:-0.125em"><rect width="16" height="16"/></svg>Текст рядом со значком</p></body>`,
 			pairs: 0,
+		},
+		{
+			name:     "svg inside button is checked",
+			html:     `<!doctype html><body style="font:16px/1.55 sans-serif"><div style="display:flex;align-items:center;gap:8px"><button style="display:flex;align-items:center;padding:0;border:0"><svg width="16" height="16" style="transform:translateY(4px)"><rect width="16" height="16"/></svg></button><span>Текст рядом со значком</span></div></body>`,
+			pairs:    1,
+			contains: "(вниз)",
 		},
 		{
 			name:  "flex arrow and dot shifted",
@@ -35,6 +53,11 @@ func TestCheckAlign(t *testing.T) {
 			html:     `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="display:grid;grid-template-columns:22px 1fr;margin:0"><span class="ic" style="display:block;font-size:12px;line-height:1"><svg width="15" height="15"><path d="M0 0h15v15"/></svg></span><span>Начало <span>вложенного текста</span> и продолжение</span></p></body>`,
 			pairs:    1,
 			contains: "(вверх)",
+		},
+		{
+			name:  "wide empty strip is not a small icon",
+			html:  `<!doctype html><body style="font:16px/1.55 sans-serif"><div style="display:grid;grid-template-columns:auto 1fr;gap:8px"><span style="width:40px;height:5px;background:#888"></span><span>Подпись рядом с полосой</span></div></body>`,
+			pairs: 0,
 		},
 		{
 			name:  "treemap tiles are not icons or row text",

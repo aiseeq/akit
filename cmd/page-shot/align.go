@@ -59,8 +59,23 @@ const alignJS = `(() => {
   const firstLine = el => {
     const text = el.textContent.trim().replace(/\\s+/g, ' ');
     if (!text || symbols(text) || !visible(el)) return null;
-    const range = document.createRange(); range.selectNodeContents(el);
-    return lineOf(el, text, Array.from(range.getClientRects()));
+    const runs = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!node.textContent.trim() || !visible(node.parentElement)) continue;
+      const range = document.createRange(); range.selectNodeContents(node);
+      const rects = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0);
+      if (!rects.length) continue;
+      const runEl = node.parentElement;
+      runs.push({el: runEl, rects, em: parseFloat(getComputedStyle(runEl).fontSize) || 0});
+    }
+    if (!runs.length) return null;
+    const firstTop = Math.min(...runs.flatMap(run => run.rects.map(rect => rect.top)));
+    const line = runs.map(run => ({...run, rects: run.rects.filter(rect => Math.abs(rect.top - firstTop) <= 1)}))
+      .filter(run => run.rects.length);
+    const em = Math.max(...line.map(run => run.em));
+    const main = line.filter(run => Math.abs(run.em - em) < 0.1);
+    return lineOf(main[0].el, text, main.flatMap(run => run.rects));
   };
   const directTextLine = el => {
     const nodes = Array.from(el.childNodes).filter(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
@@ -110,13 +125,10 @@ const alignJS = `(() => {
     return rowCache.get(row);
   };
   const pairs = [];
-  const all = Array.from(document.querySelectorAll('body *')).filter(el => isIcon(el) && visible(el) && !el.closest('button'));
+  const all = Array.from(document.querySelectorAll('body *')).filter(el => isIcon(el) && visible(el));
   const icons = all.filter(el => !all.some(parent => parent !== el && parent.contains(el)));
   for (const icon of icons) {
     const media = icon.matches('svg, img') ? icon : icon.querySelector('svg, img');
-    const mediaParentStyle = media && getComputedStyle(media.parentElement);
-    const mediaStyle = media && getComputedStyle(media);
-    if (mediaParentStyle && mediaParentStyle.display === 'flex' && mediaParentStyle.alignItems === 'center' && !(mediaStyle.position === 'relative' && mediaStyle.top !== 'auto')) continue;
     const box = visualBox(icon);
     if (!box) continue;
     let best = null;
@@ -131,7 +143,7 @@ const alignJS = `(() => {
         if (item.el === branch) continue;
         const text = item.text;
         if (Math.min(box.b, text.box.b) <= Math.max(box.t, text.box.t)) continue;
-        if (box.r - box.l > text.em * 2 || box.b - box.t > text.em * 2) continue;
+        if (box.b - box.t > text.em * 3) continue;
         if (decoratedBlock(item.el, text.em)) continue;
         const distance = box.r < text.box.l ? text.box.l - box.r : text.box.r < box.l ? box.l - text.box.r : 0;
         if (distance < bestDistance) { rowBest = text; bestDistance = distance; }
@@ -139,17 +151,11 @@ const alignJS = `(() => {
       best = rowBest;
     }
     if (!best) continue;
-    const marginElement = icon.matches('svg, img') ? icon.parentElement : icon;
-    const marginTop = parseFloat(getComputedStyle(marginElement).marginTop);
-    const centeredMargin = (best.lineHeight - (box.b - box.t)) / 2;
-    if (Number.isFinite(marginTop) && Math.abs(marginTop - centeredMargin) <= 1) continue;
+    const blankDecoration = !media && !icon.textContent.trim() && decorated(icon);
+    if (blankDecoration && (box.r - box.l > best.em * 2 || box.b - box.t > best.em * 2)) continue;
     const iconCenter = (box.t + box.b) / 2;
-    const parentDisplay = getComputedStyle(icon.parentElement).display;
     const textCenter = (best.box.t + best.box.b) / 2;
-    let shift = iconCenter - textCenter;
-    if (media && mediaStyle.position === 'relative' && mediaStyle.top !== 'auto' && parentDisplay !== 'flex' && parentDisplay !== 'grid') {
-      shift = parseFloat(mediaStyle.top);
-    }
+    const shift = iconCenter - textCenter;
     if (Math.abs(shift) <= 2) continue;
     const shorten = s => s.length > 60 ? s.slice(0, 60) + '…' : s;
     pairs.push({iconText: shorten(iconLabel(icon)), selector: describe(icon), neighbor: shorten(best.text),
