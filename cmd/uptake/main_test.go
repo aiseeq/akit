@@ -536,4 +536,19 @@ func TestWebtextHookForeignLinesAndEmptyRotation(t *testing.T) {
 	if _, err = write(`time="` + at + `" level=INFO msg="webfetch fallback statistics" broken` + "\n"); err != nil {
 		t.Errorf("another message with the same start must be skipped: %v", err)
 	}
+	for _, line := range []string{
+		`time="` + at + `" level=INFO msg="webfetch fallback`,
+		`time="` + at + `" level=INFO msg="webfetch fallback skip`,
+		`time="` + at + `" level=INFO msg="webfetch fallback" opened=false source=unknown`,
+	} {
+		if u, err = write(line + "\n"); err == nil || u.hookBadLines != 1 {
+			t.Errorf("%q: err=%v bad=%d, want a damaged line", line, err, u.hookBadLines)
+		}
+	}
+	long := strings.Repeat("x", 2<<20)
+	inWindow := since.Add(time.Hour).In(time.Local).Format("2006-01-02 15:04:05")
+	u, err = write(long + "\n" + `time="` + inWindow + `" level=INFO msg="webfetch fallback" opened=true source=direct` + "\n")
+	if err != nil || u.hookSummary.opened != 1 {
+		t.Errorf("a long foreign line stopped the read: err=%v opened=%d", err, u.hookSummary.opened)
+	}
 }

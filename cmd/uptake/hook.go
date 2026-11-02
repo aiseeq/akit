@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,7 +42,24 @@ func (u *run) readWebtextHookLogs(since, until time.Time) {
 }
 
 // hookMessage — сообщения хука webtext целиком; строки других хуков в том же логе — не наши, их формат не проверяется.
-var hookMessage = regexp.MustCompile(`(?:^|\s)msg="webfetch fallback(?: skipped)?"(?:\s|$)`)
+const hookMessageStart = `msg="webfetch fallback`
+
+// isHookLine — строка сообщения хука webtext: имя целиком («webfetch fallback» или «… skipped») или строка,
+// обрезанная внутри имени, — та повреждённая, а не чужая. «webfetch fallback statistics» — чужое сообщение.
+func isHookLine(line string) bool {
+	i := strings.Index(line, hookMessageStart)
+	if i < 0 || i > 0 && line[i-1] != ' ' {
+		return false
+	}
+	rest := line[i+len(hookMessageStart):]
+	for _, name := range []string{`"`, ` skipped"`} {
+		if strings.HasPrefix(rest, name) {
+			after := rest[len(name):]
+			return after == "" || after[0] == ' '
+		}
+	}
+	return strings.HasPrefix(` skipped"`, rest)
+}
 
 func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 	f, err := os.Open(path)
@@ -50,11 +67,18 @@ func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 		return fmt.Errorf("open hook log: %w", err)
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for n := 1; scanner.Scan(); n++ {
-		line := scanner.Text()
-		ours := hookMessage.MatchString(line)
+	// Reader, не Scanner: длинная чужая строка не должна обрывать чтение файла.
+	reader := bufio.NewReader(f)
+	for n := 1; ; n++ {
+		line, err := reader.ReadString('\n')
+		if errors.Is(err, io.EOF) && line == "" {
+			break
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read hook log: %w", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		ours := isHookLine(line)
 		if !ours && u.hookSummary.hasCoverage {
 			continue
 		}
@@ -88,9 +112,6 @@ func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 		record.day = at.Format("2006-01-02")
 		u.countHookRecord(record)
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read hook log: %w", err)
-	}
 	return nil
 }
 
@@ -101,8 +122,10 @@ func hookOutcome(msg string, fields map[string]string) (hookRecord, error) {
 		return hookRecord{opened: "skipped"}, nil
 	}
 	switch opened, source := fields["opened"], fields["source"]; {
-	case opened == "false":
+	case opened == "false" && source == "":
 		return hookRecord{opened: "false"}, nil
+	case opened == "false":
+		return hookRecord{}, fmt.Errorf("source %q for an unopened page", source)
 	case opened == "true" && (source == "direct" || source == "wayback"):
 		return hookRecord{opened: "true", source: source}, nil
 	case opened == "true":
