@@ -16,8 +16,8 @@ const waitCacheCodeFile = "wait_cache_code.go"
 
 // waitCacheListFormat — поля go list для хеша: модуль, его замена (replace, go.work) и файлы пакета под любые
 // ОС и теги сборки (IgnoredGoFiles), со встроенными (embed) и C-файлами.
-const waitCacheListFormat = `{{if .Module}}{{.Module.Path}}|{{.Module.Version}}|{{.Module.Dir}}|` +
-	`{{with .Module.Replace}}{{.Path}}|{{.Version}}|{{.Dir}}{{else}}||{{end}}|{{.Dir}}|` +
+const waitCacheListFormat = `{{if .Module}}{{.Module.Path}}	{{.Module.Version}}	{{.Module.Dir}}	` +
+	`{{with .Module.Replace}}{{.Path}}	{{.Version}}	{{.Dir}}{{else}}		{{end}}	{{.Dir}}	` +
 	`{{join .GoFiles ","}},{{join .CgoFiles ","}},{{join .IgnoredGoFiles ","}},{{join .EmbedFiles ","}},` +
 	`{{join .CFiles ","}},{{join .HFiles ","}}{{end}}`
 
@@ -31,8 +31,19 @@ func waitCacheSourcesHash(t *testing.T) string {
 		t.Fatalf("go list: %v", err)
 	}
 	hash := sha256.New()
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		f := strings.Split(line, "|")
+	// go.mod модуля tl: директива go и требования меняют сборку при тех же исходниках.
+	gomod, err := exec.Command("go", "env", "GOMOD").Output()
+	if err != nil {
+		t.Fatalf("go env GOMOD: %v", err)
+	}
+	data, err := os.ReadFile(strings.TrimSpace(string(gomod)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(hash, "go.mod %d\n", len(data))
+	hash.Write(data)
+	for line := range strings.SplitSeq(strings.TrimRight(string(out), "\n"), "\n") {
+		f := strings.Split(line, "\t")
 		if len(f) != 8 {
 			t.Fatalf("go list line %q", line)
 		}

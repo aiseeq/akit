@@ -75,7 +75,7 @@ type waitCache struct {
 	misses   atomic.Int64 // транскрипты, прочитанные мимо кэша
 }
 
-// newWaitCache — кэш под код этой сборки: исходники, от которых зависит запись (waitCacheCode), и версия Go.
+// newWaitCache — кэш под код этой сборки: исходники, от которых зависит запись (waitCacheCode), версия Go и платформа.
 // Отпечаток всего бинаря менялся бы с каждой установкой: в бинарь вшиты ревизия и пути сборки.
 func newWaitCache(stderr io.Writer) *waitCache {
 	dir, err := waitCacheDir()
@@ -84,7 +84,7 @@ func newWaitCache(stderr io.Writer) *waitCache {
 		cache.warn(err)
 		return cache
 	}
-	return &waitCache{dir: dir, code: waitCacheCode + " " + runtime.Version(), stderr: stderr}
+	return &waitCache{dir: dir, code: waitCacheCode + " " + runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH, stderr: stderr}
 }
 
 func waitCacheDir() (string, error) {
