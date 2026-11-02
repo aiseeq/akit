@@ -167,9 +167,10 @@ func validateOneLine(o options) error {
 	return nil
 }
 
-// guessedTime — время с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные классы:
-// \b в regexp Go знает только ASCII-буквы и не видит конец слова после кириллицы.
-var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}:])\d\d:\d[xх](?:$|[^\p{L}\p{N}])`)
+// guessedTime — время суток с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные
+// классы: \b в regexp Go знает только ASCII-буквы. Справа не ASCII-буква и не цифра: «06:4xМСК» — время,
+// «06:4xyz» — нет.
+var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5][xх](?:$|[^a-z0-9])`)
 
 func parseOptions(args []string, o *options) ([]string, error) {
 	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add}

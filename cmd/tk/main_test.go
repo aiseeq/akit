@@ -1518,6 +1518,10 @@ func TestJournalTextRejectsGuessedTime(t *testing.T) {
 		{"done", "task", "--check", "прошло 06:4x"},
 		{"reject", "task", "--why", "06:4x не нужно"},
 		{"review", "task", "--note", "06:4X сдано"},
+		{"note", "task", "в06:4x найдено"},
+		{"note", "task", "в 06:4xМСК найдено"},
+		{"skip", "task", "accept", "--why", "06:4x упало"},
+		{"wait", "task", "--until", "сегодня 11:0x"},
 	} {
 		if _, err := parseArgs(args); err == nil || !strings.Contains(err.Error(), "time of the entry") {
 			t.Errorf("%q: %v", args, err)
@@ -1527,6 +1531,7 @@ func TestJournalTextRejectsGuessedTime(t *testing.T) {
 		{"note", "task", "06:41 найдено"},
 		{"note", "task", "box 06:4xyz"},
 		{"note", "task", "шаг 1:4x"},
+		{"note", "task", "код 99:9x"},
 	} {
 		if _, err := parseArgs(args); err != nil {
 			t.Errorf("%q: %v", args, err)
