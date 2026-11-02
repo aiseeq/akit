@@ -637,9 +637,11 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		if err != nil {
 			return nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.path, err)
 		}
-		for _, event := range events {
-			if f.inWindow(transcript.Event{Role: event.Role, Time: event.Time, CallID: event.CallID}) {
-				wt.cachedEvent(event)
+		for i := range events {
+			event := &events[i]
+			if f.inWindow(transcript.Event{Role: event.Role, Time: event.Time, CallID: event.CallID, Line: event.Line,
+				MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw}) {
+				wt.cachedEvent(*event)
 			}
 		}
 		return nil, wt.waits, transcript.Meta{}, nil

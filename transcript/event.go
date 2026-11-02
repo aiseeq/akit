@@ -56,6 +56,8 @@ type Event struct {
 	// Поля записи Claude Code; у codex UUID пуст, SessionID и Cwd — из session_meta, Cwd меняет turn_context.
 	// Cwd — папка сессии в момент записи: меняется внутри сессии.
 	UUID, SessionID, Cwd string
+	// MessageID — message.id assistant-записи Claude Code.
+	MessageID string
 	// Sidechain — запись боковой ветки (суб-агент в транскрипте сессии, старый формат): не разговор сессии.
 	Sidechain bool
 	// PromptID — ход Claude Code: есть у событий записей user; ответы хода — после его записи user.

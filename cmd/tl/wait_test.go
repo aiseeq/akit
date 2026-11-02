@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 func writeWaitTranscript(t *testing.T, e env, name, contents string) string {
@@ -94,6 +96,94 @@ func TestWaitClaudePercentilesAndFiltering(t *testing.T) {
 	}
 }
 
+func TestWaitStartsAfterEarlierSerialCallInSameMessage(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	rows := []string{
+		waitRow("assistant", 0, `"id":"a","name":"Bash","input":{"command":"tk done one"}`, "m", ""),
+		waitRow("user", 23, `"tool_use_id":"a","content":"ok"`, "", ""),
+		waitRow("assistant", 23, `"id":"b","name":"Bash","input":{"command":"tk done two"}`, "m", ""),
+		waitRow("user", 39, `"tool_use_id":"b","content":"ok"`, "", ""),
+		waitRow("assistant", 39, `"id":"c","name":"Bash","input":{"command":"tk done three"}`, "m", ""),
+		waitRow("user", 54, `"tool_use_id":"c","content":"ok"`, "", ""),
+		waitRow("assistant", 54, `"id":"d","name":"Bash","input":{"command":"tk done four"}`, "m", ""),
+		waitRow("user", 67, `"tool_use_id":"d","content":"ok"`, "", ""),
+	}
+	path := writeWaitTranscript(t, e, "sequential.jsonl", strings.Join(rows, "\n")+"\n")
+	roles := map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}
+	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{23 * time.Second, 16 * time.Second, 15 * time.Second, 13 * time.Second}
+	if fmt.Sprint(waits) != fmt.Sprint(want) {
+		var events []string
+		_, readErr := transcript.Read(path, nil, func(ev transcript.Event) {
+			events = append(events, fmt.Sprintf("%s %s %s %s %s", ev.Role, ev.Who, ev.CallID, ev.MessageID, ev.Text))
+		})
+		t.Fatalf("waits = %v, want %v; events=%v readErr=%v", waits, want, events, readErr)
+	}
+}
+
+func waitRow(kind string, second int, part, messageID, _ string) string {
+	timestamp := time.Date(2026, 10, 25, 10, 0, second, 0, time.UTC).Format(time.RFC3339)
+	if kind == "assistant" {
+		return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"id":%q,"content":[{"type":"tool_use",%s}]}}`, timestamp, messageID, part)
+	}
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"message":{"content":[{"type":"tool_result",%s}]}}`, timestamp, part)
+}
+
+func TestWaitParallelReadIndependentMessagesAndFirstResult(t *testing.T) {
+	e := fakeHome(t)
+	rows := []string{
+		waitRow("assistant", 0, `"id":"read","name":"Read","input":{"file_path":"x"}`, "m1", ""),
+		waitRow("assistant", 1, `"id":"bash","name":"Bash","input":{"command":"tk done bash"}`, "m1", ""),
+		waitRow("assistant", 2, `"id":"other","name":"Bash","input":{"command":"tk done other"}`, "m2", ""),
+		waitRow("user", 3, `"tool_use_id":"read","content":"data"`, "", ""),
+		waitRow("user", 11, `"tool_use_id":"bash","content":"ok"`, "", ""),
+		waitRow("user", 12, `"tool_use_id":"other","content":"ok"`, "", ""),
+		waitRow("assistant", 13, `"id":"repeat","name":"Bash","input":{"command":"tk done repeated"}`, "m3", ""),
+		waitRow("user", 17, `"tool_use_id":"repeat","content":"first"`, "", ""),
+		waitRow("user", 30, `"tool_use_id":"repeat","content":"duplicate"`, "", ""),
+	}
+	waits := readWaits(t, e, "parallel.jsonl", rows)
+	want := []time.Duration{10 * time.Second, 10 * time.Second, 4 * time.Second}
+	if fmt.Sprint(waits) != fmt.Sprint(want) {
+		t.Fatalf("waits = %v, want %v", waits, want)
+	}
+}
+
+func TestWaitExcludesBackgroundPermissionRefusalAndSidechainPredecessor(t *testing.T) {
+	e := fakeHome(t)
+	rows := []string{
+		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"m","content":[{"type":"tool_use","id":"bg","name":"Bash","input":{"command":"tk done background","run_in_background":true}}]}}`,
+		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"m","content":[{"type":"tool_use","id":"denied","name":"Bash","input":{"command":"tk done denied"}}]}}`,
+		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"m","content":[{"type":"tool_use","id":"hook","name":"Bash","input":{"command":"tk done hook"}}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"started"}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"denied","is_error":true,"content":"User doesn't want to proceed with this tool use"}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"hook","is_error":true,"content":"PreToolUse hook denied this tool call"}]}}`,
+		`{"type":"assistant","isSidechain":true,"timestamp":"2026-10-25T10:00:00Z","message":{"id":"shared","content":[{"type":"tool_use","id":"sub","name":"Bash","input":{"command":"tk done sidechain"}}]}}`,
+		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"shared","content":[{"type":"tool_use","id":"parent","name":"Bash","input":{"command":"tk done parent"}}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:08Z","message":{"content":[{"type":"tool_result","tool_use_id":"sub","content":"ok"}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:10Z","message":{"content":[{"type":"tool_result","tool_use_id":"parent","content":"ok"}]}}`,
+	}
+	waits := readWaits(t, e, "excluded.jsonl", rows)
+	if fmt.Sprint(waits) != fmt.Sprint([]time.Duration{8 * time.Second, 10 * time.Second}) {
+		t.Fatalf("waits = %v, want [8s 10s]", waits)
+	}
+}
+
+func readWaits(t *testing.T, e env, name string, rows []string) []time.Duration {
+	t.Helper()
+	path := writeWaitTranscript(t, e, name, strings.Join(rows, "\n")+"\n")
+	roles := map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}
+	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return waits
+}
+
 func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	e := fakeHome(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
@@ -116,6 +206,15 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	cache := newWaitCache(io.Discard)
 	if !cache.valid(path) {
 		t.Fatal("cold call did not save a usable entry")
+	}
+	oldKey, err := cache.key(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey.Version--
+	cache.saveRecord(oldKey, nil)
+	if cache.valid(path) {
+		t.Fatal("cache entry from the previous wait rule version was accepted")
 	}
 	otherBinary := &waitCache{dir: cache.dir, binary: "different-binary"}
 	if otherBinary.valid(path) {
@@ -375,5 +474,25 @@ func TestWaitUsageErrors(t *testing.T) {
 		if _, err := parseArgs(args, fakeHome(t).now); err == nil {
 			t.Errorf("%q accepted", args)
 		}
+	}
+}
+
+// Сообщение, все вызовы которого получили результат, не остаётся в памяти трекера.
+func TestWaitTrackerForgetsFinishedMessages(t *testing.T) {
+	tr := newWaitTracker(options{waitProg: "worker", waitSub: "run"})
+	at := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"c1", "c2"} {
+		tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: id, Time: at, Line: i + 1, MessageID: "m1", Who: "Bash", Command: "worker run x"})
+	}
+	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c1", Time: at.Add(10 * time.Second), Line: 3})
+	if len(tr.messages) != 1 {
+		t.Fatalf("message forgotten before its last result: %d", len(tr.messages))
+	}
+	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c2", Time: at.Add(25 * time.Second), Line: 4})
+	if len(tr.messages) != 0 {
+		t.Errorf("finished message kept: %d", len(tr.messages))
+	}
+	if len(tr.waits) != 2 || tr.waits[1] != 15*time.Second {
+		t.Errorf("waits %v, want [10s 15s]", tr.waits)
 	}
 }

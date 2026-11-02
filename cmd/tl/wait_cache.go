@@ -21,19 +21,25 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 // afterWaitRead — точка между чтением транскрипта и сверкой его ключа; тест дописывает в ней файл.
 var afterWaitRead = func(string) {}
 
-// waitCacheVersion — формат записи: 2 — заголовок и события отдельными значениями gob.
-const waitCacheVersion = 2
+// waitCacheVersion — формат записи: 3 добавляет данные для начала вызова по соседнему результату.
+const waitCacheVersion = 3
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
 type cachedWaitEvent struct {
-	Role    transcript.Role
-	CallID  string
-	Time    time.Time
-	Command string
-	BG      bool
-	Calls   []cachedShellCall
-	Invalid bool
+	Role      transcript.Role
+	CallID    string
+	Time      time.Time
+	Line      int
+	MessageID string
+	Who       string
+	Sidechain bool
+	Error     bool
+	Raw       []byte
+	Command   string
+	BG        bool
+	Calls     []cachedShellCall
+	Invalid   bool
 }
 
 type cachedShellCall struct {
@@ -239,10 +245,10 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 			command, bg := waitCommand(ev)
 			if command != "" {
 				cachedCalls, invalid := parseWaitCalls(command)
-				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Command: command, BG: bg, Calls: cachedCalls, Invalid: invalid})
+				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: append([]byte(nil), ev.Raw...), Command: command, BG: bg, Calls: cachedCalls, Invalid: invalid})
 			}
 		} else if ev.Role == transcript.Out {
-			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time})
+			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: append([]byte(nil), ev.Raw...)})
 		}
 	})
 	if err != nil {

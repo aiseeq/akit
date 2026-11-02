@@ -130,6 +130,9 @@ func parseRecordKind(rec *record, raw []byte, claude *claudeParser, codex *codex
 		events = claude.parse(rec, raw)
 		for i := range events {
 			events[i].UUID, events[i].SessionID, events[i].Cwd = rec.UUID, rec.SessionID, rec.Cwd
+			if rec.Message != nil {
+				events[i].MessageID = rec.Message.ID
+			}
 			events[i].Sidechain, events[i].PromptID = rec.IsSidechain, rec.PromptID
 		}
 	}
