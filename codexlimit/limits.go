@@ -113,8 +113,6 @@ func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json
 		}
 		return nil, fmt.Errorf("codexlimit: start app-server: %w", err)
 	}
-	scanCtx, cancelScan := context.WithCancel(ctx)
-	defer cancelScan()
 	defer func() {
 		if err := stop(cmd, stdin); err != nil {
 			response = nil
@@ -133,7 +131,7 @@ func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json
 		_, err := io.WriteString(stdin, initializeRequests+request+"\n")
 		written <- err
 	}()
-	a, err := readAnswer(ctx, stdout, scanCtx, written)
+	a, err := readAnswer(ctx, stdout, written)
 	if err != nil {
 		return nil, err
 	}
@@ -146,57 +144,41 @@ func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json
 	return a.Result, nil
 }
 
-func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context, written <-chan error) (answer, error) {
+func readAnswer(ctx context.Context, stdout io.Reader, written <-chan error) (answer, error) {
+	// The scanner sends exactly one result — the answer with id 2, a read error, or
+	// the end of output — into a buffered channel, so the send never blocks and an
+	// answer once scanned is never dropped; the goroutine ends when stop closes stdout.
 	type scanResult struct {
-		line []byte
-		err  error
+		a   answer
+		err error
 	}
-	lines := make(chan scanResult, 1)
+	result := make(chan scanResult, 1)
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 		for scanner.Scan() {
-			line := append([]byte{}, scanner.Bytes()...)
-			select {
-			case lines <- scanResult{line: line}:
-			case <-scanCtx.Done():
-				return
+			var a answer
+			if json.Unmarshal(scanner.Bytes(), &a) != nil || a.ID != 2 {
+				continue
 			}
+			result <- scanResult{a: a}
+			return
 		}
-		select {
-		case lines <- scanResult{err: scanner.Err()}:
-		case <-scanCtx.Done():
+		if err := scanner.Err(); err != nil {
+			result <- scanResult{err: fmt.Errorf("codexlimit: read app-server output: %w", err)}
+			return
 		}
+		result <- scanResult{err: errors.New("codexlimit: app-server closed stdout without an answer")}
 	}()
 
-	// take handles one scanned line; done is false for a line that is not the answer.
-	take := func(got scanResult) (a answer, done bool, err error) {
-		if got.err != nil {
-			return answer{}, true, fmt.Errorf("codexlimit: read app-server output: %w", got.err)
-		}
-		if got.line == nil {
-			return answer{}, true, errors.New("codexlimit: app-server closed stdout without an answer")
-		}
-		if json.Unmarshal(got.line, &a) != nil || a.ID != 2 {
-			return answer{}, false, nil
-		}
-		return a, true, nil
-	}
 	for {
 		select {
 		case <-ctx.Done():
-			// select picks at random among ready cases, so lines already scanned are
-			// taken first: an answer that arrived before the context ended wins.
-			for {
-				select {
-				case got := <-lines:
-					if a, done, err := take(got); done {
-						return a, err
-					}
-					continue
-				default:
-				}
-				break
+			// select picks at random among ready cases: an answer already scanned wins.
+			select {
+			case got := <-result:
+				return got.a, got.err
+			default:
 			}
 			return answer{}, fmt.Errorf("codexlimit: no answer before context ended: %w", ctx.Err())
 		case err := <-written:
@@ -204,10 +186,8 @@ func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context, 
 				return answer{}, fmt.Errorf("codexlimit: write requests: %w", err)
 			}
 			written = nil // a nil channel never fires again
-		case got := <-lines:
-			if a, done, err := take(got); done {
-				return a, err
-			}
+		case got := <-result:
+			return got.a, got.err
 		}
 	}
 }
