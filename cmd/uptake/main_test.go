@@ -540,6 +540,8 @@ func TestWebtextHookForeignLinesAndEmptyRotation(t *testing.T) {
 		`time="` + at + `" level=INFO msg="webfetch fallback`,
 		`time="` + at + `" level=INFO msg="webfetch fallback skip`,
 		`time="` + at + `" level=INFO msg="webfetch fallback" opened=false source=unknown`,
+		`time="` + at + `" level=INFO msg="webfetch fallback"opened=true source=direct`,
+		`time="` + at + `" level=INFO msg="webfetch fallback" opened=false`,
 	} {
 		if u, err = write(line + "\n"); err == nil || u.hookBadLines != 1 {
 			t.Errorf("%q: err=%v bad=%d, want a damaged line", line, err, u.hookBadLines)

@@ -44,21 +44,16 @@ func (u *run) readWebtextHookLogs(since, until time.Time) {
 // hookMessage — сообщения хука webtext целиком; строки других хуков в том же логе — не наши, их формат не проверяется.
 const hookMessageStart = `msg="webfetch fallback`
 
-// isHookLine — строка сообщения хука webtext: имя целиком («webfetch fallback» или «… skipped») или строка,
-// обрезанная внутри имени, — та повреждённая, а не чужая. «webfetch fallback statistics» — чужое сообщение.
+// isHookLine — строка сообщения хука webtext: имя целиком в кавычках («webfetch fallback» или «… skipped») или
+// строка, обрезанная внутри имени, — та повреждённая, а не чужая. «webfetch fallback statistics» — чужое сообщение.
 func isHookLine(line string) bool {
 	i := strings.Index(line, hookMessageStart)
 	if i < 0 || i > 0 && line[i-1] != ' ' {
 		return false
 	}
 	rest := line[i+len(hookMessageStart):]
-	for _, name := range []string{`"`, ` skipped"`} {
-		if strings.HasPrefix(rest, name) {
-			after := rest[len(name):]
-			return after == "" || after[0] == ' '
-		}
-	}
-	return strings.HasPrefix(` skipped"`, rest)
+	// Имя целиком — строка наша, даже если дальше формат сломан: её разбор и скажет, что она повреждена.
+	return strings.HasPrefix(rest, `"`) || strings.HasPrefix(rest, ` skipped"`) || strings.HasPrefix(` skipped"`, rest)
 }
 
 func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
@@ -121,7 +116,10 @@ func hookOutcome(msg string, fields map[string]string) (hookRecord, error) {
 	if msg == "webfetch fallback skipped" {
 		return hookRecord{opened: "skipped"}, nil
 	}
-	switch opened, source := fields["opened"], fields["source"]; {
+	source, hasSource := fields["source"]
+	switch opened := fields["opened"]; {
+	case !hasSource:
+		return hookRecord{}, fmt.Errorf("no source field")
 	case opened == "false" && source == "":
 		return hookRecord{opened: "false"}, nil
 	case opened == "false":
