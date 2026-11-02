@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -204,7 +205,9 @@ func TestWritePreservesACL(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("setfacl", "-m", "u:12345:rw", path).CombinedOutput(); err != nil {
+	// Именованная запись на свой uid: чужой uid в пространстве имён пользователя (песочница) не отображён — EINVAL.
+	uid := strconv.Itoa(os.Getuid())
+	if out, err := exec.Command("setfacl", "-m", "u:"+uid+":rw", path).CombinedOutput(); err != nil {
 		t.Fatalf("setfacl: %v: %s", err, out)
 	}
 	plan, err := Build([]Edit{{Files: []string{path}, Old: "old", New: "new", Want: 1}})
@@ -214,11 +217,11 @@ func TestWritePreservesACL(t *testing.T) {
 	if _, err := plan.Write(); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("getfacl", "-cp", path).CombinedOutput()
+	out, err := exec.Command("getfacl", "-cpn", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("getfacl: %v: %s", err, out)
 	}
-	if !strings.Contains(string(out), "user:12345:rw-") {
+	if !strings.Contains(string(out), "user:"+uid+":rw-") {
 		t.Errorf("ACL was not preserved:\n%s", out)
 	}
 }
@@ -406,7 +409,8 @@ func TestWriteDropsInheritedDefaultACL(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("setfacl", "-d", "-m", "u:12345:rwx", dir).CombinedOutput(); err != nil {
+	uid := strconv.Itoa(os.Getuid())
+	if out, err := exec.Command("setfacl", "-d", "-m", "u:"+uid+":rwx", dir).CombinedOutput(); err != nil {
 		t.Fatalf("setfacl: %v: %s", err, out)
 	}
 	plan, err := Build([]Edit{{Files: []string{path}, Old: "old", New: "new", Want: 1}})
@@ -416,11 +420,11 @@ func TestWriteDropsInheritedDefaultACL(t *testing.T) {
 	if _, err := plan.Write(); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("getfacl", "-cp", path).CombinedOutput()
+	out, err := exec.Command("getfacl", "-cpn", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("getfacl: %v: %s", err, out)
 	}
-	if strings.Contains(string(out), "12345") {
+	if strings.Contains(string(out), "user:"+uid+":") {
 		t.Errorf("file got the directory's default ACL:\n%s", out)
 	}
 	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o640 {
