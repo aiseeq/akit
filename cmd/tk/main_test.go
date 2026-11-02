@@ -1572,6 +1572,9 @@ func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
 		{"2026-11-02 03:00 проверка", true},
 		{"03:00 — сдано", true},
 		{"03:00 — 2 проверки", true},
+		{"03:00 - 99:99 проверка", true},
+		{"03:00 - 04:001 проверка", true},
+		{"03:00-4:30 окно", false},
 		{"ждёт до 03:00", false},
 		{"03:001", false},
 	} {
