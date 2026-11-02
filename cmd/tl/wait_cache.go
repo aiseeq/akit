@@ -246,7 +246,8 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 			command, bg := waitCommand(ev)
 			if command == "" && ev.MessageID != "" && !ev.Sidechain && isSerialTool(ev.Who) {
 				// Последовательный инструмент без команды (Edit, Write) — предшественник для начала соседа.
-				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who})
+				//nolint:struct-mapping-drops-field // ввод инструмента (Raw) предшественнику не нужен, а текст Write раздул бы кэш
+				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error})
 			}
 			if command != "" {
 				cachedCalls, invalid := parseWaitCalls(command)
