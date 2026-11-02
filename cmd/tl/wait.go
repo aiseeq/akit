@@ -25,7 +25,6 @@ type waitCall struct {
 	at        time.Time
 	line      int // порядок вызова в файле (seq трекера)
 	message   string
-	tool      string
 	sidechain bool
 	bg        bool
 	done      bool
@@ -89,7 +88,7 @@ func (t *waitTracker) trackCall(event cachedWaitEvent) {
 	if call.count == 0 {
 		t.seq++
 		call.command, call.at, call.line = event.Command, event.Time, t.seq
-		call.message, call.tool, call.sidechain = event.MessageID, event.Who, event.Sidechain
+		call.message, call.sidechain = event.MessageID, event.Sidechain
 	}
 	call.count++
 	call.bg = call.bg || event.BG
