@@ -1554,6 +1554,8 @@ func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
 		{"вчера ~23:50", false},
 		{"31.10 ~03:00 упало", false},
 		{"02.11 ~03:00 упало", true},
+		{"~02:40~03:00", true},
+		{"~03:001", false},
 	} {
 		err := validateApproxTime(options{note: c.text}, now)
 		if (err != nil) != c.bad || (err != nil && !strings.Contains(err.Error(), "time of the entry")) {
