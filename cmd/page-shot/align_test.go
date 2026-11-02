@@ -55,6 +55,17 @@ func TestCheckAlign(t *testing.T) {
 			contains: "(вверх)",
 		},
 		{
+			name:     "letter icon found by second class word",
+			html:     `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="margin:0"><span class="small icon" style="position:relative;top:-6px;font-size:12px">i</span>Текст рядом с буквенным значком</p></body>`,
+			pairs:    1,
+			contains: "(вверх)",
+		},
+		{
+			name:  "hidden svg in visible icon container",
+			html:  `<!doctype html><body style="font:16px/1.55 sans-serif"><p style="margin:0"><span class="ic"><svg width="16" height="16" style="visibility:hidden;position:relative;top:-8px"><rect width="16" height="16"/></svg></span>Текст рядом со скрытым значком</p></body>`,
+			pairs: 0,
+		},
+		{
 			name:  "wide empty strip is not a small icon",
 			html:  `<!doctype html><body style="font:16px/1.55 sans-serif"><div style="display:grid;grid-template-columns:auto 1fr;gap:8px"><span style="width:40px;height:5px;background:#888"></span><span>Подпись рядом с полосой</span></div></body>`,
 			pairs: 0,

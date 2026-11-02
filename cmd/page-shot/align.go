@@ -37,7 +37,7 @@ const alignJS = `(() => {
   const isIcon = el => {
     const tag = el.tagName.toLowerCase();
     if (tag === 'svg' || tag === 'img') return true;
-    if (/(^|[\\s_-])(?:ic|icon)(?:$|[\\s_-])/i.test(className(el))) return true;
+    if (/(^|[\s_-])(?:ic|icon)(?:$|[\s_-])/i.test(className(el))) return true;
     const text = el.textContent.trim();
     if (text && symbols(text)) return true;
     return !text && !el.children.length && decorated(el);
@@ -57,7 +57,7 @@ const alignJS = `(() => {
     return box ? {el, text, em, lineHeight, box} : null;
   };
   const firstLine = el => {
-    const text = el.textContent.trim().replace(/\\s+/g, ' ');
+    const text = el.textContent.trim().replace(/\s+/g, ' ');
     if (!text || symbols(text) || !visible(el)) return null;
     const runs = [];
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
@@ -79,7 +79,7 @@ const alignJS = `(() => {
   };
   const directTextLine = el => {
     const nodes = Array.from(el.childNodes).filter(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
-    const text = nodes.map(node => node.textContent.trim()).join(' ').replace(/\\s+/g, ' ');
+    const text = nodes.map(node => node.textContent.trim()).join(' ').replace(/\s+/g, ' ');
     if (!text || symbols(text) || !visible(el)) return null;
     const rects = [];
     for (const node of nodes) {
@@ -129,6 +129,8 @@ const alignJS = `(() => {
   const icons = all.filter(el => !all.some(parent => parent !== el && parent.contains(el)));
   for (const icon of icons) {
     const media = icon.matches('svg, img') ? icon : icon.querySelector('svg, img');
+    // Видимость контейнера не делает видимым вложенный значок: мерить его рамку, только если виден он сам.
+    if (media && !visible(media)) continue;
     const box = visualBox(icon);
     if (!box) continue;
     let best = null;
