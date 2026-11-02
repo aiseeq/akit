@@ -402,3 +402,53 @@ func TestNewPartialLineThenReplaced(t *testing.T) {
 		t.Errorf("новый файл: hit %v %v, line %d", hit, err, c.hitLine)
 	}
 }
+
+func TestWaitUntilClockTimeNearest(t *testing.T) {
+	at := func(d, h, m int) time.Time { return time.Date(2026, 11, d, h, m, 0, 0, time.Local) }
+	for _, c := range []struct {
+		arg  string
+		now  time.Time
+		want time.Time
+	}{
+		{"00:03", at(2, 23, 56), at(3, 0, 3)},
+		{"00:03:30", at(2, 23, 56), time.Date(2026, 11, 3, 0, 3, 30, 0, time.Local)},
+		{"14:00", at(2, 12, 0), at(2, 14, 0)},
+		{"21:00", at(2, 8, 0), at(2, 21, 0)},
+		{"23:59", at(3, 0, 1), at(3, 23, 59)},
+		{"07:00", at(2, 20, 0), at(3, 7, 0)},
+		{"03.11 00:03", at(2, 23, 56), at(3, 0, 3)},
+	} {
+		got, err := waitUntil(c.arg, c.now)
+		if err != nil || !got.Equal(c.want) {
+			t.Errorf("waitUntil(%q, %s) = %s, %v; want %s", c.arg, c.now, got, err, c.want)
+		}
+	}
+	for _, c := range []struct {
+		arg  string
+		now  time.Time
+		want string
+	}{
+		{"12:00", at(2, 12, 5), "already past"},
+		{"07:00", at(2, 8, 0), "already past"},
+		{"02.11 00:03", at(2, 23, 56), "already past"},
+		{"5m", at(2, 23, 56), "ago"},
+	} {
+		if got, err := waitUntil(c.arg, c.now); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("waitUntil(%q, %s) = %s, %v; want an error with %q", c.arg, c.now, got, err, c.want)
+		}
+	}
+}
+
+func TestWaitUntilAcrossDaylightSaving(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal("zone data:", err)
+	}
+	// The clocks go back at 03:00 on 2026-10-25, between today's 00:30 and tomorrow's:
+	// tomorrow's 00:30 is 25 hours on, and a plain 24 hours would give 23:30, already past.
+	now := time.Date(2026, 10, 25, 23, 50, 0, 0, loc)
+	got, err := waitUntil("00:30", now)
+	if want := time.Date(2026, 10, 26, 0, 30, 0, 0, loc); err != nil || !got.Equal(want) {
+		t.Fatalf("waitUntil = %s, %v; want %s", got, err, want)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +30,9 @@ Conditions:
   gone PATH       PATH does not exist
   line RE FILE    a line of FILE matches RE (Go regexp); FILE may not exist yet
   exit PID...     the processes have exited (any processes, not only children)
-  time T          local time T: 14:45, "26.10 09:00", 2026-10-26T09:00:00Z
+  time T          local time T: 14:45, "26.10 09:00", 2026-10-26T09:00:00Z; a clock
+                  time already past today is tomorrow's when that is nearer
+                  (00:03 at 23:56), otherwise refused
   ok CMD          bash -c CMD exits 0 (one string; run every 10s, or --every);
                   its process group is killed when it exits and on timeout;
                   a process that leaves the group (setsid, a daemon) keeps running
@@ -207,13 +210,9 @@ func (p *parsed) build(s []string, now func() time.Time) (cond, error) {
 		}
 		return newExitCond(pids)
 	case "time":
-		at, err := timearg.Parse(s[1], now())
+		at, err := waitUntil(s[1], now())
 		if err != nil {
 			return nil, err
-		}
-		if !at.After(now()) {
-			return nil, fmt.Errorf("time %q is already past (%s); time takes a clock time, for a pause use sleep", s[1],
-				at.Format("02.01 15:04:05"))
 		}
 		return &timeCond{at: at, now: now}, nil
 	case "ok":
@@ -324,4 +323,34 @@ func since(start time.Time) string {
 		return d.Round(100 * time.Millisecond).String()
 	}
 	return d.Round(time.Second).String()
+}
+
+// clockArg is a clock time without a date (00:03, 12:05:30); agoArg is timearg's "N units ago" form.
+var (
+	clockArg = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
+	agoArg   = regexp.MustCompile(`^[0-9]{1,6}[smhd]$`)
+)
+
+// waitUntil reads the time a time condition waits for. A clock time without a date
+// is its occurrence nearest to now: 00:03 at 23:56 is tomorrow, 12:00 at 12:05 is
+// five minutes ago and refused. Anything not after now is refused.
+func waitUntil(arg string, now time.Time) (time.Time, error) {
+	at, err := timearg.Parse(arg, now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	s := strings.TrimSpace(arg)
+	if !at.After(now) && clockArg.MatchString(s) {
+		if next := at.AddDate(0, 0, 1); next.Sub(now) < now.Sub(at) {
+			at = next
+		}
+	}
+	if at.After(now) {
+		return at, nil
+	}
+	if agoArg.MatchString(s) {
+		return time.Time{}, fmt.Errorf("time %q reads as %s ago (%s); time takes a clock time or a date, such as 00:03 or \"03.11 00:03\"",
+			arg, s, at.Format("02.01 15:04:05"))
+	}
+	return time.Time{}, fmt.Errorf("time %q is already past (%s); time takes a clock time or a date in the future", arg, at.Format("02.01 15:04:05"))
 }
