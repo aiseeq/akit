@@ -88,3 +88,65 @@ func TestReadApprovedBadLines(t *testing.T) {
 		})
 	}
 }
+
+func approvalsFrom(t *testing.T, data string) Approvals {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "approvals.tsv")
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	approvals, err := ReadApproved(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return approvals
+}
+
+// The server reports one window with seconds that drift by one; across a minute
+// boundary that must still match the approval line.
+func TestApprovalsForAcrossMinuteBoundary(t *testing.T) {
+	approvals := approvalsFrom(t, "2026-11-09T18:41:59+01:00\tsynthetic source\n")
+	for _, at := range []time.Time{
+		time.Date(2026, 11, 9, 17, 41, 59, 0, time.UTC),
+		time.Date(2026, 11, 9, 17, 42, 0, 0, time.UTC),
+		time.Date(2026, 11, 9, 18, 42, 1, 0, time.FixedZone("synthetic", 3600)),
+		time.Date(2026, 11, 9, 17, 41, 58, 0, time.UTC),
+	} {
+		if source, ok := approvals.For(at); !ok || source != "synthetic source" {
+			t.Fatalf("For(%s) = %q, %v", at, source, ok)
+		}
+	}
+	reverse := approvalsFrom(t, "2026-11-09T17:42:00Z\tsynthetic source\n")
+	if source, ok := reverse.For(time.Date(2026, 11, 9, 17, 41, 59, 0, time.UTC)); !ok || source != "synthetic source" {
+		t.Fatalf("For one second before the line = %q, %v", source, ok)
+	}
+}
+
+func TestApprovalsForToleranceEdge(t *testing.T) {
+	approvals := approvalsFrom(t, "2026-11-09T17:42:00Z\tsynthetic source\n")
+	line := time.Date(2026, 11, 9, 17, 42, 0, 0, time.UTC)
+	for _, at := range []time.Time{line.Add(ApprovalTolerance), line.Add(-ApprovalTolerance), line.Add(ApprovalTolerance + time.Second), line.Add(72 * time.Hour)} {
+		if source, ok := approvals.For(at); ok {
+			t.Fatalf("For(%s) = %q, want no match", at, source)
+		}
+	}
+	if _, ok := approvals.For(line.Add(ApprovalTolerance - time.Nanosecond)); !ok {
+		t.Fatal("just inside the tolerance must match")
+	}
+}
+
+func TestApprovalsForNearestLine(t *testing.T) {
+	approvals := approvalsFrom(t, "2026-11-09T17:42:00Z\tfirst\n2026-11-09T17:42:40Z\tsecond\n")
+	at := time.Date(2026, 11, 9, 17, 42, 30, 0, time.UTC)
+	for range 50 { // map order is random: the nearest must win every time
+		if source, ok := approvals.For(at); !ok || source != "second" {
+			t.Fatalf("For(%s) = %q, %v; want second", at, source, ok)
+		}
+	}
+	tie := time.Date(2026, 11, 9, 17, 42, 20, 0, time.UTC)
+	for range 50 {
+		if source, ok := approvals.For(tie); !ok || source != "first" {
+			t.Fatalf("For(%s) = %q, %v; want the earlier line on a tie", tie, source, ok)
+		}
+	}
+}
