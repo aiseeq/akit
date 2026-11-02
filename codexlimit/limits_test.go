@@ -3,6 +3,7 @@ package codexlimit
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +36,6 @@ func TestAppServerHelper(t *testing.T) {
 	want := []string{
 		`{"id":1,"method":"initialize","params":{"clientInfo":{"name":"akit","title":"akit","version":"0"}}}`,
 		`{"method":"initialized"}`,
-		`{"id":2,"method":"account/rateLimits/read"}`,
 	}
 	r := bufio.NewReader(os.Stdin)
 	for _, expected := range want {
@@ -45,10 +45,45 @@ func TestAppServerHelper(t *testing.T) {
 			os.Exit(3)
 		}
 	}
+	request, err := r.ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "could not read request (error %v)\n", err)
+		os.Exit(3)
+	}
+	if strings.HasPrefix(scenario, "consume") {
+		var got struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+			Params struct {
+				CreditID   *string `json:"creditId"`
+				RequestKey string  `json:"idempotencyKey"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(request), &got); err != nil || got.ID != 2 || got.Method != "account/rateLimitResetCredit/consume" || got.Params.RequestKey != os.Getenv("CODEXLIMIT_KEY") {
+			fmt.Fprintf(os.Stderr, "unexpected consume request %q (error %v)\n", request, err)
+			os.Exit(3)
+		}
+		var raw struct {
+			Params map[string]json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(request), &raw); err != nil {
+			fmt.Fprintf(os.Stderr, "consume request params %q: %v\n", request, err)
+			os.Exit(3)
+		}
+		_, hasCredit := raw.Params["creditId"]
+		wantCredit := os.Getenv("CODEXLIMIT_CREDIT")
+		if wantCredit == "" && hasCredit || wantCredit != "" && (got.Params.CreditID == nil || *got.Params.CreditID != wantCredit) {
+			fmt.Fprintf(os.Stderr, "unexpected creditId in consume request %q\n", request)
+			os.Exit(3)
+		}
+	} else if strings.TrimSuffix(request, "\n") != `{"id":2,"method":"account/rateLimits/read"}` {
+		fmt.Fprintf(os.Stderr, "unexpected request %q\n", request)
+		os.Exit(3)
+	}
 	if scenario == "closed" {
 		os.Exit(0)
 	}
-	if scenario == "deadline" {
+	if scenario == "deadline" || scenario == "consume-deadline" {
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
 	}
@@ -56,6 +91,13 @@ func TestAppServerHelper(t *testing.T) {
 		os.Exit(5)
 	}
 	os.Exit(0)
+}
+
+func consumeCommand(t *testing.T, response, key, credit string) *exec.Cmd {
+	t.Helper()
+	cmd := helperCommand(t, "consume", response)
+	cmd.Env = append(cmd.Env, "CODEXLIMIT_KEY="+key, "CODEXLIMIT_CREDIT="+credit)
+	return cmd
 }
 
 func TestReadParsesFullAnswer(t *testing.T) {
@@ -149,5 +191,85 @@ func TestReadSkipsNotificationsAndForeignIDs(t *testing.T) {
 	}
 	if got.AccountID != "synthetic-account" {
 		t.Fatalf("limits: %+v", got)
+	}
+}
+
+func TestConsumeOutcomes(t *testing.T) {
+	for _, outcome := range []Outcome{OutcomeReset, OutcomeNothingToReset, OutcomeNoCredit, OutcomeAlreadyRedeemed} {
+		t.Run(string(outcome), func(t *testing.T) {
+			response := fmt.Sprintf(`{"id":2,"result":{"outcome":%q}}`, outcome)
+			got, err := Consume(context.Background(), consumeCommand(t, response, "synthetic-key", ""), "synthetic-key", "")
+			if err != nil || got != outcome {
+				t.Fatalf("Consume = %q, %v; want %q", got, err, outcome)
+			}
+		})
+	}
+}
+
+func TestConsumeRequestWithCredit(t *testing.T) {
+	got, err := Consume(context.Background(), consumeCommand(t, `{"id":2,"result":{"outcome":"reset"}}`, "synthetic-key", "synthetic-credit"), "synthetic-key", "synthetic-credit")
+	if err != nil || got != OutcomeReset {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+}
+
+func TestConsumeRequestWithoutCredit(t *testing.T) {
+	got, err := Consume(context.Background(), consumeCommand(t, `{"id":2,"result":{"outcome":"noCredit"}}`, "synthetic-key", ""), "synthetic-key", "")
+	if err != nil || got != OutcomeNoCredit {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+}
+
+func TestConsumeUnknownOutcome(t *testing.T) {
+	got, err := Consume(context.Background(), consumeCommand(t, `{"id":2,"result":{"outcome":"unknown"}}`, "synthetic-key", ""), "synthetic-key", "")
+	if err == nil || !strings.Contains(err.Error(), "unknown outcome") || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+}
+
+func TestConsumeNoOutcome(t *testing.T) {
+	got, err := Consume(context.Background(), consumeCommand(t, `{"id":2,"result":{}}`, "synthetic-key", ""), "synthetic-key", "")
+	if err == nil || !strings.Contains(err.Error(), "no outcome") || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+}
+
+func TestConsumeAnswerError(t *testing.T) {
+	got, err := Consume(context.Background(), consumeCommand(t, `{"id":2,"error":{"message":"synthetic consume failure"}}`, "synthetic-key", ""), "synthetic-key", "")
+	if err == nil || !strings.Contains(err.Error(), "codexlimit: synthetic consume failure") || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+}
+
+func TestConsumeEmptyKey(t *testing.T) {
+	cmd := helperCommand(t, "consume", `{"id":2,"result":{"outcome":"reset"}}`)
+	got, err := Consume(context.Background(), cmd, "", "synthetic-credit")
+	if err == nil || !strings.Contains(err.Error(), "idempotency key is empty") || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+	if cmd.Process != nil {
+		t.Fatal("app-server was started for an empty key")
+	}
+}
+
+func TestConsumeContextDeadlineKillsServer(t *testing.T) {
+	cmd := helperCommand(t, "consume-deadline", "")
+	cmd.Env = append(cmd.Env, "CODEXLIMIT_KEY=synthetic-key", "CODEXLIMIT_CREDIT=")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	got, err := Consume(ctx, cmd, "synthetic-key", "")
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Consume took %v", elapsed)
+	}
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "context deadline exceeded") || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("server process was not waited for")
+	}
+	pid := cmd.Process.Pid
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("server process %d is still present (kill probe: %v)", pid, err)
 	}
 }

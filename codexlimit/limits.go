@@ -35,37 +35,52 @@ type Limits struct {
 }
 
 type answer struct {
-	ID     int `json:"id"`
-	Result *struct {
-		OrdinaryUsageAllowed bool `json:"ordinaryUsageAllowed"`
-		RateLimits           struct {
-			Primary *struct {
-				UsedPercent        float64 `json:"usedPercent"`
-				WindowDurationMins int     `json:"windowDurationMins"`
-				ResetsAt           int64   `json:"resetsAt"`
-			} `json:"primary"`
-			PlanType string `json:"planType"`
-		} `json:"rateLimits"`
-		AccountID string `json:"accountId"`
-		Resets    Resets `json:"rateLimitResetCredits"`
-	} `json:"result"`
-	Error *struct {
+	ID     int           `json:"id"`
+	Result *answerResult `json:"result"`
+	Error  *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
+type answerResult struct {
+	OrdinaryUsageAllowed bool `json:"ordinaryUsageAllowed"`
+	RateLimits           struct {
+		Primary *struct {
+			UsedPercent        float64 `json:"usedPercent"`
+			WindowDurationMins int     `json:"windowDurationMins"`
+			ResetsAt           int64   `json:"resetsAt"`
+		} `json:"primary"`
+		PlanType string `json:"planType"`
+	} `json:"rateLimits"`
+	AccountID string   `json:"accountId"`
+	Resets    Resets   `json:"rateLimitResetCredits"`
+	Outcome   *Outcome `json:"outcome"`
+}
+
+const initializeRequests = "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"akit\",\"title\":\"akit\",\"version\":\"0\"}}}\n" +
+	"{\"method\":\"initialized\"}\n"
+
 // Read starts cmd, reads the weekly account limits, and stops the app server.
-func Read(ctx context.Context, cmd *exec.Cmd) (limits Limits, retErr error) {
+func Read(ctx context.Context, cmd *exec.Cmd) (Limits, error) {
+	response, err := exchange(ctx, cmd, `{"id":2,"method":"account/rateLimits/read"}`)
+	if err != nil {
+		return Limits{}, err
+	}
+	return parseAnswer(response)
+}
+
+// exchange sends an app-server request and returns its answer, stopping cmd on every started path.
+func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response answer, retErr error) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return Limits{}, fmt.Errorf("codexlimit: stdin pipe: %w", err)
+		return answer{}, fmt.Errorf("codexlimit: stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		if closeErr := stdin.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close stdin pipe: %w", closeErr))
 		}
-		return Limits{}, fmt.Errorf("codexlimit: stdout pipe: %w", err)
+		return answer{}, fmt.Errorf("codexlimit: stdout pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
 		if closeErr := stdin.Close(); closeErr != nil {
@@ -74,13 +89,13 @@ func Read(ctx context.Context, cmd *exec.Cmd) (limits Limits, retErr error) {
 		if closeErr := stdout.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close stdout pipe: %w", closeErr))
 		}
-		return Limits{}, fmt.Errorf("codexlimit: start app-server: %w", err)
+		return answer{}, fmt.Errorf("codexlimit: start app-server: %w", err)
 	}
 	scanCtx, cancelScan := context.WithCancel(ctx)
 	defer cancelScan()
 	defer func() {
 		if err := stop(cmd, stdin); err != nil {
-			limits = Limits{}
+			response = answer{}
 			if retErr == nil {
 				retErr = err
 			} else {
@@ -89,17 +104,24 @@ func Read(ctx context.Context, cmd *exec.Cmd) (limits Limits, retErr error) {
 		}
 	}()
 
-	requests := "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"akit\",\"title\":\"akit\",\"version\":\"0\"}}}\n" +
-		"{\"method\":\"initialized\"}\n" +
-		"{\"id\":2,\"method\":\"account/rateLimits/read\"}\n"
+	requests := initializeRequests + request + "\n"
 	if _, err := io.WriteString(stdin, requests); err != nil {
-		return Limits{}, fmt.Errorf("codexlimit: write requests: %w", err)
+		return answer{}, fmt.Errorf("codexlimit: write requests: %w", err)
 	}
-
-	return readLimits(ctx, stdout, scanCtx)
+	a, err := readAnswer(ctx, stdout, scanCtx)
+	if err != nil {
+		return answer{}, err
+	}
+	if a.Error != nil {
+		return answer{}, fmt.Errorf("codexlimit: %s", strings.TrimSpace(a.Error.Message))
+	}
+	if a.Result == nil {
+		return answer{}, errors.New("codexlimit: answer has no result")
+	}
+	return a, nil
 }
 
-func readLimits(ctx context.Context, stdout io.Reader, scanCtx context.Context) (Limits, error) {
+func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context) (answer, error) {
 	type scanResult struct {
 		line []byte
 		err  error
@@ -125,19 +147,19 @@ func readLimits(ctx context.Context, stdout io.Reader, scanCtx context.Context) 
 	for {
 		select {
 		case <-ctx.Done():
-			return Limits{}, fmt.Errorf("codexlimit: no answer before context ended: %w", ctx.Err())
+			return answer{}, fmt.Errorf("codexlimit: no answer before context ended: %w", ctx.Err())
 		case got := <-lines:
 			if got.err != nil {
-				return Limits{}, fmt.Errorf("codexlimit: read app-server output: %w", got.err)
+				return answer{}, fmt.Errorf("codexlimit: read app-server output: %w", got.err)
 			}
 			if got.line == nil {
-				return Limits{}, errors.New("codexlimit: app-server closed stdout without an answer")
+				return answer{}, errors.New("codexlimit: app-server closed stdout without an answer")
 			}
 			var a answer
 			if json.Unmarshal(got.line, &a) != nil || a.ID != 2 {
 				continue
 			}
-			return parseAnswer(a)
+			return a, nil
 		}
 	}
 }
@@ -158,12 +180,6 @@ func stop(cmd *exec.Cmd, stdin io.Closer) error {
 }
 
 func parseAnswer(a answer) (Limits, error) {
-	if a.Error != nil {
-		return Limits{}, fmt.Errorf("codexlimit: %s", strings.TrimSpace(a.Error.Message))
-	}
-	if a.Result == nil {
-		return Limits{}, errors.New("codexlimit: answer has no result")
-	}
 	if a.Result.RateLimits.Primary == nil {
 		return Limits{}, errors.New("codexlimit: answer has no primary rate limit")
 	}
