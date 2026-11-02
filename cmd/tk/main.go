@@ -118,6 +118,9 @@ func main() {
 		fmt.Print(usage)
 		return
 	}
+	if e == nil {
+		e = validateApproxTime(o, time.Now())
+	}
 	if e != nil {
 		fmt.Fprintf(os.Stderr, "tk: %v\n(tk -h for usage)\n", e)
 		os.Exit(exitUsage)
@@ -166,6 +169,33 @@ func validateOneLine(o options) error {
 	}
 	return nil
 }
+
+// validateApproxTime — «~03:00» в тексте журнала позже метки записи — угаданное будущее время: запись пишется
+// сейчас, и её метка уже точная. Сравнение — по кругу суток: «~00:05» в 23:58 — тоже будущее, «~23:50» в 00:05 —
+// прошлое; будущим считается сдвиг больше минуты и меньше 12 часов.
+func validateApproxTime(o options, now time.Time) error {
+	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}} {
+		for _, m := range approxTime.FindAllStringSubmatch(f.value, -1) {
+			if m[1] != "" && m[1] != now.Format("02.01") && m[1] != now.Format("2006-01-02") {
+				continue // время другого дня
+			}
+			h, _ := strconv.Atoi(m[2])
+			mi, _ := strconv.Atoi(m[3])
+			at := time.Date(now.Year(), now.Month(), now.Day(), h, mi, 0, 0, now.Location())
+			ahead := at.Sub(now.Truncate(time.Minute)) % (24 * time.Hour)
+			if ahead < 0 {
+				ahead += 24 * time.Hour
+			}
+			if ahead > time.Minute && ahead < 12*time.Hour {
+				return fmt.Errorf("%s: %q is later than the entry time %s; the time of the entry is its journal stamp, write the exact time from date or drop it", f.flag, "~"+m[2]+":"+m[3], now.Format("15:04"))
+			}
+		}
+	}
+	return nil
+}
+
+// approxTime — «~ЧЧ:ММ», приблизительное время в тексте, с датой перед ним, если она есть («31.10 ~03:00»).
+var approxTime = regexp.MustCompile(`(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?~\s?([01]\d|2[0-3]):([0-5]\d)(?:$|[^0-9])`)
 
 // guessedTime — время суток с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные
 // классы: \b в regexp Go знает только ASCII-буквы. Справа не ASCII-буква и не цифра: «06:4xМСК» — время,

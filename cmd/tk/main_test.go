@@ -1538,3 +1538,30 @@ func TestJournalTextRejectsGuessedTime(t *testing.T) {
 		}
 	}
 }
+
+// «~ЧЧ:ММ» позже метки записи — угаданное будущее время; раньше или в пределах минуты — проходит.
+func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
+	now := time.Date(2026, 11, 2, 2, 54, 30, 0, time.Local)
+	for _, c := range []struct {
+		text string
+		bad  bool
+	}{
+		{"сдано ~03:00", true},
+		{"сдано ~ 03:00", true},
+		{"сдано ~02:55", false},
+		{"сдано ~02:40", false},
+		{"сдано 03:00", false},
+		{"вчера ~23:50", false},
+		{"31.10 ~03:00 упало", false},
+		{"02.11 ~03:00 упало", true},
+	} {
+		err := validateApproxTime(options{note: c.text}, now)
+		if (err != nil) != c.bad || (err != nil && !strings.Contains(err.Error(), "time of the entry")) {
+			t.Errorf("%q: %v", c.text, err)
+		}
+	}
+	late := time.Date(2026, 11, 2, 23, 58, 0, 0, time.Local)
+	if validateApproxTime(options{check: "прошло ~00:05"}, late) == nil {
+		t.Error("~00:05 at 23:58 is the next day, later than the entry")
+	}
+}
