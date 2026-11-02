@@ -65,7 +65,7 @@ Flags:
   --why TEXT     reject: why the ticket was declined; skip: why the plan item is skipped (required)
   --add TEXT     plan: add a named command to the ticket plan (required)
   --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command; command syntax is checked with bash -n
-  --repin TEXT   plan: replace a required command from another session; the session and old/new commands are recorded in the journal
+  --repin TEXT   plan: replace a required command from another session; current and previous executors and pin authors are refused; the session and old/new commands are journaled
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
 
@@ -96,6 +96,7 @@ var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:пла�
 // planAddRE — строка журнала tk plan --add; «обязательный» — с --required, тогда после имени — команда пункта.
 var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
 var planRepinRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): перезакреплён обязательный пункт ([a-z0-9-]+): (.+) → (.+) — (.+)$`)
+var executorHistoryRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:в работе|на проверке) — (\S+)(?:$| — )`)
 
 // requiredMentionRE — запись «обязательный» где угодно в тексте, без привязки к строке: сверка с целыми строками
 // журнала ловит запись, спрятанную склейкой или невидимым символом.
@@ -1587,6 +1588,10 @@ func repinPlanItem(t task, o options, out, errout io.Writer) int {
 	if err != nil {
 		return fail(errout, err)
 	}
+	if requiredMentionRE.MatchString(command) || requiredMentionRE.MatchString(o.why) {
+		fmt.Fprintln(errout, "tk: --repin command and reason cannot contain a required plan journal record")
+		return exitUsage
+	}
 	if err := checkPlanSyntax(command); err != nil {
 		fmt.Fprintf(errout, "tk: repinned command has invalid bash syntax: %v\n", err)
 		return exitUsage
@@ -1614,8 +1619,7 @@ func repinPlanItem(t task, o options, out, errout io.Writer) int {
 		return exitUsage
 	}
 	body = journal(body, entry)
-	updatedPin := requiredPlan(body)[name]
-	if updatedPin.conflict || updatedPin.cmd != command {
+	if !requiredPlanAfterRepin(t.body, body, name, command) {
 		fmt.Fprintf(errout, "tk: required plan item %q would be edited by hand\n", name)
 		return exitUsage
 	}
@@ -1631,6 +1635,9 @@ func checkRepinPermission(body, name, currentSession string) error {
 		return errors.New("the ticket executor cannot repin its required plan item")
 	}
 	for _, line := range strings.FieldsFunc(body, isLineEnd) {
+		if m := executorHistoryRE.FindStringSubmatch(line); m != nil && strings.EqualFold(m[1], currentSession) {
+			return errors.New("a current or previous executor cannot repin a required plan item")
+		}
 		if m := planAddRE.FindStringSubmatch(line); m != nil && m[2] != "" && m[3] == name && strings.EqualFold(m[1], currentSession) {
 			return errors.New("the author of a required pin cannot repin it")
 		}
@@ -1663,6 +1670,33 @@ func checkRepinPlanItem(body, name, command string) (requiredPin, error) {
 		return requiredPin{}, fmt.Errorf("required plan item %q is missing from ## План", name)
 	}
 	return pin, nil
+}
+
+func requiredPlanAfterRepin(before, after, name, command string) bool {
+	oldPins, newPins := requiredPlan(before), requiredPlan(after)
+	oldPin, existed := oldPins[name]
+	newPin, exists := newPins[name]
+	if !existed || oldPin.conflict || !exists || newPin.conflict || newPin.cmd != command {
+		return false
+	}
+	for pinName, old := range oldPins {
+		if pinName == name {
+			continue
+		}
+		next, ok := newPins[pinName]
+		if !ok || next != old || next.conflict {
+			return false
+		}
+	}
+	for pinName, next := range newPins {
+		if pinName == name {
+			continue
+		}
+		if old, ok := oldPins[pinName]; !ok || next != old {
+			return false
+		}
+	}
+	return true
 }
 
 func repinJournalEntry(stamp, currentSession, name, oldCommand, newCommand, why string) (string, error) {
