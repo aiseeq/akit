@@ -178,12 +178,12 @@ func validateOneLine(o options) error {
 func validateApproxTime(o options, now time.Time) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}} {
 		found := approxTime.FindAllStringSubmatchIndex(f.value, -1)
-		if ix := leadingTime.FindStringSubmatchIndex(f.value); ix != nil {
-			found = append(found, ix)
+		if ix := leadingTime.FindStringSubmatchIndex(f.value); ix != nil && !timeRange.MatchString(f.value[ix[1]:]) {
+			found = append(found, ix) // промежуток в начале («17:40-18:00 окно») — план, не метка
 		}
 		for _, ix := range found {
-			if end := ix[1]; end < len(f.value) && strings.ContainsRune("0123456789-–", rune(f.value[end])) {
-				continue // не время («~03:001») или промежуток в начале («17:40-18:00»)
+			if end := ix[1]; end < len(f.value) && f.value[end] >= '0' && f.value[end] <= '9' {
+				continue // не время: «~03:001»
 			}
 			if err := futureTime(f.flag, f.value, ix, now); err != nil {
 				return err
@@ -227,7 +227,10 @@ func futureTime(flag, value string, ix []int, now time.Time) error {
 var approxTime = regexp.MustCompile(`(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?~\s?([01]\d|2[0-3]):([0-5]\d)`)
 
 // leadingTime — время в начале текста, с датой перед ним, если она есть («02.11 03:12: …»).
-var leadingTime = regexp.MustCompile(`^\s*(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?([01]\d|2[0-3]):([0-5]\d)`)
+var leadingTime = regexp.MustCompile(`^[\s\p{Zs}]*(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)[\s\p{Zs}]+)?([01]\d|2[0-3]):([0-5]\d)`)
+
+// timeRange — продолжение промежутка после времени: «-18:00», « – 18:00».
+var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*\d`)
 
 // guessedTime — время суток с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные
 // классы: \b в regexp Go знает только ASCII-буквы. Справа не ASCII-буква и не цифра: «06:4xМСК» — время,
