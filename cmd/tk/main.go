@@ -212,12 +212,9 @@ func futureTime(flag, value string, ix []int, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("%s: minute %q: %w", flag, m[3], err)
 	}
-	at := time.Date(now.Year(), now.Month(), now.Day(), h, mi, 0, 0, now.Location())
-	ahead := at.Sub(now.Truncate(time.Minute)) % (24 * time.Hour)
-	if ahead < 0 {
-		ahead += 24 * time.Hour
-	}
-	if ahead > time.Minute && ahead < 12*time.Hour {
+	// По часам на стене, не по длительности: в день перевода часов сутки не 24 часа.
+	ahead := ((h*60+mi-now.Hour()*60-now.Minute())%1440 + 1440) % 1440
+	if ahead > 1 && ahead < 12*60 {
 		return fmt.Errorf("%s: %q is later than the entry time %s; the time of the entry is its journal stamp, write the exact time from date or drop it", flag, strings.TrimSpace(value[ix[0]:ix[1]]), now.Format("15:04"))
 	}
 	return nil
@@ -230,7 +227,7 @@ var approxTime = regexp.MustCompile(`(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?~\s?([0
 var leadingTime = regexp.MustCompile(`^[\s\p{Zs}]*(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)[\s\p{Zs}]+)?([01]\d|2[0-3]):([0-5]\d)`)
 
 // timeRange — продолжение промежутка после времени: «-18:00», « – 18:00».
-var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*\d`)
+var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*\d{1,2}:\d\d`)
 
 // guessedTime — время суток с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные
 // классы: \b в regexp Go знает только ASCII-буквы. Справа не ASCII-буква и не цифра: «06:4xМСК» — время,

@@ -1571,6 +1571,7 @@ func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
 		{" 03:00 проверка", true},
 		{"2026-11-02 03:00 проверка", true},
 		{"03:00 — сдано", true},
+		{"03:00 — 2 проверки", true},
 		{"ждёт до 03:00", false},
 		{"03:001", false},
 	} {
@@ -1578,6 +1579,14 @@ func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
 		if (err != nil) != c.bad || (err != nil && !strings.Contains(err.Error(), "time of the entry")) {
 			t.Errorf("%q: %v", c.text, err)
 		}
+	}
+	zone, err := time.LoadLocation("Europe/Belgrade")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// день перевода часов: 23 часа в сутках, «00:00» в 12:30 — по стене на 11:30 впереди
+	if validateApproxTime(options{note: "00:00 проверка"}, time.Date(2026, 3, 29, 12, 30, 0, 0, zone)) == nil {
+		t.Error("00:00 at 12:30 on a clock-change day is ahead by wall clock")
 	}
 	late := time.Date(2026, 11, 2, 23, 58, 0, 0, time.Local)
 	if validateApproxTime(options{check: "прошло ~00:05"}, late) == nil {
