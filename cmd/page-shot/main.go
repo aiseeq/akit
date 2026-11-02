@@ -1,6 +1,6 @@
 // page-shot снимает кадры HTML-страницы в headless Chrome на нескольких окнах
 // и полную высоту, чтобы страницу смотрели глазами до публикации, и на каждом
-// окне проверяет горизонтальный скролл и наложение подписей друг на друга:
+// окне проверяет горизонтальный скролл, наложение подписей и выравнивание значков:
 // что-то из этого есть - код выхода 2.
 package main
 
@@ -49,7 +49,7 @@ var viewports = []viewport{
 }
 
 // Коды выхода: 1 - съёмка не удалась, 2 - кадры сняты, но есть горизонтальный
-// скролл или наложение подписей.
+// скролл, наложение подписей или неверное выравнивание значков.
 const (
 	exitError  = 1
 	exitLayout = 2
@@ -58,13 +58,14 @@ const (
 var (
 	errOverflow = errors.New("горизонтальный скролл")
 	errOverlap  = errors.New("наложение подписей")
+	errAlign    = errors.New("значки не выровнены с текстом")
 )
 
 func main() {
 	err := run()
 	switch {
 	case err == nil:
-	case errors.Is(err, errOverflow), errors.Is(err, errOverlap):
+	case errors.Is(err, errOverflow), errors.Is(err, errOverlap), errors.Is(err, errAlign):
 		fmt.Fprintln(os.Stderr, "page-shot:", err)
 		os.Exit(exitLayout)
 	default:
@@ -79,7 +80,7 @@ func run() error {
 		fmt.Fprintln(fs.Output(), "usage: page-shot [--at 2s,6s] [--out DIR] [--element CSS] <file.html|URL>")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "--element: только окно 1536x860@1.25, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.")
-		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл или подписи наложились, подробности в stderr.")
+		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей или значок не выровнен с текстом; подробности в stderr.")
 	}
 	at := fs.String("at", "1s", "моменты съёмки после загрузки через запятую (анимация - несколько)")
 	out := fs.String("out", "", "папка кадров (по умолчанию <файл>-shots рядом со страницей)")
@@ -126,7 +127,7 @@ func run() error {
 	if *selector != "" {
 		return shootElements(allocCtx, target, dir, *selector, moments[len(moments)-1])
 	}
-	var overflowed, overlapped []string
+	var overflowed, overlapped, misaligned []string
 	for _, vp := range viewports {
 		lay, err := shoot(allocCtx, target, dir, vp, moments)
 		if err != nil {
@@ -140,6 +141,10 @@ func run() error {
 			fmt.Fprint(os.Stderr, lay.overlap.report(vp.name()))
 			overlapped = append(overlapped, vp.name())
 		}
+		if lay.align != nil {
+			fmt.Fprint(os.Stderr, lay.align.report(vp.name()))
+			misaligned = append(misaligned, vp.name())
+		}
 	}
 	var errs []error
 	if len(overflowed) > 0 {
@@ -148,13 +153,17 @@ func run() error {
 	if len(overlapped) > 0 {
 		errs = append(errs, fmt.Errorf("%w на окнах %s", errOverlap, strings.Join(overlapped, ", ")))
 	}
+	if len(misaligned) > 0 {
+		errs = append(errs, fmt.Errorf("%w на окнах %s", errAlign, strings.Join(misaligned, ", ")))
+	}
 	return errors.Join(errs...)
 }
 
-// layout - находки раскладки на окне: переполнение по ширине и наложение подписей.
+// layout - находки раскладки на окне.
 type layout struct {
 	overflow *overflow
 	overlap  *overlapResult
+	align    *alignResult
 }
 
 // shoot открывает страницу заново на каждом окне: анимация и раскладка идут с нуля.
@@ -191,6 +200,9 @@ func shoot(allocCtx context.Context, target, dir string, vp viewport, moments []
 				return layout{}, err
 			}
 			if lay.overlap, err = checkOverlap(tabCtx); err != nil {
+				return layout{}, err
+			}
+			if lay.align, err = checkAlign(tabCtx); err != nil {
 				return layout{}, err
 			}
 			buf, err := chromedp.Run(tabCtx, chromedp.FullScreenshot(100))

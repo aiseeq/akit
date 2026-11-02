@@ -2,13 +2,7 @@ package main
 
 import (
 	"context"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
-	"time"
-
-	"github.com/chromedp/chromedp"
 )
 
 // Страницы-примеры: в первых двух подпись закрыта другой, в третьей тексты
@@ -42,48 +36,17 @@ const (
 )
 
 func TestCheckOverlap(t *testing.T) {
-	if _, err := exec.LookPath("google-chrome"); err != nil {
-		if _, err := exec.LookPath("chromium-browser"); err != nil {
-			t.Skip("нет Chrome для headless-съёмки")
+	allocCtx := newLayoutTestBrowser(t)
+	cases := []layoutTestCase{
+		{name: "svg", html: svgOverlap, pairs: 1},
+		{name: "html", html: htmlOverlap, pairs: 1},
+		{name: "clean", html: clean, pairs: 0},
+	}
+	testLayoutCases(t, allocCtx, cases, func(ctx context.Context) (int, string, error) {
+		res, err := checkOverlap(ctx)
+		if err != nil || res == nil {
+			return 0, "", err
 		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, chromedp.DefaultExecAllocatorOptions[:]...)
-	defer cancelAlloc()
-
-	cases := []struct {
-		name, html string
-		pairs      int
-	}{
-		{"svg", svgOverlap, 1},
-		{"html", htmlOverlap, 1},
-		{"clean", clean, 0},
-	}
-	dir := t.TempDir()
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			path := filepath.Join(dir, c.name+".html")
-			if err := os.WriteFile(path, []byte(c.html), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			tabCtx, cancelTab := chromedp.NewContext(allocCtx)
-			defer cancelTab()
-			if err := chromedp.Do(tabCtx, chromedp.EmulateViewport(800, 600), chromedp.Navigate("file://"+path)); err != nil {
-				t.Fatal(err)
-			}
-			res, err := checkOverlap(tabCtx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got := 0
-			if res != nil {
-				got = len(res.Pairs)
-				t.Log(res.report("800x600"))
-			}
-			if got != c.pairs {
-				t.Fatalf("пар наложения: %d, ждали %d", got, c.pairs)
-			}
-		})
-	}
+		return len(res.Pairs), res.report("800x600"), nil
+	}, "пар наложения")
 }
