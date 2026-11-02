@@ -99,7 +99,7 @@ var planRepinRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план 
 
 // requiredMentionRE — запись «обязательный» где угодно в тексте, без привязки к строке: сверка с целыми строками
 // журнала ловит запись, спрятанную склейкой или невидимым символом.
-var requiredMentionRE = regexp.MustCompile(`план — \S+: добавлен обязательный пункт ([a-z0-9-]+)`)
+var requiredMentionRE = regexp.MustCompile(`план — \S+: (?:добавлен|перезакреплён) обязательный пункт ([a-z0-9-]+)`)
 
 var errHelp = errors.New("help")
 var session = currentSession
@@ -1463,6 +1463,7 @@ func requiredPlan(body string) map[string]requiredPin {
 		}
 		if m := planRepinRE.FindStringSubmatch(l); m != nil {
 			name, old, next := m[2], m[3], m[4]
+			clean[name]++
 			p, ok := req[name]
 			if !ok || p.cmd != old || p.conflict {
 				req[name] = requiredPin{cmd: p.cmd, conflict: true}
@@ -1607,14 +1608,18 @@ func repinPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	oldLine := "- " + name + ": " + pin.cmd
 	newLine := "- " + name + ": " + command
-	var replaced bool
-	t.body, replaced = replacePlanLine(t.body, oldLine, newLine)
+	body, replaced := replacePlanLine(t.body, oldLine, newLine)
 	if !replaced {
 		fmt.Fprintf(errout, "tk: required plan item %q was edited by hand\n", name)
 		return exitUsage
 	}
-	t.body = journal(t.body, entry)
-	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
+	body = journal(body, entry)
+	updatedPin := requiredPlan(body)[name]
+	if updatedPin.conflict || updatedPin.cmd != command {
+		fmt.Fprintf(errout, "tk: required plan item %q would be edited by hand\n", name)
+		return exitUsage
+	}
+	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s plan repinned\n", t.slug)
@@ -1671,7 +1676,7 @@ func repinJournalEntry(stamp, currentSession, name, oldCommand, newCommand, why 
 			}
 		}
 	}
-	if len(delimiters) == 0 && match != nil && match[1] == currentSession && match[2] == name && match[3] == oldCommand && match[4] == newCommand && match[5] == why {
+	if match != nil && match[1] == currentSession && match[2] == name && match[3] == oldCommand && match[4] == newCommand && match[5] == why && !strings.Contains(why, " → ") {
 		return entry, nil
 	}
 	if len(delimiters) == 0 {

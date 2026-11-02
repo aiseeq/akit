@@ -1380,6 +1380,10 @@ func TestRequiredAddRefusesBadSyntax(t *testing.T) {
 		!strings.Contains(errOut.String(), "bash syntax") || read(t, path) != before {
 		t.Fatalf("bad required syntax: code %d, stderr %q", code, errOut.String())
 	}
+	if code := addPlanItem(task, options{by: "planner", add: "bad: cd <дерево> && true"}, &out, &errOut); code != 0 || !strings.Contains(read(t, path), "- bad: cd <дерево> && true") {
+		t.Fatalf("bad optional syntax should be added: code %d, stderr %q", code, errOut.String())
+	}
+	task.body = read(t, path)
 	for _, required := range []bool{false, true} {
 		name := "ok"
 		if required {
@@ -1416,12 +1420,18 @@ func TestRepinRefusedForExecutorAndAuthor(t *testing.T) {
 	}{
 		{"executor", "b", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n", "b", "elsewhere"},
 		{"pin author", "worker", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n", "a", "elsewhere"},
-		{"previous repin author", "worker", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n- 2020-01-01 12:01 план — b: перезакреплён обязательный пункт accept: false → echo ok — reason\n", "b", "elsewhere"},
+		{"previous repin author", "worker", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: echo ok\n- 2020-01-01 12:01 план — b: перезакреплён обязательный пункт accept: echo ok → echo ok | true — reason\n", "b", "elsewhere"},
 		{"by ignored", "b", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n", "b", "a"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task, path := repinFixture(t, tc.executor, tc.journal)
+			if tc.name == "previous repin author" {
+				task.body = strings.Replace(task.body, "- accept: false", "- accept: echo ok | true", 1)
+				if err := os.WriteFile(path, []byte(task.body), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
 			before := read(t, path)
 			oldSession := session
 			session = func() string { return tc.current }
@@ -1456,7 +1466,6 @@ func TestRepinNoRenameNoSkipNoBadSyntax(t *testing.T) {
 		{repin: "accept: true"},
 		{repin: "accept: cd <дерево> && true", why: "reason"},
 		{repin: "accept: true", why: "was a → b"},
-		{repin: "accept: echo — x", why: "reason"},
 		{repin: "accept: false", why: "reason"},
 	} {
 		before := read(t, path)
@@ -1470,7 +1479,6 @@ func TestRepinNoRenameNoSkipNoBadSyntax(t *testing.T) {
 		delimiter string
 	}{
 		{options{repin: "accept: true", why: "was a → b"}, " → "},
-		{options{repin: "accept: echo — x", why: "reason"}, " — "},
 	} {
 		before := read(t, path)
 		var out, errOut bytes.Buffer
@@ -1487,6 +1495,60 @@ func TestRepinNoRenameNoSkipNoBadSyntax(t *testing.T) {
 	updated := read(t, path)
 	if code := skipPlanItem(taskFromPath(path, "task", updated), options{by: "worker", item: "accept", why: "skip"}, &out, &errOut); code != exitUsage || read(t, path) != updated {
 		t.Fatalf("skip after repin: %d %q", code, errOut.String())
+	}
+}
+
+func TestRepinCorruptJournalLineConflicts(t *testing.T) {
+	journal := "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n- 2020-01-01 12:01 план — b: перезакреплён обязательный пункт accept: false → true — reason\n"
+	task, path := repinFixture(t, "worker", journal)
+	body := strings.Replace(task.body, "- 2020-01-01 12:01 план", "x- 2020-01-01 12:01 план", 1)
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pin := requiredPlan(body)["accept"]
+	if !pin.conflict {
+		t.Fatalf("glued repin record did not conflict: %#v", pin)
+	}
+	var out, errOut bytes.Buffer
+	root := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	if code := transition(taskFromPath(path, "task", body), options{cmd: "done", by: "reviewer", check: "verified", baseRoot: root}, &out, &errOut); code == 0 || strings.Contains(read(t, path), "Статус: готово") {
+		t.Fatalf("done accepted a ticket with a glued repin record: %d %q", code, errOut.String())
+	}
+}
+
+func TestRepinRejectsJournalBeforePin(t *testing.T) {
+	task, path := repinFixture(t, "worker", "")
+	task.body = "# Task\n\nСтатус: на проверке\nИсполнитель: worker\n\n## Журнал\n\n## Notes\ntext\n\n## План\n- accept: false\n\n## Other\n- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n"
+	if err := os.WriteFile(path, []byte(task.body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	before := read(t, path)
+	oldSession := session
+	session = func() string { return "b" }
+	t.Cleanup(func() { session = oldSession })
+	var out, errOut bytes.Buffer
+	if code := repinPlanItem(task, options{repin: "accept: true", why: "fixed"}, &out, &errOut); code != exitUsage || read(t, path) != before {
+		t.Fatalf("repin with journal before pin was not refused: %d %q", code, errOut.String())
+	}
+}
+
+func TestRepinAllowsUnambiguousCommandDelimiter(t *testing.T) {
+	task, path := repinFixture(t, "worker", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n")
+	oldCommand := "echo 'a — b'"
+	task.body = strings.ReplaceAll(task.body, "accept: false", "accept: "+oldCommand)
+	if err := os.WriteFile(path, []byte(task.body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldSession := session
+	session = func() string { return "b" }
+	t.Cleanup(func() { session = oldSession })
+	var out, errOut bytes.Buffer
+	if code := repinPlanItem(task, options{repin: "accept: true", why: "fixed"}, &out, &errOut); code != 0 {
+		t.Fatalf("repin with unambiguous delimiter in old command: %d %q", code, errOut.String())
+	}
+	pin := requiredPlan(read(t, path))["accept"]
+	if pin.conflict || pin.cmd != "true" {
+		t.Fatalf("repinned command not recovered: %#v", pin)
 	}
 }
 
