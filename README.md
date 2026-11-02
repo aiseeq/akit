@@ -183,13 +183,14 @@ the trailing slash: git treats a symlink as a file). Worktrees then use the main
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. A check added with
-`--required` cannot be skipped: `tk skip` refuses it with exit 2, a skip line written into the
+`--required` first checks the command with `/bin/bash --norc --noprofile -n -c COMMAND`; a syntax error refuses the add with exit 2 and Bash's diagnostic, without running the command. A required command cannot be skipped: `tk skip` refuses it with exit 2, a skip line written into the
 journal by hand does not count, and `tk done` refuses a ticket whose plan no longer has it (the
 section removed or renamed included) or runs another command under its name. The journal line
 `добавлен обязательный пункт NAME: COMMAND` marks it wherever it stands in the ticket, so editing the
 journal headings or line breaks around it does not drop it. The line pins the command: `tk plan --add`
 of that name with another command is refused (exit 2), with the same command it brings a removed item
-back. Lines that disagree on the command, or a record of the add that does not stand as a journal line
+back. `tk plan ID --repin 'NAME: COMMAND' --why TEXT` can replace a required command from a different current session. The ticket executor and every earlier pin or repin author are refused, regardless of `--by`. The journal records the session, old and new commands, and reason; Bash checks the new command's syntax without running it.
+Lines that disagree on the command, or a record of the add that does not stand as a journal line
 of its own (glued to the line before by any character, an invisible character in front) — only a hand
 edit makes them — leave the item invalid, so `tk done` refuses. Text tk writes into a ticket (note,
 `--add`, `--why`, `--check`, `--title`, `--until`) must be one line: no control character but a tab, no

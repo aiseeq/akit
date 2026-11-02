@@ -34,6 +34,7 @@ Usage:
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
+  tk plan ID --repin 'NAME: COMMAND' --why TEXT [--by NAME]
   tk skip ID NAME --why TEXT [--by NAME]
   tk check ID
   tk lint [--root DIR]
@@ -63,7 +64,8 @@ Flags:
   --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject: why the ticket was declined; skip: why the plan item is skipped (required)
   --add TEXT     plan: add a named command to the ticket plan (required)
-  --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command
+  --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command; command syntax is checked with bash -n
+  --repin TEXT   plan: replace a required command from another session; the session and old/new commands are recorded in the journal
   --until TEXT   wait: time or condition to wait for (required)
   --older D      archive: closed tickets older than D (default 14d; supports Go durations and d)
 
@@ -92,7 +94,8 @@ var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:план — \S+: )?пропущен: ([a-z0-9-]+) — (.*)$`)
 
 // planAddRE — строка журнала tk plan --add; «обязательный» — с --required, тогда после имени — команда пункта.
-var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
+var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
+var planRepinRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): перезакреплён обязательный пункт ([a-z0-9-]+): (.+) → (.+) — (.+)$`)
 
 // requiredMentionRE — запись «обязательный» где угодно в тексте, без привязки к строке: сверка с целыми строками
 // журнала ловит запись, спрятанную склейкой или невидимым символом.
@@ -103,9 +106,9 @@ var session = currentSession
 var planTimeout = 60 * time.Second
 
 type options struct {
-	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, item string
-	all, due, json, required                                                                                          bool
-	older                                                                                                             time.Duration
+	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, repin, item string
+	all, due, json, required                                                                                                 bool
+	older                                                                                                                    time.Duration
 }
 type task struct {
 	path, slug, status, prio, title, body string
@@ -141,7 +144,7 @@ func parseArgs(a []string) (options, error) {
 	if err != nil {
 		return o, err
 	}
-	if o.required && o.cmd != "plan" {
+	if o.required && (o.cmd != "plan" || o.repin != "") {
 		return o, errors.New("--required is a flag of tk plan --add")
 	}
 	if err := validateCommand(&o, pos); err != nil {
@@ -157,7 +160,7 @@ func parseArgs(a []string) (options, error) {
 // вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел. Текст журнала без
 // угаданного времени: у записи есть точная метка.
 func validateOneLine(o options) error {
-	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}} {
+	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}, {"--repin", o.repin}} {
 		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
@@ -236,7 +239,7 @@ var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*([01]?\d|2[0
 var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5][xх](?:$|[^a-z0-9])`)
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add}
+	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -342,10 +345,17 @@ func validatePlanCommand(o *options, pos []string) error {
 		return errors.New("plan needs a ticket ID")
 	}
 	o.id = pos[0]
-	if o.add == "" {
-		return errors.New("plan requires --add 'NAME: COMMAND'")
+	if (o.add == "") == (o.repin == "") {
+		return errors.New("plan requires exactly one of --add or --repin")
 	}
-	if _, _, err := splitPlanItem(o.add); err != nil {
+	if o.repin != "" && strings.TrimSpace(o.why) == "" {
+		return errors.New("--repin requires --why")
+	}
+	value := o.add
+	if o.repin != "" {
+		value = o.repin
+	}
+	if _, _, err := splitPlanItem(value); err != nil {
 		return err
 	}
 	return validateActorFlag(o)
@@ -547,6 +557,9 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 		return checkPlan(o.baseRoot, t, out)
 	}
 	if o.cmd == "plan" {
+		if o.repin != "" {
+			return repinPlanItem(t, o, out, errout)
+		}
 		return addPlanItem(t, o, out, errout)
 	}
 	if o.cmd == "skip" {
@@ -1438,15 +1451,24 @@ func requiredPlan(body string) map[string]requiredPin {
 	req := map[string]requiredPin{}
 	clean := map[string]int{}
 	for _, l := range strings.FieldsFunc(body, isLineEnd) {
-		m := planAddRE.FindStringSubmatch(l)
-		if m == nil || m[1] == "" {
+		if m := planAddRE.FindStringSubmatch(l); m != nil && m[2] != "" {
+			name, command := m[3], m[4]
+			clean[name]++
+			if p, ok := req[name]; !ok {
+				req[name] = requiredPin{cmd: command}
+			} else if p.cmd != command {
+				req[name] = requiredPin{cmd: p.cmd, conflict: true}
+			}
 			continue
 		}
-		clean[m[2]]++
-		if p, ok := req[m[2]]; !ok {
-			req[m[2]] = requiredPin{cmd: m[3]}
-		} else if p.cmd != m[3] {
-			req[m[2]] = requiredPin{cmd: p.cmd, conflict: true}
+		if m := planRepinRE.FindStringSubmatch(l); m != nil {
+			name, old, next := m[2], m[3], m[4]
+			p, ok := req[name]
+			if !ok || p.cmd != old || p.conflict {
+				req[name] = requiredPin{cmd: p.cmd, conflict: true}
+			} else {
+				req[name] = requiredPin{cmd: next}
+			}
 		}
 	}
 	// Запись «обязательный» в любом месте текста, которая не разбирается целой строкой журнала (склеена с соседней
@@ -1494,7 +1516,7 @@ func validatePlanSection(body string) error {
 func planSkipReason(body, name string) (string, bool) {
 	lines := journalLines(body)
 	for i := len(lines) - 1; i >= 0; i-- {
-		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[2] == name {
+		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[3] == name {
 			return "", false
 		}
 		if m := planSkipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
@@ -1524,6 +1546,10 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 	line := "- " + name + ": " + command
 	entry := fmt.Sprintf("- %s план — %s: добавлен пункт %s", time.Now().Format("2006-01-02 15:04"), o.by, name)
 	if o.required {
+		if err := checkPlanSyntax(command); err != nil {
+			fmt.Fprintf(errout, "tk: required plan command has invalid bash syntax: %v\n", err)
+			return exitUsage
+		}
 		entry = fmt.Sprintf("- %s план — %s: добавлен обязательный пункт %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, name, command)
 	}
 	t.body = insertPlanLine(t.body, line)
@@ -1533,6 +1559,160 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	fmt.Fprintf(out, "%s plan added\n", t.slug)
 	return 0
+}
+
+func checkPlanSyntax(command string) error {
+	cmd := exec.Command("/bin/bash", "--norc", "--noprofile", "-n", "-c", command)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("bash -n: %w: %s", err, strings.TrimSpace(output.String()))
+	}
+	return nil
+}
+
+func repinPlanItem(t task, o options, out, errout io.Writer) int {
+	s := session()
+	if s == "" {
+		fmt.Fprintln(errout, "tk: --repin requires a current session")
+		return exitUsage
+	}
+	if strings.TrimSpace(o.why) == "" {
+		fmt.Fprintln(errout, "tk: --repin requires --why")
+		return exitUsage
+	}
+	name, command, err := splitPlanItem(o.repin)
+	if err != nil {
+		return fail(errout, err)
+	}
+	if err := checkPlanSyntax(command); err != nil {
+		fmt.Fprintf(errout, "tk: repinned command has invalid bash syntax: %v\n", err)
+		return exitUsage
+	}
+	if err := checkRepinPermission(t.body, name, s); err != nil {
+		fmt.Fprintf(errout, "tk: %v\n", err)
+		return exitUsage
+	}
+	pin, err := checkRepinPlanItem(t.body, name, command)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: %v\n", err)
+		return exitUsage
+	}
+
+	entry, err := repinJournalEntry(time.Now().Format("2006-01-02 15:04"), s, name, pin.cmd, command, o.why)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: %v\n", err)
+		return exitUsage
+	}
+	oldLine := "- " + name + ": " + pin.cmd
+	newLine := "- " + name + ": " + command
+	var replaced bool
+	t.body, replaced = replacePlanLine(t.body, oldLine, newLine)
+	if !replaced {
+		fmt.Fprintf(errout, "tk: required plan item %q was edited by hand\n", name)
+		return exitUsage
+	}
+	t.body = journal(t.body, entry)
+	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintf(out, "%s plan repinned\n", t.slug)
+	return 0
+}
+
+func checkRepinPermission(body, name, currentSession string) error {
+	if owner := executor(body); owner != "" && strings.EqualFold(owner, currentSession) {
+		return errors.New("the ticket executor cannot repin its required plan item")
+	}
+	for _, line := range strings.FieldsFunc(body, isLineEnd) {
+		if m := planAddRE.FindStringSubmatch(line); m != nil && m[2] != "" && m[3] == name && strings.EqualFold(m[1], currentSession) {
+			return errors.New("the author of a required pin cannot repin it")
+		}
+		if m := planRepinRE.FindStringSubmatch(line); m != nil && m[2] == name && strings.EqualFold(m[1], currentSession) {
+			return errors.New("a previous repin author cannot repin the item again")
+		}
+	}
+	return nil
+}
+
+func checkRepinPlanItem(body, name, command string) (requiredPin, error) {
+	pin, ok := requiredPlan(body)[name]
+	if !ok || pin.conflict || pin.cmd == "" {
+		return requiredPin{}, fmt.Errorf("required plan item %q is missing or edited by hand", name)
+	}
+	if pin.cmd == command {
+		return requiredPin{}, fmt.Errorf("required plan item %q already has that command", name)
+	}
+	present := false
+	for _, item := range planItems(body) {
+		if item.Name != name || !item.Required || item.Invalid != "" || item.Missing || item.Skipped {
+			continue
+		}
+		if item.Cmd != pin.cmd {
+			return requiredPin{}, fmt.Errorf("required plan item %q was edited by hand", name)
+		}
+		present = true
+	}
+	if !present {
+		return requiredPin{}, fmt.Errorf("required plan item %q is missing from ## План", name)
+	}
+	return pin, nil
+}
+
+func repinJournalEntry(stamp, currentSession, name, oldCommand, newCommand, why string) (string, error) {
+	entry := fmt.Sprintf("- %s план — %s: перезакреплён обязательный пункт %s: %s → %s — %s", stamp, currentSession, name, oldCommand, newCommand, why)
+	match := planRepinRE.FindStringSubmatch(entry)
+	var delimiters []string
+	for _, value := range []string{currentSession, name, oldCommand, newCommand, why} {
+		for _, delimiter := range []string{" → ", " — "} {
+			if strings.Contains(value, delimiter) && !slices.Contains(delimiters, delimiter) {
+				delimiters = append(delimiters, delimiter)
+			}
+		}
+	}
+	if len(delimiters) == 0 && match != nil && match[1] == currentSession && match[2] == name && match[3] == oldCommand && match[4] == newCommand && match[5] == why {
+		return entry, nil
+	}
+	if len(delimiters) == 0 {
+		delimiters = []string{" → ", " — "}
+	}
+	return "", fmt.Errorf("journal delimiter %s prevents unambiguous repin record", strings.Join(delimiters, " and "))
+}
+
+func replacePlanLine(body, old, replacement string) (string, bool) {
+	lines := strings.Split(body, "\n")
+	start, end := -1, len(lines)
+	for i, line := range lines {
+		if line == "## План" {
+			if start >= 0 {
+				return body, false
+			}
+			start = i + 1
+			continue
+		}
+		if start >= 0 && strings.HasPrefix(line, "## ") {
+			end = i
+			break
+		}
+	}
+	if start < 0 {
+		return body, false
+	}
+	found := -1
+	for i := start; i < end; i++ {
+		if lines[i] == old {
+			if found >= 0 {
+				return body, false
+			}
+			found = i
+		}
+	}
+	if found < 0 {
+		return body, false
+	}
+	lines[found] = replacement
+	return strings.Join(lines, "\n"), true
 }
 
 func insertPlanLine(body, line string) string {
