@@ -118,7 +118,7 @@ func TestHitsBeforeEmptySections(t *testing.T) {
 	if len(lines) < 2 || !strings.HasPrefix(lines[0], "== реплики пользователя") {
 		t.Fatalf("вывод начинается не с раздела находки:\n%s", out)
 	}
-	if !strings.Contains(strings.Join(lines[:4], "\n"), "ключслово") {
+	if !strings.Contains(strings.Join(lines[:min(4, len(lines))], "\n"), "ключслово") {
 		t.Errorf("находки нет в первых строках:\n%s", out)
 	}
 	last := lastLine(out)
