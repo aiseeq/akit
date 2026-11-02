@@ -8,6 +8,8 @@ setup under `~/.claude` (noted per tool). MIT license.
 Layout: library packages at the root (`edit`, `transcript`, …), one command per tool in `cmd/<tool>`.
 Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/bin` from committed code only, prints each tool's revision.
 
+`codexlimit` reads the weekly account limit from the Codex app server without making a model call.
+
 ## shellcmd
 
 Finds program calls in shell scripts, including nested substitutions, wrapper commands, and scripts
