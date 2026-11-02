@@ -110,11 +110,14 @@ func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json
 		}
 	}()
 
-	requests := initializeRequests + request + "\n"
-	if _, err := io.WriteString(stdin, requests); err != nil {
-		return nil, fmt.Errorf("codexlimit: write requests: %w", err)
-	}
-	a, err := readAnswer(ctx, stdout, scanCtx)
+	// The write runs aside: a server that does not read stdin would otherwise block it
+	// past the context, and stop would never run. Closing stdin in stop ends a blocked write.
+	written := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(stdin, initializeRequests+request+"\n")
+		written <- err
+	}()
+	a, err := readAnswer(ctx, stdout, scanCtx, written)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +130,7 @@ func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json
 	return a.Result, nil
 }
 
-func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context) (answer, error) {
+func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context, written <-chan error) (answer, error) {
 	type scanResult struct {
 		line []byte
 		err  error
@@ -154,6 +157,11 @@ func readAnswer(ctx context.Context, stdout io.Reader, scanCtx context.Context) 
 		select {
 		case <-ctx.Done():
 			return answer{}, fmt.Errorf("codexlimit: no answer before context ended: %w", ctx.Err())
+		case err := <-written:
+			if err != nil {
+				return answer{}, fmt.Errorf("codexlimit: write requests: %w", err)
+			}
+			written = nil // a nil channel never fires again
 		case got := <-lines:
 			if got.err != nil {
 				return answer{}, fmt.Errorf("codexlimit: read app-server output: %w", got.err)

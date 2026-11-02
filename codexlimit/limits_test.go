@@ -33,6 +33,10 @@ func TestAppServerHelper(t *testing.T) {
 	if scenario == "" {
 		return
 	}
+	if scenario == "noread" {
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	}
 	want := []string{
 		`{"id":1,"method":"initialize","params":{"clientInfo":{"name":"akit","title":"akit","version":"0"}}}`,
 		`{"method":"initialized"}`,
@@ -303,5 +307,27 @@ func TestConsumeContextDeadlineKillsServer(t *testing.T) {
 	pid := cmd.Process.Pid
 	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("server process %d is still present (kill probe: %v)", pid, err)
+	}
+}
+
+// A request larger than the pipe buffer to a server that never reads stdin must not
+// block past the context: the write would hang and the server would stay alive.
+func TestConsumeLargeRequestServerNotReading(t *testing.T) {
+	cmd := helperCommand(t, "noread", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	got, err := Consume(ctx, cmd, strings.Repeat("k", 4<<20), "")
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Consume took %v", elapsed)
+	}
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("server process was not waited for")
+	}
+	if err := syscall.Kill(cmd.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("server process %d is still present (kill probe: %v)", cmd.Process.Pid, err)
 	}
 }
