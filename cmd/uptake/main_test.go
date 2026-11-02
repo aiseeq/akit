@@ -19,6 +19,10 @@ func TestParseUptakeArgs(t *testing.T) {
 	if err != nil || since.Format(time.RFC3339) != "2026-10-25T11:00:00Z" || !until.Equal(now) || seed != 20261025 || out != "/tmp/out" {
 		t.Fatalf("parsed (%s, %s, %d, %q), err %v", since, until, seed, out, err)
 	}
+	localSince, localUntil, _, _, err := parseUptakeArgs([]string{"--since", "31.10 03:00", "--until", "1h"}, now)
+	if err != nil || localSince.Location() != now.Location() || !localUntil.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("timearg forms parsed as (%s, %s), err %v", localSince, localUntil, err)
+	}
 	for _, args := range [][]string{{"--since", "bad"}, {"--since", "2026-11-01T02:00:00Z", "--until", "2026-11-01T02:00:00Z"}} {
 		if _, _, _, _, err := parseUptakeArgs(args, now); err == nil {
 			t.Errorf("parseUptakeArgs(%q) unexpectedly succeeded", args)
@@ -119,6 +123,101 @@ func writeTranscript(t *testing.T, path, data string) {
 	}
 	if err := os.WriteFile(path, []byte(data+"\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWebtextHookLogs(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	logsDir := filepath.Join(home, ".claude", "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Now().In(time.Local).Truncate(24 * time.Hour)
+	until := since.Add(48 * time.Hour)
+	line := func(at time.Time, msg, suffix string) string {
+		return `time="` + at.In(time.Local).Format("2006-01-02 15:04:05") + `" level=INFO msg="` + msg + `" session=synthetic ` + suffix
+	}
+	rotated := strings.Join([]string{
+		line(since.Add(2*time.Hour), "other message", `event=ignored`),
+		line(since.Add(3*time.Hour), "webfetch fallback", `opened=true source=wayback`),
+		line(since.Add(4*time.Hour), "webfetch fallback", `opened=false source=""`),
+		line(since.Add(5*time.Hour), "webfetch fallback skipped", `event=PostToolUseFailure`),
+		line(since.Add(-time.Second), "webfetch fallback", `opened=true source=direct`),
+	}, "\n")
+	current := line(since.Add(26*time.Hour), "webfetch fallback", `opened=true source=direct`)
+	if err := os.WriteFile(filepath.Join(logsDir, "chooks.log.1"), []byte(rotated+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logsDir, "chooks.log"), []byte(current+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u := newRun(since, until, 1, filepath.Join(root, "out"), home)
+	if err := u.runUptake(since, until); err != nil {
+		t.Fatal(err)
+	}
+	tsv, err := os.ReadFile(filepath.Join(u.outputDir, "webtext-hook.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"day\topened\tsource\tcount",
+		since.Format("2006-01-02") + "\ttrue\twayback\t1",
+		since.Format("2006-01-02") + "\tfalse\t\t1",
+		since.Format("2006-01-02") + "\tskipped\t\t1",
+		since.Add(26*time.Hour).Format("2006-01-02") + "\ttrue\tdirect\t1",
+	} {
+		if !strings.Contains(string(tsv), want) {
+			t.Errorf("webtext-hook.tsv missing %q:\n%s", want, tsv)
+		}
+	}
+	report, err := os.ReadFile(filepath.Join(u.outputDir, "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"webtext через хук: открыто 2 из 3 отказов WebFetch (direct 1, wayback 1), пропущено 1",
+		"лог покрывает окно с " + since.Add(2*time.Hour).Format("2006-01-02 15:04:05") + ", раньше — нет данных",
+		"| webtext |",
+	} {
+		if !strings.Contains(string(report), want) {
+			t.Errorf("report.md missing %q:\n%s", want, report)
+		}
+	}
+}
+
+func TestWebtextHookMissingAndUnreadableLogs(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	since := time.Now().In(time.Local).Add(-time.Hour)
+	until := since.Add(time.Hour)
+	missing := newRun(since, until, 1, filepath.Join(root, "missing-out"), home)
+	if err := missing.runUptake(since, until); err != nil {
+		t.Fatalf("missing logs: %v", err)
+	}
+	report, err := os.ReadFile(filepath.Join(missing.outputDir, "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "Отсутствуют файлы лога: chooks.log.1, chooks.log") {
+		t.Fatalf("missing log note absent:\n%s", report)
+	}
+	logsDir := filepath.Join(home, ".claude", "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(logsDir, "chooks.log.1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bad := newRun(since, until, 1, filepath.Join(root, "bad-out"), home)
+	if err := bad.runUptake(since, until); err == nil {
+		t.Fatal("unreadable existing log unexpectedly succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(bad.outputDir, "report.md")); err != nil {
+		t.Fatalf("report not written after log read failure: %v", err)
+	}
+	if len(bad.hookReadErrors) != 1 {
+		t.Fatalf("read errors = %v, want one", bad.hookReadErrors)
 	}
 }
 
@@ -287,7 +386,7 @@ func TestUptakeReviewRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := string(data)
-		for _, want := range []string{"| утилита | 01.11 / окно |", "| page-shot | 1 / 2 | пары нет |", "| busy | 1 / 1 | пары нет | 1/2 | 2 |"} {
+		for _, want := range []string{"| утилита | 01.11 / окно |", "| page-shot | 1 / 2 | пары нет |", "| busy | 1 / 1 | пары нет | не замерено | 1/2 | 2 |"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("report missing %q:\n%s", want, text)
 			}
@@ -392,5 +491,40 @@ func TestUptakeTranscriptReadProblemsAreReported(t *testing.T) {
 	}
 	if !strings.Contains(string(counts), "busy\tcalls\t1") {
 		t.Fatalf("valid transcript after read errors was not processed: %s", counts)
+	}
+}
+
+// Чужая строка лога хуков в другом формате — не повреждение; пустой старый файл не прячет покрытие нового;
+// повреждённая строка самого хука webtext — ошибка с местом.
+func TestWebtextHookForeignLinesAndEmptyRotation(t *testing.T) {
+	since := time.Now().In(time.Local).Truncate(24 * time.Hour)
+	until := since.Add(48 * time.Hour)
+	at := since.Add(-time.Hour).In(time.Local).Format("2006-01-02 15:04:05")
+	write := func(current string) (*run, error) {
+		root := t.TempDir()
+		home := filepath.Join(root, "home")
+		logsDir := filepath.Join(home, ".claude", "logs")
+		if err := os.MkdirAll(logsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(logsDir, "chooks.log.1"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(logsDir, "chooks.log"), []byte(current), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		u := newRun(since, until, 1, filepath.Join(root, "out"), home)
+		return u, u.runUptake(since, until)
+	}
+	u, err := write("panic: foreign hook output\n" + `time="` + at + `" level=INFO msg="other" x=1` + "\n")
+	if err != nil {
+		t.Fatalf("foreign line must not fail the run: %v", err)
+	}
+	if !u.hookSummary.hasCoverage || u.hookSummary.coverage.Format("2006-01-02 15:04:05") != at {
+		t.Errorf("coverage = %v (%v), want %s", u.hookSummary.coverage, u.hookSummary.hasCoverage, at)
+	}
+	u, err = write(`time="` + at + `" level=INFO msg="webfetch fallback" opened="true` + "\n")
+	if err == nil || u.hookBadLines != 1 || !strings.Contains(u.firstHookBad, "chooks.log:1:") {
+		t.Errorf("damaged webtext hook line: err=%v bad=%d first=%q", err, u.hookBadLines, u.firstHookBad)
 	}
 }

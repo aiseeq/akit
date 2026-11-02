@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/shellcmd"
+	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 	"github.com/aiseeq/akit/transcript/waits"
 )
@@ -57,6 +58,12 @@ type run struct {
 	editAttempts                                            []editAttempt
 	unreadFiles, badLines                                   int
 	firstUnread, firstBad                                   string
+	hookCounts                                              map[string]int
+	hookSummary                                             hookSummary
+	hookReadErrors                                          []string
+	hookMissing                                             []string
+	hookBadLines                                            int
+	firstHookBad                                            string
 }
 
 func newRun(since, until time.Time, seed int, out, home string) *run {
@@ -66,6 +73,7 @@ func newRun(since, until time.Time, seed int, out, home string) *run {
 		counts: map[string]int{}, habitCandidates: map[string][]example{}, refusalSamples: map[string][]example{},
 		tkPair: map[string]*[2]int{}, utilityNames: []string{"busy", "prior", "tk", "user-word", "page-shot", "webtext", "claude-rules-export", "sub", "tl", "wfor"},
 		errorStats: map[string]*errorStat{},
+		hookCounts: map[string]int{},
 	}
 }
 
@@ -1225,9 +1233,9 @@ func parseUptakeArgs(args []string, now time.Time) (time.Time, time.Time, int, s
 		}
 		switch name {
 		case "--since", "--until":
-			t, err := time.Parse(time.RFC3339Nano, value)
+			t, err := timearg.Parse(value, now)
 			if err != nil {
-				return time.Time{}, time.Time{}, 0, "", fmt.Errorf("%s must be RFC3339: %w", name, err)
+				return time.Time{}, time.Time{}, 0, "", fmt.Errorf("invalid %s: %w", name, err)
 			}
 			if name == "--since" {
 				since = t
@@ -1274,13 +1282,16 @@ func (u *run) runUptake(since, until time.Time) error {
 	for _, src := range sources {
 		u.process(src.Path)
 	}
+	u.readWebtextHookLogs(since, until)
 	if err := u.writeTables(); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
 	fmt.Printf("Окно: %s — %s (%s)\nТранскриптов: %d\nОтчёт: %s\n", since.In(time.Local).Format("2006-01-02 15:04 MST"), until.In(time.Local).Format("2006-01-02 15:04 MST"), time.Local, len(sources), filepath.Join(u.outputDir, "report.md"))
-	if u.unreadFiles > 0 || u.badLines > 0 {
-		fmt.Printf("Не прочитано файлов: %d; повреждённых строк: %d\n", u.unreadFiles, u.badLines)
-		return fmt.Errorf("incomplete transcripts: %d unread files, %d damaged lines", u.unreadFiles, u.badLines)
+	if u.unreadFiles > 0 || u.badLines > 0 || len(u.hookReadErrors) > 0 || u.hookBadLines > 0 {
+		unread := u.unreadFiles + len(u.hookReadErrors)
+		bad := u.badLines + u.hookBadLines
+		fmt.Printf("Не прочитано файлов: %d; повреждённых строк: %d\n", unread, bad)
+		return fmt.Errorf("incomplete input: %d unread files, %d damaged lines", unread, bad)
 	}
 	return nil
 }
@@ -1428,6 +1439,9 @@ func (u *run) writeExampleRows(f *os.File, w *bufio.Writer) error {
 }
 
 func (u *run) writeTables() error {
+	if err := u.writeWebtextHook(); err != nil {
+		return err
+	}
 	if err := u.writeCounts(); err != nil {
 		return err
 	}
