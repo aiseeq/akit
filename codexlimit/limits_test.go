@@ -2,6 +2,7 @@ package codexlimit
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,19 @@ func TestAppServerHelper(t *testing.T) {
 	scenario := os.Getenv("CODEXLIMIT_HELPER")
 	if scenario == "" {
 		return
+	}
+	if scenario == "grandchild" {
+		// A child that inherits stderr keeps the caller's stderr copy open after the server dies.
+		child := exec.Command("sleep", "30")
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(6)
+		}
+		if err := os.WriteFile(os.Getenv("CODEXLIMIT_CHILD_PID"), fmt.Append(nil, child.Process.Pid), 0600); err != nil {
+			os.Exit(7)
+		}
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
 	}
 	if scenario == "noread" {
 		time.Sleep(30 * time.Second)
@@ -329,5 +343,33 @@ func TestConsumeLargeRequestServerNotReading(t *testing.T) {
 	}
 	if err := syscall.Kill(cmd.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("server process %d is still present (kill probe: %v)", cmd.Process.Pid, err)
+	}
+}
+
+// With a non-file stderr, Wait copies it in a goroutine; a grandchild holding that
+// stderr must not keep Read past the context plus StopWaitDelay.
+func TestReadContextDeadlineGrandchildHoldsStderr(t *testing.T) {
+	cmd := helperCommand(t, "grandchild", "")
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	cmd.Env = append(cmd.Env, "CODEXLIMIT_CHILD_PID="+pidFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(pidFile); err == nil {
+			var pid int
+			if _, err := fmt.Sscan(string(data), &pid); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	got, err := Read(ctx, cmd)
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond+StopWaitDelay+2*time.Second {
+		t.Fatalf("Read took %v", elapsed)
+	}
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !reflect.DeepEqual(got, Limits{}) {
+		t.Fatalf("Read = %+v, %v", got, err)
 	}
 }

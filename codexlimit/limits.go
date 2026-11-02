@@ -61,6 +61,10 @@ type rateLimitsResult struct {
 const initializeRequests = "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"akit\",\"title\":\"akit\",\"version\":\"0\"}}}\n" +
 	"{\"method\":\"initialized\"}\n"
 
+// StopWaitDelay is how long stopping waits for the server's output copies after the
+// kill; Read and Consume set it as cmd.WaitDelay when the caller left that zero.
+const StopWaitDelay = time.Second
+
 // Read starts cmd, reads the weekly account limits, and stops the app server.
 func Read(ctx context.Context, cmd *exec.Cmd) (Limits, error) {
 	raw, err := exchange(ctx, cmd, `{"id":2,"method":"account/rateLimits/read"}`)
@@ -87,6 +91,11 @@ func exchange(ctx context.Context, cmd *exec.Cmd, request string) (response json
 			err = errors.Join(err, fmt.Errorf("close stdin pipe: %w", closeErr))
 		}
 		return nil, fmt.Errorf("codexlimit: stdout pipe: %w", err)
+	}
+	// Killing the server does not close a stdout or stderr copy held by a process it
+	// started; without a bound Wait would block on that copy past the context.
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = StopWaitDelay
 	}
 	if err := cmd.Start(); err != nil {
 		if closeErr := stdin.Close(); closeErr != nil {
@@ -187,7 +196,8 @@ func stop(cmd *exec.Cmd, stdin io.Closer) error {
 		errs = append(errs, fmt.Errorf("codexlimit: kill app-server: %w", err))
 	}
 	var exit *exec.ExitError
-	if err := cmd.Wait(); err != nil && !errors.As(err, &exit) {
+	// ErrWaitDelay only says an output copy held by another process was cut; the server is gone.
+	if err := cmd.Wait(); err != nil && !errors.As(err, &exit) && !errors.Is(err, exec.ErrWaitDelay) {
 		errs = append(errs, fmt.Errorf("codexlimit: wait for app-server: %w", err))
 	}
 	return errors.Join(errs...)
