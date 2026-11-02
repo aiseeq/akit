@@ -44,6 +44,16 @@ func (u *run) readWebtextHookLogs(since, until time.Time) {
 // hookMessage — сообщения хука webtext целиком; строки других хуков в том же логе — не наши, их формат не проверяется.
 const hookMessageStart = `msg="webfetch fallback`
 
+// leadingHookTime — время строки лога хуков из её начала: time="ГГГГ-ММ-ДД чч:мм:сс".
+func leadingHookTime(line string) (time.Time, bool) {
+	const prefix, layout = `time="`, "2006-01-02 15:04:05"
+	if !strings.HasPrefix(line, prefix) || len(line) < len(prefix)+len(layout)+1 || line[len(prefix)+len(layout)] != '"' {
+		return time.Time{}, false
+	}
+	at, err := time.ParseInLocation(layout, line[len(prefix):len(prefix)+len(layout)], time.Local)
+	return at, err == nil
+}
+
 // isHookLine — строка сообщения хука webtext: имя целиком в кавычках («webfetch fallback» или «… skipped») или
 // строка, обрезанная внутри имени, — та повреждённая, а не чужая. «webfetch fallback statistics» — чужое сообщение.
 func isHookLine(line string) bool {
@@ -74,7 +84,13 @@ func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 		}
 		line = strings.TrimRight(line, "\r\n")
 		ours := isHookLine(line)
-		if !ours && u.hookSummary.hasCoverage {
+		if !u.hookSummary.hasCoverage {
+			// Покрытие — по времени в начале строки любого хука, даже если остальная строка не logfmt.
+			if at, ok := leadingHookTime(line); ok {
+				u.hookSummary.coverage, u.hookSummary.hasCoverage = at, true
+			}
+		}
+		if !ours {
 			continue
 		}
 		fields, err := parseHookFields(line)
@@ -86,11 +102,7 @@ func (u *run) readWebtextHookLog(path string, since, until time.Time) error {
 			if ours {
 				u.recordBadHookLine(path, n, err)
 			}
-			continue // чужая строка в непривычном формате: покрытие ищется дальше
-		}
-		if !u.hookSummary.hasCoverage {
-			u.hookSummary.coverage = at
-			u.hookSummary.hasCoverage = true
+			continue
 		}
 		msg := fields["msg"]
 		if msg != "webfetch fallback" && msg != "webfetch fallback skipped" {

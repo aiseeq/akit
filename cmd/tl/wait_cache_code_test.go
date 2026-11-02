@@ -15,11 +15,11 @@ import (
 const waitCacheCodeFile = "wait_cache_code.go"
 
 // waitCacheListFormat — поля go list для хеша: модуль, его замена (replace, go.work) и файлы пакета под любые
-// ОС и теги сборки (IgnoredGoFiles), со встроенными (embed) и C-файлами.
+// ОС и теги сборки (IgnoredGoFiles), со встроенными (embed), C-, ассемблерными и .syso-файлами.
 const waitCacheListFormat = `{{if .Module}}{{.Module.Path}}	{{.Module.Version}}	{{.Module.Dir}}	` +
 	`{{with .Module.Replace}}{{.Path}}	{{.Version}}	{{.Dir}}{{else}}		{{end}}	{{.Dir}}	` +
 	`{{join .GoFiles ","}},{{join .CgoFiles ","}},{{join .IgnoredGoFiles ","}},{{join .EmbedFiles ","}},` +
-	`{{join .CFiles ","}},{{join .HFiles ","}}{{end}}`
+	`{{join .CFiles ","}},{{join .HFiles ","}},{{join .SFiles ","}},{{join .SysoFiles ","}}{{end}}`
 
 // waitCacheSourcesHash — хеш кода, который пишет запись кэша. Пакет из исходников на диске (модуль akit, замена
 // на папку) входит файлами: путь от корня модуля и содержимое; пакет из версии модуля — строкой path@version

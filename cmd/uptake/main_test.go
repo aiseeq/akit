@@ -547,6 +547,11 @@ func TestWebtextHookForeignLinesAndEmptyRotation(t *testing.T) {
 			t.Errorf("%q: err=%v bad=%d, want a damaged line", line, err, u.hookBadLines)
 		}
 	}
+	later := since.Add(time.Hour).In(time.Local).Format("2006-01-02 15:04:05")
+	u, err = write(`time="` + at + `" msg="other" foreign-format` + "\n" + `time="` + later + `" level=INFO msg="other" x=1` + "\n")
+	if err != nil || u.hookSummary.coverage.Format("2006-01-02 15:04:05") != at {
+		t.Errorf("coverage from a foreign-format first line: err=%v coverage=%v, want %s", err, u.hookSummary.coverage, at)
+	}
 	long := strings.Repeat("x", 2<<20)
 	inWindow := since.Add(time.Hour).In(time.Local).Format("2006-01-02 15:04:05")
 	u, err = write(long + "\n" + `time="` + inWindow + `" level=INFO msg="webfetch fallback" opened=true source=direct` + "\n")
