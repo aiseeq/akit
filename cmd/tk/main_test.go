@@ -1377,7 +1377,7 @@ func TestRequiredAddRefusesBadSyntax(t *testing.T) {
 	before := read(t, path)
 	var out, errOut bytes.Buffer
 	if code := addPlanItem(task, options{by: "planner", add: "bad: cd <дерево> && true", required: true}, &out, &errOut); code != exitUsage ||
-		!strings.Contains(errOut.String(), "bash syntax") || read(t, path) != before {
+		!strings.Contains(errOut.String(), "bash syntax") || !strings.Contains(errOut.String(), "дерево") || read(t, path) != before {
 		t.Fatalf("bad required syntax: code %d, stderr %q", code, errOut.String())
 	}
 	if code := addPlanItem(task, options{by: "planner", add: "bad: cd <дерево> && true"}, &out, &errOut); code != 0 || !strings.Contains(read(t, path), "- bad: cd <дерево> && true") {
@@ -1398,14 +1398,26 @@ func TestRequiredAddRefusesBadSyntax(t *testing.T) {
 
 func TestRepinFromOtherSession(t *testing.T) {
 	task, path := repinFixture(t, "a", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n")
-	marker := filepath.Join(t.TempDir(), "ran")
+	addMarker := filepath.Join(t.TempDir(), "added")
+	addCommand := "touch " + strconv.Quote(addMarker)
+	var out, errOut bytes.Buffer
+	if code := addPlanItem(task, options{by: "planner", add: "added: " + addCommand, required: true}, &out, &errOut); code != 0 {
+		t.Fatalf("add required item: %d %s", code, errOut.String())
+	}
+	if _, err := os.Stat(addMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("required add command ran during syntax check: %v", err)
+	}
+	task = taskFromPath(path, "task", read(t, path))
+	marker := filepath.Join(t.TempDir(), "repinned")
 	command := "touch " + strconv.Quote(marker)
 	oldSession := session
 	session = func() string { return "b" }
 	t.Cleanup(func() { session = oldSession })
-	var out, errOut bytes.Buffer
 	if code := repinPlanItem(task, options{by: "a", repin: "accept: " + command, why: "fixed"}, &out, &errOut); code != 0 {
 		t.Fatalf("repin: %d %s", code, errOut.String())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repinned command ran during syntax check: %v", err)
 	}
 	updated := read(t, path)
 	if !strings.Contains(updated, "- accept: "+command) || !strings.Contains(updated, "план — b: перезакреплён обязательный пункт accept: false → "+command+" — fixed") {
@@ -1416,6 +1428,34 @@ func TestRepinFromOtherSession(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("repinned command did not create its marker: %v", err)
+	}
+	if _, err := os.Stat(addMarker); err != nil {
+		t.Fatalf("added command did not create its marker: %v", err)
+	}
+}
+
+func TestRepinChainFromDifferentSessions(t *testing.T) {
+	task, path := repinFixture(t, "a", "- 2020-01-01 12:00 план — a: добавлен обязательный пункт accept: false\n")
+	marker := filepath.Join(t.TempDir(), "final-command")
+	command := "touch " + strconv.Quote(marker)
+	oldSession := session
+	t.Cleanup(func() { session = oldSession })
+	var out, errOut bytes.Buffer
+	session = func() string { return "b" }
+	if code := repinPlanItem(task, options{repin: "accept: true", why: "first repair"}, &out, &errOut); code != 0 {
+		t.Fatalf("first repin: %d %s", code, errOut.String())
+	}
+	updated := read(t, path)
+	session = func() string { return "c" }
+	if code := repinPlanItem(taskFromPath(path, "task", updated), options{repin: "accept: " + command, why: "second repair"}, &out, &errOut); code != 0 {
+		t.Fatalf("second repin: %d %s", code, errOut.String())
+	}
+	updated = read(t, path)
+	if code := transition(taskFromPath(path, "task", updated), options{cmd: "done", by: "reviewer", check: "verified", baseRoot: filepath.Dir(filepath.Dir(filepath.Dir(path)))}, &out, &errOut); code != 0 {
+		t.Fatalf("done after repin chain: %d %s", code, errOut.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("last repinned command did not run: %v", err)
 	}
 }
 
@@ -1533,6 +1573,9 @@ func TestRepinNoRenameNoSkipNoBadSyntax(t *testing.T) {
 		var out, errOut bytes.Buffer
 		if code := repinPlanItem(taskFromPath(path, "task", before), o, &out, &errOut); code != exitUsage || read(t, path) != before {
 			t.Fatalf("invalid repin %+v: %d %q", o, code, errOut.String())
+		}
+		if strings.Contains(o.repin, "cd <дерево>") && !strings.Contains(errOut.String(), "дерево") {
+			t.Fatalf("repin syntax refusal omitted bash diagnostic: %q", errOut.String())
 		}
 	}
 	for _, tc := range []struct {
