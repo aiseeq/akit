@@ -66,6 +66,17 @@ func TestCheckAlign(t *testing.T) {
 			pairs: 0,
 		},
 		{
+			name:     "svg next to a decorated label",
+			html:     `<!doctype html><body style="font:16px/1 sans-serif"><div style="display:flex;align-items:center;gap:6px"><svg width="16" height="16" style="transform:translateY(6px)"><rect width="16" height="16"/></svg><span style="background:#ddd;min-width:80px;padding:2px 6px">Подпись</span></div></body>`,
+			pairs:    1,
+			contains: "(вниз)",
+		},
+		{
+			name:  "icons in far table cells are not on the label line",
+			html:  `<!doctype html><body style="font:16px/1.4 sans-serif"><div style="display:grid;grid-template-columns:120px repeat(3,60px);border-top:1px solid #ccc"><div style="border-bottom:1px solid #ccc;padding:6px">sc2demu</div><div></div><div style="display:flex;justify-content:center;align-items:center;height:48px"><svg width="14" height="14"><rect width="14" height="14"/></svg></div><div style="display:flex;justify-content:center;align-items:center;height:48px"><svg width="14" height="14"><rect width="14" height="14"/></svg></div></div></body>`,
+			pairs: 0,
+		},
+		{
 			name:  "wide empty strip is not a small icon",
 			html:  `<!doctype html><body style="font:16px/1.55 sans-serif"><div style="display:grid;grid-template-columns:auto 1fr;gap:8px"><span style="width:40px;height:5px;background:#888"></span><span>Подпись рядом с полосой</span></div></body>`,
 			pairs: 0,

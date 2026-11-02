@@ -88,10 +88,7 @@ const alignJS = `(() => {
     }
     return lineOf(el, text, rects);
   };
-  const decoratedBlock = (el, em) => {
-    const rect = el.getBoundingClientRect();
-    return decorated(el) && (rect.width > em * 2 || rect.height > em * 2);
-  };
+
   const visualBox = icon => {
     const media = icon.matches('svg, img') ? icon : icon.querySelector('svg, img');
     if (media) return clippedBox(media, media.getBoundingClientRect());
@@ -146,8 +143,9 @@ const alignJS = `(() => {
         const text = item.text;
         if (Math.min(box.b, text.box.b) <= Math.max(box.t, text.box.t)) continue;
         if (box.b - box.t > text.em * 3) continue;
-        if (decoratedBlock(item.el, text.em)) continue;
         const distance = box.r < text.box.l ? text.box.l - box.r : text.box.r < box.l ? box.l - text.box.r : 0;
+        // Значок дальше 3em от текста — уже не на его строке (ячейки таблицы, колонки графика).
+        if (distance > text.em * 3) continue;
         if (distance < bestDistance) { rowBest = text; bestDistance = distance; }
       }
       best = rowBest;
