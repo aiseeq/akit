@@ -45,51 +45,15 @@ const (
 // сравниваются. Невидимое (visibility, opacity 0 у предка, нулевая рамка) - мимо.
 const overlapJS = `(() => {
   const min = ` + overlapMinPxJS + `;
-  const describe = el => {
-    const tag = el.tagName.toLowerCase();
-    if (el.id) return tag + '#' + el.id;
-    const cn = typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '';
-    const cls = cn.trim().split(/\s+/).filter(Boolean).slice(0, 2);
-    return cls.length ? tag + '.' + cls.join('.') : tag;
-  };
-  const hiddenCache = new Map();
-  const hidden = el => {
-    if (!el || el === document.documentElement) return false;
-    if (hiddenCache.has(el)) return hiddenCache.get(el);
-    const cs = getComputedStyle(el);
-    const h = cs.opacity === '0' || hidden(el.parentElement);
-    hiddenCache.set(el, h);
-    return h;
-  };
-  const clipCache = new Map();
-  const clipOf = el => {
-    if (!el || el === document.body || el === document.documentElement) return null;
-    if (clipCache.has(el)) return clipCache.get(el);
-    let c = clipOf(el.parentElement);
-    const cs = getComputedStyle(el);
-    if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') {
-      const r = el.getBoundingClientRect();
-      c = c ? {l: Math.max(c.l, r.left), t: Math.max(c.t, r.top), r: Math.min(c.r, r.right), b: Math.min(c.b, r.bottom)}
-            : {l: r.left, t: r.top, r: r.right, b: r.bottom};
-    }
-    clipCache.set(el, c);
-    return c;
-  };
+  ` + layoutCommonJS + `
   const items = [];
   const add = (owner, el, text, r, em) => {
-    let l = r.left, t = r.top, rr = r.right, b = r.bottom;
-    const inset = Math.max(0, (b - t - em) / 2);
-    t += inset; b -= inset;
-    const c = clipOf(el);
-    if (c) { l = Math.max(l, c.l); t = Math.max(t, c.t); rr = Math.min(rr, c.r); b = Math.min(b, c.b); }
-    if (rr - l < 1 || b - t < 1) return;
-    items.push({owner, el, text, l, t, r: rr, b});
+    const box = textBox(el, r, em);
+    if (!box) return;
+    items.push({owner, el, text, ...box});
   };
   // checkVisibility: закрытый details (content-visibility: hidden), display none,
   // visibility и opacity 0; без него - свой обход предков.
-  const visible = el => el.checkVisibility
-    ? el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true, opacityProperty: true, visibilityProperty: true})
-    : getComputedStyle(el).visibility === 'visible' && !hidden(el);
   const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
   let owner = 0;
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
