@@ -57,11 +57,11 @@ func TestParseArgsErrors(t *testing.T) {
 }
 
 func TestRoleAliases(t *testing.T) {
-	opts, err := parseArgs([]string{"--role", "assistant, tool,user"}, time.Now())
+	opts, err := parseArgs([]string{"--role", "assistant, tool,tool_use,bash,result,user"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[transcript.Role]bool{transcript.Agent: true, transcript.Cmd: true, transcript.User: true}
+	want := map[transcript.Role]bool{transcript.Agent: true, transcript.Cmd: true, transcript.Out: true, transcript.User: true}
 	if !maps.Equal(opts.roles, want) {
 		t.Errorf("roles %v, want %v", opts.roles, want)
 	}
@@ -176,13 +176,34 @@ func TestRef(t *testing.T) {
 	if code, _, _ := runTL(t, e, "1a2b3c4d:2"); code != exitNone {
 		t.Errorf("service record: code %d", code)
 	}
+	plainCode, plain, _ := runTL(t, e, "1a2b3c4d:12")
+	prefixedCode, prefixed, _ := runTL(t, e, "id:1a2b3c4d:12")
+	if plainCode != prefixedCode || plain != prefixed {
+		t.Errorf("id: reference differs: plain (%d, %q), prefixed (%d, %q)", plainCode, plain, prefixedCode, prefixed)
+	}
+	code, out, _ = runTL(t, e, "--width", "3", "id:1a2b3c4d:12", "1a2b3c4d:3")
+	if code != 0 || !strings.Contains(out, "смо…(+19)") || !strings.Contains(out, "при…(+15)") {
+		t.Errorf("multiple refs with width: code %d:\n%s", code, out)
+	}
+	if _, err := parseArgs([]string{"--version"}, e.now); err != nil {
+		t.Fatalf("--version parse: %v", err)
+	}
+	opts, _ := parseArgs([]string{"--version"}, e.now)
+	var version bytes.Buffer
+	if code := run(opts, e, &version, &bytes.Buffer{}); code != 0 || !strings.HasPrefix(version.String(), "tl (") {
+		t.Errorf("--version: code %d, output %q", code, version.String())
+	}
 }
 
 func TestResolveErrors(t *testing.T) {
 	e := fakeHome(t)
 	for _, args := range [][]string{{}, {"abc"}, {"deadbeef"}, {"--all", "1a2b3c4d"}} {
-		if code, _, _ := runTL(t, e, args...); code != exitUsage {
+		code, _, errOut := runTL(t, e, args...)
+		if code != exitUsage {
 			t.Errorf("%q: code %d", args, code)
+		}
+		if len(args) == 1 && args[0] == "deadbeef" && (!strings.Contains(errOut, "--grep") || !strings.Contains(errOut, "--project")) {
+			t.Errorf("session lookup hint missing: %q", errOut)
 		}
 	}
 }
@@ -208,8 +229,8 @@ func TestProblemsInSummary(t *testing.T) {
 	if _, err := timearg.Parse("1000000m", e.now); err == nil {
 		t.Error("7-digit ago accepted")
 	}
-	if ref, _, err := splitRef([]string{"1a2b3c4d:0"}); ref != "" || err != nil {
-		t.Errorf("line 0 taken as a ref: %q %v", ref, err)
+	if refs, err := splitRefs([]string{"1a2b3c4d:0"}); len(refs) != 0 || err != nil {
+		t.Errorf("line 0 taken as a ref: %v %v", refs, err)
 	}
 }
 

@@ -1,4 +1,4 @@
-// Package timearg разбирает время из аргумента утилиты: «назад» (30m), часы сегодня (12:05), день, день с часами, RFC3339.
+// Package timearg разбирает время из аргумента утилиты: «назад» (30m), часы сегодня (12:05), день, день с часами, RFC3339 и ISO без зоны.
 package timearg
 
 import (
@@ -34,6 +34,8 @@ func Parse(s string, now time.Time) (time.Time, error) {
 		{"2006-01-02", ""},
 		{"2006-01-02 15:04", ""},
 		{"2006-01-02 15:04:05", ""},
+		{"2006-01-02T15:04", ""},
+		{"2006-01-02T15:04:05", ""},
 	}
 	for _, l := range layouts {
 		layout, value := l.layout, s
@@ -46,7 +48,7 @@ func Parse(s string, now time.Time) (time.Time, error) {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("time %q: use 12:05, 25.10, \"25.10 12:05\", 2026-10-25T10:05:00Z or 30m/2h/3d", s)
+	return time.Time{}, fmt.Errorf("time %q: use 12:05, 25.10, \"25.10 12:05\", 2026-10-25T10:05, 2026-10-25T10:05:00, 2026-10-25T10:05:00Z or 2026-10-25T10:05:00+01:00, or 30m/2h/3d", s)
 }
 
 // agoArg — «N единиц назад»: 90s, 30m, 2h, 3d.

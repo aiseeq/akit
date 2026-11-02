@@ -106,6 +106,7 @@ func reportWait(res result, opts options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %d wait event(s); --q %d needs at least %d\n", len(waits), opts.q, need)
 		return 3
 	}
+	fmt.Fprintf(stderr, "tl: %d wait event(s)\n", len(waits))
 	slices.Sort(waits)
 	index := int(math.Ceil(float64(opts.q)*float64(len(waits))/100)) - 1
 	fmt.Fprintln(stdout, waits[index].Milliseconds())

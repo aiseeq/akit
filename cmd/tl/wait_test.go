@@ -81,7 +81,7 @@ func TestWaitClaudePercentilesAndFiltering(t *testing.T) {
 	)
 	path := writeWaitTranscript(t, e, "wait-claude.jsonl", claudeWaitRows(specs))
 	code, out, errOut := runTL(t, e, "--wait", "tk done", "--q", "50", path)
-	if code != 0 || out != "10000\n" {
+	if code != 0 || out != "10000\n" || !strings.Contains(errOut, "20 wait event(s)") {
 		t.Errorf("q50 code=%d out=%q stderr=%q", code, out, errOut)
 	}
 	code, out, errOut = runTL(t, e, "--wait=tk done", "--q=95", path)
@@ -106,11 +106,11 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	path := writeWaitTranscript(t, e, "cache.jsonl", claudeWaitRows(spec))
 	args := []string{"--wait", "tk done", "--q", "50", path}
 	code, cold, coldErr := runTL(t, e, args...)
-	if code != 0 || cold != "2000\n" || coldErr != "" {
+	if code != 0 || cold != "2000\n" || !strings.Contains(coldErr, "3 wait event(s)") {
 		t.Fatalf("cold = (%d, %q, %q)", code, cold, coldErr)
 	}
 	code, warm, warmErr := runTL(t, e, args...)
-	if code != 0 || warm != cold || warmErr != "" {
+	if code != 0 || warm != cold || !strings.Contains(warmErr, "3 wait event(s)") {
 		t.Fatalf("warm = (%d, %q, %q), cold %q", code, warm, warmErr, cold)
 	}
 	cache := newWaitCache(io.Discard)
@@ -143,7 +143,7 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 	if after, err := os.Stat(path); err != nil || after.Size() != before.Size() {
 		t.Fatalf("same-size rewrite changed the size: %v", err)
 	}
-	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "5000\n" || errOut != "" {
+	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "5000\n" || !strings.Contains(errOut, "3 wait event(s)") {
 		t.Fatalf("same size, new mtime = (%d, %q, %q)", code, out, errOut)
 	}
 	withMore := append(spec, struct {
@@ -165,7 +165,7 @@ func TestWaitCacheColdWarmChangedAndBinaryFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, changed, changedErr := runTL(t, e, args...)
-	if code != 0 || changed != "3000\n" || changedErr != "" || !cache.valid(path) {
+	if code != 0 || changed != "3000\n" || !strings.Contains(changedErr, "5 wait event(s)") || !cache.valid(path) {
 		t.Fatalf("changed = (%d, %q, %q)", code, changed, changedErr)
 	}
 }
@@ -204,10 +204,10 @@ func TestWaitCacheSkipsTranscriptChangedDuringRead(t *testing.T) {
 	args := []string{"--wait", "tk done", "--q", "50", path}
 	// Первый вызов прочёл три вызова, файл тем временем дописан до пяти: его ответ — по прочитанному,
 	// а запись не сохраняется, и второй вызов читает файл заново.
-	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "2000\n" || errOut != "" {
+	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "2000\n" || !strings.Contains(errOut, "3 wait event(s)") {
 		t.Fatalf("during append = (%d, %q, %q)", code, out, errOut)
 	}
-	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "3000\n" || errOut != "" {
+	if code, out, errOut := runTL(t, e, args...); code != 0 || out != "3000\n" || !strings.Contains(errOut, "5 wait event(s)") {
 		t.Fatalf("after append = (%d, %q, %q), want 3000 from a fresh read", code, out, errOut)
 	}
 }
@@ -301,7 +301,7 @@ func TestWaitCachePreservesRepeatedCallIDSemantics(t *testing.T) {
 	args := []string{"--wait", "tk done", "--q", "50", path}
 	codeCold, cold, errCold := runTL(t, e, args...)
 	codeWarm, warm, errWarm := runTL(t, e, args...)
-	if codeCold != 0 || codeWarm != codeCold || cold != "2000\n" || warm != cold || errCold != "" || errWarm != "" {
+	if codeCold != 0 || codeWarm != codeCold || cold != "2000\n" || warm != cold || (!strings.Contains(errCold, "3 wait event(s)") || !strings.Contains(errWarm, "3 wait event(s)")) {
 		t.Fatalf("cold=(%d,%q,%q) warm=(%d,%q,%q)", codeCold, cold, errCold, codeWarm, warm, errWarm)
 	}
 }

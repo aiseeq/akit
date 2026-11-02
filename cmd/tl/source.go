@@ -118,7 +118,7 @@ func find(arg, home string) (string, error) {
 		if aliveErr != nil {
 			return "", fmt.Errorf("%q: no transcript with this id; live sessions read with error: %w", arg, aliveErr)
 		}
-		return "", fmt.Errorf("%q: no live session with this name and no transcript with this id", arg)
+		return "", fmt.Errorf("%q: no live session with this name and no transcript with this id; find sessions with --grep or --all --project", arg)
 	case 1:
 		return matches[0], nil
 	}
@@ -227,18 +227,47 @@ func subSource(path string) (source, error) {
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)
 
-// splitRef узнаёт единственный аргумент вида «id:строка»; не он — пустой ref.
-func splitRef(args []string) (string, int, error) {
-	if len(args) != 1 {
-		return "", 0, nil
-	}
-	m := refArg.FindStringSubmatch(args[0])
+type eventRef struct {
+	id   string
+	line int
+}
+
+// parseRef узнаёт аргумент вида «id:строка» или «id:<id>:строка» (форма из документации); не он — ok=false.
+func parseRef(arg string) (string, int, bool, error) {
+	m := refArg.FindStringSubmatch(arg)
 	if m == nil {
-		return "", 0, nil
+		return "", 0, false, nil
+	}
+	id := strings.TrimPrefix(m[1], "id:")
+	if id == "" {
+		return "", 0, true, fmt.Errorf("ref %s: empty id", arg)
 	}
 	line, err := strconv.Atoi(m[2])
 	if err != nil {
-		return "", 0, fmt.Errorf("ref %s: %w", args[0], err)
+		return "", 0, true, fmt.Errorf("ref %s: %w", arg, err)
 	}
-	return m[1], line, nil
+	return id, line, true, nil
+}
+
+// splitRefs accepts either session arguments or event references, never a mixture.
+func splitRefs(args []string) ([]eventRef, error) {
+	refs := make([]eventRef, 0, len(args))
+	matched := 0
+	for _, arg := range args {
+		id, line, ok, err := parseRef(arg)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			matched++
+			refs = append(refs, eventRef{id: id, line: line})
+		}
+	}
+	if matched == 0 {
+		return nil, nil
+	}
+	if matched != len(args) {
+		return nil, errors.New("REF cannot be combined with SESSION")
+	}
+	return refs, nil
 }

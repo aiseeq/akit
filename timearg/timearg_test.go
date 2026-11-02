@@ -15,6 +15,9 @@ func TestParseTime(t *testing.T) {
 		"24.10":                time.Date(2026, 10, 24, 0, 0, 0, 0, loc),
 		"24.10 23:09":          time.Date(2026, 10, 24, 23, 9, 0, 0, loc),
 		"2026-10-20":           time.Date(2026, 10, 20, 0, 0, 0, 0, loc),
+		"2026-10-25T03:00":     time.Date(2026, 10, 25, 3, 0, 0, 0, loc),
+		"2026-10-25T03:00:05":  time.Date(2026, 10, 25, 3, 0, 5, 0, loc),
+		"2026-10-25 03:00":     time.Date(2026, 10, 25, 3, 0, 0, 0, loc),
 		"2026-10-25T09:00:00Z": time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC),
 	}
 	for in, want := range cases {

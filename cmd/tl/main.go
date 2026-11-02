@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aiseeq/akit/buildversion"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 )
@@ -23,7 +24,8 @@ const usage = `tl — session transcripts, briefly: a time/role window or a sear
 Usage:
   tl [SESSION...] [flags]     events of sessions (default: this session)
   tl --all [flags]            all Claude Code transcripts (default --since 7d)
-  tl REF                      one event in full; REF is id:line from a listing
+  tl REF [REF...]              events in full; REF is id:line from a listing
+  tl --version                 print the build version
 
 SESSION is a live session name (main), a session id or its prefix, or a .jsonl
 path (Claude Code or codex rollout).
@@ -31,7 +33,8 @@ path (Claude Code or codex rollout).
   --role R,R    user ask peer agent cmd out note, or all (assistant = agent,
                 tool = cmd: the names in jsonl)
                 (default user,ask,peer,agent: the conversation)
-  --since T     from time T: 12:05, 25.10, "25.10 12:05", 2026-10-25T10:05:00Z,
+  --since T     from time T: 12:05, 25.10, "25.10 12:05", 2026-10-25T10:05,
+                2026-10-25T10:05:00, 2026-10-25T10:05:00Z, 2026-10-25T10:05:00+01:00,
                 or ago: 30m 2h 3d
   --until T     up to time T, same forms
   --grep RE     events whose text matches RE (case-insensitive)
@@ -93,6 +96,7 @@ type options struct {
 	maxSet       bool
 	widthSet     bool
 	rolesSet     bool
+	version      bool
 	args         []string
 	originalArgs []string
 	waitCache    *waitCache
@@ -183,6 +187,8 @@ func setSwitch(opts *options, name string) bool {
 		opts.subagents = true
 	case "--usage":
 		opts.usage = true
+	case "--version":
+		opts.version = true
 	default:
 		return false
 	}
@@ -267,7 +273,7 @@ func nonNegative(name, val string) (int, error) {
 }
 
 // roleAliases — имена ролей, как они записаны в jsonl: агенты пишут их в --role естественно.
-var roleAliases = map[string]transcript.Role{"assistant": transcript.Agent, "tool": transcript.Cmd}
+var roleAliases = map[string]transcript.Role{"assistant": transcript.Agent, "tool": transcript.Cmd, "tool_use": transcript.Cmd, "bash": transcript.Cmd, "result": transcript.Out}
 
 func setRoles(opts *options, list string) error {
 	opts.roles = map[transcript.Role]bool{}
@@ -301,13 +307,23 @@ func setRoles(opts *options, list string) error {
 }
 
 func run(opts options, e env, stdout, stderr io.Writer) int {
-	ref, line, err := splitRef(opts.args)
+	if opts.version {
+		fmt.Fprintln(stdout, buildversion.String("tl"))
+		return 0
+	}
+	refs, err := splitRefs(opts.args)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	if ref != "" {
-		return showRef(ref, line, e, stdout, stderr)
+	if len(refs) > 0 {
+		code := 0
+		for _, ref := range refs {
+			if result := showRef(ref.id, ref.line, opts.width, e, stdout, stderr); result > code {
+				code = result
+			}
+		}
+		return code
 	}
 	sources, err := resolve(opts, e)
 	if err != nil {

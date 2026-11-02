@@ -845,7 +845,7 @@ func tilde(path, home string) string {
 }
 
 // showRef печатает одно событие полностью: все события строки ref (у вызова их бывает несколько).
-func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
+func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 	path, err := find(ref, e.home)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
@@ -876,7 +876,11 @@ func showRef(ref string, lineNo int, e env, w, stderr io.Writer) int {
 		if ev.Who != "" {
 			who = " " + ev.Who
 		}
-		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), src.id, ev.Line, ev.Role, who, ev.Shown())
+		text := ev.Shown()
+		if width > 0 && utf8.RuneCountInString(text) > width {
+			text = transcript.Short(text, width)
+		}
+		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), src.id, ev.Line, ev.Role, who, text)
 	}
 	return 0
 }

@@ -9,9 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/aiseeq/akit/buildversion"
 )
 
 const (
@@ -71,12 +72,7 @@ func newFetcher() *fetcher {
 // userAgent — короткое честное имя с версией akit. Длинное, со словами «AI agent», режут часть сайтов (замер на
 // новостном сайте); имени обычного браузера нет и не будет.
 func userAgent() string {
-	v := "dev"
-	if bi, ok := debug.ReadBuildInfo(); ok && strings.HasPrefix(bi.Main.Version, "v") {
-		v, _, _ = strings.Cut(bi.Main.Version, "-")
-		v = strings.TrimSuffix(v, "+dirty")
-	}
-	return "akit-webtext/" + v
+	return "akit-webtext/" + buildversion.Version()
 }
 
 // open проходит ступени: прямой запрос (direct=false — сайт уже ответил 429 и не спрашивается), затем снимки
