@@ -325,32 +325,58 @@ func since(start time.Time) string {
 	return d.Round(time.Second).String()
 }
 
-// clockArg is a clock time without a date (00:03, 12:05:30); agoArg is timearg's "N units ago" form.
+// clockArg is a clock time without a date (00:03, 12:05:30, 12:05:30.5); agoArg is
+// timearg's "N units ago" form, which a wait for a moment never takes.
 var (
-	clockArg = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
-	agoArg   = regexp.MustCompile(`^[0-9]{1,6}[smhd]$`)
+	clockArg = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?$`)
+	agoArg   = regexp.MustCompile(`^[0-9]+[smhd]$`)
 )
 
 // waitUntil reads the time a time condition waits for. A clock time without a date
-// is its occurrence nearest to now: 00:03 at 23:56 is tomorrow, 12:00 at 12:05 is
-// five minutes ago and refused. Anything not after now is refused.
+// is today's, or tomorrow's when today's has passed and tomorrow's is nearer: 00:03
+// at 23:56 is tomorrow, 12:00 at 12:05 is five minutes ago and refused. Anything not
+// after now is refused.
 func waitUntil(arg string, now time.Time) (time.Time, error) {
-	at, err := timearg.Parse(arg, now)
-	if err != nil {
-		return time.Time{}, err
-	}
 	s := strings.TrimSpace(arg)
-	if !at.After(now) && clockArg.MatchString(s) {
-		if next := at.AddDate(0, 0, 1); next.Sub(now) < now.Sub(at) {
-			at = next
+	if agoArg.MatchString(s) {
+		return time.Time{}, fmt.Errorf("time %q reads as %s ago; time takes a clock time or a date, such as 00:03 or \"03.11 00:03\"", arg, s)
+	}
+	var at time.Time
+	if clockArg.MatchString(s) {
+		var err error
+		if at, err = nextClock(s, now); err != nil {
+			return time.Time{}, err
+		}
+	} else {
+		var err error
+		if at, err = timearg.Parse(s, now); err != nil {
+			return time.Time{}, fmt.Errorf("time %q: use 14:45, 26.10, \"26.10 09:00\", 2026-10-26T09:00:00Z or 2026-10-26T09:00:00+01:00", arg)
 		}
 	}
-	if at.After(now) {
-		return at, nil
+	if !at.After(now) {
+		return time.Time{}, fmt.Errorf("time %q is already past (%s); time takes a clock time or a date in the future", arg, at.Format("02.01 15:04:05"))
 	}
-	if agoArg.MatchString(s) {
-		return time.Time{}, fmt.Errorf("time %q reads as %s ago (%s); time takes a clock time or a date, such as 00:03 or \"03.11 00:03\"",
-			arg, s, at.Format("02.01 15:04:05"))
+	return at, nil
+}
+
+// nextClock builds today's and tomorrow's wall-clock time from the clock fields, so a
+// time that does not exist today (the clocks go forward) does not move tomorrow's.
+func nextClock(s string, now time.Time) (time.Time, error) {
+	layout := "15:04"
+	if strings.Count(s, ":") == 2 {
+		layout = "15:04:05"
 	}
-	return time.Time{}, fmt.Errorf("time %q is already past (%s); time takes a clock time or a date in the future", arg, at.Format("02.01 15:04:05"))
+	c, err := time.Parse(layout, strings.Replace(s, ",", ".", 1))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("time %q: %w", s, err)
+	}
+	y, mo, d := now.Date()
+	at := func(day int) time.Time {
+		return time.Date(y, mo, day, c.Hour(), c.Minute(), c.Second(), c.Nanosecond(), now.Location())
+	}
+	today, tomorrow := at(d), at(d+1)
+	if !today.After(now) && tomorrow.Sub(now) < now.Sub(today) {
+		return tomorrow, nil
+	}
+	return today, nil
 }

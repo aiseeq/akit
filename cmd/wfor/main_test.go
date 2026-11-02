@@ -417,6 +417,8 @@ func TestWaitUntilClockTimeNearest(t *testing.T) {
 		{"23:59", at(3, 0, 1), at(3, 23, 59)},
 		{"07:00", at(2, 20, 0), at(3, 7, 0)},
 		{"03.11 00:03", at(2, 23, 56), at(3, 0, 3)},
+		{"00:03:00.5", at(2, 23, 56), time.Date(2026, 11, 3, 0, 3, 0, 5e8, time.Local)},
+		{" 7:05 ", at(2, 6, 0), at(2, 7, 5)},
 	} {
 		got, err := waitUntil(c.arg, c.now)
 		if err != nil || !got.Equal(c.want) {
@@ -432,6 +434,8 @@ func TestWaitUntilClockTimeNearest(t *testing.T) {
 		{"07:00", at(2, 8, 0), "already past"},
 		{"02.11 00:03", at(2, 23, 56), "already past"},
 		{"5m", at(2, 23, 56), "ago"},
+		{"200000d", at(2, 23, 56), "ago"},
+		{"25:00", at(2, 23, 56), "25:00"},
 	} {
 		if got, err := waitUntil(c.arg, c.now); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("waitUntil(%q, %s) = %s, %v; want an error with %q", c.arg, c.now, got, err, c.want)
@@ -450,5 +454,18 @@ func TestWaitUntilAcrossDaylightSaving(t *testing.T) {
 	got, err := waitUntil("00:30", now)
 	if want := time.Date(2026, 10, 26, 0, 30, 0, 0, loc); err != nil || !got.Equal(want) {
 		t.Fatalf("waitUntil = %s, %v; want %s", got, err, want)
+	}
+	// The clocks go forward at 02:00 on 2026-03-29: today's 02:30 does not exist,
+	// and tomorrow's 02:30 must stay 02:30.
+	got, err = waitUntil("02:30", time.Date(2026, 3, 29, 23, 50, 0, 0, loc))
+	if want := time.Date(2026, 3, 30, 2, 30, 0, 0, loc); err != nil || !got.Equal(want) {
+		t.Fatalf("waitUntil after the clocks go forward = %s, %v; want %s", got, err, want)
+	}
+}
+
+func TestWaitUntilParseErrorNamesOnlyMoments(t *testing.T) {
+	_, err := waitUntil("tomorrow", time.Date(2026, 11, 2, 12, 0, 0, 0, time.Local))
+	if err == nil || strings.Contains(err.Error(), "30m") || !strings.Contains(err.Error(), "14:45") {
+		t.Fatalf("parse error = %v; want the moment forms without ago forms", err)
 	}
 }
