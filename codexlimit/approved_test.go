@@ -54,11 +54,27 @@ func TestApprovalsForNeighbourMinute(t *testing.T) {
 	}
 }
 
+func TestReadApprovedLongSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "approvals.tsv")
+	source := strings.Repeat("s", 2<<20)
+	if err := os.WriteFile(path, []byte("2026-11-02T15:39:00Z\t"+source+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	approvals, err := ReadApproved(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := approvals.For(time.Date(2026, 11, 2, 15, 39, 0, 0, time.UTC)); !ok || got != source {
+		t.Fatalf("For: ok %v, source length %d", ok, len(got))
+	}
+}
+
 func TestReadApprovedBadLines(t *testing.T) {
 	for name, badLine := range map[string]string{
 		"no-tab":       "2026-11-02T15:39:00Z source",
 		"not-rfc3339":  "not-a-time\tsynthetic source",
 		"empty-source": "2026-11-02T15:39:00Z\t  ",
+		"long-no-tab":  strings.Repeat("x", 2<<20),
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "approvals.tsv")

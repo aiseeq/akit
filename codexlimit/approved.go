@@ -1,7 +1,6 @@
 package codexlimit
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -15,20 +14,18 @@ type Approvals map[time.Time]string
 
 // ReadApproved reads reset approvals from path.
 func ReadApproved(path string) (Approvals, error) {
-	file, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Approvals{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("codexlimit: open approvals: %w", err)
+		return nil, fmt.Errorf("codexlimit: read approvals: %w", err)
 	}
-	defer file.Close()
 
 	approvals := Approvals{}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for lineNumber := 1; scanner.Scan(); lineNumber++ {
-		line := scanner.Text()
+	// The whole file is read at once, so a line of any length still gets its number in an error.
+	for i, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		lineNumber := i + 1
 		if line == "" {
 			continue
 		}
@@ -38,9 +35,6 @@ func ReadApproved(path string) (Approvals, error) {
 			return nil, fmt.Errorf("%s:%d: want RFC3339<TAB>source, got %q", path, lineNumber, line)
 		}
 		approvals[at.UTC().Truncate(time.Minute)] = source
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("%s: read approvals: %w", path, err)
 	}
 	return approvals, nil
 }
