@@ -188,8 +188,14 @@ func validateApproxTime(o options, now time.Time) error {
 			if m[1] != "" && m[1] != now.Format("02.01") && m[1] != now.Format("2006-01-02") {
 				continue // время другого дня
 			}
-			h, _ := strconv.Atoi(m[2])
-			mi, _ := strconv.Atoi(m[3])
+			h, err := strconv.Atoi(m[2])
+			if err != nil {
+				return fmt.Errorf("%s: hour %q: %w", f.flag, m[2], err)
+			}
+			mi, err := strconv.Atoi(m[3])
+			if err != nil {
+				return fmt.Errorf("%s: minute %q: %w", f.flag, m[3], err)
+			}
 			at := time.Date(now.Year(), now.Month(), now.Day(), h, mi, 0, 0, now.Location())
 			ahead := at.Sub(now.Truncate(time.Minute)) % (24 * time.Hour)
 			if ahead < 0 {
