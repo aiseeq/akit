@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -26,10 +27,111 @@ func (u *run) writeReport() error {
 	u.writeReportIssueSummary(&b)
 	u.writeHookInputSummary(&b)
 	u.writeReportNotes(&b)
+	u.writePairReport(&b)
 	if err := os.WriteFile(filepath.Join(u.outputDir, "report.md"), []byte(b.String()), fileMode); err != nil {
 		return fmt.Errorf("report.md: %w", err)
 	}
 	return nil
+}
+
+type pairReportTally struct{ newEpisodes, oldEpisodes, mixedEpisodes, calls, fail, unknown int }
+
+func (u *run) writePairReport(b *strings.Builder) {
+	b.WriteString("\n## Пары этапа 2\n\n")
+	if u.releasesPath == "" {
+		b.WriteString("даты выпуска не заданы; период — no-date.\n\n")
+	}
+	b.WriteString("| утилита | доля по эпизодам (95% Уилсон) | эпизоды new / old / mixed | доля ошибок |\n|---|---:|---:|---:|\n")
+	for _, tool := range pairTools() {
+		u.writePairReportRow(b, tool, u.pairReportTally(tool))
+	}
+	fmt.Fprintf(b, "\nВне пар busy: без последующего решения — %d; `busy --quiet` — %d.\n", u.busyNoDecision, u.busyQuiet)
+	fmt.Fprintf(b, "Поиск решений (по правилу): %d вызовов.\n", u.decisionRuleSearches)
+	fmt.Fprintf(b, "Prior old по источнику: .claude/improve/ — %d вызовов; tl --role user --grep — %d вызовов.\n", u.priorImproveCalls, u.priorTLCalls)
+	b.WriteString("\n## Ограничения замера\n\nЦель определяется по ключу, а не по смыслу; instructed означает упоминание утилиты, а не обязательность её применения. Полнота детекторов оценивается внутри заданного надмножества. Повтор не означает ошибку. Польза tk измерена прокси.\n")
+	b.WriteString("Неизвестные исходы новых пар по причинам: ")
+	if len(u.pairUnknownReasons) == 0 {
+		b.WriteString("нет; ")
+	} else {
+		reasons := make([]string, 0, len(u.pairUnknownReasons))
+		for reason := range u.pairUnknownReasons {
+			reasons = append(reasons, reason)
+		}
+		sort.Strings(reasons)
+		for i, reason := range reasons {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(b, "%s — %d", reason, u.pairUnknownReasons[reason])
+		}
+		b.WriteString("; ")
+	}
+	fmt.Fprintf(b, "отклонённых вызовов tool use не учтено: %d.\n", u.rejectedToolUses)
+}
+
+func (u *run) pairReportTally(tool string) pairReportTally {
+	tally := pairReportTally{}
+	episodes := map[string][]pairCall{}
+	for i := range u.pairCalls {
+		call := &u.pairCalls[i]
+		if call.tool != tool || call.goal == "" {
+			continue
+		}
+		episodes[call.session+"|"+call.goal] = append(episodes[call.session+"|"+call.goal], *call)
+		if call.way == "new" {
+			tally.calls++
+			if call.outcome == "fail" || call.outcome == "callerr" {
+				tally.fail++
+			}
+			if call.outcome == "unknown" {
+				tally.unknown++
+			}
+		}
+	}
+	for _, calls := range episodes {
+		sort.Slice(calls, func(i, j int) bool { return calls[i].at.Before(calls[j].at) })
+		tallyPairEpisodes(&tally, calls)
+	}
+	return tally
+}
+
+func tallyPairEpisodes(tally *pairReportTally, calls []pairCall) {
+	for start := 0; start < len(calls); {
+		end, ways := reportEpisodeEnd(calls, start)
+		switch {
+		case ways["new"] && ways["old"]:
+			tally.mixedEpisodes++
+		case ways["new"]:
+			tally.newEpisodes++
+		default:
+			tally.oldEpisodes++
+		}
+		start = end
+	}
+}
+
+func reportEpisodeEnd(calls []pairCall, start int) (int, map[string]bool) {
+	end := start + 1
+	ways := map[string]bool{calls[start].way: true}
+	for end < len(calls) && calls[end].at.Sub(calls[end-1].at) <= 30*time.Minute {
+		ways[calls[end].way] = true
+		end++
+	}
+	return end, ways
+}
+
+func (u *run) writePairReportRow(b *strings.Builder, tool string, tally pairReportTally) {
+	total := tally.newEpisodes + tally.oldEpisodes
+	share := "мало данных"
+	if total >= 20 {
+		low, high := u.wilson(tally.newEpisodes, total)
+		share = fmt.Sprintf("%.1f%% (%.1f–%.1f%%)", 100*float64(tally.newEpisodes)/float64(total), 100*low, 100*high)
+	}
+	errorShare := "—"
+	if tally.calls > 0 {
+		errorShare = fmt.Sprintf("%.1f–%.1f%%", 100*float64(tally.fail)/float64(tally.calls), 100*float64(tally.fail+tally.unknown)/float64(tally.calls))
+	}
+	fmt.Fprintf(b, "| %s | %s | %d / %d / %d | %s |\n", tool, share, tally.newEpisodes, tally.oldEpisodes, tally.mixedEpisodes, errorShare)
 }
 
 type reportTally struct{ window, recent, old int }

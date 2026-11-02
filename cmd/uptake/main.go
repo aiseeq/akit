@@ -36,6 +36,7 @@ type call struct {
 }
 type taskWrite struct {
 	agent, file, key, source, op string
+	session                      string
 	at                           time.Time
 	line                         int
 	failed                       bool
@@ -64,6 +65,20 @@ type run struct {
 	hookMissing                                             []string
 	hookBadLines                                            int
 	firstHookBad                                            string
+	releasesPath                                            string
+	pairCalls                                               []pairCall
+	pairOldIDs                                              map[string]map[string]struct{}
+	pairCandidates                                          []pairCandidate
+	tkRefusals                                              []tkRefusal
+	tkActions                                               []taskWrite
+	pairOverlap                                             []pairOverlap
+	busyQuiet, busyNoDecision                               int
+	rejectedToolUses                                        int
+	pairUnknownReasons                                      map[string]int
+	decisionRuleSearches                                    int
+	priorImproveCalls, priorTLCalls                         int
+	sessionEnds                                             map[string]time.Time
+	pairPatterns                                            pairPatterns
 }
 
 func newRun(since, until time.Time, seed int, out, home string) *run {
@@ -72,8 +87,9 @@ func newRun(since, until time.Time, seed int, out, home string) *run {
 		outputDir: out, home: home,
 		counts: map[string]int{}, habitCandidates: map[string][]example{}, refusalSamples: map[string][]example{},
 		tkPair: map[string]*[2]int{}, utilityNames: []string{"busy", "prior", "tk", "user-word", "page-shot", "webtext", "claude-rules-export", "sub", "tl", "wfor"},
-		errorStats: map[string]*errorStat{},
-		hookCounts: map[string]int{},
+		errorStats:   map[string]*errorStat{},
+		hookCounts:   map[string]int{},
+		pairPatterns: newPairPatterns(),
 	}
 }
 
@@ -539,10 +555,15 @@ func (u *run) process(path string) {
 		return
 	}
 	calls, taskWrites := u.scanProcessEvents(path, isClaude, models, evs, outs)
+	for i := range taskWrites {
+		taskWrites[i].session = path
+	}
 	u.resolveCallCodes(calls, outs)
+	u.collectPairEvents(path, isClaude, models, evs, outs, calls)
 	u.recordProcessCalls(path, evs, models, calls)
 	u.processWaits(path, evs, models, outs)
 	u.recordTaskWrites(taskWrites)
+	u.tkActions = append(u.tkActions, taskWrites...)
 }
 
 func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transcript.Event, map[string]transcript.Event, bool) {
@@ -1036,16 +1057,18 @@ func (u *run) recordWebFetch(path string, models map[int]string, e transcript.Ev
 func (u *run) recordTaskWrites(taskWrites []taskWrite) {
 	seenWrites := map[string]bool{}
 	var uniqueWrites []taskWrite
-	for _, w := range taskWrites {
+	for i := range taskWrites {
+		w := &taskWrites[i]
 		k := fmt.Sprintf("%s|%d|%s|%s", w.agent, w.line, w.source, w.key)
 		if !seenWrites[k] {
 			seenWrites[k] = true
-			uniqueWrites = append(uniqueWrites, w)
+			uniqueWrites = append(uniqueWrites, *w)
 		}
 	}
 	// Every successful write is in the denominator; the repeat is a later manual
 	// write to the same ticket by the same agent within 10 minutes.
-	for _, w := range uniqueWrites {
+	for i := range uniqueWrites {
+		w := &uniqueWrites[i]
 		if w.failed {
 			continue
 		}
@@ -1072,7 +1095,7 @@ func (u *run) recordTaskWrites(taskWrites []taskWrite) {
 	}
 }
 
-func (u *run) isFirstManualWrite(w taskWrite, writes []taskWrite) bool {
+func (u *run) isFirstManualWrite(w *taskWrite, writes []taskWrite) bool {
 	for i := range writes {
 		n := &writes[i]
 		if n.at.Before(w.at) && n.agent == w.agent && (n.source == "manual" && n.file == w.file || n.source == "tk" && strings.Contains(filepath.Base(w.file), n.key)) {
@@ -1082,18 +1105,20 @@ func (u *run) isFirstManualWrite(w taskWrite, writes []taskWrite) bool {
 	return true
 }
 
-func (u *run) manualWriteAfter(w taskWrite, writes []taskWrite, matches func(taskWrite, taskWrite) bool) bool {
+func (u *run) manualWriteAfter(w *taskWrite, writes []taskWrite, matches func(*taskWrite, *taskWrite) bool) bool {
 	for i := range writes {
 		n := &writes[i]
-		if n.source == "manual" && n.line != w.line && n.agent == w.agent && matches(w, *n) && n.at.Sub(w.at) >= 0 && n.at.Sub(w.at) <= 10*time.Minute {
+		if n.source == "manual" && n.line != w.line && n.agent == w.agent && matches(w, n) && n.at.Sub(w.at) >= 0 && n.at.Sub(w.at) <= 10*time.Minute {
 			return true
 		}
 	}
 	return false
 }
 
-func (u *run) sameTaskFile(w, n taskWrite) bool { return n.file == w.file }
-func (u *run) sameTaskKey(w, n taskWrite) bool  { return strings.Contains(filepath.Base(n.file), w.key) }
+func (u *run) sameTaskFile(w, n *taskWrite) bool { return n.file == w.file }
+func (u *run) sameTaskKey(w, n *taskWrite) bool {
+	return strings.Contains(filepath.Base(n.file), w.key)
+}
 
 func (u *run) processWaits(path string, evs []transcript.Event, models map[int]string, outs map[string]transcript.Event) {
 	wr := waits.New()
@@ -1197,7 +1222,7 @@ func (u *run) ruleFlags(cmd string) string {
 	return strings.Join(r, "; ")
 }
 func main() {
-	since, until, chosenSeed, out, err := parseUptakeArgs(os.Args[1:], time.Now())
+	args, err := parseUptakeArgs(os.Args[1:], time.Now())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "uptake:", err)
 		os.Exit(2)
@@ -1207,27 +1232,50 @@ func main() {
 		fmt.Fprintln(os.Stderr, "uptake: home directory:", err)
 		os.Exit(1)
 	}
-	u := newRun(since, until, chosenSeed, out, home)
-	if err := u.runUptake(since, until); err != nil {
+	u := newRun(args.since, args.until, args.seed, args.out, home)
+	u.releasesPath = args.releases
+	if _, err := u.loadReleases(); err != nil {
+		fmt.Fprintln(os.Stderr, "uptake:", err)
+		os.Exit(2)
+	}
+	if err := u.runUptake(args.since, args.until); err != nil {
 		fmt.Fprintln(os.Stderr, "uptake:", err)
 		os.Exit(1)
 	}
 }
 
-func parseUptakeArgs(args []string, now time.Time) (time.Time, time.Time, int, string, error) {
+// uptakeArgs — разобранные аргументы командной строки.
+type uptakeArgs struct {
+	since, until  time.Time
+	seed          int
+	out, releases string
+}
+
+func parseUptakeArgs(args []string, now time.Time) (uptakeArgs, error) {
+	a, err := parseUptakeFlags(args, now)
+	if err != nil {
+		return uptakeArgs{}, err
+	}
+	if !a.since.Before(a.until) {
+		return uptakeArgs{}, fmt.Errorf("--since must be before --until")
+	}
+	return a, nil
+}
+
+func parseUptakeFlags(args []string, now time.Time) (uptakeArgs, error) {
 	since, until := now.Add(-7*24*time.Hour), now
-	chosenSeed, out := 0, ""
+	chosenSeed, out, releases := 0, "", ""
 	seedSet := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		name, value, has := strings.Cut(arg, "=")
-		if name != "--since" && name != "--until" && name != "--seed" && name != "--out" {
-			return time.Time{}, time.Time{}, 0, "", fmt.Errorf("unknown argument %q", arg)
+		if name != "--since" && name != "--until" && name != "--seed" && name != "--out" && name != "--releases" {
+			return uptakeArgs{}, fmt.Errorf("unknown argument %q", arg)
 		}
 		if !has {
 			i++
 			if i >= len(args) {
-				return time.Time{}, time.Time{}, 0, "", fmt.Errorf("%s needs a value", name)
+				return uptakeArgs{}, fmt.Errorf("%s needs a value", name)
 			}
 			value = args[i]
 		}
@@ -1235,7 +1283,7 @@ func parseUptakeArgs(args []string, now time.Time) (time.Time, time.Time, int, s
 		case "--since", "--until":
 			t, err := timearg.Parse(value, now)
 			if err != nil {
-				return time.Time{}, time.Time{}, 0, "", fmt.Errorf("invalid %s: %w", name, err)
+				return uptakeArgs{}, fmt.Errorf("invalid %s: %w", name, err)
 			}
 			if name == "--since" {
 				since = t
@@ -1245,21 +1293,20 @@ func parseUptakeArgs(args []string, now time.Time) (time.Time, time.Time, int, s
 		case "--seed":
 			n, err := strconv.Atoi(value)
 			if err != nil {
-				return time.Time{}, time.Time{}, 0, "", fmt.Errorf("--seed must be an integer: %w", err)
+				return uptakeArgs{}, fmt.Errorf("--seed must be an integer: %w", err)
 			}
 			chosenSeed, seedSet = n, true
 		case "--out":
 			out = value
+		case "--releases":
+			releases = value
 		}
-	}
-	if !since.Before(until) {
-		return time.Time{}, time.Time{}, 0, "", fmt.Errorf("--since must be before --until")
 	}
 	if !seedSet {
 		y, m, d := since.UTC().Date()
 		chosenSeed = y*10000 + int(m)*100 + d
 	}
-	return since, until, chosenSeed, out, nil
+	return uptakeArgs{since: since, until: until, seed: chosenSeed, out: out, releases: releases}, nil
 }
 
 func (u *run) runUptake(since, until time.Time) error {
@@ -1458,6 +1505,9 @@ func (u *run) writeTables() error {
 		return err
 	}
 	if err := u.writeSubCost(); err != nil {
+		return err
+	}
+	if err := u.writePairTables(); err != nil {
 		return err
 	}
 	return u.writeReport()

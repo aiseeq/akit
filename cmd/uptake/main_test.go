@@ -15,16 +15,16 @@ import (
 
 func TestParseUptakeArgs(t *testing.T) {
 	now := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC)
-	since, until, seed, out, err := parseUptakeArgs([]string{"--since", "2026-10-25T11:00:00Z", "--out=/tmp/out"}, now)
-	if err != nil || since.Format(time.RFC3339) != "2026-10-25T11:00:00Z" || !until.Equal(now) || seed != 20261025 || out != "/tmp/out" {
-		t.Fatalf("parsed (%s, %s, %d, %q), err %v", since, until, seed, out, err)
+	a, err := parseUptakeArgs([]string{"--since", "2026-10-25T11:00:00Z", "--out=/tmp/out", "--releases", "rel.tsv"}, now)
+	if err != nil || a.since.Format(time.RFC3339) != "2026-10-25T11:00:00Z" || !a.until.Equal(now) || a.seed != 20261025 || a.out != "/tmp/out" || a.releases != "rel.tsv" {
+		t.Fatalf("parsed %+v, err %v", a, err)
 	}
-	localSince, localUntil, _, _, err := parseUptakeArgs([]string{"--since", "31.10 03:00", "--until", "1h"}, now)
-	if err != nil || localSince.Location() != now.Location() || !localUntil.Equal(now.Add(-time.Hour)) {
-		t.Fatalf("timearg forms parsed as (%s, %s), err %v", localSince, localUntil, err)
+	local, err := parseUptakeArgs([]string{"--since", "31.10 03:00", "--until", "1h", "--releases=r.tsv"}, now)
+	if err != nil || local.since.Location() != now.Location() || !local.until.Equal(now.Add(-time.Hour)) || local.releases != "r.tsv" {
+		t.Fatalf("timearg forms parsed as %+v, err %v", local, err)
 	}
-	for _, args := range [][]string{{"--since", "bad"}, {"--since", "2026-11-01T02:00:00Z", "--until", "2026-11-01T02:00:00Z"}} {
-		if _, _, _, _, err := parseUptakeArgs(args, now); err == nil {
+	for _, args := range [][]string{{"--since", "bad"}, {"--since", "2026-11-01T02:00:00Z", "--until", "2026-11-01T02:00:00Z"}, {"--releases"}} {
+		if _, err := parseUptakeArgs(args, now); err == nil {
 			t.Errorf("parseUptakeArgs(%q) unexpectedly succeeded", args)
 		}
 	}
@@ -352,9 +352,9 @@ func TestUptakeReviewRegressions(t *testing.T) {
 		since := time.Date(2026, 10, 31, 23, 0, 0, 500_000_000, time.UTC)
 		until := since.Add(time.Hour)
 		u := newRun(since, until, 1, t.TempDir(), t.TempDir())
-		parsedSince, parsedUntil, _, _, err := parseUptakeArgs([]string{"--since", since.Format(time.RFC3339Nano), "--until", until.Format(time.RFC3339Nano)}, until)
-		if err != nil || !parsedSince.Equal(since) || !parsedUntil.Equal(until) {
-			t.Fatalf("fractional flag parse = (%s, %s, %v)", parsedSince, parsedUntil, err)
+		parsed, err := parseUptakeArgs([]string{"--since", since.Format(time.RFC3339Nano), "--until", until.Format(time.RFC3339Nano)}, until)
+		if err != nil || !parsed.since.Equal(since) || !parsed.until.Equal(until) {
+			t.Fatalf("fractional flag parse = (%s, %s, %v)", parsed.since, parsed.until, err)
 		}
 		if u.valid(since.Add(-250 * time.Millisecond)) {
 			t.Fatal("event before since accepted")
