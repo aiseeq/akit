@@ -32,17 +32,22 @@ func Consume(ctx context.Context, cmd *exec.Cmd, idempotencyKey, creditID string
 		return "", fmt.Errorf("codexlimit: encode consume request: %w", err)
 	}
 	request := fmt.Sprintf("{\"id\":2,\"method\":\"account/rateLimitResetCredit/consume\",\"params\":%s}", encoded)
-	response, err := exchange(ctx, cmd, request)
+	raw, err := exchange(ctx, cmd, request)
 	if err != nil {
 		return "", err
 	}
-	if response.Result.Outcome == nil || *response.Result.Outcome == "" {
-		return "", errors.New("codexlimit: answer has no outcome")
+	var result struct {
+		Outcome Outcome `json:"outcome"`
 	}
-	switch *response.Result.Outcome {
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("codexlimit: decode consume result: %w", err)
+	}
+	switch result.Outcome {
+	case "":
+		return "", errors.New("codexlimit: answer has no outcome")
 	case OutcomeReset, OutcomeNothingToReset, OutcomeNoCredit, OutcomeAlreadyRedeemed:
-		return *response.Result.Outcome, nil
+		return result.Outcome, nil
 	default:
-		return "", fmt.Errorf("codexlimit: unknown outcome %q", *response.Result.Outcome)
+		return "", fmt.Errorf("codexlimit: unknown outcome %q", result.Outcome)
 	}
 }

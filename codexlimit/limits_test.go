@@ -136,6 +136,38 @@ func TestReadNoPrimary(t *testing.T) {
 	}
 }
 
+// A field of another method's result in the answer must not change how Read parses it.
+func TestReadIgnoresForeignResultFields(t *testing.T) {
+	response := strings.Replace(fullAnswer, `"result":{`, `"result":{"outcome":123,`, 1)
+	got, err := Read(context.Background(), helperCommand(t, "answer", response))
+	if err != nil || got.AccountID != "synthetic-account" {
+		t.Fatalf("Read = %+v, %v", got, err)
+	}
+}
+
+// A result of the wrong shape is a decode error at once, not a skipped line and a wait.
+func TestReadBadResultShape(t *testing.T) {
+	response := `{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":"high","windowDurationMins":10080}}}}`
+	got, err := Read(context.Background(), helperCommand(t, "answer", response))
+	if err == nil || !strings.Contains(err.Error(), "decode rate limits") || !reflect.DeepEqual(got, Limits{}) {
+		t.Fatalf("Read = %+v, %v", got, err)
+	}
+}
+
+func TestReadNullResult(t *testing.T) {
+	got, err := Read(context.Background(), helperCommand(t, "answer", `{"id":2,"result":null}`))
+	if err == nil || !strings.Contains(err.Error(), "no result") || !reflect.DeepEqual(got, Limits{}) {
+		t.Fatalf("Read = %+v, %v", got, err)
+	}
+}
+
+func TestConsumeBadOutcomeType(t *testing.T) {
+	got, err := Consume(context.Background(), consumeCommand(t, `{"id":2,"result":{"outcome":5}}`, "synthetic-key", ""), "synthetic-key", "")
+	if err == nil || !strings.Contains(err.Error(), "decode consume result") || got != "" {
+		t.Fatalf("Consume = %q, %v", got, err)
+	}
+}
+
 func TestReadNoResult(t *testing.T) {
 	got, err := Read(context.Background(), helperCommand(t, "answer", `{"id":2}`))
 	if err == nil || !strings.Contains(err.Error(), "result") || !reflect.DeepEqual(got, Limits{}) {
