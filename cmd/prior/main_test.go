@@ -94,8 +94,41 @@ func TestSources(t *testing.T) {
 	if got := sectionOf(out, "механизмы"); len(got) != 2 || !strings.HasPrefix(got[0], "(карточки не сверены") || got[1] != "(нет карточек)" {
 		t.Errorf("механизмы без inventory и карточек: %q", got)
 	}
-	if got := sectionOf(runPrior(t, home, "нигде"), "журнал решений"); len(got) != 1 || got[0] != "(нет)" {
-		t.Errorf("ничего: %q", got)
+	nothing := runPrior(t, home, "нигде")
+	if got := sectionOf(nothing, "журнал решений"); len(got) != 0 {
+		t.Errorf("пустой раздел напечатан отдельно: %q", got)
+	}
+	if last := lastLine(nothing); !strings.HasPrefix(last, "== пусто: ") || !strings.Contains(last, "журнал решений") {
+		t.Errorf("последняя строка без перечня пустых разделов: %q", last)
+	}
+}
+
+func lastLine(out string) string {
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	return lines[len(lines)-1]
+}
+
+// Пустые разделы и разделы с одними пометками идут в порядке источников раньше раздела с находкой; вывод
+// начинается с находки, пометки — после неё, пустые — одной строкой в конце.
+func TestHitsBeforeEmptySections(t *testing.T) {
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".claude/user-replies.md"), "### 2026-10-25T10:00 · ~/git/x\n  находка про ключслово\n")
+	out := runPrior(t, home, "ключслово")
+	lines := strings.Split(strings.TrimLeft(out, "\n"), "\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[0], "== реплики пользователя") {
+		t.Fatalf("вывод начинается не с раздела находки:\n%s", out)
+	}
+	if !strings.Contains(strings.Join(lines[:4], "\n"), "ключслово") {
+		t.Errorf("находки нет в первых строках:\n%s", out)
+	}
+	last := lastLine(out)
+	for _, name := range []string{"журнал решений", "пробы и очереди ночного разбора"} {
+		if !strings.Contains(last, name) {
+			t.Errorf("в строке пустых нет %q: %q", name, last)
+		}
+	}
+	if got := sectionOf(out, "журнал решений"); len(got) != 0 {
+		t.Errorf("пустой раздел напечатан отдельно: %q", got)
 	}
 }
 

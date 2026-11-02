@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,8 @@ usage: prior <слово> [слово…] - слова темы, любое из
 
 Порядок вывода - по весу источника: журнал решений, сказанное пользователем (правила, решения и обещания дословно),
 механизмы (карточки наших инструментов), опубликованные артефакты claude.ai (по названию), память пространств,
-пробы и очереди ночного разбора, его отчёты, реплики (свежие внизу).
+пробы и очереди ночного разбора, его отчёты, реплики (свежие внизу). Сначала разделы с находками, затем разделы
+с одними пометками (источник не прочитан), пустые - одной строкой «== пусто: …» в конце.
 `
 
 const exitUsage = 2
@@ -107,36 +109,87 @@ func cut(s string) string {
 	return string(r[:width])
 }
 
-func section(w io.Writer, title string) { fmt.Fprintf(w, "\n== %s\n", title) }
+// report копит разделы, чтобы напечатать сначала разделы с находками, а пустые — одной строкой в конце:
+// вывод prior часто обрезают по первым строкам, и пустые разделы не должны вытеснять находку.
+type report struct {
+	titles []string
+	bodies []*bytes.Buffer
+}
+
+// section открывает раздел; его текст пишется в возвращённый буфер.
+func (r *report) section(title string) *bytes.Buffer {
+	b := &bytes.Buffer{}
+	r.titles = append(r.titles, title)
+	r.bodies = append(r.bodies, b)
+	return b
+}
+
+// Вид раздела по его строкам: пометки prior — строки в скобках, «(нет)» — ничего не нашлось.
+const (
+	sectionHits  = iota // есть находка
+	sectionNotes        // только пометки: источник не прочитан или не сверен — на виду, но после находок
+	sectionEmpty        // только «(нет)»
+)
+
+func kind(body *bytes.Buffer) int {
+	k := sectionEmpty
+	for l := range strings.Lines(body.String()) {
+		l = strings.TrimSpace(l)
+		switch {
+		case l == "" || l == "(нет)":
+		case strings.HasPrefix(l, "(") && strings.HasSuffix(l, ")"):
+			k = sectionNotes
+		default:
+			return sectionHits
+		}
+	}
+	return k
+}
+
+func (r *report) print(w io.Writer) {
+	var none []string
+	for _, want := range []int{sectionHits, sectionNotes} {
+		for i, title := range r.titles {
+			if kind(r.bodies[i]) == want {
+				fmt.Fprintf(w, "\n== %s\n%s", title, r.bodies[i])
+			}
+		}
+	}
+	for i, title := range r.titles {
+		if kind(r.bodies[i]) == sectionEmpty {
+			short, _, _ := strings.Cut(title, " (")
+			none = append(none, short)
+		}
+	}
+	if len(none) > 0 {
+		fmt.Fprintf(w, "\n== пусто: %s\n", strings.Join(none, "; "))
+	}
+}
 
 func run(q query, home string, w io.Writer) {
 	s := sources(home)
-	section(w, "журнал решений (~/.claude/decisions.md)")
-	if !grepReport(w, q, s.decisions, "") {
-		fmt.Fprintln(w, "(нет)")
+	var r report
+	b := r.section("журнал решений (~/.claude/decisions.md)")
+	if !grepReport(b, q, s.decisions, "") {
+		fmt.Fprintln(b, "(нет)")
 	}
-	section(w, "сказанное пользователем (~/.claude/said.tsv): правила, решения, обещания дословно, до 10")
-	said(w, q, s.said)
-	section(w, "механизмы: что у нас уже есть (~/.claude/improve/mechanisms), до 40 строк")
-	mechanisms(w, q, s)
-	section(w, fmt.Sprintf("артефакты claude.ai по названию (~/.claude/improve/state/artifacts.tsv), до %d", maxArtifacts))
-	artifacts(w, q, s.artifacts)
-	section(w, fmt.Sprintf("память пространств (~/.claude/projects/*/memory), до %d файлов", maxMemories))
-	memories(w, q, s.projects)
-	section(w, "пробы и очереди ночного разбора (~/.claude/improve/state)")
+	said(r.section("сказанное пользователем (~/.claude/said.tsv): правила, решения, обещания дословно, до 10"), q, s.said)
+	mechanisms(r.section("механизмы: что у нас уже есть (~/.claude/improve/mechanisms), до 40 строк"), q, s)
+	artifacts(r.section(fmt.Sprintf("артефакты claude.ai по названию (~/.claude/improve/state/artifacts.tsv), до %d", maxArtifacts)), q, s.artifacts)
+	memories(r.section(fmt.Sprintf("память пространств (~/.claude/projects/*/memory), до %d файлов", maxMemories)), q, s.projects)
+	b = r.section("пробы и очереди ночного разбора (~/.claude/improve/state)")
 	found := false
 	for _, f := range stateFiles {
-		if grepReport(w, q, s.state+"/"+f, f+":") {
+		if grepReport(b, q, s.state+"/"+f, f+":") {
 			found = true
 		}
 	}
 	if !found {
-		fmt.Fprintln(w, "(нет)")
+		fmt.Fprintln(b, "(нет)")
 	}
-	section(w, "отчёты ночного разбора (~/.claude/improve/runs), свежие сверху, до 3 за день, затем заполнение до 10 файлов")
-	runs(w, q, s.runs)
-	section(w, "реплики пользователя (~/.claude/user-replies.md), последние 8")
-	replies(w, q, s)
+	runs(r.section("отчёты ночного разбора (~/.claude/improve/runs), свежие сверху, до 3 за день, затем заполнение до 10 файлов"), q, s.runs)
+	replies(r.section("реплики пользователя (~/.claude/user-replies.md), последние 8"), q, s)
+	r.print(w)
 }
 
 // paths — где prior ищет и какие программы разбора зовёт.
