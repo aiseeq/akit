@@ -558,6 +558,11 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	case "archive":
 		return archive(root, dir, o, out, errout)
 	}
+	release, err := lockForCommand(dir, o.cmd)
+	if err != nil {
+		return fail(errout, err)
+	}
+	defer release()
 	t, err := find(dir, o.id)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -729,6 +734,11 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	if e := os.MkdirAll(dir, dirMode); e != nil {
 		return fail(errout, e)
 	}
+	release, e := lockTasks(dir)
+	if e != nil {
+		return fail(errout, e)
+	}
+	defer release()
 	ts, e := load(dir)
 	if e != nil {
 		return fail(errout, e)
@@ -755,7 +765,7 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	p := filepath.Join(dir, now.Format("20060102-1504")+"-"+o.prio+"-"+o.id+".md")
-	if e = os.WriteFile(p, []byte(body), fileMode); e != nil {
+	if e = writeTask(p, body); e != nil {
 		return fail(errout, e)
 	}
 	fmt.Fprintln(out, relative(root, p))
@@ -1579,7 +1589,7 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	t.body = insertPlanLine(t.body, line)
 	t.body = journal(t.body, entry)
-	if err := os.WriteFile(t.path, []byte(t.body), fileMode); err != nil {
+	if err := writeTask(t.path, t.body); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s plan added\n", t.slug)
@@ -1646,7 +1656,7 @@ func repinPlanItem(t task, o options, out, errout io.Writer) int {
 		fmt.Fprintf(errout, "tk: required plan item %q would be edited by hand\n", name)
 		return exitUsage
 	}
-	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s plan repinned\n", t.slug)
@@ -1824,7 +1834,7 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, o.why)
 	body := journal(t.body, line)
-	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s plan skipped\n", t.slug)
@@ -2135,24 +2145,32 @@ func reportGlintFindings(w io.Writer, findings int, issues []struct {
 
 // checkDone — всё, что done проверяет до записи: прежние условия, план и то, что тикет не изменился за время
 // проверок (они идут до минуты на пункт: новый пункт или пропуск иначе затёрся бы записью или прошёл мимо).
-func checkDone(t *task, o options, errout io.Writer) (int, int) {
+// Проверки идут без блокировки папки, чтобы заметки других не ждали их; сверка и запись — под ней: при коде 0
+// вызывающий держит её до записи и снимает release.
+func checkDone(t *task, o options, errout io.Writer) (int, func(), int) {
 	loaded := t.body
 	findings, code := prepareDone(t, o, errout)
 	if code != 0 {
-		return findings, code
+		return findings, nil, code
 	}
 	if code = executePlan(o.baseRoot, t, o.planLimit(), errout); code != 0 {
-		return findings, code
+		return findings, nil, code
+	}
+	release, err := lockTasks(filepath.Dir(t.path))
+	if err != nil {
+		return findings, nil, fail(errout, err)
 	}
 	current, err := os.ReadFile(t.path)
 	if err != nil {
-		return findings, fail(errout, err)
+		release()
+		return findings, nil, fail(errout, err)
 	}
 	if string(current) != loaded {
+		release()
 		fmt.Fprintf(errout, "tk: %s changed while plan checks ran; run done again\n", t.slug)
-		return findings, exitNone
+		return findings, nil, exitNone
 	}
-	return findings, 0
+	return findings, release, 0
 }
 
 func transition(t task, o options, out, errout io.Writer) int {
@@ -2160,9 +2178,11 @@ func transition(t task, o options, out, errout io.Writer) int {
 	glintFindings := 0
 	if o.cmd == "done" {
 		var code int
-		if glintFindings, code = checkDone(&t, o, errout); code != 0 {
+		var release func()
+		if glintFindings, release, code = checkDone(&t, o, errout); code != 0 {
 			return code
 		}
+		defer release()
 	}
 	if o.cmd == "start" || o.cmd == "review" && executor(t.body) == "" {
 		t.body = setExecutor(t.body, o.by)
@@ -2198,7 +2218,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 		line += " — " + o.until
 	}
 	t.body = journal(setStatus(t.body, next), line)
-	if e := os.WriteFile(t.path, []byte(t.body), fileMode); e != nil {
+	if e := writeTask(t.path, t.body); e != nil {
 		return fail(errout, e)
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
@@ -2207,7 +2227,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 func addNote(t task, o options, out, errout io.Writer) int {
 	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, o.note)
 	body := journal(t.body, line)
-	if err := os.WriteFile(t.path, []byte(body), fileMode); err != nil {
+	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s noted\n", t.slug)
@@ -2451,33 +2471,10 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 	cut := time.Now().Add(-o.older)
 	var moved []string
 	for _, repo := range repos {
-		taskDir := filepath.Join(repo, "docs/tasks")
-		ts, err := load(taskDir)
+		got, err := archiveRepo(repo, base, cut)
+		moved = append(moved, got...)
 		if err != nil {
 			return fail(errout, err)
-		}
-		dstDir, err := archiveDir(repo)
-		if err != nil {
-			return fail(errout, err)
-		}
-		for i := range ts {
-			t := ts[i]
-			if (t.status != "готово" && t.status != "отклонён") || t.changed.After(cut) {
-				continue
-			}
-			if err = os.MkdirAll(dstDir, dirMode); err != nil {
-				return fail(errout, err)
-			}
-			dst := filepath.Join(dstDir, filepath.Base(t.path))
-			if _, err = os.Stat(dst); err == nil {
-				return fail(errout, fmt.Errorf("archive destination exists: %s", dst))
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return fail(errout, err)
-			}
-			if err = os.Rename(t.path, dst); err != nil {
-				return fail(errout, err)
-			}
-			moved = append(moved, relative(base, dst))
 		}
 	}
 	fmt.Fprintf(out, "archived %d\n", len(moved))
@@ -2485,4 +2482,44 @@ func archive(root, _ string, o options, out, errout io.Writer) int {
 		fmt.Fprintln(out, p)
 	}
 	return 0
+}
+
+// archiveRepo moves the closed tickets of one repository older than cut, under the folder lock: a note
+// racing the move then finds the ticket gone instead of writing it back at the old path.
+func archiveRepo(repo, base string, cut time.Time) ([]string, error) {
+	taskDir := filepath.Join(repo, "docs/tasks")
+	release, err := lockForCommand(taskDir, "archive")
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	ts, err := load(taskDir)
+	if err != nil {
+		return nil, err
+	}
+	dstDir, err := archiveDir(repo)
+	if err != nil {
+		return nil, err
+	}
+	var moved []string
+	for i := range ts {
+		t := ts[i]
+		if (t.status != "готово" && t.status != "отклонён") || t.changed.After(cut) {
+			continue
+		}
+		if err = os.MkdirAll(dstDir, dirMode); err != nil {
+			return moved, err
+		}
+		dst := filepath.Join(dstDir, filepath.Base(t.path))
+		if _, err = os.Stat(dst); err == nil {
+			return moved, fmt.Errorf("archive destination exists: %s", dst)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return moved, err
+		}
+		if err = os.Rename(t.path, dst); err != nil {
+			return moved, err
+		}
+		moved = append(moved, relative(base, dst))
+	}
+	return moved, nil
 }
