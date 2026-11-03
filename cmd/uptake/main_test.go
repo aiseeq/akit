@@ -50,7 +50,7 @@ func TestInputFileErrorsExitTwo(t *testing.T) {
 	labelsRun.pairCandidates = []pairCandidate{{id: "known", pair: "prior"}}
 	labelsRun.pairCandidateSample = append(labelsRun.pairCandidateSample, labelsRun.pairCandidates[0])
 	labelsRun.labels = map[string]string{}
-	labelsErr := labelsRun.loadPairLabels()
+	labelsErr := labelsRun.readPairLabels()
 	assertInputFileExitTwo(t, labelsErr, labelsPath+":2:")
 
 	releasesPath := filepath.Join(root, "releases.tsv")
@@ -61,6 +61,69 @@ func TestInputFileErrorsExitTwo(t *testing.T) {
 	releasesRun.releasesPath = releasesPath
 	_, releasesErr := releasesRun.loadReleases()
 	assertInputFileExitTwo(t, releasesErr, releasesPath+":1:")
+}
+
+func TestInputFileMissingExitTwo(t *testing.T) {
+	root := t.TempDir()
+	since := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	until := since.Add(24 * time.Hour)
+	missing := filepath.Join(root, "missing.tsv")
+	for _, tc := range []struct {
+		name string
+		set  func(u *run)
+		path string
+	}{
+		{"labels-missing", func(u *run) { u.labelsPath = missing }, missing},
+		{"releases-missing", func(u *run) { u.releasesPath = missing }, missing},
+		// A directory opens but cannot be read as a file.
+		{"labels-unreadable", func(u *run) { u.labelsPath = root }, root},
+		{"releases-unreadable", func(u *run) { u.releasesPath = root }, root},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := newRun(since, until, 1, filepath.Join(t.TempDir(), "out"), filepath.Join(root, "home"))
+			tc.set(u)
+			assertInputFileExitTwo(t, u.runUptake(since, until), tc.path)
+		})
+	}
+}
+
+func TestLabelsFormatCheckedBeforeScan(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	since := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	session := filepath.Join(home, ".claude", "projects", "demo", "session.jsonl")
+	writeTranscript(t, session, `{"parentUuid":null,"type":"user","timestamp":"2026-10-31T12:00:00Z","message":{"role":"user","content":"run"}}`+"\n"+
+		`{"parentUuid":"a","type":"assistant","timestamp":"2026-10-31T12:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"p1","name":"Bash","input":{"command":"prior synthetic topic"}}]}}`+"\n"+
+		`{"parentUuid":"b","type":"user","timestamp":"2026-10-31T12:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"p1","content":"== совпадения: решения"}]}}`)
+	if err := os.Chtimes(session, until, until); err != nil {
+		t.Fatal(err)
+	}
+	labels := filepath.Join(root, "labels.tsv")
+	if err := os.WriteFile(labels, []byte("id\tverdict\nprior:x\tyes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(root, "out")
+	u := newRun(since, until, 1, out, home)
+	u.labelsPath = labels
+	assertInputFileExitTwo(t, u.runUptake(since, until), labels+":1:")
+	// The transcript holds a prior call: a scan would have recorded its session and the call.
+	if len(u.sessionEnds) != 0 || len(u.pairCalls) != 0 {
+		t.Fatalf("transcripts were read before the labels format was checked: sessions %d, calls %d", len(u.sessionEnds), len(u.pairCalls))
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("output directory created before the labels check: %v", err)
+	}
+	// The same transcript is scanned when the labels file is well formed.
+	if err := os.WriteFile(labels, []byte("id\tlabel\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u = newRun(since, until, 1, out, home)
+	u.labelsPath = labels
+	err := u.runUptake(since, until)
+	if len(u.sessionEnds) != 1 || len(u.pairCalls) != 1 {
+		t.Fatalf("control run did not scan the transcript: sessions %d, calls %d, err %v", len(u.sessionEnds), len(u.pairCalls), err)
+	}
 }
 
 func assertInputFileExitTwo(t *testing.T, err error, location string) {

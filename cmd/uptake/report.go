@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -34,7 +36,8 @@ func (u *run) writeReport() error {
 	return nil
 }
 
-type pairReportTally struct{ newEpisodes, oldEpisodes, mixedEpisodes, calls, fail, unknown int }
+// pairReportTally — one layer of a pair; errors counts the new way's call errors and failures (callerr + fail).
+type pairReportTally struct{ newEpisodes, oldEpisodes, mixedEpisodes, calls, errors, unknown int }
 
 type pairReportLayer struct {
 	agent, instructed, period string
@@ -49,7 +52,7 @@ func (u *run) writePairReport(b *strings.Builder) {
 	if u.releasesPath == "" {
 		b.WriteString("даты выпуска не заданы; период — no-date.\n\n")
 	}
-	b.WriteString("| утилита | агент | instructed | период | точность (нижняя) | полнота (нижняя) | доля по эпизодам (95% Уилсон) | new / old / mixed | ошибки вызова (fail) |\n|---|---|---|---|---:|---:|---:|---:|---:|\n")
+	b.WriteString("| утилита | агент | instructed | период | точность (нижняя) | полнота (нижняя) | доля по эпизодам (95% Уилсон) | new / old / mixed | ошибки вызова (callerr + fail) |\n|---|---|---|---|---:|---:|---:|---:|---:|\n")
 	for _, tool := range pairTools() {
 		layers := u.pairReportLayers(tool)
 		for _, layer := range layers {
@@ -59,17 +62,14 @@ func (u *run) writePairReport(b *strings.Builder) {
 	fmt.Fprintf(b, "\nВне пар busy: без последующего решения — %d; `busy --quiet` — %d.\n", u.busyNoDecision, u.busyQuiet)
 	fmt.Fprintf(b, "Поиск решений (по правилу): %d вызовов.\n", u.decisionRuleSearches)
 	fmt.Fprintf(b, "Prior old по источнику: .claude/improve/ — %d вызовов; tl --role user --grep — %d вызовов.\n", u.priorImproveCalls, u.priorTLCalls)
+	t := u.tkRefusalTotals()
+	fmt.Fprintf(b, "Отказы tk: %d; исправлены потом %d (той же подкомандой %d, другой %d), обход ручной правкой %d, сессия кончилась раньше 10 мин %d, брошены %d — [tk-refusals.tsv](tk-refusals.tsv).\n", t.refusals, t.same+t.other, t.same, t.other, t.bypass, t.incomplete, t.dropped)
 	b.WriteString("\n## Ограничения замера\n\nЦель определяется по ключу, а не по смыслу; instructed означает упоминание утилиты, а не обязательность её применения. Полнота детекторов оценивается только внутри широкого надмножества кандидатов. Взвешивания по составу проектов нет; версии утилит не учитываются. Повтор не означает ошибку. Польза tk измерена прокси.\n")
 	b.WriteString("Неизвестные исходы новых пар по причинам: ")
 	if len(u.pairUnknownReasons) == 0 {
 		b.WriteString("нет; ")
 	} else {
-		reasons := make([]string, 0, len(u.pairUnknownReasons))
-		for reason := range u.pairUnknownReasons {
-			reasons = append(reasons, reason)
-		}
-		sort.Strings(reasons)
-		for i, reason := range reasons {
+		for i, reason := range slices.Sorted(maps.Keys(u.pairUnknownReasons)) {
 			if i > 0 {
 				b.WriteString(", ")
 			}
@@ -136,8 +136,8 @@ func (u *run) pairReportTallyForLayer(tool string, layer pairReportLayer) pairRe
 		episodes[call.session+"|"+call.goal] = append(episodes[call.session+"|"+call.goal], *call)
 		if call.way == "new" {
 			tally.calls++
-			if call.outcome == "fail" {
-				tally.fail++
+			if call.outcome == "fail" || call.outcome == "callerr" {
+				tally.errors++
 			}
 			if call.outcome == "unknown" {
 				tally.unknown++
@@ -176,18 +176,58 @@ func reportEpisodeEnd(calls []pairCall, start int) (int, map[string]bool) {
 	return end, ways
 }
 
-func (u *run) pairLabelMetrics(tool string) (float64, float64, bool, string) {
-	nYes, nNo, sampleYes, trueYes, sampleNo, falseYes := 0, 0, 0, 0, 0, 0
+// labelVerdict — the blind labelling check of a pair detector: gate is "ok" or why the share is withheld
+// (unlabelled, no-yes-sample, precision<0.8, recall<0.7); reason says it in the report's words.
+type labelVerdict struct {
+	precision, recall float64
+	gate, reason      string
+}
+
+func (u *run) pairLabelMetrics(tool string) labelVerdict {
+	if u.labelsPath == "" {
+		return labelVerdict{gate: "unlabelled", reason: "не проверено разметкой"}
+	}
+	nYes, nNo := 0, 0
 	for i := range u.pairCandidates {
 		c := &u.pairCandidates[i]
-		if c.pair == tool {
-			if c.yes {
-				nYes++
-			} else {
-				nNo++
-			}
+		if c.pair != tool {
+			continue
+		}
+		if c.yes {
+			nYes++
+		} else {
+			nNo++
 		}
 	}
+	sampleYes, trueYes, sampleNo, falseYes := u.pairLabelCounts(tool)
+	if sampleYes == 0 {
+		return labelVerdict{gate: "no-yes-sample", reason: "нет кандидатов «да» — точность не определена"}
+	}
+	pLo, _ := u.wilson(trueYes, sampleYes)
+	// Without labelled "no" candidates the miss rate is unknown: take its worst case, not zero.
+	qHi := 0.0
+	if sampleNo > 0 {
+		_, qHi = u.wilson(falseYes, sampleNo)
+	} else if nNo > 0 {
+		qHi = 1
+	}
+	denom := pLo*float64(nYes) + qHi*float64(nNo)
+	recallLo := 0.0
+	if denom > 0 {
+		recallLo = pLo * float64(nYes) / denom
+	}
+	v := labelVerdict{precision: pLo, recall: recallLo, gate: "ok"}
+	if pLo < 0.8 {
+		v.gate, v.reason = "precision<0.8", fmt.Sprintf("разметка: точность %.2f < 0,8", pLo)
+	} else if recallLo < 0.7 {
+		v.gate, v.reason = "recall<0.7", fmt.Sprintf("разметка: полнота %.2f < 0,7", recallLo)
+	}
+	return v
+}
+
+// pairLabelCounts counts the labelled sample of a pair: detector "yes" candidates and how many of them the
+// labels confirm, detector "no" candidates and how many of them the labels call "yes".
+func (u *run) pairLabelCounts(tool string) (sampleYes, trueYes, sampleNo, falseYes int) {
 	for i := range u.pairCandidateSample {
 		c := &u.pairCandidateSample[i]
 		if c.pair != tool {
@@ -209,70 +249,33 @@ func (u *run) pairLabelMetrics(tool string) (float64, float64, bool, string) {
 			}
 		}
 	}
-	if u.labelsPath == "" || sampleYes == 0 {
-		return 0, 0, false, "не проверено разметкой"
-	}
-	pLo, _ := u.wilson(trueYes, sampleYes)
-	// Without labelled "no" candidates the miss rate is unknown: take its worst case, not zero.
-	qHi := 0.0
-	if sampleNo > 0 {
-		_, qHi = u.wilson(falseYes, sampleNo)
-	} else if nNo > 0 {
-		qHi = 1
-	}
-	denom := pLo*float64(nYes) + qHi*float64(nNo)
-	recallLo := 0.0
-	if denom > 0 {
-		recallLo = pLo * float64(nYes) / denom
-	}
-	if pLo < 0.8 {
-		return pLo, recallLo, false, fmt.Sprintf("разметка: точность %.2f < 0,8", pLo)
-	}
-	if recallLo < 0.7 {
-		return pLo, recallLo, false, fmt.Sprintf("разметка: полнота %.2f < 0,7", recallLo)
-	}
-	return pLo, recallLo, true, ""
+	return sampleYes, trueYes, sampleNo, falseYes
 }
 
 func (u *run) pairLabelGate(tool string) string {
-	if u.labelsPath == "" {
-		return "unlabelled"
-	}
-	precision, recall, ok, _ := u.pairLabelMetrics(tool)
-	if precision < 0.8 {
-		return "precision<0.8"
-	}
-	if recall < 0.7 {
-		return "recall<0.7"
-	}
-	if !ok {
-		return "precision<0.8"
-	}
-	return "ok"
+	return u.pairLabelMetrics(tool).gate
 }
 
 func (u *run) writePairReportRow(b *strings.Builder, tool string, layer pairReportLayer, tally pairReportTally) {
 	total := tally.newEpisodes + tally.oldEpisodes
-	precision, recall, verified, reason := u.pairLabelMetrics(tool)
+	verdict := u.pairLabelMetrics(tool)
 	precisionText, recallText := "—", "—"
-	if u.labelsPath == "" {
-		precisionText, recallText = "не проверено разметкой", "не проверено разметкой"
-	} else {
-		precisionText = fmt.Sprintf("%.3f", precision)
-		recallText = fmt.Sprintf("%.3f", recall)
+	if verdict.gate == "unlabelled" {
+		precisionText, recallText = verdict.reason, verdict.reason
+	} else if verdict.gate != "no-yes-sample" {
+		precisionText = fmt.Sprintf("%.3f", verdict.precision)
+		recallText = fmt.Sprintf("%.3f", verdict.recall)
 	}
 	share := "мало данных"
-	if u.labelsPath == "" {
-		share = "не проверено разметкой"
-	} else if !verified {
-		share = reason
+	if verdict.gate != "ok" {
+		share = verdict.reason
 	} else if total >= 20 {
 		low, high := u.wilson(tally.newEpisodes, total)
 		share = fmt.Sprintf("%.1f%% (%.1f–%.1f%%)", 100*float64(tally.newEpisodes)/float64(total), 100*low, 100*high)
 	}
 	fmt.Fprintf(b, "| %s | %s | %s | %s | %s | %s | %s | %d / %d / %d | %d |\n",
 		tool, layer.agent, layer.instructed, layer.period, precisionText, recallText, share,
-		tally.newEpisodes, tally.oldEpisodes, tally.mixedEpisodes, tally.fail)
+		tally.newEpisodes, tally.oldEpisodes, tally.mixedEpisodes, tally.errors)
 }
 
 type reportTally struct{ window, recent, old int }
@@ -326,8 +329,12 @@ func (u *run) writeReportUtilityRows(b *strings.Builder, rows map[string]*report
 		}
 		crash, total, killed, callerr := u.reportFaultCounts(tool)
 		benefit := "не замерено"
-		if tool == "webtext" {
+		switch tool {
+		case "webtext":
 			benefit = fmt.Sprintf("открыто %d/%d; пропущено %d", u.hookSummary.opened, u.hookSummary.total, u.hookSummary.skipped)
+		case "tk":
+			t := u.tkRefusalTotals()
+			benefit = fmt.Sprintf("отказов %d, исправлено потом %d (tk-refusals.tsv)", t.refusals, t.same+t.other)
 		}
 		fmt.Fprintf(b, "| %s | %d / %d | %s | %s | %d/%d | %d | %d |\n", tool, r.recent, r.window, share, benefit, crash, total, killed, callerr)
 	}

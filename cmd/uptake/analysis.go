@@ -400,7 +400,8 @@ func (u *run) wilson(k, n int) (float64, float64) {
 	d := 1 + z*z/float64(n)
 	c := (p + z*z/(2*float64(n))) / d
 	r := z * math.Sqrt(p*(1-p)/float64(n)+z*z/(4*float64(n*n))) / d
-	return c - r, c + r
+	// At k = 0 or k = n rounding can put a bound a hair outside [0, 1] ("-0.000000"): clamp it.
+	return max(c-r, 0), min(c+r, 1)
 }
 
 func (u *run) waitOutput(w waits.Wait, outs map[string]transcript.Event) string {

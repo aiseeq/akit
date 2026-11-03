@@ -12,9 +12,9 @@ import (
 	"regexp"
 	"slices"
 	"sort"
-
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
@@ -25,16 +25,15 @@ const pairCode2Tools = "busy prior user-word wfor claude-rules-export"
 const candidateContextRunes = 600
 
 type pairPatterns struct {
-	busyProbe, searchTool, taskWrite, copyTool, heavyCommand, spaces *regexp.Regexp
-	waitGoals                                                        []*regexp.Regexp
-	tkKindClean, tkPath, tkTicketID                                  *regexp.Regexp
+	busyProbe, searchTool, copyTool, heavyCommand, spaces *regexp.Regexp
+	waitGoals                                             []*regexp.Regexp
+	tkKindClean, tkPath, tkTicketID                       *regexp.Regexp
 }
 
 func newPairPatterns() pairPatterns {
 	return pairPatterns{
 		busyProbe:    regexp.MustCompile(`\b(uptime|w|top|vmstat|mpstat|loadavg|pressure)\b`),
 		searchTool:   regexp.MustCompile(`\b(grep|rg|jq|sed|tl)\b`),
-		taskWrite:    regexp.MustCompile(`\b(cat|tee|sed|perl|python|apply_patch)\b`),
 		copyTool:     regexp.MustCompile(`\b(cp|rsync|install)\b`),
 		heavyCommand: regexp.MustCompile(`\b(graft\s+(gate|test|commit|install|release)|graft\s+exec\s+--heavy|go\s+(test|build)|make|docker\s+build|podman\s+build|worker\s+run|(npm|pnpm|yarn)\s+(run\s+)?(test|build))\b`),
 		spaces:       regexp.MustCompile(`\s+`),
@@ -63,6 +62,9 @@ type pairCall struct {
 	code                                                               int
 	instructed                                                         bool
 	codeNotOwned                                                       bool
+	// severalCalls — the utility is called more than once in the command: a line of the shared output
+	// cannot be attributed to one of the calls.
+	severalCalls bool
 }
 
 type pairCandidate struct {
@@ -78,14 +80,23 @@ type tkRefusal struct {
 type pairOverlap struct{ id, tool string }
 type releaseDate struct{ available, instructed time.Time }
 
-func (u *run) loadReleases() (map[string]releaseDate, error) {
-	m := map[string]releaseDate{}
-	if u.releasesPath == "" {
-		return m, nil
-	}
-	f, err := os.Open(u.releasesPath)
+// loadInputs reads the --releases and --labels files before any transcript is read: a missing, unreadable
+// or malformed file is a usage error found at once. Labels are checked against the sample after the scan.
+func (u *run) loadInputs() error {
+	releases, err := u.loadReleases()
 	if err != nil {
-		return nil, fmt.Errorf("open releases: %w", err)
+		return err
+	}
+	u.releases = releases
+	return u.readPairLabels()
+}
+
+// readInputTSV calls each with the line number and the tab-separated fields of every line of an input
+// file and returns the number of lines; failing to open or read the file is a usage error.
+func readInputTSV(kind, path string, each func(line int, fields []string) error) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, &uptakeInputError{message: fmt.Sprintf("%s: %v", kind, err)}
 	}
 	defer f.Close()
 	s := bufio.NewScanner(f)
@@ -93,9 +104,24 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 	line := 0
 	for s.Scan() {
 		line++
-		p := strings.Split(s.Text(), "\t")
+		if err := each(line, strings.Split(s.Text(), "\t")); err != nil {
+			return line, err
+		}
+	}
+	if err := s.Err(); err != nil {
+		return line, &uptakeInputError{message: fmt.Sprintf("%s %s: %v", kind, path, err)}
+	}
+	return line, nil
+}
+
+func (u *run) loadReleases() (map[string]releaseDate, error) {
+	m := map[string]releaseDate{}
+	if u.releasesPath == "" {
+		return m, nil
+	}
+	_, err := readInputTSV("releases", u.releasesPath, func(line int, p []string) error {
 		if len(p) != 3 || !contains(pairTools(), p[0]) {
-			return nil, &uptakeInputError{message: fmt.Sprintf("%s:%d: expected known tool and two RFC3339 dates", u.releasesPath, line)}
+			return &uptakeInputError{message: fmt.Sprintf("%s:%d: expected known tool and two RFC3339 dates", u.releasesPath, line)}
 		}
 		d := releaseDate{}
 		for i, v := range p[1:] {
@@ -104,7 +130,7 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 			}
 			t, e := time.Parse(time.RFC3339, v)
 			if e != nil {
-				return nil, &uptakeInputError{message: fmt.Sprintf("%s:%d: invalid date", u.releasesPath, line)}
+				return &uptakeInputError{message: fmt.Sprintf("%s:%d: invalid date", u.releasesPath, line)}
 			}
 			if i == 0 {
 				d.available = t
@@ -113,16 +139,17 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 			}
 		}
 		if _, ok := m[p[0]]; ok {
-			return nil, &uptakeInputError{message: fmt.Sprintf("%s:%d: duplicate tool", u.releasesPath, line)}
+			return &uptakeInputError{message: fmt.Sprintf("%s:%d: duplicate tool", u.releasesPath, line)}
 		}
 		m[p[0]] = d
-	}
-	if err := s.Err(); err != nil {
-		return nil, fmt.Errorf("read releases: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	for _, tool := range pairTools() {
 		if _, ok := m[tool]; !ok {
-			return nil, &uptakeInputError{message: fmt.Sprintf("%s:1: missing %s", u.releasesPath, tool)}
+			return nil, &uptakeInputError{message: fmt.Sprintf("%s: missing %s", u.releasesPath, tool)}
 		}
 	}
 	return m, nil
@@ -216,7 +243,7 @@ func decisionRuleSearchCount(calls []shellcmd.Call) int {
 
 func (u *run) collectPairOverlap(path string, e *transcript.Event, c shellcmd.Call, cmd string) {
 	if c.Name == "tl" && strings.Contains(strings.ToLower(cmd), "--grep") || u.isTranscriptHabit(c, strings.ToLower(strings.Join(c.Args, " ")), strings.ToLower(cmd)) {
-		u.pairOverlap = append(u.pairOverlap, pairOverlap{id: fmt.Sprintf("%s:%d", path, e.Line), tool: "tl"})
+		u.pairOverlap = append(u.pairOverlap, pairOverlap{id: callRef(path, e), tool: "tl"})
 	}
 }
 
@@ -264,10 +291,36 @@ func (u *run) collectPairNew(path, agent, firstUser string, evs []transcript.Eve
 		baseCode = callByID[e.CallID].code
 	}
 	code := u.pairUtilityCode(tool, calls, ci, baseCode, out)
-	id := fmt.Sprintf("%s:%d", path, e.Line)
-	pc := pairCall{tool: tool, way: "new", goal: goal, agent: agent, session: path, id: id, command: cmd, out: out, at: e.Time, code: code, codeNotOwned: baseCode >= 0 && code < 0, instructed: strings.Contains(strings.ToLower(firstUser), strings.ToLower(tool))}
+	pc := pairCall{tool: tool, way: "new", goal: goal, agent: agent, session: path, id: callRef(path, e), command: cmd, out: out, at: e.Time, code: code, codeNotOwned: baseCode >= 0 && code < 0, severalCalls: utilityCallCount(calls, tool) > 1, instructed: strings.Contains(strings.ToLower(firstUser), strings.ToLower(tool))}
 	pc.outcome = pairOutcome(pc)
+	// The outcome is decided on the whole output; only its ends are kept for the samples.
+	pc.out = clipOutput(out, pairOutputKeep)
 	u.pairCalls = append(u.pairCalls, pc)
+}
+
+// pairOutputKeep — bytes kept from each end of a new call's output: enough for the unknown and failure
+// samples, which show at most 2000 runes, without holding every long output of the window in memory.
+const pairOutputKeep = 4096
+
+// clipOutput keeps the first and the last keep bytes of s, cut on rune boundaries.
+func clipOutput(s string, keep int) string {
+	if len(s) <= 2*keep {
+		return s
+	}
+	head, tail := keep, len(s)-keep
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	for tail < len(s) && !utf8.RuneStart(s[tail]) {
+		tail++
+	}
+	return s[:head] + "\n…\n" + s[tail:]
+}
+
+// callRef — the reference of one tool call: events of one transcript record share the line number, so the
+// call id tells apart several calls of one record.
+func callRef(path string, e *transcript.Event) string {
+	return fmt.Sprintf("%s:%d:%s", path, e.Line, e.CallID)
 }
 
 func (u *run) collectPairOld(path, agent, firstUser string, evs []transcript.Event, outs map[string]transcript.Event, sc shellcmd.Call, cmd string, i int, e *transcript.Event) {
@@ -282,7 +335,7 @@ func (u *run) collectPairOld(path, agent, firstUser string, evs []transcript.Eve
 			return
 		}
 	}
-	id := fmt.Sprintf("%s:%d", path, e.Line)
+	id := callRef(path, e)
 	if way == "prior" {
 		if sc.Name == "tl" {
 			u.priorTLCalls++
@@ -290,7 +343,8 @@ func (u *run) collectPairOld(path, agent, firstUser string, evs []transcript.Eve
 			u.priorImproveCalls++
 		}
 	}
-	u.pairCalls = append(u.pairCalls, pairCall{tool: way, way: "old", goal: goal, agent: agent, session: path, id: id, command: cmd, out: u.outFor(*e, outs), at: e.Time, code: u.eventExitCode(outs[e.CallID]), instructed: strings.Contains(strings.ToLower(firstUser), way)})
+	// The old way's outcome is taken from the exit code alone, so its output is not kept.
+	u.pairCalls = append(u.pairCalls, pairCall{tool: way, way: "old", goal: goal, agent: agent, session: path, id: id, command: cmd, at: e.Time, code: u.eventExitCode(outs[e.CallID]), instructed: strings.Contains(strings.ToLower(firstUser), way)})
 	if u.pairOldIDs == nil {
 		u.pairOldIDs = make(map[string]map[string]struct{})
 	}
@@ -307,14 +361,101 @@ func pairGoal(tool string, c shellcmd.Call) string {
 	case "user-word":
 		return userWordGoal(c.Args)
 	case "wfor":
-		return lastArg(c.Args)
+		goal, _ := wforGoal(c.Args)
+		return goal
 	case "page-shot":
 		return pageGoal(c.Args)
 	case "claude-rules-export":
-		return firstPositional(c.Args)
+		return lastArg(positionals(c.Args, "src-home", "rules"))
 	default:
 		return ""
 	}
+}
+
+// positionals returns the arguments that are neither flags nor values of the named value flags (names
+// without dashes; both "--name V" and "--name=V" are understood). Everything after "--" is positional.
+func positionals(args []string, valueFlags ...string) []string {
+	var words []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return append(words, args[i+1:]...)
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			words = append(words, arg)
+			continue
+		}
+		name, _, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if !hasValue && contains(valueFlags, name) {
+			i++
+		}
+	}
+	return words
+}
+
+// wforConditionWords — words after a wfor condition keyword; the goal is the last of them. exit takes
+// one or more PIDs and is handled apart.
+func wforConditionWords(cond string) (int, bool) {
+	switch cond {
+	case "file", "gone", "time", "ok":
+		return 1, true
+	case "line":
+		return 2, true
+	case "idle":
+		return 0, true
+	}
+	return 0, false
+}
+
+// wforGoal returns the goal of a wfor call — the objects of its conditions in order: the path of file,
+// gone and line, the PIDs of exit, the moment of time, the command of ok, and "idle". A call for help or
+// without conditions is not a call of the utility (ok false). A malformed condition list is still a call
+// (it ends in a usage error); its goal is then the condition words as written.
+func wforGoal(args []string) (string, bool) {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return "", false
+		}
+	}
+	words := positionals(args, "timeout", "every", "after")
+	if len(words) == 0 {
+		return "", false
+	}
+	targets, ok := wforTargets(words)
+	if !ok {
+		return strings.Join(words, " "), true
+	}
+	return strings.Join(targets, ", "), true
+}
+
+func wforTargets(words []string) ([]string, bool) {
+	var targets []string
+	for i := 0; i < len(words); {
+		cond := words[i]
+		i++
+		if cond == "exit" {
+			start := i
+			for i < len(words) && words[i] != "" && strings.Trim(words[i], "0123456789") == "" {
+				targets = append(targets, words[i])
+				i++
+			}
+			if i == start {
+				return nil, false
+			}
+			continue
+		}
+		n, known := wforConditionWords(cond)
+		if !known || i+n > len(words) {
+			return nil, false
+		}
+		if n == 0 {
+			targets = append(targets, cond)
+			continue
+		}
+		targets = append(targets, words[i+n-1])
+		i += n
+	}
+	return targets, true
 }
 
 func priorGoal(args []string) string {
@@ -341,17 +482,7 @@ func userWordGoal(args []string) string {
 }
 
 func pageGoal(args []string) string {
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if strings.HasPrefix(arg, "-") {
-			name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
-			if contains([]string{"at", "out", "element", "timeout"}, name) {
-				if !strings.Contains(arg, "=") {
-					i++
-				}
-			}
-			continue
-		}
+	for _, arg := range positionals(args, "at", "out", "element", "timeout") {
 		if isLocalPage(arg) {
 			return arg
 		}
@@ -371,15 +502,6 @@ func isLocalPage(arg string) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-func firstPositional(args []string) string {
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, "-") {
-			return arg
-		}
-	}
-	return ""
-}
-
 func hasLetters(s string) bool {
 	for _, r := range s {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= 'а' && r <= 'я' || r >= 'А' && r <= 'Я' {
@@ -390,6 +512,10 @@ func hasLetters(s string) bool {
 }
 
 func pairOutcome(c pairCall) string {
+	if c.severalCalls {
+		// A summary or usage line of the shared output may belong to any of the calls.
+		c.out = ""
+	}
 	usage := strings.Contains(c.out, "("+c.tool+" -h for usage)")
 	if usage || c.code == 2 && contains(strings.Fields(pairCode2Tools), c.tool) {
 		return "callerr"
@@ -494,13 +620,7 @@ func pairOutputAnswer(tool, out string) bool {
 
 func (u *run) pairUtilityCode(tool string, calls []shellcmd.Call, at, code int, out string) int {
 	if strings.Contains(out, "("+tool+" -h for usage)") {
-		count := 0
-		for i := range calls {
-			if calls[i].Name == tool {
-				count++
-			}
-		}
-		if count == 1 {
+		if utilityCallCount(calls, tool) == 1 {
 			return code
 		}
 		return -1
@@ -614,15 +734,62 @@ func (u *run) pageShotGoal(c shellcmd.Call) string {
 	return findLocalPage(line)
 }
 
+// copyValueFlags — flags of cp, rsync and install that take a value, so the value is not a path.
+func copyValueFlags(tool string) ([]string, bool) {
+	switch tool {
+	case "cp":
+		return []string{"t", "target-directory", "S", "suffix"}, true
+	case "install":
+		return []string{"t", "target-directory", "S", "suffix", "m", "mode", "o", "owner", "g", "group"}, true
+	case "rsync":
+		return []string{"e", "rsh", "f", "filter", "exclude", "include", "exclude-from", "include-from", "files-from", "chmod", "chown", "rsync-path", "log-file", "partial-dir", "temp-dir", "T", "compare-dest", "copy-dest", "link-dest"}, true
+	}
+	return nil, false
+}
+
+// exportGoal recognises the old way of claude-rules-export: a copy (cp, rsync, install) whose source is a
+// Claude Code rules or skills location; the goal is the destination, the last path or the -t directory.
 func (u *run) exportGoal(c shellcmd.Call) string {
-	if c.Name != "cp" && c.Name != "rsync" && c.Name != "install" {
+	valueFlags, ok := copyValueFlags(c.Name)
+	if !ok {
 		return ""
 	}
-	line := strings.ToLower(c.Raw + " " + strings.Join(c.Args, " "))
-	if strings.Contains(line, "work/claude-rules") {
-		return lastArg(c.Args)
+	paths := positionals(c.Args, valueFlags...)
+	dest := copyTargetDirectory(c.Args)
+	sources := paths
+	if dest == "" {
+		if len(paths) < 2 {
+			return ""
+		}
+		dest, sources = paths[len(paths)-1], paths[:len(paths)-1]
+	}
+	if !slices.ContainsFunc(sources, isClaudeRulesSource) {
+		return ""
+	}
+	return dest
+}
+
+func copyTargetDirectory(args []string) string {
+	for i, arg := range args {
+		if v, ok := strings.CutPrefix(arg, "--target-directory="); ok {
+			return v
+		}
+		if (arg == "-t" || arg == "--target-directory") && i+1 < len(args) {
+			return args[i+1]
+		}
 	}
 	return ""
+}
+
+// isClaudeRulesSource reports a path inside the Claude Code rules, skills or global instructions.
+func isClaudeRulesSource(path string) bool {
+	p := filepath.ToSlash(path)
+	for _, part := range []string{".claude/rules", ".claude/skills", ".claude/CLAUDE.md"} {
+		if strings.HasSuffix(p, part) || strings.Contains(p, part+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func searchGoal(c shellcmd.Call) string {
@@ -672,7 +839,7 @@ func (u *run) collectCandidate(path string, evs []transcript.Event, i int, cmd, 
 	l := strings.ToLower(cmd)
 	candidates := u.candidateClasses(l, cmd)
 	for pair := range candidates {
-		eventID := fmt.Sprintf("%s:%d", path, evs[i].Line)
+		eventID := callRef(path, &evs[i])
 		_, yes := u.pairOldIDs[eventID][pair]
 		id := pair + ":" + eventID
 		context := u.candidateContext(evs, i)
@@ -695,11 +862,8 @@ func (u *run) candidateClasses(l, cmd string) map[string]bool {
 	if strings.Contains(l, "sleep") {
 		candidates["wfor"] = u.waitGoal(cmd) != ""
 	}
-	if strings.Contains(l, "docs/tasks/") {
-		candidates["tk"] = u.pairPatterns.taskWrite.MatchString(l)
-	}
 	if u.pairPatterns.copyTool.MatchString(l) {
-		candidates["claude-rules-export"] = strings.Contains(l, "work/claude-rules")
+		candidates["claude-rules-export"] = u.oldPairCandidate("claude-rules-export", cmd)
 	}
 	return candidates
 }
@@ -768,48 +932,62 @@ func (u *run) collectTKRefusal(path, agent string, e transcript.Event, c shellcm
 	}
 }
 
-func (u *run) loadPairLabels() error {
+type labelRow struct {
+	label string
+	line  int
+}
+
+// readPairLabels checks the format of the labels file — header, columns, values, duplicates — and keeps
+// its rows; whether the ids are those of the sample is checked by checkPairLabels after the scan.
+func (u *run) readPairLabels() error {
 	if u.labelsPath == "" {
 		return nil
 	}
-	f, err := os.Open(u.labelsPath)
-	if err != nil {
-		return fmt.Errorf("open labels: %w", err)
-	}
-	defer f.Close()
-	validIDs := make(map[string]struct{}, len(u.pairCandidateSample))
-	for i := range u.pairCandidateSample {
-		validIDs[u.pairCandidateSample[i].id] = struct{}{}
-	}
-	labels := map[string]string{}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4096), 1<<20)
-	line := 0
-	for scanner.Scan() {
-		line++
-		fields := strings.Split(scanner.Text(), "\t")
+	rows := map[string]labelRow{}
+	lines, err := readInputTSV("labels", u.labelsPath, func(line int, fields []string) error {
 		if line == 1 {
 			if len(fields) != 2 || fields[0] != "id" || fields[1] != "label" {
 				return &uptakeInputError{message: fmt.Sprintf("%s:1: expected id<TAB>label header", u.labelsPath)}
 			}
-			continue
+			return nil
 		}
 		if len(fields) != 2 || fields[0] == "" || (fields[1] != "yes" && fields[1] != "no") {
 			return &uptakeInputError{message: fmt.Sprintf("%s:%d: expected candidate id and yes|no label", u.labelsPath, line)}
 		}
-		if _, ok := labels[fields[0]]; ok {
+		if _, ok := rows[fields[0]]; ok {
 			return &uptakeInputError{message: fmt.Sprintf("%s:%d: duplicate id %q", u.labelsPath, line, fields[0])}
 		}
-		if _, ok := validIDs[fields[0]]; !ok {
-			return &uptakeInputError{message: fmt.Sprintf("%s:%d: unknown candidate id %q", u.labelsPath, line, fields[0])}
+		rows[fields[0]] = labelRow{label: fields[1], line: line}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if lines == 0 {
+		return &uptakeInputError{message: fmt.Sprintf("%s: empty file, expected id<TAB>label header", u.labelsPath)}
+	}
+	u.labelRows = rows
+	return nil
+}
+
+// checkPairLabels matches the read labels to the candidate sample: every label names a sampled
+// candidate and every sampled candidate has a label.
+func (u *run) checkPairLabels() error {
+	if u.labelsPath == "" {
+		return nil
+	}
+	validIDs := make(map[string]struct{}, len(u.pairCandidateSample))
+	for i := range u.pairCandidateSample {
+		validIDs[u.pairCandidateSample[i].id] = struct{}{}
+	}
+	ids := slices.SortedFunc(maps.Keys(u.labelRows), func(a, b string) int { return u.labelRows[a].line - u.labelRows[b].line })
+	labels := make(map[string]string, len(ids))
+	for _, id := range ids {
+		row := u.labelRows[id]
+		if _, ok := validIDs[id]; !ok {
+			return &uptakeInputError{message: fmt.Sprintf("%s:%d: unknown candidate id %q", u.labelsPath, row.line, id)}
 		}
-		labels[fields[0]] = fields[1]
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read labels: %w", err)
-	}
-	if line == 0 {
-		return &uptakeInputError{message: fmt.Sprintf("%s:1: missing id<TAB>label header", u.labelsPath)}
+		labels[id] = row.label
 	}
 	missing := 0
 	for id := range validIDs {
@@ -818,20 +996,16 @@ func (u *run) loadPairLabels() error {
 		}
 	}
 	if missing > 0 {
-		return &uptakeInputError{message: fmt.Sprintf("%s:2: %d sampled candidates have no label; label the whole candidates.tsv", u.labelsPath, missing)}
+		return &uptakeInputError{message: fmt.Sprintf("%s: %d sampled candidates have no label; label the whole candidates.tsv", u.labelsPath, missing)}
 	}
 	u.labels = labels
 	return nil
 }
 
 func (u *run) writePairTables() error {
-	releases, err := u.loadReleases()
-	if err != nil {
-		return err
-	}
 	for i := range u.pairCalls {
 		c := &u.pairCalls[i]
-		d := releases[c.tool]
+		d := u.releases[c.tool]
 		if u.releasesPath != "" {
 			if d.instructed.IsZero() {
 				c.period = "no-date"
@@ -862,7 +1036,7 @@ func (u *run) writePairTables() error {
 	if err := u.writeCandidates(); err != nil {
 		return err
 	}
-	if err := u.loadPairLabels(); err != nil {
+	if err := u.checkPairLabels(); err != nil {
 		return err
 	}
 	if err := u.writePairs(); err != nil {
@@ -919,6 +1093,9 @@ func (u *run) writePairUnknown() error {
 
 func pairUnknownReason(c pairCall) string {
 	// 2>&1 merges stderr into the visible output, so only other redirects hide it.
+	if c.severalCalls {
+		return "several-calls"
+	}
 	command := strings.ReplaceAll(strings.ToLower(c.command), "2>&1", "")
 	if strings.Contains(command, ">/dev/null") || strings.Contains(command, "2>") || strings.Contains(command, "| grep") || strings.Contains(command, "| tail") || strings.Contains(command, "| head") {
 		return "output-hidden"
@@ -1038,12 +1215,7 @@ func ensurePairRows(counts map[string]*epCount) {
 func (u *run) writePairRows(counts map[string]*epCount, calls map[pairCallCountKey]int) error {
 	var b strings.Builder
 	b.WriteString("tool\tagent\tinstructed\tperiod\tway\tepisodes_new\tepisodes_old\tepisodes_mixed\tswitches\tcalls\tshare\twilson95\tgate\n")
-	keys := make([]string, 0, len(counts))
-	for key := range counts {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(counts)) {
 		u.writePairRow(&b, key, counts[key], calls)
 	}
 	return u.save("pairs.tsv", b.String())
@@ -1054,15 +1226,11 @@ func (u *run) writePairRow(b *strings.Builder, key string, count *epCount, calls
 	for _, way := range []string{"new", "old"} {
 		ncalls := calls[pairCallCountKey{parts[0], parts[1], parts[2], parts[3], way}]
 		total := count.new + count.old
-		share := 0.0
-		if total > 0 {
-			share = float64(count.new) / float64(total)
-		}
-		low, high := u.wilson(count.new, total)
 		gate := u.pairLabelGate(parts[0])
 		shareText, interval := "-", "-"
-		if gate == "ok" {
-			shareText = fmt.Sprintf("%.6f", share)
+		if gate == "ok" && total > 0 {
+			low, high := u.wilson(count.new, total)
+			shareText = fmt.Sprintf("%.6f", float64(count.new)/float64(total))
 			interval = fmt.Sprintf("%.6f-%.6f", low, high)
 		}
 		fmt.Fprintf(b, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n", parts[0], parts[1], parts[2], parts[3], way, count.new, count.old, count.mixed, count.switches, ncalls, shareText, interval, gate)
@@ -1137,23 +1305,19 @@ func (u *run) writeOutcomeRow(b *strings.Builder, tool, way string, stat *pairOu
 	if stat == nil {
 		stat = &pairOutcomeStat{}
 	}
-	lowN := stat.n - stat.unknown
-	low, high, known := outcomeBounds(stat, lowN)
-	wilsonLow, wilsonHigh := u.wilson(stat.fail+stat.callerr, lowN)
-	fmt.Fprintf(b, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f-%.6f\n", tool, way, stat.n, stat.answer, stat.callerr, stat.fail, stat.unknown, stat.empty, stat.notyet, low, high, known, wilsonLow, wilsonHigh)
-}
-
-func outcomeBounds(stat *pairOutcomeStat, knownN int) (float64, float64, float64) {
-	low, high, known := 0.0, 0.0, 0.0
-	fails := stat.fail + stat.callerr
+	fails, knownN := stat.fail+stat.callerr, stat.n-stat.unknown
+	// A share over zero calls is undefined: it is written as "-", not as 0.
+	low, high, known, interval := "-", "-", "-", "-"
 	if stat.n > 0 {
-		low = float64(fails) / float64(stat.n)
-		high = float64(fails+stat.unknown) / float64(stat.n)
+		low = fmt.Sprintf("%.6f", float64(fails)/float64(stat.n))
+		high = fmt.Sprintf("%.6f", float64(fails+stat.unknown)/float64(stat.n))
 	}
 	if knownN > 0 {
-		known = float64(fails) / float64(knownN)
+		wilsonLow, wilsonHigh := u.wilson(fails, knownN)
+		known = fmt.Sprintf("%.6f", float64(fails)/float64(knownN))
+		interval = fmt.Sprintf("%.6f-%.6f", wilsonLow, wilsonHigh)
 	}
-	return low, high, known
+	fmt.Fprintf(b, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n", tool, way, stat.n, stat.answer, stat.callerr, stat.fail, stat.unknown, stat.empty, stat.notyet, low, high, known, interval)
 }
 
 type pairRepeatKey struct{ session, goal string }
@@ -1215,25 +1379,6 @@ func countEligiblePairRepeats(groups map[pairRepeatKey][]pairCall, eligible map[
 	return total
 }
 
-func countPairRepeats(groups map[pairRepeatKey][]pairCall) int {
-	total := 0
-	for _, calls := range groups {
-		sort.Slice(calls, func(i, j int) bool { return calls[i].at.Before(calls[j].at) })
-		total += countGroupRepeats(calls)
-	}
-	return total
-}
-
-func countGroupRepeats(calls []pairCall) int {
-	count := 0
-	for i := range calls {
-		if hasDifferentRepeat(calls, i) {
-			count++
-		}
-	}
-	return count
-}
-
 func hasDifferentRepeat(calls []pairCall, index int) bool {
 	for j := index + 1; j < len(calls) && calls[j].at.Sub(calls[index].at) <= 10*time.Minute; j++ {
 		if calls[index].command != calls[j].command {
@@ -1266,23 +1411,14 @@ func (u *run) writePairOverlap() error {
 		byID[c.id][c.tool] = true
 	}
 	for _, tools := range byID {
-		names := []string{}
-		for n := range tools {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		for i := 0; i < len(names); i++ {
+		names := slices.Sorted(maps.Keys(tools))
+		for i := range names {
 			for j := i + 1; j < len(names); j++ {
 				counts[names[i]+"\t"+names[j]]++
 			}
 		}
 	}
-	keys := make([]string, 0, len(counts))
-	for k := range counts {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range slices.Sorted(maps.Keys(counts)) {
 		fmt.Fprintf(&b, "%s\t%d\n", k, counts[k])
 	}
 	return u.save("pair-overlap.tsv", b.String())
@@ -1315,6 +1451,20 @@ func (u *run) tkRefusalStats() map[string]*tkRefusalStat {
 		addTKRefusalOutcome(stat, u.tkRefusalState(refusal))
 	}
 	return stats
+}
+
+// tkRefusalTotals sums tk-refusals.tsv over the kinds of refusal.
+func (u *run) tkRefusalTotals() tkRefusalStat {
+	total := tkRefusalStat{}
+	for _, s := range u.tkRefusalStats() {
+		total.refusals += s.refusals
+		total.same += s.same
+		total.other += s.other
+		total.bypass += s.bypass
+		total.incomplete += s.incomplete
+		total.dropped += s.dropped
+	}
+	return total
 }
 
 func addTKRefusalOutcome(stat *tkRefusalStat, state string) {
@@ -1405,4 +1555,22 @@ func (u *run) writeCandidates() error {
 		return err
 	}
 	return u.save("candidates-verdict.tsv", v.String())
+}
+
+// utilityCallCount — how many calls of tool a command makes. A wfor without conditions (-h, --help, flags
+// only) prints usage and waits for nothing, so it is not a call: `wfor -h | head; wfor exit 1` is one call.
+func utilityCallCount(calls []shellcmd.Call, tool string) int {
+	n := 0
+	for i := range calls {
+		if calls[i].Name != tool {
+			continue
+		}
+		if tool == "wfor" {
+			if _, isCall := wforGoal(calls[i].Args); !isCall {
+				continue
+			}
+		}
+		n++
+	}
+	return n
 }

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -71,6 +72,8 @@ type run struct {
 	hookBadLines                                            int
 	firstHookBad                                            string
 	releasesPath, labelsPath                                string
+	releases                                                map[string]releaseDate
+	labelRows                                               map[string]labelRow
 	labels                                                  map[string]string
 	pairCalls                                               []pairCall
 	pairOldIDs                                              map[string]map[string]struct{}
@@ -266,12 +269,7 @@ func (u *run) utilityHabit(cmd string) []string {
 		}
 
 	}
-	var out []string
-	for k := range found {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(found))
 }
 
 func (u *run) utilityHabitsForCall(c shellcmd.Call, cmd string) []string {
@@ -1247,6 +1245,8 @@ Usage:
                     pairs into periods before and after release and instruction
   --labels FILE     TSV id<TAB>label (yes|no) from a blind labeling of candidates.tsv: a pair share
                     is reported only when precision and recall pass their lower bounds
+                    (both files are checked before the transcripts are read: a missing, unreadable
+                    or malformed file is a usage error)
   -h, --help        this help
 
 Writes report.md and TSV tables (counts, examples, errors, pairs, outcomes, candidates, ...) to DIR.
@@ -1270,11 +1270,6 @@ func main() {
 	}
 	u := newRun(args.since, args.until, args.seed, args.out, home)
 	u.releasesPath, u.labelsPath = args.releases, args.labels
-	if _, err := u.loadReleases(); err != nil {
-		code, message := uptakeErrorResult(err)
-		fmt.Fprintln(os.Stderr, message)
-		os.Exit(code)
-	}
 	if err := u.runUptake(args.since, args.until); err != nil {
 		code, message := uptakeErrorResult(err)
 		fmt.Fprintln(os.Stderr, message)
@@ -1308,15 +1303,17 @@ func parseUptakeArgs(args []string, now time.Time) (uptakeArgs, error) {
 	return a, nil
 }
 
+func uptakeFlagNames() []string {
+	return []string{"--since", "--until", "--seed", "--out", "--releases", "--labels"}
+}
+
 func parseUptakeFlags(args []string, now time.Time) (uptakeArgs, error) {
-	since, until := now.Add(-7*24*time.Hour), now
-	chosenSeed, out, releases, labels := 0, "", "", ""
+	a := uptakeArgs{since: now.Add(-7 * 24 * time.Hour), until: now}
 	seedSet := false
 	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		name, value, has := strings.Cut(arg, "=")
-		if name != "--since" && name != "--until" && name != "--seed" && name != "--out" && name != "--releases" && name != "--labels" {
-			return uptakeArgs{}, fmt.Errorf("unknown argument %q", arg)
+		name, value, has := strings.Cut(args[i], "=")
+		if !slices.Contains(uptakeFlagNames(), name) {
+			return uptakeArgs{}, fmt.Errorf("unknown argument %q", args[i])
 		}
 		if !has {
 			i++
@@ -1325,45 +1322,57 @@ func parseUptakeFlags(args []string, now time.Time) (uptakeArgs, error) {
 			}
 			value = args[i]
 		}
-		switch name {
-		case "--since", "--until":
-			t, err := timearg.Parse(value, now)
-			if err != nil {
-				return uptakeArgs{}, fmt.Errorf("invalid %s: %w", name, err)
-			}
-			if name == "--since" {
-				since = t
-			} else {
-				until = t
-			}
-		case "--seed":
-			n, err := strconv.Atoi(value)
-			if err != nil {
-				return uptakeArgs{}, fmt.Errorf("--seed must be an integer: %w", err)
-			}
-			chosenSeed, seedSet = n, true
-		case "--out":
-			out = value
-		case "--releases":
-			if value == "" {
-				return uptakeArgs{}, fmt.Errorf("--releases needs a non-empty value")
-			}
-			releases = value
-		case "--labels":
-			if value == "" {
-				return uptakeArgs{}, fmt.Errorf("--labels needs a non-empty value")
-			}
-			labels = value
+		if name == "--seed" {
+			seedSet = true
+		}
+		if err := a.setFlag(name, value, now); err != nil {
+			return uptakeArgs{}, err
 		}
 	}
 	if !seedSet {
-		y, m, d := since.UTC().Date()
-		chosenSeed = y*10000 + int(m)*100 + d
+		y, m, d := a.since.UTC().Date()
+		a.seed = y*10000 + int(m)*100 + d
 	}
-	return uptakeArgs{since: since, until: until, seed: chosenSeed, out: out, releases: releases, labels: labels}, nil
+	return a, nil
+}
+
+func (a *uptakeArgs) setFlag(name, value string, now time.Time) error {
+	switch name {
+	case "--since", "--until":
+		t, err := timearg.Parse(value, now)
+		if err != nil {
+			return fmt.Errorf("invalid %s: %w", name, err)
+		}
+		if name == "--since" {
+			a.since = t
+		} else {
+			a.until = t
+		}
+	case "--seed":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("--seed must be an integer: %w", err)
+		}
+		a.seed = n
+	case "--out":
+		a.out = value
+	case "--releases", "--labels":
+		if value == "" {
+			return fmt.Errorf("%s needs a non-empty value", name)
+		}
+		if name == "--releases" {
+			a.releases = value
+		} else {
+			a.labels = value
+		}
+	}
+	return nil
 }
 
 func (u *run) runUptake(since, until time.Time) error {
+	if err := u.loadInputs(); err != nil {
+		return err
+	}
 	out := u.outputDir
 	if out == "" {
 		var err error
@@ -1455,12 +1464,7 @@ func (u *run) writeCounts() error {
 }
 func (u *run) writeExamples() (result error) {
 	rng := rand.New(rand.NewSource(int64(u.seed)))
-	keys := make([]string, 0, len(u.habitCandidates))
-	for k := range u.habitCandidates {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range slices.Sorted(maps.Keys(u.habitCandidates)) {
 		arr := u.habitCandidates[k]
 		rng.Shuffle(len(arr), func(i, j int) { arr[i], arr[j] = arr[j], arr[i] })
 		limit := 20
