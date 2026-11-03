@@ -13,7 +13,7 @@ func fakes() map[string]string {
 	return map[string]string{
 		"private-key": "-----BEGIN RSA " + "PRIVATE KEY-----\n" + r("Ab1", 20) + "\n-----END RSA " + "PRIVATE KEY-----",
 		"sk_live":     "sk" + "_live_" + r("a1B2", 5),
-		"sk":          "sk" + "-proj-" + r("x9Y8", 6),
+		"sk":          "sk" + "-" + r("x9Y8", 6),
 		"github":      "gh" + "p_" + r("Q7w", 12),
 		"slack":       "xo" + "xb-" + r("12ab-", 3),
 		"aws":         "AK" + "IA" + r("Z9", 8),
@@ -38,7 +38,7 @@ func TestMaskEachKind(t *testing.T) {
 }
 
 func TestMaskGluedKeysPreservesPrefix(t *testing.T) {
-	contexts := []string{"\\n", "\\t", "\\r", "_", "a", "0", "%20"}
+	contexts := []string{"\\n", "\\t", "\\r", "_", "a", "0", "%20", "\\u0041", "\\f", "\\e[31m", "\\033[0;1m", "\\x1b[32m", "\x1b[0m"}
 	for kind, value := range fakes() {
 		for _, prefix := range contexts {
 			if kind == "sk" && (prefix == "a" || prefix == "0" || prefix == "%20") {
@@ -55,7 +55,7 @@ func TestMaskGluedKeysPreservesPrefix(t *testing.T) {
 		}
 	}
 
-	for _, prefix := range []string{"", " ", "_", "\\n", "\\t", "\\r"} {
+	for _, prefix := range []string{"", " ", "_", "\\n", "\\t", "\\r", "%20", "\\u0041", "\\f", "\\e[31m", "\\033[0;1m", "\\x1b[32m", "\x1b[0m"} {
 		t.Run("sk/allowed/"+prefix, func(t *testing.T) {
 			text := prefix + fakes()["sk"]
 			got, found := Mask(text)
@@ -109,11 +109,27 @@ func TestMaskDistinctiveGluedToGenericSkIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMaskDistinctiveSkPrefixes(t *testing.T) {
+	body := strings.Repeat("abcdefgh", 3)
+	for _, prefix := range []string{"sk" + "-proj-", "sk" + "-ant-"} {
+		t.Run(prefix, func(t *testing.T) {
+			text := "x9" + prefix + body
+			got, found := Mask(text)
+			if got != "x9[скрыто:sk]" || !maps.Equal(found, map[string]int{"sk": 1}) {
+				t.Errorf("distinctive prefix was not masked: output length %d, counts %v", len(got), found)
+			}
+		})
+	}
+}
+
 func TestMaskSkDoesNotMatchInsideWords(t *testing.T) {
 	texts := []string{
-		"task-1234567890-abcdefghijkl",
-		"disk_usage_2024_report_final_v2",
-		"risk-proj-1234567890-abcdefghijkl",
+		"task-20261103-1604-HIGH-secret-mask-judge",
+		"disk_usage_report_2026_11_03_final",
+		"risk-assessment-2026-q4-final-report",
+		"sk-learn==1.5.2",
+		"mask-1234567890-abcdefghijkl",
+		"desk-2026-11-03-abcdefghijklmn",
 	}
 	for _, text := range texts {
 		got, found := Mask(text)
