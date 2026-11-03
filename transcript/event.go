@@ -247,6 +247,8 @@ func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNa
 		}
 		if len(raw) > 0 {
 			rd.line(raw)
+		} else if err == nil {
+			rd.lineNo++ // a blank line is still a line of the file: numbers match sed -n
 		}
 		if err != nil {
 			rd.meta.Originator, rd.meta.Account = rd.codex.originator, rd.codex.firstAccount
