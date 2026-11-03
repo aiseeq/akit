@@ -41,7 +41,11 @@ type pairReportLayer struct {
 }
 
 func (u *run) writePairReport(b *strings.Builder) {
-	b.WriteString("\n## Пары этапа 2\n\n")
+	b.WriteString("\n## Пары этапа 2")
+	if u.labelsPath == "" {
+		b.WriteString(" — доля: не проверено разметкой")
+	}
+	b.WriteString("\n\n")
 	if u.releasesPath == "" {
 		b.WriteString("даты выпуска не заданы; период — no-date.\n\n")
 	}
@@ -230,6 +234,23 @@ func (u *run) pairLabelMetrics(tool string) (float64, float64, bool, string) {
 	return pLo, recallLo, true, ""
 }
 
+func (u *run) pairLabelGate(tool string) string {
+	if u.labelsPath == "" {
+		return "unlabelled"
+	}
+	precision, recall, ok, _ := u.pairLabelMetrics(tool)
+	if precision < 0.8 {
+		return "precision<0.8"
+	}
+	if recall < 0.7 {
+		return "recall<0.7"
+	}
+	if !ok {
+		return "precision<0.8"
+	}
+	return "ok"
+}
+
 func (u *run) writePairReportRow(b *strings.Builder, tool string, layer pairReportLayer, tally pairReportTally) {
 	total := tally.newEpisodes + tally.oldEpisodes
 	precision, recall, verified, reason := u.pairLabelMetrics(tool)
@@ -298,7 +319,9 @@ func (u *run) writeReportUtilityRows(b *strings.Builder, rows map[string]*report
 			r = &reportTally{}
 		}
 		share := "пары нет"
-		if r.old > 0 {
+		if contains(pairTools(), tool) {
+			share = "см. «Пары этапа 2»"
+		} else if r.old > 0 {
 			share = fmt.Sprintf("%.1f%%", 100*float64(r.window)/float64(r.window+r.old))
 		}
 		crash, total, killed, callerr := u.reportFaultCounts(tool)
