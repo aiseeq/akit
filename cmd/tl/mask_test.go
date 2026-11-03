@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A key pasted into a transcript never comes out of tl: not in a conversation, a whole event, a grep or
@@ -30,6 +31,22 @@ func TestOutputMasksSecrets(t *testing.T) {
 		}
 		if code != 0 || !strings.Contains(out, "[скрыто:sk]") {
 			t.Errorf("tl %v: code %d, no mask marker in %d bytes of output", args, code, len(out))
+		}
+	}
+}
+
+// An argument error quotes the value; a key passed by mistake as a value stays masked there too.
+func TestArgumentErrorMasksSecrets(t *testing.T) {
+	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
+	for _, args := range [][]string{{"--since", key}, {"--q", key}, {"--role", key}} {
+		var out, errOut strings.Builder
+		code := start(args, time.Now(), &out, &errOut)
+		if strings.Contains(out.String()+errOut.String(), key) {
+			t.Errorf("tl %s VALUE: the key is in the output", args[0])
+			continue
+		}
+		if code != exitUsage || !strings.Contains(errOut.String(), "[скрыто:sk]") {
+			t.Errorf("tl %s VALUE: code %d, no mask marker in %d bytes of stderr", args[0], code, errOut.Len())
 		}
 	}
 }

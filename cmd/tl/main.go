@@ -107,21 +107,33 @@ type options struct {
 var errHelp = errors.New("help")
 
 func main() {
-	opts, err := parseArgs(os.Args[1:], time.Now())
+	os.Exit(start(os.Args[1:], time.Now(), os.Stdout, os.Stderr))
+}
+
+// start parses the arguments and runs tl. What it prints itself is masked like the output of run: an
+// error quotes the argument, and a pasted key may be one.
+func start(args []string, now time.Time, stdout, stderr io.Writer) int {
+	opts, err := parseArgs(args, now)
 	if errors.Is(err, errHelp) {
-		fmt.Print(usage)
-		return
+		printMasked(stdout, usage)
+		return 0
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "tl: %v\n(tl -h for usage)\n", err)
-		os.Exit(exitUsage)
+		printMasked(stderr, fmt.Sprintf("tl: %v\n(tl -h for usage)\n", err))
+		return exitUsage
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "tl: %v\n", err)
-		os.Exit(exitUsage)
+		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
+		return exitUsage
 	}
-	os.Exit(run(opts, env{home: home, sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: time.Now()}, os.Stdout, os.Stderr))
+	return run(opts, env{home: home, sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now}, stdout, stderr)
+}
+
+// printMasked prints like fmt.Fprint, with secret values masked.
+func printMasked(w io.Writer, text string) {
+	masked, _ := secretmask.Mask(text)
+	fmt.Fprint(w, masked)
 }
 
 // env — то, что tl берёт из окружения; в тестах подменяется.
