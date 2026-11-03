@@ -123,3 +123,39 @@ func TestWriteTaskNewHonorsUmask(t *testing.T) {
 		t.Fatalf("new ticket mode %v, want 0600: %v", st.Mode().Perm(), err)
 	}
 }
+
+func TestConcurrentStartsAssignTicketToOneActor(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1000-MED-race.md")
+	body := "# Race\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — author\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	errs := make([]string, 2)
+	for i := range 2 {
+		wg.Go(func() {
+			o := options{cmd: "start", id: "race", by: fmt.Sprintf("actor-%d", i)}
+			var out, errOut bytes.Buffer
+			codes[i] = runAtBase(base, dir, o, &out, &errOut)
+			errs[i] = errOut.String()
+		})
+	}
+	wg.Wait()
+	if !((codes[0] == 0 && codes[1] == exitNone) || (codes[1] == 0 && codes[0] == exitNone)) {
+		t.Fatalf("start codes = %v, errors = %q", codes, errs)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := executor(string(data))
+	if owner != "actor-0" && owner != "actor-1" {
+		t.Fatalf("ticket has unexpected executor %q: %s", owner, data)
+	}
+}
