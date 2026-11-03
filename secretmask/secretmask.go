@@ -10,12 +10,12 @@ import (
 
 var (
 	privateKeyRE = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)`)
-	skLiveRE     = regexp.MustCompile(`\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{16,}`)
-	skRE         = regexp.MustCompile(`\bsk[-_][A-Za-z0-9_-]{20,}`)
-	githubRE     = regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})`)
-	slackRE      = regexp.MustCompile(`\bxox[abeoprs]-[A-Za-z0-9-]{10,}`)
-	awsRE        = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
-	googleRE     = regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{30,}`)
+	skLiveRE     = regexp.MustCompile(`(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{16,}`)
+	skRE         = regexp.MustCompile(`(^|_|[^A-Za-z0-9_]|\\[ntr])(sk[-_][A-Za-z0-9_-]{20,})`)
+	githubRE     = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})`)
+	slackRE      = regexp.MustCompile(`xox[abeoprs]-[A-Za-z0-9-]{10,}`)
+	awsRE        = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	googleRE     = regexp.MustCompile(`AIza[0-9A-Za-z_-]{30,}`)
 )
 
 type pattern struct {
@@ -26,17 +26,17 @@ type pattern struct {
 	digit bool
 }
 
-// patterns in the order they apply: a private key block first, so the keys
-// inside it are not counted again
+// patterns apply private key blocks first, then distinctive prefixes, and the
+// generic sk form last so it can match after a replacement marker.
 func patterns() []pattern {
 	return []pattern{
 		{kind: "private-key", re: privateKeyRE},
 		{kind: "sk_live", re: skLiveRE},
-		{kind: "sk", re: skRE, digit: true},
 		{kind: "github", re: githubRE},
 		{kind: "slack", re: slackRE},
 		{kind: "aws", re: awsRE},
 		{kind: "google", re: googleRE},
+		{kind: "sk", re: skRE, digit: true},
 	}
 }
 
@@ -46,11 +46,17 @@ func Mask(text string) (string, map[string]int) {
 	found := map[string]int{}
 	for _, p := range patterns() {
 		text = p.re.ReplaceAllStringFunc(text, func(m string) string {
-			if p.digit && !strings.ContainsAny(m, "0123456789") {
+			prefix, secret := "", m
+			if p.digit {
+				// the generic sk form captures the character before the key; it stays in the text
+				groups := p.re.FindStringSubmatch(m)
+				prefix, secret = groups[1], groups[2]
+			}
+			if p.digit && !strings.ContainsAny(secret, "0123456789") {
 				return m
 			}
 			found[p.kind]++
-			return "[скрыто:" + p.kind + "]"
+			return prefix + "[скрыто:" + p.kind + "]"
 		})
 	}
 	return text, found
