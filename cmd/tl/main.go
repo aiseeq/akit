@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/buildversion"
+	"github.com/aiseeq/akit/secretmask"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 )
@@ -306,7 +308,29 @@ func setRoles(opts *options, list string) error {
 	return nil
 }
 
+// run prints what runOutput prints with secret values masked: an event quoted verbatim may hold a key a
+// user pasted, and tl output goes on to other agents and models. The output is buffered whole, so a
+// private key block across lines is masked as one.
 func run(opts options, e env, stdout, stderr io.Writer) int {
+	var out, errs bytes.Buffer
+	code := runOutput(opts, e, &out, &errs)
+	if err := errors.Join(writeMasked(stdout, out.String()), writeMasked(stderr, errs.String())); err != nil {
+		fmt.Fprintf(stderr, "tl: write output: %v\n", err)
+		return exitUsage
+	}
+	return code
+}
+
+func writeMasked(w io.Writer, text string) error {
+	if text == "" {
+		return nil
+	}
+	masked, _ := secretmask.Mask(text)
+	_, err := io.WriteString(w, masked)
+	return err
+}
+
+func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 	if opts.version {
 		fmt.Fprintln(stdout, buildversion.String("tl"))
 		return 0
