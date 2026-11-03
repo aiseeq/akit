@@ -296,6 +296,27 @@ with the fragment give the last one and a note. `~` expands only at the start of
     user-word --search 'да, делай' [--since 2026-10-24] [--project akit]
     user-word --brief task.md [--until '2026-10-31 15:00']
 
+## timeit
+
+Measures a command's median runtime in milliseconds, running it up to five times while the first-run
+budget permits. It starts the first run unconditionally; each later run starts only if less than the
+budget has elapsed since the first run started. After the first run, the effective budget is the smaller
+of `--budget` and `--limit` minus that run's duration, with a floor of zero. Defaults are 45s for the
+budget and 60s for the limit, so a slow first run leaves less time for repeats.
+
+The command runs directly, without a shell. Its stdout is discarded and stderr is kept for reporting a
+failed run. At most the last 64 KiB of stderr is printed, with a note when its beginning was truncated.
+Input is empty unless `--stdin FILE` reopens a regular file for every run. `--ok-exit` accepts a
+comma-separated list of successful exit codes; `--fail-on-stderr TEXT` marks a run as failed if stderr
+contains the text. A failed run stops the measurement, prints its stderr and run number, and returns
+its exit code (1 for a stderr match with exit code 0). If the command is killed by a signal, timeit prints
+`signal NAME` and exits with 128 plus the signal number. Interrupting timeit with SIGINT, SIGTERM, or
+SIGHUP also exits with 128 plus the signal number. Usage and launch errors exit 2.
+
+    timeit --runs 5 --budget 45s --limit 60s -- ./bin/reference --case small
+
+`timeit -h` lists all flags and defaults.
+
 ## wfor
 
 Wait for conditions in one call, with a timeout, instead of a `while … sleep` loop. The answer
