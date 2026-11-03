@@ -302,3 +302,28 @@ func TestCommandNotFound(t *testing.T) {
 		t.Fatalf("code %d stdout %q stderr %q", code, out.String(), stderr.String())
 	}
 }
+
+// firstWriteFails fails its first write and records the later ones.
+type firstWriteFails struct {
+	failed bool
+	bytes.Buffer
+}
+
+func (w *firstWriteFails) Write(p []byte) (int, error) {
+	if !w.failed {
+		w.failed = true
+		return 0, errors.New("disk full")
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestFailedRunReportsStderrWriteError(t *testing.T) {
+	stderr := &firstWriteFails{}
+	code := failedRun(stderr, result{code: 3, stderrData: []byte("diagnostic\n")}, 1, 1, "")
+	if code != exitError {
+		t.Errorf("code %d, want %d", code, exitError)
+	}
+	if !strings.Contains(stderr.String(), "disk full") {
+		t.Errorf("write error not reported: %q", stderr.String())
+	}
+}

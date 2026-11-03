@@ -759,3 +759,14 @@ func TestBriefLaterCountsQuestionAnswers(t *testing.T) {
 	_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Пользователь 31.10: «Склад считаем по четвергам»\n"), "--until", "2026-10-31 17:00")
 	mustHave(t, "ответ в окне вопроса", out, "1 found", "answer in a question dialog", "Северный", "--- 1 more user lines not shown")
 }
+
+// Битая запись вызова AskUserQuestion оставляется фильтром и попадает в предупреждение читателя.
+func TestBriefQuoteReportsMalformedAskCall(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-r5", "7a000000-0000",
+		human("2026-10-31T10:00:00Z", "Цитата перед битым вопросом"),
+		`{"type":"assistant","timestamp":"2026-10-31T10:00:05Z","message":{"content":[{"type":"tool_use","name":"AskUserQuestion"`)
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10: «Цитата перед битым вопросом»\n")
+	_, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	mustHave(t, "битый вызов вопроса замечен", out, "malformed", "line 2")
+}

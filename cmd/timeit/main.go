@@ -278,6 +278,7 @@ func failedRun(stderr io.Writer, res result, runNumber, runs int, text string) i
 		fmt.Fprintln(stderr, "timeit: stderr beginning truncated; showing last 65536 bytes")
 	}
 	if _, err := stderr.Write(data); err != nil {
+		fmt.Fprintf(stderr, "timeit: write captured stderr: %v\n", err)
 		return exitError
 	}
 	if len(data) > 0 && data[len(data)-1] != '\n' {
