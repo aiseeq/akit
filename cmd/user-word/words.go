@@ -2040,7 +2040,13 @@ func readChronologicalBriefLines(path string, f *os.File, size int64, from, unti
 		return nil, err
 	}
 	if !ordered {
-		return readLines(path, keep)
+		lines, err := readLines(path, keep)
+		for i := range lines {
+			if lines[i].warning != "" {
+				lines[i].warning += " in " + path
+			}
+		}
+		return lines, err
 	}
 	if firstStamp.After(until) {
 		return nil, nil
@@ -2057,20 +2063,51 @@ func readChronologicalBriefLines(path string, f *os.File, size int64, from, unti
 	}
 	r := bufio.NewReaderSize(f, 1<<20)
 	parser := transcript.NewParser()
-	return scanChronologicalBriefLines(r, parser, until, keep, setDay, parsed...)
+	// The line number of a malformed record counts from the file start; the
+	// lines before the seek point are counted only when a warning needs them.
+	scan := briefScan{path: path, linesBefore: func() (int, error) { return countLines(f, start) }}
+	return scan.lines(r, parser, until, keep, setDay, parsed...)
 }
 
-func scanChronologicalBriefLines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte) bool, setDay func([]byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
+// countLines counts the line breaks in the first n bytes of f.
+func countLines(f *os.File, n int64) (int, error) {
+	count := 0
+	buf := make([]byte, 1<<20)
+	for off := int64(0); off < n; {
+		k, err := f.ReadAt(buf[:min(int64(len(buf)), n-off)], off)
+		count += bytes.Count(buf[:k], []byte{'\n'})
+		off += int64(k)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return 0, fmt.Errorf("count transcript lines: %w", err)
+		}
+	}
+	return count, nil
+}
+
+// briefScan reads one chronological transcript for --brief and reports its
+// first malformed record by file line.
+type briefScan struct {
+	path        string
+	linesBefore func() (int, error)
+	bad         int
+	badLine     int
+	badErr      error
+}
+
+func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte) bool, setDay func([]byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
 	var out []line
-	var bad int
-	var firstBad error
 	lineNo := 0
 	untilDate := []byte(until.UTC().Format(time.DateOnly))
 	for {
-		raw, readErr := readBriefRecord(r)
+		raw, consumed, readErr := readBriefRecord(r)
+		if consumed {
+			lineNo++
+		}
 		var rawDay []byte
 		if len(raw) > 0 {
-			lineNo++
 			var after, known bool
 			var err error
 			rawDay, after, known, err = briefRecordStatus(raw, untilDate, until)
@@ -2078,7 +2115,7 @@ func scanChronologicalBriefLines(r *bufio.Reader, parser *transcript.Parser, unt
 				return nil, err
 			}
 			if known && after {
-				return finishBriefScan(out, bad, firstBad), nil
+				return s.finish(out)
 			}
 			if !known {
 				stamp, err := transcriptTimestamp(raw)
@@ -2086,7 +2123,7 @@ func scanChronologicalBriefLines(r *bufio.Reader, parser *transcript.Parser, unt
 					return nil, err
 				}
 				if !stamp.IsZero() && stamp.After(until) {
-					return finishBriefScan(out, bad, firstBad), nil
+					return s.finish(out)
 				}
 			}
 		}
@@ -2096,20 +2133,20 @@ func scanChronologicalBriefLines(r *bufio.Reader, parser *transcript.Parser, unt
 		if len(raw) > 0 && (keep == nil || keep(raw)) {
 			events, parseErr := parseBriefRecord(raw, parser, parsed)
 			if parseErr != nil {
-				bad++
-				if firstBad == nil {
-					firstBad = fmt.Errorf("line %d: %w", lineNo, parseErr)
+				s.bad++
+				if s.badErr == nil {
+					s.badLine, s.badErr = lineNo, parseErr
 				}
 			} else {
 				finished := appendBriefEvents(&out, events, until)
 				if finished {
-					return finishBriefScan(out, bad, firstBad), nil
+					return s.finish(out)
 				}
 			}
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				return finishBriefScan(out, bad, firstBad), nil
+				return s.finish(out)
 			}
 			return nil, fmt.Errorf("read transcript record: %w", readErr)
 		}
@@ -2125,11 +2162,18 @@ func parseBriefRecord(raw []byte, parser *transcript.Parser, parsed []func([]byt
 	return parser.Parse(raw)
 }
 
-func finishBriefScan(out []line, bad int, first error) []line {
-	if bad > 0 {
-		out = append(out, malformedTranscriptWarning(bad, first))
+func (s *briefScan) finish(out []line) ([]line, error) {
+	if s.bad == 0 {
+		return out, nil
 	}
-	return out
+	before, err := s.linesBefore()
+	if err != nil {
+		return nil, err
+	}
+	first := fmt.Errorf("line %d: %w", before+s.badLine, s.badErr)
+	warning := malformedTranscriptWarning(s.bad, first)
+	warning.warning += " in " + s.path
+	return append(out, warning), nil
 }
 
 func briefRecordStatus(raw, untilDate []byte, until time.Time) ([]byte, bool, bool, error) {
@@ -2195,11 +2239,16 @@ func validUTCTimestampDate(stamp []byte) bool {
 	return true
 }
 
-func readBriefRecord(r *bufio.Reader) ([]byte, error) {
+// readBriefRecord reads one transcript line. A tool result without answers is
+// skipped (nil record), but consumed still reports that a line was read, so the
+// caller's line count matches the file.
+func readBriefRecord(r *bufio.Reader) ([]byte, bool, error) {
 	var raw []byte
 	skippingResult := false
+	consumed := false
 	for {
 		chunk, err := r.ReadSlice('\n')
+		consumed = consumed || len(chunk) > 0
 		if !skippingResult {
 			raw = append(raw, chunk...)
 			if bytes.Contains(raw, []byte(`"type":"tool_result"`)) && !bytes.Contains(raw, []byte(`"answers":`)) {
@@ -2209,9 +2258,9 @@ func readBriefRecord(r *bufio.Reader) ([]byte, error) {
 		}
 		if err != bufio.ErrBufferFull {
 			if skippingResult {
-				return nil, err
+				return nil, consumed, err
 			}
-			return bytes.TrimSuffix(raw, []byte{'\n'}), err
+			return bytes.TrimSuffix(raw, []byte{'\n'}), consumed, err
 		}
 	}
 }
