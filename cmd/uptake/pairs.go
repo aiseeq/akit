@@ -625,13 +625,8 @@ func (u *run) pairUtilityCode(tool string, calls []shellcmd.Call, at, code int, 
 		}
 		return -1
 	}
-	if at < 0 || at >= len(calls) || at != len(calls)-1 || calls[at].Name != tool {
+	if at < 0 || at >= len(calls) || at != len(calls)-1 || calls[at].Name != tool || utilityCallCount(calls, tool) != 1 {
 		return -1
-	}
-	for i := range calls {
-		if i != at && calls[i].Name == tool {
-			return -1
-		}
 	}
 	return code
 }
