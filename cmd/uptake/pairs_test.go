@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
@@ -155,13 +156,17 @@ func TestOutcomeUnknownBounds(t *testing.T) {
 func TestOutcomeLineNeedsSingleCall(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
 	e := transcript.Event{Role: transcript.Out}
-	calls, err := shellcmd.Calls("prior one; prior two")
-	if err != nil {
-		t.Fatal(err)
-	}
-	code := u.pairUtilityCode("prior", calls, 1, u.eventExitCode(e), "== пусто: журнал решений")
-	if pairOutcome(pairCall{tool: "prior", code: code, out: "== пусто: журнал решений"}) != "answer" {
-		t.Fatal("ambiguous line counted as answer")
+	const line = "== пусто: журнал решений"
+	for _, tc := range []struct{ command, want string }{{"prior one", "answer"}, {"prior one; prior two", "unknown"}} {
+		calls, err := shellcmd.Calls(tc.command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := u.pairUtilityCode("prior", calls, len(calls)-1, u.eventExitCode(e), line)
+		got := pairOutcome(pairCall{tool: "prior", code: code, out: line, severalCalls: utilityCallCount(calls, "prior") > 1})
+		if got != tc.want {
+			t.Errorf("%q with a summary line => %s, want %s", tc.command, got, tc.want)
+		}
 	}
 }
 
@@ -209,9 +214,11 @@ func TestPairReleasesDate(t *testing.T) {
 	}
 	u := newRun(time.Time{}, time.Time{}, 1, d, d)
 	u.releasesPath = path
-	if _, err := u.loadReleases(); err != nil {
+	releases, err := u.loadReleases()
+	if err != nil {
 		t.Fatal(err)
 	}
+	u.releases = releases
 	u.pairCalls = []pairCall{{tool: "busy", way: "old", goal: "make", at: time.Now().UTC()}}
 	if err := u.writePairTables(); err != nil {
 		t.Fatal(err)
@@ -364,22 +371,27 @@ func TestReportShareLabelsThresholds(t *testing.T) {
 		}
 		return u
 	}
-	precisionBad := build(50, 0, 35, 0)
-	_, _, pass, reason := precisionBad.pairLabelMetrics("prior")
-	if pass || !strings.Contains(reason, "точность") {
-		t.Fatalf("precision threshold not enforced: %q", reason)
+	precisionBad := build(50, 0, 35, 0).pairLabelMetrics("prior")
+	if precisionBad.gate != "precision<0.8" || !strings.Contains(precisionBad.reason, "точность") {
+		t.Fatalf("precision threshold not enforced: %+v", precisionBad)
 	}
-	recallBad := build(30, 90, 30, 25)
-	_, _, pass, reason = recallBad.pairLabelMetrics("prior")
-	if pass || !strings.Contains(reason, "полнота") {
-		t.Fatalf("recall threshold not enforced: %q", reason)
+	recallBad := build(30, 90, 30, 25).pairLabelMetrics("prior")
+	if recallBad.gate != "recall<0.7" || !strings.Contains(recallBad.reason, "полнота") {
+		t.Fatalf("recall threshold not enforced: %+v", recallBad)
 	}
-	passRun := build(90, 10, 90, 0)
-	_, _, pass, reason = passRun.pairLabelMetrics("prior")
-	if !pass {
-		t.Fatalf("valid labels rejected: %s", reason)
+	if v := build(90, 10, 90, 0).pairLabelMetrics("prior"); v.gate != "ok" {
+		t.Fatalf("valid labels rejected: %+v", v)
 	}
 }
+
+// loadLabels reads the labels file and checks it against the sample, as a run does around its scan.
+func loadLabels(u *run) error {
+	if err := u.readPairLabels(); err != nil {
+		return err
+	}
+	return u.checkPairLabels()
+}
+
 func ensureLabels(labels map[string]string) map[string]string {
 	if labels == nil {
 		return map[string]string{}
@@ -404,7 +416,7 @@ func TestLabelsFileErrors(t *testing.T) {
 			u.labelsPath = path
 			u.pairCandidates = []pairCandidate{{id: "candidate", pair: "prior"}}
 			u.pairCandidateSample = append(u.pairCandidateSample, u.pairCandidates[0])
-			err := u.loadPairLabels()
+			err := loadLabels(u)
 			if err == nil || !strings.Contains(err.Error(), path+":") {
 				t.Fatalf("expected line-specific error, got %v", err)
 			}
@@ -534,7 +546,7 @@ func TestReportLimitationsAndErrors(t *testing.T) {
 	var b strings.Builder
 	u.writePairReport(&b)
 	text := b.String()
-	for _, phrase := range []string{"не по смыслу", "не обязательность", "внутри широкого надмножества", "Взвешивания по составу проектов нет", "версии утилит не учитываются", "ошибки вызова (fail)"} {
+	for _, phrase := range []string{"не по смыслу", "не обязательность", "внутри широкого надмножества", "Взвешивания по составу проектов нет", "версии утилит не учитываются", "ошибки вызова (callerr + fail)"} {
 		if !strings.Contains(text, phrase) {
 			t.Errorf("report missing %q", phrase)
 		}
@@ -770,9 +782,9 @@ func TestLabelRecallWithoutLabelledNo(t *testing.T) {
 	for i := range 40 {
 		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: fmt.Sprintf("no-%d", i), pair: "prior"})
 	}
-	_, recall, pass, reason := u.pairLabelMetrics("prior")
-	if pass || recall >= 0.7 || !strings.Contains(reason, "полнота") {
-		t.Fatalf("recall without labelled no = %.3f, pass %v, %q; want a failed recall", recall, pass, reason)
+	v := u.pairLabelMetrics("prior")
+	if v.gate != "recall<0.7" || v.recall >= 0.7 || !strings.Contains(v.reason, "полнота") {
+		t.Fatalf("recall without labelled no = %+v; want a failed recall", v)
 	}
 }
 
@@ -784,7 +796,7 @@ func TestLabelsFileMissingSampledID(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
 	u.labelsPath = path
 	u.pairCandidateSample = []pairCandidate{{id: "first", pair: "prior"}, {id: "second", pair: "prior"}}
-	if err := u.loadPairLabels(); err == nil || !strings.Contains(err.Error(), "1 sampled candidates have no label") {
+	if err := loadLabels(u); err == nil || !strings.Contains(err.Error(), path+": 1 sampled candidates have no label") {
 		t.Fatalf("partial labels: %v", err)
 	}
 }
@@ -871,7 +883,7 @@ func TestLabelsIdsPerPair(t *testing.T) {
 	}
 	u.labelsPath = path
 	u.pairCandidateSample = append([]pairCandidate(nil), u.pairCandidates...)
-	if err := u.loadPairLabels(); err != nil {
+	if err := loadLabels(u); err != nil {
 		t.Fatal(err)
 	}
 	if u.labels[ids["prior"]] != "yes" || u.labels[ids["user-word"]] != "no" {
@@ -928,5 +940,268 @@ func TestReportTopShareNeedsLabels(t *testing.T) {
 	rowsData, err = os.ReadFile(filepath.Join(u.outputDir, "pairs.tsv"))
 	if err != nil || !strings.Contains(string(rowsData), "0.500000") {
 		t.Fatalf("labelled share absent: err=%v\n%s", err, rowsData)
+	}
+}
+
+func TestWforGoalByCondition(t *testing.T) {
+	for _, tc := range []struct {
+		args   []string
+		want   string
+		isCall bool
+	}{
+		{[]string{"exit", "123", "--timeout", "4m30s"}, "123", true},
+		{[]string{"line", "DONE", "/x/a.log", "--timeout", "4m30s"}, "/x/a.log", true},
+		{[]string{"--any", "file", "a", "gone", "b"}, "a, b", true},
+		{[]string{"--timeout=1m", "exit", "1", "2", "time", "14:45", "ok", "test -s x", "idle"}, "1, 2, 14:45, test -s x, idle", true},
+		{[]string{"--every", "5s", "--after", "10", "line", "x", "f.log"}, "f.log", true},
+		{[]string{"-h"}, "", false},
+		{[]string{"--help"}, "", false},
+		{[]string{"--timeout", "4m30s"}, "", false},
+		{nil, "", false},
+		{[]string{"bogus", "x"}, "bogus x", true},
+	} {
+		goal, isCall := wforGoal(tc.args)
+		if goal != tc.want || isCall != tc.isCall {
+			t.Errorf("wfor %q => %q, call %v; want %q, call %v", tc.args, goal, isCall, tc.want, tc.isCall)
+		}
+	}
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	for i, command := range []string{"wfor -h", "wfor --help", "wfor --timeout 4m30s"} {
+		e := transcript.Event{Line: i + 1, Time: time.Now(), Role: transcript.Cmd, Who: "Bash", Text: command, CallID: fmt.Sprintf("help-%d", i)}
+		outs := map[string]transcript.Event{e.CallID: {Role: transcript.Out, CallID: e.CallID, Text: "wfor — wait for conditions in one call, with a timeout."}}
+		u.collectPairEvents("synthetic.jsonl", true, nil, []transcript.Event{e}, outs, nil)
+		var calls []call
+		var writes []taskWrite
+		u.collectCommandCalls("synthetic.jsonl", true, nil, e, outs, &calls, &writes)
+		// Stage-1 uptake counts every wfor invocation, help included; only stage-2 pairs drop it.
+		if len(calls) != 1 {
+			t.Errorf("%q: stage-1 uptake should count it once, got %d calls", command, len(calls))
+		}
+	}
+	if len(u.pairCalls) != 0 {
+		t.Fatalf("wfor help or a call without conditions entered the pair: %+v", u.pairCalls)
+	}
+}
+
+func TestOutcomeLineSeveralCallsUnknown(t *testing.T) {
+	for _, out := range []string{"prior: bad query\n(prior -h for usage)", "== совпадения: решения\n/synthetic/topic.md:4: a"} {
+		u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+		e := transcript.Event{Line: 3, Time: time.Now(), Role: transcript.Cmd, Who: "Bash", Text: "prior a; prior b", CallID: "several"}
+		outs := map[string]transcript.Event{e.CallID: {Role: transcript.Out, CallID: e.CallID, Text: out}}
+		u.collectPairEvents("synthetic.jsonl", true, nil, []transcript.Event{e}, outs, nil)
+		if len(u.pairCalls) != 2 {
+			t.Fatalf("want two prior calls, got %+v", u.pairCalls)
+		}
+		for _, c := range u.pairCalls {
+			if c.outcome != "unknown" || pairUnknownReason(c) != "several-calls" {
+				t.Errorf("%q with output %q => %s (%s), want unknown (several-calls)", c.goal, out, c.outcome, pairUnknownReason(c))
+			}
+		}
+	}
+}
+
+func TestReportErrorsCountCallerr(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	for i, outcome := range []string{"callerr", "fail", "answer", "unknown"} {
+		u.pairCalls = append(u.pairCalls, pairCall{tool: "prior", way: "new", goal: fmt.Sprintf("goal-%d", i), agent: "agent", session: "s", period: "no-date", outcome: outcome, at: time.Now()})
+	}
+	var b strings.Builder
+	u.writePairReport(&b)
+	text := b.String()
+	if !strings.Contains(text, "| ошибки вызова (callerr + fail) |") {
+		t.Fatalf("error column does not name callerr and fail:\n%s", text)
+	}
+	if !strings.Contains(text, "| prior | agent | no | no-date |") || !strings.Contains(text, "| 4 / 0 / 0 | 2 |") {
+		t.Fatalf("call errors and failures not summed in the layer row:\n%s", text)
+	}
+}
+
+func TestZeroDenominatorDash(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.labelsPath = "synthetic-labels"
+	u.labels = map[string]string{}
+	for i := range 100 {
+		for _, yes := range []bool{true, false} {
+			c := pairCandidate{id: fmt.Sprintf("prior:%d:%t", i, yes), pair: "prior", yes: yes}
+			u.pairCandidates = append(u.pairCandidates, c)
+			u.pairCandidateSample = append(u.pairCandidateSample, c)
+			u.labels[c.id] = map[bool]string{true: "yes", false: "no"}[yes]
+		}
+	}
+	if gate := u.pairLabelGate("prior"); gate != "ok" {
+		t.Fatalf("labels gate = %s, want ok", gate)
+	}
+	counts := map[string]*epCount{"prior\tagent\tno\tno-date": {mixed: 3}}
+	if err := u.writePairRows(counts, map[pairCallCountKey]int{}); err != nil {
+		t.Fatal(err)
+	}
+	pairs, err := os.ReadFile(filepath.Join(u.outputDir, "pairs.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(pairs), "prior\tagent\tno\tno-date\tnew\t0\t0\t3\t0\t0\t-\t-\tok") {
+		t.Fatalf("share over zero new+old episodes is not a dash:\n%s", pairs)
+	}
+	u.pairCalls = []pairCall{{tool: "prior", way: "new", outcome: "unknown"}}
+	if err := u.writeOutcomes(); err != nil {
+		t.Fatal(err)
+	}
+	outcomes, err := os.ReadFile(filepath.Join(u.outputDir, "outcomes.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"busy\tnew\t0\t0\t0\t0\t0\t0\t0\t-\t-\t-\t-\n", "prior\tnew\t1\t0\t0\t0\t1\t0\t0\t0.000000\t1.000000\t-\t-\n"} {
+		if !strings.Contains(string(outcomes), want) {
+			t.Errorf("outcomes.tsv lacks %q:\n%s", want, outcomes)
+		}
+	}
+	for n := 1; n <= 100; n++ {
+		for _, k := range []int{0, n} {
+			if lo, hi := u.wilson(k, n); lo < 0 || hi > 1 || strings.HasPrefix(fmt.Sprintf("%.6f", lo), "-") {
+				t.Fatalf("wilson(%d, %d) = %v-%v leaves [0, 1]", k, n, lo, hi)
+			}
+		}
+	}
+}
+
+func TestRulesExportGoalOutDir(t *testing.T) {
+	for _, args := range [][]string{
+		{"--src-home", "/synthetic/home", "--rules", "/synthetic/rules", "/synthetic/out"},
+		{"--src-home=/synthetic/home", "--rules=/synthetic/rules", "/synthetic/out"},
+		{"/synthetic/out"},
+	} {
+		if got := pairGoal("claude-rules-export", shellcmd.Call{Name: "claude-rules-export", Args: args}); got != "/synthetic/out" {
+			t.Errorf("claude-rules-export %q goal = %q, want /synthetic/out", args, got)
+		}
+	}
+	if got := pairGoal("claude-rules-export", shellcmd.Call{Name: "claude-rules-export", Args: []string{"--rules", "/synthetic/rules"}}); got != "" {
+		t.Errorf("flag value became the goal: %q", got)
+	}
+}
+
+func TestCandidateIDByCallID(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	at := time.Now()
+	// Two Bash calls of one assistant record share its line number.
+	evs := []transcript.Event{
+		{Line: 5, Time: at, Role: transcript.Cmd, Who: "Bash", Text: "cp -r /synthetic/.claude/skills/x /synthetic/out/", CallID: "call-a"},
+		{Line: 5, Time: at, Role: transcript.Cmd, Who: "Bash", Text: "cp a.txt /synthetic/out/", CallID: "call-b"},
+	}
+	u.collectPairEvents("synthetic.jsonl", true, nil, evs, map[string]transcript.Event{}, nil)
+	ids := map[string]pairCandidate{}
+	for _, c := range u.pairCandidates {
+		if c.pair == "claude-rules-export" {
+			ids[c.id] = c
+		}
+	}
+	first, second := "claude-rules-export:synthetic.jsonl:5:call-a", "claude-rules-export:synthetic.jsonl:5:call-b"
+	if len(ids) != 2 || !ids[first].yes || ids[second].yes {
+		t.Fatalf("candidates of one record are not told apart by call: %+v", u.pairCandidates)
+	}
+	path := filepath.Join(t.TempDir(), "labels.tsv")
+	if err := os.WriteFile(path, []byte("id\tlabel\n"+first+"\tyes\n"+second+"\tno\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u.labelsPath = path
+	u.pairCandidateSample = []pairCandidate{ids[first], ids[second]}
+	if err := loadLabels(u); err != nil {
+		t.Fatal(err)
+	}
+	if u.labels[first] != "yes" || u.labels[second] != "no" {
+		t.Fatalf("labels not applied each to its own call: %#v", u.labels)
+	}
+}
+
+func TestGateNoYesReason(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.labelsPath = "synthetic-labels"
+	u.labels = map[string]string{}
+	for i := range 10 {
+		c := pairCandidate{id: fmt.Sprintf("prior:no-%d", i), pair: "prior"}
+		u.pairCandidates = append(u.pairCandidates, c)
+		u.pairCandidateSample = append(u.pairCandidateSample, c)
+		u.labels[c.id] = "no"
+	}
+	if gate := u.pairLabelGate("prior"); gate != "no-yes-sample" {
+		t.Fatalf("gate without sampled yes candidates = %s, want no-yes-sample", gate)
+	}
+	u.pairCalls = []pairCall{{tool: "prior", way: "new", goal: "g", agent: "agent", session: "s", period: "no-date", outcome: "answer", at: time.Now()}}
+	var b strings.Builder
+	u.writePairReport(&b)
+	if !strings.Contains(b.String(), "| prior | agent | no | no-date | — | — | нет кандидатов «да» — точность не определена |") {
+		t.Fatalf("report does not name the missing yes sample:\n%s", b.String())
+	}
+}
+
+func TestRulesExportOldWayGeneric(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	for _, tc := range []struct{ command, way, goal string }{
+		{"cp -r ~/.claude/skills/x /tmp/out/", "claude-rules-export", "/tmp/out/"},
+		{"rsync -a --exclude '*.tmp' /synthetic/.claude/rules/ /synthetic/export", "claude-rules-export", "/synthetic/export"},
+		{"cp -t /synthetic/dest /synthetic/.claude/CLAUDE.md", "claude-rules-export", "/synthetic/dest"},
+		{"cp a.txt /tmp/out/", "", ""},
+		{"cp /synthetic/out/x ~/.claude/skills/x", "", ""},
+	} {
+		cs, err := shellcmd.Calls(tc.command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if way, goal := u.oldPair(cs[0], tc.command); way != tc.way || goal != tc.goal {
+			t.Errorf("%q => %q %q, want %q %q", tc.command, way, goal, tc.way, tc.goal)
+		}
+	}
+}
+
+func TestReportTkBenefit(t *testing.T) {
+	u := newRun(time.Time{}, time.Now(), 1, t.TempDir(), t.TempDir())
+	base := time.Now().UTC().Truncate(time.Hour)
+	u.sessionEnds = map[string]time.Time{"s": base.Add(time.Hour)}
+	u.tkRefusals = []tkRefusal{{kind: "bad args", session: "s", at: base, ticket: "x.md", subcommand: "done"}, {kind: "no ticket", session: "s", at: base, ticket: "y.md", subcommand: "done"}}
+	u.tkActions = []taskWrite{{session: "s", source: "tk", key: "x.md", op: "done", at: base.Add(time.Minute)}}
+	u.utilityNames = []string{"tk"}
+	var top strings.Builder
+	u.writeReportUtilityRows(&top, map[string]*reportTally{})
+	if !strings.Contains(top.String(), "| tk | 0 / 0 | пары нет | отказов 2, исправлено потом 1 (tk-refusals.tsv) |") {
+		t.Fatalf("tk benefit missing from the top table:\n%s", top.String())
+	}
+	var pairs strings.Builder
+	u.writePairReport(&pairs)
+	if !strings.Contains(pairs.String(), "Отказы tk: 2; исправлены потом 1 (той же подкомандой 1, другой 0), обход ручной правкой 0, сессия кончилась раньше 10 мин 0, брошены 1 — [tk-refusals.tsv](tk-refusals.tsv).") {
+		t.Fatalf("tk refusal line missing:\n%s", pairs.String())
+	}
+}
+
+func TestPairCallOutputClipped(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	long := strings.Repeat("ё", 10000) + "\n== совпадения: решения\n" + strings.Repeat("я", 10000)
+	e := transcript.Event{Line: 2, Time: time.Now(), Role: transcript.Cmd, Who: "Bash", Text: "prior synthetic topic", CallID: "long"}
+	outs := map[string]transcript.Event{e.CallID: {Role: transcript.Out, CallID: e.CallID, Text: long}}
+	u.collectPairEvents("synthetic.jsonl", true, nil, []transcript.Event{e}, outs, nil)
+	if len(u.pairCalls) != 1 {
+		t.Fatalf("want one call, got %d", len(u.pairCalls))
+	}
+	c := u.pairCalls[0]
+	if c.outcome != "answer" {
+		t.Errorf("outcome = %s: the summary line in the middle of the output was not seen", c.outcome)
+	}
+	if len(c.out) > 2*pairOutputKeep+16 || !utf8.ValidString(c.out) || !strings.HasPrefix(c.out, "ёё") || !strings.HasSuffix(c.out, "яя") {
+		t.Errorf("kept output is %d bytes, valid UTF-8 %v; want both ends within %d bytes each", len(c.out), utf8.ValidString(c.out), pairOutputKeep)
+	}
+}
+
+func TestWforHelpBesideCallNotSeveral(t *testing.T) {
+	calls, err := shellcmd.Calls("wfor -h 2>&1 | head -5; wfor exit 123 --timeout 4m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := utilityCallCount(calls, "wfor"); n != 1 {
+		t.Fatalf("wfor -h beside a call counted: %d calls, want 1", n)
+	}
+	calls, err = shellcmd.Calls("prior a; prior -h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := utilityCallCount(calls, "prior"); n != 2 {
+		t.Fatalf("prior calls: %d, want 2", n)
 	}
 }

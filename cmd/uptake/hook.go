@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -227,12 +228,7 @@ func (u *run) writeWebtextHook() error {
 		f.Close()
 		return fmt.Errorf("write webtext-hook.tsv: %w", err)
 	}
-	keys := make([]string, 0, len(u.hookCounts))
-	for key := range u.hookCounts {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(u.hookCounts)) {
 		if _, err := fmt.Fprintf(w, "%s\t%d\n", key, u.hookCounts[key]); err != nil {
 			f.Close()
 			return fmt.Errorf("write webtext-hook.tsv: %w", err)
