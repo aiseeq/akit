@@ -30,6 +30,15 @@ func TestParseUptakeArgs(t *testing.T) {
 	}
 }
 
+func TestReleasesEmptyValue(t *testing.T) {
+	now := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC)
+	for _, args := range [][]string{{"--releases="}, {"--releases", ""}} {
+		if _, err := parseUptakeArgs(args, now); err == nil {
+			t.Errorf("empty releases value accepted for %q", args)
+		}
+	}
+}
+
 func TestWriteTablesContent(t *testing.T) {
 	since := time.Date(2026, 10, 25, 11, 0, 0, 0, time.UTC)
 	until := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC)
@@ -557,5 +566,13 @@ func TestWebtextHookForeignLinesAndEmptyRotation(t *testing.T) {
 	u, err = write(long + "\n" + `time="` + inWindow + `" level=INFO msg="webfetch fallback" opened=true source=direct` + "\n")
 	if err != nil || u.hookSummary.opened != 1 {
 		t.Errorf("a long foreign line stopped the read: err=%v opened=%d", err, u.hookSummary.opened)
+	}
+}
+
+func TestUsageNamesEveryFlag(t *testing.T) {
+	for _, flag := range []string{"--since", "--until", "--out", "--seed", "--releases", "--labels", "-h, --help"} {
+		if !strings.Contains(usage, flag) {
+			t.Errorf("usage misses %s", flag)
+		}
 	}
 }

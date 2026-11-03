@@ -1,3 +1,8 @@
+// uptake — недельный замер подхвата утилит akit по транскриптам агентов: сколько вызовов у каждой утилиты против
+// прежнего способа, исходы вызовов, ошибки, пары «утилита против прежнего способа» по эпизодам цели и выборка
+// кандидатов для слепой разметки; итог — report.md и TSV в папке --out.
+//
+// Коды выхода: 0 — замер записан, 1 — ошибка чтения или записи, 2 — ошибка вызова.
 package main
 
 import (
@@ -65,10 +70,12 @@ type run struct {
 	hookMissing                                             []string
 	hookBadLines                                            int
 	firstHookBad                                            string
-	releasesPath                                            string
+	releasesPath, labelsPath                                string
+	labels                                                  map[string]string
 	pairCalls                                               []pairCall
 	pairOldIDs                                              map[string]map[string]struct{}
 	pairCandidates                                          []pairCandidate
+	pairCandidateSample                                     []pairCandidate
 	tkRefusals                                              []tkRefusal
 	tkActions                                               []taskWrite
 	pairOverlap                                             []pairOverlap
@@ -1221,10 +1228,35 @@ func (u *run) ruleFlags(cmd string) string {
 	}
 	return strings.Join(r, "; ")
 }
+
+const usage = `uptake — weekly uptake of akit tools from agent transcripts.
+
+Usage:
+  uptake [--since T] [--until T] [--out DIR] [--seed N] [--releases FILE] [--labels FILE]
+
+  --since T         window start (default: 7 days before now): 12:05, 25.10, "25.10 12:05", RFC3339,
+                    or an age such as 3d (three days ago)
+  --until T         window end (default: now)
+  --out DIR         output directory (default: a new temporary directory; its report path is printed)
+  --seed N          seed of the random samples (default: the window start date, YYYYMMDD)
+  --releases FILE   TSV tool<TAB>available<TAB>instructed (RFC3339, either may be empty): splits
+                    pairs into periods before and after release and instruction
+  --labels FILE     TSV id<TAB>label (yes|no) from a blind labeling of candidates.tsv: a pair share
+                    is reported only when precision and recall pass their lower bounds
+  -h, --help        this help
+
+Writes report.md and TSV tables (counts, examples, errors, pairs, outcomes, candidates, ...) to DIR.
+Exit: 0 written, 1 read/write error, 2 usage error.
+`
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
+		fmt.Print(usage)
+		return
+	}
 	args, err := parseUptakeArgs(os.Args[1:], time.Now())
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "uptake:", err)
+		fmt.Fprintln(os.Stderr, "uptake:", err, "(uptake -h for usage)")
 		os.Exit(2)
 	}
 	home, err := os.UserHomeDir()
@@ -1233,7 +1265,7 @@ func main() {
 		os.Exit(1)
 	}
 	u := newRun(args.since, args.until, args.seed, args.out, home)
-	u.releasesPath = args.releases
+	u.releasesPath, u.labelsPath = args.releases, args.labels
 	if _, err := u.loadReleases(); err != nil {
 		fmt.Fprintln(os.Stderr, "uptake:", err)
 		os.Exit(2)
@@ -1246,9 +1278,9 @@ func main() {
 
 // uptakeArgs — разобранные аргументы командной строки.
 type uptakeArgs struct {
-	since, until  time.Time
-	seed          int
-	out, releases string
+	since, until          time.Time
+	seed                  int
+	out, releases, labels string
 }
 
 func parseUptakeArgs(args []string, now time.Time) (uptakeArgs, error) {
@@ -1264,12 +1296,12 @@ func parseUptakeArgs(args []string, now time.Time) (uptakeArgs, error) {
 
 func parseUptakeFlags(args []string, now time.Time) (uptakeArgs, error) {
 	since, until := now.Add(-7*24*time.Hour), now
-	chosenSeed, out, releases := 0, "", ""
+	chosenSeed, out, releases, labels := 0, "", "", ""
 	seedSet := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		name, value, has := strings.Cut(arg, "=")
-		if name != "--since" && name != "--until" && name != "--seed" && name != "--out" && name != "--releases" {
+		if name != "--since" && name != "--until" && name != "--seed" && name != "--out" && name != "--releases" && name != "--labels" {
 			return uptakeArgs{}, fmt.Errorf("unknown argument %q", arg)
 		}
 		if !has {
@@ -1299,14 +1331,22 @@ func parseUptakeFlags(args []string, now time.Time) (uptakeArgs, error) {
 		case "--out":
 			out = value
 		case "--releases":
+			if value == "" {
+				return uptakeArgs{}, fmt.Errorf("--releases needs a non-empty value")
+			}
 			releases = value
+		case "--labels":
+			if value == "" {
+				return uptakeArgs{}, fmt.Errorf("--labels needs a non-empty value")
+			}
+			labels = value
 		}
 	}
 	if !seedSet {
 		y, m, d := since.UTC().Date()
 		chosenSeed = y*10000 + int(m)*100 + d
 	}
-	return uptakeArgs{since: since, until: until, seed: chosenSeed, out: out, releases: releases}, nil
+	return uptakeArgs{since: since, until: until, seed: chosenSeed, out: out, releases: releases, labels: labels}, nil
 }
 
 func (u *run) runUptake(since, until time.Time) error {

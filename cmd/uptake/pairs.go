@@ -239,8 +239,11 @@ func (u *run) collectPairNew(path, agent, firstUser string, evs []transcript.Eve
 		return
 	}
 	goal := pairGoal(tool, calls[ci])
+	if tool == "page-shot" && localPage(goal) == "" {
+		return
+	}
 	if tool == "busy" {
-		goal = u.busyGoal(evs, i, cmd)
+		goal = u.busyGoal(evs, i, cmd, calls[ci])
 	}
 	if goal == "" {
 		if tool == "busy" {
@@ -273,7 +276,7 @@ func (u *run) collectPairOld(path, agent, firstUser string, evs []transcript.Eve
 		return
 	}
 	if way == "busy" {
-		goal = u.busyGoal(evs, i, cmd)
+		goal = u.busyGoal(evs, i, cmd, sc)
 		if goal == "" {
 			u.busyNoDecision++
 			return
@@ -474,11 +477,17 @@ func (u *run) pairUtilityCode(tool string, calls []shellcmd.Call, at, code int, 
 	if at < 0 || at >= len(calls) || at != len(calls)-1 || calls[at].Name != tool {
 		return -1
 	}
+	for i := range calls {
+		if i != at && calls[i].Name == tool {
+			return -1
+		}
+	}
 	return code
 }
 
-func (u *run) busyGoal(evs []transcript.Event, at int, cmd string) string {
-	if g := u.heavyCommandGoal(cmd); g != "" {
+func (u *run) busyGoal(evs []transcript.Event, at int, cmd string, probe shellcmd.Call) string {
+	start := min(max(probe.Offset+len(probe.Raw), 0), len(cmd))
+	if g := u.heavyCommandGoal(cmd[start:]); g != "" {
 		return g
 	}
 	for i := at + 1; i < len(evs); i++ {
@@ -604,14 +613,14 @@ func (u *run) waitGoal(cmd string) string {
 func localPage(s string) string {
 	for a := range strings.FieldsSeq(s) {
 		a = strings.Trim(a, "'\"")
-		if strings.HasSuffix(strings.ToLower(a), ".html") || strings.HasPrefix(a, "file://") || strings.Contains(a, "localhost") || strings.Contains(a, "127.0.0.1") {
+		if strings.HasPrefix(a, "file://") || strings.HasSuffix(strings.ToLower(a), ".html") || strings.Contains(a, "localhost") || strings.Contains(a, "127.0.0.1") || strings.Contains(a, "[::1]") {
 			if strings.HasPrefix(a, "http") {
 				p, err := url.Parse(a)
 				if err != nil {
 					slog.Debug("parse local page URL", "error", err)
 					return ""
 				}
-				if p != nil && (p.Hostname() == "localhost" || p.Hostname() == "127.0.0.1") {
+				if p.Hostname() == "localhost" || p.Hostname() == "127.0.0.1" || p.Hostname() == "::1" {
 					return a
 				}
 				continue
@@ -727,6 +736,62 @@ func (u *run) collectTKRefusal(path, agent string, e transcript.Event, c shellcm
 	}
 }
 
+func (u *run) loadPairLabels() error {
+	if u.labelsPath == "" {
+		return nil
+	}
+	f, err := os.Open(u.labelsPath)
+	if err != nil {
+		return fmt.Errorf("open labels: %w", err)
+	}
+	defer f.Close()
+	validIDs := make(map[string]struct{}, len(u.pairCandidateSample))
+	for i := range u.pairCandidateSample {
+		validIDs[u.pairCandidateSample[i].id] = struct{}{}
+	}
+	labels := map[string]string{}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	line := 0
+	for scanner.Scan() {
+		line++
+		fields := strings.Split(scanner.Text(), "\t")
+		if line == 1 {
+			if len(fields) != 2 || fields[0] != "id" || fields[1] != "label" {
+				return fmt.Errorf("labels line 1: expected id<TAB>label header")
+			}
+			continue
+		}
+		if len(fields) != 2 || fields[0] == "" || (fields[1] != "yes" && fields[1] != "no") {
+			return fmt.Errorf("labels line %d: expected candidate id and yes|no label", line)
+		}
+		if _, ok := labels[fields[0]]; ok {
+			return fmt.Errorf("labels line %d: duplicate id %q", line, fields[0])
+		}
+		if _, ok := validIDs[fields[0]]; !ok {
+			return fmt.Errorf("labels line %d: unknown candidate id %q", line, fields[0])
+		}
+		labels[fields[0]] = fields[1]
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read labels: %w", err)
+	}
+	if line == 0 {
+		return fmt.Errorf("labels line 1: missing id<TAB>label header")
+	}
+	missing := 0
+	for id := range validIDs {
+		if _, ok := labels[id]; !ok {
+			missing++
+		}
+	}
+	if missing > 0 {
+		return fmt.Errorf("labels: %d sampled candidates have no label; label the whole candidates.tsv", missing)
+	}
+	u.labels = labels
+	return nil
+}
+
 func (u *run) writePairTables() error {
 	releases, err := u.loadReleases()
 	if err != nil {
@@ -766,6 +831,9 @@ func (u *run) writePairTables() error {
 		return err
 	}
 	if err := u.writeCandidates(); err != nil {
+		return err
+	}
+	if err := u.loadPairLabels(); err != nil {
 		return err
 	}
 	if err := u.writePairFailSamples(); err != nil {
@@ -1069,11 +1137,11 @@ func (u *run) writePairRepeats() error {
 			eligible := 0
 			for i := range cs {
 				c := &cs[i]
-				if !u.sessionObservedFor(*c, 10*time.Minute) {
+				if u.sessionObservedFor(*c, 10*time.Minute) {
+					eligible++
+				} else {
 					incomplete++
-					continue
 				}
-				eligible++
 				key := pairRepeatKey{c.session, c.goal}
 				byGoal[key] = append(byGoal[key], *c)
 			}
@@ -1245,26 +1313,33 @@ func (u *run) writeCandidates() error {
 	b.WriteString("id\tpair\tcommand\tcontext\n")
 	v.WriteString("id\tpair\tverdict\n")
 	sort.Slice(u.pairCandidates, func(i, j int) bool { return u.pairCandidates[i].id < u.pairCandidates[j].id })
+	u.pairCandidateSample = nil
 	for _, tool := range pairTools() {
+		selected := make([]pairCandidate, 0, 60)
 		for _, yes := range []bool{true, false} {
 			a := []pairCandidate{}
-			for _, c := range u.pairCandidates {
+			for i := range u.pairCandidates {
+				c := &u.pairCandidates[i]
 				if c.pair == tool && c.yes == yes {
-					a = append(a, c)
+					a = append(a, *c)
 				}
 			}
 			rng.Shuffle(len(a), func(i, j int) { a[i], a[j] = a[j], a[i] })
 			if len(a) > 30 {
 				a = a[:30]
 			}
-			for _, c := range a {
-				fmt.Fprintf(&b, "%s\t%s\t%s\t%s\n", c.id, c.pair, u.clean(c.command), u.clean(c.context))
-				verdict := "no"
-				if c.yes {
-					verdict = "yes"
-				}
-				fmt.Fprintf(&v, "%s\t%s\t%s\n", c.id, c.pair, verdict)
+			selected = append(selected, a...)
+		}
+		rng.Shuffle(len(selected), func(i, j int) { selected[i], selected[j] = selected[j], selected[i] })
+		u.pairCandidateSample = append(u.pairCandidateSample, selected...)
+		for i := range selected {
+			c := &selected[i]
+			fmt.Fprintf(&b, "%s\t%s\t%s\t%s\n", c.id, c.pair, u.clean(c.command), u.clean(c.context))
+			verdict := "no"
+			if c.yes {
+				verdict = "yes"
 			}
+			fmt.Fprintf(&v, "%s\t%s\t%s\n", c.id, c.pair, verdict)
 		}
 	}
 	if err := u.save("candidates.tsv", b.String()); err != nil {
