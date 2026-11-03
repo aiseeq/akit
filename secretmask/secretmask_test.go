@@ -1,6 +1,7 @@
 package secretmask
 
 import (
+	"fmt"
 	"maps"
 	"strings"
 	"testing"
@@ -14,10 +15,10 @@ func fakes() map[string]string {
 		"private-key": "-----BEGIN RSA " + "PRIVATE KEY-----\n" + r("Ab1", 20) + "\n-----END RSA " + "PRIVATE KEY-----",
 		"sk_live":     "sk" + "_live_" + r("a1B2", 5),
 		"sk":          "sk" + "-" + r("x9Y8", 6),
-		"github":      "gh" + "p_" + r("Q7w", 12),
-		"slack":       "xo" + "xb-" + r("12ab-", 3),
+		"github":      "github" + "_pat_" + r("A1b", 7) + "A" + "_" + r("C2d", 19) + "C2",
+		"slack":       "xo" + "xb-" + "123456789-987654321-" + r("A1b", 8),
 		"aws":         "AK" + "IA" + r("Z9", 8),
-		"google":      "AI" + "za" + r("k_3-", 9),
+		"google":      "AI" + "za" + r("A1b", 11) + "A1",
 	}
 }
 
@@ -84,18 +85,17 @@ func TestMaskKeysWithGluedSuffix(t *testing.T) {
 }
 
 // A key glued to a generic sk key with nothing between: the generic form goes
-// last, so after the fixed-length aws key it still matches; a variable-length
-// body takes the «sk» in, and the rest is not seen as a key — such input is not
-// expected, only no full value and a stable result are asked.
+// last and recognizes the long random body even after a word character.
 func TestMaskDistinctiveGluedToGenericSkIsIdempotent(t *testing.T) {
+	generic := "sk-" + strings.Repeat("a1B", 11) + "a1"
 	for kind, value := range fakes() {
 		if kind == "sk" {
 			continue
 		}
 		t.Run(kind, func(t *testing.T) {
-			text := value + fakes()["sk"]
+			text := value + generic
 			got, found := Mask(text)
-			if strings.Contains(got, value) || strings.Contains(got, fakes()["sk"]) {
+			if strings.Contains(got, value) || strings.Contains(got, generic) {
 				t.Errorf("a secret remains in output of length %d", len(got))
 			}
 			if kind == "aws" && !maps.Equal(found, map[string]int{kind: 1, "sk": 1}) {
@@ -110,7 +110,7 @@ func TestMaskDistinctiveGluedToGenericSkIsIdempotent(t *testing.T) {
 }
 
 func TestMaskDistinctiveSkPrefixes(t *testing.T) {
-	body := strings.Repeat("abcdefgh", 3)
+	body := strings.Repeat("a1bcdefgh", 3)
 	for _, prefix := range []string{"sk" + "-proj-", "sk" + "-ant-"} {
 		t.Run(prefix, func(t *testing.T) {
 			text := "x9" + prefix + body
@@ -119,6 +119,73 @@ func TestMaskDistinctiveSkPrefixes(t *testing.T) {
 				t.Errorf("distinctive prefix was not masked: output length %d, counts %v", len(got), found)
 			}
 		})
+	}
+}
+
+func TestMaskGenericSkAfterEncodedContexts(t *testing.T) {
+	contexts := []string{
+		`\u001b[32m`, `\u001B[32m`, `\x1B[32m`, `\E[32m`, `\33[32m`, "\x1b[2K", `\e[2K`,
+		`\v`, `\b`, `\a`, `\0`, `\x20`, `\012`, `\N`, `%2520`, `=3D`, `&#61`, "x", "9",
+	}
+	for _, bodyLen := range []int{20, 24, 31, 35} {
+		key := "sk-" + strings.Repeat("a1B", 12)[:bodyLen]
+		for _, context := range contexts {
+			t.Run(fmt.Sprintf("%d/%s", bodyLen, context), func(t *testing.T) {
+				got, found := Mask(context + key)
+				if got != context+"[скрыто:sk]" || !maps.Equal(found, map[string]int{"sk": 1}) {
+					t.Errorf("encoded context was not preserved and masked: output length %d, counts %v", len(got), found)
+				}
+			})
+		}
+	}
+}
+
+func TestMaskShortRandomRunsAfterEscapedContexts(t *testing.T) {
+	google := "AIza" + "Ab1Cd2Ef3Gh" + "-" + "Ij5Kl6Mn7Op" + "-" + "Qr9St0Uv1Wx"
+	slack := "xoxb-" + "111111111111-" + "2222222222222-" + strings.Repeat("a", 24)
+	sk := "sk-" + "Ab1Cd2Ef3Gh" + "-" + "Ij5Kl6Mn7Op"
+	contexts := []string{
+		`\u001b[32m`, `\x1B[32m`, `\E[32m`, `\33[32m`, "\x1b[2K", `\e[2K`,
+		`\v`, `\b`, `\a`, `\0`, `\x20`, `\012`, `\N`, `%2520`, `%3D`, `%2f`,
+		`Bearer%20`, `\e[32m`, `\033[1;32m`, `\x1b[0m`, `\f`, `=3D`, `&#61`,
+		`\n`, `\t`, ` `, `&#61;`, `&#x3D;`,
+	}
+	for _, context := range contexts {
+		for kind, value := range map[string]string{"google": google, "slack": slack, "sk": sk} {
+			t.Run(kind+"/"+context, func(t *testing.T) {
+				got, found := Mask(context + value)
+				if got != context+"[скрыто:"+kind+"]" || !maps.Equal(found, map[string]int{kind: 1}) {
+					t.Errorf("short random runs after escaped context were not masked: output length %d, counts %v", len(got), found)
+				}
+			})
+		}
+	}
+}
+
+func TestMaskDistinctivePrefixesRespectWordBoundary(t *testing.T) {
+	key := func(prefix string) string { return prefix + strings.Repeat("a1bcdefgh", 3) }
+	texts := []string{
+		"network_test_ConnectionTimeoutCase",
+		"framework_test_HandlesTimeoutCases",
+		"xo" + "xo-hugs-and-kisses-from-me",
+		"task-proj-migration-notes-2026-final",
+		"xo" + "xb-hugs-and-kisses-from-me",
+		"ask-ant-colony-optimisation-notes-draft",
+		"task_ThisIsAVeryLongCamelCaseFunctionNameForTests",
+		"risk_" + strings.Repeat("a", 40),
+	}
+	for _, text := range texts {
+		got, found := Mask(text)
+		if got != text || len(found) != 0 {
+			t.Errorf("ordinary text changed: output length %d, counts %v", len(got), found)
+		}
+	}
+	for _, prefix := range []string{"x", "2"} {
+		text := prefix + key("sk-proj-")
+		got, found := Mask(text)
+		if got != prefix+"[скрыто:sk]" || !maps.Equal(found, map[string]int{"sk": 1}) {
+			t.Errorf("distinctive token with random body was not masked: output length %d, counts %v", len(got), found)
+		}
 	}
 }
 
