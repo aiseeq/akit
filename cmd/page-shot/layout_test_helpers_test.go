@@ -37,6 +37,38 @@ func newLayoutTestBrowser(t *testing.T) context.Context {
 	return allocCtx
 }
 
+func TestCheckGazette(t *testing.T) {
+	allocCtx := newLayoutTestBrowser(t)
+	cases := []struct {
+		name    string
+		html    string
+		missing bool
+	}{
+		{name: "missing", html: "<!doctype html><html><body></body></html>", missing: true},
+		{name: "present", html: "<!doctype html><script>window.Gazette={}</script><body></body>", missing: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), c.name+".html")
+			if err := os.WriteFile(path, []byte(c.html), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tabCtx, cancelTab := chromedp.NewContext(allocCtx)
+			defer cancelTab()
+			if err := chromedp.Do(tabCtx, chromedp.EmulateViewport(800, 600), chromedp.Navigate("file://"+path)); err != nil {
+				t.Fatal(err)
+			}
+			missing, err := checkGazette(tabCtx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if missing != c.missing {
+				t.Fatalf("отсутствие Gazette: получили %t, ждали %t", missing, c.missing)
+			}
+		})
+	}
+}
+
 func testLayoutCases(t *testing.T, allocCtx context.Context, cases []layoutTestCase, check func(context.Context) (int, string, error), failure string) {
 	t.Helper()
 	dir := t.TempDir()

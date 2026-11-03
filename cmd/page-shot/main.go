@@ -49,7 +49,7 @@ var viewports = []viewport{
 }
 
 // Коды выхода: 1 - съёмка не удалась, 2 - кадры сняты, но есть горизонтальный
-// скролл, наложение подписей или неверное выравнивание значков.
+// скролл, наложение подписей, неверное выравнивание значков или нет разметки Gazette.
 const (
 	exitError  = 1
 	exitLayout = 2
@@ -59,14 +59,17 @@ var (
 	errOverflow = errors.New("горизонтальный скролл")
 	errOverlap  = errors.New("наложение подписей")
 	errAlign    = errors.New("значки не выровнены с текстом")
+	errGazette  = errors.New("нет разметки Gazette (скилл web-page, gazette.js)")
 )
 
 func main() {
 	err := run()
 	switch {
 	case err == nil:
-	case errors.Is(err, errOverflow), errors.Is(err, errOverlap), errors.Is(err, errAlign):
-		fmt.Fprintln(os.Stderr, "page-shot:", err)
+	case errors.Is(err, errOverflow), errors.Is(err, errOverlap), errors.Is(err, errAlign), errors.Is(err, errGazette):
+		for line := range strings.SplitSeq(err.Error(), "\n") {
+			fmt.Fprintln(os.Stderr, "page-shot:", line)
+		}
 		os.Exit(exitLayout)
 	default:
 		fmt.Fprintln(os.Stderr, "page-shot:", err)
@@ -78,9 +81,10 @@ func run() error {
 	fs := flag.NewFlagSet("page-shot", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: page-shot [--at 2s,6s] [--out DIR] [--element CSS] <file.html|URL>")
+		fmt.Fprintln(fs.Output(), "Проверяет разметку Gazette; с --element проверки раскладки и Gazette не выполняются.")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "--element: только окно 1536x860@1.25, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.")
-		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей или значок не выровнен с текстом; подробности в stderr.")
+		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, значок не выровнен с текстом или нет разметки Gazette; подробности в stderr.")
 	}
 	at := fs.String("at", "1s", "моменты съёмки после загрузки через запятую (анимация - несколько)")
 	out := fs.String("out", "", "папка кадров (по умолчанию <файл>-shots рядом со страницей)")
@@ -128,6 +132,7 @@ func run() error {
 		return shootElements(allocCtx, target, dir, *selector, moments[len(moments)-1])
 	}
 	var overflowed, overlapped, misaligned []string
+	gazetteMissing := false
 	for _, vp := range viewports {
 		lay, err := shoot(allocCtx, target, dir, vp, moments)
 		if err != nil {
@@ -145,6 +150,7 @@ func run() error {
 			fmt.Fprint(os.Stderr, lay.align.report(vp.name()))
 			misaligned = append(misaligned, vp.name())
 		}
+		gazetteMissing = gazetteMissing || lay.gazetteMissing
 	}
 	var errs []error
 	if len(overflowed) > 0 {
@@ -156,14 +162,18 @@ func run() error {
 	if len(misaligned) > 0 {
 		errs = append(errs, fmt.Errorf("%w на окнах %s", errAlign, strings.Join(misaligned, ", ")))
 	}
+	if gazetteMissing {
+		errs = append(errs, errGazette)
+	}
 	return errors.Join(errs...)
 }
 
 // layout - находки раскладки на окне.
 type layout struct {
-	overflow *overflow
-	overlap  *overlapResult
-	align    *alignResult
+	overflow       *overflow
+	overlap        *overlapResult
+	align          *alignResult
+	gazetteMissing bool
 }
 
 // shoot открывает страницу заново на каждом окне: анимация и раскладка идут с нуля.
@@ -196,6 +206,9 @@ func shoot(allocCtx context.Context, target, dir string, vp viewport, moments []
 		// Полная высота - один раз, в последний момент, когда страница уже дорисована.
 		// Качество 100 - PNG.
 		if i == len(moments)-1 {
+			if lay.gazetteMissing, err = checkGazette(tabCtx); err != nil {
+				return layout{}, err
+			}
 			if lay.overflow, err = checkOverflow(tabCtx); err != nil {
 				return layout{}, err
 			}
@@ -215,6 +228,14 @@ func shoot(allocCtx context.Context, target, dir string, vp viewport, moments []
 		}
 	}
 	return lay, nil
+}
+
+func checkGazette(ctx context.Context) (bool, error) {
+	missing, err := chromedp.Run(ctx, chromedp.Evaluate[bool]("typeof window.Gazette === 'undefined'"))
+	if err != nil {
+		return false, fmt.Errorf("проверка Gazette: %w", err)
+	}
+	return missing, nil
 }
 
 func save(path string, buf []byte) error {
