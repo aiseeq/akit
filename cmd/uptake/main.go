@@ -218,7 +218,7 @@ func (u *run) habitForCall(c shellcmd.Call, cmd string) string {
 	if u.isTranscriptHabit(c, args, cmd) {
 		return "habit-transcript"
 	}
-	if u.isDirectEditHabit(c, low) {
+	if directEditCall(c) {
 		return "habit-edit"
 	}
 	return ""
@@ -226,17 +226,209 @@ func (u *run) habitForCall(c shellcmd.Call, cmd string) string {
 
 func (u *run) isAnchorHabit(c shellcmd.Call, low string) bool {
 	if c.Name == "sed" {
-		return strings.Contains(low, "-i") && (regexp.MustCompile(`(^|\s)[0-9]+(?:,[0-9]+)?[acdi]?(\s|$)`).MatchString(low) || regexp.MustCompile(`(^|\s)'?/(?:[^ ]|\\/)+/\s*,\s*/`).MatchString(low))
+		return sedInPlace(c.Args) && (regexp.MustCompile(`(^|\s)[0-9]+(?:,[0-9]+)?[acdi]?(\s|$)`).MatchString(low) || regexp.MustCompile(`(^|\s)'?/(?:[^ ]|\\/)+/\s*,\s*/`).MatchString(low))
 	}
 	return (c.Name == "python" || c.Name == "python3") && (strings.Contains(low, ".index(") || strings.Contains(low, ".find(")) && (strings.Contains(low, "read_text") || strings.Contains(low, "open(")) && strings.Contains(low, "[") && (strings.Contains(low, "write_text") || strings.Contains(low, ".write("))
 }
 
 func (u *run) isTranscriptHabit(c shellcmd.Call, args, cmd string) bool {
-	return (c.Name == "grep" || c.Name == "rg" || c.Name == "jq" || c.Name == "sed") && u.transcriptArgs(args, strings.ToLower(cmd))
+	return transcriptSearchCall(c, args, strings.ToLower(cmd), u)
 }
 
-func (u *run) isDirectEditHabit(c shellcmd.Call, low string) bool {
-	return c.Name == "sed" && strings.Contains(low, "-i") || c.Name == "perl" && strings.Contains(low, "-pi") || strings.Contains(low, ".replace(") && (strings.Contains(low, "write_text") || strings.Contains(low, ".write("))
+func transcriptSearchCall(c shellcmd.Call, args, lowCmd string, u *run) bool {
+	if c.Name != "grep" && c.Name != "rg" && c.Name != "jq" && c.Name != "sed" {
+		return false
+	}
+	if !u.transcriptArgs(args, lowCmd) {
+		return false
+	}
+	return c.Name != "jq" || !jqNullInputReadsNothing(c.Args)
+}
+
+// directEditCall — единое определение прямой правки для привычек и способов.
+func directEditCall(c shellcmd.Call) bool {
+	low := strings.ToLower(c.Raw)
+	switch c.Name {
+	case "sed":
+		return sedInPlace(c.Args)
+	case "perl":
+		return perlInPlace(c.Args)
+	}
+	if !editInterpreter(c) {
+		return false
+	}
+	scripts := []string{c.Raw}
+	if interpreterReadsStdinScript(c) {
+		for _, r := range c.Redirs {
+			if (r.N == "" || r.N == "0") && (r.Op == "<<" || r.Op == "<<-") {
+				scripts = append(scripts, r.Body)
+			} else if (r.N == "" || r.N == "0") && r.Op == "<<<" {
+				scripts = append(scripts, r.Target)
+			}
+		}
+	}
+	low = strings.ToLower(strings.Join(scripts, "\n"))
+	return strings.Contains(low, ".replace(") && (strings.Contains(low, "write_text") || strings.Contains(low, ".write(") || strings.Contains(low, "writefilesync("))
+}
+
+func interpreterReadsStdinScript(c shellcmd.Call) bool {
+	args, python, ok := interpreterStdinArgs(c)
+	return ok && stdinScriptArgs(args, python)
+}
+
+func interpreterStdinArgs(c shellcmd.Call) ([]string, bool, bool) {
+	args := c.Args
+	name := strings.ToLower(c.Name)
+	python := pythonExecutable(name)
+	switch name {
+	case "uv", "poetry", "pipx", "pdm":
+		if len(args) < 2 || args[0] != "run" || !pythonExecutable(args[1]) {
+			return nil, false, false
+		}
+		return args[2:], true, true
+	case "node":
+		return args, false, true
+	default:
+		return args, python, python
+	}
+}
+
+func stdinScriptArgs(args []string, python bool) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if isInterpreterInlineScriptFlag(a) || (python && a == "-m") {
+			return false
+		}
+		if a == "--" {
+			return i+1 == len(args) || args[i+1] == "-"
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			if interpreterFlagTakesValue(a, python) {
+				i++
+			}
+			continue
+		}
+		return a == "-"
+	}
+	return true
+}
+
+func isInterpreterInlineScriptFlag(arg string) bool {
+	return arg == "-c" || arg == "-e" || arg == "--eval" || arg == "--print"
+}
+
+func interpreterFlagTakesValue(arg string, python bool) bool {
+	if python {
+		return arg == "-W" || arg == "-X"
+	}
+	return arg == "--require" || arg == "-r" || arg == "--loader" || arg == "--import"
+}
+
+func editInterpreter(c shellcmd.Call) bool {
+	name := strings.ToLower(c.Name)
+	if name == "node" || regexp.MustCompile(`^python(?:[0-9]+(?:\.[0-9]+)*)?$`).MatchString(name) {
+		return true
+	}
+	if name == "uv" || name == "poetry" || name == "pipx" || name == "pdm" {
+		return len(c.Args) >= 2 && c.Args[0] == "run" && pythonExecutable(c.Args[1])
+	}
+	return false
+}
+
+func pythonExecutable(name string) bool {
+	name = strings.ToLower(name)
+	return name == "python" || regexp.MustCompile(`^python[0-9]+(?:\.[0-9]+)*$`).MatchString(name)
+}
+
+func sedInPlace(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if a == "--in-place" || strings.HasPrefix(a, "--in-place=") {
+			return true
+		}
+		if len(a) < 2 || a[0] != '-' || strings.HasPrefix(a, "--") {
+			continue
+		}
+		flags := a[1:]
+		if strings.HasPrefix(flags, "i") || strings.ContainsRune(flags, 'i') && strings.Trim(flags, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func perlInPlace(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if len(a) < 2 || a[0] != '-' || strings.HasPrefix(a, "--") {
+			continue
+		}
+		flags := a[1:]
+		if strings.ContainsRune(flags, 'i') && strings.Trim(flags, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
+			return true
+		}
+		if strings.HasPrefix(a, "-i.") || strings.HasPrefix(a, "-pi.") {
+			return true
+		}
+	}
+	return false
+}
+
+func jqNullInputReadsNothing(args []string) bool {
+	found, reads := false, false
+	filter := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		valueCount := 0
+		switch a {
+		case "--arg", "--argjson":
+			valueCount = 2
+		case "--slurpfile", "--rawfile", "--argfile":
+			valueCount, reads = 2, true
+		case "--indent":
+			valueCount = 1
+		}
+		if valueCount > 0 {
+			i += valueCount
+			continue
+		}
+		if a == "--null-input" || strings.HasPrefix(a, "--null-input=") {
+			found = true
+			continue
+		}
+		if len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.Trim(a[1:], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" && strings.Contains(a, "n") {
+			found = true
+			continue
+		}
+		if !strings.HasPrefix(a, "-") {
+			filter = a
+			break
+		}
+	}
+	if regexp.MustCompile(`\binputs?\b`).MatchString(filter) {
+		reads = true
+	}
+	return found && !reads
+}
+
+// directEditOwnsCode — код команды принадлежит прямой правке, только если она единственная
+// прямая правка и последний вызов команды.
+func directEditOwnsCode(cmd string) bool {
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil { //nolint:fallback-return,silent-error-handling // nested scripts can fail after yielding usable outer calls
+		slog.Debug("parse command for direct edit ownership", "error", err)
+	}
+	n := 0
+	for _, c := range calls {
+		if directEditCall(c) {
+			n++
+		}
+	}
+	return n == 1 && len(calls) > 0 && directEditCall(calls[len(calls)-1])
 }
 
 // transcriptArgs — аргументы явно называют транскрипт: папку сессий Claude или rollout codex.
@@ -838,7 +1030,11 @@ func (u *run) scanShellPatterns(path string, isClaude bool, models map[int]strin
 	outEv := outs[e.CallID]
 	u.recordShellWays(u.shellWays(cmd), outEv)
 	if h == "habit-edit" {
-		u.addError("sub", "direct replacements", u.eventExitCode(outEv), outEv.Text, outEv.Error)
+		if directEditOwnsCode(cmd) {
+			u.addError("sub", "direct replacements", u.eventExitCode(outEv), outEv.Text, outEv.Error)
+		} else {
+			u.addError("sub", "direct replacements", -1, "", false)
+		}
 		if u.repeatedEdit(evs, ei, agent, path, models, isClaude, u.replacementFiles(cmd)) {
 			u.addRepeat("sub", "direct replacements")
 		}

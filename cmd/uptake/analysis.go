@@ -118,17 +118,13 @@ func (u *run) shellWays(cmd string) map[string]bool {
 			w[way] = true
 		}
 	}
-	// Python/.replace may be recognized inside an embedded shell script, so inspect the full command too.
-	l := strings.ToLower(cmd)
-	if strings.Contains(l, ".replace(") && (strings.Contains(l, "write_text") || strings.Contains(l, ".write(")) {
-		w[".replace"] = true
-	}
+
 	return w
 }
 
 func (u *run) shellWay(c shellcmd.Call, cmd string) string {
 	low := strings.ToLower(c.Raw)
-	if way := u.editShellWay(c, low); way != "" {
+	if way := u.editShellWay(c); way != "" {
 		return way
 	}
 	args := strings.ToLower(strings.Join(c.Args, " "))
@@ -144,21 +140,22 @@ func (u *run) shellWay(c shellcmd.Call, cmd string) string {
 	return ""
 }
 
-func (u *run) editShellWay(c shellcmd.Call, low string) string {
-	if c.Name == "sed" && strings.Contains(low, "-i") {
+func (u *run) editShellWay(c shellcmd.Call) string {
+	if !directEditCall(c) {
+		return ""
+	}
+	switch c.Name {
+	case "sed":
 		return "sed -i"
-	}
-	if c.Name == "perl" && strings.Contains(low, "-pi") {
+	case "perl":
 		return "perl -pi"
-	}
-	if strings.Contains(low, ".replace(") && (strings.Contains(low, "write_text") || strings.Contains(low, ".write(") || strings.Contains(low, "open(")) {
+	default:
 		return ".replace"
 	}
-	return ""
 }
 
 func (u *run) transcriptShellWay(c shellcmd.Call, args, cmd string) string {
-	if !u.transcriptArgs(args, strings.ToLower(cmd)) {
+	if !transcriptSearchCall(c, args, strings.ToLower(cmd), u) {
 		return ""
 	}
 	if c.Name == "grep" || c.Name == "rg" || c.Name == "jq" {

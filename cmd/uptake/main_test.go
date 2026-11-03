@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -435,7 +436,7 @@ func TestRunAnalysisHelpers(t *testing.T) {
 	if got := u.toolFault("busy", "busy: invalid input", 2, "busy", 0); got != "call-error" {
 		t.Errorf("toolFault = %q", got)
 	}
-	if got := u.shellWay(shellcmd.Call{Name: "sed", Raw: "sed -i file"}, ""); got != "sed -i" {
+	if got := u.shellWay(shellcmd.Call{Name: "sed", Args: []string{"-i", "file"}, Raw: "sed -i file"}, ""); got != "sed -i" {
 		t.Errorf("shellWay = %q", got)
 	}
 	searchRun := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), home)
@@ -672,5 +673,146 @@ func TestUsageNamesEveryFlag(t *testing.T) {
 		if !strings.Contains(usage, flag) {
 			t.Errorf("usage misses %s", flag)
 		}
+	}
+}
+
+func TestOldSedErrorOwnedOnlyBySingleLastCall(t *testing.T) {
+	record := func(cmd string) *errorStat {
+		u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+		e := transcript.Event{Line: 1, Time: time.Now(), Role: transcript.Cmd, Who: "Bash", Text: cmd, CallID: "call"}
+		out := transcript.Event{Text: "synthetic output", Result: []byte(`{"exitCode":1}`)}
+		u.scanShellPatterns("synthetic.jsonl", true, nil, 0, e, cmd, "claude-main", map[string]transcript.Event{"call": out}, []transcript.Event{e}, &[]taskWrite{})
+		return u.errorStats["sub\tdirect replacements"]
+	}
+	compound := record("sed -i 's/a/b/' f.go && go test ./...")
+	if compound == nil || compound.fail != 0 || compound.unknown != 1 {
+		t.Fatalf("compound command: sub/direct replacements = %+v, want unknown", compound)
+	}
+	single := record("sed -i 's/a/b/' f.go")
+	if single == nil || single.fail != 1 || single.unknown != 0 {
+		t.Fatalf("single call: sub/direct replacements = %+v, want fail", single)
+	}
+}
+
+func TestSubHeredocBodyNotDirectEdit(t *testing.T) {
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+	body := "value.replace(\"a\", \"b\")\npath.write_text(\"x\")\n"
+	cmd := "cat > helper.py <<'EOF'\n" + body + "EOF"
+	if got := u.habitType(cmd); got == "habit-edit" {
+		t.Fatalf("heredoc writer classified as %q", got)
+	}
+	if u.hasDirectReplace(cmd) || u.shellWays(cmd)[".replace"] {
+		t.Fatalf("heredoc body counted as a direct replacement: %v", u.shellWays(cmd))
+	}
+	py := `python3 -c 'value.replace("a", "b"); path.write_text("x")'`
+	if got := u.habitType(py); got != "habit-edit" || !u.hasDirectReplace(py) {
+		t.Fatalf("python direct edit = habit %q, ways %v", got, u.shellWays(py))
+	}
+}
+
+func TestDirectEditInterpreterHeredocScript(t *testing.T) {
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+	for _, cmd := range []string{
+		"python3 - <<'EOF'\nx.replace('a','b'); open(p,'w').write(x)\nEOF",
+		"python3 - \"$file\" <<'PY'\nx.replace('a','b'); p.write_text(x)\nPY",
+		"python3 <<EOF\nx.replace('a','b'); p.write_text(x)\nEOF",
+		"python3 <<'EOF'\nx.replace('a','b'); p.write_text(x)\nEOF",
+		`python3 <<< 'x.replace("a","b"); p.write_text(x)'`,
+		"node - <<EOF\ns.replace('a','b'); fs.writeFileSync(p,s)\nEOF",
+	} {
+		if got := u.habitType(cmd); got != "habit-edit" || !u.hasDirectReplace(cmd) || !u.shellWays(cmd)[".replace"] {
+			t.Errorf("%q: habit %q, direct=%v ways=%v", cmd, got, u.hasDirectReplace(cmd), u.shellWays(cmd))
+		}
+	}
+	for _, cmd := range []string{
+		"cat > x.py <<EOF\nx.replace('a','b'); p.write_text(x)\nEOF",
+		"python3 x.py <<EOF\nx.replace('a','b'); p.write_text(x)\nEOF",
+	} {
+		if u.habitType(cmd) == "habit-edit" || u.hasDirectReplace(cmd) || u.shellWays(cmd)[".replace"] {
+			t.Errorf("%q counted heredoc data as a direct edit: habit=%q ways=%v", cmd, u.habitType(cmd), u.shellWays(cmd))
+		}
+	}
+}
+
+func TestSedPerlInPlaceFlagFromArgs(t *testing.T) {
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+	if got := u.habitType("sed -n 1p '/-item/p' f"); got == "habit-anchor" {
+		t.Fatalf("sed script text containing -i classified as %q", got)
+	}
+	for _, cmd := range []string{"sed -i 's/a/b/' f", "sed -i.bak 's/a/b/' f", "sed --in-place=backup 's/a/b/' f", "sed -Ei 's/a/b/' f", "sed -ni 's/a/b/' f", "perl -pi -e 's/a/b/' f", "perl -i -pe 's/a/b/' f", "perl -pi.bak -e 's/a/b/' f", "perl -i.bak -pe 's/a/b/' f"} {
+		if got := u.habitType(cmd); got != "habit-edit" || !u.hasDirectReplace(cmd) {
+			t.Errorf("%q: habit %q, direct ways %v", cmd, got, u.shellWays(cmd))
+		}
+	}
+	for _, cmd := range []string{"sed 's/-i/x/' f", "sed -n '/-item/p' f", "perl -ne '/-i/' f"} {
+		if got := u.habitType(cmd); got == "habit-edit" || u.hasDirectReplace(cmd) {
+			t.Errorf("%q misclassified as direct edit: habit %q, ways %v", cmd, got, u.shellWays(cmd))
+		}
+	}
+}
+
+func TestJqNullInputReadsNothing(t *testing.T) {
+	home := t.TempDir()
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), home)
+	file := filepath.Join(home, ".claude", "projects", "demo", "session.jsonl")
+	for _, cmd := range []string{"jq -n '.a' " + file, "jq -cn '{a:1}' " + file, "jq --null-input '.a' " + file} {
+		if got := u.habitType(cmd); got == "habit-transcript" || u.hasTranscriptSearch(cmd) {
+			t.Errorf("%q classified as transcript search: habit %q ways %v", cmd, got, u.shellWays(cmd))
+		}
+	}
+	for _, cmd := range []string{"jq -n --slurpfile x " + file + " '$x'", "jq -n --rawfile x " + file + " '$x'", "jq -n 'input' " + file, "jq -n 'inputs' " + file} {
+		if got := u.habitType(cmd); got != "habit-transcript" || !u.hasTranscriptSearch(cmd) {
+			t.Errorf("%q: habit %q, ways %v; want transcript search", cmd, got, u.shellWays(cmd))
+		}
+	}
+}
+
+func TestDirectEditInterpreterVariants(t *testing.T) {
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), t.TempDir())
+	for _, cmd := range []string{`python -c 'x.replace("a","b"); p.write_text(x)'`, `python3 -c 'x.replace("a","b"); p.write_text(x)'`, `python3.12 -c 'x.replace("a","b"); p.write_text(x)'`, `node -e 'x.replace("a","b"); fs.writeFileSync(p,x)'`, `uv run python3 -c 'x.replace("a","b"); p.write_text(x)'`, `poetry run python3 -c 'x.replace("a","b"); p.write_text(x)'`, `pipx run python3 -c 'x.replace("a","b"); p.write_text(x)'`, `pdm run python3 -c 'x.replace("a","b"); p.write_text(x)'`} {
+		if got := u.habitType(cmd); got != "habit-edit" || !u.hasDirectReplace(cmd) {
+			calls, _ := shellcmd.Calls(cmd)
+			t.Errorf("%q: habit %q, ways %v, calls %#v", cmd, got, u.shellWays(cmd), calls)
+		}
+	}
+	for _, cmd := range []string{"cat > script.py <<'EOF'\nx.replace('a','b'); p.write_text(x)\nEOF", `bash -c 'python3 -c "x.replace(\"a\",\"b\"); p.write_text(x)"'`} {
+		if (u.habitType(cmd) == "habit-edit") != strings.HasPrefix(cmd, "bash -c") {
+			t.Errorf("%q has unexpected direct edit habit %q", cmd, u.habitType(cmd))
+		}
+	}
+}
+
+func TestTranscriptSearchOnePredicate(t *testing.T) {
+	home := t.TempDir()
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), home)
+	file := filepath.Join(home, ".claude", "projects", "demo", "session.jsonl")
+	cmd := "jq -n '.a' " + file
+	if got := u.habitType(cmd); got == "habit-transcript" || slices.Contains(u.utilityHabit(cmd), "tl") || u.hasTranscriptSearch(cmd) {
+		t.Errorf("%q disagrees across predicates: habit=%q utility=%v search=%v", cmd, got, u.utilityHabit(cmd), u.hasTranscriptSearch(cmd))
+	}
+	cmd = "jq --arg v -n '.a' " + file
+	if got := u.habitType(cmd); got != "habit-transcript" || !slices.Contains(u.utilityHabit(cmd), "tl") || !u.hasTranscriptSearch(cmd) {
+		t.Errorf("option value should not act as -n: habit=%q utility=%v search=%v", got, u.utilityHabit(cmd), u.hasTranscriptSearch(cmd))
+	}
+	cmd = "jq -n --slurpfile x " + file + " '$x'"
+	if got := u.habitType(cmd); got != "habit-transcript" || !slices.Contains(u.utilityHabit(cmd), "tl") || !u.hasTranscriptSearch(cmd) {
+		t.Errorf("%q disagrees across predicates: habit=%q utility=%v search=%v", cmd, got, u.utilityHabit(cmd), u.hasTranscriptSearch(cmd))
+	}
+}
+
+func TestJqBuildingJsonlNotTranscriptSearch(t *testing.T) {
+	home := t.TempDir()
+	u := newRun(time.Now().Add(-time.Hour), time.Now(), 1, t.TempDir(), home)
+	built := filepath.Join(home, ".claude", "projects", "demo", "x.jsonl")
+	build := "jq -cn --arg type user --arg message hi '{type:$type, message:$message}' > " + built
+	if got := u.habitType(build); got == "habit-transcript" {
+		t.Fatalf("building jsonl classified as %q", got)
+	}
+	read := "jq '.message' " + filepath.Join(home, ".claude", "projects", "demo", "session.jsonl")
+	if got := u.habitType(read); got != "habit-transcript" {
+		t.Fatalf("reading transcript = %q, want habit-transcript", got)
+	}
+	if !u.shellWays(read)["jq transcript"] {
+		t.Fatal("reading transcript not recorded as jq transcript search")
 	}
 }
