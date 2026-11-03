@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -367,11 +368,7 @@ func askAnswers(raw json.RawMessage) (string, string) {
 	if len(raw) == 0 || json.Unmarshal(raw, &r) != nil || len(r.Answers) == 0 {
 		return "", ""
 	}
-	qs := make([]string, 0, len(r.Answers))
-	for q := range r.Answers {
-		qs = append(qs, q)
-	}
-	sort.Strings(qs)
+	qs := slices.Sorted(maps.Keys(r.Answers))
 	lines := make([]string, 0, len(qs))
 	answers := make([]string, 0, len(qs))
 	for _, q := range qs {
