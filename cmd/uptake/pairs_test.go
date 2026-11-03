@@ -405,7 +405,7 @@ func TestLabelsFileErrors(t *testing.T) {
 			u.pairCandidates = []pairCandidate{{id: "candidate", pair: "prior"}}
 			u.pairCandidateSample = append(u.pairCandidateSample, u.pairCandidates[0])
 			err := u.loadPairLabels()
-			if err == nil || !strings.Contains(err.Error(), "line ") {
+			if err == nil || !strings.Contains(err.Error(), path+":") {
 				t.Fatalf("expected line-specific error, got %v", err)
 			}
 		})
@@ -786,5 +786,147 @@ func TestLabelsFileMissingSampledID(t *testing.T) {
 	u.pairCandidateSample = []pairCandidate{{id: "first", pair: "prior"}, {id: "second", pair: "prior"}}
 	if err := u.loadPairLabels(); err == nil || !strings.Contains(err.Error(), "1 sampled candidates have no label") {
 		t.Fatalf("partial labels: %v", err)
+	}
+}
+
+func TestPairRepeatsRateAtMostOne(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	base := time.Now().Add(-time.Hour)
+	u.sessionEnds = map[string]time.Time{}
+	u.sessionEnds["s"] = base.Add(14 * time.Minute)
+	calls := []pairCall{
+		{session: "s", goal: "x", id: "a", at: base, command: "poll a"},
+		{session: "s", goal: "x", id: "b", at: base.Add(10 * time.Minute), command: "poll b"},
+		{session: "s", goal: "x", id: "c", at: base.Add(12 * time.Minute), command: "poll c"},
+	}
+	groups := map[pairRepeatKey][]pairCall{{session: "s", goal: "x"}: calls}
+	eligible := map[string]bool{"a": true}
+	if got := countEligiblePairRepeats(groups, eligible); got != 1 {
+		t.Fatalf("eligible repeat count = %d, want 1 (incomplete calls cannot start repeats)", got)
+	}
+	u.pairCalls = []pairCall{{tool: "prior", way: "new", goal: "x", session: "s", id: "a", at: base, command: "poll a"}, {tool: "prior", way: "new", goal: "x", session: "s", id: "b", at: base.Add(10 * time.Minute), command: "poll b"}, {tool: "prior", way: "new", goal: "x", session: "s", id: "c", at: base.Add(12 * time.Minute), command: "poll c"}}
+	if err := u.writePairRepeats(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(u.outputDir, "pair-repeats.tsv"))
+	if err != nil || strings.Contains(string(data), "NaN") {
+		t.Fatalf("invalid repeat rates: %v\n%s", err, data)
+	}
+	u.pairCalls = []pairCall{{tool: "prior", way: "new", goal: "x", session: "s", id: "last", at: base.Add(12 * time.Minute), command: "poll c"}}
+	if err := u.writePairRepeats(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(filepath.Join(u.outputDir, "pair-repeats.tsv"))
+	if err != nil || !strings.Contains(string(data), "prior\tnew\t1\t0\t1\t-\t-") {
+		t.Fatalf("zero eligible denominator not rendered as dashes: %v\n%s", err, data)
+	}
+}
+
+func TestPairCodeUsageLineSeveralCalls(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	calls, err := shellcmd.Calls("prior a; prior b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := u.pairUtilityCode("prior", calls, len(calls)-1, 2, "(prior -h for usage)"); got != -1 {
+		t.Fatalf("usage line attributed to multi-call command: code %d", got)
+	}
+}
+
+func TestPageShotGoalIgnoresFlagValues(t *testing.T) {
+	if got := pageGoal([]string{"--out", "local.html", "https://example.com/"}); got != "" {
+		t.Fatalf("remote page or flag value became goal: %q", got)
+	}
+	if got := pageGoal([]string{"--at", "2s", "docs/page"}); got != "docs/page" {
+		t.Fatalf("positional page goal = %q", got)
+	}
+	if got := pageGoal([]string{"-out=other.html", "file:///tmp/page"}); got != "file:///tmp/page" {
+		t.Fatalf("equals flag value became goal: %q", got)
+	}
+}
+
+func TestLabelsIdsPerPair(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	events := []transcript.Event{{Line: 7, Time: time.Now(), Role: transcript.Cmd}}
+	transcriptPath := "/synthetic/projects/demo/s.jsonl"
+	u.collectCandidate("synthetic/session.jsonl", events, 0, "grep 'two words' "+transcriptPath, "agent")
+	if len(u.pairCandidates) < 2 {
+		t.Fatalf("expected one event in multiple candidate pairs, got %#v", u.pairCandidates)
+	}
+	ids := map[string]string{}
+	for i := range u.pairCandidates {
+		c := u.pairCandidates[i]
+		if !strings.HasPrefix(c.id, c.pair+":") {
+			t.Fatalf("candidate id lacks pair prefix: %q", c.id)
+		}
+		ids[c.pair] = c.id
+	}
+	if ids["prior"] == "" || ids["user-word"] == "" || ids["prior"] == ids["user-word"] {
+		t.Fatalf("candidate IDs not pair-specific: %#v", ids)
+	}
+	path := filepath.Join(t.TempDir(), "labels.tsv")
+	body := "id\tlabel\n" + ids["prior"] + "\tyes\n" + ids["user-word"] + "\tno\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u.labelsPath = path
+	u.pairCandidateSample = append([]pairCandidate(nil), u.pairCandidates...)
+	if err := u.loadPairLabels(); err != nil {
+		t.Fatal(err)
+	}
+	if u.labels[ids["prior"]] != "yes" || u.labels[ids["user-word"]] != "no" {
+		t.Fatalf("labels not applied independently: %#v", u.labels)
+	}
+}
+
+func TestReportTopShareNeedsLabels(t *testing.T) {
+	u := newRun(time.Time{}, time.Now(), 1, t.TempDir(), t.TempDir())
+	u.utilityNames = []string{"prior", "webtext"}
+	var pairReport strings.Builder
+	u.writePairReport(&pairReport)
+	if !strings.Contains(pairReport.String(), "## Пары этапа 2 — доля: не проверено разметкой") {
+		t.Fatalf("unlabelled pair section does not explain the hidden share:\n%s", pairReport.String())
+	}
+	var report strings.Builder
+	u.writeReportUtilityRows(&report, map[string]*reportTally{"prior": {window: 10, old: 10}, "webtext": {window: 10, old: 10}})
+	if strings.Contains(report.String(), "| prior | 0 / 10 | 50.0%") || !strings.Contains(report.String(), "| prior | 0 / 10 | см. «Пары этапа 2»") {
+		t.Fatalf("top-level pair share not suppressed:\n%s", report.String())
+	}
+	counts := map[string]*epCount{"prior\tclaude-main\tno\tno-date": {new: 10, old: 10}}
+	if err := u.writePairRows(counts, map[pairCallCountKey]int{}); err != nil {
+		t.Fatal(err)
+	}
+	rowsData, err := os.ReadFile(filepath.Join(u.outputDir, "pairs.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rowsData), "\t-\t-\tunlabelled") {
+		t.Fatalf("unlabelled pair has numeric share:\n%s", rowsData)
+	}
+
+	u.labelsPath = "synthetic-labels"
+	u.pairCandidates, u.pairCandidateSample, u.labels = nil, nil, map[string]string{}
+	for i := range 100 {
+		for _, yes := range []bool{true, false} {
+			id := fmt.Sprintf("prior:%d:%t", i, yes)
+			c := pairCandidate{id: id, pair: "prior", yes: yes}
+			u.pairCandidates = append(u.pairCandidates, c)
+			u.pairCandidateSample = append(u.pairCandidateSample, c)
+			if yes {
+				u.labels[id] = "yes"
+			} else {
+				u.labels[id] = "no"
+			}
+		}
+	}
+	if u.pairLabelGate("prior") != "ok" {
+		t.Fatalf("valid labels failed gate: %s", u.pairLabelGate("prior"))
+	}
+	if err := u.writePairRows(counts, map[pairCallCountKey]int{}); err != nil {
+		t.Fatal(err)
+	}
+	rowsData, err = os.ReadFile(filepath.Join(u.outputDir, "pairs.tsv"))
+	if err != nil || !strings.Contains(string(rowsData), "0.500000") {
+		t.Fatalf("labelled share absent: err=%v\n%s", err, rowsData)
 	}
 }

@@ -95,7 +95,7 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 		line++
 		p := strings.Split(s.Text(), "\t")
 		if len(p) != 3 || !contains(pairTools(), p[0]) {
-			return nil, fmt.Errorf("releases line %d: expected known tool and two RFC3339 dates", line)
+			return nil, &uptakeInputError{message: fmt.Sprintf("%s:%d: expected known tool and two RFC3339 dates", u.releasesPath, line)}
 		}
 		d := releaseDate{}
 		for i, v := range p[1:] {
@@ -104,7 +104,7 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 			}
 			t, e := time.Parse(time.RFC3339, v)
 			if e != nil {
-				return nil, fmt.Errorf("releases line %d: invalid date", line)
+				return nil, &uptakeInputError{message: fmt.Sprintf("%s:%d: invalid date", u.releasesPath, line)}
 			}
 			if i == 0 {
 				d.available = t
@@ -113,7 +113,7 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 			}
 		}
 		if _, ok := m[p[0]]; ok {
-			return nil, fmt.Errorf("releases line %d: duplicate tool", line)
+			return nil, &uptakeInputError{message: fmt.Sprintf("%s:%d: duplicate tool", u.releasesPath, line)}
 		}
 		m[p[0]] = d
 	}
@@ -122,7 +122,7 @@ func (u *run) loadReleases() (map[string]releaseDate, error) {
 	}
 	for _, tool := range pairTools() {
 		if _, ok := m[tool]; !ok {
-			return nil, fmt.Errorf("releases missing %s", tool)
+			return nil, &uptakeInputError{message: fmt.Sprintf("%s:1: missing %s", u.releasesPath, tool)}
 		}
 	}
 	return m, nil
@@ -239,7 +239,7 @@ func (u *run) collectPairNew(path, agent, firstUser string, evs []transcript.Eve
 		return
 	}
 	goal := pairGoal(tool, calls[ci])
-	if tool == "page-shot" && localPage(goal) == "" {
+	if tool == "page-shot" && !isLocalPage(goal) {
 		return
 	}
 	if tool == "busy" {
@@ -341,12 +341,34 @@ func userWordGoal(args []string) string {
 }
 
 func pageGoal(args []string) string {
-	for _, arg := range args {
-		if strings.Contains(arg, ".html") || strings.Contains(arg, "://") {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+			if contains([]string{"at", "out", "element", "timeout"}, name) {
+				if !strings.Contains(arg, "=") {
+					i++
+				}
+			}
+			continue
+		}
+		if isLocalPage(arg) {
 			return arg
 		}
 	}
 	return ""
+}
+
+func isLocalPage(arg string) bool {
+	if strings.HasPrefix(arg, "file://") || !strings.Contains(arg, "://") {
+		return arg != ""
+	}
+	u, err := url.Parse(arg)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.Trim(u.Hostname(), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func firstPositional(args []string) string {
@@ -472,7 +494,16 @@ func pairOutputAnswer(tool, out string) bool {
 
 func (u *run) pairUtilityCode(tool string, calls []shellcmd.Call, at, code int, out string) int {
 	if strings.Contains(out, "("+tool+" -h for usage)") {
-		return code
+		count := 0
+		for i := range calls {
+			if calls[i].Name == tool {
+				count++
+			}
+		}
+		if count == 1 {
+			return code
+		}
+		return -1
 	}
 	if at < 0 || at >= len(calls) || at != len(calls)-1 || calls[at].Name != tool {
 		return -1
@@ -580,7 +611,7 @@ func (u *run) pageShotGoal(c shellcmd.Call) string {
 	if !browser && !script {
 		return ""
 	}
-	return localPage(line)
+	return findLocalPage(line)
 }
 
 func (u *run) exportGoal(c shellcmd.Call) string {
@@ -610,7 +641,7 @@ func (u *run) waitGoal(cmd string) string {
 	}
 	return ""
 }
-func localPage(s string) string {
+func findLocalPage(s string) string {
 	for a := range strings.FieldsSeq(s) {
 		a = strings.Trim(a, "'\"")
 		if strings.HasPrefix(a, "file://") || strings.HasSuffix(strings.ToLower(a), ".html") || strings.Contains(a, "localhost") || strings.Contains(a, "127.0.0.1") || strings.Contains(a, "[::1]") {
@@ -641,8 +672,9 @@ func (u *run) collectCandidate(path string, evs []transcript.Event, i int, cmd, 
 	l := strings.ToLower(cmd)
 	candidates := u.candidateClasses(l, cmd)
 	for pair := range candidates {
-		id := fmt.Sprintf("%s:%d", path, evs[i].Line)
-		_, yes := u.pairOldIDs[id][pair]
+		eventID := fmt.Sprintf("%s:%d", path, evs[i].Line)
+		_, yes := u.pairOldIDs[eventID][pair]
+		id := pair + ":" + eventID
 		context := u.candidateContext(evs, i)
 		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: id, pair: pair, command: truncateRunes(cmd, 300), context: context, yes: yes, agent: agent})
 	}
@@ -758,18 +790,18 @@ func (u *run) loadPairLabels() error {
 		fields := strings.Split(scanner.Text(), "\t")
 		if line == 1 {
 			if len(fields) != 2 || fields[0] != "id" || fields[1] != "label" {
-				return fmt.Errorf("labels line 1: expected id<TAB>label header")
+				return &uptakeInputError{message: fmt.Sprintf("%s:1: expected id<TAB>label header", u.labelsPath)}
 			}
 			continue
 		}
 		if len(fields) != 2 || fields[0] == "" || (fields[1] != "yes" && fields[1] != "no") {
-			return fmt.Errorf("labels line %d: expected candidate id and yes|no label", line)
+			return &uptakeInputError{message: fmt.Sprintf("%s:%d: expected candidate id and yes|no label", u.labelsPath, line)}
 		}
 		if _, ok := labels[fields[0]]; ok {
-			return fmt.Errorf("labels line %d: duplicate id %q", line, fields[0])
+			return &uptakeInputError{message: fmt.Sprintf("%s:%d: duplicate id %q", u.labelsPath, line, fields[0])}
 		}
 		if _, ok := validIDs[fields[0]]; !ok {
-			return fmt.Errorf("labels line %d: unknown candidate id %q", line, fields[0])
+			return &uptakeInputError{message: fmt.Sprintf("%s:%d: unknown candidate id %q", u.labelsPath, line, fields[0])}
 		}
 		labels[fields[0]] = fields[1]
 	}
@@ -777,7 +809,7 @@ func (u *run) loadPairLabels() error {
 		return fmt.Errorf("read labels: %w", err)
 	}
 	if line == 0 {
-		return fmt.Errorf("labels line 1: missing id<TAB>label header")
+		return &uptakeInputError{message: fmt.Sprintf("%s:1: missing id<TAB>label header", u.labelsPath)}
 	}
 	missing := 0
 	for id := range validIDs {
@@ -786,7 +818,7 @@ func (u *run) loadPairLabels() error {
 		}
 	}
 	if missing > 0 {
-		return fmt.Errorf("labels: %d sampled candidates have no label; label the whole candidates.tsv", missing)
+		return &uptakeInputError{message: fmt.Sprintf("%s:2: %d sampled candidates have no label; label the whole candidates.tsv", u.labelsPath, missing)}
 	}
 	u.labels = labels
 	return nil
@@ -815,9 +847,6 @@ func (u *run) writePairTables() error {
 			c.period = "no-date"
 		}
 	}
-	if err := u.writePairs(); err != nil {
-		return err
-	}
 	if err := u.writeOutcomes(); err != nil {
 		return err
 	}
@@ -834,6 +863,9 @@ func (u *run) writePairTables() error {
 		return err
 	}
 	if err := u.loadPairLabels(); err != nil {
+		return err
+	}
+	if err := u.writePairs(); err != nil {
 		return err
 	}
 	if err := u.writePairFailSamples(); err != nil {
@@ -1005,7 +1037,7 @@ func ensurePairRows(counts map[string]*epCount) {
 
 func (u *run) writePairRows(counts map[string]*epCount, calls map[pairCallCountKey]int) error {
 	var b strings.Builder
-	b.WriteString("tool\tagent\tinstructed\tperiod\tway\tepisodes_new\tepisodes_old\tepisodes_mixed\tswitches\tcalls\tshare\twilson95\n")
+	b.WriteString("tool\tagent\tinstructed\tperiod\tway\tepisodes_new\tepisodes_old\tepisodes_mixed\tswitches\tcalls\tshare\twilson95\tgate\n")
 	keys := make([]string, 0, len(counts))
 	for key := range counts {
 		keys = append(keys, key)
@@ -1027,7 +1059,13 @@ func (u *run) writePairRow(b *strings.Builder, key string, count *epCount, calls
 			share = float64(count.new) / float64(total)
 		}
 		low, high := u.wilson(count.new, total)
-		fmt.Fprintf(b, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f-%.6f\n", parts[0], parts[1], parts[2], parts[3], way, count.new, count.old, count.mixed, count.switches, ncalls, share, low, high)
+		gate := u.pairLabelGate(parts[0])
+		shareText, interval := "-", "-"
+		if gate == "ok" {
+			shareText = fmt.Sprintf("%.6f", share)
+			interval = fmt.Sprintf("%.6f-%.6f", low, high)
+		}
+		fmt.Fprintf(b, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n", parts[0], parts[1], parts[2], parts[3], way, count.new, count.old, count.mixed, count.switches, ncalls, shareText, interval, gate)
 	}
 }
 
@@ -1134,28 +1172,49 @@ func (u *run) writePairRepeats() error {
 			}
 			incomplete := 0
 			byGoal := map[pairRepeatKey][]pairCall{}
+			eligibleCalls := map[string]bool{}
 			eligible := 0
 			for i := range cs {
 				c := &cs[i]
 				if u.sessionObservedFor(*c, 10*time.Minute) {
 					eligible++
+					eligibleCalls[c.id] = true
 				} else {
 					incomplete++
 				}
 				key := pairRepeatKey{c.session, c.goal}
 				byGoal[key] = append(byGoal[key], *c)
 			}
-			rep := countPairRepeats(byGoal)
+			rep := countEligiblePairRepeats(byGoal, eligibleCalls)
 			rate := 0.0
 			if eligible > 0 {
 				rate = float64(rep) / float64(eligible)
 			}
-			lo, hi := u.wilson(rep, eligible)
-			fmt.Fprintf(&b, "%s\t%s\t%d\t%d\t%d\t%.6f\t%.6f-%.6f\n", t, w, len(cs), rep, incomplete, rate, lo, hi)
+			interval := "-"
+			rateText := "-"
+			if eligible > 0 {
+				lo, hi := u.wilson(rep, eligible)
+				interval = fmt.Sprintf("%.6f-%.6f", lo, hi)
+				rateText = fmt.Sprintf("%.6f", rate)
+			}
+			fmt.Fprintf(&b, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", t, w, len(cs), rep, incomplete, rateText, interval)
 		}
 	}
 	return u.save("pair-repeats.tsv", b.String())
 }
+func countEligiblePairRepeats(groups map[pairRepeatKey][]pairCall, eligible map[string]bool) int {
+	total := 0
+	for _, calls := range groups {
+		sort.Slice(calls, func(i, j int) bool { return calls[i].at.Before(calls[j].at) })
+		for i := range calls {
+			if eligible[calls[i].id] && hasDifferentRepeat(calls, i) {
+				total++
+			}
+		}
+	}
+	return total
+}
+
 func countPairRepeats(groups map[pairRepeatKey][]pairCall) int {
 	total := 0
 	for _, calls := range groups {

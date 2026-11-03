@@ -1229,6 +1229,10 @@ func (u *run) ruleFlags(cmd string) string {
 	return strings.Join(r, "; ")
 }
 
+type uptakeInputError struct{ message string }
+
+func (e *uptakeInputError) Error() string { return e.message }
+
 const usage = `uptake — weekly uptake of akit tools from agent transcripts.
 
 Usage:
@@ -1267,13 +1271,23 @@ func main() {
 	u := newRun(args.since, args.until, args.seed, args.out, home)
 	u.releasesPath, u.labelsPath = args.releases, args.labels
 	if _, err := u.loadReleases(); err != nil {
-		fmt.Fprintln(os.Stderr, "uptake:", err)
-		os.Exit(2)
+		code, message := uptakeErrorResult(err)
+		fmt.Fprintln(os.Stderr, message)
+		os.Exit(code)
 	}
 	if err := u.runUptake(args.since, args.until); err != nil {
-		fmt.Fprintln(os.Stderr, "uptake:", err)
-		os.Exit(1)
+		code, message := uptakeErrorResult(err)
+		fmt.Fprintln(os.Stderr, message)
+		os.Exit(code)
 	}
+}
+
+func uptakeErrorResult(err error) (int, string) {
+	var inputErr *uptakeInputError
+	if errors.As(err, &inputErr) {
+		return 2, fmt.Sprintf("uptake: %v (uptake -h for usage)", inputErr)
+	}
+	return 1, fmt.Sprintf("uptake: %v", err)
 }
 
 // uptakeArgs — разобранные аргументы командной строки.

@@ -39,6 +39,41 @@ func TestReleasesEmptyValue(t *testing.T) {
 	}
 }
 
+func TestInputFileErrorsExitTwo(t *testing.T) {
+	root := t.TempDir()
+	labelsPath := filepath.Join(root, "labels.tsv")
+	if err := os.WriteFile(labelsPath, []byte("id\tlabel\nunknown\tmaybe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	labelsRun := newRun(time.Time{}, time.Time{}, 1, filepath.Join(root, "out"), root)
+	labelsRun.labelsPath = labelsPath
+	labelsRun.pairCandidates = []pairCandidate{{id: "known", pair: "prior"}}
+	labelsRun.pairCandidateSample = append(labelsRun.pairCandidateSample, labelsRun.pairCandidates[0])
+	labelsRun.labels = map[string]string{}
+	labelsErr := labelsRun.loadPairLabels()
+	assertInputFileExitTwo(t, labelsErr, labelsPath+":2:")
+
+	releasesPath := filepath.Join(root, "releases.tsv")
+	if err := os.WriteFile(releasesPath, []byte("busy\tnot-a-date\t2026-11-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	releasesRun := newRun(time.Time{}, time.Time{}, 1, filepath.Join(root, "out"), root)
+	releasesRun.releasesPath = releasesPath
+	_, releasesErr := releasesRun.loadReleases()
+	assertInputFileExitTwo(t, releasesErr, releasesPath+":1:")
+}
+
+func assertInputFileExitTwo(t *testing.T, err error, location string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("invalid input unexpectedly accepted")
+	}
+	code, message := uptakeErrorResult(err)
+	if code != 2 || !strings.Contains(message, location) || !strings.HasSuffix(message, "(uptake -h for usage)") {
+		t.Fatalf("input error result = (%d, %q), want code 2, %q and usage hint", code, message, location)
+	}
+}
+
 func TestWriteTablesContent(t *testing.T) {
 	since := time.Date(2026, 10, 25, 11, 0, 0, 0, time.UTC)
 	until := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC)
@@ -395,7 +430,7 @@ func TestUptakeReviewRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := string(data)
-		for _, want := range []string{"| утилита | 01.11 / окно |", "| page-shot | 1 / 2 | пары нет |", "| busy | 1 / 1 | пары нет | не замерено | 1/2 | 2 |"} {
+		for _, want := range []string{"| утилита | 01.11 / окно |", "| page-shot | 1 / 2 | см. «Пары этапа 2» |", "| busy | 1 / 1 | см. «Пары этапа 2» | не замерено | 1/2 | 2 |"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("report missing %q:\n%s", want, text)
 			}
