@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"unicode/utf8"
 )
@@ -66,5 +67,59 @@ func TestConcurrentNotesKeepEveryNote(t *testing.T) {
 	leftovers, err := filepath.Glob(filepath.Join(dir, ".*"))
 	if err != nil || len(leftovers) != 0 {
 		t.Errorf("temporary files left in the task folder: %v %v", leftovers, err)
+	}
+}
+
+// A symlinked ticket is updated at its target and the link survives; a hard-linked one is refused rather
+// than split by the rename.
+func TestWriteTaskKeepsLinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "store", "20200101-1000-LOW-linked.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "20200101-1000-LOW-linked.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTask(link, "new\n"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the symlink was replaced: %v %v", info, err)
+	}
+	b, err := os.ReadFile(target)
+	if err != nil || string(b) != "new\n" {
+		t.Fatalf("target not updated: %q %v", b, err)
+	}
+	if st, err := os.Stat(target); err != nil || st.Mode().Perm() != 0o640 {
+		t.Fatalf("target mode changed: %v %v", st, err)
+	}
+	hard := filepath.Join(dir, "20200101-1000-LOW-hard.md")
+	if err := os.Link(target, hard); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTask(hard, "split\n"); err == nil || !strings.Contains(err.Error(), "hard links") {
+		t.Fatalf("hard-linked ticket written: %v", err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "new\n" {
+		t.Fatalf("refused write changed the ticket: %q", b)
+	}
+}
+
+// A new ticket gets fileMode less the umask, as os.WriteFile gave it.
+func TestWriteTaskNewHonorsUmask(t *testing.T) {
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	path := filepath.Join(t.TempDir(), "20200101-1000-LOW-private.md")
+	if err := writeTask(path, "x\n"); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("new ticket mode %v, want 0600: %v", st.Mode().Perm(), err)
 	}
 }

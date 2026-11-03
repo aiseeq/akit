@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -34,21 +35,20 @@ func lockTasks(dir string) (func(), error) {
 }
 
 // writeTask replaces a ticket in one rename: a reader sees the old or the new text, never a mix. A new
-// ticket gets fileMode, an existing one keeps its mode.
+// ticket gets fileMode less the umask, as a plain create would; an existing one keeps its mode. A symlinked
+// ticket is written at its target, so the link stays; a ticket with several hard links is refused, since a
+// rename would leave the other names on the old text.
 func writeTask(path, body string) error {
-	mode := fs.FileMode(fileMode)
-	if info, err := os.Stat(path); err == nil {
-		mode = info.Mode().Perm()
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	// The leading dot keeps the temporary file out of fileRE, so a concurrent ls never lists it.
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tk-*.tmp")
+	target, keep, err := taskTarget(path)
 	if err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	if err = writeTemp(tmp, body, mode); err == nil {
-		err = os.Rename(tmp.Name(), path)
+	tmp, err := createTemp(filepath.Dir(target))
+	if err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err = writeTemp(tmp, body, keep); err == nil {
+		err = os.Rename(tmp.Name(), target)
 	}
 	if err != nil {
 		if rerr := os.Remove(tmp.Name()); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
@@ -59,10 +59,43 @@ func writeTask(path, body string) error {
 	return nil
 }
 
-func writeTemp(tmp *os.File, body string, mode fs.FileMode) error {
+// taskTarget resolves the file a write replaces and the mode to keep: zero for a new ticket, whose mode the
+// create already set.
+func taskTarget(path string) (string, fs.FileMode, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return path, 0, nil
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("stat ticket: %w", err)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+		return "", 0, fmt.Errorf("the ticket has %d hard links; a rename would split them", st.Nlink)
+	}
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", 0, fmt.Errorf("resolve ticket link: %w", err)
+	}
+	return target, info.Mode().Perm(), nil
+}
+
+// createTemp makes the temporary file with fileMode, so the umask applies as for a plain create. The leading
+// dot keeps it out of fileRE: a concurrent ls never lists it.
+func createTemp(dir string) (*os.File, error) {
+	for range 10 {
+		name := filepath.Join(dir, fmt.Sprintf(".tk-%d-%d.tmp", os.Getpid(), rand.Uint64()))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileMode)
+		if !errors.Is(err, fs.ErrExist) {
+			return f, err
+		}
+	}
+	return nil, errors.New("no free temporary name after 10 tries")
+}
+
+func writeTemp(tmp *os.File, body string, keep fs.FileMode) error {
 	_, err := tmp.WriteString(body)
-	if err == nil {
-		err = tmp.Chmod(mode)
+	if err == nil && keep != 0 {
+		err = tmp.Chmod(keep)
 	}
 	if err == nil {
 		err = tmp.Sync()
