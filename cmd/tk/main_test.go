@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,11 +94,11 @@ func TestValidateNew(t *testing.T) {
 		pos               []string
 		wantPrio, wantErr string
 	}{
-		{name: "default priority", o: options{id: "new-task"}, pos: []string{"new-task"}, wantPrio: "MEDIUM"},
-		{name: "all priorities", o: options{id: "new-task", prio: "HIGH"}, pos: []string{"new-task"}, wantPrio: "HIGH"},
+		{name: "default priority", o: options{id: "new-task"}, pos: []string{"new-task"}, wantPrio: "MED"},
+		{name: "all priorities", o: options{id: "new-task", prio: "HIGH", why: "reason"}, pos: []string{"new-task"}, wantPrio: "HIGH"},
 		{name: "bad slug", o: options{id: "Bad"}, pos: []string{"Bad"}, wantErr: "new needs a lowercase slug"},
 		{name: "extra positional", o: options{id: "new-task"}, pos: []string{"new-task", "extra"}, wantErr: "new needs a lowercase slug"},
-		{name: "bad priority", o: options{id: "new-task", prio: "urgent"}, pos: []string{"new-task"}, wantErr: "--prio must be HIGH, MEDIUM, or LOW"},
+		{name: "bad priority", o: options{id: "new-task", prio: "urgent"}, pos: []string{"new-task"}, wantErr: "--prio must be CRIT, HIGH, MED, MEDIUM, or LOW"},
 		{name: "bad actor", o: options{id: "new-task", by: "two words"}, pos: []string{"new-task"}, wantErr: "--by must be a name without spaces; use --by NAME"},
 	}
 	for _, tt := range tests {
@@ -113,6 +114,39 @@ func TestValidateNew(t *testing.T) {
 				t.Fatalf("priority = %q, error = %v", tt.o.prio, err)
 			}
 		})
+	}
+}
+
+func TestNewAcceptanceIsEmptyAndNoCheckIsShown(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	var out, errout bytes.Buffer
+	if code := create(root, dir, options{id: "plain", by: "worker", prio: "MED"}, &out, &errout); code != 0 {
+		t.Fatalf("new without text: %d %s", code, errout.String())
+	}
+	plainPath := filepath.Join(root, strings.TrimSpace(out.String()))
+	plain, err := os.ReadFile(plainPath)
+	if err != nil || !noCheck(string(plain)) {
+		t.Fatalf("new without text should have an empty acceptance section: %s, %v", plain, err)
+	}
+	issues, err := lintTicket(plainPath, "plain")
+	if err != nil || len(issues) != 1 || !strings.Contains(issues[0], "empty Приёмка") {
+		t.Fatalf("fresh no-check ticket lint = %v, %v", issues, err)
+	}
+	out.Reset()
+	errout.Reset()
+	text := "## Приёмка\n- run checks\n"
+	if code := create(root, dir, options{id: "with-text", by: "worker", prio: "MED", text: text}, &out, &errout); code != 0 {
+		t.Fatalf("new with text: %d %s", code, errout.String())
+	}
+	withText, err := os.ReadFile(filepath.Join(root, strings.TrimSpace(out.String())))
+	acceptance, ok := sectionBody(string(withText), "## Приёмка")
+	if err != nil || !ok || strings.TrimSpace(acceptance) != "- run checks" {
+		t.Fatalf("acceptance section = %q, found=%v, err=%v", acceptance, ok, err)
+	}
+	out.Reset()
+	if code := list(root, options{}, &out, &errout); code != 0 || !strings.Contains(out.String(), "plain") || !strings.Contains(out.String(), "no-check") {
+		t.Fatalf("ls without-text marker: code=%d output=%q err=%q", code, out.String(), errout.String())
 	}
 }
 
@@ -1939,5 +1973,445 @@ func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
 	late := time.Date(2026, 11, 2, 23, 58, 0, 0, time.Local)
 	if validateApproxTime(options{check: "прошло ~00:05"}, late) == nil {
 		t.Error("~00:05 at 23:58 is the next day, later than the entry")
+	}
+}
+
+func TestTaskNameParserSupportsCurrentAndLegacyNames(t *testing.T) {
+	for _, tc := range []struct {
+		name, prio, diff, slug string
+	}{
+		{"20200101-1000-MEDIUM-legacy-name.md", "MEDIUM", "", "legacy-name"},
+		{"20200101-1000-HIGH-ARCH-new-name.md", "HIGH", "ARCH", "new-name"},
+	} {
+		got, ok := parseTaskName(tc.name)
+		if !ok || got.prio != tc.prio || got.diff != tc.diff || got.slug != tc.slug {
+			t.Errorf("parseTaskName(%q) = %#v, %v", tc.name, got, ok)
+		}
+	}
+	if got := normalizePrio("MEDIUM"); got != "MED" {
+		t.Errorf("normalizePrio(MEDIUM) = %q", got)
+	}
+}
+
+func TestSetRenameFindsTicketByPriorName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldName := "20200101-1000-MED-old-name.md"
+	path := filepath.Join(dir, oldName)
+	body := "# Old\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — author\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ticket := task{path: path, slug: "old-name", prio: "MED", body: body}
+	var out, errout bytes.Buffer
+	if code := setTask(ticket, options{prio: "HIGH", why: "urgent", by: "actor"}, &out, &errout); code != 0 {
+		t.Fatalf("setTask = %d, stderr %q", code, errout.String())
+	}
+	newPath := filepath.Join(dir, "20200101-1000-HIGH-old-name.md")
+	updatedBody, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updatedBody), "Причина: urgent") || !strings.Contains(string(updatedBody), oldName+" → 20200101-1000-HIGH-old-name.md") {
+		t.Fatalf("updated ticket lacks cause or rename journal: %s", updatedBody)
+	}
+	for _, id := range []string{oldName, strings.TrimSuffix(oldName, ".md")} {
+		if got, err := find(dir, id); err != nil || filepath.Base(got.path) != filepath.Base(newPath) {
+			t.Errorf("find(%q) = %v, %v", id, got.path, err)
+		}
+	}
+}
+
+func TestLegacyTaskJSONHasNormalizedMetadataFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20200101-1000-MEDIUM-legacy.md")
+	got := taskObject("", task{path: path, slug: "legacy", prio: "MEDIUM", body: "# Legacy\n\nСтатус: открыт\n"}, "", false)
+	if got.Prio != "MED" || got.Diff != "" || got.Back != "" || got.Why != "" {
+		t.Errorf("legacy task JSON fields: %#v", got)
+	}
+}
+
+func TestLintRequiresReasonOnlyAfterCutoff(t *testing.T) {
+	dir := t.TempDir()
+	body := "# Ticket\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — actor\n"
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{"20261103-2359-HIGH-old.md", false},
+		{"20261104-0000-HIGH-new.md", true},
+	} {
+		path := filepath.Join(dir, tc.name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		issues, err := lintTicket(path, tc.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := strings.Contains(strings.Join(issues, "\n"), "HIGH without Причина")
+		if found != tc.want {
+			t.Errorf("lint %s reason issue = %v, want %v: %v", tc.name, found, tc.want, issues)
+		}
+	}
+}
+
+func TestAbsoluteToCreatesAndPrintsTicketPath(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	o, err := parseArgs([]string{"new", "requested", "--to", target, "--back", "request-session", "--diff", "ARCH", "--by", "author"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := createAtBase(base, filepath.Join(base, "docs", "tasks"), o, &out, &errout); code != 0 {
+		t.Fatalf("new --to: %d %s", code, errout.String())
+	}
+	path := strings.TrimSpace(out.String())
+	if !filepath.IsAbs(path) || filepath.Dir(path) != filepath.Join(target, "docs", "tasks") {
+		t.Fatalf("reported path = %q", path)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(body), "Заказчик: request-session") || !strings.Contains(filepath.Base(path), "-ARCH-requested.md") {
+		t.Fatalf("created ticket = %s, %v", body, err)
+	}
+}
+
+func TestNewRejectsInvalidCommandFlagsAndBack(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"new", "task", "--take"}, "--take: flag only for start"},
+		{[]string{"set", "task", "--to", "project"}, "--to/--back: flag only for new"},
+		{[]string{"start", "task", "--back", "request"}, "--to/--back: flag only for new"},
+		{[]string{"ls", "--diff", "DO"}, "--prio/--diff: flag only for new, set, or start"},
+		{[]string{"next", "--prio", "HIGH"}, "--prio/--diff: flag only for new, set, or start"},
+		{[]string{"show", "task", "--why", "reason"}, "--why: flag only for new, set, start, reject, skip, or plan --repin"},
+		{[]string{"new", "task", "--back", "two words"}, "--back must be a name without spaces"},
+		{[]string{"new", "task", "--back", "bad\nname"}, "--back must be a name without spaces"},
+	} {
+		t.Run(strings.Join(tc.args, "_"), func(t *testing.T) {
+			if _, err := parseArgs(tc.args); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("parseArgs error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+	for _, args := range [][]string{{"new", "task", "--prio", "HIGH"}, {"new", "task", "--diff", "NOPE"}} {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%q) succeeded", args)
+		}
+	}
+}
+
+func TestSetAndStartInsertWhyWithoutStatus(t *testing.T) {
+	for _, command := range []string{"set", "start"} {
+		t.Run(command, func(t *testing.T) {
+			dir := t.TempDir()
+			oldPath := filepath.Join(dir, "20261105-1000-MED-legacy.md")
+			body := "# Legacy title\n\n## Что сделать\nwork\n"
+			if err := os.WriteFile(oldPath, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			ticket := task{path: oldPath, slug: "legacy", prio: "MED", status: "открыт", body: body}
+			var out, errout bytes.Buffer
+			o := options{cmd: command, prio: "HIGH", why: "urgent", by: "actor"}
+			var code int
+			if command == "set" {
+				code = setTask(ticket, o, &out, &errout)
+			} else {
+				code = transition(ticket, o, &out, &errout)
+			}
+			newPath := filepath.Join(dir, "20261105-1000-HIGH-legacy.md")
+			updated, err := os.ReadFile(newPath)
+			want := "# Legacy title\nПричина: urgent\n"
+			if command == "start" {
+				want = "Статус: в работе\nПричина: urgent\n"
+			}
+			if code != 0 || err != nil || !strings.Contains(string(updated), want) {
+				t.Fatalf("%s result=%d body=%q err=%v stderr=%q", command, code, updated, err, errout.String())
+			}
+		})
+	}
+}
+
+func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
+	for _, command := range []string{"set", "start"} {
+		for _, tc := range []struct {
+			name, oldPrio, newPrio, diff string
+			wantCode                     int
+		}{
+			{name: "same priority", oldPrio: "HIGH", newPrio: "HIGH"},
+			{name: "diff only", oldPrio: "HIGH", newPrio: "HIGH", diff: "DO"},
+			{name: "downgrade", oldPrio: "HIGH", newPrio: "LOW"},
+			{name: "promotion requires reason", oldPrio: "MED", newPrio: "HIGH", wantCode: exitUsage},
+		} {
+			t.Run(command+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				oldPath := filepath.Join(dir, "20261105-1000-"+tc.oldPrio+"-ticket.md")
+				body := "# Ticket\n\nСтатус: открыт\n\n## Журнал\n"
+				if command == "start" {
+					body = "# Ticket\n\nСтатус: в работе\nИсполнитель: actor\n\n## Журнал\n"
+				}
+				if err := os.WriteFile(oldPath, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				o := options{cmd: command, prio: tc.newPrio, diff: tc.diff, by: "actor"}
+				var out, errout bytes.Buffer
+				ticket := task{path: oldPath, slug: "ticket", prio: tc.oldPrio, status: "открыт", body: body}
+				var code int
+				if command == "start" {
+					code = transition(ticket, o, &out, &errout)
+				} else {
+					code = setTask(ticket, o, &out, &errout)
+				}
+				if code != tc.wantCode {
+					t.Fatalf("code=%d, want %d; stderr=%q", code, tc.wantCode, errout.String())
+				}
+				if tc.wantCode != 0 {
+					if _, err := os.Stat(oldPath); err != nil {
+						t.Fatalf("refused promotion changed ticket name: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestStartUpdatesMetadataOnOwnTicket(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20261105-1000-MED-ticket.md")
+	body := "# Ticket\\n\\nСтатус: в работе\\nИсполнитель: actor\\n\\n## Журнал\\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	o := options{cmd: "start", prio: "HIGH", why: "urgent", by: "actor"}
+	if code := transition(task{path: path, slug: "ticket", prio: "MED", status: "в работе", body: body}, o, &out, &errout); code != 0 {
+		t.Fatalf("start own ticket = %d %q", code, errout.String())
+	}
+	updated, err := os.ReadFile(filepath.Join(dir, "20261105-1000-HIGH-ticket.md"))
+	if err != nil || !strings.Contains(string(updated), "Причина: urgent") {
+		t.Fatalf("own ticket metadata = %q, %v", updated, err)
+	}
+}
+
+func TestMetadataWithoutTitleOrStatusRefusesRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20261105-1000-MED-legacy.md")
+	body := "## What\nwork\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	code := setTask(task{path: path, slug: "legacy", prio: "MED", body: body}, options{prio: "HIGH", why: "urgent", by: "actor"}, &out, &errout)
+	if code != exitUsage || !strings.Contains(errout.String(), "cannot insert Причина") {
+		t.Fatalf("set without insertion point = %d %q", code, errout.String())
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != body {
+		t.Fatalf("original ticket changed: %q %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "20261105-1000-HIGH-legacy.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected renamed ticket: %v", err)
+	}
+}
+
+func TestSetClosedTicketAndNameConflict(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20200101-1000-MED-closed.md")
+	body := "# Closed\n\nСтатус: готово\n\n## Журнал\n- 2020-01-01 10:00 готово — actor: checked\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := setTask(task{path: path, slug: "closed", prio: "MED", body: body}, options{diff: "ARCH", by: "actor"}, &out, &errout); code != 0 {
+		t.Fatalf("set closed: %d %s", code, errout.String())
+	}
+	archived := filepath.Join(dir, "20200101-1000-MED-ARCH-closed.md")
+	updated, err := os.ReadFile(archived)
+	if err != nil || !strings.Contains(string(updated), "Статус: готово") {
+		t.Fatalf("closed status changed: %s %v", updated, err)
+	}
+	conflict := filepath.Join(dir, "20200101-1000-HIGH-ARCH-closed.md")
+	if err := os.WriteFile(conflict, []byte("target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errout.Reset()
+	code := setTask(task{path: archived, slug: "closed", prio: "MED", diff: "ARCH", body: string(updated)}, options{prio: "HIGH", why: "urgent", by: "actor"}, &out, &errout)
+	if code != exitUsage || !strings.Contains(errout.String(), "already exists") {
+		t.Fatalf("set conflict = %d %q", code, errout.String())
+	}
+	if got, _ := os.ReadFile(archived); string(got) != string(updated) {
+		t.Fatalf("conflict changed source: %q", got)
+	}
+}
+
+func TestRenameRefusesSymlinkAndFailedRenameLeavesJournalUntouched(t *testing.T) {
+	for _, command := range []string{"set", "start"} {
+		t.Run(command+"-symlink", func(t *testing.T) {
+			dir := t.TempDir()
+			target := filepath.Join(dir, "target.md")
+			link := filepath.Join(dir, "20261105-1000-MED-linked.md")
+			body := "# Linked\n\nСтатус: открыт\n\n## Журнал\n"
+			if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			var out, errout bytes.Buffer
+			o := options{cmd: command, prio: "HIGH", why: "urgent", by: "actor"}
+			var code int
+			if command == "set" {
+				code = setTask(task{path: link, slug: "linked", prio: "MED", body: body}, o, &out, &errout)
+			} else {
+				code = transition(task{path: link, slug: "linked", prio: "MED", status: "открыт", body: body}, o, &out, &errout)
+			}
+			if code != exitUsage || !strings.Contains(errout.String(), "symlink") {
+				t.Fatalf("rename symlink = %d %q", code, errout.String())
+			}
+			got, _ := os.ReadFile(target)
+			if string(got) != body {
+				t.Fatalf("symlink target changed: %q", got)
+			}
+		})
+		t.Run(command+"-rename-error", func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "20261105-1000-MED-ticket.md")
+			body := "# Ticket\n\nСтатус: открыт\n\n## Журнал\n"
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			oldRename := renameTaskFile
+			renameTaskFile = func(string, string) error { return errors.New("injected rename failure") }
+			t.Cleanup(func() { renameTaskFile = oldRename })
+			var out, errout bytes.Buffer
+			o := options{cmd: command, prio: "HIGH", why: "urgent", by: "actor"}
+			var code int
+			if command == "set" {
+				code = setTask(task{path: path, slug: "ticket", prio: "MED", body: body}, o, &out, &errout)
+			} else {
+				code = transition(task{path: path, slug: "ticket", prio: "MED", status: "открыт", body: body}, o, &out, &errout)
+			}
+			got, err := os.ReadFile(path)
+			if code != exitUsage || err != nil || string(got) != body || strings.Contains(string(got), "переименован") {
+				t.Fatalf("rename failure = %d body=%q err=%v stderr=%q", code, got, err, errout.String())
+			}
+			if _, err := os.Stat(filepath.Join(dir, "20261105-1000-HIGH-ticket.md")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("new path remains after failed rename: %v", err)
+			}
+		})
+	}
+}
+
+func TestClosedFieldIsOnlyAddedToNextJSON(t *testing.T) {
+	ticket := task{path: filepath.Join(t.TempDir(), "20200101-1000-MED-ticket.md"), slug: "ticket", prio: "MED", status: "открыт", body: "# Ticket\nСтатус: открыт\n"}
+	standard, err := json.Marshal(taskObject("", ticket, "", false))
+	if err != nil || bytes.Contains(standard, []byte(`"closed"`)) {
+		t.Fatalf("standard task JSON has closed: %s %v", standard, err)
+	}
+	var out, errout bytes.Buffer
+	if code := printNext("", ticket, true, true, false, &out, &errout); code != 0 {
+		t.Fatalf("next JSON = %d %s", code, errout.String())
+	}
+	var next map[string]any
+	if err := json.Unmarshal(out.Bytes(), &next); err != nil || next["closed"] != true {
+		t.Fatalf("next JSON missing closed: %s %v", out.String(), err)
+	}
+}
+
+func TestNextWaitDeadlinesExcludeFutureTickets(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, deadline := range map[string]string{"past": "2000-01-01 10:00", "future": "2099-01-01 10:00"} {
+		body := fmt.Sprintf("# %s\n\nСтатус: ждёт\nЖдёт: %s\n\n## Журнал\n", name, deadline)
+		path := filepath.Join(dir, "20200101-1000-MED-"+name+".md")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tasks, err := loadTasks(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := nextCandidates(tasks, "actor", gateState{}, true)
+	if len(candidates) != 1 || candidates[0].slug != "past" {
+		t.Fatalf("waiting candidates = %#v", candidates)
+	}
+}
+
+func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		gate       string
+		wantSlug   string
+		wantClosed bool
+		wantDiag   bool
+	}{
+		{"live gates", `{"at":%q,"live":["project"],"open":["MED-DO"]}`, "med-do", false, false},
+		{"project not live", `{"at":%q,"live":["other"],"open":["MED-DO"]}`, "med-hunt", true, false},
+		{"gate missing", "", "med-hunt", false, true},
+		{"gate malformed", "{", "med-hunt", false, true},
+		{"gate stale", `{"at":"2000-01-01T00:00:00Z","live":["project"],"open":[]}`, "high", false, true},
+		{"gate future", `{"at":"2099-01-01T00:00:00Z","live":["project"],"open":[]}`, "high", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			root := filepath.Join(home, "project")
+			dir := filepath.Join(root, "docs", "tasks")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			write := func(name, status string) {
+				t.Helper()
+				body := "# " + name + "\n\nСтатус: " + status + "\n\n## Приёмка\n- check\n\n## Журнал\n"
+				if status == "в работе" {
+					body += "- 2026-11-01 10:00 в работе — me\n"
+				}
+				if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("20261101-1000-MED-DO-med-do", "открыт")
+			write("20261030-1000-MED-HUNT-med-hunt", "открыт")
+			if tc.name == "gate stale" || tc.name == "gate future" {
+				write("20261101-1000-HIGH-high", "открыт")
+			}
+			if tc.gate != "" {
+				gateDir := filepath.Join(home, ".local", "state", "queue")
+				if err := os.MkdirAll(gateDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				gate := tc.gate
+				if strings.Contains(gate, "%q") {
+					gate = fmt.Sprintf(gate, time.Now().Format(time.RFC3339))
+				}
+				if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(gate), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var out, errout bytes.Buffer
+			if code := nextTask(root, "", dir, options{by: "me", json: true}, &out, &errout); code != 0 {
+				t.Fatalf("nextTask = %d, stderr %q", code, errout.String())
+			}
+			var got nextTaskJSON
+			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Slug != tc.wantSlug || got.Closed != tc.wantClosed {
+				t.Errorf("next JSON = slug %q closed %v, want %q %v", got.Slug, got.Closed, tc.wantSlug, tc.wantClosed)
+			}
+			if strings.Contains(errout.String(), "gate.json") != tc.wantDiag {
+				t.Errorf("gate diagnostic = %q, want present %v", errout.String(), tc.wantDiag)
+			}
+		})
 	}
 }

@@ -30,7 +30,8 @@ import (
 const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
-  tk new SLUG [--prio HIGH|MEDIUM|LOW] [--title TEXT] [--by NAME] [--text FILE|-]
+  tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--text FILE|-]
+  tk set ID [--prio P] [--diff D] [--why TEXT] [--by NAME]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
@@ -38,7 +39,8 @@ Usage:
   tk skip ID NAME --why TEXT [--by NAME]
   tk check ID [--timeout D]
   tk lint [--root DIR]
-  tk start ID [--by NAME]
+  tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take]
+  tk next [--by NAME] [--json]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
   tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]
@@ -47,14 +49,18 @@ Usage:
   tk archive [--older DURATION] [--root DIR]
 
 Flags:
-  --prio P       new: priority HIGH, MEDIUM, or LOW (default MEDIUM)
+  --prio P       new/set/start: CRIT, HIGH, MED, MEDIUM, or LOW (new default MED)
+  --diff D       new/set/start: difficulty DO, HUNT, or ARCH
+  --why TEXT     new: required for CRIT/HIGH; set/start: required when promoting to CRIT/HIGH; reject: reason
+  --to PROJECT   new: create in PROJECT/docs/tasks; absolute PROJECT is its root
+  --back NAME    new: requesting session
   --title TEXT   new: ticket title (default: slug)
   --by NAME      actor name (default: current session); ls: show tickets assigned to NAME
   --text FILE|-  new: fill ticket sections from FILE, or standard input with -
   --all          ls: include closed tickets
 
   --due          ls: show waiting tickets whose parsed deadline has passed
-  --json         ls: output JSON array; show: output the ticket and journal as JSON
+  --json         ls: output JSON array; show: ticket and journal JSON; next: top ticket JSON
   --status S     ls: show only status S
   --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
@@ -62,7 +68,8 @@ Flags:
   --check TEXT   done: describe independent verification (required)
   --doer NAME    done: specify the executor of a legacy ticket
   --glint-debt S done: link findings to an open ticket when glint reports them
-  --why TEXT     reject: why the ticket was declined; skip: why the plan item is skipped (required)
+  --why TEXT     reject: why declined; skip: why item skipped (required)
+  --take         start: take a ticket assigned to another session
   --add TEXT     plan: add a named command to the ticket plan (required)
   --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command; command syntax is checked with bash -n
   --repin TEXT   plan: replace a required command from another session; current and previous executors and pin authors are refused; the session and old/new commands are journaled
@@ -85,10 +92,12 @@ const (
 
 var slugRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 var slugPrefixRE = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*-?$`)
-var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-([A-Z]+)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$`)
+var fileRE = regexp.MustCompile(`^([0-9]{8})-([0-9]{4})-([A-Z]+)-(?:(DO|HUNT|ARCH)-)?([a-z0-9]+(?:-[a-z0-9]+)*)\.md$`)
 var nameRE = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N}._:@-]*$`)
-var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-[a-z0-9]+(?:-[a-z0-9]+)*(?:\.md)?$`)
+var ticketIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{4}-[A-Z]+-(?:(?:DO|HUNT|ARCH)-)?[a-z0-9]+(?:-[a-z0-9]+)*(?:\.md)?$`)
 var planNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+const mandatoryWhySince = "20261104-0000" // с этого штампа причина обязательна
 
 // planSkipRE — строка журнала, которую пишет tk skip (и прежняя форма без автора), целиком с начала:
 // «пропущен:» внутри заметки или причины другого пункта пропуском не считается.
@@ -111,9 +120,9 @@ var session = currentSession
 var planTimeout = 8 * time.Minute
 
 type options struct {
-	cmd, id, prio, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, add, repin, item string
-	all, due, json, required                                                                                                 bool
-	older, timeout                                                                                                           time.Duration
+	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back string
+	all, due, json, required, take                                                                                                                     bool
+	older, timeout                                                                                                                                     time.Duration
 }
 
 // planLimit — предел пункта плана: --timeout или умолчание.
@@ -125,8 +134,8 @@ func (o options) planLimit() time.Duration {
 }
 
 type task struct {
-	path, slug, status, prio, title, body string
-	created, changed                      time.Time
+	path, slug, status, prio, diff, title, body string
+	created, changed                            time.Time
 }
 
 func main() {
@@ -178,7 +187,7 @@ func parseArgs(a []string) (options, error) {
 // вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел. Текст журнала без
 // угаданного времени: у записи есть точная метка.
 func validateOneLine(o options) error {
-	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}, {"--add", o.add}, {"--repin", o.repin}} {
+	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--back", o.back}, {"--until", o.until}, {"--add", o.add}, {"--repin", o.repin}} {
 		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
@@ -257,7 +266,7 @@ var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*([01]?\d|2[0
 var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5][xх](?:$|[^a-z0-9])`)
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin}
+	values := map[string]*string{"--prio": &o.prio, "--diff": &o.diff, "--to": &o.to, "--back": &o.back, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -274,6 +283,9 @@ func parseOptions(args []string, o *options) ([]string, error) {
 			continue
 		case "--required":
 			o.required = true
+			continue
+		case "--take":
+			o.take = true
 			continue
 		}
 		if p, ok := values[v]; ok {
@@ -312,6 +324,9 @@ func parseOptions(args []string, o *options) ([]string, error) {
 }
 
 func validateCommand(o *options, pos []string) error {
+	if err := validateCommandFlags(o); err != nil {
+		return err
+	}
 	switch o.cmd {
 	case "plan":
 		return validatePlanCommand(o, pos)
@@ -319,23 +334,73 @@ func validateCommand(o *options, pos []string) error {
 		return validateSkipCommand(o, pos)
 	case "check":
 		return validateCheckCommand(o, pos)
+	case "note":
+		return validateNoteCommand(o, pos)
+	default:
+		return validateSimpleCommand(o, pos)
 	}
-	if o.cmd == "note" {
-		if len(pos) != 2 {
-			return errors.New("note needs a ticket ID and text")
+}
+
+func validateCommandFlags(o *options) error {
+	checks := []func(*options) error{validateTakeFlag, validateDestinationFlags, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
+	for _, check := range checks {
+		if err := check(o); err != nil {
+			return err
 		}
-		if !validID(pos[0]) {
-			return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
-		}
-		o.id, o.note = pos[0], pos[1]
-		if strings.TrimSpace(o.note) == "" {
-			return errors.New("note text must not be empty")
-		}
-		if o.by != "" && !nameRE.MatchString(o.by) {
-			return errors.New("--by must be a name without spaces; use --by NAME")
-		}
+	}
+	return nil
+}
+
+func validateTakeFlag(o *options) error {
+	if o.take && o.cmd != "start" {
+		return errors.New("--take: flag only for start")
+	}
+	return nil
+}
+
+func validateDestinationFlags(o *options) error {
+	if (o.to != "" || o.back != "") && o.cmd != "new" {
+		return errors.New("--to/--back: flag only for new")
+	}
+	return nil
+}
+
+func validatePriorityFlags(o *options) error {
+	if (o.prio != "" || o.diff != "") && o.cmd != "new" && o.cmd != "set" && o.cmd != "start" {
+		return errors.New("--prio/--diff: flag only for new, set, or start")
+	}
+	return nil
+}
+
+func validateWhyFlag(o *options) error {
+	if o.why == "" || o.cmd == "new" || o.cmd == "set" || o.cmd == "start" || o.cmd == "reject" || o.cmd == "skip" || o.cmd == "plan" && o.repin != "" {
 		return nil
 	}
+	return errors.New("--why: flag only for new, set, start, reject, skip, or plan --repin")
+}
+
+func validateJSONFlag(o *options) error {
+	if o.json && o.cmd != "ls" && o.cmd != "show" && o.cmd != "next" {
+		return errors.New("--json: flag only for ls, show, or next")
+	}
+	return nil
+}
+
+func validateNoteCommand(o *options, pos []string) error {
+	if len(pos) != 2 {
+		return errors.New("note needs a ticket ID and text")
+	}
+	if !validID(pos[0]) {
+		return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
+	}
+	o.id, o.note = pos[0], pos[1]
+	if strings.TrimSpace(o.note) == "" {
+		return errors.New("note text must not be empty")
+	}
+	return validateActorFlag(o)
+}
+
+func validateSimpleCommand(o *options, pos []string) error {
 	if len(pos) > 1 {
 		return errors.New("too many arguments")
 	}
@@ -347,12 +412,18 @@ func validateCommand(o *options, pos []string) error {
 		return validateNew(o, pos)
 	case "ls":
 		return validateList(o, pos)
-	case "start", "wait", "review", "done", "reject", "show":
+	case "start", "wait", "review", "done", "reject", "show", "set":
 		return validateTicketAction(o, pos)
+	case "next":
+		if len(pos) != 0 {
+			return errors.New("next takes no id")
+		}
+		return validateActorFlag(o)
 	case "lint":
 		if len(pos) > 0 {
 			return errors.New("lint takes no id")
 		}
+		return nil
 	case "archive":
 		if len(pos) > 0 {
 			return errors.New("archive takes no id")
@@ -361,7 +432,6 @@ func validateCommand(o *options, pos []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", o.cmd)
 	}
-	return nil
 }
 
 func validatePlanCommand(o *options, pos []string) error {
@@ -420,13 +490,23 @@ func validateNew(o *options, pos []string) error {
 		return errors.New("new needs a lowercase slug")
 	}
 	if o.prio == "" {
-		o.prio = "MEDIUM"
+		o.prio = "MED"
 	}
-	if o.prio != "HIGH" && o.prio != "MEDIUM" && o.prio != "LOW" {
-		return errors.New("--prio must be HIGH, MEDIUM, or LOW")
+	o.prio = normalizePrio(o.prio)
+	if !validPrio(o.prio) {
+		return errors.New("--prio must be CRIT, HIGH, MED, MEDIUM, or LOW")
+	}
+	if !validDiff(o.diff) {
+		return errors.New("--diff must be DO, HUNT, or ARCH")
+	}
+	if requiresWhyForPromotion("LOW", o.prio) && strings.TrimSpace(o.why) == "" {
+		return errors.New("--prio CRIT/HIGH requires --why")
 	}
 	if o.by != "" && !nameRE.MatchString(o.by) {
 		return errors.New("--by must be a name without spaces; use --by NAME")
+	}
+	if o.back != "" && !nameRE.MatchString(o.back) {
+		return errors.New("--back must be a name without spaces; use --back NAME")
 	}
 	return nil
 }
@@ -451,6 +531,13 @@ func validateTicketAction(o *options, pos []string) error {
 	if len(pos) != 1 || !validID(o.id) {
 		return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
 	}
+	if err := validateActionIdentity(o); err != nil {
+		return err
+	}
+	return validateActionOptions(o)
+}
+
+func validateActionIdentity(o *options) error {
 	if o.by != "" && !nameRE.MatchString(o.by) {
 		return errors.New("--by must be a name without spaces; use --by NAME")
 	}
@@ -463,20 +550,73 @@ func validateTicketAction(o *options, pos []string) error {
 	if o.cmd == "wait" && o.until == "" {
 		return errors.New("wait requires --until")
 	}
+	return nil
+}
+
+func validateActionOptions(o *options) error {
+	if o.cmd == "set" || o.cmd == "start" {
+		if err := validatePriorityOptions(o); err != nil {
+			return err
+		}
+	}
+
 	if o.cmd == "done" && o.check == "" {
 		return errors.New("done requires --check")
 	}
 	if o.cmd == "reject" && o.why == "" {
 		return errors.New("reject requires --why")
 	}
-	if o.cmd != "show" && o.json {
-		return errors.New("--json is only valid for ls and show")
+
+	return nil
+}
+
+func validatePriorityOptions(o *options) error {
+	if o.prio != "" {
+		o.prio = normalizePrio(o.prio)
+		if !validPrio(o.prio) {
+			return errors.New("--prio must be CRIT, HIGH, MED, MEDIUM, or LOW")
+		}
+	}
+	if !validDiff(o.diff) {
+		return errors.New("--diff must be DO, HUNT, or ARCH")
+	}
+	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" {
+		return errors.New("set needs --prio, --diff, or --why")
 	}
 	return nil
 }
 func validID(id string) bool {
 	return slugRE.MatchString(id) || ticketIDRE.MatchString(id)
 }
+func normalizePrio(p string) string {
+	if p == "MEDIUM" {
+		return "MED"
+	}
+	return p
+}
+func validPrio(p string) bool { return p == "CRIT" || p == "HIGH" || p == "MED" || p == "LOW" }
+
+func requiresWhyForPromotion(oldPrio, newPrio string) bool {
+	newPrio = normalizePrio(newPrio)
+	if newPrio != "CRIT" && newPrio != "HIGH" {
+		return false
+	}
+	return prioRank(newPrio) < prioRank(oldPrio)
+}
+
+func prioRank(prio string) int {
+	switch normalizePrio(prio) {
+	case "CRIT":
+		return 0
+	case "HIGH":
+		return 1
+	case "MED":
+		return 2
+	default:
+		return 3
+	}
+}
+func validDiff(d string) bool { return d == "" || d == "DO" || d == "HUNT" || d == "ARCH" }
 func duration(s string) (time.Duration, error) {
 	if before, ok := strings.CutSuffix(s, "d"); ok {
 		n, e := strconv.ParseFloat(before, 64)
@@ -526,6 +666,7 @@ func run(o options, out, errout io.Writer) int {
 	// Дерево кода (glint, команды плана) остаётся текущим, а тикеты, которые
 	// основное дерево не отслеживает, общие для всех его worktree.
 	o.baseRoot = root
+	o.mainRoot = main
 	if shared, err := sharedTaskRoot(root, main); err != nil {
 		return fail(errout, err)
 	} else if shared != "" {
@@ -548,16 +689,63 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	if o.baseRoot == "" {
 		o.baseRoot = root
 	}
+	if code, handled := runBaseCommand(root, dir, o, out, errout); handled {
+		return code
+	}
+	return runLockedCommand(root, dir, o, out, errout)
+}
+
+func runBaseCommand(root, dir string, o options, out, errout io.Writer) (int, bool) {
 	switch o.cmd {
 	case "new":
-		return create(root, dir, o, out, errout)
+		return createAtBase(root, dir, o, out, errout), true
 	case "ls":
-		return list(root, o, out, errout)
+		return list(root, o, out, errout), true
 	case "lint":
-		return lint(root, "", out, errout)
+		return lint(root, "", out, errout), true
 	case "archive":
-		return archive(root, dir, o, out, errout)
+		return archive(root, dir, o, out, errout), true
+	case "next":
+		return nextTask(root, o.mainRoot, dir, o, out, errout), true
+	default:
+		return 0, false
 	}
+}
+
+func createAtBase(root, dir string, o options, out, errout io.Writer) int {
+	if o.to != "" {
+		target, err := destinationProject(o.to)
+		if err != nil {
+			return fail(errout, err)
+		}
+		root, dir = target, filepath.Join(target, "docs/tasks")
+	}
+	return create(root, dir, o, out, errout)
+}
+
+func destinationProject(name string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("determine destination project: %w", err)
+	}
+	target := name
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(home, "git", target)
+	}
+	info, err := os.Stat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("project %q does not exist", name)
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect project %q: %w", name, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project %q is not a directory", name)
+	}
+	return target, nil
+}
+
+func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 	release, err := lockForCommand(dir, o.cmd)
 	if err != nil {
 		return fail(errout, err)
@@ -565,39 +753,49 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 	defer release()
 	t, err := find(dir, o.id)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintf(errout, "tk: task %q not found\n", o.id)
-			return exitNone
-		}
-		fmt.Fprintln(errout, "tk:", err)
-		return exitUsage
+		return reportFindError(err, o.id, errout)
 	}
-	if o.cmd == "show" {
-		if o.json {
-			return showJSON(root, t, out, errout)
-		}
-		fmt.Fprintf(out, "%s\n%s", relative(root, t.path), wrapLines(t.body, showWidth))
-		if !strings.HasSuffix(t.body, "\n") {
-			fmt.Fprintln(out)
-		}
-		return 0
+	return runFoundTask(root, t, o, out, errout)
+}
+
+func reportFindError(err error, id string, errout io.Writer) int {
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(errout, "tk: task %q not found\n", id)
+		return exitNone
 	}
-	if o.cmd == "check" {
+	fmt.Fprintln(errout, "tk:", err)
+	return exitUsage
+}
+
+func runFoundTask(root string, t task, o options, out, errout io.Writer) int {
+	switch o.cmd {
+	case "show":
+		return showTask(root, t, o, out, errout)
+	case "check":
 		return checkPlan(o.baseRoot, t, o.planLimit(), out)
-	}
-	if o.cmd == "plan" {
+	case "plan":
 		if o.repin != "" {
 			return repinPlanItem(t, o, out, errout)
 		}
 		return addPlanItem(t, o, out, errout)
-	}
-	if o.cmd == "skip" {
+	case "skip":
 		return skipPlanItem(t, o, out, errout)
-	}
-	if o.cmd == "note" {
+	case "note":
 		return addNote(t, o, out, errout)
+	default:
+		return transition(t, o, out, errout)
 	}
-	return transition(t, o, out, errout)
+}
+
+func showTask(root string, t task, o options, out, errout io.Writer) int {
+	if o.json {
+		return showJSON(root, t, out, errout)
+	}
+	fmt.Fprintf(out, "%s\n%s", relative(root, t.path), wrapLines(t.body, showWidth))
+	if !strings.HasSuffix(t.body, "\n") {
+		fmt.Fprintln(out)
+	}
+	return 0
 }
 
 // sharedTaskRoot возвращает основное дерево main, если tk запущен из другого
@@ -756,19 +954,37 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		title = o.id
 	}
 	// Исполнителя ставит start: автор тикета часто его же и проверяет.
-	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
-		title, now.Format("2006-01-02 15:04"), o.by)
+	meta := ""
+	if o.why != "" {
+		meta += "Причина: " + o.why + "\n"
+	}
+	if o.back != "" {
+		meta += "Заказчик: " + o.back + "\n"
+	}
+	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n%s\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
+		title, meta, now.Format("2006-01-02 15:04"), o.by)
 	if o.text != "" {
 		body = fillTicket(body, o.text)
 	}
 	if err := validatePlanSection(body); err != nil {
 		return fail(errout, err)
 	}
-	p := filepath.Join(dir, now.Format("20060102-1504")+"-"+o.prio+"-"+o.id+".md")
+	name := now.Format("20060102-1504") + "-" + o.prio + "-"
+	if o.diff != "" {
+		name += o.diff + "-"
+	}
+	p := filepath.Join(dir, name+o.id+".md")
 	if e = writeTask(p, body); e != nil {
 		return fail(errout, e)
 	}
-	fmt.Fprintln(out, relative(root, p))
+	createdPath := relative(root, p)
+	if o.to != "" {
+		createdPath, e = filepath.Abs(p)
+		if e != nil {
+			return fail(errout, e)
+		}
+	}
+	fmt.Fprintln(out, createdPath)
 	return 0
 }
 func fail(w io.Writer, e error) int { fmt.Fprintf(w, "tk: %v\n", e); return exitUsage }
@@ -789,8 +1005,8 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 		if en.IsDir() {
 			continue
 		}
-		m := fileRE.FindStringSubmatch(en.Name())
-		if m == nil {
+		name, ok := parseTaskName(en.Name())
+		if !ok {
 			continue
 		}
 		p := filepath.Join(dir, en.Name())
@@ -802,7 +1018,7 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 		if e != nil {
 			return nil, e
 		}
-		created, err := time.ParseInLocation("20060102-1504", m[1]+"-"+m[2], time.Local)
+		created, err := time.ParseInLocation("20060102-1504", name.date+"-"+name.clock, time.Local)
 		if err != nil {
 			return nil, fmt.Errorf("invalid task filename %s: %w", en.Name(), err)
 		}
@@ -814,7 +1030,7 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 			}
 			st, _ = explicitStatus(s)
 		}
-		ts = append(ts, task{p, m[4], st, m[3], title(s), s, created, lastChange(s, info.ModTime())})
+		ts = append(ts, task{p, name.slug, st, name.prio, name.diff, title(s), s, created, lastChange(s, info.ModTime())})
 	}
 	return ts, nil
 }
@@ -894,7 +1110,27 @@ func find(dir, id string) (task, error) {
 }
 func matchesID(t task, id string) bool {
 	base := filepath.Base(t.path)
-	return t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id
+	if t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id {
+		return true
+	}
+	for _, line := range journalLines(t.body) {
+		if m := renameHistoryRE.FindStringSubmatch(line); m != nil && (m[1] == id || strings.TrimSuffix(m[1], ".md") == id) {
+			return true
+		}
+	}
+	return false
+}
+
+type taskName struct{ date, clock, prio, diff, slug string }
+
+var renameHistoryRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} переименован — \S+: (\S+) → (\S+)$`)
+
+func parseTaskName(name string) (taskName, bool) {
+	m := fileRE.FindStringSubmatch(name)
+	if m == nil {
+		return taskName{}, false
+	}
+	return taskName{date: m[1], clock: m[2], prio: m[3], diff: m[4], slug: m[5]}, true
 }
 
 func list(root string, o options, out, errout io.Writer) int {
@@ -943,8 +1179,10 @@ func gatherTasks(root string, o options) ([]task, map[string]string, []string, e
 			return nil, nil, nil, err
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") && fileRE.FindStringSubmatch(entry.Name()) == nil {
-				skipped = append(skipped, entry.Name())
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") {
+				if _, ok := parseTaskName(entry.Name()); !ok {
+					skipped = append(skipped, entry.Name())
+				}
 			}
 		}
 		for i := range loaded {
@@ -2174,29 +2412,108 @@ func checkDone(t *task, o options, errout io.Writer) (int, func(), int) {
 }
 
 func transition(t task, o options, out, errout io.Writer) int {
-	next := map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён"}[o.cmd]
-	glintFindings := 0
-	if o.cmd == "done" {
-		var code int
-		var release func()
-		if glintFindings, release, code = checkDone(&t, o, errout); code != 0 {
-			return code
-		}
+	if o.cmd == "set" {
+		return setTask(t, o, out, errout)
+	}
+	if code, handled := guardStart(t, o, out, errout); handled {
+		return code
+	}
+	glintFindings, release, code := prepareTransition(t, o, errout)
+	if code != 0 {
+		return code
+	}
+	if release != nil {
 		defer release()
 	}
-	if o.cmd == "start" || o.cmd == "review" && executor(t.body) == "" {
-		t.body = setExecutor(t.body, o.by)
+	next := transitionStatus(o.cmd)
+	_, hadStatus := explicitStatus(t.body)
+	body, err := transitionBody(t.body, &o, next, errout)
+	if err != nil {
+		return fail(errout, err)
+	}
+	body = setStatus(body, next)
+	if o.cmd == "start" && !hadStatus {
+		body = moveMetadataAfterStatus(body)
+	}
+	body = journal(body, transitionJournal(o, next, glintFindings))
+	newPath, err := transitionPath(&t, o)
+	if err != nil {
+		return fail(errout, err)
+	}
+	if newPath != t.path {
+		body = journal(body, renameJournal(o.by, t.path, newPath))
+		if err := renameTaskFile(t.path, newPath); err != nil {
+			return fail(errout, err)
+		}
+	}
+	if err := writeRenamedTask(t.path, newPath, body); err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintf(out, "%s %s\n", t.slug, next)
+	return 0
+}
+
+func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
+	if o.cmd != "start" || t.status != "в работе" {
+		return 0, false
+	}
+	owner := executor(t.body)
+	if strings.EqualFold(owner, o.by) && o.prio == "" && o.diff == "" && o.why == "" {
+		fmt.Fprintf(out, "%s %s\n", t.slug, t.status)
+		return 0, true
+	}
+	if owner != "" && !strings.EqualFold(owner, o.by) && !o.take {
+		fmt.Fprintf(errout, "tk: ticket is assigned to %s\n", owner)
+		return exitNone, true
+	}
+	return 0, false
+}
+
+func prepareTransition(t task, o options, errout io.Writer) (int, func(), int) {
+	if o.cmd == "start" && (o.prio != "" || o.diff != "" || o.why != "") {
+		prio := t.prio
+		if o.prio != "" {
+			prio = o.prio
+		}
+		if requiresWhyForPromotion(t.prio, prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == "" {
+			fmt.Fprintln(errout, "tk: --prio CRIT/HIGH requires --why or an existing Причина")
+			return 0, nil, exitUsage
+		}
+	}
+	if o.cmd != "done" {
+		return 0, nil, 0
+	}
+	findings, release, code := checkDone(&t, o, errout)
+	return findings, release, code
+}
+
+func transitionStatus(cmd string) string {
+	return map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён"}[cmd]
+}
+
+func transitionBody(body string, o *options, next string, errout io.Writer) (string, error) {
+	if o.cmd == "start" || o.cmd == "review" && executor(body) == "" {
+		body = setExecutor(body, o.by)
 	}
 	if o.cmd == "wait" {
 		o.until = datedWait(o.until, time.Now())
 		if _, ok := waitDue(o.until, time.Now()); !ok {
 			fmt.Fprintln(errout, "tk: --until has no time at the start: a condition, tk ls --due will not show it")
 		}
-		t.body = setWaiting(setStatus(t.body, next), o.until)
+		body = setWaiting(setStatus(body, next), o.until)
 	}
 	if o.cmd == "start" {
-		t.body = removeWaiting(t.body)
+		body = removeWaiting(body)
+		var err error
+		body, err = applyMetadata(body, *o)
+		if err != nil {
+			return "", err
+		}
 	}
+	return body, nil
+}
+
+func transitionJournal(o options, next string, glintFindings int) string {
 	line := fmt.Sprintf("- %s %s — %s", time.Now().Format("2006-01-02 15:04"), next, o.by)
 	if o.cmd == "done" {
 		checkSession := session()
@@ -2217,13 +2534,176 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "wait" {
 		line += " — " + o.until
 	}
-	t.body = journal(setStatus(t.body, next), line)
-	if e := writeTask(t.path, t.body); e != nil {
-		return fail(errout, e)
+	return line
+}
+
+func transitionPath(t *task, o options) (string, error) {
+	if o.cmd != "start" || o.prio == "" && o.diff == "" {
+		return t.path, nil
 	}
-	fmt.Fprintf(out, "%s %s\n", t.slug, next)
+	parsed, ok := parseTaskName(filepath.Base(t.path))
+	if !ok {
+		return "", errors.New("cannot update an unrecognized ticket name")
+	}
+	prio := parsed.prio
+	if o.prio != "" {
+		prio = o.prio
+	}
+	diff := parsed.diff
+	if o.diff != "" {
+		diff = o.diff
+	}
+	name := parsed.date + "-" + parsed.clock + "-" + prio + "-"
+	if diff != "" {
+		name += diff + "-"
+	}
+	name += parsed.slug + ".md"
+	newPath := filepath.Join(filepath.Dir(t.path), name)
+	if newPath == t.path {
+		return newPath, nil
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		return "", fmt.Errorf("target ticket name already exists: %s", name)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := ensureRenameableTicket(t.path); err != nil {
+		return "", err
+	}
+	return newPath, nil
+}
+
+func applyMetadata(body string, o options) (string, error) {
+	if o.why == "" {
+		return body, nil
+	}
+	return setHeaderValue(body, "Причина: ", o.why)
+}
+func setHeaderValue(body, prefix, value string) (string, error) {
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			lines[i] = prefix + value
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	for i, line := range lines {
+		if strings.HasPrefix(line, "Статус: ") {
+			lines = append(lines[:i+1], append([]string{prefix + value}, lines[i+1:]...)...)
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	for i, line := range lines {
+		if strings.HasPrefix(line, "# ") {
+			lines = append(lines[:i+1], append([]string{prefix + value}, lines[i+1:]...)...)
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	return "", errors.New("cannot insert Причина: ticket has no title or status")
+}
+
+func moveMetadataAfterStatus(body string) string {
+	lines := strings.Split(body, "\n")
+	metadata := make([]string, 0, 2)
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Причина: ") || strings.HasPrefix(line, "Заказчик: ") {
+			metadata = append(metadata, line)
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if len(metadata) == 0 {
+		return body
+	}
+	for i, line := range kept {
+		if strings.HasPrefix(line, "Статус: ") {
+			kept = append(kept[:i+1], append(metadata, kept[i+1:]...)...)
+			return strings.Join(kept, "\n")
+		}
+	}
+	return body
+}
+
+func setTask(t task, o options, out, errout io.Writer) int {
+	prio := t.prio
+	if o.prio != "" {
+		prio = o.prio
+	}
+	diff := t.diff
+	if o.diff != "" {
+		diff = o.diff
+	}
+	if requiresWhyForPromotion(t.prio, prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == "" {
+		fmt.Fprintln(errout, "tk: --prio CRIT/HIGH requires --why or an existing Причина")
+		return exitUsage
+	}
+	body, err := applyMetadata(t.body, o)
+	if err != nil {
+		return fail(errout, err)
+	}
+	old := filepath.Base(t.path)
+	name, ok := parseTaskName(old)
+	if !ok {
+		return fail(errout, errors.New("cannot update ticket with invalid name"))
+	}
+	stamp := name.date + "-" + name.clock
+	newName := fmt.Sprintf("%s-%s-", stamp, prio)
+	if diff != "" {
+		newName += diff + "-"
+	}
+	newName += t.slug + ".md"
+	newPath := filepath.Join(filepath.Dir(t.path), newName)
+	if newPath != t.path {
+		if _, err := os.Stat(newPath); err == nil {
+			return fail(errout, fmt.Errorf("target ticket name already exists: %s", newName))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fail(errout, err)
+		}
+		if err := ensureRenameableTicket(t.path); err != nil {
+			return fail(errout, err)
+		}
+		body = journal(body, renameJournal(o.by, t.path, newPath))
+		if err := renameTaskFile(t.path, newPath); err != nil {
+			return fail(errout, err)
+		}
+	}
+	if err := writeRenamedTask(t.path, newPath, body); err != nil {
+		return fail(errout, err)
+	}
+	fmt.Fprintln(out, newName)
 	return 0
 }
+
+func writeRenamedTask(oldPath, newPath, body string) error {
+	if err := writeTask(newPath, body); err != nil {
+		if newPath != oldPath {
+			if rollbackErr := renameTaskFile(newPath, oldPath); rollbackErr != nil {
+				return fmt.Errorf("write ticket: %v; restore old name: %w", err, rollbackErr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func ensureRenameableTicket(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect ticket before rename: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("cannot rename a symlink ticket")
+	}
+	return nil
+}
+
+func renameJournal(actor, oldPath, newPath string) string {
+	return fmt.Sprintf("- %s переименован — %s: %s → %s", time.Now().Format("2006-01-02 15:04"), actor, filepath.Base(oldPath), filepath.Base(newPath))
+}
+
+var renameTaskFile = os.Rename
+
 func addNote(t task, o options, out, errout io.Writer) int {
 	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, o.note)
 	body := journal(t.body, line)
@@ -2239,6 +2719,9 @@ type taskJSON struct {
 	Slug           string     `json:"slug"`
 	Status         string     `json:"status"`
 	Prio           string     `json:"prio"`
+	Diff           string     `json:"diff"`
+	Back           string     `json:"back"`
+	Why            string     `json:"why"`
 	Title          string     `json:"title"`
 	Created        string     `json:"created"`
 	Changed        string     `json:"changed"`
@@ -2280,7 +2763,8 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 			overdue = true
 		}
 	}
-	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: t.prio, Title: t.title,
+	prio := normalizePrio(t.prio)
+	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: lineValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
 		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
 		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, NoCheck: noCheck(t.body)}
 	if details {
@@ -2289,6 +2773,177 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
 	obj.Plan = planItems(t.body)
 	return obj
+}
+
+type taskGate struct {
+	At   string   `json:"at"`
+	Live []string `json:"live"`
+	Open []string `json:"open"`
+}
+
+func gateOpen(t task, open []string) bool {
+	p := normalizePrio(t.prio)
+	if p == "CRIT" || p == "HIGH" {
+		return true
+	}
+	if t.diff != "" {
+		for _, pair := range open {
+			if pair == p+"-"+t.diff || pair == "MEDIUM-"+t.diff && p == "MED" {
+				return true
+			}
+		}
+		return false
+	}
+	for _, pair := range open {
+		if strings.HasPrefix(pair, p+"-") || p == "MED" && strings.HasPrefix(pair, "MEDIUM-") {
+			return true
+		}
+	}
+	return false
+}
+
+type gateState struct {
+	data    taskGate
+	path    string
+	problem string
+	valid   bool
+}
+
+func readTaskGate() (gateState, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return gateState{}, fmt.Errorf("determine gate directory: %w", err)
+	}
+	state := gateState{path: filepath.Join(home, ".local/state/queue/gate.json"), problem: "gate.json is missing"}
+	content, err := os.ReadFile(state.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return state, nil
+	}
+	if err != nil {
+		state.problem = "cannot read gate.json: " + err.Error()
+		return state, nil
+	}
+	if err := json.Unmarshal(content, &state.data); err != nil {
+		state.problem = "cannot parse gate.json: " + err.Error()
+		return state, nil
+	}
+	at, err := time.Parse(time.RFC3339, state.data.At)
+	if err != nil {
+		state.problem = "gate.json has invalid at timestamp: " + err.Error()
+		return state, nil
+	}
+	if time.Since(at) > 26*time.Hour {
+		state.problem = "gate.json is older than 26 hours"
+		return state, nil
+	}
+	if at.After(time.Now()) {
+		state.problem = "gate.json timestamp is in the future"
+		return state, nil
+	}
+	state.valid = true
+	return state, nil
+}
+
+func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
+	tasks, err := loadTasks(dir, true)
+	if err != nil {
+		return fail(errout, err)
+	}
+	gate, err := readTaskGate()
+	if err != nil {
+		return fail(errout, err)
+	}
+	if !gate.valid {
+		fmt.Fprintf(errout, "tk: %s; showing all candidates (%s)\n", gate.problem, gate.path)
+	}
+	project := root
+	if main != "" {
+		project = main
+	}
+	live := slices.Contains(gate.data.Live, filepath.Base(project))
+	candidates := nextCandidates(tasks, o.by, gate, live)
+	if len(candidates) == 0 {
+		fmt.Fprintln(out, "работы нет")
+		return exitNone
+	}
+	sortNextCandidates(candidates, o.by)
+	return printNext(root, candidates[0], o.json, gate.valid, live, out, errout)
+}
+
+func nextCandidates(tasks []task, actor string, gate gateState, live bool) []task {
+	var candidates []task
+	for i := range tasks {
+		t := tasks[i]
+		if !eligibleForNext(t, actor) {
+			continue
+		}
+		if gate.valid && live && !gateOpen(t, gate.data.Open) {
+			continue
+		}
+		candidates = append(candidates, t)
+	}
+	return candidates
+}
+
+func eligibleForNext(t task, actor string) bool {
+	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
+		return true
+	}
+	if t.status != "ждёт" {
+		return false
+	}
+	at, ok := waitDue(waiting(t.body), time.Now())
+	return ok && !at.After(time.Now())
+}
+
+func nextGroup(t task, actor string) int {
+	prio := normalizePrio(t.prio)
+	if prio == "CRIT" {
+		return 0
+	}
+	if t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
+		return 1
+	}
+	if prio == "HIGH" {
+		return 2
+	}
+	if prio == "MED" {
+		return 3
+	}
+	return 4
+}
+
+func sortNextCandidates(candidates []task, actor string) {
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if nextGroup(left, actor) != nextGroup(right, actor) {
+			return nextGroup(left, actor) < nextGroup(right, actor)
+		}
+		return left.created.Before(right.created)
+	})
+}
+
+type nextTaskJSON struct {
+	taskJSON
+	Closed bool `json:"closed"`
+}
+
+func printNext(root string, t task, jsonOutput, gateValid, live bool, out, errout io.Writer) int {
+	if jsonOutput {
+		obj := nextTaskJSON{taskJSON: taskObject(root, t, "", false), Closed: gateValid && !live}
+		if err := json.NewEncoder(out).Encode(obj); err != nil {
+			return fail(errout, err)
+		}
+		return 0
+	}
+	var row bytes.Buffer
+	printTask(&row, t, "")
+	line := strings.TrimSuffix(row.String(), "\n")
+	if gateValid && !live {
+		line += " закрыто"
+	}
+	fmt.Fprintln(out, line)
+	return 0
 }
 
 // completion — проверяющий и проверка последней строки «готово» журнала: тикет могли открыть заново.
@@ -2397,16 +3052,33 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	body := string(bodyBytes)
 	var issues []string
-	if fileRE.FindStringSubmatch(filepath.Base(path)) == nil {
+	name, validName := parseTaskName(filepath.Base(path))
+	if !validName {
 		issues = append(issues, shown+": invalid file name")
+	} else if (name.prio == "CRIT" || name.prio == "HIGH") && name.date+"-"+name.clock >= mandatoryWhySince && lineValue(body, "Причина: ") == "" {
+		issues = append(issues, shown+": "+name.prio+" without Причина")
 	}
+	return append(issues, lintTicketBody(body, shown)...), nil
+}
+
+func lintTicketBody(body, shown string) []string {
+	var issues []string
 	statusValue, hasStatus := explicitStatus(body)
 	if hasStatus && !validStatus(statusValue) {
 		issues = append(issues, shown+": unknown status "+statusValue)
 	}
 	if !hasStatus {
-		return issues, nil
+		return issues
 	}
+	issues = append(issues, lintTicketSections(body, shown)...)
+	if statusValue == "готово" {
+		issues = append(issues, lintCompletion(body, shown)...)
+	}
+	return issues
+}
+
+func lintTicketSections(body, shown string) []string {
+	var issues []string
 	_, acceptance := sectionBody(body, "## Приёмка")
 	_, oldCheck := sectionBody(body, "## Чем проверить")
 	_, hasJournal := sectionBody(body, "## Журнал")
@@ -2422,15 +3094,18 @@ func lintTicket(path, shown string) ([]string, error) {
 	if err := validatePlanSection(body); err != nil {
 		issues = append(issues, shown+": "+err.Error())
 	}
-	if statusValue == "готово" {
-		checker, check, _ := completion(body)
-		if checker == "" || check == "" {
-			issues = append(issues, shown+": готово without journal verification")
-		} else if doer := executor(body); doer != "" && strings.EqualFold(checker, doer) {
-			issues = append(issues, shown+": checker equals executor")
-		}
+	return issues
+}
+
+func lintCompletion(body, shown string) []string {
+	checker, check, _ := completion(body)
+	if checker == "" || check == "" {
+		return []string{shown + ": готово without journal verification"}
 	}
-	return issues, nil
+	if doer := executor(body); doer != "" && strings.EqualFold(checker, doer) {
+		return []string{shown + ": checker equals executor"}
+	}
+	return nil
 }
 
 func explicitStatus(s string) (string, bool) {
