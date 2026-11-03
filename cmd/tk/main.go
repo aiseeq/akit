@@ -2508,7 +2508,7 @@ func archiveRepo(repo, base string, cut time.Time) ([]string, error) {
 			continue
 		}
 		if err = os.MkdirAll(dstDir, dirMode); err != nil {
-			return moved, err
+			return moved, fmt.Errorf("create archive folder: %w", err)
 		}
 		dst := filepath.Join(dstDir, filepath.Base(t.path))
 		if _, err = os.Stat(dst); err == nil {
@@ -2517,7 +2517,7 @@ func archiveRepo(repo, base string, cut time.Time) ([]string, error) {
 			return moved, err
 		}
 		if err = os.Rename(t.path, dst); err != nil {
-			return moved, err
+			return moved, fmt.Errorf("archive %s: %w", filepath.Base(t.path), err)
 		}
 		moved = append(moved, relative(base, dst))
 	}

@@ -45,7 +45,7 @@ func writeTask(path, body string) error {
 	// The leading dot keeps the temporary file out of fileRE, so a concurrent ls never lists it.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tk-*.tmp")
 	if err != nil {
-		return err
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	if err = writeTemp(tmp, body, mode); err == nil {
 		err = os.Rename(tmp.Name(), path)
