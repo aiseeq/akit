@@ -2043,7 +2043,7 @@ func readChronologicalBriefLines(path string, f *os.File, size int64, from, unti
 		lines, err := readLines(path, keep)
 		for i := range lines {
 			if lines[i].warning != "" {
-				lines[i].warning += " in " + path
+				lines[i].warning = fmt.Sprintf("%s in %s", lines[i].warning, path)
 			}
 		}
 		return lines, err
@@ -2106,40 +2106,22 @@ func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time
 		if consumed {
 			lineNo++
 		}
-		var rawDay []byte
 		if len(raw) > 0 {
-			var after, known bool
-			var err error
-			rawDay, after, known, err = briefRecordStatus(raw, untilDate, until)
+			rawDay, past, err := briefRecordPast(raw, untilDate, until)
 			if err != nil {
 				return nil, err
 			}
-			if known && after {
+			if past {
 				return s.finish(out)
 			}
-			if !known {
-				stamp, err := transcriptTimestamp(raw)
-				if err != nil {
-					return nil, err
-				}
-				if !stamp.IsZero() && stamp.After(until) {
-					return s.finish(out)
-				}
+			if setDay != nil {
+				setDay(rawDay)
 			}
-		}
-		if len(raw) > 0 && setDay != nil {
-			setDay(rawDay)
-		}
-		if len(raw) > 0 && (keep == nil || keep(raw)) {
-			events, parseErr := parseBriefRecord(raw, parser, parsed)
-			if parseErr != nil {
-				s.bad++
-				if s.badErr == nil {
-					s.badLine, s.badErr = lineNo, parseErr
-				}
-			} else {
-				finished := appendBriefEvents(&out, events, until)
-				if finished {
+			if keep == nil || keep(raw) {
+				events, err := parseBriefRecord(raw, parser, parsed)
+				if err != nil {
+					s.noteBad(lineNo, err)
+				} else if appendBriefEvents(&out, events, until) {
 					return s.finish(out)
 				}
 			}
@@ -2160,6 +2142,28 @@ func parseBriefRecord(raw []byte, parser *transcript.Parser, parsed []func([]byt
 		}
 	}
 	return parser.Parse(raw)
+}
+
+// briefRecordPast reports whether a record is later than until, by its day
+// when the day decides it and by its timestamp otherwise.
+func briefRecordPast(raw, untilDate []byte, until time.Time) ([]byte, bool, error) {
+	rawDay, after, known, err := briefRecordStatus(raw, untilDate, until)
+	if err != nil || known {
+		return rawDay, known && after, err
+	}
+	stamp, err := transcriptTimestamp(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	return rawDay, !stamp.IsZero() && stamp.After(until), nil
+}
+
+// noteBad counts a malformed record and keeps the first one for the warning.
+func (s *briefScan) noteBad(lineNo int, err error) {
+	s.bad++
+	if s.badErr == nil {
+		s.badLine, s.badErr = lineNo, err
+	}
 }
 
 func (s *briefScan) finish(out []line) ([]line, error) {
