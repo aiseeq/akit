@@ -1197,6 +1197,10 @@ func TestWforHelpBesideCallNotSeveral(t *testing.T) {
 	if n := utilityCallCount(calls, "wfor"); n != 1 {
 		t.Fatalf("wfor -h beside a call counted: %d calls, want 1", n)
 	}
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	if code := u.pairUtilityCode("wfor", calls, len(calls)-1, 3, "wfor: not yet after 4m"); code != 3 {
+		t.Fatalf("the exit code of the one real wfor call: %d, want 3", code)
+	}
 	calls, err = shellcmd.Calls("prior a; prior -h")
 	if err != nil {
 		t.Fatal(err)
