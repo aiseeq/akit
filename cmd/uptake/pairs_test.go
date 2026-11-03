@@ -51,14 +51,14 @@ func TestPairBusyNeedsDecision(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
 	base := time.Now()
 	evs := []transcript.Event{{Role: transcript.Cmd, Who: "Bash", Time: base, Text: "uptime"}}
-	if got := u.busyGoal(evs, 0, "uptime"); got != "" {
+	if got := u.busyGoal(evs, 0, "uptime", shellcmd.Call{Name: "uptime", Raw: "uptime", Offset: 0}); got != "" {
 		t.Fatalf("probe without decision goal=%q", got)
 	}
 	evs = append(evs, transcript.Event{Role: transcript.Cmd, Who: "Bash", Time: base.Add(3 * time.Minute), Text: "go test ./..."})
-	if got := u.busyGoal(evs, 0, "uptime"); got == "" {
+	if got := u.busyGoal(evs, 0, "uptime", shellcmd.Call{Name: "uptime", Raw: "uptime", Offset: 0}); got == "" {
 		t.Fatal("probe before heavy command was not paired")
 	}
-	if got := u.busyGoal(evs[:1], 0, "busy"); got != "" {
+	if got := u.busyGoal(evs[:1], 0, "busy", shellcmd.Call{Name: "busy", Raw: "busy", Offset: 0}); got != "" {
 		t.Fatalf("busy without heavy command goal=%q", got)
 	}
 	u.collectPairEvents("session", true, nil, evs, nil, nil)
@@ -273,6 +273,277 @@ func TestCandidatesBlind(t *testing.T) {
 	}
 }
 
+func TestCandidatesOrderHidesVerdict(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 91, t.TempDir(), t.TempDir())
+	for i := range 40 {
+		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: fmt.Sprintf("same:%03d", i), pair: "busy", command: "uptime", yes: true})
+		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: fmt.Sprintf("same:%03d", i+40), pair: "busy", command: "uptime", yes: false})
+	}
+	read := func(name string) []byte {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(u.outputDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	if err := u.writeCandidates(); err != nil {
+		t.Fatal(err)
+	}
+	first, verdicts := read("candidates.tsv"), read("candidates-verdict.tsv")
+	labels := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(verdicts)), "\n")[1:] {
+		fields := strings.Split(line, "\t")
+		labels[fields[0]] = fields[2]
+	}
+	last, switches := "", 0
+	for _, line := range strings.Split(strings.TrimSpace(string(first)), "\n")[1:] {
+		id := strings.Split(line, "\t")[0]
+		if last != "" && labels[id] != last {
+			switches++
+		}
+		last = labels[id]
+	}
+	if switches < 5 {
+		t.Fatalf("candidate order reveals verdict: only %d switches", switches)
+	}
+	if err := u.writeCandidates(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(string(first), string(read("candidates.tsv"))) || string(verdicts) != string(read("candidates-verdict.tsv")) {
+		t.Fatal("candidate sample changed with the same seed")
+	}
+}
+
+func TestReportShareNeedsLabels(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	base := time.Now()
+	for i := range 20 {
+		old := pairAt("old", fmt.Sprintf("goal-%d", i), i)
+		old.tool, old.session, old.at = "prior", fmt.Sprintf("s-%d", i), base.Add(time.Duration(i)*time.Hour)
+		newCall := old
+		newCall.way = "new"
+		newCall.id += "-new"
+		newCall.at = old.at.Add(time.Minute)
+		u.pairCalls = append(u.pairCalls, old, newCall)
+	}
+	var b strings.Builder
+	u.writePairReport(&b)
+	if !strings.Contains(b.String(), "не проверено разметкой") || strings.Contains(b.String(), "50.0%") {
+		t.Fatalf("unlabeled share was presented as a conclusion:\n%s", b.String())
+	}
+}
+
+func TestReportShareLabelsThresholds(t *testing.T) {
+	build := func(nYes, nNo, yesCorrect, noPositive int) *run {
+		u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+		u.labelsPath = "synthetic-labels"
+		for i := range nYes {
+			id := fmt.Sprintf("yes-%d", i)
+			candidate := pairCandidate{id: id, pair: "prior", yes: true}
+			u.pairCandidates = append(u.pairCandidates, candidate)
+			u.pairCandidateSample = append(u.pairCandidateSample, candidate)
+			label := "no"
+			if i < yesCorrect {
+				label = "yes"
+			}
+			u.labels = ensureLabels(u.labels)
+			u.labels[id] = label
+		}
+		for i := range nNo {
+			id := fmt.Sprintf("no-%d", i)
+			candidate := pairCandidate{id: id, pair: "prior"}
+			u.pairCandidates = append(u.pairCandidates, candidate)
+			u.pairCandidateSample = append(u.pairCandidateSample, candidate)
+			label := "no"
+			if i < noPositive {
+				label = "yes"
+			}
+			u.labels = ensureLabels(u.labels)
+			u.labels[id] = label
+		}
+		return u
+	}
+	precisionBad := build(50, 0, 35, 0)
+	_, _, pass, reason := precisionBad.pairLabelMetrics("prior")
+	if pass || !strings.Contains(reason, "точность") {
+		t.Fatalf("precision threshold not enforced: %q", reason)
+	}
+	recallBad := build(30, 90, 30, 25)
+	_, _, pass, reason = recallBad.pairLabelMetrics("prior")
+	if pass || !strings.Contains(reason, "полнота") {
+		t.Fatalf("recall threshold not enforced: %q", reason)
+	}
+	passRun := build(90, 10, 90, 0)
+	_, _, pass, reason = passRun.pairLabelMetrics("prior")
+	if !pass {
+		t.Fatalf("valid labels rejected: %s", reason)
+	}
+}
+func ensureLabels(labels map[string]string) map[string]string {
+	if labels == nil {
+		return map[string]string{}
+	}
+	return labels
+}
+
+func TestLabelsFileErrors(t *testing.T) {
+	for _, tc := range []struct{ name, data string }{
+		{"header", "id\twrong\n"},
+		{"empty-id", "id\tlabel\n\tyes\n"},
+		{"invalid-label", "id\tlabel\ncandidate\tmaybe\n"},
+		{"duplicate", "id\tlabel\ncandidate\tyes\ncandidate\tno\n"},
+		{"unknown", "id\tlabel\nunknown\tyes\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "labels.tsv")
+			if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+			u.labelsPath = path
+			u.pairCandidates = []pairCandidate{{id: "candidate", pair: "prior"}}
+			u.pairCandidateSample = append(u.pairCandidateSample, u.pairCandidates[0])
+			err := u.loadPairLabels()
+			if err == nil || !strings.Contains(err.Error(), "line ") {
+				t.Fatalf("expected line-specific error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestReportShareByLayer(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.labelsPath = "labels"
+	u.labels = map[string]string{}
+	for _, layer := range []struct{ agent, instructed, period string }{{"agent-a", "yes", "no-date"}, {"agent-b", "no", "no-date"}} {
+		for i, way := range []string{"new", "old"} {
+			call := pairAt(way, layer.agent+fmt.Sprint(i), i)
+			call.tool, call.agent, call.session, call.period = "prior", layer.agent, layer.agent, layer.period
+			call.instructed = layer.instructed == "yes"
+			u.pairCalls = append(u.pairCalls, call)
+		}
+	}
+	var b strings.Builder
+	u.writePairReport(&b)
+	for _, want := range []string{"| prior | agent-a | yes | no-date |", "| prior | agent-b | no | no-date |"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("missing layer row %q:\n%s", want, b.String())
+		}
+	}
+	if strings.Contains(b.String(), "| prior | all |") {
+		t.Fatal("report merged layers")
+	}
+}
+
+func TestPairCodeSeveralCallsNotOwned(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	calls, err := shellcmd.Calls("page-shot a.html; page-shot b.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range calls {
+		if got := u.pairUtilityCode("page-shot", calls, i, 1, ""); got != -1 {
+			t.Fatalf("call %d incorrectly owns command exit code %d", i, got)
+		}
+	}
+}
+
+func TestPageShotNewLocalOnly(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	session := filepath.Join(home, ".claude", "projects", "synthetic", "transcript.jsonl")
+	base := time.Now().UTC().Truncate(time.Second)
+	lines := []string{fmt.Sprintf(`{"parentUuid":null,"type":"user","timestamp":%q,"message":{"role":"user","content":"synthetic"}}`, base.Format(time.RFC3339))}
+	for i, cmd := range []string{"page-shot file:///synthetic/page.html", "page-shot /synthetic/local.html", "page-shot https://example.org/page.html"} {
+		at, id := base.Add(time.Duration(i+1)*time.Minute), fmt.Sprintf("shot-%d", i)
+		lines = append(lines,
+			fmt.Sprintf(`{"parentUuid":"a%d","type":"assistant","timestamp":%q,"message":{"role":"assistant","content":[{"type":"tool_use","id":%q,"name":"Bash","input":{"command":%q}}]}}`, i, at.Format(time.RFC3339), id, cmd),
+			fmt.Sprintf(`{"parentUuid":"b%d","type":"user","timestamp":%q,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":"captured"}]}}`, i, at.Add(time.Second).Format(time.RFC3339), id))
+	}
+	writeTranscript(t, session, strings.Join(lines, "\n"))
+	u := newRun(base.Add(-time.Minute), base.Add(time.Hour), 5, filepath.Join(root, "out"), home)
+	if err := u.runUptake(base.Add(-time.Minute), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for i := range u.pairCalls {
+		if u.pairCalls[i].tool == "page-shot" && u.pairCalls[i].way == "new" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("new page-shot local calls=%d, want 2: %+v", count, u.pairCalls)
+	}
+}
+
+func TestPairRepeatsNearSessionEnd(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	first := pairAt("new", "/same", 0)
+	first.tool, first.session, first.command = "wfor", "s", "wfor file /same"
+	second := first
+	second.at = first.at.Add(5 * time.Minute)
+	second.command = "wfor file /same --timeout 10"
+	u.pairCalls = []pairCall{first, second}
+	u.sessionEnds = map[string]time.Time{"s": first.at.Add(10 * time.Minute)}
+	if err := u.writePairRepeats(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(u.outputDir, "pair-repeats.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n")[1:] {
+		fields := strings.Split(line, "\t")
+		if fields[0] == "wfor" && fields[1] == "new" {
+			if fields[2] != "2" || fields[3] != "1" || fields[4] != "1" || fields[5] != "1.000000" {
+				t.Fatalf("repeat accounting wrong: %s", line)
+			}
+			return
+		}
+	}
+	t.Fatal("wfor new row missing")
+}
+
+func TestBusyDecisionAfterProbe(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	probeGoal := func(command string) string {
+		calls, err := shellcmd.Calls(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range calls {
+			if calls[i].Name == "busy" {
+				return u.busyGoal(nil, 0, command, calls[i])
+			}
+		}
+		t.Fatalf("busy call missing in %q", command)
+		return ""
+	}
+	if got := probeGoal("go test ./...; busy"); got != "" {
+		t.Fatalf("heavy command before busy paired: %q", got)
+	}
+	if got := probeGoal("busy; go test ./..."); got == "" {
+		t.Fatal("heavy command after busy was not paired")
+	}
+}
+
+func TestReportLimitationsAndErrors(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.pairCalls = []pairCall{{tool: "busy", way: "new", goal: "synthetic", agent: "agent", session: "s", period: "no-date", outcome: "fail", at: time.Now()}}
+	var b strings.Builder
+	u.writePairReport(&b)
+	text := b.String()
+	for _, phrase := range []string{"не по смыслу", "не обязательность", "внутри широкого надмножества", "Взвешивания по составу проектов нет", "версии утилит не учитываются", "ошибки вызова (fail)"} {
+		if !strings.Contains(text, phrase) {
+			t.Errorf("report missing %q", phrase)
+		}
+	}
+	if !strings.Contains(text, "| busy | agent | no | no-date |") || !strings.Contains(text, "| 1 |") {
+		t.Fatalf("failure count missing:\n%s", text)
+	}
+}
+
 func TestPairUserWordOverlap(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -482,5 +753,38 @@ func TestPairUtilityExitCodeAttribution(t *testing.T) {
 		if !found {
 			t.Errorf("%s new outcomes missing: %s", tool, data)
 		}
+	}
+}
+
+func TestLabelRecallWithoutLabelledNo(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.labelsPath = "synthetic-labels"
+	u.labels = map[string]string{}
+	for i := range 40 {
+		c := pairCandidate{id: fmt.Sprintf("yes-%d", i), pair: "prior", yes: true}
+		u.pairCandidates = append(u.pairCandidates, c)
+		u.pairCandidateSample = append(u.pairCandidateSample, c)
+		u.labels[c.id] = "yes"
+	}
+	// "no" candidates exist but none was sampled and labelled: the recall is unknown, not 1.
+	for i := range 40 {
+		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: fmt.Sprintf("no-%d", i), pair: "prior"})
+	}
+	_, recall, pass, reason := u.pairLabelMetrics("prior")
+	if pass || recall >= 0.7 || !strings.Contains(reason, "полнота") {
+		t.Fatalf("recall without labelled no = %.3f, pass %v, %q; want a failed recall", recall, pass, reason)
+	}
+}
+
+func TestLabelsFileMissingSampledID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "labels.tsv")
+	if err := os.WriteFile(path, []byte("id\tlabel\nfirst\tyes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.labelsPath = path
+	u.pairCandidateSample = []pairCandidate{{id: "first", pair: "prior"}, {id: "second", pair: "prior"}}
+	if err := u.loadPairLabels(); err == nil || !strings.Contains(err.Error(), "1 sampled candidates have no label") {
+		t.Fatalf("partial labels: %v", err)
 	}
 }

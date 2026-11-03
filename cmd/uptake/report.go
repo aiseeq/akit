@@ -36,19 +36,26 @@ func (u *run) writeReport() error {
 
 type pairReportTally struct{ newEpisodes, oldEpisodes, mixedEpisodes, calls, fail, unknown int }
 
+type pairReportLayer struct {
+	agent, instructed, period string
+}
+
 func (u *run) writePairReport(b *strings.Builder) {
 	b.WriteString("\n## Пары этапа 2\n\n")
 	if u.releasesPath == "" {
 		b.WriteString("даты выпуска не заданы; период — no-date.\n\n")
 	}
-	b.WriteString("| утилита | доля по эпизодам (95% Уилсон) | эпизоды new / old / mixed | доля ошибок |\n|---|---:|---:|---:|\n")
+	b.WriteString("| утилита | агент | instructed | период | точность (нижняя) | полнота (нижняя) | доля по эпизодам (95% Уилсон) | new / old / mixed | ошибки вызова (fail) |\n|---|---|---|---|---:|---:|---:|---:|---:|\n")
 	for _, tool := range pairTools() {
-		u.writePairReportRow(b, tool, u.pairReportTally(tool))
+		layers := u.pairReportLayers(tool)
+		for _, layer := range layers {
+			u.writePairReportRow(b, tool, layer, u.pairReportTallyForLayer(tool, layer))
+		}
 	}
 	fmt.Fprintf(b, "\nВне пар busy: без последующего решения — %d; `busy --quiet` — %d.\n", u.busyNoDecision, u.busyQuiet)
 	fmt.Fprintf(b, "Поиск решений (по правилу): %d вызовов.\n", u.decisionRuleSearches)
 	fmt.Fprintf(b, "Prior old по источнику: .claude/improve/ — %d вызовов; tl --role user --grep — %d вызовов.\n", u.priorImproveCalls, u.priorTLCalls)
-	b.WriteString("\n## Ограничения замера\n\nЦель определяется по ключу, а не по смыслу; instructed означает упоминание утилиты, а не обязательность её применения. Полнота детекторов оценивается внутри заданного надмножества. Повтор не означает ошибку. Польза tk измерена прокси.\n")
+	b.WriteString("\n## Ограничения замера\n\nЦель определяется по ключу, а не по смыслу; instructed означает упоминание утилиты, а не обязательность её применения. Полнота детекторов оценивается только внутри широкого надмножества кандидатов. Взвешивания по составу проектов нет; версии утилит не учитываются. Повтор не означает ошибку. Польза tk измерена прокси.\n")
 	b.WriteString("Неизвестные исходы новых пар по причинам: ")
 	if len(u.pairUnknownReasons) == 0 {
 		b.WriteString("нет; ")
@@ -69,18 +76,63 @@ func (u *run) writePairReport(b *strings.Builder) {
 	fmt.Fprintf(b, "отклонённых вызовов tool use не учтено: %d.\n", u.rejectedToolUses)
 }
 
-func (u *run) pairReportTally(tool string) pairReportTally {
+func (u *run) pairReportLayers(tool string) []pairReportLayer {
+	set := map[pairReportLayer]bool{}
+	for i := range u.pairCalls {
+		c := &u.pairCalls[i]
+		if c.tool != tool || c.goal == "" {
+			continue
+		}
+		instructed := "no"
+		if c.instructed {
+			instructed = "yes"
+		}
+		period := c.period
+		if period == "" {
+			period = "no-date"
+		}
+		agent := c.agent
+		if agent == "" {
+			agent = "unknown"
+		}
+		set[pairReportLayer{agent, instructed, period}] = true
+	}
+	if len(set) == 0 {
+		set[pairReportLayer{"unknown", "no", "no-date"}] = true
+	}
+	layers := make([]pairReportLayer, 0, len(set))
+	for layer := range set {
+		layers = append(layers, layer)
+	}
+	sort.Slice(layers, func(i, j int) bool {
+		a, c := layers[i], layers[j]
+		return strings.Join([]string{a.agent, a.instructed, a.period}, "\t") < strings.Join([]string{c.agent, c.instructed, c.period}, "\t")
+	})
+	return layers
+}
+
+func (u *run) pairReportTallyForLayer(tool string, layer pairReportLayer) pairReportTally {
 	tally := pairReportTally{}
 	episodes := map[string][]pairCall{}
 	for i := range u.pairCalls {
 		call := &u.pairCalls[i]
-		if call.tool != tool || call.goal == "" {
+		agent, instructed, period := call.agent, "no", call.period
+		if call.instructed {
+			instructed = "yes"
+		}
+		if agent == "" {
+			agent = "unknown"
+		}
+		if period == "" {
+			period = "no-date"
+		}
+		if call.tool != tool || call.goal == "" || agent != layer.agent || instructed != layer.instructed || period != layer.period {
 			continue
 		}
 		episodes[call.session+"|"+call.goal] = append(episodes[call.session+"|"+call.goal], *call)
 		if call.way == "new" {
 			tally.calls++
-			if call.outcome == "fail" || call.outcome == "callerr" {
+			if call.outcome == "fail" {
 				tally.fail++
 			}
 			if call.outcome == "unknown" {
@@ -120,18 +172,86 @@ func reportEpisodeEnd(calls []pairCall, start int) (int, map[string]bool) {
 	return end, ways
 }
 
-func (u *run) writePairReportRow(b *strings.Builder, tool string, tally pairReportTally) {
+func (u *run) pairLabelMetrics(tool string) (float64, float64, bool, string) {
+	nYes, nNo, sampleYes, trueYes, sampleNo, falseYes := 0, 0, 0, 0, 0, 0
+	for i := range u.pairCandidates {
+		c := &u.pairCandidates[i]
+		if c.pair == tool {
+			if c.yes {
+				nYes++
+			} else {
+				nNo++
+			}
+		}
+	}
+	for i := range u.pairCandidateSample {
+		c := &u.pairCandidateSample[i]
+		if c.pair != tool {
+			continue
+		}
+		label, ok := u.labels[c.id]
+		if !ok {
+			continue
+		}
+		if c.yes {
+			sampleYes++
+			if label == "yes" {
+				trueYes++
+			}
+		} else {
+			sampleNo++
+			if label == "yes" {
+				falseYes++
+			}
+		}
+	}
+	if u.labelsPath == "" || sampleYes == 0 {
+		return 0, 0, false, "не проверено разметкой"
+	}
+	pLo, _ := u.wilson(trueYes, sampleYes)
+	// Without labelled "no" candidates the miss rate is unknown: take its worst case, not zero.
+	qHi := 0.0
+	if sampleNo > 0 {
+		_, qHi = u.wilson(falseYes, sampleNo)
+	} else if nNo > 0 {
+		qHi = 1
+	}
+	denom := pLo*float64(nYes) + qHi*float64(nNo)
+	recallLo := 0.0
+	if denom > 0 {
+		recallLo = pLo * float64(nYes) / denom
+	}
+	if pLo < 0.8 {
+		return pLo, recallLo, false, fmt.Sprintf("разметка: точность %.2f < 0,8", pLo)
+	}
+	if recallLo < 0.7 {
+		return pLo, recallLo, false, fmt.Sprintf("разметка: полнота %.2f < 0,7", recallLo)
+	}
+	return pLo, recallLo, true, ""
+}
+
+func (u *run) writePairReportRow(b *strings.Builder, tool string, layer pairReportLayer, tally pairReportTally) {
 	total := tally.newEpisodes + tally.oldEpisodes
+	precision, recall, verified, reason := u.pairLabelMetrics(tool)
+	precisionText, recallText := "—", "—"
+	if u.labelsPath == "" {
+		precisionText, recallText = "не проверено разметкой", "не проверено разметкой"
+	} else {
+		precisionText = fmt.Sprintf("%.3f", precision)
+		recallText = fmt.Sprintf("%.3f", recall)
+	}
 	share := "мало данных"
-	if total >= 20 {
+	if u.labelsPath == "" {
+		share = "не проверено разметкой"
+	} else if !verified {
+		share = reason
+	} else if total >= 20 {
 		low, high := u.wilson(tally.newEpisodes, total)
 		share = fmt.Sprintf("%.1f%% (%.1f–%.1f%%)", 100*float64(tally.newEpisodes)/float64(total), 100*low, 100*high)
 	}
-	errorShare := "—"
-	if tally.calls > 0 {
-		errorShare = fmt.Sprintf("%.1f–%.1f%%", 100*float64(tally.fail)/float64(tally.calls), 100*float64(tally.fail+tally.unknown)/float64(tally.calls))
-	}
-	fmt.Fprintf(b, "| %s | %s | %d / %d / %d | %s |\n", tool, share, tally.newEpisodes, tally.oldEpisodes, tally.mixedEpisodes, errorShare)
+	fmt.Fprintf(b, "| %s | %s | %s | %s | %s | %s | %s | %d / %d / %d | %d |\n",
+		tool, layer.agent, layer.instructed, layer.period, precisionText, recallText, share,
+		tally.newEpisodes, tally.oldEpisodes, tally.mixedEpisodes, tally.fail)
 }
 
 type reportTally struct{ window, recent, old int }
