@@ -320,3 +320,67 @@ func TestMaskPGPPrivateKeyBlock(t *testing.T) {
 		t.Errorf("public block changed: counts %v", found)
 	}
 }
+
+// A generated key may hold no digit by chance: where the prefix stands on its
+// own and the body has no separators, nothing else looks like this.
+func TestMaskDigitlessKeyAtCleanEdge(t *testing.T) {
+	letters := func(n int) string { return strings.Repeat("aBcDeFgHiJkL", n/12+1)[:n] }
+	keys := map[string]string{
+		"sk" + "_live_": "sk_live", "sk" + "_test_": "sk_live", "rk" + "_live_": "sk_live", "rk" + "_test_": "sk_live", "pk" + "_live_": "sk_live", "pk" + "_test_": "sk_live",
+		"gh" + "p_": "github", "gh" + "o_": "github", "gh" + "u_": "github", "gh" + "s_": "github", "gh" + "r_": "github",
+		"AI" + "za": "google",
+	}
+	for prefix, kind := range keys {
+		key := prefix + letters(36)
+		for _, before := range []string{"", " ", "KEY=", "\"", "\n", `\n`, "[32m"} {
+			got, found := Mask(before + key + " tail")
+			if got != before+"[скрыто:"+kind+"] tail" || found[kind] != 1 {
+				t.Errorf("%s after %q: counts %v, output length %d", kind, before, found, len(got))
+			}
+		}
+		for _, before := range []string{"x", "7", "x_", "x-", "_", "-"} {
+			if got, found := Mask(before + key); got != before+key || len(found) != 0 {
+				t.Errorf("%s glued after %q changed: counts %v", kind, before, found)
+			}
+		}
+	}
+}
+
+// Names and kinds whose bodies can hold words keep needing a digit.
+func TestMaskDigitlessNamesStay(t *testing.T) {
+	for _, text := range []string{
+		"network_test_ConnectionTimeoutCase",
+		"framework_test_HandlesEmptyInput",
+		"my_pk_test_ConnectionTimeoutCase",
+		"task_ThisIsLongDescriptiveName",
+		"xo" + "xo-hugs-and-kisses-from-me",
+		"xo" + "xb-hugs-and-kisses-from-me",
+		"sk-proj-migration-notes-final-version",
+		"sk-ant-colony-optimisation-notes-draft",
+		"github" + "_pat_some_very_long_descriptive_name_here",
+		"gh" + "p_short",
+		"sk" + "_live_short",
+	} {
+		if got, found := Mask("before " + text + " after"); got != "before "+text+" after" || len(found) != 0 {
+			t.Errorf("text of %d bytes changed: counts %v", len(text), found)
+		}
+	}
+}
+
+// A personal token prefix inside a fine-grained token must not cut it apart.
+func TestMaskGithubPatWithTokenPrefixInside(t *testing.T) {
+	body := "aaaaa" + "gh" + "p_" + strings.Repeat("a1B2", 10) + "BBBB"
+	got, found := Mask("key github" + "_pat_" + body + " end")
+	if got != "key [скрыто:github] end" || found["github"] != 1 {
+		t.Errorf("output length %d, counts %v", len(got), found)
+	}
+}
+
+// A digitless match cut by _ is not a key: the real key after it must not lose its prefix.
+func TestMaskDigitlessMatchBeforeRealKey(t *testing.T) {
+	key := "sk" + "_live_" + strings.Repeat("a1B2", 8)
+	got, found := Mask("rk" + "_live_" + strings.Repeat("aBcD", 8) + key + " end")
+	if !strings.HasSuffix(got, "[скрыто:sk_live] end") || found["sk_live"] != 1 || strings.Contains(got, "a1B2") {
+		t.Errorf("output length %d, counts %v", len(got), found)
+	}
+}

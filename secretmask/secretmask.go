@@ -5,12 +5,24 @@
 // Detection has deliberate limits:
 //   - Short fragments after a bare letter or digit, and generic sk values
 //     without digits, can leak.
+//   - A random body holds no digit by chance: over 62 characters 1.47% at length
+//     24, 0.21% at 35, 0.18% at 36; AIza bodies, over 64, 0.26% at 35. Such a key
+//     of the sk_live, gh?_ or AIza kinds is hidden only where it stands on its
+//     own; next to a letter, a digit, - or _ it leaks. Other kinds always need a
+//     digit: their bodies can hold phrases, and the shortest forms accepted here
+//     can leak without one (github_pat_ 0.56%, sk-proj- and sk-ant- 3.3%, xox?-
+//     17.8% at the minimum length), real keys of these kinds being much longer.
 //   - Base64url under generic sk can split into short fragments: at length 32,
 //     0.47% after a space and 28.34% after a letter.
 //   - Escapes outside escapeRE grammar can leak, including byte 0x9b.
 //   - rk_, pk_ and sk_ names with test/live can be corrupted when a fragment
 //     is at least 16 characters and contains a digit (see
 //     network_test_HandlesUtf8Input).
+//   - A name of the sk_live, gh?_ or AIza form standing on its own is corrupted
+//     when its body is long enough, with or without a digit: one long word
+//     (pk_test_ConnectionTimeoutCase), also before a dot (…Case.Field), and for
+//     AIza a phrase joined by - or _. A leaked key costs more than these names,
+//     which ordinary text rarely has.
 //   - At a left boundary, digit-bearing names can be corrupted, including
 //     sk-learn-contrib-imbalanced-2024-01, sk_buff_data_end_offset_2_bytes,
 //     --sk-color-primary-500-hover-dark and xoxo-hugs-and-kisses-2026.
@@ -44,6 +56,9 @@ type acceptance uint8
 const (
 	acceptDigitAndRun acceptance = iota
 	acceptGenericSk
+	// acceptAlsoStandingAlone adds a body without a digit where the token stands
+	// on its own: these prefixes rarely start anything but a key.
+	acceptAlsoStandingAlone
 )
 
 const (
@@ -71,12 +86,13 @@ type tokenVariant struct {
 // last so it sees the text after more specific tokens have been replaced.
 var patterns = [...]pattern{
 	{kind: "private-key", re: privateKeyRE},
-	{kind: "sk_live", variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, acceptance: acceptDigitAndRun, firstBytes: "srp"},
+	{kind: "sk_live", variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, acceptance: acceptAlsoStandingAlone, firstBytes: "srp"},
 	{kind: "sk", variants: []tokenVariant{{"sk-proj-", tokenChars, 28}, {"sk-ant-", tokenChars, skAntMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "s"},
-	{kind: "github", variants: []tokenVariant{{"ghp_", alphaNum, githubTokenMinimumLength}, {"gho_", alphaNum, githubTokenMinimumLength}, {"ghu_", alphaNum, githubTokenMinimumLength}, {"ghs_", alphaNum, githubTokenMinimumLength}, {"ghr_", alphaNum, githubTokenMinimumLength}, {"github_pat_", alphaUnderscore, githubPatMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "g"},
+	{kind: "github", variants: []tokenVariant{{"github_pat_", alphaUnderscore, githubPatMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "g"},
+	{kind: "github", variants: []tokenVariant{{"ghp_", alphaNum, githubTokenMinimumLength}, {"gho_", alphaNum, githubTokenMinimumLength}, {"ghu_", alphaNum, githubTokenMinimumLength}, {"ghs_", alphaNum, githubTokenMinimumLength}, {"ghr_", alphaNum, githubTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone, firstBytes: "g"},
 	{kind: "slack", variants: []tokenVariant{{"xoxa-", alphaDash, 15}, {"xoxb-", alphaDash, 15}, {"xoxe-", alphaDash, 15}, {"xoxo-", alphaDash, 15}, {"xoxp-", alphaDash, 15}, {"xoxr-", alphaDash, 15}, {"xoxs-", alphaDash, 15}}, acceptance: acceptDigitAndRun, firstBytes: "x"},
 	{kind: "aws", re: awsRE},
-	{kind: "google", variants: []tokenVariant{{"AIza", tokenChars, googleTokenMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "A"},
+	{kind: "google", variants: []tokenVariant{{"AIza", tokenChars, googleTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone, firstBytes: "A"},
 	{kind: "sk", variants: []tokenVariant{{"sk-", tokenChars, 23}, {"sk_", tokenChars, 23}}, acceptance: acceptGenericSk, firstBytes: "s"},
 }
 
@@ -175,8 +191,20 @@ func acceptsToken(text string, start, body, end int, p pattern, runs *runIndex) 
 		}
 		return (boundaryBefore(text, start) || start > 0 && text[start-1] == '_') && runs.hasDigit(start, end)
 	}
+	if p.acceptance == acceptAlsoStandingAlone && standsAlone(text, start, end) {
+		return true
+	}
 	return runs.hasDigit(start, end) && (boundaryBefore(text, start) || runs.has(start, end, 16))
 }
+
+// standsAlone: nothing joins the token to a longer one. Unlike boundaryBefore,
+// - and _ do not count as an edge: they make a longer name, or a real key may
+// start inside this match and its body must not be left behind the cut.
+func standsAlone(text string, start, end int) bool {
+	return boundaryBefore(text, start) && (start == 0 || !isJoiner(text[start-1])) && (end == len(text) || !isJoiner(text[end]))
+}
+
+func isJoiner(c byte) bool { return c == '-' || c == '_' }
 
 type scanIndex struct {
 	runs *runIndex
