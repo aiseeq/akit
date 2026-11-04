@@ -301,3 +301,22 @@ func hasRandomRun(text string, n int) bool {
 	}
 	return false
 }
+
+func TestMaskPGPPrivateKeyBlock(t *testing.T) {
+	begin, end := "-----BEGIN PGP PRIVATE KEY BLOCK-----", "-----END PGP PRIVATE KEY BLOCK-----"
+	body := "\n\nlQOYBGabcdefgh\n=abcd\n"
+	for name, text := range map[string]string{"closed": begin + body + end + "\nafter", "open": begin + body} {
+		got, found := Mask(text)
+		if found["private-key"] != 1 || strings.Contains(got, "lQOYB") {
+			t.Errorf("%s block: counts %v, output length %d", name, found, len(got))
+		}
+	}
+	got, found := Mask("before\n" + begin + body + end + "\nafter")
+	if got != "before\n[скрыто:private-key]\nafter" || found["private-key"] != 1 {
+		t.Errorf("text around a closed block changed: counts %v, output length %d", found, len(got))
+	}
+	public := "-----BEGIN PGP PUBLIC KEY BLOCK-----" + body + "-----END PGP PUBLIC KEY BLOCK-----"
+	if got, found := Mask(public); got != public || len(found) != 0 {
+		t.Errorf("public block changed: counts %v", found)
+	}
+}
