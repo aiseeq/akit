@@ -412,6 +412,10 @@ func commandLeftBoundary(text string, at int) bool {
 // literalSpaceAt returns the length of a written \n, \r or \t at this place, with
 // the backslashes of any escaping depth: raw JSON and %q output carry them as text.
 func literalSpaceAt(text string, at int) int {
+	// Only the head of a series can start the literal: this keeps a long series linear.
+	if at > 0 && text[at-1] == '\\' {
+		return 0
+	}
 	end := at
 	for end < len(text) && text[end] == '\\' {
 		end++

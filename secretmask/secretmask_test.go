@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Fake values are built at run time, so the source holds nothing that looks like a key. Failures name the
@@ -540,6 +541,29 @@ func TestMaskToolAfterWrittenLineBreak(t *testing.T) {
 	} {
 		if out, found := Mask(text); out != text || len(found) != 0 {
 			t.Errorf("changed: %q -> %q %v", text, out, found)
+		}
+	}
+}
+
+// A bare -p of mysql asks for the password, so the word after it is no value:
+// a written line break behaves here as a real one and as a space.
+func TestMaskBareMysqlFlagBeforeWrittenLineBreak(t *testing.T) {
+	for _, sep := range []string{` `, "\n", `\n`, `\\n`, `\t`} {
+		text := `mysql -p` + sep + `Vvalue123 db`
+		if out, found := Mask(text); out != text || len(found) != 0 {
+			t.Errorf("changed: %q -> %q %v", text, out, found)
+		}
+	}
+}
+
+func TestMaskLinearOnBackslashSeries(t *testing.T) {
+	const size = 1 << 20
+	series := strings.Repeat(`\`, size)
+	for _, text := range []string{`curl ` + series + `x`, `curl ` + series + `n`, series, strings.Repeat(`curl \\\\x `, size/10), `curl ` + strings.Repeat(`\\\n`, size/4)} {
+		start := time.Now()
+		Mask(text)
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("%.12q: %v on 1 MiB", text, took)
 		}
 	}
 }
