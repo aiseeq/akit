@@ -186,6 +186,14 @@ Queue gates close only the start of new work: a ticket the agent already took an
 `tk done` ends with a `следующий:` line when the queue has a ticket: the one `tk next` would give the
 ticket's executor.
 
+In projects under `$HOME/git` or `$HOME/work`, `tk next` can read an executable `.tk-next-source`
+in the projects root. It receives the project directory name and prints a JSON array of tickets with
+`key`, `title`, `status`, `prio` and `url`; it has a five second limit, and a failed source leaves
+local tickets available with a warning. `tk new --to NAME` resolves names in either projects root
+and reports an error if both contain that name. When creating tickets in an eligible repository,
+`tk new` links `docs/tasks` to the shared `tasks/PROJECT` store and records the ignore rule in the
+repository's exclude file when needed.
+
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. Each check gets 8 minutes

@@ -2573,15 +2573,9 @@ func TestDoneHintsNextTicket(t *testing.T) {
 		tickets := map[string]string{closing: "в работе"}
 		maps.Copy(tickets, others)
 		root, dir := queueProject(t, gate, tickets)
-		path := filepath.Join(dir, closing+".md")
-		content, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ticket := task{path: path, slug: "closing", prio: "HIGH", status: "в работе", body: string(content)}
 		var out, errout bytes.Buffer
-		o := options{cmd: "done", by: "checker", check: "checked by test", baseRoot: root}
-		if code := transition(ticket, o, &out, &errout); code != 0 {
+		o := options{cmd: "done", id: "closing", by: "checker", check: "checked by test", baseRoot: root}
+		if code := runLockedCommand(root, dir, o, &out, &errout); code != 0 {
 			t.Fatalf("done = %d, stderr %q", code, errout.String())
 		}
 		return out.String()

@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/timearg"
@@ -52,7 +53,7 @@ Flags:
   --prio P       new/set/start: CRIT, HIGH, MED, MEDIUM, or LOW (new default MED)
   --diff D       new/set/start: difficulty DO, HUNT, or ARCH
   --why TEXT     new: required for CRIT/HIGH; set/start: required when promoting to CRIT/HIGH; reject: reason
-  --to PROJECT   new: create in PROJECT/docs/tasks; absolute PROJECT is its root
+  --to PROJECT   new: create in PROJECT/docs/tasks; absolute path or project name
   --back NAME    new: requesting session
   --title TEXT   new: ticket title (default: slug)
   --by NAME      actor name (default: current session); ls: show tickets assigned to NAME
@@ -713,14 +714,53 @@ func runBaseCommand(root, dir string, o options, out, errout io.Writer) (int, bo
 }
 
 func createAtBase(root, dir string, o options, out, errout io.Writer) int {
+	main := o.mainRoot
 	if o.to != "" {
 		target, err := destinationProject(o.to)
 		if err != nil {
 			return fail(errout, err)
 		}
 		root, dir = target, filepath.Join(target, "docs/tasks")
+		main = ""
+	}
+	if err := prepareTaskDirectory(root, main); err != nil {
+		return fail(errout, err)
+	}
+	if o.to != "" {
+		var err error
+		main, err = gitMainRoot(root)
+		if err != nil {
+			return fail(errout, err)
+		}
+	}
+	base := o.baseRoot
+	if o.to != "" {
+		base = root
+	}
+	if main != "" && base != "" {
+		if shared, err := sharedTaskRoot(base, main); err != nil {
+			return fail(errout, err)
+		} else if shared != "" {
+			root, dir = shared, filepath.Join(shared, "docs/tasks")
+		}
 	}
 	return create(root, dir, o, out, errout)
+}
+
+func gitMainRoot(target string) (string, error) {
+	b, err := exec.Command("git", "-C", target, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 128 {
+			return "", nil
+		}
+		return "", fmt.Errorf("git rev-parse in %s: %w", target, err)
+	}
+	common := strings.TrimSpace(string(b))
+	if filepath.Base(common) != ".git" {
+		return "", nil
+	}
+	return filepath.Dir(common), nil
 }
 
 func destinationProject(name string) (string, error) {
@@ -730,7 +770,27 @@ func destinationProject(name string) (string, error) {
 	}
 	target := name
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(home, "git", target)
+		gitPath, workPath := filepath.Join(home, "git", name), filepath.Join(home, "work", name)
+		gi, ge := os.Stat(gitPath)
+		wi, we := os.Stat(workPath)
+		if ge != nil && !errors.Is(ge, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect project %s: %w", gitPath, ge)
+		}
+		if we != nil && !errors.Is(we, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect project %s: %w", workPath, we)
+		}
+		gok, wok := ge == nil && gi.IsDir(), we == nil && wi.IsDir()
+		if gok && wok {
+			return "", fmt.Errorf("project %q exists in both %s and %s; pass an absolute path", name, gitPath, workPath)
+		}
+		if !gok && !wok {
+			return "", fmt.Errorf("project %q not found at %s or %s", name, gitPath, workPath)
+		}
+		if wok {
+			target = workPath
+		} else {
+			target = gitPath
+		}
 	}
 	info, err := os.Stat(target)
 	if errors.Is(err, os.ErrNotExist) {
@@ -750,12 +810,17 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 	if err != nil {
 		return fail(errout, err)
 	}
-	defer release()
 	t, err := find(dir, o.id)
 	if err != nil {
+		release()
 		return reportFindError(err, o.id, errout)
 	}
-	return runFoundTask(root, t, o, out, errout)
+	code := runFoundTask(root, t, o, out, errout)
+	release()
+	if o.cmd == "done" && code == 0 {
+		hintNext(t, dir, o, out, errout)
+	}
+	return code
 }
 
 func reportFindError(err error, id string, errout io.Writer) int {
@@ -986,6 +1051,151 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	}
 	fmt.Fprintln(out, createdPath)
 	return 0
+}
+
+func prepareTaskDirectory(target, knownMain string) error {
+	main := knownMain
+	if main == "" {
+		var err error
+		main, err = gitMainRoot(target)
+		if err != nil || main == "" {
+			return err
+		}
+	}
+	common, err := exec.Command("git", "-C", target, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return fmt.Errorf("git rev-parse in %s: %w", target, err)
+	}
+	commonDir := strings.TrimSpace(string(common))
+	_, applicable, pathErr := taskSourcePath(main)
+	if pathErr != nil {
+		return pathErr
+	}
+	if !applicable {
+		return nil
+	}
+	tasksRoot := filepath.Dir(main)
+	docsTasks := filepath.Join(main, "docs/tasks")
+	ready, err := existingTaskDirectory(docsTasks)
+	if err != nil || ready {
+		return err
+	}
+	store := filepath.Join(tasksRoot, "tasks")
+	storeInfo, err := os.Stat(store)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("ticket store %s is missing", store)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect ticket store %s: %w", store, err)
+	}
+	if !storeInfo.IsDir() {
+		return fmt.Errorf("ticket store %s is not a directory", store)
+	}
+	project := filepath.Base(main)
+	if err := os.MkdirAll(filepath.Join(tasksRoot, "tasks", project), dirMode); err != nil {
+		return fmt.Errorf("create ticket store for %s: %w", project, err)
+	}
+	if err := os.MkdirAll(filepath.Join(main, "docs"), dirMode); err != nil {
+		return fmt.Errorf("create docs directory: %w", err)
+	}
+	link := "../../tasks/" + project
+	if err := installTaskLink(docsTasks, link); err != nil {
+		return err
+	}
+	return ensureTaskExclude(main, commonDir)
+}
+
+func existingTaskDirectory(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if _, err = os.Stat(path); err != nil {
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				return false, fmt.Errorf("read link %s: %w", path, readErr)
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				return false, fmt.Errorf("%s points to missing target %s", path, target)
+			}
+			return false, fmt.Errorf("inspect link target %s from %s: %w", target, path, err)
+		}
+		return true, nil
+	}
+	if !info.IsDir() {
+		return true, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(entries) > 0 {
+		return true, nil
+	}
+	if err = os.Remove(path); err != nil {
+		return false, fmt.Errorf("remove empty directory %s: %w", path, err)
+	}
+	return false, nil
+}
+
+func installTaskLink(path, target string) error {
+	err := os.Symlink(target, path)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create symlink %s: %w", path, err)
+	}
+	got, err := os.Readlink(path)
+	if err != nil {
+		return fmt.Errorf("inspect concurrent symlink %s: %w", path, err)
+	}
+	if got != target {
+		return fmt.Errorf("%s already points to %s, expected %s", path, got, target)
+	}
+	return nil
+}
+
+func ensureTaskExclude(main, commonDir string) error {
+	check := exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", "docs/tasks")
+	err := check.Run()
+	if err == nil {
+		return nil
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		return fmt.Errorf("git check-ignore in %s: %w", main, err)
+	}
+	path := filepath.Join(commonDir, "info/exclude")
+	if err = os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
+		return fmt.Errorf("create exclude directory: %w", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	if len(content) > 0 && content[len(content)-1] != '\n' {
+		if _, err = file.Write([]byte("\n")); err != nil {
+			file.Close()
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+	}
+	if _, err = file.Write([]byte("/docs/tasks\n")); err != nil {
+		file.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err = file.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+	return nil
 }
 func fail(w io.Writer, e error) int { fmt.Fprintf(w, "tk: %v\n", e); return exitUsage }
 func load(dir string) ([]task, error) {
@@ -2450,9 +2660,6 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
-	if o.cmd == "done" {
-		hintNext(t, filepath.Dir(newPath), o, out, errout)
-	}
 	return 0
 }
 
@@ -2870,11 +3077,79 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if !choice.gate.valid {
 		fmt.Fprintf(errout, "tk: %s; showing started work and of new work CRIT and HIGH only (%s)\n", choice.gate.problem, choice.gate.path)
 	}
+	var external []externalTask
+	sourceFailed := false
+	if sourcePath, ok, pathErr := taskSourcePath(project); pathErr != nil {
+		return fail(errout, pathErr)
+	} else if ok {
+		if _, statErr := os.Lstat(sourcePath); statErr == nil {
+			var bad int
+			var reason string
+			external, bad, reason, sourceFailed = runTaskSource(sourcePath, filepath.Base(project))
+			if sourceFailed {
+				sourceWarning(errout, sourcePath, reason)
+			} else if bad > 0 {
+				fmt.Fprintf(errout, "tk: source %s: skipped %d bad records (first: %s)\n", sourcePath, bad, externalReason(reason))
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			sourceFailed = true
+			sourceWarning(errout, sourcePath, "cannot inspect source: "+statErr.Error())
+		}
+	}
+	visible := make([]externalTask, 0, len(external))
+	for _, item := range external {
+		t := task{prio: item.Prio, diff: "", status: "открыт"}
+		if gateVisible(t, choice.gate, choice.live) {
+			visible = append(visible, item)
+		}
+	}
+	sortExternal(visible)
+	localGroup := 99
+	if choice.found {
+		localGroup = nextGroup(choice.task, o.by)
+	}
+	if len(visible) > 0 && (!choice.found || externalGroup(visible[0]) < localGroup) {
+		return printExternalNext(root, choice, visible, choice.found, o.json, out, errout)
+	}
 	if !choice.found {
-		fmt.Fprintln(out, "работы нет")
+		if sourceFailed {
+			fmt.Fprintln(out, "местных тикетов нет, источник недоступен: очередь неполная")
+		} else {
+			fmt.Fprintln(out, "работы нет")
+		}
 		return exitNone
 	}
-	return printNext(root, choice, o.json, out, errout)
+	return printCombinedNext(root, choice, visible, o.json, out, errout)
+}
+
+func externalGroup(t externalTask) int {
+	switch t.Prio {
+	case "CRIT":
+		return 0
+	case "HIGH":
+		return 2
+	case "MED":
+		return 3
+	default:
+		return 4
+	}
+}
+func externalReason(s string) string {
+	s = safeSourceString(s)
+	if len(s) > 200 {
+		limit := 200
+		for limit > 0 && !utf8.RuneStart(s[limit]) {
+			limit--
+		}
+		s = s[:limit]
+	}
+	return strings.ReplaceAll(maskSourceText(s), "\n", " ")
+}
+
+var sourceSecretRE = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)|AKIA[0-9A-Z]{16}|(?:sk_live|sk_test|rk_live|rk_test|pk_live|pk_test)_[A-Za-z0-9]{24,}|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{34,}|xox[abepors]-[A-Za-z0-9-]{15,}`)
+
+func maskSourceText(s string) string {
+	return sourceSecretRE.ReplaceAllString(s, "[скрыто:secret]")
 }
 
 type nextChoice struct {
@@ -2885,6 +3160,17 @@ type nextChoice struct {
 }
 
 func chooseNext(dir, project, actor string) (nextChoice, error) {
+	if info, err := os.Lstat(dir); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if _, e := os.Stat(dir); errors.Is(e, os.ErrNotExist) {
+			target, readErr := os.Readlink(dir)
+			if readErr != nil {
+				return nextChoice{}, fmt.Errorf("read dangling symlink %s: %w", dir, readErr)
+			}
+			return nextChoice{}, fmt.Errorf("%s is a dangling symlink to %s", dir, target)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nextChoice{}, fmt.Errorf("inspect %s: %w", dir, err)
+	}
 	tasks, err := loadTasks(dir, true)
 	if err != nil {
 		return nextChoice{}, err
@@ -2919,9 +3205,130 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return
 	}
-	if choice.found {
+	var ext []externalTask
+	if p, ok, pathErr := taskSourcePath(project); pathErr != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", pathErr)
+		return
+	} else if ok {
+		if _, e := os.Lstat(p); e == nil {
+			var bad int
+			var reason string
+			var failed bool
+			ext, bad, reason, failed = runTaskSource(p, filepath.Base(project))
+			if failed {
+				sourceWarning(errout, p, reason)
+			} else if bad > 0 {
+				fmt.Fprintf(errout, "tk: source %s: skipped %d bad records (first: %s)\n", p, bad, externalReason(reason))
+			}
+		} else if !errors.Is(e, os.ErrNotExist) {
+			sourceWarning(errout, p, "cannot inspect source: "+e.Error())
+		}
+	}
+	if len(ext) > 0 {
+		filtered := ext[:0]
+		for _, x := range ext {
+			if gateVisible(task{prio: x.Prio, status: "открыт"}, choice.gate, choice.live) {
+				filtered = append(filtered, x)
+			}
+		}
+		ext = filtered
+	}
+	sortExternal(ext)
+	if len(ext) > 0 && (!choice.found || externalGroup(ext[0]) < nextGroup(choice.task, actor)) {
+		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.valid && !choice.live))
+	} else if choice.found {
 		fmt.Fprintln(out, "следующий: "+nextLine(choice))
 	}
+}
+
+func sortExternal(items []externalTask) {
+	for i := 1; i < len(items); i++ {
+		for j := i; j > 0 && externalGroup(items[j]) < externalGroup(items[j-1]); j-- {
+			items[j], items[j-1] = items[j-1], items[j]
+		}
+	}
+}
+func externalLine(t externalTask, closed bool) string {
+	s := strings.TrimSpace(strings.Join([]string{t.Key, t.Prio, t.Status, t.Title, t.URL}, " "))
+	if closed {
+		s += " закрыто"
+	}
+	return s
+}
+func externalJSON(t externalTask, closed bool) map[string]any {
+	return map[string]any{"source": "external", "key": t.Key, "title": t.Title, "status": t.Status, "prio": t.Prio, "url": t.URL, "closed": closed}
+}
+func localNextObject(root string, t task, closed bool) (map[string]any, error) {
+	b, err := json.Marshal(taskObject(root, t, "", false))
+	if err != nil {
+		return nil, fmt.Errorf("encode local ticket: %w", err)
+	}
+	var obj map[string]any
+	if err = json.Unmarshal(b, &obj); err != nil {
+		return nil, fmt.Errorf("decode local ticket: %w", err)
+	}
+	obj["source"], obj["closed"] = "local", closed
+	return obj, nil
+}
+func printCombinedNext(root string, choice nextChoice, ext []externalTask, jsonOutput bool, out, errout io.Writer) int {
+	if !jsonOutput {
+		fmt.Fprintln(out, nextLine(choice))
+		if len(ext) > 0 {
+			fmt.Fprintln(out, "также: "+externalLine(ext[0], choice.gate.valid && !choice.live))
+			if len(ext) > 1 {
+				fmt.Fprintf(out, "ещё из источника: %d\n", len(ext)-1)
+			}
+		}
+		return 0
+	}
+	obj, e := localNextObject(root, choice.task, choice.gate.valid && !choice.live)
+	if e != nil {
+		return fail(errout, e)
+	}
+	if len(ext) > 0 {
+		obj["also"] = externalJSON(ext[0], choice.gate.valid && !choice.live)
+		if len(ext) > 1 {
+			obj["more"] = len(ext) - 1
+		}
+	}
+	return encodeNext(obj, out, errout)
+}
+func printExternalNext(root string, choice nextChoice, ext []externalTask, local bool, jsonOutput bool, out, errout io.Writer) int {
+	closed := choice.gate.valid && !choice.live
+	if !jsonOutput {
+		fmt.Fprintln(out, externalLine(ext[0], closed))
+		if local {
+			fmt.Fprintln(out, "также: "+nextLine(choice))
+		}
+		if len(ext) > 1 {
+			n := len(ext) - 1
+			if local {
+				n = len(ext) - 1
+			}
+			if n > 0 {
+				fmt.Fprintf(out, "ещё из источника: %d\n", n)
+			}
+		}
+		return 0
+	}
+	obj := externalJSON(ext[0], closed)
+	if local {
+		other, err := localNextObject(root, choice.task, closed)
+		if err != nil {
+			return fail(errout, err)
+		}
+		obj["also"] = other
+	}
+	if len(ext) > 1 {
+		obj["more"] = len(ext) - 1
+	}
+	return encodeNext(obj, out, errout)
+}
+func encodeNext(obj any, out, errout io.Writer) int {
+	if err := json.NewEncoder(out).Encode(obj); err != nil {
+		return fail(errout, err)
+	}
+	return 0
 }
 
 func nextCandidates(tasks []task, actor string, gate gateState, live bool) []task {
