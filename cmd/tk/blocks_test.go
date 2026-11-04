@@ -770,6 +770,19 @@ func TestLintDoesNotRequireReverseReferenceForClosedBlocker(t *testing.T) {
 	}
 }
 
+func TestLintReportsUnresolvedBlockingReference(t *testing.T) {
+	_, dir := blockTestProject(t)
+	ticket := blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\nЗаблокирован: foreign/project/ticket\n")
+	issues, err := lintTicket(ticket.path, "t.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "blocking reference foreign/project/ticket cannot be resolved"
+	if !strings.Contains(strings.Join(issues, "\n"), want) {
+		t.Fatalf("lint issues = %v, want %q", issues, want)
+	}
+}
+
 func TestSetBlocksPrintsTheNameBeforeRaises(t *testing.T) {
 	root, dir := blockTestProject(t)
 	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n")

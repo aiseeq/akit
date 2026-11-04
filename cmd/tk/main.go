@@ -274,6 +274,7 @@ var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5]
 
 func parseOptions(args []string, o *options) ([]string, error) {
 	values := map[string]*string{"--prio": &o.prio, "--diff": &o.diff, "--to": &o.to, "--back": &o.back, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin, "--parent": &o.parent}
+	flags := map[string]func(){"--all": func() { o.all = true }, "--due": func() { o.due = true }, "--json": func() { o.json = true }, "--required": func() { o.required = true }, "--take": func() { o.take = true }, "--journal": func() { o.journal = true }}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -290,24 +291,8 @@ func parseOptions(args []string, o *options) ([]string, error) {
 			}
 			continue
 		}
-		switch v {
-		case "--all":
-			o.all = true
-			continue
-		case "--due":
-			o.due = true
-			continue
-		case "--json":
-			o.json = true
-			continue
-		case "--required":
-			o.required = true
-			continue
-		case "--take":
-			o.take = true
-			continue
-		case "--journal":
-			o.journal = true
+		if set, ok := flags[v]; ok {
+			set()
 			continue
 		}
 		if p, ok := values[v]; ok {
@@ -822,6 +807,16 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 			root, dir = shared, filepath.Join(shared, "docs/tasks")
 		}
 	}
+	if code := validateNewBlockTargets(root, main, o, errout); code != 0 {
+		return code
+	}
+	if err := prepareTaskDirectory(root, main); err != nil {
+		return fail(errout, err)
+	}
+	return createAtBaseTask(root, dir, main, o, out, errout)
+}
+
+func validateNewBlockTargets(root, main string, o options, errout io.Writer) int {
 	for _, ref := range o.blocks {
 		probe := o
 		probe.baseRoot = root
@@ -845,9 +840,10 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 			return fail(errout, fmt.Errorf("target %s: %w", ref, err))
 		}
 	}
-	if err := prepareTaskDirectory(root, main); err != nil {
-		return fail(errout, err)
-	}
+	return 0
+}
+
+func createAtBaseTask(root, dir, main string, o options, out, errout io.Writer) int {
 	blocks := o.blocks
 	o.blocks = nil
 	if len(blocks) == 0 {
@@ -866,6 +862,10 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 	o.blocks = blocks
 	o.baseRoot = root
 	o.mainRoot = main
+	return finishCreateAtBase(root, dir, t, o, out, errout, blocks)
+}
+
+func finishCreateAtBase(root, dir string, t task, o options, out, errout io.Writer, blocks []string) int {
 	var relationOutput bytes.Buffer
 	code := attachBlocks(t, o, &relationOutput, errout, blocks)
 	fresh, err := readTaskLocked(dir, o.id)
@@ -951,21 +951,7 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	if o.cmd == "transfer" {
-		before, findErr := find(dir, o.id)
-		if findErr != nil {
-			release()
-			code := transferTask(root, dir, o, out, errout)
-			if code == 0 {
-				finishTransferRelations(dir, o.id, task{}, o, errout)
-			}
-			return code
-		}
-		code := transferTask(root, dir, o, out, errout)
-		release()
-		if code == 0 {
-			finishTransferRelations(dir, strings.TrimSuffix(filepath.Base(before.path), ".md"), before, o, errout)
-		}
-		return code
+		return runTransferCommand(root, dir, o, out, errout, release)
 	}
 	t, err := find(dir, o.id)
 	if err != nil {
@@ -973,32 +959,9 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 		return reportFindError(err, o.id, errout)
 	}
 	if o.cmd == "set" || o.cmd == "start" {
-		release()
-		blockOptions := o
-		blockOptions.baseRoot = taskProject(t.path)
-		if len(o.blocks) > 0 {
-			if _, code := validateBlockAttachments(t, blockOptions, o.blocks, errout); code != 0 {
-				return code
-			}
-		}
-		for _, ref := range o.unblocks {
-			if _, _, _, _, err := resolveBlockLocation(blockOptions, ref); err != nil {
-				return fail(errout, err)
-			}
-		}
-		release, err = lockForCommand(dir, o.cmd)
-		if err != nil {
-			return fail(errout, err)
-		}
-		t, err = find(dir, o.id)
-		if err != nil {
-			release()
-			return reportFindError(err, o.id, errout)
-		}
-		// Under the own lock, without taking another: a raise from the blocked ticket
-		// writes that ticket first and then waits here, so one of the two sees the other.
-		if code := validatePriorityFloor(t, blockOptions, errout); code != 0 {
-			release()
+		var code int
+		t, release, code = prepareSetOrStart(dir, t, o, errout, release)
+		if code != 0 {
 			return code
 		}
 	}
@@ -1011,67 +974,130 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 	}
 	code := runFoundTask(root, t, o, commandOut, errout)
 	release()
+	return finishLockedCommand(code, dir, t, o, out, errout, relationOut, &relations, namesLater)
+}
+
+func prepareSetOrStart(dir string, t task, o options, errout io.Writer, release func()) (task, func(), int) {
+	release()
+	blockOptions := o
+	blockOptions.baseRoot = taskProject(t.path)
+	if len(o.blocks) > 0 {
+		if _, code := validateBlockAttachments(t, blockOptions, o.blocks, errout); code != 0 {
+			return task{}, nil, code
+		}
+	}
+	for _, ref := range o.unblocks {
+		if _, _, _, _, err := resolveBlockLocation(blockOptions, ref); err != nil {
+			return task{}, nil, fail(errout, err)
+		}
+	}
+	locked, err := lockForCommand(dir, o.cmd)
+	if err != nil {
+		return task{}, nil, fail(errout, err)
+	}
+	t, err = find(dir, o.id)
+	if err != nil {
+		locked()
+		return task{}, nil, reportFindError(err, o.id, errout)
+	}
+	// A priority raise writes the blocked ticket before waiting here, so one lock at a time is enough.
+	if code := validatePriorityFloor(t, blockOptions, errout); code != 0 {
+		locked()
+		return task{}, nil, code
+	}
+	return t, locked, 0
+}
+
+func finishLockedCommand(code int, dir string, t task, o options, out, errout, relationOut io.Writer, relations *bytes.Buffer, namesLater bool) int {
 	if code == 0 && (o.cmd == "set" || o.cmd == "start") {
-		current, err := readTaskLocked(dir, t.slug)
-		if err != nil {
-			return fail(errout, err)
-		}
-		if len(o.blocks) > 0 {
-			blockOptions := o
-			blockOptions.baseRoot = taskProject(current.path)
-			code = attachBlocks(current, blockOptions, relationOut, errout, o.blocks)
-			if code == 0 {
-				current, err = readTaskLocked(dir, t.slug)
-				if err != nil {
-					return fail(errout, err)
-				}
-			}
-		}
-		if code == 0 && len(o.unblocks) > 0 {
-			blockOptions := o
-			blockOptions.baseRoot = taskProject(current.path)
-			code = removeBlocks(current, blockOptions, errout, o.unblocks)
-			if code == 0 {
-				current, err = readTaskLocked(dir, t.slug)
-				if err != nil {
-					return fail(errout, err)
-				}
-			}
-		}
-		if code == 0 && o.prio != "" {
-			code = propagatePriority(current.path, o, relationOut, errout)
-			if code == 0 {
-				current, err = readTaskLocked(dir, t.slug)
-				if err != nil {
-					return fail(errout, err)
-				}
-			}
-		}
-		if code == 0 && o.prio != "" {
-			refreshed, err := readTaskLocked(dir, t.slug)
-			if err != nil {
-				return fail(errout, err)
-			}
-			lowered := o
-			lowered.prio = refreshed.prio
-			loweredTicket := t
-			loweredTicket.body = refreshed.body
-			notePriorityLowered(loweredTicket, lowered, errout)
-		}
-		if namesLater {
-			final, err := readTaskLocked(dir, t.slug)
-			if err != nil {
-				return fail(errout, err)
-			}
-			fmt.Fprintln(out, filepath.Base(final.path))
-			_, _ = relations.WriteTo(out)
-		}
+		code = finishSetOrStart(dir, t, o, out, errout, relationOut, relations, namesLater)
 	}
 	if code == 0 && (o.cmd == "done" || o.cmd == "reject") {
 		code = closeBlockRelations(t, o, out, errout, code)
 	}
 	if o.cmd == "done" && code == 0 {
 		hintNext(t, dir, o, out, errout)
+	}
+	return code
+}
+
+func runTransferCommand(root, dir string, o options, out, errout io.Writer, release func()) int {
+	before, findErr := find(dir, o.id)
+	if findErr != nil && !errors.Is(findErr, os.ErrNotExist) {
+		release()
+		return reportFindError(findErr, o.id, errout)
+	}
+	if errors.Is(findErr, os.ErrNotExist) {
+		release()
+		code := transferTask(root, dir, o, out, errout)
+		if code == 0 {
+			finishTransferRelations(dir, o.id, task{}, o, errout)
+		}
+		return code
+	}
+	code := transferTask(root, dir, o, out, errout)
+	release()
+	if code == 0 {
+		finishTransferRelations(dir, strings.TrimSuffix(filepath.Base(before.path), ".md"), before, o, errout)
+	}
+	return code
+}
+
+func finishSetOrStart(dir string, t task, o options, out, errout, relationOut io.Writer, relations *bytes.Buffer, namesLater bool) int {
+	current, err := readTaskLocked(dir, t.slug)
+	if err != nil {
+		return fail(errout, err)
+	}
+	code := 0
+	if len(o.blocks) > 0 {
+		blockOptions := o
+		blockOptions.baseRoot = taskProject(current.path)
+		code = attachBlocks(current, blockOptions, relationOut, errout, o.blocks)
+		if code == 0 {
+			current, err = readTaskLocked(dir, t.slug)
+			if err != nil {
+				return fail(errout, err)
+			}
+		}
+	}
+	if code == 0 && len(o.unblocks) > 0 {
+		blockOptions := o
+		blockOptions.baseRoot = taskProject(current.path)
+		code = removeBlocks(current, blockOptions, errout, o.unblocks)
+		if code == 0 {
+			current, err = readTaskLocked(dir, t.slug)
+			if err != nil {
+				return fail(errout, err)
+			}
+		}
+	}
+	if code == 0 && o.prio != "" {
+		code = propagatePriority(current.path, o, relationOut, errout)
+		if code == 0 {
+			current, err = readTaskLocked(dir, t.slug)
+			if err != nil {
+				return fail(errout, err)
+			}
+		}
+	}
+	if code == 0 && o.prio != "" {
+		refreshed, err := readTaskLocked(dir, t.slug)
+		if err != nil {
+			return fail(errout, err)
+		}
+		lowered := o
+		lowered.prio = refreshed.prio
+		loweredTicket := t
+		loweredTicket.body = refreshed.body
+		notePriorityLowered(loweredTicket, lowered, errout)
+	}
+	if namesLater {
+		final, err := readTaskLocked(dir, t.slug)
+		if err != nil {
+			return fail(errout, err)
+		}
+		fmt.Fprintln(out, filepath.Base(final.path))
+		_, _ = relations.WriteTo(out)
 	}
 	return code
 }
@@ -3902,6 +3928,7 @@ func lintTicket(path, shown string) ([]string, error) {
 	for _, ref := range headerLinks(body, blockedPrefix) {
 		dir, neighbor, err := linkedPath(project, ref)
 		if err != nil {
+			issues = append(issues, shown+": blocking reference "+ref+" cannot be resolved: "+err.Error())
 			continue
 		}
 		b, e := os.ReadFile(neighbor)
