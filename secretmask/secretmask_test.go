@@ -328,6 +328,33 @@ func TestMaskContextReviewKeepsNonValues(t *testing.T) {
 	}
 }
 
+func TestMaskContextIndependentReview(t *testing.T) {
+	tests := []struct{ name, input, want string }{
+		{"quoted ampersand", "curl -d 'a=1&b=2' -u admin:x y", "curl -d 'a=1&b=2' -u admin:[скрыто:password] y"},
+		{"multiline quote", "curl -d '{\nbody\n}' -u a:b", "curl -d '{\nbody\n}' -u a:[скрыто:password]"},
+		{"unclosed quote", "curl it's x; id -u a:b", "curl it's x; id -u a:b"},
+		{"quoted mysql unicode", "mysql -p'пароль' db", "mysql -p'[скрыто:password]' db"},
+		{"quoted sshpass dash", "sshpass -p '-hunter2pass' ssh host", "sshpass -p '[скрыто:password]' ssh host"},
+		{"nested escaped quote", `{"password":"a\\\"hunter2pass"}`, `{"password":"[скрыто:password]"}`},
+		{"empty url user", "https://:secret-value@host/", "https://:[скрыто:password]@host/"},
+		{"header stays on line", "Authorization: Bearer\nContent-Type: application/json", "Authorization: Bearer\nContent-Type: application/json"},
+		{"password option equals name", "--password=PASSWORD", "--password=PASSWORD"},
+		{"token option equals name", "--token=TOKEN", "--token=TOKEN"},
+		{"api key option equals normalized name", "--api-key=API_KEY", "--api-key=API_KEY"},
+		{"api key hyphen equals name", "--api-key=api-key", "--api-key=api-key"},
+		{"empty flag assignment", "--password= psql", "--password= psql"},
+		{"marker stays intact", "s://token=/|@", "s://token=[скрыто:token]|@"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := Mask(tt.input)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func BenchmarkMaskOrdinary1MiB(b *testing.B) {
 	text := strings.Repeat("ordinary event message with no credentials or command names; ", (1<<20)/59+1)[:1<<20]
 	b.SetBytes(int64(len(text)))
