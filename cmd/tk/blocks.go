@@ -679,11 +679,8 @@ func blockMark(t task, errout io.Writer) string {
 			fmt.Fprintf(errout, "tk: warning: cannot read transfer ledger for %s: %v\n", ref, ledgerErr)
 			continue
 		}
-		stem := filepath.Base(ref)
-		for _, row := range rows {
-			if row.Slug == stem || row.Stem == stem {
-				return " заблокирован: " + row.Key + " " + row.URL
-			}
+		if row, ok := transferredRecord(rows, filepath.Base(ref)); ok {
+			return " заблокирован: " + row.Key + " " + row.URL
 		}
 	}
 	return ""

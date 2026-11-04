@@ -814,3 +814,25 @@ func TestTransferredRecordTakesTheLatestBySlugAndExactByStem(t *testing.T) {
 		t.Fatalf("by stem: %+v %v", row, ok)
 	}
 }
+
+func TestFailedLinkStillNamesTheRaisedFile(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n")
+	blockTestWrite(t, dir, "t1", "HIGH", "# t1\n\nСтатус: открыт\n")
+	blockTestWrite(t, dir, "t2", "MED", "# t2\n\nСтатус: открыт\nЗаблокирован: nosuch\n")
+	for _, args := range [][]string{
+		{"set", "x", "--blocks", "t1", "--blocks", "t2", "--by", "tester"},
+		{"new", "y", "--prio", "LOW", "--blocks", "t1", "--blocks", "t2", "--by", "tester"},
+	} {
+		o, err := parseArgs(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, errout bytes.Buffer
+		code := runAtBase(root, dir, o, &out, &errout)
+		first, _, _ := strings.Cut(out.String(), "\n")
+		if _, err := os.Stat(filepath.Join(dir, filepath.Base(first))); err != nil {
+			t.Fatalf("%v: code=%d stdout=%q names no file: %v", args, code, out.String(), err)
+		}
+	}
+}

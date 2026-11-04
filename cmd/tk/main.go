@@ -854,8 +854,8 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 		return create(root, dir, o, out, errout)
 	}
 	// The name and the hint wait for the links: a link can raise the new ticket and rename it.
-	var created, createdErr bytes.Buffer
-	if code := create(root, dir, o, &created, &createdErr); code != 0 {
+	var createdErr bytes.Buffer
+	if code := create(root, dir, o, io.Discard, &createdErr); code != 0 {
 		_, _ = createdErr.WriteTo(errout)
 		return code
 	}
@@ -867,11 +867,7 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 	o.baseRoot = root
 	o.mainRoot = main
 	var relationOutput bytes.Buffer
-	if code := attachBlocks(t, o, &relationOutput, errout, blocks); code != 0 {
-		_, _ = created.WriteTo(out)
-		_, _ = relationOutput.WriteTo(out)
-		return code
-	}
+	code := attachBlocks(t, o, &relationOutput, errout, blocks)
 	fresh, err := readTaskLocked(dir, o.id)
 	if err != nil {
 		return fail(errout, err)
@@ -884,9 +880,11 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 		}
 	}
 	fmt.Fprintln(out, createdPath)
-	fmt.Fprintln(errout, hintAfterNew(o, createdPath, fresh.body))
+	if code == 0 {
+		fmt.Fprintln(errout, hintAfterNew(o, createdPath, fresh.body))
+	}
 	_, _ = relationOutput.WriteTo(out)
-	return 0
+	return code
 }
 
 func gitMainRoot(target string) (string, error) {
@@ -1007,9 +1005,9 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 	// With new links the name is printed last known: a link can raise and rename the ticket.
 	namesLater := o.cmd == "set" && len(o.blocks) > 0
 	commandOut, relationOut := out, out
-	var deferredName, relations bytes.Buffer
+	var relations bytes.Buffer
 	if namesLater {
-		commandOut, relationOut = &deferredName, &relations
+		commandOut, relationOut = io.Discard, &relations
 	}
 	code := runFoundTask(root, t, o, commandOut, errout)
 	release()
@@ -1061,15 +1059,12 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 			notePriorityLowered(loweredTicket, lowered, errout)
 		}
 		if namesLater {
-			if code == 0 {
-				fmt.Fprintln(out, filepath.Base(current.path))
-			} else {
-				_, _ = deferredName.WriteTo(out)
+			final, err := readTaskLocked(dir, t.slug)
+			if err != nil {
+				return fail(errout, err)
 			}
+			fmt.Fprintln(out, filepath.Base(final.path))
 			_, _ = relations.WriteTo(out)
-		}
-		if code == 0 && o.cmd == "start" && len(o.blocks) > 0 {
-			fmt.Fprintln(errout, hintAfterStart(current, current.body, current.path))
 		}
 	}
 	if code == 0 && (o.cmd == "done" || o.cmd == "reject") {
@@ -2967,7 +2962,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
-	if o.cmd == "start" && len(o.blocks) == 0 {
+	if o.cmd == "start" {
 		fmt.Fprintln(errout, hintAfterStart(t, body, newPath))
 	}
 	return 0
@@ -2980,9 +2975,7 @@ func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
 	owner := executor(t.body)
 	if strings.EqualFold(owner, o.by) && o.prio == "" && o.diff == "" && o.why == "" {
 		fmt.Fprintf(out, "%s %s\n", t.slug, t.status)
-		if len(o.blocks) == 0 {
-			fmt.Fprintln(errout, hintAfterStart(t, t.body, t.path))
-		}
+		fmt.Fprintln(errout, hintAfterStart(t, t.body, t.path))
 		return 0, true
 	}
 	if owner != "" && !strings.EqualFold(owner, o.by) && !o.take {
