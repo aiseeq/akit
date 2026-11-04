@@ -2789,3 +2789,61 @@ func TestNextDueWaitOrderUnderClosedGate(t *testing.T) {
 		t.Errorf("first %q", choice.task.slug)
 	}
 }
+
+// tk new prints the ticket path on stdout, and scripts read it, so the next step goes to stderr.
+func TestNewAndStartNameNextStep(t *testing.T) {
+	cases := []struct {
+		name, text  string
+		want, hasnt string
+	}{
+		{name: "empty ticket", want: "заполни «Что сделать» и «Приёмка»"},
+		{name: "filled ticket", text: "## Что сделать\nwork\n\n## Приёмка\n- check\n", want: "дальше: tk start ", hasnt: "заполни"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "docs", "tasks")
+			o := options{cmd: "new", id: "sample", prio: "MED", by: "me", text: tc.text}
+			var out, errOut bytes.Buffer
+			if code := create(root, dir, o, &out, &errOut); code != 0 {
+				t.Fatalf("create = %d: %s", code, errOut.String())
+			}
+			if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); len(lines) != 1 || !strings.HasSuffix(lines[0], "-sample.md") {
+				t.Fatalf("stdout must stay the ticket path: %q", out.String())
+			}
+			if !strings.Contains(errOut.String(), tc.want) || tc.hasnt != "" && strings.Contains(errOut.String(), tc.hasnt) {
+				t.Fatalf("hint = %q, want %q", errOut.String(), tc.want)
+			}
+			tasks, err := load(dir)
+			if err != nil || len(tasks) != 1 {
+				t.Fatalf("load = %v, %v", tasks, err)
+			}
+			out.Reset()
+			errOut.Reset()
+			if code := transition(tasks[0], options{cmd: "start", id: "sample", by: "me"}, &out, &errOut); code != 0 {
+				t.Fatalf("start = %d: %s", code, errOut.String())
+			}
+			if strings.TrimSpace(out.String()) != "sample в работе" {
+				t.Fatalf("start stdout changed: %q", out.String())
+			}
+			if !strings.Contains(errOut.String(), "tk done sample --check") || !strings.Contains(errOut.String(), "tk note sample") {
+				t.Fatalf("start hint = %q", errOut.String())
+			}
+		})
+	}
+}
+
+func TestNewToAndJournalHints(t *testing.T) {
+	filled := "# T\n\n## Приёмка\n- check\n\n## Журнал\n"
+	if got := hintAfterNew(options{id: "x", to: "elsewhere"}, "/p/x.md", filled); strings.Contains(got, "tk start") {
+		t.Fatalf("a ticket for another project must not suggest starting it: %q", got)
+	}
+	root := t.TempDir()
+	var out, errOut bytes.Buffer
+	if code := create(root, filepath.Join(root, "docs", "tasks"), options{cmd: "new", id: "log", prio: "MED", by: "me", journal: true}, &out, &errOut); code != 0 {
+		t.Fatalf("create = %d: %s", code, errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("a journal ticket is not worked on, no hint: %q", errOut.String())
+	}
+}
