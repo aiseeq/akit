@@ -374,7 +374,7 @@ func findCommandWord(text, name string, prefix bool) (contextValue, bool) {
 		}
 		end := start + len(name)
 		if prefix {
-			for end < len(text) && !strings.ContainsRune(" \t\r\n'\"`)", rune(text[end])) {
+			for end < len(text) && !strings.ContainsRune(" \t\r\n'\"`)\\", rune(text[end])) {
 				end++
 			}
 			return contextValue{start, end, false}, true
@@ -403,14 +403,27 @@ func commandLeftBoundary(text string, at int) bool {
 	if at == 0 {
 		return true
 	}
-	if at >= 2 && text[at-2:at] == "\\\n" {
+	if at >= 2 && text[at-2] == '\\' && strings.ContainsRune("\nnrt", rune(text[at-1])) {
 		return true
 	}
 	return strings.ContainsRune(" \t/('\"`", rune(text[at-1]))
 }
 
+// literalSpaceAt returns the length of a written \n, \r or \t at this place, with
+// the backslashes of any escaping depth: raw JSON and %q output carry them as text.
+func literalSpaceAt(text string, at int) int {
+	end := at
+	for end < len(text) && text[end] == '\\' {
+		end++
+	}
+	if end == at || end == len(text) || !strings.ContainsRune("nrt", rune(text[end])) {
+		return 0
+	}
+	return end + 1 - at
+}
+
 func commandRightBoundary(text string, at int) bool {
-	return at == len(text) || strings.ContainsRune(" \t'\"`)", rune(text[at])) || strings.HasPrefix(text[at:], "\\\n")
+	return at == len(text) || strings.ContainsRune(" \t'\"`)", rune(text[at])) || strings.HasPrefix(text[at:], "\\\n") || literalSpaceAt(text, at) > 0
 }
 
 func commandSegments(text string) [][2]int {
@@ -1103,6 +1116,10 @@ func (w *shellWords) next() (int, int, bool) {
 			at += 2
 			continue
 		}
+		if n := literalSpaceAt(text, at); n > 0 {
+			at += n
+			continue
+		}
 		break
 	}
 	w.at = at
@@ -1118,7 +1135,7 @@ func (w *shellWords) next() (int, int, bool) {
 			at = w.base + w.quotes[0][1]
 			continue
 		}
-		if c := text[at]; c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.HasPrefix(text[at:], "\\\n") {
+		if c := text[at]; c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.HasPrefix(text[at:], "\\\n") || literalSpaceAt(text, at) > 0 {
 			break
 		}
 		at++

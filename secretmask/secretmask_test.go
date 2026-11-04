@@ -512,3 +512,34 @@ func TestMaskDigitlessMatchBeforeRealKey(t *testing.T) {
 		t.Errorf("output length %d, counts %v", len(got), found)
 	}
 }
+
+func TestMaskToolAfterWrittenLineBreak(t *testing.T) {
+	const value = "Vvalue123"
+	for _, sep := range []string{`\n`, `\r\n`, `\t`} {
+		for _, text := range []string{
+			`{"content":"#!/bin/sh` + sep + `curl -u admin:Vvalue123 https://x` + sep + `"}`,
+			`model "x` + sep + `curl -u admin:Vvalue123 https://x" is not approved`,
+			`["#!/bin/sh` + sep + `curl -u admin:Vvalue123 https://x"]`,
+			`"{\"script\": \"#!/bin/sh\` + sep + `curl -u admin:Vvalue123 https://x\"}"`,
+			`{"#!/bin/sh` + sep + `curl -u admin:Vvalue123 https://x":1}`,
+			`"a` + sep + `curl` + sep + `-u admin:Vvalue123 x"`,
+			`"a` + sep + `mysqldump` + sep + `-pVvalue123 db"`,
+			`"a` + sep + `sshpass -p Vvalue123 ssh h"`,
+		} {
+			if out, found := Mask(text); strings.Contains(out, value) || len(found) == 0 {
+				t.Errorf("value kept: %q -> %q %v", text, out, found)
+			}
+		}
+	}
+	for _, text := range []string{
+		`printf 'a\nb'`,
+		`echo "x\ncurl https://x"`,
+		`C:\new\curl`,
+		`C:\tmp\curl -u a:b`,
+		`"a\ncurly -u a:b x"`,
+	} {
+		if out, found := Mask(text); out != text || len(found) != 0 {
+			t.Errorf("changed: %q -> %q %v", text, out, found)
+		}
+	}
+}
