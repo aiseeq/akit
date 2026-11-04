@@ -2868,7 +2868,7 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	if !choice.gate.valid {
-		fmt.Fprintf(errout, "tk: %s; showing CRIT and HIGH only (%s)\n", choice.gate.problem, choice.gate.path)
+		fmt.Fprintf(errout, "tk: %s; showing started work and of new work CRIT and HIGH only (%s)\n", choice.gate.problem, choice.gate.path)
 	}
 	if !choice.found {
 		fmt.Fprintln(out, "работы нет")
