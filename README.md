@@ -182,6 +182,9 @@ the trailing slash: git treats a symlink as a file). Worktrees then use the main
 `tk archive` moves closed tickets to `docs/tasks/archive/` inside the store instead of
 `docs/tasks-archive/` in the repository.
 
+`tk done` ends with a `следующий:` line when the queue has a ticket: the one `tk next` would give the
+ticket's executor.
+
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. Each check gets 8 minutes

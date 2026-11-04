@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2316,7 +2317,7 @@ func TestClosedFieldIsOnlyAddedToNextJSON(t *testing.T) {
 		t.Fatalf("standard task JSON has closed: %s %v", standard, err)
 	}
 	var out, errout bytes.Buffer
-	if code := printNext("", ticket, true, true, false, &out, &errout); code != 0 {
+	if code := printNext("", nextChoice{task: ticket, found: true, gate: gateState{valid: true}}, true, &out, &errout); code != 0 {
 		t.Fatalf("next JSON = %d %s", code, errout.String())
 	}
 	var next map[string]any
@@ -2341,7 +2342,7 @@ func TestNextWaitDeadlinesExcludeFutureTickets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates := nextCandidates(tasks, "actor", gateState{}, true)
+	candidates := nextCandidates(tasks, "actor", gateState{valid: true}, false)
 	if len(candidates) != 1 || candidates[0].slug != "past" {
 		t.Fatalf("waiting candidates = %#v", candidates)
 	}
@@ -2357,8 +2358,8 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 	}{
 		{"live gates", `{"at":%q,"live":["project"],"open":["MED-DO"]}`, "med-do", false, false},
 		{"project not live", `{"at":%q,"live":["other"],"open":["MED-DO"]}`, "med-hunt", true, false},
-		{"gate missing", "", "med-hunt", false, true},
-		{"gate malformed", "{", "med-hunt", false, true},
+		{"gate missing", "", "high", false, true},
+		{"gate malformed", "{", "high", false, true},
 		{"gate stale", `{"at":"2000-01-01T00:00:00Z","live":["project"],"open":[]}`, "high", false, true},
 		{"gate future", `{"at":"2099-01-01T00:00:00Z","live":["project"],"open":[]}`, "high", false, true},
 	} {
@@ -2382,7 +2383,7 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 			}
 			write("20261101-1000-MED-DO-med-do", "открыт")
 			write("20261030-1000-MED-HUNT-med-hunt", "открыт")
-			if tc.name == "gate stale" || tc.name == "gate future" {
+			if tc.wantDiag {
 				write("20261101-1000-HIGH-high", "открыт")
 			}
 			if tc.gate != "" {
@@ -2481,4 +2482,142 @@ func TestRetagOldWordNeedsPrio(t *testing.T) {
 	if err != nil || name != "20200101-1000-LOW-DO-old.md" {
 		t.Errorf("--prio LOW --diff DO on INFO = %q, %v", name, err)
 	}
+}
+
+func TestGateOpenTicketWithoutDifficultyNeedsAllPairs(t *testing.T) {
+	med := task{prio: "MED"}
+	for _, tc := range []struct {
+		open []string
+		want bool
+	}{
+		{[]string{"MED-DO"}, false},
+		{[]string{"MED-DO", "MED-HUNT"}, false},
+		{[]string{"MED-DO", "MED-HUNT", "MED-ARCH"}, true},
+		{[]string{"MEDIUM-DO", "MEDIUM-HUNT", "MEDIUM-ARCH"}, true},
+		{[]string{"LOW-DO", "LOW-HUNT", "LOW-ARCH"}, false},
+	} {
+		if got := gateOpen(med, tc.open); got != tc.want {
+			t.Errorf("gateOpen(MED, %v) = %v, want %v", tc.open, got, tc.want)
+		}
+	}
+	if !gateOpen(task{prio: "HIGH"}, nil) || !gateOpen(task{prio: "CRIT"}, nil) {
+		t.Error("CRIT and HIGH are always open")
+	}
+}
+
+func queueProject(t *testing.T, gate string, tickets map[string]string) (string, string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "project")
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, status := range tickets {
+		body := "# " + name + "\n\nСтатус: " + status + "\n\n## Приёмка\n- check\n\n## Журнал\n- 2026-11-01 10:00 в работе — master\n"
+		if status == "в работе" {
+			body = strings.Replace(body, "\n\n## Приёмка", "\nИсполнитель: master\n\n## Приёмка", 1)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if gate != "" {
+		gateDir := filepath.Join(home, ".local", "state", "queue")
+		if err := os.MkdirAll(gateDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		content := strings.ReplaceAll(gate, "NOW", time.Now().Format(time.RFC3339))
+		if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root, dir
+}
+
+// Without readable gates only what is always open is shown, with the reason.
+func TestNextBrokenGateShowsOnlyAlwaysOpen(t *testing.T) {
+	for name, gate := range map[string]string{
+		"missing":   "",
+		"malformed": "{",
+		"stale":     `{"at":"2000-01-01T00:00:00Z","live":["project"],"open":["MED-DO"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			root, dir := queueProject(t, gate, map[string]string{"20261101-1000-MED-DO-med": "открыт"})
+			var out, errout bytes.Buffer
+			if code := nextTask(root, "", dir, options{by: "me"}, &out, &errout); code != exitNone {
+				t.Errorf("only MED open: code %d, out %q", code, out.String())
+			}
+			if !strings.Contains(errout.String(), "gate.json") || !strings.Contains(errout.String(), "CRIT and HIGH") {
+				t.Errorf("warning %q", errout.String())
+			}
+			if err := os.WriteFile(filepath.Join(dir, "20261101-1100-HIGH-high.md"), []byte("# high\n\nСтатус: открыт\nПричина: x\n\n## Приёмка\n- check\n\n## Журнал\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out.Reset()
+			if code := nextTask(root, "", dir, options{by: "me"}, &out, &errout); code != 0 || !strings.Contains(out.String(), "high") {
+				t.Errorf("HIGH open: code %d, out %q", code, out.String())
+			}
+		})
+	}
+}
+
+// tk done ends with the next ticket chosen as tk next chooses it, for the master
+// who owns the closed ticket, and prints nothing when the queue is empty.
+func TestDoneHintsNextTicket(t *testing.T) {
+	const live = `{"at":"NOW","live":["project"],"open":["MED-DO"]}`
+	closing := "20261101-1000-HIGH-closing"
+	done := func(t *testing.T, gate string, others map[string]string) string {
+		t.Helper()
+		tickets := map[string]string{closing: "в работе"}
+		maps.Copy(tickets, others)
+		root, dir := queueProject(t, gate, tickets)
+		path := filepath.Join(dir, closing+".md")
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket := task{path: path, slug: "closing", prio: "HIGH", status: "в работе", body: string(content)}
+		var out, errout bytes.Buffer
+		o := options{cmd: "done", by: "checker", check: "checked by test", baseRoot: root}
+		if code := transition(ticket, o, &out, &errout); code != 0 {
+			t.Fatalf("done = %d, stderr %q", code, errout.String())
+		}
+		return out.String()
+	}
+	t.Run("empty queue prints only the status", func(t *testing.T) {
+		if got := done(t, live, nil); got != "closing готово\n" {
+			t.Errorf("output %q", got)
+		}
+	})
+	t.Run("next open ticket", func(t *testing.T) {
+		got := done(t, live, map[string]string{"20261101-1100-MED-DO-open-pair": "открыт", "20261101-0900-MED-HUNT-closed-pair": "открыт"})
+		lines := strings.Split(strings.TrimSpace(got), "\n")
+		if len(lines) != 2 || !strings.HasPrefix(lines[1], "следующий: open-pair ") {
+			t.Errorf("output %q", got)
+		}
+	})
+	t.Run("the owner's ticket in work comes first", func(t *testing.T) {
+		got := done(t, live, map[string]string{"20261101-1100-HIGH-open": "открыт", "20261101-1200-MED-DO-owned": "в работе"})
+		if !strings.Contains(got, "следующий: owned ") {
+			t.Errorf("output %q", got)
+		}
+	})
+	t.Run("not done prints no hint", func(t *testing.T) {
+		root, dir := queueProject(t, live, map[string]string{"20261101-1100-HIGH-other": "открыт", "20261101-1000-HIGH-rejected": "открыт"})
+		path := filepath.Join(dir, "20261101-1000-HIGH-rejected.md")
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, errout bytes.Buffer
+		o := options{cmd: "reject", by: "me", why: "no", baseRoot: root}
+		if code := transition(task{path: path, slug: "rejected", prio: "HIGH", status: "открыт", body: string(content)}, o, &out, &errout); code != 0 {
+			t.Fatalf("reject = %d, stderr %q", code, errout.String())
+		}
+		if strings.Contains(out.String(), "следующий") {
+			t.Errorf("output %q", out.String())
+		}
+	})
 }

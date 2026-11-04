@@ -43,7 +43,7 @@ Usage:
   tk next [--by NAME] [--json]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
-  tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]
+  tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]   ends with the next ticket, as tk next chooses it for the executor
   tk reject ID --why TEXT [--by NAME]
   tk show ID [--json]
   tk archive [--older DURATION] [--root DIR]
@@ -2450,6 +2450,9 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
+	if o.cmd == "done" {
+		hintNext(t, filepath.Dir(newPath), o, out, errout)
+	}
 	return 0
 }
 
@@ -2793,15 +2796,20 @@ func gateOpen(t task, open []string) bool {
 		return true
 	}
 	if t.diff != "" {
-		for _, pair := range open {
-			if pair == p+"-"+t.diff || pair == "MEDIUM-"+t.diff && p == "MED" {
-				return true
-			}
-		}
-		return false
+		return pairOpen(p, t.diff, open)
 	}
+	// A ticket without a difficulty may turn out to be any of them.
+	for _, diff := range []string{"DO", "HUNT", "ARCH"} {
+		if !pairOpen(p, diff, open) {
+			return false
+		}
+	}
+	return true
+}
+
+func pairOpen(prio, diff string, open []string) bool {
 	for _, pair := range open {
-		if strings.HasPrefix(pair, p+"-") || p == "MED" && strings.HasPrefix(pair, "MEDIUM-") {
+		if pair == prio+"-"+diff || prio == "MED" && pair == "MEDIUM-"+diff {
 			return true
 		}
 	}
@@ -2851,29 +2859,69 @@ func readTaskGate() (gateState, error) {
 }
 
 func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
-	tasks, err := loadTasks(dir, true)
-	if err != nil {
-		return fail(errout, err)
-	}
-	gate, err := readTaskGate()
-	if err != nil {
-		return fail(errout, err)
-	}
-	if !gate.valid {
-		fmt.Fprintf(errout, "tk: %s; showing all candidates (%s)\n", gate.problem, gate.path)
-	}
 	project := root
 	if main != "" {
 		project = main
 	}
-	live := slices.Contains(gate.data.Live, filepath.Base(project))
-	candidates := nextCandidates(tasks, o.by, gate, live)
-	if len(candidates) == 0 {
+	choice, err := chooseNext(dir, project, o.by)
+	if err != nil {
+		return fail(errout, err)
+	}
+	if !choice.gate.valid {
+		fmt.Fprintf(errout, "tk: %s; showing CRIT and HIGH only (%s)\n", choice.gate.problem, choice.gate.path)
+	}
+	if !choice.found {
 		fmt.Fprintln(out, "работы нет")
 		return exitNone
 	}
-	sortNextCandidates(candidates, o.by)
-	return printNext(root, candidates[0], o.json, gate.valid, live, out, errout)
+	return printNext(root, choice, o.json, out, errout)
+}
+
+type nextChoice struct {
+	task  task
+	found bool
+	gate  gateState
+	live  bool
+}
+
+func chooseNext(dir, project, actor string) (nextChoice, error) {
+	tasks, err := loadTasks(dir, true)
+	if err != nil {
+		return nextChoice{}, err
+	}
+	gate, err := readTaskGate()
+	if err != nil {
+		return nextChoice{}, err
+	}
+	choice := nextChoice{gate: gate, live: slices.Contains(gate.data.Live, filepath.Base(project))}
+	candidates := nextCandidates(tasks, actor, gate, choice.live)
+	if len(candidates) != 0 {
+		sortNextCandidates(candidates, actor)
+		choice.task, choice.found = candidates[0], true
+	}
+	return choice, nil
+}
+
+// hintNext ends tk done with the ticket tk next would give its executor, who
+// takes the next one even when a checker closes this one. The ticket is already
+// closed, so a failed lookup only warns.
+func hintNext(t task, dir string, o options, out, errout io.Writer) {
+	project := o.mainRoot
+	if project == "" {
+		project = o.baseRoot
+	}
+	actor := executor(t.body)
+	if actor == "" {
+		actor = o.by
+	}
+	choice, err := chooseNext(dir, project, actor)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
+		return
+	}
+	if choice.found {
+		fmt.Fprintln(out, "следующий: "+nextLine(choice))
+	}
 }
 
 func nextCandidates(tasks []task, actor string, gate gateState, live bool) []task {
@@ -2883,12 +2931,21 @@ func nextCandidates(tasks []task, actor string, gate gateState, live bool) []tas
 		if !eligibleForNext(t, actor) {
 			continue
 		}
-		if gate.valid && live && !gateOpen(t, gate.data.Open) {
+		if !gateVisible(t, gate, live) {
 			continue
 		}
 		candidates = append(candidates, t)
 	}
 	return candidates
+}
+
+// gateVisible: without readable gates nothing tells which pairs are open or
+// which projects are live, so only what is always open stays visible.
+func gateVisible(t task, gate gateState, live bool) bool {
+	if !gate.valid {
+		return gateOpen(t, nil)
+	}
+	return !live || gateOpen(t, gate.data.Open)
 }
 
 func eligibleForNext(t task, actor string) bool {
@@ -2934,22 +2991,26 @@ type nextTaskJSON struct {
 	Closed bool `json:"closed"`
 }
 
-func printNext(root string, t task, jsonOutput, gateValid, live bool, out, errout io.Writer) int {
+func printNext(root string, choice nextChoice, jsonOutput bool, out, errout io.Writer) int {
 	if jsonOutput {
-		obj := nextTaskJSON{taskJSON: taskObject(root, t, "", false), Closed: gateValid && !live}
+		obj := nextTaskJSON{taskJSON: taskObject(root, choice.task, "", false), Closed: choice.gate.valid && !choice.live}
 		if err := json.NewEncoder(out).Encode(obj); err != nil {
 			return fail(errout, err)
 		}
 		return 0
 	}
+	fmt.Fprintln(out, nextLine(choice))
+	return 0
+}
+
+func nextLine(choice nextChoice) string {
 	var row bytes.Buffer
-	printTask(&row, t, "")
+	printTask(&row, choice.task, "")
 	line := strings.TrimSuffix(row.String(), "\n")
-	if gateValid && !live {
+	if choice.gate.valid && !choice.live {
 		line += " закрыто"
 	}
-	fmt.Fprintln(out, line)
-	return 0
+	return line
 }
 
 // completion — проверяющий и проверка последней строки «готово» журнала: тикет могли открыть заново.
