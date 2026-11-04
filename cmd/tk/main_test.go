@@ -2843,7 +2843,31 @@ func TestNewToAndJournalHints(t *testing.T) {
 	if code := create(root, filepath.Join(root, "docs", "tasks"), options{cmd: "new", id: "log", prio: "MED", by: "me", journal: true}, &out, &errOut); code != 0 {
 		t.Fatalf("create = %d: %s", code, errOut.String())
 	}
-	if errOut.Len() != 0 {
-		t.Fatalf("a journal ticket is not worked on, no hint: %q", errOut.String())
+	if !strings.Contains(errOut.String(), "tk note log") || strings.Contains(errOut.String(), "tk start") {
+		t.Fatalf("a journal ticket takes notes, it is not started: %q", errOut.String())
+	}
+}
+
+func TestFillHintNamesOnlyEmptySections(t *testing.T) {
+	work := "# T\n\n## Что сделать\nwork\n\n## Приёмка\n\n## Журнал\n"
+	if got := fillHint(work, "p"); strings.Contains(got, "Что сделать") || !strings.Contains(got, "«Приёмка»") {
+		t.Fatalf("hint for empty acceptance = %q", got)
+	}
+	check := "# T\n\n## Что сделать\n\n## Приёмка\n- check\n\n## Журнал\n"
+	if got := fillHint(check, "p"); !strings.Contains(got, "«Что сделать»") || strings.Contains(got, "Приёмка") {
+		t.Fatalf("hint for empty work = %q", got)
+	}
+	if got := fillHint("# T\n\n## Что сделать\nwork\n\n## Приёмка\n- check\n\n## Журнал\n", "p"); got != "" {
+		t.Fatalf("hint for a filled ticket = %q", got)
+	}
+}
+
+func TestRepeatedStartNamesNextStep(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20261104-1000-MED-DO-again.md")
+	body := "# T\n\nСтатус: в работе\nИсполнитель: me\n\n## Что сделать\nwork\n\n## Приёмка\n- check\n\n## Журнал\n"
+	var out, errOut bytes.Buffer
+	code, done := guardStart(task{path: path, slug: "again", status: "в работе", body: body}, options{cmd: "start", by: "me"}, &out, &errOut)
+	if code != 0 || !done || strings.TrimSpace(out.String()) != "again в работе" || !strings.Contains(errOut.String(), "tk done again") {
+		t.Fatalf("repeat start = %d %v %q %q", code, done, out.String(), errOut.String())
 	}
 }

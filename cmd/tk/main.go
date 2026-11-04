@@ -1098,33 +1098,49 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 		}
 	}
 	fmt.Fprintln(out, createdPath)
-	if !o.journal {
-		fmt.Fprintln(errout, hintAfterNew(o, createdPath, body))
-	}
+	fmt.Fprintln(errout, hintAfterNew(o, createdPath, body))
 	return 0
 }
 
 // hintAfterNew and hintAfterStart name the next step on stderr: stdout of tk new
 // is the ticket path, and scripts read it.
 func hintAfterNew(o options, path, body string) string {
+	fill := fillHint(body, path)
 	switch {
-	case noCheck(body) && o.to != "":
-		return "дальше: заполни «Что сделать» и «Приёмка» в " + path
-	case noCheck(body):
-		return "дальше: заполни «Что сделать» и «Приёмка» в " + path + ", затем tk start " + o.id
+	case o.journal:
+		return "дальше: записи — tk note " + o.id + " TEXT"
+	case o.to != "" && fill != "":
+		return "дальше: " + fill
 	case o.to != "":
 		return "дальше: тикет в очереди проекта, его возьмёт исполнитель"
+	case fill != "":
+		return "дальше: " + fill + ", затем tk start " + o.id
 	default:
 		return "дальше: tk start " + o.id
 	}
 }
 
-func hintAfterStart(t task, body string) string {
-	finish := "закончил — независимая проверка, затем tk done " + t.slug + " --check TEXT"
-	if noCheck(body) {
-		return "дальше: заполни «Приёмка» в " + t.path + "; по ходу tk note " + t.slug + " TEXT; " + finish
+func hintAfterStart(t task, body, path string) string {
+	hint := "дальше: "
+	if fill := fillHint(body, path); fill != "" {
+		hint += fill + "; "
 	}
-	return "дальше: по ходу tk note " + t.slug + " TEXT; " + finish
+	return hint + "по ходу tk note " + t.slug + " TEXT; закончил — независимая проверка, затем tk done " + t.slug + " --check TEXT"
+}
+
+// fillHint names the sections tk new left empty, or nothing when both are filled.
+func fillHint(body, path string) string {
+	var empty []string
+	if section, ok := sectionBody(body, "## Что сделать"); ok && strings.TrimSpace(section) == "" {
+		empty = append(empty, "«Что сделать»")
+	}
+	if noCheck(body) {
+		empty = append(empty, "«Приёмка»")
+	}
+	if len(empty) == 0 {
+		return ""
+	}
+	return "заполни " + strings.Join(empty, " и ") + " в " + path
 }
 
 func prepareTaskDirectory(target, knownMain string) error {
@@ -2732,8 +2748,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
 	if o.cmd == "start" {
-		t.path = newPath
-		fmt.Fprintln(errout, hintAfterStart(t, body))
+		fmt.Fprintln(errout, hintAfterStart(t, body, newPath))
 	}
 	return 0
 }
@@ -2745,6 +2760,7 @@ func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
 	owner := executor(t.body)
 	if strings.EqualFold(owner, o.by) && o.prio == "" && o.diff == "" && o.why == "" {
 		fmt.Fprintf(out, "%s %s\n", t.slug, t.status)
+		fmt.Fprintln(errout, hintAfterStart(t, t.body, t.path))
 		return 0, true
 	}
 	if owner != "" && !strings.EqualFold(owner, o.by) && !o.take {
