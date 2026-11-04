@@ -228,11 +228,112 @@ func TestMaskSkNeedsDigit(t *testing.T) {
 	}
 }
 
+func TestMaskBareCodeValueAfterShortAssignment(t *testing.T) {
+	for _, in := range []string{"token := part[start:end]", "password := load", "token => next"} {
+		if out, found := Mask(in); out != in || len(found) != 0 {
+			t.Errorf("changed: %q -> %q %v", in, out, found)
+		}
+	}
+	if out, _ := Mask(`password := "literal"`); strings.Contains(out, "literal") {
+		t.Errorf("quoted literal kept: %q", out)
+	}
+}
+
 func TestMaskPlainTextUnchanged(t *testing.T) {
 	text := "go test ./... — ok; AKIA short; sk-1; ghp_x\n"
 	got, found := Mask(text)
 	if got != text || found == nil || len(found) != 0 {
 		t.Fatalf("plain text changed or counts not empty: %v", found)
+	}
+}
+
+func TestMaskCommandContext(t *testing.T) {
+	tests := []struct{ in, want, kind string }{
+		{"Authorization: Bearer synthetic-pass", "Authorization: Bearer [скрыто:authorization]", "authorization"},
+		{"Proxy-Authorization=basic abc", "Proxy-Authorization=basic [скрыто:authorization]", "authorization"},
+		{"PGPASSWORD=secret-value", "PGPASSWORD=[скрыто:password]", "password"},
+		{"curl -u user:secret-value x", "curl -u user:[скрыто:password] x", "password"},
+		{"curl --user='user:secret-value' x", "curl --user='user:[скрыто:password]' x", "password"},
+		{"tool --client-secret secret-value", "tool --client-secret [скрыто:token]", "token"},
+		{"mysql -psecret-value db", "mysql -p[скрыто:password] db", "password"},
+		{"sshpass -p secret-value ssh host", "sshpass -p [скрыто:password] ssh host", "password"},
+		{"postgres://user:secret-value@db/x", "postgres://user:[скрыто:password]@db/x", "password"},
+		{`{"api_key":"secret-value"}`, `{"api_key":"[скрыто:token]"}`, "token"},
+		{"token: meaningful", "token: [скрыто:token]", "token"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, found := Mask(tt.in)
+			if got != tt.want || found[tt.kind] != 1 {
+				t.Errorf("got %q, counts %v", got, found)
+			}
+		})
+	}
+}
+
+func TestMaskCommandContextLeavesNonValues(t *testing.T) {
+	for _, in := range []string{"TOKEN_COUNT=5", "TOKEN_FILE=/run/t", "PWD=/tmp", "OLDPWD=/tmp", "max_tokens=100", "max_token=100", "api_key=api_key", "token=cfg.Token", "password=getpass()", "Authorization: Bearer $TOKEN", "password: string", "token: the value", "curl -u \"$U:$P\" x", "mysql -p db", "curl https://host:8080/@foo"} {
+		got, found := Mask(in)
+		if got != in || len(found) != 0 {
+			t.Errorf("%q changed to %q (%v)", in, got, found)
+		}
+	}
+}
+
+func TestMaskContextReviewForms(t *testing.T) {
+	tests := []struct {
+		name, input, want string
+	}{
+		{"curl absolute path", "/usr/bin/curl -u admin:secret-value x", "/usr/bin/curl -u admin:[скрыто:password] x"},
+		{"curl substitution", "$(curl -u admin:secret-value x)", "$(curl -u admin:[скрыто:password] x)"},
+		{"mysql subshell", "(mysql -psecret-value)", "(mysql -p[скрыто:password])"},
+		{"mysql absolute path", "/usr/bin/mysql -psecret-value", "/usr/bin/mysql -p[скрыто:password]"},
+		{"sshpass after flag", "sshpass -v -p secret-value ssh host", "sshpass -v -p [скрыто:password] ssh host"},
+		{"curl grouped short flags", "curl -su admin:secret-value x", "curl -su admin:[скрыто:password] x"},
+		{"curl uppercase group", "curl -sSu admin:secret-value x", "curl -sSu admin:[скрыто:password] x"},
+		{"curl continued line", "curl -sS \\\n  -u admin:secret-value x", "curl -sS \\\n  -u admin:[скрыто:password] x"},
+		{"mysql continued line", "mysql -h db \\\n  -psecret-value", "mysql -h db \\\n  -p[скрыто:password]"},
+		{"sshpass continued line", "sshpass \\\n  -p secret-value ssh host", "sshpass \\\n  -p [скрыто:password] ssh host"},
+		{"flag continued line", "tool --token \\\n  secret-value", "tool --token \\\n  [скрыто:token]"},
+		{"assignment spaces", "token = secret-value", "token = [скрыто:token]"},
+		{"password spaces", "password = secret-value", "password = [скрыто:password]"},
+		{"quoted code", `password: "cfg.Token"`, `password: "[скрыто:password]"`},
+		{"quoted parentheses", `PASSWORD="ab(cd"`, `PASSWORD="[скрыто:password]"`},
+		{"equals in value", "PASSWORD=ab=cd", "PASSWORD=[скрыто:password]"},
+		{"comma in equals value", "PASSWORD=ab,cd", "PASSWORD=[скрыто:password]"},
+		{"unicode value", "PASSWORD=паролька", "PASSWORD=[скрыто:password]"},
+		{"short quoted token", `{"token":"12345"}`, `{"token":"[скрыто:token]"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _ := Mask(tt.input); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaskContextReviewKeepsNonValues(t *testing.T) {
+	for _, input := range []string{
+		"curly -u a:b x", "xcurl -u a:b x", "notmysql -psecret", "docs/change-password now",
+		"tool admin-token prune", "change-password is broken", "x-api-key is required",
+		"password:\n  user: x", "token:\n  value: abc123456", "sshpass -e ssh -p 22 host",
+		"sshpass -f /run/p ssh -p 22 host", "mysql -h db -P3306", "mysql -h db -P 3306",
+		"PGPASSWORD= psql -h db", "TOKEN= ./run", "curl -d 'q=a:b' x", "curl -X -u x",
+		"password: cfg.Token", "password=ab(cd)", "token: the value", "token=12345",
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("%q changed to %q (%v)", input, got, found)
+		}
+	}
+}
+
+func BenchmarkMaskOrdinary1MiB(b *testing.B) {
+	text := strings.Repeat("ordinary event message with no credentials or command names; ", (1<<20)/59+1)[:1<<20]
+	b.SetBytes(int64(len(text)))
+	b.ResetTimer()
+	for range b.N {
+		Mask(text)
 	}
 }
 

@@ -28,6 +28,12 @@
 //     --sk-color-primary-500-hover-dark and xoxo-hugs-and-kisses-2026.
 //     A hyphen or underscore neighbor can expose the same false positive, as
 //     in task-sk-learn-contrib-imbalanced-2024-01.
+//   - Command context detection misses tool-specific options such as
+//     redis-cli -a, Cookie headers, a bare Bearer value, non-English key names,
+//     and references such as $ecret. An unquoted value can end at a quote and
+//     leave a tail visible (for example PASSWORD=a'b').
+//   - Context rules can hide prose that resembles an assignment or option,
+//     including “--token is no longer needed” and “password: word”.
 package secretmask
 
 import (
@@ -37,10 +43,88 @@ import (
 )
 
 var (
-	privateKeyRE = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
-	awsRE        = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	escapeRE     = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
+	privateKeyRE   = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
+	awsRE          = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	escapeRE       = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
+	contextNameRE  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\?["'])?([ \t]*)(:=|=>|=|:)`)
+	headerRE       = regexp.MustCompile(`(?i)(?:proxy-)?authorization\s*[:=]\s*(?:(?:bearer|basic|token|digest|negotiate)\s+)?`)
+	urlRE          = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]+:([^\s/@]+)@`)
+	flagRE         = regexp.MustCompile("(?i)(?:^|[ \\t'\"`])--?([a-z0-9_.-]+)(?:=|(?:[ \\t]|\\\\\\n)+)")
+	contextAnchors = map[byte][]string{
+		'a': {"authorization", "api_key", "api-key", "apikey", "access_key"},
+		'c': {"curl"}, 'm': {"mysql", "mariadb"},
+		'p': {"password", "passwd", "passphrase", "pass", "pwd", "private_key"},
+		's': {"secret", "sshpass"}, 't': {"token"},
+	}
 )
+
+type contextAnchorState struct {
+	next  [128]int
+	fail  int
+	match bool
+}
+
+var contextAnchorAutomaton = buildContextAnchorAutomaton()
+
+func buildContextAnchorAutomaton() []contextAnchorState {
+	states := []contextAnchorState{{}}
+	firstBytes := make([]int, 0, len(contextAnchors))
+	for first := range contextAnchors {
+		firstBytes = append(firstBytes, int(first))
+	}
+	sort.Ints(firstBytes)
+	for _, first := range firstBytes {
+		words := contextAnchors[byte(first)]
+		for _, word := range words {
+			state := 0
+			for i := 0; i < len(word); i++ {
+				c := word[i]
+				if states[state].next[c] == 0 {
+					states = append(states, contextAnchorState{})
+					states[state].next[c] = len(states) - 1
+				}
+				state = states[state].next[c]
+			}
+			states[state].match = true
+		}
+	}
+	queue := make([]int, 0, len(states))
+	for c := range 128 {
+		if child := states[0].next[c]; child != 0 {
+			queue = append(queue, child)
+		}
+	}
+	for head := 0; head < len(queue); head++ {
+		state := queue[head]
+		for c := range 128 {
+			child := states[state].next[c]
+			if child == 0 {
+				continue
+			}
+			queue = append(queue, child)
+			failure := states[state].fail
+			for failure != 0 && states[failure].next[c] == 0 {
+				failure = states[failure].fail
+			}
+			states[child].fail = states[failure].next[c]
+			states[child].match = states[child].match || states[states[child].fail].match
+		}
+	}
+	return states
+}
+
+type contextValue struct {
+	start, end int
+	quoted     bool
+}
+type contextMatch struct {
+	start, end int
+	kind       string
+}
+type contextSpan struct {
+	start, end int
+	kind       string
+}
 
 type bodyClass uint8
 
@@ -117,23 +201,532 @@ func Mask(text string) (string, map[string]int) {
 			scan = nil // replacements invalidate byte offsets and run metadata
 		}
 	}
+	if hasContextAnchor(text) || strings.Contains(text, "://") {
+		text = maskContext(text, found)
+	}
 	return text, found
+}
+
+func hasContextAnchor(text string) bool {
+	state := 0
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		if c >= 128 {
+			state = 0
+			continue
+		}
+		for state != 0 && contextAnchorAutomaton[state].next[c] == 0 {
+			state = contextAnchorAutomaton[state].fail
+		}
+		state = contextAnchorAutomaton[state].next[c]
+		if contextAnchorAutomaton[state].match {
+			return true
+		}
+	}
+	return false
+}
+
+// Context rules recognize values after familiar command and configuration names.
+func maskContext(text string, found map[string]int) string {
+	matches := make([]contextMatch, 0)
+	matches = append(matches, headerMatches(text)...)
+	matches = append(matches, nameMatches(text)...)
+	matches = append(matches, flagMatches(text)...)
+	matches = append(matches, urlMatches(text)...)
+	matches = append(matches, curlMatches(text)...)
+	matches = append(matches, toolPasswordMatches(text)...)
+	sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
+	spans := make([]contextSpan, 0, len(matches))
+	last := 0
+	for _, match := range matches {
+		if match.start < last || match.end <= match.start {
+			continue
+		}
+		spans = append(spans, contextSpan{match.start, match.end, match.kind})
+		last = match.end
+	}
+	return replaceSpans(text, spans, found)
+}
+
+func headerMatches(text string) []contextMatch {
+	var matches []contextMatch
+	for _, ix := range headerRE.FindAllStringIndex(text, -1) {
+		value, ok := scanValue(text, ix[1], false)
+		if ok && valueIsValue(text, value, "", "authorization", false) {
+			matches = append(matches, contextMatch{value.start, value.end, "authorization"})
+		}
+	}
+	return matches
+}
+
+func nameMatches(text string) []contextMatch {
+	var matches []contextMatch
+	coveredUntil := 0
+	for _, ix := range contextNameRE.FindAllStringSubmatchIndex(text, -1) {
+		if ix[0] < coveredUntil {
+			continue
+		}
+		name := text[ix[2]:ix[3]]
+		kind, ok := secretName(name)
+		if !ok {
+			continue
+		}
+		leftSpace := text[ix[4]:ix[5]]
+		delimiter := text[ix[6]:ix[7]]
+		at := ix[1]
+		if delimiter == "=" && leftSpace == "" && hasHorizontalSpaceAt(text, at) {
+			continue
+		}
+		value, ok := scanValue(text, at, delimiter == ":" || delimiter == ":=")
+		if !ok {
+			continue
+		}
+		coveredUntil = value.end
+		// After := and => a bare value is an expression in code; a literal has quotes.
+		if !value.quoted && (delimiter == ":=" || delimiter == "=>") {
+			continue
+		}
+		if valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=") {
+			matches = append(matches, contextMatch{value.start, value.end, kind})
+		}
+	}
+	return matches
+}
+
+func flagMatches(text string) []contextMatch {
+	var matches []contextMatch
+	coveredUntil := 0
+	for _, ix := range flagRE.FindAllStringSubmatchIndex(text, -1) {
+		if ix[0] < coveredUntil {
+			continue
+		}
+		name := text[ix[2]:ix[3]]
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "no-") || strings.HasPrefix(lower, "ask-") || strings.HasPrefix(lower, "prompt-") {
+			continue
+		}
+		kind, ok := secretName(name)
+		if !ok {
+			continue
+		}
+		at := ix[1]
+		value, ok := scanValue(text, at, false)
+		if !ok {
+			continue
+		}
+		coveredUntil = value.end
+		separator := text[ix[1]-1]
+		if separator != '=' && !flagValueAllowed(text[value.start:value.end]) {
+			continue
+		}
+		if valueIsValue(text, value, name, kind, false) {
+			matches = append(matches, contextMatch{value.start, value.end, kind})
+		}
+	}
+	return matches
+}
+
+func urlMatches(text string) []contextMatch {
+	var matches []contextMatch
+	for _, ix := range urlRE.FindAllStringSubmatchIndex(text, -1) {
+		value, ok := scanValue(text, ix[2], false)
+		if !ok {
+			continue
+		}
+		if value.end > ix[3] {
+			value.end = ix[3]
+		}
+		if valueIsValue(text, value, "", "password", false) {
+			matches = append(matches, contextMatch{value.start, value.end, "password"})
+		}
+	}
+	return matches
+}
+
+func curlMatches(text string) []contextMatch {
+	var matches []contextMatch
+	for _, segment := range commandSegments(text) {
+		part := text[segment[0]:segment[1]]
+		if command, ok := findCommandWord(part, "curl", false); ok {
+			for at := command.end; ; {
+				start, end, ok := nextShellWord(part, at)
+				if !ok {
+					break
+				}
+				at = end
+				valueAt, found := curlUserValue(part, start, end)
+				if !found {
+					continue
+				}
+				value, ok := scanValue(part, valueAt, false)
+				if !ok {
+					continue
+				}
+				colon := strings.IndexByte(part[value.start:value.end], ':')
+				if colon < 0 {
+					continue
+				}
+				password := contextValue{value.start + colon + 1, value.end, value.quoted}
+				if valueIsValue(part, password, "", "password", false) {
+					matches = append(matches, contextMatch{segment[0] + password.start, segment[0] + password.end, "password"})
+				}
+			}
+		}
+	}
+	return matches
+}
+
+func curlUserValue(text string, start, end int) (int, bool) {
+	token := text[start:end]
+	if strings.HasPrefix(token, "--user=") {
+		return start + len("--user="), true
+	}
+	if token == "--user" {
+		value, _, ok := nextShellWord(text, end)
+		return value, ok
+	}
+	if !strings.HasPrefix(token, "-") || strings.HasPrefix(token, "--") {
+		return 0, false
+	}
+	body := token[1:]
+	u := strings.IndexByte(body, 'u')
+	if u < 0 {
+		return 0, false
+	}
+	after := start + 1 + u + 1
+	if after < end && text[after] == '=' {
+		return after + 1, true
+	}
+	if after < end {
+		return after, true
+	}
+	value, _, ok := nextShellWord(text, end)
+	return value, ok
+}
+
+func toolPasswordMatches(text string) []contextMatch {
+	var matches []contextMatch
+	for _, segment := range commandSegments(text) {
+		part := text[segment[0]:segment[1]]
+		if command, ok := findCommandWord(part, "sshpass", false); ok {
+			for at := command.end; ; {
+				start, end, ok := nextShellWord(part, at)
+				if !ok {
+					break
+				}
+				token := part[start:end]
+				at = end
+				if !strings.HasPrefix(token, "-") {
+					break
+				}
+				if token == "-p" {
+					valueAt, _, ok := nextShellWord(part, end)
+					if ok {
+						addToolPassword(part, segment[0], valueAt, &matches)
+					}
+					break
+				}
+				if strings.HasPrefix(token, "-p") && len(token) > 2 {
+					addToolPassword(part, segment[0], start+2, &matches)
+					break
+				}
+				if token == "-f" || token == "-d" {
+					_, at, _ = nextShellWord(part, at)
+				}
+			}
+		}
+		for _, tool := range [...]string{"mysql", "mariadb"} {
+			command, ok := findCommandWord(part, tool, true)
+			if !ok {
+				continue
+			}
+			for at := command.end; ; {
+				start, end, ok := nextShellWord(part, at)
+				if !ok {
+					break
+				}
+				at = end
+				if strings.HasPrefix(part[start:end], "-p") && end-start > 2 {
+					addToolPassword(part, segment[0], start+2, &matches)
+				}
+			}
+		}
+	}
+	return matches
+}
+
+func addToolPassword(text string, offset, at int, matches *[]contextMatch) {
+	value, ok := scanValue(text, at, false)
+	if ok && flagValueAllowed(text[value.start:value.end]) && valueIsValue(text, value, "", "password", false) {
+		*matches = append(*matches, contextMatch{offset + value.start, offset + value.end, "password"})
+	}
+}
+
+func findCommandWord(text, name string, prefix bool) (contextValue, bool) {
+	for start := 0; start+len(name) <= len(text); start++ {
+		if !commandLeftBoundary(text, start) || !asciiEqualFoldAt(text, start, name) {
+			continue
+		}
+		end := start + len(name)
+		if prefix || commandRightBoundary(text, end) {
+			return contextValue{start, end, false}, true
+		}
+	}
+	return contextValue{}, false
+}
+
+func asciiEqualFoldAt(text string, start int, want string) bool {
+	for i := 0; i < len(want); i++ {
+		c := text[start+i]
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		if c != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func commandLeftBoundary(text string, at int) bool {
+	if at == 0 {
+		return true
+	}
+	if at >= 2 && text[at-2:at] == "\\\n" {
+		return true
+	}
+	return strings.ContainsRune(" \t/('\"`", rune(text[at-1]))
+}
+
+func commandRightBoundary(text string, at int) bool {
+	return at == len(text) || strings.ContainsRune(" \t'\"`)", rune(text[at])) || strings.HasPrefix(text[at:], "\\\n")
+}
+
+func commandSegments(text string) [][2]int {
+	var segments [][2]int
+	start := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] == '\n' && i > 0 && text[i-1] == '\\' {
+			continue
+		}
+		if strings.ContainsRune(";|&\n", rune(text[i])) {
+			segments = append(segments, [2]int{start, i})
+			start = i + 1
+		}
+	}
+	return append(segments, [2]int{start, len(text)})
+}
+
+func nextShellWord(text string, at int) (int, int, bool) {
+	for at < len(text) {
+		if text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r' {
+			at++
+			continue
+		}
+		if strings.HasPrefix(text[at:], "\\\n") {
+			at += 2
+			continue
+		}
+		break
+	}
+	if at >= len(text) {
+		return 0, 0, false
+	}
+	start := at
+	var quote byte
+	for at < len(text) {
+		c := text[at]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && at+1 < len(text) {
+				at += 2
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			at++
+			continue
+		}
+		if c == '\'' || c == '"' || c == '`' {
+			quote = c
+			at++
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.HasPrefix(text[at:], "\\\n") {
+			break
+		}
+		at++
+	}
+	return start, at, true
+}
+
+func scanValue(text string, at int, colon bool) (contextValue, bool) {
+	for at < len(text) {
+		if text[at] == ' ' || text[at] == '\t' {
+			at++
+			continue
+		}
+		if strings.HasPrefix(text[at:], "\\\n") {
+			at += 2
+			continue
+		}
+		break
+	}
+	if at >= len(text) || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' {
+		return contextValue{}, false
+	}
+	if strings.HasPrefix(text[at:], `\"`) {
+		start := at + 2
+		for i := start; i+1 < len(text); i++ {
+			if text[i:i+2] == `\"` {
+				return contextValue{start, i, true}, i > start
+			}
+			if text[i] == '\\' {
+				i++
+			}
+		}
+		return contextValue{}, false
+	}
+	if text[at] == '\'' || text[at] == '"' {
+		quote, start := text[at], at+1
+		for i := start; i < len(text); i++ {
+			if quote == '"' && text[i] == '\\' && i+1 < len(text) {
+				i++
+				continue
+			}
+			if text[i] == quote {
+				return contextValue{start, i, true}, i > start
+			}
+		}
+		return contextValue{}, false
+	}
+	start := at
+	for at < len(text) {
+		c := text[at]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.ContainsRune("\"'&;|)}`", rune(c)) || c == ',' && colon || strings.HasPrefix(text[at:], "\\\n") {
+			break
+		}
+		at++
+	}
+	return contextValue{start, at, false}, at > start
+}
+
+func valueIsValue(text string, value contextValue, name, kind string, colon bool) bool {
+	v := text[value.start:value.end]
+	if value.quoted {
+		return quotedIsValue(v)
+	}
+	return bareIsValue(v, name, kind, colon)
+}
+
+func quotedIsValue(value string) bool {
+	return value != "" && !isReference(value) && !isPlaceholder(value) && !strings.HasPrefix(value, "[скрыто:")
+}
+
+func bareIsValue(value, name, kind string, colon bool) bool {
+	if value == "" || isReference(value) || isPlaceholder(value) || strings.HasPrefix(value, "[скрыто:") || strings.ContainsAny(value, "('") || strings.EqualFold(value, name) {
+		return false
+	}
+	if strings.Contains(value, ".") {
+		identifier := true
+		for i := 0; i < len(value); i++ {
+			if !isLetter(value[i]) && value[i] != '.' {
+				identifier = false
+				break
+			}
+		}
+		if identifier {
+			return false
+		}
+	}
+	if kind == "token" {
+		digits := true
+		for i := 0; i < len(value); i++ {
+			if value[i] < '0' || value[i] > '9' {
+				digits = false
+				break
+			}
+		}
+		if digits && len(value) < 8 || colon && !digits && len(value) < 8 {
+			return false
+		}
+	}
+	return true
+}
+
+func isReference(value string) bool {
+	return strings.HasPrefix(value, "${") || strings.HasPrefix(value, "$(") || strings.HasPrefix(value, "`") || len(value) > 1 && value[0] == '$' && ((value[1] >= 'A' && value[1] <= 'Z') || (value[1] >= 'a' && value[1] <= 'z') || value[1] == '_') || strings.HasPrefix(value, `\"$`)
+}
+
+var placeholderWords = map[string]bool{"%s": true, "%v": true, "string": true, "str": true, "bool": true, "int": true, "true": true, "false": true, "null": true, "nil": true, "none": true, "undefined": true, "required": true, "optional": true, "yes": true, "no": true}
+
+func isPlaceholder(value string) bool {
+	if placeholderWords[strings.ToLower(value)] {
+		return true
+	}
+	return len(value) > 1 && (value[0] == '<' && value[len(value)-1] == '>' || value[0] == '[' && value[len(value)-1] == ']' || value[0] == '{' && value[len(value)-1] == '}')
+}
+
+func flagValueAllowed(value string) bool { return value != "" && value[0] != '-' && value[0] < 0x80 }
+
+func hasHorizontalSpaceAt(text string, at int) bool {
+	return at < len(text) && (text[at] == ' ' || text[at] == '\t')
+}
+
+func secretName(name string) (string, bool) {
+	n := strings.ToLower(name)
+	for len(n) > 0 && n[len(n)-1] >= '0' && n[len(n)-1] <= '9' {
+		n = n[:len(n)-1]
+	}
+	for _, suffix := range [...]string{"password", "passwd", "passphrase"} {
+		if strings.HasSuffix(n, suffix) {
+			return "password", true
+		}
+	}
+	if strings.HasSuffix(n, "pwd") && strings.ToUpper(name) != "PWD" && strings.ToUpper(name) != "OLDPWD" {
+		return "password", true
+	}
+	if n == "pass" || strings.HasSuffix(n, "_pass") || strings.HasSuffix(n, "-pass") {
+		return "password", true
+	}
+	for _, suffix := range [...]string{"token", "secret", "api_key", "api-key", "apikey", "access_key", "private_key"} {
+		if strings.HasSuffix(n, suffix) {
+			return "token", true
+		}
+	}
+	if strings.Contains(n, "secret") && strings.HasSuffix(n, "key") {
+		return "token", true
+	}
+	return "", false
 }
 
 func replaceMatches(text string, indices [][]int, kind string, found map[string]int) string {
 	if len(indices) == 0 {
 		return text
 	}
+	spans := make([]contextSpan, 0, len(indices))
+	for _, index := range indices {
+		spans = append(spans, contextSpan{index[0], index[1], kind})
+	}
+	return replaceSpans(text, spans, found)
+}
+
+func replaceSpans(text string, spans []contextSpan, found map[string]int) string {
+	if len(spans) == 0 {
+		return text
+	}
 	var out strings.Builder
 	last := 0
-	for _, index := range indices {
-		start, end := index[0], index[1]
-		out.WriteString(text[last:start])
+	for _, span := range spans {
+		out.WriteString(text[last:span.start])
 		out.WriteString("[скрыто:")
-		out.WriteString(kind)
+		out.WriteString(span.kind)
 		out.WriteByte(']')
-		last = end
-		found[kind]++
+		last = span.end
+		found[span.kind]++
 	}
 	out.WriteString(text[last:])
 	return out.String()
