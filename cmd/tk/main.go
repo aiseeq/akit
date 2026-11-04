@@ -30,8 +30,8 @@ import (
 const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
-  tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--journal] [--text FILE|-]
-  tk set ID [--prio P] [--diff D] [--why TEXT] [--by NAME] [--journal]
+  tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--journal] [--text FILE|-] [--blocks ID]
+  tk set ID [--prio P] [--diff D] [--why TEXT] [--by NAME] [--journal] [--blocks ID] [--unblocks ID]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
@@ -57,6 +57,8 @@ Flags:
   --to PROJECT   new: create in PROJECT/docs/tasks; absolute path or project name
   --journal      new/set: mark the ticket as a journal entry, hidden from next unless a wait is due
   --parent KEY   transfer: parent item key passed to the transfer command
+  --blocks ID    new/set: ticket this ticket blocks (repeatable)
+  --unblocks ID  set: remove a blocking relation (repeatable)
   --back NAME    new: requesting session
   --title TEXT   new: ticket title (default: slug)
   --by NAME      actor name (default: current session); ls: show tickets assigned to NAME
@@ -127,6 +129,7 @@ type options struct {
 	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back, parent string
 	all, due, json, required, take, journal                                                                                                                    bool
 	older, timeout                                                                                                                                             time.Duration
+	blocks, unblocks                                                                                                                                           []string
 }
 
 // planLimit — предел пункта плана: --timeout или умолчание.
@@ -275,6 +278,18 @@ func parseOptions(args []string, o *options) ([]string, error) {
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		v := args[i]
+		if v == "--blocks" || v == "--unblocks" {
+			if i+1 == len(args) || strings.HasPrefix(args[i+1], "--") || strings.TrimSpace(args[i+1]) == "" {
+				return nil, fmt.Errorf("%s needs a value", v)
+			}
+			i++
+			if v == "--blocks" {
+				o.blocks = append(o.blocks, args[i])
+			} else {
+				o.unblocks = append(o.unblocks, args[i])
+			}
+			continue
+		}
 		switch v {
 		case "--all":
 			o.all = true
@@ -356,6 +371,9 @@ func validateCommandFlags(o *options) error {
 		if err := check(o); err != nil {
 			return err
 		}
+	}
+	if (len(o.blocks) > 0 && o.cmd != "new" && o.cmd != "set") || (len(o.unblocks) > 0 && o.cmd != "set") {
+		return errors.New("--blocks is for new/set; --unblocks is for set")
 	}
 	return nil
 }
@@ -615,7 +633,7 @@ func validatePriorityOptions(o *options) error {
 	if !validDiff(o.diff) {
 		return errors.New("--diff must be DO, HUNT, or ARCH")
 	}
-	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && !o.journal {
+	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && !o.journal && len(o.blocks) == 0 && len(o.unblocks) == 0 {
 		return errors.New("set needs --prio, --diff, --why, or --journal")
 	}
 	return nil
@@ -807,7 +825,36 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 			root, dir = shared, filepath.Join(shared, "docs/tasks")
 		}
 	}
-	return create(root, dir, o, out, errout)
+	for _, ref := range o.blocks {
+		probe := o
+		probe.baseRoot = root
+		probe.mainRoot = main
+		target, err := resolveBlockTarget(probe, ref)
+		if err != nil {
+			return fail(errout, err)
+		}
+		if t, err := find(target.dir, target.id); err != nil {
+			return fail(errout, err)
+		} else if t.status == "готово" || t.status == "отклонён" {
+			return fail(errout, fmt.Errorf("target %s is closed", ref))
+		}
+	}
+	blocks := o.blocks
+	o.blocks = nil
+	if code := create(root, dir, o, out, errout); code != 0 {
+		return code
+	}
+	if len(blocks) == 0 {
+		return 0
+	}
+	t, err := find(dir, o.id)
+	if err != nil {
+		return fail(errout, err)
+	}
+	o.blocks = blocks
+	o.baseRoot = root
+	o.mainRoot = main
+	return attachBlocks(t, o, out, errout, blocks)
 }
 
 func gitMainRoot(target string) (string, error) {
@@ -884,6 +931,26 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 	}
 	code := runFoundTask(root, t, o, out, errout)
 	release()
+	if code == 0 && (o.cmd == "set" || o.cmd == "start") {
+		current, err := find(dir, t.slug)
+		if err == nil {
+			if len(o.blocks) > 0 {
+				code = attachBlocks(current, o, out, errout, o.blocks)
+			}
+			if code == 0 && len(o.unblocks) > 0 {
+				code = removeBlocks(current, o, out, errout, o.unblocks)
+			}
+			if code == 0 && o.prio != "" {
+				code = propagatePriority(current.path, o, out, errout)
+			}
+			if code == 0 && o.prio != "" {
+				notePriorityLowered(t, o)
+			}
+		}
+	}
+	if code == 0 && (o.cmd == "done" || o.cmd == "reject") {
+		code = closeBlockRelations(t, o, out, errout, code)
+	}
 	if o.cmd == "done" && code == 0 {
 		hintNext(t, dir, o, out, errout)
 	}
@@ -1637,7 +1704,7 @@ func printTask(out io.Writer, t task, label string) {
 	if noCheck(t.body) {
 		checkMark = " no-check"
 	}
-	fmt.Fprintf(out, "%s%s %s %s %s %s%s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait, checkMark)
+	fmt.Fprintf(out, "%s%s %s %s %s %s%s%s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait, checkMark, blockMark(t))
 }
 
 func waiting(s string) string {
@@ -3093,6 +3160,8 @@ type taskJSON struct {
 	Journal        any        `json:"journal,omitempty"` // ls: true for journals; show: journal lines
 	Kind           string     `json:"kind,omitempty"`
 	Plan           []planJSON `json:"plan,omitempty"`
+	Blocks         []string   `json:"blocks,omitempty"`
+	BlockedBy      []string   `json:"blocked_by,omitempty"`
 }
 
 type planJSON struct {
@@ -3136,6 +3205,8 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	}
 	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
 	obj.Plan = planItems(t.body)
+	obj.Blocks = headerLinks(t.body, blocksPrefix)
+	obj.BlockedBy = headerLinks(t.body, blockedPrefix)
 	return obj
 }
 
@@ -3706,6 +3777,30 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	body := string(bodyBytes)
 	var issues []string
+	project := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	for _, ref := range headerLinks(body, blockedPrefix) {
+		dir, neighbor, err := linkedPath(project, ref)
+		if err != nil {
+			continue
+		}
+		b, e := os.ReadFile(neighbor)
+		if e != nil {
+			continue
+		}
+		other, _ := parseTask(neighbor, string(b))
+		if other.status != "готово" && other.status != "отклонён" && blockPrioRank(parseTaskPriority(path)) > blockPrioRank(other.prio) {
+			issues = append(issues, shown+": priority below blocking ticket "+ref)
+		}
+		name, _ := parseTaskName(filepath.Base(path))
+		reverse := projectRef(dirProject(dir), project)
+		if reverse != "" {
+			reverse += "/"
+		}
+		reverse += name.slug
+		if !slices.Contains(headerLinks(other.body, blocksPrefix), reverse) {
+			issues = append(issues, shown+": blocking link "+ref+" has no reverse Блокирует reference")
+		}
+	}
 	name, validName := parseTaskName(filepath.Base(path))
 	if !validName {
 		issues = append(issues, shown+": invalid file name")
@@ -3714,6 +3809,8 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	return append(issues, lintTicketBody(body, shown)...), nil
 }
+
+func parseTaskPriority(path string) string { n, _ := parseTaskName(filepath.Base(path)); return n.prio }
 
 func lintTicketBody(body, shown string) []string {
 	var issues []string

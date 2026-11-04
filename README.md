@@ -155,6 +155,8 @@ blocks after it. With a FILE argument a path line may only repeat that file (`./
 
 ## tk
 
+`tk new` and `tk set` can link tickets with repeatable `--blocks` flags; `tk set --unblocks` removes a link. A ticket that blocks other work inherits at least its priority, so work hidden by queue gates can rise with the ticket it blocks. Links can point across projects under `$HOME/git` and `$HOME/work` using `git/PROJECT/SLUG` or `work/PROJECT/SLUG`.
+
 Repository task files live in `docs/tasks/`; closed tickets can be moved to `docs/tasks-archive/`
 after an independent review.
 
