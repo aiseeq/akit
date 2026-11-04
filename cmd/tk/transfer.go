@@ -8,18 +8,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
 )
 
 type transferRecord struct {
-	At   string `json:"at"`
-	Slug string `json:"slug"`
-	Stem string `json:"stem"`
-	Back string `json:"back"`
-	Key  string `json:"key"`
-	URL  string `json:"url"`
+	At     string   `json:"at"`
+	Slug   string   `json:"slug"`
+	Stem   string   `json:"stem"`
+	Back   string   `json:"back"`
+	Key    string   `json:"key"`
+	URL    string   `json:"url"`
+	Blocks []string `json:"blocks,omitempty"`
 }
 
 type transferResult struct {
@@ -83,7 +85,7 @@ func transferFoundTask(root string, t task, o options, out, errout io.Writer) in
 	if err != nil {
 		return transferError(errout, commandPath, err.Error())
 	}
-	row := transferRecord{At: time.Now().Format(time.RFC3339), Slug: t.slug, Stem: stem, Back: lineValue(t.body, "Заказчик: "), Key: result.Key, URL: result.URL}
+	row := transferRecord{At: time.Now().Format(time.RFC3339), Slug: t.slug, Stem: stem, Back: lineValue(t.body, "Заказчик: "), Key: result.Key, URL: result.URL, Blocks: headerLinks(t.body, blockedPrefix)}
 	if err := appendTransferRecord(dir, row); err != nil {
 		fmt.Fprintf(out, "%s %s\n", result.Key, result.URL)
 		return transferError(errout, filepath.Join(dir, ".transferred.jsonl"), err.Error())
@@ -105,6 +107,9 @@ func transferBlockRelations(t task, o options, key string, errout io.Writer) {
 		}
 		msg := "заблокированный " + back + " перенесён в " + key
 		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			if !slices.Contains(headerLinks(current.body, blocksPrefix), back) {
+				return current.body, nil
+			}
 			return journal(removeHeaderLink(current.body, blocksPrefix, back), "- "+timeStamp()+" note — "+o.by+": "+msg), nil
 		}); err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot update %s after transfer: %v\n", ref, err)

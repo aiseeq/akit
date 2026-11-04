@@ -795,9 +795,6 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 		root, dir = target, filepath.Join(target, "docs/tasks")
 		main = ""
 	}
-	if err := prepareTaskDirectory(root, main); err != nil {
-		return fail(errout, err)
-	}
 	if o.to != "" {
 		var err error
 		main, err = gitMainRoot(root)
@@ -833,11 +830,16 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 		if err != nil {
 			return fail(errout, err)
 		}
-		if t, err := find(target.dir, target.id); err != nil {
+		if t, err := readTaskLocked(target.dir, target.id); err != nil {
 			return fail(errout, err)
 		} else if t.status == "готово" || t.status == "отклонён" {
 			return fail(errout, fmt.Errorf("target %s is closed", ref))
+		} else if _, err := addHeaderLink(t.body, blockedPrefix, "preflight"); err != nil {
+			return fail(errout, err)
 		}
+	}
+	if err := prepareTaskDirectory(root, main); err != nil {
+		return fail(errout, err)
 	}
 	blocks := o.blocks
 	o.blocks = nil
@@ -924,7 +926,26 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 		before, findErr := find(dir, o.id)
 		if findErr != nil {
 			release()
-			return transferTask(root, dir, o, out, errout)
+			code := transferTask(root, dir, o, out, errout)
+			if code == 0 {
+				rows, ledgerErr := readTransferLedger(dir)
+				if ledgerErr != nil {
+					fmt.Fprintf(errout, "tk: warning: cannot update blockers after transfer of %s: %v\n", o.id, ledgerErr)
+				} else {
+					stem := strings.TrimSuffix(filepath.Base(o.id), ".md")
+					if row, ok := transferredRecord(rows, o.id); ok {
+						stem = row.Stem
+						lines := make([]string, 0, len(row.Blocks))
+						for _, ref := range row.Blocks {
+							lines = append(lines, blockedPrefix+ref)
+						}
+						body := strings.Join(lines, "\n")
+						before = task{path: filepath.Join(dir, stem+".md"), slug: row.Slug, body: body}
+						transferBlockRelations(before, o, row.Key, errout)
+					}
+				}
+			}
+			return code
 		}
 		code := transferTask(root, dir, o, out, errout)
 		release()
@@ -949,23 +970,66 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 		release()
 		return reportFindError(err, o.id, errout)
 	}
+	if o.cmd == "set" || o.cmd == "start" {
+		release()
+		blockOptions := o
+		blockOptions.baseRoot = taskProject(t.path)
+		if len(o.blocks) > 0 {
+			if _, code := validateBlockAttachments(t, blockOptions, o.blocks, errout); code != 0 {
+				return code
+			}
+		}
+		for _, ref := range o.unblocks {
+			if _, _, _, _, err := resolveBlockLocation(blockOptions, ref); err != nil {
+				return fail(errout, err)
+			}
+		}
+		release, err = lockForCommand(dir, o.cmd)
+		if err != nil {
+			return fail(errout, err)
+		}
+		t, err = find(dir, o.id)
+		if err != nil {
+			release()
+			return reportFindError(err, o.id, errout)
+		}
+		// Under the own lock, without taking another: a raise from the blocked ticket
+		// writes that ticket first and then waits here, so one of the two sees the other.
+		if code := validatePriorityFloor(t, blockOptions, errout); code != 0 {
+			release()
+			return code
+		}
+	}
 	code := runFoundTask(root, t, o, out, errout)
 	release()
 	if code == 0 && (o.cmd == "set" || o.cmd == "start") {
-		current, err := find(dir, t.slug)
-		if err == nil {
-			if len(o.blocks) > 0 {
-				code = attachBlocks(current, o, out, errout, o.blocks)
+		current, err := readTaskLocked(dir, t.slug)
+		if err != nil {
+			return fail(errout, err)
+		}
+		if len(o.blocks) > 0 {
+			blockOptions := o
+			blockOptions.baseRoot = taskProject(current.path)
+			code = attachBlocks(current, blockOptions, out, errout, o.blocks)
+		}
+		if code == 0 && len(o.unblocks) > 0 {
+			blockOptions := o
+			blockOptions.baseRoot = taskProject(current.path)
+			code = removeBlocks(current, blockOptions, errout, o.unblocks)
+		}
+		if code == 0 && o.prio != "" {
+			code = propagatePriority(current.path, o, out, errout)
+		}
+		if code == 0 && o.prio != "" {
+			refreshed, err := readTaskLocked(dir, t.slug)
+			if err != nil {
+				return fail(errout, err)
 			}
-			if code == 0 && len(o.unblocks) > 0 {
-				code = removeBlocks(current, o, errout, o.unblocks)
-			}
-			if code == 0 && o.prio != "" {
-				code = propagatePriority(current.path, o, out, errout)
-			}
-			if code == 0 && o.prio != "" {
-				notePriorityLowered(t, o, errout)
-			}
+			lowered := o
+			lowered.prio = refreshed.prio
+			loweredTicket := t
+			loweredTicket.body = refreshed.body
+			notePriorityLowered(loweredTicket, lowered, errout)
 		}
 	}
 	if code == 0 && (o.cmd == "done" || o.cmd == "reject") {

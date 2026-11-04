@@ -24,18 +24,18 @@ func headerLinks(body, prefix string) []string {
 	return out
 }
 
-func addHeaderLink(body, prefix, value string) string {
+func addHeaderLink(body, prefix, value string) (string, error) {
 	if slices.Contains(headerLinks(body, prefix), value) {
-		return body
+		return body, nil
 	}
 	lines := strings.Split(body, "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(line, "Статус: ") {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.HasPrefix(lines[i], prefix) {
 			lines = append(lines[:i+1], append([]string{prefix + value}, lines[i+1:]...)...)
-			return strings.Join(lines, "\n")
+			return strings.Join(lines, "\n"), nil
 		}
 	}
-	return body
+	return setHeaderValue(body, prefix, value)
 }
 
 func removeHeaderLink(body, prefix, value string) string {
@@ -49,14 +49,14 @@ func removeHeaderLink(body, prefix, value string) string {
 	return strings.Join(kept, "\n")
 }
 
-type blockTarget struct{ root, dir, id, ref string }
+type blockTarget struct{ root, dir, id, ref, status string }
 
 func currentProject(o options) string {
-	if o.mainRoot != "" {
-		return o.mainRoot
-	}
 	if o.baseRoot != "" {
 		return o.baseRoot
+	}
+	if o.mainRoot != "" {
+		return o.mainRoot
 	}
 	return ""
 }
@@ -98,42 +98,54 @@ func ticketRef(from, to, slug string) (string, error) {
 }
 
 func resolveBlockTarget(o options, raw string) (blockTarget, error) {
+	project, dir, id, ref, err := resolveBlockLocation(o, raw)
+	if err != nil {
+		return blockTarget{}, err
+	}
+	t, err := readTaskLocked(dir, id)
+	if err != nil {
+		return blockTarget{}, err
+	}
+	ref, err = ticketRef(currentProject(o), project, t.slug)
+	if err != nil {
+		return blockTarget{}, err
+	}
+	return blockTarget{project, dir, t.slug, ref, t.status}, nil
+}
+
+func resolveBlockLocation(o options, raw string) (string, string, string, string, error) {
 	parts := strings.Split(raw, "/")
 	project, id := currentProject(o), raw
 	if len(parts) == 3 && (parts[0] == "git" || parts[0] == "work") {
 		name := parts[1]
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return blockTarget{}, fmt.Errorf("determine linked project root: %w", err)
+			return "", "", "", "", fmt.Errorf("determine linked project root: %w", err)
 		}
 		project = filepath.Join(home, parts[0], name)
 		id = parts[2]
 	} else if len(parts) == 2 {
 		projectPath, err := destinationProject(parts[0])
 		if err != nil {
-			return blockTarget{}, err
+			return "", "", "", "", err
 		}
 		id = parts[1]
 		project = projectPath
 	} else if len(parts) != 1 {
-		return blockTarget{}, fmt.Errorf("invalid ticket reference %q", raw)
+		return "", "", "", "", fmt.Errorf("invalid ticket reference %q", raw)
 	}
 	if !slugRE.MatchString(id) {
-		return blockTarget{}, fmt.Errorf("invalid ticket slug %q", id)
+		return "", "", "", "", fmt.Errorf("invalid ticket slug %q", id)
 	}
 	if project == "" {
-		return blockTarget{}, fmt.Errorf("cannot resolve current project")
+		return "", "", "", "", fmt.Errorf("cannot resolve current project")
 	}
 	dir := filepath.Join(project, "docs/tasks")
-	t, err := readTaskLocked(dir, id)
+	ref, err := ticketRef(currentProject(o), project, id)
 	if err != nil {
-		return blockTarget{}, err
+		return "", "", "", "", err
 	}
-	ref, err := ticketRef(currentProject(o), project, t.slug)
-	if err != nil {
-		return blockTarget{}, err
-	}
-	return blockTarget{project, dir, t.slug, ref}, nil
+	return project, dir, id, ref, nil
 }
 
 func linkedPath(project, ref string) (string, string, error) {
@@ -235,22 +247,15 @@ func parseTask(path, body string) (task, error) {
 }
 
 func attachBlocks(t task, o options, out, errout io.Writer, targets []string) int {
+	resolved, code := validateBlockAttachments(t, o, targets, errout)
+	if code != 0 {
+		return code
+	}
 	var raiseFrom []string
-	for _, raw := range targets {
-		target, err := resolveBlockTarget(o, raw)
-		if err != nil {
-			return fail(errout, err)
-		}
-		if sameTicket(taskProject(t.path), t.slug, target.root, target.id) {
-			return fail(errout, fmt.Errorf("ticket cannot block itself"))
-		}
+	for _, target := range resolved {
 		fresh, err := readTaskLocked(filepath.Dir(t.path), t.slug)
 		if err != nil {
 			return fail(errout, err)
-		}
-		chain, cycle := blockingChainTo(fresh, target, errout)
-		if cycle {
-			return fail(errout, fmt.Errorf("blocking cycle: %s", strings.Join(chain, " → ")))
 		}
 		back, err := ticketRef(target.root, currentProject(o), fresh.slug)
 		if err != nil {
@@ -258,11 +263,14 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 		}
 		targetTask, err := mutateTask(target.dir, target.id, func(current task) (string, error) {
 			if current.status == "готово" || current.status == "отклонён" {
-				return "", fmt.Errorf("target %s is closed", raw)
+				return "", fmt.Errorf("target %s is closed", target.id)
 			}
 			body := current.body
 			if !slices.Contains(headerLinks(body, blockedPrefix), back) {
-				body = addHeaderLink(body, blockedPrefix, back)
+				body, err = addHeaderLink(body, blockedPrefix, back)
+				if err != nil {
+					return "", err
+				}
 				body = journal(body, fmt.Sprintf("- %s note — %s: блокирует %s", timeStamp(), o.by, back))
 			}
 			return body, nil
@@ -273,7 +281,10 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 		_, err = mutateTask(filepath.Dir(t.path), fresh.slug, func(current task) (string, error) {
 			body := current.body
 			if !slices.Contains(headerLinks(body, blocksPrefix), target.ref) {
-				body = addHeaderLink(body, blocksPrefix, target.ref)
+				body, err = addHeaderLink(body, blocksPrefix, target.ref)
+				if err != nil {
+					return "", err
+				}
 				body = journal(body, fmt.Sprintf("- %s note — %s: заблокирован %s", timeStamp(), o.by, target.ref))
 			}
 			return body, nil
@@ -283,13 +294,39 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 		}
 		raiseFrom = append(raiseFrom, targetTask.path)
 	}
-	code := 0
+	resultCode := 0
 	for _, path := range raiseFrom {
 		if c := propagatePriority(path, o, out, errout); c != 0 {
-			code = c
+			resultCode = c
 		}
 	}
-	return code
+	return resultCode
+}
+
+func validateBlockAttachments(t task, o options, targets []string, errout io.Writer) ([]blockTarget, int) {
+	resolved := make([]blockTarget, 0, len(targets))
+	for _, raw := range targets {
+		target, err := resolveBlockTarget(o, raw)
+		if err != nil {
+			return nil, fail(errout, err)
+		}
+		if target.status == "готово" || target.status == "отклонён" {
+			return nil, fail(errout, fmt.Errorf("target %s is closed", raw))
+		}
+		if sameTicket(taskProject(t.path), t.slug, target.root, target.id) {
+			return nil, fail(errout, errors.New("ticket cannot block itself"))
+		}
+		fresh, err := readTaskLocked(filepath.Dir(t.path), t.slug)
+		if err != nil {
+			return nil, fail(errout, err)
+		}
+		chain, cycle := blockingChainTo(fresh, target, errout)
+		if cycle {
+			return nil, fail(errout, fmt.Errorf("blocking cycle: %s", strings.Join(chain, " → ")))
+		}
+		resolved = append(resolved, target)
+	}
+	return resolved, 0
 }
 
 func sameTicket(project, slug, otherProject, otherSlug string) bool {
@@ -377,7 +414,7 @@ func updateTicket(path string, edit func(string) string) error {
 	defer release()
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("read ticket %s: %w", path, err)
 	}
 	next := edit(string(b))
 	if next == string(b) {
@@ -432,6 +469,7 @@ func propagatePriority(start string, o options, out, errout io.Writer) int {
 		for _, ref := range headerLinks(source.body, blockedPrefix) {
 			next, err := propagateLink(path, source, ref, o, out, errout)
 			if err != nil {
+				fmt.Fprintf(errout, "tk: warning: cannot propagate blocking link %s from %s: %v\n", ref, source.slug, err)
 				code = exitUsage
 				continue
 			}
@@ -546,6 +584,7 @@ func raiseNeighborLocked(neighbor, source task, sourcePath string, o options, re
 }
 
 func transferredRecord(rows []transferRecord, id string) (transferRecord, bool) {
+	id = strings.TrimSuffix(id, ".md")
 	for _, row := range rows {
 		if row.Slug == id || row.Stem == id {
 			return row, true
@@ -560,35 +599,38 @@ func appendTaskNote(path string, o options, note string) error {
 
 func removeBlocks(t task, o options, errout io.Writer, refs []string) int {
 	for _, raw := range refs {
-		target, err := resolveBlockTarget(o, raw)
+		project, dir, id, _, err := resolveBlockLocation(o, raw)
 		if err != nil {
 			return fail(errout, err)
 		}
-		back, err := ticketRef(target.root, currentProject(o), t.slug)
+		canonical, err := ticketRef(currentProject(o), project, id)
 		if err != nil {
 			return fail(errout, err)
 		}
-		hadLink := false
-		_, err = mutateTask(filepath.Dir(t.path), t.slug, func(current task) (string, error) {
-			if !slices.Contains(headerLinks(current.body, blocksPrefix), target.ref) {
-				return current.body, nil
-			}
-			hadLink = true
-			body := removeHeaderLink(current.body, blocksPrefix, target.ref)
-			return journal(body, fmt.Sprintf("- %s note — %s: связь с %s снята", timeStamp(), o.by, target.ref)), nil
-		})
+		back, err := ticketRef(project, currentProject(o), t.slug)
 		if err != nil {
 			return fail(errout, err)
 		}
-		if !hadLink {
-			continue
-		}
-		_, err = mutateTask(target.dir, target.id, func(current task) (string, error) {
+		_, err = mutateTask(dir, id, func(current task) (string, error) {
 			if !slices.Contains(headerLinks(current.body, blockedPrefix), back) {
 				return current.body, nil
 			}
 			body := removeHeaderLink(current.body, blockedPrefix, back)
 			return journal(body, fmt.Sprintf("- %s note — %s: связь с %s снята", timeStamp(), o.by, back)), nil
+		})
+		missing := errors.Is(err, os.ErrNotExist)
+		if err != nil && !missing {
+			return fail(errout, err)
+		}
+		if missing {
+			fmt.Fprintf(errout, "tk: warning: blocking ticket %s not found; removing reverse reference\n", raw)
+		}
+		_, err = mutateTask(filepath.Dir(t.path), t.slug, func(current task) (string, error) {
+			if !slices.Contains(headerLinks(current.body, blocksPrefix), canonical) {
+				return current.body, nil
+			}
+			body := removeHeaderLink(current.body, blocksPrefix, canonical)
+			return journal(body, fmt.Sprintf("- %s note — %s: связь с %s снята", timeStamp(), o.by, canonical)), nil
 		})
 		if err != nil {
 			return fail(errout, err)
@@ -641,13 +683,20 @@ func closeBlockRelations(t task, o options, out, errout io.Writer, code int) int
 			fmt.Fprintf(errout, "tk: warning: cannot unblock %s: %v\n", ref, err)
 			continue
 		}
+		removed := false
 		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			if !slices.Contains(headerLinks(current.body, blockedPrefix), back) {
+				return current.body, nil
+			}
+			removed = true
 			return journal(removeHeaderLink(current.body, blockedPrefix, back), "- "+timeStamp()+" note — "+o.by+": блокирующий "+back+" закрыт"), nil
 		}); err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot update %s: %v\n", ref, err)
 			continue
 		}
-		fmt.Fprintln(out, "разблокирован "+ref)
+		if removed {
+			fmt.Fprintln(out, "разблокирован "+ref)
+		}
 	}
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
 		dir, id, back, err := reverseTaskRef(t, ref)
@@ -656,6 +705,9 @@ func closeBlockRelations(t task, o options, out, errout io.Writer, code int) int
 			continue
 		}
 		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			if !slices.Contains(headerLinks(current.body, blocksPrefix), back) {
+				return current.body, nil
+			}
 			return journal(removeHeaderLink(current.body, blocksPrefix, back), "- "+timeStamp()+" note — "+o.by+": заблокированный "+back+" закрыт, приоритет не менялся: понизь, если не нужен"), nil
 		}); err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot update %s: %v\n", ref, err)
@@ -712,4 +764,45 @@ func notePriorityLowered(t task, o options, errout io.Writer) {
 			fmt.Fprintf(errout, "tk: warning: cannot notify %s: %v\n", ref, err)
 		}
 	}
+}
+
+func validatePriorityFloor(t task, o options, errout io.Writer) int {
+	if o.prio == "" || blockPrioRank(o.prio) <= blockPrioRank(t.prio) {
+		return 0
+	}
+	project := taskProject(t.path)
+	for _, ref := range headerLinks(t.body, blocksPrefix) {
+		dir, id, err := referenceLocation(project, ref)
+		if err != nil {
+			fmt.Fprintf(errout, "tk: cannot inspect blocking ticket %s: %v\n", ref, err)
+			return exitUsage
+		}
+		unblocked := false
+		for _, raw := range o.unblocks {
+			up, ud, uid, _, resolveErr := resolveBlockLocation(o, raw)
+			if resolveErr == nil && sameTicket(up, uid, dirProject(ud), id) {
+				unblocked = true
+				break
+			}
+		}
+		if unblocked {
+			continue
+		}
+		target, err := findWithArchive(dir, id)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			fmt.Fprintf(errout, "tk: cannot read blocking ticket %s: %v\n", ref, err)
+			return exitUsage
+		}
+		if isArchivedTask(target.path) || target.status == "готово" || target.status == "отклонён" {
+			continue
+		}
+		if blockPrioRank(o.prio) > blockPrioRank(target.prio) {
+			fmt.Fprintf(errout, "tk: cannot lower priority below blocking ticket %s (%s); use --unblocks %s or lower that ticket first\n", ref, normalizePrio(target.prio), ref)
+			return exitUsage
+		}
+	}
+	return 0
 }

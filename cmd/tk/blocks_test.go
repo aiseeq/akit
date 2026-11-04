@@ -336,6 +336,16 @@ func TestTransferUpdatesSameFolderBlockerAfterUnlock(t *testing.T) {
 	if strings.Contains(string(got), blocksPrefix+"t") || !strings.Contains(string(got), "заблокированный t перенесён в EXT-1") {
 		t.Fatalf("blocker not updated:\n%s", got)
 	}
+	if code := runLockedCommand(project, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("repeat transfer code=%d stderr=%q", code, errout.String())
+	}
+	got, err = os.ReadFile(xPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(got), "заблокированный t перенесён в EXT-1") != 1 {
+		t.Fatalf("repeat transfer duplicated relation note:\n%s", got)
+	}
 }
 
 func blockTestProject(t *testing.T) (string, string) {
@@ -390,5 +400,235 @@ func TestAttachBlocksRejectsClosedTargetWithoutWrites(t *testing.T) {
 	}
 	if string(got) != xBody {
 		t.Fatalf("blocker changed on rejected link:\n%s", got)
+	}
+}
+
+func TestAttachBlocksAddsHeaderToLegacyTicket(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blocker := blockTestWrite(t, dir, "x", "MED", "# x\n\nСтатус: открыт\n")
+	legacyPath := filepath.Join(dir, "20260101-0000-MED-legacy.md")
+	if err := os.WriteFile(legacyPath, []byte("# legacy\n\nТело\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := attachBlocks(blocker, options{baseRoot: root, by: "tester"}, &out, &errout, []string{"legacy"}); code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errout.String())
+	}
+	got, err := os.ReadFile(legacyPath)
+	if err != nil || !strings.Contains(string(got), "# legacy\nЗаблокирован: x") {
+		t.Fatalf("legacy header not updated: %s err=%v", got, err)
+	}
+}
+
+func TestRemoveBlocksUsesSourceOfTruthAndMissingTarget(t *testing.T) {
+	root, dir := blockTestProject(t)
+	x := blockTestWrite(t, dir, "x", "MED", "# x\n\nСтатус: открыт\n")
+	ticket := blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\nЗаблокирован: x\n")
+	var errout bytes.Buffer
+	if code := removeBlocks(x, options{baseRoot: root, by: "tester"}, &errout, []string{"t"}); code != 0 {
+		t.Fatalf("source truth removal code=%d stderr=%q", code, errout.String())
+	}
+	got, _ := os.ReadFile(ticket.path)
+	if strings.Contains(string(got), blockedPrefix+"x") {
+		t.Fatalf("truth link remains without reverse reference: %s", got)
+	}
+	if err := os.Remove(ticket.path); err != nil {
+		t.Fatal(err)
+	}
+	if code := removeBlocks(x, options{baseRoot: root, by: "tester"}, &errout, []string{"t"}); code != 0 {
+		t.Fatalf("missing target code=%d stderr=%q", code, errout.String())
+	}
+	got, _ = os.ReadFile(x.path)
+	if strings.Contains(string(got), blocksPrefix+"t") || !strings.Contains(errout.String(), "warning") {
+		t.Fatalf("stale help reference not removed or no warning: %s / %s", got, errout.String())
+	}
+}
+
+func TestRemoveBlocksWriteFailureKeepsReverseReference(t *testing.T) {
+	root, dir := blockTestProject(t)
+	x := blockTestWrite(t, dir, "x", "MED", "# x\n\nСтатус: открыт\nБлокирует: t\n")
+	ticket := blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\nЗаблокирован: x\n")
+	alias := filepath.Join(dir, "alias")
+	if err := os.Link(ticket.path, alias); err != nil {
+		t.Fatal(err)
+	}
+	var errout bytes.Buffer
+	if code := removeBlocks(x, options{baseRoot: root, by: "tester"}, &errout, []string{"t"}); code == 0 {
+		t.Fatal("write failure was reported as success")
+	}
+	got, err := os.ReadFile(x.path)
+	if err != nil || !strings.Contains(string(got), blocksPrefix+"t") {
+		t.Fatalf("reverse reference removed after truth write failed: %s err=%v", got, err)
+	}
+}
+
+func TestSetPreflightsAllTargetsBeforePriorityChanges(t *testing.T) {
+	root, dir := blockTestProject(t)
+	path := filepath.Join(dir, "20260101-0000-MED-x.md")
+	body := "# x\n\nСтатус: открыт\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	blockTestWrite(t, dir, "open", "MED", "# open\n\nСтатус: открыт\n")
+	blockTestWrite(t, dir, "closed", "MED", "# closed\n\nСтатус: готово\n")
+	o, err := parseArgs([]string{"set", "x", "--prio", "HIGH", "--why", "synthetic", "--blocks", "open", "--blocks", "closed", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(root, dir, o, &out, &errout); code == 0 {
+		t.Fatal("closed second target accepted")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != body {
+		t.Fatalf("source changed before all targets were checked: %s err=%v", got, err)
+	}
+}
+
+func TestNewPreflightsClosedTargetBeforeCreatingFiles(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "closed", "MED", "# closed\n\nСтатус: отклонён\n")
+	o, err := parseArgs([]string{"new", "fresh", "--prio", "MED", "--blocks", "closed", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.baseRoot = root
+	var out, errout bytes.Buffer
+	if code := createAtBase(root, dir, o, &out, &errout); code == 0 {
+		t.Fatal("closed target accepted")
+	}
+	if matches, err := filepath.Glob(filepath.Join(dir, "*-fresh.md")); err != nil || len(matches) != 0 {
+		t.Fatalf("new ticket created before target validation: %v err=%v", matches, err)
+	}
+}
+
+func TestWorktreeProjectUsesTicketFolderAndRejectsCrossProjectRefs(t *testing.T) {
+	worktree, dir := blockTestProject(t)
+	main := t.TempDir()
+	x := blockTestWrite(t, dir, "x", "MED", "# x\n\nСтатус: открыт\n")
+	blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\n")
+	o := options{baseRoot: worktree, mainRoot: main, by: "tester"}
+	var out, errout bytes.Buffer
+	if code := attachBlocks(x, o, &out, &errout, []string{"t"}); code != 0 {
+		t.Fatalf("same worktree project link failed: %d %s", code, errout.String())
+	}
+	if _, err := ticketRef(worktree, main, "elsewhere"); err == nil {
+		t.Fatal("cross-project link from unaddressable worktree was accepted")
+	}
+}
+
+func TestCloseBlockRelationsRepeatIsSilent(t *testing.T) {
+	root, dir := blockTestProject(t)
+	closed := blockTestWrite(t, dir, "x", "MED", "# x\n\nСтатус: готово\nБлокирует: t\n")
+	blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\nЗаблокирован: x\n")
+	var out, errout bytes.Buffer
+	closeBlockRelations(closed, options{by: "tester"}, &out, &errout, 0)
+	first := out.String()
+	out.Reset()
+	closeBlockRelations(closed, options{by: "tester"}, &out, &errout, 0)
+	if out.Len() != 0 || !strings.Contains(first, "разблокирован") {
+		t.Fatalf("repeat close output first=%q second=%q root=%s", first, out.String(), root)
+	}
+}
+
+func TestManualPriorityFloorAndSameCommandUnblock(t *testing.T) {
+	root, dir := blockTestProject(t)
+	path := filepath.Join(dir, "20260101-0000-HIGH-x.md")
+	if err := os.WriteFile(path, []byte("# x\n\nСтатус: открыт\nБлокирует: t\nПричина: r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	blockTestWrite(t, dir, "t", "HIGH", "# t\n\nСтатус: открыт\n")
+	for _, args := range [][]string{{"set", "x", "--prio", "LOW", "--why", "lower"}, {"start", "x", "--prio", "LOW", "--why", "lower"}} {
+		o, err := parseArgs(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.by = "tester"
+		var out, errout bytes.Buffer
+		if code := runAtBase(root, dir, o, &out, &errout); code == 0 || !strings.Contains(errout.String(), "t") || !strings.Contains(errout.String(), "HIGH") {
+			t.Fatalf("downgrade not rejected for %v: code=%d stderr=%q", args, code, errout.String())
+		}
+	}
+	o, err := parseArgs([]string{"set", "x", "--prio", "LOW", "--why", "lower", "--unblocks", "t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("lowering with same-command unblock failed: code=%d stderr=%q", code, errout.String())
+	}
+}
+
+func TestManualPriorityFloorAllowsClosedArchivedAndMissingBlockers(t *testing.T) {
+	root, dir := blockTestProject(t)
+	for _, slug := range []string{"closed", "archived", "missing"} {
+		if slug == "closed" {
+			blockTestWrite(t, dir, slug, "HIGH", "# closed\n\nСтатус: готово\n")
+		}
+		if slug == "archived" {
+			archive, err := archiveDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(archive, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(archive, "20260101-0000-HIGH-archived.md"), []byte("# archived\n\nСтатус: открыт\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ticket := blockTestWrite(t, dir, "x-"+slug, "HIGH", "# x\n\nСтатус: открыт\nБлокирует: "+slug+"\n")
+		var errout bytes.Buffer
+		if code := validatePriorityFloor(ticket, options{prio: "LOW", baseRoot: root}, &errout); code != 0 {
+			t.Errorf("allowed %s blocker: code=%d stderr=%q", slug, code, errout.String())
+		}
+	}
+}
+
+func TestRepeatedTransferFinishesNeighborAfterWriteFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := filepath.Join(home, "git", "sample")
+	dir := filepath.Join(project, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	command := filepath.Join(home, "git", ".tk-transfer")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"key\":\"EXT-2\"}'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	xPath := filepath.Join(dir, "20260101-0000-MED-x.md")
+	tPath := filepath.Join(dir, "20260101-0000-MED-t.md")
+	if err := os.WriteFile(xPath, []byte("# x\n\nСтатус: открыт\nБлокирует: t\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tPath, []byte("# t\n\nСтатус: открыт\nЗаблокирован: x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "alias")
+	if err := os.Link(xPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	o := options{cmd: "transfer", id: "t", baseRoot: project, mainRoot: project, by: "tester"}
+	var out, errout bytes.Buffer
+	if code := runLockedCommand(project, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("transfer code=%d stderr=%q", code, errout.String())
+	}
+	if !strings.Contains(errout.String(), "hard links") {
+		t.Fatalf("expected neighbor write warning: %q", errout.String())
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	errout.Reset()
+	if code := runLockedCommand(project, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("repeat transfer code=%d stderr=%q", code, errout.String())
+	}
+	got, err := os.ReadFile(xPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), blocksPrefix+"t") || !strings.Contains(string(got), "заблокированный t перенесён в EXT-2") {
+		t.Fatalf("repeat transfer did not finish neighbor update:\n%s", got)
 	}
 }
