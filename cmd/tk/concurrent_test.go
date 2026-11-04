@@ -9,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -126,6 +127,27 @@ func TestWriteTaskNewHonorsUmask(t *testing.T) {
 
 func TestConcurrentStartsAssignTicketToOneActor(t *testing.T) {
 	base := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	gatePath := filepath.Join(home, ".local", "state", "queue", "gate.json")
+	if err := os.MkdirAll(filepath.Dir(gatePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gate := fmt.Sprintf(`{"at":%q,"open_by_root":{%q:["MED-DO","MED-HUNT","MED-ARCH"]}}`, time.Now().Format(time.RFC3339), base)
+	if err := os.WriteFile(gatePath, []byte(gate), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := readTaskGate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = gateForProject(state, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gateVisible(task{status: "открыт", prio: "MED", diff: "DO"}, state, true) {
+		t.Fatalf("test gate is closed: %#v", state)
+	}
 	dir := filepath.Join(base, "docs", "tasks")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)

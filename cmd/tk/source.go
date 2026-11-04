@@ -54,6 +54,10 @@ func normalizedRoot(path string) (string, error) {
 }
 
 func taskSourcePath(main string) (string, bool, error) {
+	return taskCommandPath(main, ".tk-next-source")
+}
+
+func taskCommandPath(main, filename string) (string, bool, error) {
 	if main == "" {
 		return "", false, nil
 	}
@@ -80,21 +84,18 @@ func taskSourcePath(main string) (string, bool, error) {
 			return "", false, fmt.Errorf("resolve projects root %s: %w", rootPath, e)
 		}
 		if root == parent {
-			return filepath.Join(parent, ".tk-next-source"), true, nil
+			return filepath.Join(parent, filename), true, nil
 		}
 	}
 	return "", false, nil
 }
 
-func runTaskSource(path, project string) ([]externalTask, int, string, bool) {
-	if err := trustedSource(path); err != nil {
-		return nil, 0, err.Error(), true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Duration) ([]byte, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, project)
+	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Dir = filepath.Dir(path)
-	cmd.Stdin = strings.NewReader("")
+	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 500 * time.Millisecond
 	cmd.Cancel = func() error {
@@ -108,22 +109,33 @@ func runTaskSource(path, project string) ([]externalTask, int, string, bool) {
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if stdout.overflow || stderr.overflow {
-		return nil, 0, "output over 1 MiB", true
+		return nil, stderr.Bytes(), errors.New("output over 1 MiB")
 	}
 	if errors.Is(err, exec.ErrWaitDelay) {
-		return nil, 0, "source did not exit", true
+		return nil, stderr.Bytes(), errors.New("command did not exit")
 	}
 	if ctx.Err() != nil {
-		return nil, 0, "source timed out", true
+		return nil, stderr.Bytes(), errors.New("command timed out")
 	}
 	if err != nil {
-		reason := firstStderrLine(stderr.String())
+		return nil, stderr.Bytes(), fmt.Errorf("run source command: %w", err)
+	}
+	return stdout.Bytes(), stderr.Bytes(), nil
+}
+
+func runTaskSource(path, project string) ([]externalTask, int, string, bool) {
+	if err := trustedSource(path); err != nil {
+		return nil, 0, err.Error(), true
+	}
+	stdout, stderr, err := runBoundedCommand(path, []string{project}, nil, 5*time.Second)
+	if err != nil {
+		reason := firstStderrLine(string(stderr))
 		if reason == "" {
 			reason = err.Error()
 		}
 		return nil, 0, reason, true
 	}
-	return parseExternalTasks(stdout.Bytes())
+	return parseExternalTasks(stdout)
 }
 
 func trustedSource(path string) error {
@@ -218,5 +230,5 @@ func safeSourceString(s string) string {
 	}, s)
 }
 func sourceWarning(w io.Writer, path, reason string) {
-	fmt.Fprintf(w, "tk: source %s: %s; showing local tickets only\n", path, maskSourceText(reason))
+	fmt.Fprintf(w, "tk: source %s: %s; showing local tickets only\n", path, externalReason(reason))
 }

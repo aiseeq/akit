@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTaskSourceLaunchAndValidation(t *testing.T) {
@@ -77,8 +78,54 @@ func TestExternalCandidateGate(t *testing.T) {
 	if !gateVisible(closed, gateState{valid: true}, false) {
 		t.Fatal("non-live project should not require an open pair")
 	}
-	if gateVisible(closed, gateState{valid: true, data: taskGate{Open: []string{"OTHER"}}}, true) {
+	if gateVisible(closed, gateState{valid: true, open: []string{"OTHER"}, scoped: true}, true) {
 		t.Fatal("closed pair should hide candidate in live project")
+	}
+}
+
+func TestJournalEligibilityAndGateRoots(t *testing.T) {
+	now := time.Now().Add(-time.Minute).Format(time.RFC3339)
+	journal := task{status: "открыт", prio: "CRIT", journal: true, body: "Вид: журнал\n"}
+	if eligibleForNext(journal, "") {
+		t.Fatal("open journal ticket is eligible")
+	}
+	journal.status = "ждёт"
+	journal.body += "Ждёт: " + now + "\n"
+	if !eligibleForNext(journal, "") {
+		t.Fatal("due journal wait should be eligible")
+	}
+
+	base := t.TempDir()
+	root := filepath.Join(base, "work")
+	project := filepath.Join(root, "group", "project")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := gateState{valid: true, data: taskGate{OpenByRoot: func() *map[string][]string {
+		m := map[string][]string{root: {"MED-DO"}, filepath.Join(root, "group"): {}}
+		return &m
+	}()}}
+	got, err := gateForProject(state, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.scoped || len(got.open) != 0 {
+		t.Fatalf("most specific root gate = %#v", got)
+	}
+	workshop := filepath.Join(base, "workshop", "project")
+	if err := os.MkdirAll(workshop, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	boundary, err := gateForProject(state, workshop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary.scoped {
+		t.Fatalf("component boundary matched unrelated root: %#v", boundary)
+	}
+	legacy := gateState{problem: "gate.json has no open_by_root"}
+	if gateVisible(task{status: "открыт", prio: "MED"}, legacy, true) || !gateVisible(task{status: "открыт", prio: "HIGH"}, legacy, true) {
+		t.Fatal("missing root map should expose only CRIT/HIGH")
 	}
 }
 

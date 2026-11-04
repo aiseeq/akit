@@ -25,14 +25,15 @@ import (
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/proc"
+	"github.com/aiseeq/akit/secretmask"
 	"github.com/aiseeq/akit/timearg"
 )
 
 const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
-  tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--text FILE|-]
-  tk set ID [--prio P] [--diff D] [--why TEXT] [--by NAME]
+  tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--journal] [--text FILE|-]
+  tk set ID [--prio P] [--diff D] [--why TEXT] [--by NAME] [--journal]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
@@ -42,6 +43,7 @@ Usage:
   tk lint [--root DIR]
   tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take]
   tk next [--by NAME] [--json]
+  tk transfer ID [--parent KEY] [--by NAME]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
   tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]   ends with the next ticket, as tk next chooses it for the executor
@@ -54,6 +56,8 @@ Flags:
   --diff D       new/set/start: difficulty DO, HUNT, or ARCH
   --why TEXT     new: required for CRIT/HIGH; set/start: required when promoting to CRIT/HIGH; reject: reason
   --to PROJECT   new: create in PROJECT/docs/tasks; absolute path or project name
+  --journal      new/set: mark the ticket as a journal entry, hidden from next unless a wait is due
+  --parent KEY   transfer: parent item key passed to the transfer command
   --back NAME    new: requesting session
   --title TEXT   new: ticket title (default: slug)
   --by NAME      actor name (default: current session); ls: show tickets assigned to NAME
@@ -121,9 +125,9 @@ var session = currentSession
 var planTimeout = 8 * time.Minute
 
 type options struct {
-	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back string
-	all, due, json, required, take                                                                                                                     bool
-	older, timeout                                                                                                                                     time.Duration
+	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back, parent string
+	all, due, json, required, take, journal                                                                                                                    bool
+	older, timeout                                                                                                                                             time.Duration
 }
 
 // planLimit — предел пункта плана: --timeout или умолчание.
@@ -137,6 +141,7 @@ func (o options) planLimit() time.Duration {
 type task struct {
 	path, slug, status, prio, diff, title, body string
 	created, changed                            time.Time
+	journal                                     bool
 }
 
 func main() {
@@ -267,7 +272,7 @@ var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*([01]?\d|2[0
 var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5][xх](?:$|[^a-z0-9])`)
 
 func parseOptions(args []string, o *options) ([]string, error) {
-	values := map[string]*string{"--prio": &o.prio, "--diff": &o.diff, "--to": &o.to, "--back": &o.back, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin}
+	values := map[string]*string{"--prio": &o.prio, "--diff": &o.diff, "--to": &o.to, "--back": &o.back, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin, "--parent": &o.parent}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -287,6 +292,9 @@ func parseOptions(args []string, o *options) ([]string, error) {
 			continue
 		case "--take":
 			o.take = true
+			continue
+		case "--journal":
+			o.journal = true
 			continue
 		}
 		if p, ok := values[v]; ok {
@@ -337,13 +345,15 @@ func validateCommand(o *options, pos []string) error {
 		return validateCheckCommand(o, pos)
 	case "note":
 		return validateNoteCommand(o, pos)
+	case "transfer":
+		return validateTransfer(o, pos)
 	default:
 		return validateSimpleCommand(o, pos)
 	}
 }
 
 func validateCommandFlags(o *options) error {
-	checks := []func(*options) error{validateTakeFlag, validateDestinationFlags, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
+	checks := []func(*options) error{validateTakeFlag, validateDestinationFlags, validateJournalFlag, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
 	for _, check := range checks {
 		if err := check(o); err != nil {
 			return err
@@ -362,6 +372,16 @@ func validateTakeFlag(o *options) error {
 func validateDestinationFlags(o *options) error {
 	if (o.to != "" || o.back != "") && o.cmd != "new" {
 		return errors.New("--to/--back: flag only for new")
+	}
+	return nil
+}
+
+func validateJournalFlag(o *options) error {
+	if o.journal && o.cmd != "new" && o.cmd != "set" {
+		return errors.New("--journal: flag only for new or set")
+	}
+	if o.parent != "" && o.cmd != "transfer" {
+		return errors.New("--parent: flag only for transfer")
 	}
 	return nil
 }
@@ -401,6 +421,14 @@ func validateNoteCommand(o *options, pos []string) error {
 	return validateActorFlag(o)
 }
 
+func validateTransfer(o *options, pos []string) error {
+	if len(pos) != 1 || !validID(pos[0]) {
+		return errors.New("transfer needs a ticket ID")
+	}
+	o.id = pos[0]
+	return validateActorFlag(o)
+}
+
 func validateSimpleCommand(o *options, pos []string) error {
 	if len(pos) > 1 {
 		return errors.New("too many arguments")
@@ -411,6 +439,8 @@ func validateSimpleCommand(o *options, pos []string) error {
 	switch o.cmd {
 	case "new":
 		return validateNew(o, pos)
+	case "transfer":
+		return validateTransfer(o, pos)
 	case "ls":
 		return validateList(o, pos)
 	case "start", "wait", "review", "done", "reject", "show", "set":
@@ -581,7 +611,7 @@ func validatePriorityOptions(o *options) error {
 	if !validDiff(o.diff) {
 		return errors.New("--diff must be DO, HUNT, or ARCH")
 	}
-	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" {
+	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && !o.journal {
 		return errors.New("set needs --prio, --diff, or --why")
 	}
 	return nil
@@ -810,6 +840,10 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 	if err != nil {
 		return fail(errout, err)
 	}
+	if o.cmd == "transfer" {
+		defer release()
+		return transferTask(root, dir, o, out, errout)
+	}
 	t, err := find(dir, o.id)
 	if err != nil {
 		release()
@@ -847,6 +881,8 @@ func runFoundTask(root string, t task, o options, out, errout io.Writer) int {
 		return skipPlanItem(t, o, out, errout)
 	case "note":
 		return addNote(t, o, out, errout)
+	case "transfer":
+		return transferFoundTask(root, t, o, out, errout)
 	default:
 		return transition(t, o, out, errout)
 	}
@@ -1025,6 +1061,9 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	}
 	if o.back != "" {
 		meta += "Заказчик: " + o.back + "\n"
+	}
+	if o.journal {
+		meta += "Вид: журнал\n"
 	}
 	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n%s\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
 		title, meta, now.Format("2006-01-02 15:04"), o.by)
@@ -1240,7 +1279,7 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 			}
 			st, _ = explicitStatus(s)
 		}
-		ts = append(ts, task{p, name.slug, st, name.prio, name.diff, title(s), s, created, lastChange(s, info.ModTime())})
+		ts = append(ts, task{path: p, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(s), body: s, created: created, changed: lastChange(s, info.ModTime()), journal: lineValue(s, "Вид: ") == "журнал"})
 	}
 	return ts, nil
 }
@@ -2664,6 +2703,26 @@ func transition(t task, o options, out, errout io.Writer) int {
 }
 
 func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
+	if o.cmd == "start" && t.status == "открыт" {
+		project := o.mainRoot
+		if project == "" {
+			project = o.baseRoot
+		}
+		if project != "" {
+			gate, err := readTaskGate()
+			if err != nil {
+				return fail(errout, err), true
+			}
+			gate, err = gateForProject(gate, project)
+			if err != nil {
+				return fail(errout, err), true
+			}
+			if !gateVisible(t, gate, gate.live) {
+				fmt.Fprintf(errout, "tk: start is closed by the queue gate for %s\n", project)
+				return exitUsage, true
+			}
+		}
+	}
 	if o.cmd != "start" || t.status != "в работе" {
 		return 0, false
 	}
@@ -2806,6 +2865,21 @@ func applyMetadata(body string, o options) (string, error) {
 	}
 	return setHeaderValue(body, "Причина: ", o.why)
 }
+
+func setJournalKind(body string) string {
+	lines := strings.Split(body, "\n")
+	if slices.Contains(lines, "Вид: журнал") {
+		return body
+	}
+	for i, line := range lines {
+		if strings.HasPrefix(line, "Статус: ") {
+			lines = append(lines[:i+1], append([]string{"Вид: журнал"}, lines[i+1:]...)...)
+			return strings.Join(lines, "\n")
+		}
+	}
+	return body
+}
+
 func setHeaderValue(body, prefix, value string) (string, error) {
 	lines := strings.Split(body, "\n")
 	for i, line := range lines {
@@ -2864,6 +2938,9 @@ func setTask(t task, o options, out, errout io.Writer) int {
 	body, err := applyMetadata(t.body, o)
 	if err != nil {
 		return fail(errout, err)
+	}
+	if o.journal {
+		body = setJournalKind(body)
 	}
 	newName, err := retaggedName(filepath.Base(t.path), o)
 	if err != nil {
@@ -2949,7 +3026,7 @@ type taskJSON struct {
 	Check          string     `json:"check"`
 	Checker        string     `json:"checker"`
 	CheckerSession string     `json:"checker_session"`
-	Journal        []string   `json:"journal"`
+	Journal        any        `json:"journal,omitempty"`
 	Plan           []planJSON `json:"plan,omitempty"`
 }
 
@@ -2980,11 +3057,14 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 		}
 	}
 	prio := normalizePrio(t.prio)
+	isJournal := t.journal || lineValue(t.body, "Вид: ") == "журнал"
 	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: lineValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
 		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
 		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, NoCheck: noCheck(t.body)}
 	if details {
 		obj.Journal = journalLines(t.body)
+	} else if isJournal {
+		obj.Journal = true
 	}
 	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
 	obj.Plan = planItems(t.body)
@@ -2992,9 +3072,10 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 }
 
 type taskGate struct {
-	At   string   `json:"at"`
-	Live []string `json:"live"`
-	Open []string `json:"open"`
+	At         string               `json:"at"`
+	Live       *[]string            `json:"live"`
+	Open       *[]string            `json:"open"`
+	OpenByRoot *map[string][]string `json:"open_by_root"`
 }
 
 func gateOpen(t task, open []string) bool {
@@ -3028,6 +3109,11 @@ type gateState struct {
 	path    string
 	problem string
 	valid   bool
+	open    []string
+	scoped  bool
+	legacy  bool
+	live    bool
+	logMode bool
 }
 
 func readTaskGate() (gateState, error) {
@@ -3035,7 +3121,7 @@ func readTaskGate() (gateState, error) {
 	if err != nil {
 		return gateState{}, fmt.Errorf("determine gate directory: %w", err)
 	}
-	state := gateState{path: filepath.Join(home, ".local/state/queue/gate.json"), problem: "gate.json is missing"}
+	state := gateState{path: filepath.Join(home, ".local/state/queue/gate.json"), problem: "gate.json is missing", live: true}
 	content, err := os.ReadFile(state.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil
@@ -3048,6 +3134,8 @@ func readTaskGate() (gateState, error) {
 		state.problem = "cannot parse gate.json: " + err.Error()
 		return state, nil
 	}
+	state.legacy = state.data.Live != nil && state.data.Open != nil
+	state.logMode = state.legacy && len(*state.data.Live) == 0
 	at, err := time.Parse(time.RFC3339, state.data.At)
 	if err != nil {
 		state.problem = "gate.json has invalid at timestamp: " + err.Error()
@@ -3061,7 +3149,60 @@ func readTaskGate() (gateState, error) {
 		state.problem = "gate.json timestamp is in the future"
 		return state, nil
 	}
+	if state.data.OpenByRoot == nil {
+		state.problem = "gate.json has no open_by_root"
+		return state, nil
+	}
 	state.valid = true
+	return state, nil
+}
+
+func gateForProject(state gateState, project string) (gateState, error) {
+	if state.legacy {
+		state.live = false
+		for _, name := range *state.data.Live {
+			if name == filepath.Base(project) {
+				state.live = true
+				break
+			}
+		}
+		state.open = *state.data.Open
+		state.scoped = state.live
+		if !state.valid {
+			return state, nil
+		}
+	}
+	if !state.valid {
+		return state, nil
+	}
+	resolvedProject, err := normalizedRoot(project)
+	if err != nil {
+		return state, fmt.Errorf("resolve project root %s: %w", project, err)
+	}
+	best := ""
+	for candidate, pairs := range *state.data.OpenByRoot {
+		if !filepath.IsAbs(candidate) {
+			continue
+		}
+		resolvedRoot, err := normalizedRoot(candidate)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return state, fmt.Errorf("resolve gate root %s: %w", candidate, err)
+		}
+		rel, err := filepath.Rel(resolvedRoot, resolvedProject)
+		if err != nil {
+			return state, fmt.Errorf("compare gate root %s with project %s: %w", resolvedRoot, resolvedProject, err)
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || len(resolvedRoot) <= len(best) {
+			continue
+		}
+		best, state.open, state.scoped = resolvedRoot, pairs, true
+	}
+	if state.legacy && state.live && !state.scoped {
+		state.scoped = true
+	}
 	return state, nil
 }
 
@@ -3106,9 +3247,9 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	sortExternal(visible)
 	localGroup := 99
 	if choice.found {
-		localGroup = nextGroup(choice.task, o.by)
+		localGroup = nextGroup(choice.task, o.by, choice.gate, choice.live)
 	}
-	if len(visible) > 0 && (!choice.found || externalGroup(visible[0]) < localGroup) {
+	if len(visible) > 0 && (!choice.found || externalWinsLocal(visible[0], localGroup)) {
 		return printExternalNext(root, choice, visible, choice.found, o.json, out, errout)
 	}
 	if !choice.found {
@@ -3134,6 +3275,9 @@ func externalGroup(t externalTask) int {
 		return 4
 	}
 }
+func externalWinsLocal(t externalTask, localGroup int) bool {
+	return externalGroup(t) <= localGroup
+}
 func externalReason(s string) string {
 	s = safeSourceString(s)
 	if len(s) > 200 {
@@ -3143,13 +3287,8 @@ func externalReason(s string) string {
 		}
 		s = s[:limit]
 	}
-	return strings.ReplaceAll(maskSourceText(s), "\n", " ")
-}
-
-var sourceSecretRE = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)|AKIA[0-9A-Z]{16}|(?:sk_live|sk_test|rk_live|rk_test|pk_live|pk_test)_[A-Za-z0-9]{24,}|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{34,}|xox[abepors]-[A-Za-z0-9-]{15,}`)
-
-func maskSourceText(s string) string {
-	return sourceSecretRE.ReplaceAllString(s, "[скрыто:secret]")
+	masked, _ := secretmask.Mask(s)
+	return strings.ReplaceAll(masked, "\n", " ")
 }
 
 type nextChoice struct {
@@ -3179,7 +3318,11 @@ func chooseNext(dir, project, actor string) (nextChoice, error) {
 	if err != nil {
 		return nextChoice{}, err
 	}
-	choice := nextChoice{gate: gate, live: slices.Contains(gate.data.Live, filepath.Base(project))}
+	gate, err = gateForProject(gate, project)
+	if err != nil {
+		return nextChoice{}, err
+	}
+	choice := nextChoice{gate: gate, live: gate.live}
 	candidates := nextCandidates(tasks, actor, gate, choice.live)
 	if len(candidates) != 0 {
 		sortNextCandidates(candidates, actor, gate, choice.live)
@@ -3234,7 +3377,7 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		ext = filtered
 	}
 	sortExternal(ext)
-	if len(ext) > 0 && (!choice.found || externalGroup(ext[0]) < nextGroup(choice.task, actor)) {
+	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate, choice.live))) {
 		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.valid && !choice.live))
 	} else if choice.found {
 		fmt.Fprintln(out, "следующий: "+nextLine(choice))
@@ -3358,10 +3501,13 @@ func gatePasses(t task, gate gateState, live bool) bool {
 	if !gate.valid {
 		return gateOpen(t, nil)
 	}
-	return !live || gateOpen(t, gate.data.Open)
+	return !live || !gate.scoped || gateOpen(t, gate.open)
 }
 
 func eligibleForNext(t task, actor string) bool {
+	if (t.journal || lineValue(t.body, "Вид: ") == "журнал") && !(t.status == "ждёт" && dueWaitingTicket(t.body)) {
+		return false
+	}
 	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
 		return true
 	}
@@ -3369,6 +3515,11 @@ func eligibleForNext(t task, actor string) bool {
 		return false
 	}
 	at, ok := waitDue(waiting(t.body), time.Now())
+	return ok && !at.After(time.Now())
+}
+
+func dueWaitingTicket(body string) bool {
+	at, ok := waitDue(waiting(body), time.Now())
 	return ok && !at.After(time.Now())
 }
 

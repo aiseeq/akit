@@ -194,6 +194,14 @@ and reports an error if both contain that name. When creating tickets in an elig
 `tk new` links `docs/tasks` to the shared `tasks/PROJECT` store and records the ignore rule in the
 repository's exclude file when needed.
 
+Use `tk new --journal` or `tk set ID --journal` to mark a journal ticket; it stays out of `tk next`
+until a wait deadline is due. Queue gates use `open_by_root` in `gate.json`, keyed by absolute project
+roots. `tk transfer ID [--parent KEY]` passes the project name, ticket filename stem, optional parent
+key, and full ticket text to the executable `.tk-transfer` in the parent of the project under
+`$HOME/git` or `$HOME/work`. The command prints a JSON object with `key` and `url`. The command must
+make repeated transfers with the same stem idempotent; if tk stops after the transfer command ran,
+the operator must decide whether to retry.
+
 `tk new` starts a ticket with `Что сделать`, `Приёмка` and `Журнал` sections. The optional
 `## План` section lists `- name: command` checks; `tk plan` adds checks, `tk skip` records a reason,
 `tk check` runs them, and `tk done` runs every unskipped check before closing. Each check gets 8 minutes

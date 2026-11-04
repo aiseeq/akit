@@ -2356,12 +2356,12 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 		wantClosed bool
 		wantDiag   bool
 	}{
-		{"live gates", `{"at":%q,"live":["project"],"open":["MED-DO"]}`, "med-do", false, false},
-		{"project not live", `{"at":%q,"live":["other"],"open":["MED-DO"]}`, "med-hunt", true, false},
+		{"root gate", `{"at":%q,"open_by_root":{"%s":["MED-DO"]}}`, "med-do", false, false},
+		{"project outside configured root", `{"at":%q,"open_by_root":{"%s":["MED-DO"]}}`, "med-hunt", false, false},
 		{"gate missing", "", "high", false, true},
 		{"gate malformed", "{", "high", false, true},
-		{"gate stale", `{"at":"2000-01-01T00:00:00Z","live":["project"],"open":[]}`, "high", false, true},
-		{"gate future", `{"at":"2099-01-01T00:00:00Z","live":["project"],"open":[]}`, "high", false, true},
+		{"gate stale", `{"at":"2000-01-01T00:00:00Z","open_by_root":{}}`, "high", false, true},
+		{"gate future", `{"at":"2099-01-01T00:00:00Z","open_by_root":{}}`, "high", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -2393,7 +2393,12 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 				}
 				gate := tc.gate
 				if strings.Contains(gate, "%q") {
-					gate = fmt.Sprintf(gate, time.Now().Format(time.RFC3339))
+					gate = fmt.Sprintf(gate, time.Now().Format(time.RFC3339), func() string {
+						if tc.name == "project outside configured root" {
+							return filepath.Join(home, "other")
+						}
+						return root
+					}())
 				}
 				if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(gate), 0o644); err != nil {
 					t.Fatal(err)
@@ -2529,6 +2534,15 @@ func queueProject(t *testing.T, gate string, tickets map[string]string) (string,
 			t.Fatal(err)
 		}
 		content := strings.ReplaceAll(gate, "NOW", time.Now().Format(time.RFC3339))
+		var data map[string]any
+		if json.Unmarshal([]byte(content), &data) == nil {
+			if _, ok := data["open_by_root"]; !ok {
+				open, _ := data["open"].([]any)
+				data["open_by_root"] = map[string]any{root: open}
+				encoded, _ := json.Marshal(data)
+				content = string(encoded)
+			}
+		}
 		if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -2659,15 +2673,9 @@ func TestDoneHintKeepsStartedWorkUnderClosedGate(t *testing.T) {
 		"20261101-1001-MED-DO-begun":  "в работе",
 		"20261101-1002-MED-DO-unseen": "открыт",
 	})
-	path := filepath.Join(dir, "20261101-1000-HIGH-closing.md")
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticket := task{path: path, slug: "closing", prio: "HIGH", status: "в работе", body: string(content)}
 	var out, errout bytes.Buffer
-	o := options{cmd: "done", by: "checker", check: "checked by test", baseRoot: root}
-	if code := transition(ticket, o, &out, &errout); code != 0 {
+	o := options{cmd: "done", id: "closing", by: "checker", check: "checked by test", baseRoot: root}
+	if code := runLockedCommand(root, dir, o, &out, &errout); code != 0 {
 		t.Fatalf("done: code %d, stderr %q", code, errout.String())
 	}
 	if !strings.Contains(out.String(), "следующий: begun") {
