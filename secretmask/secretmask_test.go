@@ -3,6 +3,7 @@ package secretmask
 import (
 	"fmt"
 	"maps"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -235,6 +236,26 @@ func TestMaskPlainTextUnchanged(t *testing.T) {
 	}
 }
 
+func TestMaskOverlapFindsNestedGenericKey(t *testing.T) {
+	body := strings.Repeat("a1B2", 5)
+	key := "sk-" + body
+	text := "ta" + "sk-" + strings.Repeat("letters", 4) + "." + key
+	got, found := Mask(text)
+	if !strings.HasSuffix(got, ".[скрыто:sk]") || found["sk"] != 1 {
+		t.Fatalf("nested generic key was not masked: length %d, counts %v", len(got), found)
+	}
+}
+
+func TestMaskNewEscapedContexts(t *testing.T) {
+	contexts := []string{`\u{1b}[32m`, `\U0000003d`, `^[[32m`, "␛[32m", "\x1b(B", "[32m", "[0;32m"}
+	for _, context := range contexts {
+		got, found := Mask(context + fakes()["sk"])
+		if got != context+"[скрыто:sk]" || found["sk"] != 1 {
+			t.Errorf("escaped context %q was not preserved and masked: output length %d, counts %v", context, len(got), found)
+		}
+	}
+}
+
 // An unterminated private key block is masked to the end of the text.
 func TestMaskUnterminatedPrivateKey(t *testing.T) {
 	text := "key:\n-----BEGIN " + "PRIVATE KEY-----\n" + strings.Repeat("Zz9", 30)
@@ -242,4 +263,41 @@ func TestMaskUnterminatedPrivateKey(t *testing.T) {
 	if got != "key:\n[скрыто:private-key]" || found["private-key"] != 1 {
 		t.Fatalf("unterminated block: counts %v, masked length %d", found, len(got))
 	}
+}
+
+func TestRunIndexMatchesLinearRandomRun(t *testing.T) {
+	random := rand.New(rand.NewSource(19))
+	for range 1000 {
+		var text strings.Builder
+		for n := random.Intn(100); n > 0; n-- {
+			text.WriteByte("ab09-_"[random.Intn(6)])
+		}
+		value := text.String()
+		index := newRunIndex(value)
+		for start := range value {
+			for end := start; end <= len(value); end++ {
+				for _, minimum := range []int{16, 20} {
+					if got, want := index.has(start, end, minimum), hasRandomRun(value[start:end], minimum); got != want {
+						t.Fatalf("run index differs for %q at range %d:%d, minimum %d: got %v want %v", value, start, end, minimum, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func hasRandomRun(text string, n int) bool {
+	start, letter, digit := 0, false, false
+	for i := 0; i <= len(text); i++ {
+		if i < len(text) && isAlphaNum(text[i]) {
+			letter = letter || isLetter(text[i])
+			digit = digit || text[i] >= '0' && text[i] <= '9'
+			continue
+		}
+		if i-start >= n && letter && digit {
+			return true
+		}
+		start, letter, digit = i+1, false, false
+	}
+	return false
 }
