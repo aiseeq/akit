@@ -2352,7 +2352,7 @@ func TestClosedFieldIsOnlyAddedToNextJSON(t *testing.T) {
 		t.Fatalf("standard task JSON has closed: %s %v", standard, err)
 	}
 	var out, errout bytes.Buffer
-	if code := printNext("", nextChoice{task: ticket, found: true, gate: gateState{valid: true}}, true, &out, &errout); code != 0 {
+	if code := printCombinedNext("", nextChoice{task: ticket, found: true, gate: gateState{valid: true}}, nil, true, &out, &errout); code != 0 {
 		t.Fatalf("next JSON = %d %s", code, errout.String())
 	}
 	var next map[string]any
@@ -2443,7 +2443,10 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 			if code := nextTask(root, "", dir, options{by: "me", json: true}, &out, &errout); code != 0 {
 				t.Fatalf("nextTask = %d, stderr %q", code, errout.String())
 			}
-			var got nextTaskJSON
+			var got struct {
+				Slug   string `json:"slug"`
+				Closed bool   `json:"closed"`
+			}
 			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 				t.Fatal(err)
 			}

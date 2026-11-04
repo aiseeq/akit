@@ -35,8 +35,9 @@ func transferTask(root, dir string, o options, out, errout io.Writer) int {
 			if readErr != nil {
 				return transferError(errout, filepath.Join(dir, ".transferred.jsonl"), readErr.Error())
 			}
+			stem := strings.TrimSuffix(o.id, ".md")
 			for _, row := range rows {
-				if row.Slug == o.id {
+				if row.Slug == o.id || row.Stem == stem {
 					fmt.Fprintf(out, "%s уже перенесён: %s %s\n", row.Slug, row.Key, row.URL)
 					return 0
 				}

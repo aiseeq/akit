@@ -64,6 +64,18 @@ func TestTransferRunsUnderLockAndRecordsOnce(t *testing.T) {
 	if code := runLockedCommand(project, dir, o, &out, &errOut); code != 0 || !strings.Contains(out.String(), "уже перенесён: EXT-7") {
 		t.Fatalf("repeat transfer = %d %q %q", code, out.String(), errOut.String())
 	}
+	o.id = strings.TrimSuffix(name, ".md")
+	out.Reset()
+	errOut.Reset()
+	if code := runLockedCommand(project, dir, o, &out, &errOut); code != 0 || !strings.Contains(out.String(), "уже перенесён: EXT-7") {
+		t.Fatalf("repeat transfer by file stem = %d %q %q", code, out.String(), errOut.String())
+	}
+	o.id = name
+	out.Reset()
+	errOut.Reset()
+	if code := runLockedCommand(project, dir, o, &out, &errOut); code != 0 || !strings.Contains(out.String(), "уже перенесён: EXT-7") {
+		t.Fatalf("repeat transfer by file name = %d %q %q", code, out.String(), errOut.String())
+	}
 	gotCalls, _ = os.ReadFile(marker)
 	if strings.Count(string(gotCalls), "sample ") != 1 {
 		t.Fatalf("transfer command called repeatedly: %q", gotCalls)

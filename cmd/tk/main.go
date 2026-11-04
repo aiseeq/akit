@@ -758,14 +758,23 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 			return fail(errout, err)
 		}
 	}
-	base := o.baseRoot
 	if o.to != "" {
-		base = root
-	}
-	if main != "" && base != "" {
-		if shared, err := sharedTaskRoot(base, main); err != nil {
+		// --to names a project: a worktree path leads to its main tree whatever the tickets are.
+		if main != "" && main != root {
+			bare, err := bareRepository(main)
+			if err != nil {
+				return fail(errout, err)
+			}
+			if !bare {
+				root, dir = main, filepath.Join(main, "docs/tasks")
+			}
+		}
+	} else if main != "" && o.baseRoot != "" {
+		shared, err := sharedTaskRoot(o.baseRoot, main)
+		if err != nil {
 			return fail(errout, err)
-		} else if shared != "" {
+		}
+		if shared != "" {
 			root, dir = shared, filepath.Join(shared, "docs/tasks")
 		}
 	}
@@ -892,27 +901,34 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 	return 0
 }
 
+func bareRepository(main string) (bool, error) {
+	bare, err := exec.Command("git", "-C", main, "rev-parse", "--is-bare-repository").Output()
+	if err != nil {
+		return false, fmt.Errorf("git rev-parse in %s: %w", main, err)
+	}
+	return strings.TrimSpace(string(bare)) == "true", nil
+}
+
 // sharedTaskRoot возвращает основное дерево main, если tk запущен из другого
-// его worktree и основное дерево игнорирует docs/tasks: тогда тикеты лежат там
-// одни на все ветки. Иначе — пусто, тикеты в текущем дереве.
+// его worktree и в основном дереве docs/tasks — симлинк на хранилище или
+// игнорируется: тогда тикеты лежат там одни на все ветки. Иначе — пусто, тикеты
+// в текущем дереве.
 func sharedTaskRoot(root, main string) (string, error) {
 	if main == "" || main == root {
 		return "", nil
 	}
 	// Каталог .git бывает и bare-репо (рабочего дерева у него нет): тогда тикеты в worktree.
-	bare, err := exec.Command("git", "-C", main, "rev-parse", "--is-bare-repository").Output()
+	bare, err := bareRepository(main)
 	if err != nil {
-		return "", fmt.Errorf("git rev-parse in %s: %w", main, err)
+		return "", err
 	}
-	if strings.TrimSpace(string(bare)) == "true" {
+	if bare {
 		return "", nil
 	}
-	// Симлинк для git — файл: путь со слешем за ним git отвергает (код 128), спрашивать без слеша.
-	query := "docs/tasks/"
 	if info, lerr := os.Lstat(filepath.Join(main, "docs/tasks")); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-		query = "docs/tasks"
+		return main, nil
 	}
-	err = exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", query).Run()
+	err = exec.Command("git", "-C", main, "check-ignore", "-q", "--no-index", "docs/tasks/").Run()
 	if err == nil {
 		return main, nil
 	}
@@ -1123,6 +1139,9 @@ func prepareTaskDirectory(target, knownMain string) error {
 	if !storeInfo.IsDir() {
 		return fmt.Errorf("ticket store %s is not a directory", store)
 	}
+	if err := os.Remove(docsTasks); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove empty directory %s: %w", docsTasks, err)
+	}
 	project := filepath.Base(main)
 	if err := os.MkdirAll(filepath.Join(tasksRoot, "tasks", project), dirMode); err != nil {
 		return fmt.Errorf("create ticket store for %s: %w", project, err)
@@ -1165,13 +1184,7 @@ func existingTaskDirectory(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}
-	if len(entries) > 0 {
-		return true, nil
-	}
-	if err = os.Remove(path); err != nil {
-		return false, fmt.Errorf("remove empty directory %s: %w", path, err)
-	}
-	return false, nil
+	return len(entries) > 0, nil
 }
 
 func installTaskLink(path, target string) error {
@@ -3472,23 +3485,6 @@ func sortNextCandidates(candidates []task, actor string, gate gateState, live bo
 		}
 		return left.created.Before(right.created)
 	})
-}
-
-type nextTaskJSON struct {
-	taskJSON
-	Closed bool `json:"closed"`
-}
-
-func printNext(root string, choice nextChoice, jsonOutput bool, out, errout io.Writer) int {
-	if jsonOutput {
-		obj := nextTaskJSON{taskJSON: taskObject(root, choice.task, "", false), Closed: choice.gate.valid && !choice.live}
-		if err := json.NewEncoder(out).Encode(obj); err != nil {
-			return fail(errout, err)
-		}
-		return 0
-	}
-	fmt.Fprintln(out, nextLine(choice))
-	return 0
 }
 
 func nextLine(choice nextChoice) string {

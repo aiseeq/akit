@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -195,5 +196,101 @@ func TestTaskSourceRootMatch(t *testing.T) {
 	}
 	if _, ok, err := taskSourcePath(filepath.Join(home, "other", "sample")); err != nil || ok {
 		t.Fatal("unexpected source outside supported roots")
+	}
+}
+
+func gitInTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// linkedProject makes HOME/work/sample, its store and a linked worktree. The link
+// is neither ignored nor excluded, as in a project linked by hand.
+func linkedProject(t *testing.T) (project, worktree string) {
+	t.Helper()
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	project = filepath.Join(home, "work", "sample")
+	for _, path := range []string{filepath.Join(home, "work", "tasks", "sample"), filepath.Join(project, "docs")} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitInTest(t, project, "init", "-q", "-b", "main")
+	gitInTest(t, project, "commit", "-q", "--allow-empty", "-m", "init")
+	if err := os.Symlink("../../tasks/sample", filepath.Join(project, "docs", "tasks")); err != nil {
+		t.Fatal(err)
+	}
+	worktree = filepath.Join(home, "trees", "feature")
+	gitInTest(t, project, "worktree", "add", "-q", "-b", "feature", worktree)
+	return project, worktree
+}
+
+func TestWorktreeUsesLinkedStoreWithoutIgnore(t *testing.T) {
+	project, worktree := linkedProject(t)
+	shared, err := sharedTaskRoot(worktree, project)
+	if err != nil || shared != project {
+		t.Fatalf("sharedTaskRoot = %q, %v, want %q", shared, err, project)
+	}
+}
+
+func TestNewToWorktreeWritesToMainTree(t *testing.T) {
+	project, worktree := linkedProject(t)
+	if err := os.Remove(filepath.Join(project, "docs", "tasks")); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(project, "docs", "tasks")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "20261001-1000-MED-old.md"), []byte("# Old\n\nСтатус: открыт\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitInTest(t, project, "add", "docs/tasks")
+	gitInTest(t, project, "commit", "-q", "-m", "tickets")
+	gitInTest(t, worktree, "merge", "-q", "--ff-only", "main")
+	o, err := parseArgs([]string{"new", "fresh", "--to", worktree, "--by", "me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := createAtBase(worktree, filepath.Join(worktree, "docs", "tasks"), o, &out, &errOut); code != 0 {
+		t.Fatalf("createAtBase = %d: %s", code, errOut.String())
+	}
+	found, err := filepath.Glob(filepath.Join(real, "*-fresh.md"))
+	if err != nil || len(found) != 1 {
+		t.Fatalf("ticket in main tree = %v, %v", found, err)
+	}
+	stray, err := filepath.Glob(filepath.Join(worktree, "docs", "tasks", "*-fresh.md"))
+	if err != nil || len(stray) != 0 {
+		t.Fatalf("ticket in worktree = %v, %v", stray, err)
+	}
+}
+
+func TestMissingStoreKeepsEmptyTaskDirectory(t *testing.T) {
+	project, _ := linkedProject(t)
+	link := filepath.Join(project, "docs", "tasks")
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(link, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := filepath.Join(filepath.Dir(project), "tasks")
+	if err := os.RemoveAll(store); err != nil {
+		t.Fatal(err)
+	}
+	err := prepareTaskDirectory(project, project)
+	if err == nil || !strings.Contains(err.Error(), "is missing") {
+		t.Fatalf("prepareTaskDirectory = %v", err)
+	}
+	if info, statErr := os.Lstat(link); statErr != nil || !info.IsDir() {
+		t.Fatalf("empty directory is gone: %v", statErr)
 	}
 }
