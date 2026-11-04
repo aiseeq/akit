@@ -709,7 +709,7 @@ func TestWaitReplaceAndStartClearsWait(t *testing.T) {
 		t.Fatal("default ls hides waiting tickets")
 	}
 	out.Reset()
-	printTask(&out, waitingTask, "")
+	printTask(&out, waitingTask, "", &bytes.Buffer{})
 	if !strings.Contains(out.String(), "[до 2020-01-01 10:00 overdue]") {
 		t.Fatalf("overdue wait not shown: %q", out.String())
 	}

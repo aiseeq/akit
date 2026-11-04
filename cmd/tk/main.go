@@ -921,8 +921,28 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	if o.cmd == "transfer" {
-		defer release()
-		return transferTask(root, dir, o, out, errout)
+		before, findErr := find(dir, o.id)
+		if findErr != nil {
+			release()
+			return transferTask(root, dir, o, out, errout)
+		}
+		code := transferTask(root, dir, o, out, errout)
+		release()
+		if code == 0 {
+			rows, ledgerErr := readTransferLedger(dir)
+			if ledgerErr != nil {
+				fmt.Fprintf(errout, "tk: warning: cannot update blockers after transfer of %s: %v\n", before.slug, ledgerErr)
+			} else {
+				stem := strings.TrimSuffix(filepath.Base(before.path), ".md")
+				for _, row := range rows {
+					if row.Stem == stem {
+						transferBlockRelations(before, o, row.Key, errout)
+						break
+					}
+				}
+			}
+		}
+		return code
 	}
 	t, err := find(dir, o.id)
 	if err != nil {
@@ -938,13 +958,13 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 				code = attachBlocks(current, o, out, errout, o.blocks)
 			}
 			if code == 0 && len(o.unblocks) > 0 {
-				code = removeBlocks(current, o, out, errout, o.unblocks)
+				code = removeBlocks(current, o, errout, o.unblocks)
 			}
 			if code == 0 && o.prio != "" {
 				code = propagatePriority(current.path, o, out, errout)
 			}
 			if code == 0 && o.prio != "" {
-				notePriorityLowered(t, o)
+				notePriorityLowered(t, o, errout)
 			}
 		}
 	}
@@ -1540,7 +1560,7 @@ func list(root string, o options, out, errout io.Writer) int {
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].created.Before(all[j].created) })
 	for i := range all {
-		printTask(out, all[i], labels[all[i].path])
+		printTask(out, all[i], labels[all[i].path], errout)
 	}
 	if len(skipped) > 0 {
 		sort.Strings(skipped)
@@ -1675,7 +1695,7 @@ func matchesListFilters(t task, o options) bool {
 	return true
 }
 
-func printTask(out io.Writer, t task, label string) {
+func printTask(out io.Writer, t task, label string, errout io.Writer) {
 	age := time.Since(t.created)
 	var ageText string
 	switch {
@@ -1704,7 +1724,7 @@ func printTask(out io.Writer, t task, label string) {
 	if noCheck(t.body) {
 		checkMark = " no-check"
 	}
-	fmt.Fprintf(out, "%s%s %s %s %s %s%s%s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait, checkMark, blockMark(t))
+	fmt.Fprintf(out, "%s%s %s %s %s %s%s%s%s\n", label, t.slug, t.status, t.prio, ageText, t.title, wait, checkMark, blockMark(t, errout))
 }
 
 func waiting(s string) string {
@@ -3429,7 +3449,7 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate, choice.live))) {
 		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.valid && !choice.live))
 	} else if choice.found {
-		fmt.Fprintln(out, "следующий: "+nextLine(choice))
+		fmt.Fprintln(out, "следующий: "+nextLine(choice, errout))
 	}
 }
 
@@ -3524,7 +3544,7 @@ func localNextObject(root string, t task, closed bool) (map[string]any, error) {
 }
 func printCombinedNext(root string, choice nextChoice, ext []externalTask, jsonOutput bool, out, errout io.Writer) int {
 	if !jsonOutput {
-		fmt.Fprintln(out, nextLine(choice))
+		fmt.Fprintln(out, nextLine(choice, errout))
 		if len(ext) > 0 {
 			fmt.Fprintln(out, "также: "+externalLine(ext[0], choice.gate.valid && !choice.live))
 			if len(ext) > 1 {
@@ -3550,7 +3570,7 @@ func printExternalNext(root string, choice nextChoice, ext []externalTask, local
 	if !jsonOutput {
 		fmt.Fprintln(out, externalLine(ext[0], closed))
 		if local {
-			fmt.Fprintln(out, "также: "+nextLine(choice))
+			fmt.Fprintln(out, "также: "+nextLine(choice, errout))
 		}
 		if len(ext) > 1 {
 			n := len(ext) - 1
@@ -3661,9 +3681,9 @@ func sortNextCandidates(candidates []task, actor string, gate gateState, live bo
 	})
 }
 
-func nextLine(choice nextChoice) string {
+func nextLine(choice nextChoice, errout io.Writer) string {
 	var row bytes.Buffer
-	printTask(&row, choice.task, "")
+	printTask(&row, choice.task, "", errout)
 	line := strings.TrimSuffix(row.String(), "\n")
 	if choice.gate.valid && !choice.live {
 		line += " закрыто"
@@ -3787,16 +3807,21 @@ func lintTicket(path, shown string) ([]string, error) {
 		if e != nil {
 			continue
 		}
-		other, _ := parseTask(neighbor, string(b))
-		if other.status != "готово" && other.status != "отклонён" && blockPrioRank(parseTaskPriority(path)) > blockPrioRank(other.prio) {
+		other, parseErr := parseTask(neighbor, string(b))
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		name, valid := parseTaskName(filepath.Base(path))
+		if !valid {
+			continue
+		}
+		if other.status != "готово" && other.status != "отклонён" && blockPrioRank(other.prio) > blockPrioRank(name.prio) {
 			issues = append(issues, shown+": priority below blocking ticket "+ref)
 		}
-		name, _ := parseTaskName(filepath.Base(path))
-		reverse := projectRef(dirProject(dir), project)
-		if reverse != "" {
-			reverse += "/"
+		reverse, refErr := ticketRef(dirProject(dir), project, name.slug)
+		if refErr != nil {
+			return nil, refErr
 		}
-		reverse += name.slug
 		if !slices.Contains(headerLinks(other.body, blocksPrefix), reverse) {
 			issues = append(issues, shown+": blocking link "+ref+" has no reverse Блокирует reference")
 		}
@@ -3809,8 +3834,6 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	return append(issues, lintTicketBody(body, shown)...), nil
 }
-
-func parseTaskPriority(path string) string { n, _ := parseTaskName(filepath.Base(path)); return n.prio }
 
 func lintTicketBody(body, shown string) []string {
 	var issues []string

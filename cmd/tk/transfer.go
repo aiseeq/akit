@@ -92,20 +92,20 @@ func transferFoundTask(root string, t task, o options, out, errout io.Writer) in
 		fmt.Fprintf(out, "%s %s\n", result.Key, result.URL)
 		return transferError(errout, t.path, err.Error())
 	}
-	transferBlockRelations(t, o, result.Key, errout)
 	fmt.Fprintf(out, "%s перенесён: %s %s\n", t.slug, result.Key, result.URL)
 	return 0
 }
 
 func transferBlockRelations(t task, o options, key string, errout io.Writer) {
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
-		_, path, back, err := reverseTaskRef(t, ref)
+		dir, id, back, err := reverseTaskRef(t, ref)
 		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot update blocker %s after transfer: %v\n", ref, err)
 			continue
 		}
 		msg := "заблокированный " + back + " перенесён в " + key
-		if err = updateTicket(path, func(s string) string {
-			return journal(removeHeaderLink(s, blocksPrefix, back), "- "+timeStamp()+" note — "+o.by+": "+msg)
+		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			return journal(removeHeaderLink(current.body, blocksPrefix, back), "- "+timeStamp()+" note — "+o.by+": "+msg), nil
 		}); err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot update %s after transfer: %v\n", ref, err)
 		}

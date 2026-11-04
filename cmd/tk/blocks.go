@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -60,20 +61,40 @@ func currentProject(o options) string {
 	return ""
 }
 
-func projectRef(from, to string) string {
-	fa, _ := filepath.Abs(from)
-	ta, _ := filepath.Abs(to)
-	if fa == ta {
-		return ""
+func ticketRef(from, to, slug string) (string, error) {
+	fromRoot, err := normalizedRoot(from)
+	if err != nil {
+		return "", fmt.Errorf("resolve source project: %w", err)
 	}
-	home, _ := os.UserHomeDir()
+	toRoot, err := normalizedRoot(to)
+	if err != nil {
+		return "", fmt.Errorf("resolve target project: %w", err)
+	}
+	if fromRoot == toRoot {
+		return slug, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("determine project roots: %w", err)
+	}
 	for _, root := range []string{"git", "work"} {
-		base := filepath.Join(home, root)
-		if rel, err := filepath.Rel(base, ta); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return root + "/" + filepath.ToSlash(rel)
+		base, err := normalizedRoot(filepath.Join(home, root))
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return "", fmt.Errorf("resolve %s project root: %w", root, err)
+			}
+			continue
 		}
+		rel, err := filepath.Rel(base, toRoot)
+		if err != nil {
+			return "", fmt.Errorf("relate project paths: %w", err)
+		}
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.Dir(rel) != "." {
+			continue
+		}
+		return root + "/" + filepath.ToSlash(rel) + "/" + slug, nil
 	}
-	return ""
+	return "", fmt.Errorf("target project %s must be a direct child of $HOME/git or $HOME/work", toRoot)
 }
 
 func resolveBlockTarget(o options, raw string) (blockTarget, error) {
@@ -83,38 +104,17 @@ func resolveBlockTarget(o options, raw string) (blockTarget, error) {
 		name := parts[1]
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return blockTarget{}, err
+			return blockTarget{}, fmt.Errorf("determine linked project root: %w", err)
 		}
 		project = filepath.Join(home, parts[0], name)
 		id = parts[2]
 	} else if len(parts) == 2 {
-		name := parts[0]
-		id = parts[1]
-		home, err := os.UserHomeDir()
+		projectPath, err := destinationProject(parts[0])
 		if err != nil {
 			return blockTarget{}, err
 		}
-		gp, wp := filepath.Join(home, "git", name), filepath.Join(home, "work", name)
-		gi, ge := os.Stat(gp)
-		wi, we := os.Stat(wp)
-		if ge != nil && !os.IsNotExist(ge) {
-			return blockTarget{}, ge
-		}
-		if we != nil && !os.IsNotExist(we) {
-			return blockTarget{}, we
-		}
-		gok, wok := ge == nil && gi.IsDir(), we == nil && wi.IsDir()
-		if gok && wok {
-			return blockTarget{}, fmt.Errorf("project %q exists in both %s and %s; use git/ or work/", name, gp, wp)
-		}
-		if !gok && !wok {
-			return blockTarget{}, fmt.Errorf("project %q not found", name)
-		}
-		if gok {
-			project = gp
-		} else {
-			project = wp
-		}
+		id = parts[1]
+		project = projectPath
 	} else if len(parts) != 1 {
 		return blockTarget{}, fmt.Errorf("invalid ticket reference %q", raw)
 	}
@@ -125,45 +125,101 @@ func resolveBlockTarget(o options, raw string) (blockTarget, error) {
 		return blockTarget{}, fmt.Errorf("cannot resolve current project")
 	}
 	dir := filepath.Join(project, "docs/tasks")
-	t, err := find(dir, id)
+	t, err := readTaskLocked(dir, id)
 	if err != nil {
 		return blockTarget{}, err
 	}
-	ref := t.slug
-	if pref := projectRef(currentProject(o), project); pref != "" {
-		ref = pref + "/" + t.slug
+	ref, err := ticketRef(currentProject(o), project, t.slug)
+	if err != nil {
+		return blockTarget{}, err
 	}
 	return blockTarget{project, dir, t.slug, ref}, nil
 }
 
 func linkedPath(project, ref string) (string, string, error) {
-	parts := strings.Split(ref, "/")
-	dir := filepath.Join(project, "docs/tasks")
-	id := ref
-	if len(parts) == 2 && (parts[0] == "git" || parts[0] == "work") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", "", err
-		}
-		dir = filepath.Join(home, parts[0], parts[1], "docs/tasks")
-		id = parts[1] /* overridden below for 3-part canonical references */
-	}
-	if len(parts) == 3 && (parts[0] == "git" || parts[0] == "work") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", "", err
-		}
-		dir = filepath.Join(home, parts[0], parts[1], "docs/tasks")
-		id = parts[2]
-	}
-	if len(parts) == 2 && parts[0] != "git" && parts[0] != "work" {
-		return dir, "", fmt.Errorf("unresolved project reference %s", ref)
-	}
-	t, err := find(dir, id)
+	dir, id, err := referenceLocation(project, ref)
 	if err != nil {
 		return dir, "", err
 	}
-	return dir, t.path, nil
+	t, err := find(dir, id)
+	if err == nil {
+		return dir, t.path, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return dir, "", err
+	}
+	archive, archiveErr := archiveDir(dirProject(dir))
+	if archiveErr != nil {
+		return dir, "", archiveErr
+	}
+	archived, archiveErr := find(archive, id)
+	if archiveErr == nil {
+		return archive, archived.path, nil
+	}
+	if !errors.Is(archiveErr, os.ErrNotExist) {
+		return archive, "", archiveErr
+	}
+	if err != nil {
+		return dir, "", err
+	}
+	return dir, "", os.ErrNotExist
+}
+
+func referenceLocation(project, ref string) (string, string, error) {
+	parts := strings.Split(ref, "/")
+	id := ref
+	if len(parts) == 3 && (parts[0] == "git" || parts[0] == "work") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", fmt.Errorf("determine linked project root: %w", err)
+		}
+		project = filepath.Join(home, parts[0], parts[1])
+		id = parts[2]
+	} else if len(parts) != 1 {
+		return "", "", fmt.Errorf("unresolved project reference %s", ref)
+	}
+	if !slugRE.MatchString(id) {
+		return "", "", fmt.Errorf("invalid ticket reference %s", ref)
+	}
+	return filepath.Join(project, "docs/tasks"), id, nil
+}
+
+func findWithArchive(dir, id string) (task, error) {
+	t, err := find(dir, id)
+	if err == nil {
+		return t, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return task{}, err
+	}
+	archive, err := archiveDir(dirProject(dir))
+	if err != nil {
+		return task{}, err
+	}
+	return find(archive, id)
+}
+
+func isArchivedTask(path string) bool {
+	archive, err := archiveDir(taskProject(path))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(archive, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func findReferenceLocked(project, ref string) (string, task, error) {
+	dir, id, err := referenceLocation(project, ref)
+	if err != nil {
+		return dir, task{}, err
+	}
+	release, err := lockTasks(dir)
+	if err != nil {
+		return dir, task{}, err
+	}
+	t, findErr := findWithArchive(dir, id)
+	release()
+	return dir, t, findErr
 }
 
 func parseTask(path, body string) (task, error) {
@@ -171,90 +227,143 @@ func parseTask(path, body string) (task, error) {
 	if !ok {
 		return task{}, fmt.Errorf("invalid task name %s", path)
 	}
-	st, _ := status(body)
+	st, err := status(body)
+	if err != nil {
+		return task{}, fmt.Errorf("%s: %w", path, err)
+	}
 	return task{path: path, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(body), body: body}, nil
 }
 
 func attachBlocks(t task, o options, out, errout io.Writer, targets []string) int {
-	var roots []string
+	var raiseFrom []string
 	for _, raw := range targets {
 		target, err := resolveBlockTarget(o, raw)
 		if err != nil {
 			return fail(errout, err)
 		}
-		if target.dir == filepath.Dir(t.path) && target.id == t.slug {
+		if sameTicket(taskProject(t.path), t.slug, target.root, target.id) {
 			return fail(errout, fmt.Errorf("ticket cannot block itself"))
 		}
-		targetTask, err := find(target.dir, target.id)
+		fresh, err := readTaskLocked(filepath.Dir(t.path), t.slug)
 		if err != nil {
 			return fail(errout, err)
-		} else if targetTask.status == "готово" || targetTask.status == "отклонён" {
-			return fail(errout, fmt.Errorf("target %s is closed", raw))
 		}
-		roots = append(roots, targetTask.path)
-		ref := target.ref
-		back := projectRef(target.root, currentProject(o))
-		if back != "" {
-			back += "/"
+		chain, cycle := blockingChainTo(fresh, target, errout)
+		if cycle {
+			return fail(errout, fmt.Errorf("blocking cycle: %s", strings.Join(chain, " → ")))
 		}
-		back += t.slug
-		if slices.Contains(headerLinks(targetTask.body, blockedPrefix), back) && slices.Contains(headerLinks(t.body, blocksPrefix), ref) {
-			continue
+		back, err := ticketRef(target.root, currentProject(o), fresh.slug)
+		if err != nil {
+			return fail(errout, err)
 		}
-		// The reverse chain from X must not reach T.
-		chain := []string{t.slug}
-		seen := map[string]bool{}
-		cur := blockTarget{root: currentProject(o), dir: filepath.Dir(t.path), id: t.slug}
-		for {
-			if cur.dir == target.dir && cur.id == target.id {
-				return fail(errout, fmt.Errorf("blocking cycle: %s", strings.Join(append(chain, target.id), " → ")))
+		targetTask, err := mutateTask(target.dir, target.id, func(current task) (string, error) {
+			if current.status == "готово" || current.status == "отклонён" {
+				return "", fmt.Errorf("target %s is closed", raw)
 			}
-			key := cur.dir + "/" + cur.id
-			if seen[key] {
-				break
+			body := current.body
+			if !slices.Contains(headerLinks(body, blockedPrefix), back) {
+				body = addHeaderLink(body, blockedPrefix, back)
+				body = journal(body, fmt.Sprintf("- %s note — %s: блокирует %s", timeStamp(), o.by, back))
 			}
-			seen[key] = true
-			tt, e := find(cur.dir, cur.id)
-			if e != nil {
-				break
-			}
-			links := headerLinks(tt.body, blockedPrefix)
-			if len(links) == 0 {
-				break
-			}
-			d, p, e := linkedPath(cur.root, links[0])
-			if e != nil {
-				break
-			}
-			name, _ := parseTaskName(filepath.Base(p))
-			chain = append(chain, name.slug)
-			cur = blockTarget{root: filepath.Dir(filepath.Dir(filepath.Dir(p))), dir: d, id: name.slug}
+			return body, nil
+		})
+		if err != nil {
+			return fail(errout, err)
 		}
-		if !slices.Contains(headerLinks(targetTask.body, blockedPrefix), back) {
-			if err := updateTicket(targetTask.path, func(body string) string {
-				return journal(addHeaderLink(body, blockedPrefix, back), fmt.Sprintf("- %s note — %s: блокирует %s", timeStamp(), o.by, back))
-			}); err != nil {
-				return fail(errout, err)
+		_, err = mutateTask(filepath.Dir(t.path), fresh.slug, func(current task) (string, error) {
+			body := current.body
+			if !slices.Contains(headerLinks(body, blocksPrefix), target.ref) {
+				body = addHeaderLink(body, blocksPrefix, target.ref)
+				body = journal(body, fmt.Sprintf("- %s note — %s: заблокирован %s", timeStamp(), o.by, target.ref))
 			}
+			return body, nil
+		})
+		if err != nil {
+			return fail(errout, err)
 		}
-		if !slices.Contains(headerLinks(t.body, blocksPrefix), ref) {
-			if err := updateTicket(t.path, func(body string) string {
-				return journal(addHeaderLink(body, blocksPrefix, ref), fmt.Sprintf("- %s note — %s: заблокирован %s", timeStamp(), o.by, ref))
-			}); err != nil {
-				return fail(errout, err)
-			}
-		}
+		raiseFrom = append(raiseFrom, targetTask.path)
 	}
 	code := 0
-	for _, path := range roots {
+	for _, path := range raiseFrom {
 		if c := propagatePriority(path, o, out, errout); c != 0 {
 			code = c
 		}
 	}
-	if len(targets) > 0 {
-		return code
+	return code
+}
+
+func sameTicket(project, slug, otherProject, otherSlug string) bool {
+	a, errA := normalizedRoot(project)
+	b, errB := normalizedRoot(otherProject)
+	return errA == nil && errB == nil && a == b && slug == otherSlug
+}
+
+func readTaskLocked(dir, id string) (task, error) {
+	release, err := lockTasks(dir)
+	if err != nil {
+		return task{}, err
 	}
-	return 0
+	defer release()
+	return findWithArchive(dir, id)
+}
+
+func mutateTask(dir, id string, edit func(task) (string, error)) (task, error) {
+	release, err := lockTasks(dir)
+	if err != nil {
+		return task{}, err
+	}
+	defer release()
+	t, err := findWithArchive(dir, id)
+	if err != nil {
+		return task{}, err
+	}
+	body, err := edit(t)
+	if err != nil {
+		return task{}, err
+	}
+	if body != t.body {
+		if err := writeTask(t.path, body); err != nil {
+			return task{}, err
+		}
+		t.body = body
+	}
+	return t, nil
+}
+
+func blockingChainTo(start task, target blockTarget, errout io.Writer) ([]string, bool) {
+	type node struct {
+		ticket task
+		chain  []string
+	}
+	queue := []node{{start, []string{start.slug}}}
+	visited := map[string]bool{}
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		project := taskProject(n.ticket.path)
+		for _, ref := range headerLinks(n.ticket.body, blockedPrefix) {
+			dir, neighbor, err := findReferenceLocked(project, ref)
+			if err != nil {
+				fmt.Fprintf(errout, "tk: warning: cannot inspect cycle link %s from %s: %v\n", ref, n.ticket.slug, err)
+				continue
+			}
+			root := taskProject(neighbor.path)
+			if sameTicket(root, neighbor.slug, target.root, target.id) {
+				return append(append([]string(nil), n.chain...), neighbor.slug), true
+			}
+			key, err := normalizedRoot(filepath.Join(dir, filepath.Base(neighbor.path)))
+			if err != nil {
+				fmt.Fprintf(errout, "tk: warning: cannot normalize cycle link %s from %s: %v\n", ref, n.ticket.slug, err)
+				continue
+			}
+			if visited[key] {
+				continue
+			}
+			visited[key] = true
+			queue = append(queue, node{neighbor, append(append([]string(nil), n.chain...), neighbor.slug)})
+		}
+	}
+	return nil, false
 }
 
 func timeStamp() string { return time.Now().Format("2006-01-02 15:04") }
@@ -298,143 +407,223 @@ func propagatePriority(start string, o options, out, errout io.Writer) int {
 	for len(queue) > 0 {
 		path := queue[0]
 		queue = queue[1:]
-		abs, _ := filepath.Abs(path)
-		if seen[abs] {
+		key, err := normalizedRoot(path)
+		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot inspect blocking chain at %s: %v\n", path, err)
+			code = exitUsage
 			continue
 		}
-		seen[abs] = true
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		b, err := os.ReadFile(path)
 		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot read blocking chain at %s: %v\n", path, err)
+			code = exitUsage
 			continue
 		}
 		source, err := parseTask(path, string(b))
 		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot read blocking chain at %s: %v\n", path, err)
+			code = exitUsage
 			continue
 		}
 		for _, ref := range headerLinks(source.body, blockedPrefix) {
-			dir, neighborPath, err := linkedPath(filepath.Dir(filepath.Dir(filepath.Dir(path))), ref)
+			next, err := propagateLink(path, source, ref, o, out, errout)
 			if err != nil {
-				rows, _ := readTransferLedger(dir)
-				stem := strings.TrimSuffix(filepath.Base(ref), ".md")
-				transferred := false
-				for _, row := range rows {
-					if row.Slug == stem || row.Stem == stem {
-						note := fmt.Sprintf("блокирующий %s вне tk: подними в трекере", row.Key)
-						_ = updateTicket(path, func(s string) string { return journal(s, "- "+timeStamp()+" note — "+o.by+": "+note) })
-						fmt.Fprintln(out, note)
-						transferred = true
-						break
-					}
-				}
-				if transferred {
-					continue
-				}
-				fmt.Fprintf(errout, "tk: missing blocking link %s from %s\n", ref, source.slug)
 				code = exitUsage
 				continue
 			}
-			neighborBytes, err := os.ReadFile(neighborPath)
-			if err != nil {
-				fmt.Fprintf(errout, "tk: missing blocking link %s from %s\n", ref, source.slug)
-				code = exitUsage
-				continue
+			if next != "" {
+				queue = append(queue, next)
 			}
-			neighbor, err := parseTask(neighborPath, string(neighborBytes))
-			if err != nil {
-				continue
-			}
-			if neighbor.status == "готово" || neighbor.status == "отклонён" {
-				continue
-			}
-			queue = append(queue, neighborPath)
-			if blockPrioRank(neighbor.prio) <= blockPrioRank(source.prio) {
-				queue = append(queue, neighborPath)
-				continue
-			}
-			name, err := retaggedName(filepath.Base(neighborPath), options{prio: normalizePrio(source.prio)})
-			if err != nil {
-				fmt.Fprintf(errout, "tk: raise %s: %v\n", ref, err)
-				code = exitUsage
-				continue
-			}
-			newPath := filepath.Join(filepath.Dir(neighborPath), name)
-			why := ""
-			if blockPrioRank(source.prio) <= 1 && lineValue(neighbor.body, "Причина: ") == "" {
-				ref := projectRef(filepath.Dir(filepath.Dir(filepath.Dir(neighborPath))), filepath.Dir(filepath.Dir(filepath.Dir(path))))
-				if ref != "" {
-					ref += "/"
-				}
-				why = "блокирует " + ref + source.slug
-			}
-			updated := neighbor.body
-			if why != "" {
-				updated, _ = setHeaderValue(updated, "Причина: ", why)
-			}
-			updated = journal(updated, fmt.Sprintf("- %s note — %s: приоритет %s → %s: блокирует %s", timeStamp(), o.by, normalizePrio(neighbor.prio), normalizePrio(source.prio), source.slug))
-			if newPath != neighborPath {
-				updated = journal(updated, renameJournal(o.by, neighborPath, newPath))
-			}
-			release, e := lockTasks(filepath.Dir(neighborPath))
-			if e == nil {
-				if newPath != neighborPath {
-					e = renameTaskFile(neighborPath, newPath)
-				}
-				if e == nil {
-					e = writeRenamedTask(neighborPath, newPath, updated)
-				}
-				release()
-			}
-			if e != nil {
-				fmt.Fprintf(errout, "tk: raise %s: %v\n", ref, e)
-				code = exitUsage
-				continue
-			}
-			fmt.Fprintf(out, "поднят %s %s → %s: блокирует %s\n", ref, normalizePrio(neighbor.prio), normalizePrio(source.prio), source.slug)
-			queue = append(queue, newPath)
 		}
 	}
 	return code
 }
 
-func removeBlocks(t task, o options, out, errout io.Writer, refs []string) int {
+func propagateLink(sourcePath string, source task, ref string, o options, out, errout io.Writer) (string, error) {
+	dir, id, err := referenceLocation(taskProject(sourcePath), ref)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: warning: blocking link %s from %s: %v\n", ref, source.slug, err)
+		return "", err
+	}
+	release, err := lockTasks(dir)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: warning: blocking link %s from %s: %v\n", ref, source.slug, err)
+		return "", err
+	}
+	neighbor, err := findWithArchive(dir, id)
+	if err != nil {
+		rows, ledgerErr := readTransferLedger(dir)
+		release()
+		if ledgerErr != nil {
+			fmt.Fprintf(errout, "tk: warning: blocking link %s from %s: transfer ledger: %v\n", ref, source.slug, ledgerErr)
+			return "", ledgerErr
+		}
+		if row, ok := transferredRecord(rows, id); ok {
+			note := fmt.Sprintf("блокирующий %s вне tk: подними в трекере", row.Key)
+			if e := appendTaskNote(sourcePath, o, note); e != nil {
+				fmt.Fprintf(errout, "tk: warning: blocking link %s from %s: %v\n", ref, source.slug, e)
+				return "", e
+			}
+			fmt.Fprintln(out, note)
+			return "", nil
+		}
+		fmt.Fprintf(errout, "tk: warning: missing blocking link %s from %s\n", ref, source.slug)
+		return "", os.ErrNotExist
+	}
+	if isArchivedTask(neighbor.path) || neighbor.status == "готово" || neighbor.status == "отклонён" {
+		release()
+		return "", nil
+	}
+	if blockPrioRank(neighbor.prio) <= blockPrioRank(source.prio) {
+		release()
+		return neighbor.path, nil
+	}
+	newPath, err := raiseNeighborLocked(neighbor, source, sourcePath, o, ref, errout)
+	release()
+	if err != nil {
+		return "", err
+	}
+	neighborProject, sourceProject := taskProject(neighbor.path), taskProject(sourcePath)
+	neighborRef, refErr := ticketRef(sourceProject, neighborProject, neighbor.slug)
+	blockedRef, blockedErr := ticketRef(neighborProject, sourceProject, source.slug)
+	if refErr != nil {
+		fmt.Fprintf(errout, "tk: warning: blocking link %s from %s: %v\n", ref, source.slug, refErr)
+		return newPath, refErr
+	}
+	if blockedErr != nil {
+		fmt.Fprintf(errout, "tk: warning: blocking link %s from %s: %v\n", ref, source.slug, blockedErr)
+		return newPath, blockedErr
+	}
+	fmt.Fprintf(out, "поднят %s %s → %s: блокирует %s\n", neighborRef, normalizePrio(neighbor.prio), normalizePrio(source.prio), blockedRef)
+	return newPath, nil
+}
+
+func raiseNeighborLocked(neighbor, source task, sourcePath string, o options, ref string, errout io.Writer) (string, error) {
+	name, err := retaggedName(filepath.Base(neighbor.path), options{prio: normalizePrio(source.prio)})
+	if err != nil {
+		fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, err)
+		return "", err
+	}
+	newPath := filepath.Join(filepath.Dir(neighbor.path), name)
+	blockedRef, err := ticketRef(taskProject(neighbor.path), taskProject(sourcePath), source.slug)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, err)
+		return "", err
+	}
+	updated := neighbor.body
+	if blockPrioRank(source.prio) <= 1 && lineValue(updated, "Причина: ") == "" {
+		updated, err = setHeaderValue(updated, "Причина: ", "блокирует "+blockedRef)
+		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, err)
+			return "", err
+		}
+	}
+	updated = journal(updated, fmt.Sprintf("- %s note — %s: приоритет %s → %s: блокирует %s", timeStamp(), o.by, normalizePrio(neighbor.prio), normalizePrio(source.prio), blockedRef))
+	if newPath != neighbor.path {
+		updated = journal(updated, renameJournal(o.by, neighbor.path, newPath))
+		if _, statErr := os.Stat(newPath); statErr == nil {
+			err = fmt.Errorf("target name already exists: %s", filepath.Base(newPath))
+			fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, err)
+			return "", err
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, statErr)
+			return "", statErr
+		}
+		if err = renameTaskFile(neighbor.path, newPath); err != nil {
+			fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, err)
+			return "", err
+		}
+	}
+	if err = writeRenamedTask(neighbor.path, newPath, updated); err != nil {
+		fmt.Fprintf(errout, "tk: warning: raise %s: %v\n", ref, err)
+		return "", err
+	}
+	return newPath, nil
+}
+
+func transferredRecord(rows []transferRecord, id string) (transferRecord, bool) {
+	for _, row := range rows {
+		if row.Slug == id || row.Stem == id {
+			return row, true
+		}
+	}
+	return transferRecord{}, false
+}
+
+func appendTaskNote(path string, o options, note string) error {
+	return updateTicket(path, func(s string) string { return journal(s, "- "+timeStamp()+" note — "+o.by+": "+note) })
+}
+
+func removeBlocks(t task, o options, errout io.Writer, refs []string) int {
 	for _, raw := range refs {
 		target, err := resolveBlockTarget(o, raw)
 		if err != nil {
 			return fail(errout, err)
 		}
-		forward := target.ref
-		if !slices.Contains(headerLinks(t.body, blocksPrefix), forward) {
-			continue
-		}
-		if err = updateTicket(t.path, func(s string) string { return removeHeaderLink(s, blocksPrefix, forward) }); err != nil {
+		back, err := ticketRef(target.root, currentProject(o), t.slug)
+		if err != nil {
 			return fail(errout, err)
 		}
-		back := projectRef(target.root, currentProject(o))
-		if back != "" {
-			back += "/"
+		hadLink := false
+		_, err = mutateTask(filepath.Dir(t.path), t.slug, func(current task) (string, error) {
+			if !slices.Contains(headerLinks(current.body, blocksPrefix), target.ref) {
+				return current.body, nil
+			}
+			hadLink = true
+			body := removeHeaderLink(current.body, blocksPrefix, target.ref)
+			return journal(body, fmt.Sprintf("- %s note — %s: связь с %s снята", timeStamp(), o.by, target.ref)), nil
+		})
+		if err != nil {
+			return fail(errout, err)
 		}
-		back += t.slug
-		if err = updateTicket(func() string { tt, _ := find(target.dir, target.id); return tt.path }(), func(s string) string { return removeHeaderLink(s, blockedPrefix, back) }); err != nil {
+		if !hadLink {
+			continue
+		}
+		_, err = mutateTask(target.dir, target.id, func(current task) (string, error) {
+			if !slices.Contains(headerLinks(current.body, blockedPrefix), back) {
+				return current.body, nil
+			}
+			body := removeHeaderLink(current.body, blockedPrefix, back)
+			return journal(body, fmt.Sprintf("- %s note — %s: связь с %s снята", timeStamp(), o.by, back)), nil
+		})
+		if err != nil {
 			return fail(errout, err)
 		}
 	}
 	return 0
 }
 
-func blockMark(t task) string {
-	project := filepath.Dir(filepath.Dir(filepath.Dir(t.path)))
+func blockMark(t task, errout io.Writer) string {
+	project := taskProject(t.path)
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
 		dir, path, err := linkedPath(project, ref)
 		if err == nil {
+			if isArchivedTask(path) {
+				continue
+			}
 			if b, e := os.ReadFile(path); e == nil {
-				tt, _ := parseTask(path, string(b))
-				if tt.status != "готово" && tt.status != "отклонён" {
+				st, statusErr := status(string(b))
+				if statusErr != nil {
+					fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, statusErr)
+					continue
+				}
+				if st != "готово" && st != "отклонён" {
 					return " заблокирован: " + ref
 				}
+			} else if !errors.Is(e, os.ErrNotExist) {
+				fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, e)
 			}
 			continue
 		}
-		rows, _ := readTransferLedger(dir)
+		rows, ledgerErr := readTransferLedger(dir)
+		if ledgerErr != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot read transfer ledger for %s: %v\n", ref, ledgerErr)
+			continue
+		}
 		stem := filepath.Base(ref)
 		for _, row := range rows {
 			if row.Slug == stem || row.Stem == stem {
@@ -446,21 +635,14 @@ func blockMark(t task) string {
 }
 
 func closeBlockRelations(t task, o options, out, errout io.Writer, code int) int {
-	project := filepath.Dir(filepath.Dir(filepath.Dir(t.path)))
 	for _, ref := range headerLinks(t.body, blocksPrefix) {
-		dir, path, err := linkedPath(project, ref)
+		dir, id, back, err := reverseTaskRef(t, ref)
 		if err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot unblock %s: %v\n", ref, err)
 			continue
 		}
-		name, _ := parseTaskName(filepath.Base(t.path))
-		back := projectRef(dirProject(dir), project)
-		if back != "" {
-			back += "/"
-		}
-		back += name.slug
-		if err = updateTicket(path, func(s string) string {
-			return journal(removeHeaderLink(s, blockedPrefix, back), "- "+timeStamp()+" note — "+o.by+": блокирующий "+back+" закрыт")
+		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			return journal(removeHeaderLink(current.body, blockedPrefix, back), "- "+timeStamp()+" note — "+o.by+": блокирующий "+back+" закрыт"), nil
 		}); err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot update %s: %v\n", ref, err)
 			continue
@@ -468,18 +650,13 @@ func closeBlockRelations(t task, o options, out, errout io.Writer, code int) int
 		fmt.Fprintln(out, "разблокирован "+ref)
 	}
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
-		dir, path, err := linkedPath(project, ref)
+		dir, id, back, err := reverseTaskRef(t, ref)
 		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot update %s: %v\n", ref, err)
 			continue
 		}
-		name, _ := parseTaskName(filepath.Base(t.path))
-		back := projectRef(dirProject(dir), project)
-		if back != "" {
-			back += "/"
-		}
-		back += name.slug
-		if err = updateTicket(path, func(s string) string {
-			return journal(removeHeaderLink(s, blocksPrefix, back), "- "+timeStamp()+" note — "+o.by+": заблокированный "+back+" закрыт, приоритет не менялся: понизь, если не нужен")
+		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			return journal(removeHeaderLink(current.body, blocksPrefix, back), "- "+timeStamp()+" note — "+o.by+": заблокированный "+back+" закрыт, приоритет не менялся: понизь, если не нужен"), nil
 		}); err != nil {
 			fmt.Fprintf(errout, "tk: warning: cannot update %s: %v\n", ref, err)
 		}
@@ -487,11 +664,24 @@ func closeBlockRelations(t task, o options, out, errout io.Writer, code int) int
 	return code
 }
 
-func dirProject(dir string) string { return filepath.Dir(filepath.Dir(dir)) }
+func dirProject(dir string) string {
+	if filepath.Base(dir) == "archive" {
+		dir = filepath.Dir(dir)
+	}
+	return filepath.Dir(filepath.Dir(dir))
+}
+
+func taskProject(path string) string {
+	dir := filepath.Dir(path)
+	if filepath.Base(dir) == "archive" {
+		dir = filepath.Dir(dir)
+	}
+	return filepath.Dir(filepath.Dir(dir))
+}
 
 func reverseTaskRef(t task, ref string) (string, string, string, error) {
-	project := filepath.Dir(filepath.Dir(filepath.Dir(t.path)))
-	dir, path, err := linkedPath(project, ref)
+	project := taskProject(t.path)
+	dir, id, err := referenceLocation(project, ref)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -499,24 +689,27 @@ func reverseTaskRef(t task, ref string) (string, string, string, error) {
 	if !ok {
 		return "", "", "", fmt.Errorf("invalid task path %s", t.path)
 	}
-	back := projectRef(dirProject(dir), project)
-	if back != "" {
-		back += "/"
+	back, err := ticketRef(dirProject(dir), project, name.slug)
+	if err != nil {
+		return "", "", "", err
 	}
-	return dir, path, back + name.slug, nil
+	return dir, id, back, nil
 }
 
-func notePriorityLowered(t task, o options) {
+func notePriorityLowered(t task, o options, errout io.Writer) {
 	if o.prio == "" || blockPrioRank(o.prio) <= blockPrioRank(t.prio) {
 		return
 	}
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
-		_, path, back, err := reverseTaskRef(t, ref)
+		dir, id, back, err := reverseTaskRef(t, ref)
 		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot notify %s: %v\n", ref, err)
 			continue
 		}
-		_ = updateTicket(path, func(s string) string {
-			return journal(s, "- "+timeStamp()+" note — "+o.by+": заблокированный "+back+" закрыт, приоритет не менялся: понизь, если не нужен")
-		})
+		if _, err = mutateTask(dir, id, func(current task) (string, error) {
+			return journal(current.body, "- "+timeStamp()+" note — "+o.by+": заблокированный "+back+" понижен, приоритет не менялся: понизь, если не нужен"), nil
+		}); err != nil {
+			fmt.Fprintf(errout, "tk: warning: cannot notify %s: %v\n", ref, err)
+		}
 	}
 }
