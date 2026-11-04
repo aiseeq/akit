@@ -192,7 +192,7 @@ func TestMaskDistinctivePrefixesRespectWordBoundary(t *testing.T) {
 
 func TestMaskSkDoesNotMatchInsideWords(t *testing.T) {
 	texts := []string{
-		"task-20261103-1604-HIGH-secret-mask-judge",
+		"task-example-secret-mask-judge",
 		"disk_usage_report_2026_11_03_final",
 		"risk-assessment-2026-q4-final-report",
 		"sk-learn==1.5.2",

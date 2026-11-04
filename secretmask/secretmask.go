@@ -47,9 +47,9 @@ var (
 	awsRE          = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE       = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
 	contextNameRE  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
-	headerRE       = regexp.MustCompile(`(?im)(?:proxy-)?authorization[ \t]*[:=][ \t]*(?:(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
+	headerRE       = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	urlRE          = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]*:([^\s/@]+)@`)
-	flagRE         = regexp.MustCompile("(?i)(?:^|[ \\t'\"`])--?([a-z0-9_.-]+)(?:=|(?:[ \\t]|\\\\\\n)+)")
+	flagRE         = regexp.MustCompile("(?i)(?:^|[ \\t'\"`])--?([a-z0-9_.-]+)")
 	contextAnchors = map[byte][]string{
 		'a': {"authorization", "api_key", "api-key", "apikey", "access_key"},
 		'c': {"curl"}, 'm': {"mysql", "mariadb"},
@@ -316,16 +316,21 @@ func flagMatches(text string) []contextMatch {
 			continue
 		}
 		at := ix[1]
+		assigned := at < len(text) && text[at] == '='
+		if assigned {
+			at++
+		} else if at == len(text) || !hasFlagSpaceAt(text, at) {
+			continue
+		}
+		if assigned && hasHorizontalSpaceAt(text, at) {
+			continue
+		}
 		value, ok := scanValue(text, at, false)
 		if !ok {
 			continue
 		}
 		coveredUntil = value.end
-		separator := text[ix[1]-1]
-		if separator == '=' && ix[1] < len(text) && hasHorizontalSpaceAt(text, ix[1]) {
-			continue
-		}
-		if separator != '=' && !flagValueAllowed(text[value.start:value.end]) {
+		if !assigned && !flagValueAllowed(text[value.start:value.end]) {
 			continue
 		}
 		if valueIsValue(text, value, name, kind, false) {
@@ -431,7 +436,7 @@ func commandSegments(text string) [][2]int {
 	return append(segments, [2]int{start, len(text)})
 }
 
-func scanValue(text string, at int, colon bool) (contextValue, bool) {
+func skipValueSpace(text string, at int) int {
 	for at < len(text) {
 		if text[at] == ' ' || text[at] == '\t' {
 			at++
@@ -443,6 +448,11 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		}
 		break
 	}
+	return at
+}
+
+func scanValue(text string, at int, colon bool) (contextValue, bool) {
+	at = skipValueSpace(text, at)
 	if at >= len(text) || strings.HasPrefix(text[at:], maskMarker) || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' || text[at] == '`' {
 		return contextValue{}, false
 	}
@@ -459,6 +469,10 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		end -= slashes
 		return contextValue{quoteAt + 1, end, true}, end > quoteAt+1
 	}
+	return scanBareValue(text, at, colon)
+}
+
+func scanBareValue(text string, at int, colon bool) (contextValue, bool) {
 	start := at
 	for at < len(text) {
 		c := text[at]
@@ -510,6 +524,8 @@ func bareIsValue(value, name, kind string, colon bool) bool {
 const (
 	maskMarker     = "[скрыто:"
 	maskMarkerSpan = 64 // the longest marker fits: a kind is a short word
+
+	maxQuoteSlashes = 31
 )
 
 func withinMaskMarker(text string, at int) bool {
@@ -819,15 +835,41 @@ func escapeBefore(text string, index int) bool {
 }
 
 // notSecretHere keeps forms of ordinary output that look like a name and a value:
-// test results (PASS: x, pass=0), messages of the passwd tool, a path before a colon.
+// test results (PASS: go, pass=0), a message of the passwd tool, a file path before
+// a colon. A value mixing letters and digits after PASS: stays hidden: test words
+// and status codes do not look like that.
 func notSecretHere(text string, at int, name, delimiter, value string) bool {
-	if delimiter == ":" && at > 0 && text[at-1] == '/' {
+	if delimiter == ":" && startsFilePath(text, at) {
 		return true
 	}
-	if lower := strings.ToLower(name); lower != "pass" && lower != "passwd" {
+	switch {
+	case name == "PASS" && delimiter == ":":
+		return !strings.ContainsAny(value, "0123456789") || onlyDigits(value) && len(value) < 8
+	case strings.EqualFold(name, "pass"):
+		return delimiter == "=" && onlyDigits(value) && len(value) < 8
+	case strings.EqualFold(name, "passwd"):
+		return delimiter == ":" && value == "password"
+	}
+	return false
+}
+
+// startsFilePath: the word ending at `at` is an absolute or relative path. The look
+// back is bounded, a path is short and many names must stay linear.
+func startsFilePath(text string, at int) bool {
+	if at == 0 || text[at-1] != '/' {
 		return false
 	}
-	return delimiter == ":" || onlyDigits(value)
+	start := at - 1
+	for start > 0 && at-start < 256 && !strings.ContainsRune(" \t\r\n'\"", rune(text[start-1])) {
+		start--
+	}
+	word := text[start:at]
+	return word[0] == '/' || strings.HasPrefix(word, "./") || strings.HasPrefix(word, "../") || strings.HasPrefix(word, "~/")
+}
+
+// hasFlagSpaceAt: a flag is followed by a space or a line continuation.
+func hasFlagSpaceAt(text string, at int) bool {
+	return hasHorizontalSpaceAt(text, at) || strings.HasPrefix(text[at:], "\\\n")
 }
 
 func curlMatches(text string) []contextMatch {
@@ -918,22 +960,27 @@ func toolPasswordMatches(text string) []contextMatch {
 	for _, segment := range commandSegments(text) {
 		part := text[segment[0]:segment[1]]
 		sshpassMatches(part, segment[0], &matches)
-		for _, tool := range [...]string{"mysql", "mariadb"} {
-			if command, ok := findCommandWord(part, tool, true); ok {
-				words := wordsAfter(part, command.end)
-				for {
-					start, end, ok := words.next()
-					if !ok {
-						break
-					}
-					if strings.HasPrefix(part[start:end], "-p") && end-start > 2 {
-						addToolPassword(part, segment[0], start+2, &matches)
-					}
-				}
-			}
-		}
+		mysqlMatches(part, "mysql", segment[0], &matches)
+		mysqlMatches(part, "mariadb", segment[0], &matches)
 	}
 	return matches
+}
+
+func mysqlMatches(part, tool string, offset int, matches *[]contextMatch) {
+	command, ok := findCommandWord(part, tool, true)
+	if !ok {
+		return
+	}
+	words := wordsAfter(part, command.end)
+	for {
+		start, end, ok := words.next()
+		if !ok {
+			return
+		}
+		if strings.HasPrefix(part[start:end], "-p") && end-start > 2 {
+			addToolPassword(part, offset, start+2, matches)
+		}
+	}
 }
 
 func sshpassMatches(part string, offset int, matches *[]contextMatch) {
@@ -957,7 +1004,7 @@ func sshpassMatches(part string, offset int, matches *[]contextMatch) {
 		case strings.HasPrefix(token, "-p"):
 			addToolPassword(part, offset, start+2, matches)
 			return
-		case token == "-f" || token == "-d":
+		case token == "-f" || token == "-d" || token == "-P":
 			words.next()
 		}
 	}
@@ -997,12 +1044,13 @@ func quoteSpans(text string) [][2]int {
 }
 
 // opensQuote: a backslash before an apostrophe only escapes it; before a double
-// quote 1, 3, 7... backslashes are the quote of a string nested in a string.
+// quote backslashes are the quote of a string nested in a string. The limit keeps
+// the number of quote forms, each searched once, small.
 func opensQuote(quote byte, slashes int) bool {
 	if quote != '"' {
 		return slashes == 0
 	}
-	return slashes&(slashes+1) == 0
+	return slashes <= maxQuoteSlashes
 }
 
 // closingQuote returns the index of the quote closing the one at quoteAt, or -1.
