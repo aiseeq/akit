@@ -346,6 +346,34 @@ func TestExternalList(t *testing.T) {
 	}
 }
 
+func TestExternalListIgnoresClosedGate(t *testing.T) {
+	project, _ := linkedProject(t)
+	home := filepath.Dir(filepath.Dir(project))
+	state := filepath.Join(home, ".local", "state", "queue")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gate := `{"at":"` + time.Now().Format(time.RFC3339) + `","live":["sample"],"open":[]}`
+	if err := os.WriteFile(filepath.Join(state, "gate.json"), []byte(gate), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSource(t, filepath.Dir(project), `echo '[{"key":"K1","title":"one","status":"open","prio":"LOW","url":"u"}]'`)
+	code, stdout, stderr := runExternalIn(t, project)
+	if code != 0 || !strings.Contains(stdout, `"K1"`) {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	o, err := parseArgs([]string{"next", "--by", "me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	run(o, &out, &errOut)
+	if strings.Contains(out.String(), "K1") {
+		t.Fatalf("gate is not closed in this test: tk next shows %q", out.String())
+	}
+}
+
 func TestExternalListUntrustedSourceFails(t *testing.T) {
 	project, _ := linkedProject(t)
 	root := filepath.Dir(project)
