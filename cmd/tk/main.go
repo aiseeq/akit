@@ -2939,9 +2939,14 @@ func nextCandidates(tasks []task, actor string, gate gateState, live bool) []tas
 	return candidates
 }
 
-// gateVisible: without readable gates nothing tells which pairs are open or
-// which projects are live, so only what is always open stays visible.
+// gateVisible: gates close the start of new work only, so what an agent already
+// began and a wait that came due stay visible. Without readable gates nothing
+// tells which pairs are open or which projects are live, so of new work only what
+// is always open stays visible.
 func gateVisible(t task, gate gateState, live bool) bool {
+	if t.status != "открыт" {
+		return true
+	}
 	if !gate.valid {
 		return gateOpen(t, nil)
 	}

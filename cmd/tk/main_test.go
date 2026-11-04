@@ -2621,3 +2621,62 @@ func TestDoneHintsNextTicket(t *testing.T) {
 		}
 	})
 }
+
+// Gates close the start of new work only: what an agent already began and a wait
+// that came due stay visible under a closed pair and under unreadable gates.
+func TestNextGateKeepsStartedWork(t *testing.T) {
+	const closed = `{"at":"NOW","live":["project"],"open":[]}`
+	for name, gate := range map[string]string{"closed pair": closed, "missing": "", "malformed": "{"} {
+		t.Run(name, func(t *testing.T) {
+			next := func(t *testing.T, status string) (string, int) {
+				t.Helper()
+				root, dir := queueProject(t, gate, map[string]string{"20261101-1000-MED-DO-subject": status})
+				if status == "ждёт" {
+					path := filepath.Join(dir, "20261101-1000-MED-DO-subject.md")
+					content, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body := strings.Replace(string(content), "\n\n## Приёмка", "\nЖдёт: 2020-01-01 10:00\n\n## Приёмка", 1)
+					if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var out, errout bytes.Buffer
+				code := nextTask(root, "", dir, options{by: "master"}, &out, &errout)
+				return out.String(), code
+			}
+			for _, status := range []string{"в работе", "ждёт"} {
+				if out, code := next(t, status); code != 0 || !strings.Contains(out, "subject") {
+					t.Errorf("%s: code %d, out %q", status, code, out)
+				}
+			}
+			if out, code := next(t, "открыт"); code != exitNone || strings.Contains(out, "subject") {
+				t.Errorf("открыт: code %d, out %q", code, out)
+			}
+		})
+	}
+}
+
+// The hint of tk done follows the same rule.
+func TestDoneHintKeepsStartedWorkUnderClosedGate(t *testing.T) {
+	root, dir := queueProject(t, `{"at":"NOW","live":["project"],"open":[]}`, map[string]string{
+		"20261101-1000-HIGH-closing":  "в работе",
+		"20261101-1001-MED-DO-begun":  "в работе",
+		"20261101-1002-MED-DO-unseen": "открыт",
+	})
+	path := filepath.Join(dir, "20261101-1000-HIGH-closing.md")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := task{path: path, slug: "closing", prio: "HIGH", status: "в работе", body: string(content)}
+	var out, errout bytes.Buffer
+	o := options{cmd: "done", by: "checker", check: "checked by test", baseRoot: root}
+	if code := transition(ticket, o, &out, &errout); code != 0 {
+		t.Fatalf("done: code %d, stderr %q", code, errout.String())
+	}
+	if !strings.Contains(out.String(), "следующий: begun") {
+		t.Errorf("hint %q", out.String())
+	}
+}
