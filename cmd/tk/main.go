@@ -41,6 +41,7 @@ Usage:
   tk lint [--root DIR]
   tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take]
   tk next [--by NAME] [--json]
+  tk external --json   the project's whole task source, no gates and no local tickets
   tk transfer ID [--parent KEY] [--by NAME]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
@@ -398,8 +399,8 @@ func validateWhyFlag(o *options) error {
 }
 
 func validateJSONFlag(o *options) error {
-	if o.json && o.cmd != "ls" && o.cmd != "show" && o.cmd != "next" {
-		return errors.New("--json: flag only for ls, show, or next")
+	if o.json && o.cmd != "ls" && o.cmd != "show" && o.cmd != "next" && o.cmd != "external" {
+		return errors.New("--json: flag only for ls, show, next, or external")
 	}
 	return nil
 }
@@ -445,6 +446,14 @@ func validateSimpleCommand(o *options, pos []string) error {
 			return errors.New("next takes no id")
 		}
 		return validateActorFlag(o)
+	case "external":
+		if len(pos) != 0 {
+			return errors.New("external takes no id")
+		}
+		if !o.json {
+			return errors.New("external: --json is required")
+		}
+		return nil
 	case "lint":
 		if len(pos) > 0 {
 			return errors.New("lint takes no id")
@@ -678,6 +687,9 @@ func run(o options, out, errout io.Writer) int {
 	if err != nil {
 		return fail(errout, err)
 	}
+	if o.cmd == "external" {
+		return externalAtBase(root, main, found, out, errout)
+	}
 	if !found && o.cmd != "new" {
 		fmt.Fprintln(errout, "tk: no docs/tasks here or above up to $HOME")
 		return exitNone
@@ -699,6 +711,23 @@ func run(o options, out, errout io.Writer) int {
 		root, dir = shared, filepath.Join(shared, "docs/tasks")
 	}
 	return runAtBase(root, dir, o, out, errout)
+}
+
+// externalAtBase needs no ticket folder: a project without docs/tasks can have
+// a source. Worktrees read it for the main tree, as tk next does.
+func externalAtBase(root, main string, found bool, out, errout io.Writer) int {
+	project := root
+	if main != "" {
+		project = main
+	}
+	if !found {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fail(errout, fmt.Errorf("get current directory: %w", err))
+		}
+		project = cwd
+	}
+	return listExternal(project, out, errout)
 }
 
 func runRootScan(o options, out, errout io.Writer) int {
@@ -985,7 +1014,7 @@ func resolveTaskBase() (string, string, string, bool, error) {
 	return cwd, filepath.Join(cwd, "docs/tasks"), "", false, nil
 }
 func prepareActor(o *options, errout io.Writer) int {
-	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" || o.cmd == "lint" || o.cmd == "check" {
+	if o.cmd == "ls" || o.cmd == "archive" || o.cmd == "show" || o.cmd == "lint" || o.cmd == "check" || o.cmd == "external" {
 		return 0
 	}
 	if o.by == "" {
@@ -3341,27 +3370,56 @@ func sortExternal(items []externalTask) {
 	})
 }
 
-func visibleExternal(project string, choice nextChoice, errout io.Writer) (items []externalTask, failed bool, err error) {
+// readExternal returns the project's whole source list, sorted. A project
+// without a source has an empty list; failure names why the source was not read.
+func readExternal(project string, errout io.Writer) (items []externalTask, path, failure string, err error) {
 	path, ok, err := taskSourcePath(project)
 	if err != nil || !ok {
-		return nil, false, err
+		return nil, "", "", err
 	}
 	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
+		return nil, path, "", nil
 	} else if err != nil {
-		failed = true
-		sourceWarning(errout, path, "cannot inspect source: "+err.Error())
-		return nil, true, nil
+		return nil, path, "cannot inspect source: " + err.Error(), nil
 	}
-	var bad int
-	var reason string
-	items, bad, reason, failed = runTaskSource(path, filepath.Base(project))
+	items, bad, reason, failed := runTaskSource(path, filepath.Base(project))
 	if failed {
-		sourceWarning(errout, path, reason)
-		return nil, true, nil
+		return nil, path, reason, nil
 	}
 	if bad > 0 {
 		fmt.Fprintf(errout, "tk: source %s: skipped %d bad records (first: %s)\n", path, bad, firstStderrLine(reason))
+	}
+	sortExternal(items)
+	return items, path, "", nil
+}
+
+// listExternal is the source list for an outside reader. A failed source prints
+// nothing on stdout: an empty array would mean the project has no such tasks.
+func listExternal(project string, out, errout io.Writer) int {
+	items, path, failure, err := readExternal(project, errout)
+	if err != nil {
+		return fail(errout, err)
+	}
+	if failure != "" {
+		return fail(errout, fmt.Errorf("source %s: %s", path, firstStderrLine(failure)))
+	}
+	if items == nil {
+		items = []externalTask{}
+	}
+	if err := json.NewEncoder(out).Encode(items); err != nil {
+		return fail(errout, err)
+	}
+	return 0
+}
+
+func visibleExternal(project string, choice nextChoice, errout io.Writer) (items []externalTask, failed bool, err error) {
+	items, path, failure, err := readExternal(project, errout)
+	if err != nil {
+		return nil, false, err
+	}
+	if failure != "" {
+		sourceWarning(errout, path, failure)
+		return nil, true, nil
 	}
 	visible := items[:0]
 	for _, item := range items {
@@ -3369,7 +3427,6 @@ func visibleExternal(project string, choice nextChoice, errout io.Writer) (items
 			visible = append(visible, item)
 		}
 	}
-	sortExternal(visible)
 	return visible, false, nil
 }
 func externalLine(t externalTask, closed bool) string {

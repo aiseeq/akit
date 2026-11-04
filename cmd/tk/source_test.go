@@ -294,3 +294,99 @@ func TestMissingStoreKeepsEmptyTaskDirectory(t *testing.T) {
 		t.Fatalf("empty directory is gone: %v", statErr)
 	}
 }
+
+func runExternalIn(t *testing.T, dir string) (code int, stdout, stderr string) {
+	t.Helper()
+	t.Chdir(dir)
+	o, err := parseArgs([]string{"external", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code = run(o, &out, &errOut)
+	return code, out.String(), errOut.String()
+}
+
+func writeSource(t *testing.T, root, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, ".tk-next-source"), []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExternalList(t *testing.T) {
+	const good = `{"key":"K1","title":"one","status":"open","prio":"LOW","url":"u1"},{"key":"K2","title":"two","status":"open","prio":"CRIT","url":"u2"}`
+	want := `[{"key":"K2","title":"two","status":"open","prio":"CRIT","url":"u2"},{"key":"K1","title":"one","status":"open","prio":"LOW","url":"u1"}]` + "\n"
+	cases := []struct {
+		name, source, stdout, stderr string
+		failed                       bool
+	}{
+		{name: "all records, gates and local tickets aside", source: "[ \"$1\" = sample ] || exit 3\necho '[" + good + "]'", stdout: want},
+		{name: "no file", stdout: "[]\n"},
+		{name: "empty source", source: "echo '[]'", stdout: "[]\n"},
+		{name: "bad record next to good", source: "echo '[" + good + `,{"key":"K3"}]'`, stdout: want, stderr: "skipped 1 bad records"},
+		{name: "nonzero exit", source: "echo boom >&2; exit 3", failed: true, stderr: "boom"},
+		{name: "not JSON", source: "echo nope", failed: true, stderr: "invalid JSON array"},
+		{name: "only bad records", source: `echo '[{"key":"K3"}]'`, failed: true, stderr: "no valid records"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			project, _ := linkedProject(t)
+			if err := os.WriteFile(filepath.Join(project, "docs", "tasks", "20261001-1000-HIGH-local.md"), []byte("# Local\n\nСтатус: открыт\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if c.source != "" {
+				writeSource(t, filepath.Dir(project), c.source)
+			}
+			code, stdout, stderr := runExternalIn(t, project)
+			if (code != 0) != c.failed || stdout != c.stdout || !strings.Contains(stderr, c.stderr) {
+				t.Fatalf("code %d, stdout %q, stderr %q", code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestExternalListUntrustedSourceFails(t *testing.T) {
+	project, _ := linkedProject(t)
+	root := filepath.Dir(project)
+	writeSource(t, root, "echo '[]'")
+	if err := os.Chmod(filepath.Join(root, ".tk-next-source"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runExternalIn(t, project)
+	if code == 0 || stdout != "" || !strings.Contains(stderr, "writable by group or others") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+}
+
+func TestExternalListFollowsMainTreeFromWorktree(t *testing.T) {
+	project, worktree := linkedProject(t)
+	writeSource(t, filepath.Dir(project), `[ "$1" = sample ] && echo '[{"key":"K1","title":"one","status":"open","prio":"HIGH","url":"u"}]'`)
+	code, stdout, stderr := runExternalIn(t, worktree)
+	if code != 0 || !strings.Contains(stdout, `"K1"`) {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+}
+
+func TestExternalListOutsideProjectRoots(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, dir := range []string{filepath.Join(home, "other", "repo"), filepath.Join(home, "other", "plain")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitInTest(t, filepath.Join(home, "other", "repo"), "init", "-q")
+	for _, name := range []string{"repo", "plain"} {
+		code, stdout, stderr := runExternalIn(t, filepath.Join(home, "other", name))
+		if code != 0 || stdout != "[]\n" {
+			t.Fatalf("%s: code %d, stdout %q, stderr %q", name, code, stdout, stderr)
+		}
+	}
+}
+
+func TestExternalNeedsJSONFlag(t *testing.T) {
+	if _, err := parseArgs([]string{"external"}); err == nil {
+		t.Fatal("external without --json accepted")
+	}
+}
