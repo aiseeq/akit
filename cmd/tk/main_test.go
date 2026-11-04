@@ -2415,3 +2415,70 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 		})
 	}
 }
+
+// An old MEDIUM ticket gets the current MED spelling whenever tk writes its name.
+func TestRenameWritesCurrentPrioSpelling(t *testing.T) {
+	body := "# Old\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — author\n"
+	write := func(t *testing.T) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "20200101-1000-MEDIUM-old.md")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir, path
+	}
+	const want = "20200101-1000-MED-DO-old.md"
+	t.Run("set", func(t *testing.T) {
+		dir, path := write(t)
+		var out, errout bytes.Buffer
+		if code := setTask(task{path: path, slug: "old", prio: "MEDIUM", body: body}, options{diff: "DO", by: "actor"}, &out, &errout); code != 0 {
+			t.Fatalf("setTask = %d, stderr %q", code, errout.String())
+		}
+		if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
+			t.Errorf("set wrote %q, want %s", out.String(), want)
+		}
+	})
+	t.Run("start", func(t *testing.T) {
+		dir, path := write(t)
+		got, err := transitionPath(&task{path: path, slug: "old", prio: "MEDIUM", body: body}, options{cmd: "start", diff: "DO", by: "actor"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != filepath.Join(dir, want) {
+			t.Errorf("start path %s, want %s", filepath.Base(got), want)
+		}
+	})
+}
+
+// Old names change only on an explicit --prio or --diff.
+func TestOldNameStaysWithoutPrioOrDiff(t *testing.T) {
+	body := "# Old\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — author\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20200101-1000-MEDIUM-old.md")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := setTask(task{path: path, slug: "old", prio: "MEDIUM", body: body}, options{why: "cause", by: "actor"}, &out, &errout); code != 0 {
+		t.Fatalf("setTask = %d, stderr %q", code, errout.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), "Причина: cause") || strings.Contains(string(updated), "переименован") {
+		t.Errorf("set --why changed the name or lost the cause: %s", updated)
+	}
+}
+
+// An old word with no current form is not carried into a written name.
+func TestRetagOldWordNeedsPrio(t *testing.T) {
+	if name, err := retaggedName("20200101-1000-INFO-old.md", options{diff: "DO"}); err == nil {
+		t.Errorf("--diff on INFO wrote %s, want an error", name)
+	}
+	name, err := retaggedName("20200101-1000-INFO-old.md", options{prio: "LOW", diff: "DO"})
+	if err != nil || name != "20200101-1000-LOW-DO-old.md" {
+		t.Errorf("--prio LOW --diff DO on INFO = %q, %v", name, err)
+	}
+}

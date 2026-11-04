@@ -2538,26 +2538,13 @@ func transitionJournal(o options, next string, glintFindings int) string {
 }
 
 func transitionPath(t *task, o options) (string, error) {
-	if o.cmd != "start" || o.prio == "" && o.diff == "" {
+	if o.cmd != "start" {
 		return t.path, nil
 	}
-	parsed, ok := parseTaskName(filepath.Base(t.path))
-	if !ok {
-		return "", errors.New("cannot update an unrecognized ticket name")
+	name, err := retaggedName(filepath.Base(t.path), o)
+	if err != nil {
+		return "", err
 	}
-	prio := parsed.prio
-	if o.prio != "" {
-		prio = o.prio
-	}
-	diff := parsed.diff
-	if o.diff != "" {
-		diff = o.diff
-	}
-	name := parsed.date + "-" + parsed.clock + "-" + prio + "-"
-	if diff != "" {
-		name += diff + "-"
-	}
-	name += parsed.slug + ".md"
 	newPath := filepath.Join(filepath.Dir(t.path), name)
 	if newPath == t.path {
 		return newPath, nil
@@ -2571,6 +2558,36 @@ func transitionPath(t *task, o options) (string, error) {
 		return "", err
 	}
 	return newPath, nil
+}
+
+// retaggedName is a ticket file name with the priority and difficulty from
+// options. Without either the name stays as it is, old spellings included: old
+// names are not renamed on their own. A written name uses the current spelling
+// of the priority; an old word without a current form needs --prio.
+func retaggedName(base string, o options) (string, error) {
+	if o.prio == "" && o.diff == "" {
+		return base, nil
+	}
+	parsed, ok := parseTaskName(base)
+	if !ok {
+		return "", errors.New("cannot update an unrecognized ticket name")
+	}
+	prio := normalizePrio(parsed.prio)
+	if o.prio != "" {
+		prio = o.prio
+	}
+	if !validPrio(prio) {
+		return "", fmt.Errorf("old priority %s has no current form: pass --prio", prio)
+	}
+	diff := parsed.diff
+	if o.diff != "" {
+		diff = o.diff
+	}
+	name := parsed.date + "-" + parsed.clock + "-" + prio + "-"
+	if diff != "" {
+		name += diff + "-"
+	}
+	return name + parsed.slug + ".md", nil
 }
 
 func applyMetadata(body string, o options) (string, error) {
@@ -2630,10 +2647,6 @@ func setTask(t task, o options, out, errout io.Writer) int {
 	if o.prio != "" {
 		prio = o.prio
 	}
-	diff := t.diff
-	if o.diff != "" {
-		diff = o.diff
-	}
 	if requiresWhyForPromotion(t.prio, prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == "" {
 		fmt.Fprintln(errout, "tk: --prio CRIT/HIGH requires --why or an existing Причина")
 		return exitUsage
@@ -2642,17 +2655,10 @@ func setTask(t task, o options, out, errout io.Writer) int {
 	if err != nil {
 		return fail(errout, err)
 	}
-	old := filepath.Base(t.path)
-	name, ok := parseTaskName(old)
-	if !ok {
-		return fail(errout, errors.New("cannot update ticket with invalid name"))
+	newName, err := retaggedName(filepath.Base(t.path), o)
+	if err != nil {
+		return fail(errout, err)
 	}
-	stamp := name.date + "-" + name.clock
-	newName := fmt.Sprintf("%s-%s-", stamp, prio)
-	if diff != "" {
-		newName += diff + "-"
-	}
-	newName += t.slug + ".md"
 	newPath := filepath.Join(filepath.Dir(t.path), newName)
 	if newPath != t.path {
 		if _, err := os.Stat(newPath); err == nil {
