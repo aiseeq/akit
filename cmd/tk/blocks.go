@@ -49,7 +49,7 @@ func removeHeaderLink(body, prefix, value string) string {
 	return strings.Join(kept, "\n")
 }
 
-type blockTarget struct{ root, dir, id, ref, status string }
+type blockTarget struct{ root, dir, id, ref, back, status, body string }
 
 func currentProject(o options) string {
 	if o.baseRoot != "" {
@@ -110,7 +110,7 @@ func resolveBlockTarget(o options, raw string) (blockTarget, error) {
 	if err != nil {
 		return blockTarget{}, err
 	}
-	return blockTarget{project, dir, t.slug, ref, t.status}, nil
+	return blockTarget{root: project, dir: dir, id: t.slug, ref: ref, status: t.status, body: t.body}, nil
 }
 
 func resolveBlockLocation(o options, raw string) (string, string, string, string, error) {
@@ -257,21 +257,17 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 		if err != nil {
 			return fail(errout, err)
 		}
-		back, err := ticketRef(target.root, currentProject(o), fresh.slug)
-		if err != nil {
-			return fail(errout, err)
-		}
 		targetTask, err := mutateTask(target.dir, target.id, func(current task) (string, error) {
 			if current.status == "готово" || current.status == "отклонён" {
 				return "", fmt.Errorf("target %s is closed", target.id)
 			}
 			body := current.body
-			if !slices.Contains(headerLinks(body, blockedPrefix), back) {
-				body, err = addHeaderLink(body, blockedPrefix, back)
+			if !slices.Contains(headerLinks(body, blockedPrefix), target.back) {
+				body, err = addHeaderLink(body, blockedPrefix, target.back)
 				if err != nil {
 					return "", err
 				}
-				body = journal(body, fmt.Sprintf("- %s note — %s: блокирует %s", timeStamp(), o.by, back))
+				body = journal(body, fmt.Sprintf("- %s note — %s: блокирует %s", timeStamp(), o.by, target.back))
 			}
 			return body, nil
 		})
@@ -290,6 +286,7 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 			return body, nil
 		})
 		if err != nil {
+			fmt.Fprintf(errout, "tk: warning: target %s was linked, but source %s could not be updated: %v\n", target.ref, t.slug, err)
 			return fail(errout, err)
 		}
 		raiseFrom = append(raiseFrom, targetTask.path)
@@ -305,6 +302,7 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 
 func validateBlockAttachments(t task, o options, targets []string, errout io.Writer) ([]blockTarget, int) {
 	resolved := make([]blockTarget, 0, len(targets))
+	sourceProject := taskProject(t.path)
 	for _, raw := range targets {
 		target, err := resolveBlockTarget(o, raw)
 		if err != nil {
@@ -315,6 +313,20 @@ func validateBlockAttachments(t task, o options, targets []string, errout io.Wri
 		}
 		if sameTicket(taskProject(t.path), t.slug, target.root, target.id) {
 			return nil, fail(errout, errors.New("ticket cannot block itself"))
+		}
+		target.ref, err = ticketRef(sourceProject, target.root, target.id)
+		if err != nil {
+			return nil, fail(errout, err)
+		}
+		target.back, err = ticketRef(target.root, sourceProject, t.slug)
+		if err != nil {
+			return nil, fail(errout, err)
+		}
+		if _, err = addHeaderLink(target.body, blockedPrefix, target.back); err != nil {
+			return nil, fail(errout, fmt.Errorf("target %s: %w", raw, err))
+		}
+		if _, err = addHeaderLink(t.body, blocksPrefix, target.ref); err != nil {
+			return nil, fail(errout, fmt.Errorf("source %s: %w", t.slug, err))
 		}
 		fresh, err := readTaskLocked(filepath.Dir(t.path), t.slug)
 		if err != nil {
@@ -585,7 +597,8 @@ func raiseNeighborLocked(neighbor, source task, sourcePath string, o options, re
 
 func transferredRecord(rows []transferRecord, id string) (transferRecord, bool) {
 	id = strings.TrimSuffix(id, ".md")
-	for _, row := range rows {
+	// The ledger only grows and a slug can come back: the latest record is the live one.
+	for _, row := range slices.Backward(rows) {
 		if row.Slug == id || row.Stem == id {
 			return row, true
 		}

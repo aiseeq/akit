@@ -830,12 +830,19 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 		if err != nil {
 			return fail(errout, err)
 		}
-		if t, err := readTaskLocked(target.dir, target.id); err != nil {
-			return fail(errout, err)
-		} else if t.status == "готово" || t.status == "отклонён" {
+		if target.status == "готово" || target.status == "отклонён" {
 			return fail(errout, fmt.Errorf("target %s is closed", ref))
-		} else if _, err := addHeaderLink(t.body, blockedPrefix, "preflight"); err != nil {
+		}
+		target.ref, err = ticketRef(root, target.root, target.id)
+		if err != nil {
 			return fail(errout, err)
+		}
+		target.back, err = ticketRef(target.root, root, o.id)
+		if err != nil {
+			return fail(errout, err)
+		}
+		if _, err := addHeaderLink(target.body, blockedPrefix, target.back); err != nil {
+			return fail(errout, fmt.Errorf("target %s: %w", ref, err))
 		}
 	}
 	if err := prepareTaskDirectory(root, main); err != nil {
@@ -843,11 +850,14 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 	}
 	blocks := o.blocks
 	o.blocks = nil
-	if code := create(root, dir, o, out, errout); code != 0 {
-		return code
-	}
 	if len(blocks) == 0 {
-		return 0
+		return create(root, dir, o, out, errout)
+	}
+	// The name and the hint wait for the links: a link can raise the new ticket and rename it.
+	var created, createdErr bytes.Buffer
+	if code := create(root, dir, o, &created, &createdErr); code != 0 {
+		_, _ = createdErr.WriteTo(errout)
+		return code
 	}
 	t, err := find(dir, o.id)
 	if err != nil {
@@ -856,7 +866,27 @@ func createAtBase(root, dir string, o options, out, errout io.Writer) int {
 	o.blocks = blocks
 	o.baseRoot = root
 	o.mainRoot = main
-	return attachBlocks(t, o, out, errout, blocks)
+	var relationOutput bytes.Buffer
+	if code := attachBlocks(t, o, &relationOutput, errout, blocks); code != 0 {
+		_, _ = created.WriteTo(out)
+		_, _ = relationOutput.WriteTo(out)
+		return code
+	}
+	fresh, err := readTaskLocked(dir, o.id)
+	if err != nil {
+		return fail(errout, err)
+	}
+	createdPath := relative(root, fresh.path)
+	if o.to != "" {
+		createdPath, err = filepath.Abs(fresh.path)
+		if err != nil {
+			return fail(errout, err)
+		}
+	}
+	fmt.Fprintln(out, createdPath)
+	fmt.Fprintln(errout, hintAfterNew(o, createdPath, fresh.body))
+	_, _ = relationOutput.WriteTo(out)
+	return 0
 }
 
 func gitMainRoot(target string) (string, error) {
@@ -928,40 +958,14 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 			release()
 			code := transferTask(root, dir, o, out, errout)
 			if code == 0 {
-				rows, ledgerErr := readTransferLedger(dir)
-				if ledgerErr != nil {
-					fmt.Fprintf(errout, "tk: warning: cannot update blockers after transfer of %s: %v\n", o.id, ledgerErr)
-				} else {
-					stem := strings.TrimSuffix(filepath.Base(o.id), ".md")
-					if row, ok := transferredRecord(rows, o.id); ok {
-						stem = row.Stem
-						lines := make([]string, 0, len(row.Blocks))
-						for _, ref := range row.Blocks {
-							lines = append(lines, blockedPrefix+ref)
-						}
-						body := strings.Join(lines, "\n")
-						before = task{path: filepath.Join(dir, stem+".md"), slug: row.Slug, body: body}
-						transferBlockRelations(before, o, row.Key, errout)
-					}
-				}
+				finishTransferRelations(dir, o.id, task{}, o, errout)
 			}
 			return code
 		}
 		code := transferTask(root, dir, o, out, errout)
 		release()
 		if code == 0 {
-			rows, ledgerErr := readTransferLedger(dir)
-			if ledgerErr != nil {
-				fmt.Fprintf(errout, "tk: warning: cannot update blockers after transfer of %s: %v\n", before.slug, ledgerErr)
-			} else {
-				stem := strings.TrimSuffix(filepath.Base(before.path), ".md")
-				for _, row := range rows {
-					if row.Stem == stem {
-						transferBlockRelations(before, o, row.Key, errout)
-						break
-					}
-				}
-			}
+			finishTransferRelations(dir, strings.TrimSuffix(filepath.Base(before.path), ".md"), before, o, errout)
 		}
 		return code
 	}
@@ -1000,7 +1004,14 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 			return code
 		}
 	}
-	code := runFoundTask(root, t, o, out, errout)
+	// With new links the name is printed last known: a link can raise and rename the ticket.
+	namesLater := o.cmd == "set" && len(o.blocks) > 0
+	commandOut, relationOut := out, out
+	var deferredName, relations bytes.Buffer
+	if namesLater {
+		commandOut, relationOut = &deferredName, &relations
+	}
+	code := runFoundTask(root, t, o, commandOut, errout)
 	release()
 	if code == 0 && (o.cmd == "set" || o.cmd == "start") {
 		current, err := readTaskLocked(dir, t.slug)
@@ -1010,15 +1021,33 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 		if len(o.blocks) > 0 {
 			blockOptions := o
 			blockOptions.baseRoot = taskProject(current.path)
-			code = attachBlocks(current, blockOptions, out, errout, o.blocks)
+			code = attachBlocks(current, blockOptions, relationOut, errout, o.blocks)
+			if code == 0 {
+				current, err = readTaskLocked(dir, t.slug)
+				if err != nil {
+					return fail(errout, err)
+				}
+			}
 		}
 		if code == 0 && len(o.unblocks) > 0 {
 			blockOptions := o
 			blockOptions.baseRoot = taskProject(current.path)
 			code = removeBlocks(current, blockOptions, errout, o.unblocks)
+			if code == 0 {
+				current, err = readTaskLocked(dir, t.slug)
+				if err != nil {
+					return fail(errout, err)
+				}
+			}
 		}
 		if code == 0 && o.prio != "" {
-			code = propagatePriority(current.path, o, out, errout)
+			code = propagatePriority(current.path, o, relationOut, errout)
+			if code == 0 {
+				current, err = readTaskLocked(dir, t.slug)
+				if err != nil {
+					return fail(errout, err)
+				}
+			}
 		}
 		if code == 0 && o.prio != "" {
 			refreshed, err := readTaskLocked(dir, t.slug)
@@ -1030,6 +1059,17 @@ func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
 			loweredTicket := t
 			loweredTicket.body = refreshed.body
 			notePriorityLowered(loweredTicket, lowered, errout)
+		}
+		if namesLater {
+			if code == 0 {
+				fmt.Fprintln(out, filepath.Base(current.path))
+			} else {
+				_, _ = deferredName.WriteTo(out)
+			}
+			_, _ = relations.WriteTo(out)
+		}
+		if code == 0 && o.cmd == "start" && len(o.blocks) > 0 {
+			fmt.Fprintln(errout, hintAfterStart(current, current.body, current.path))
 		}
 	}
 	if code == 0 && (o.cmd == "done" || o.cmd == "reject") {
@@ -2927,7 +2967,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	fmt.Fprintf(out, "%s %s\n", t.slug, next)
-	if o.cmd == "start" {
+	if o.cmd == "start" && len(o.blocks) == 0 {
 		fmt.Fprintln(errout, hintAfterStart(t, body, newPath))
 	}
 	return 0
@@ -2940,7 +2980,9 @@ func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
 	owner := executor(t.body)
 	if strings.EqualFold(owner, o.by) && o.prio == "" && o.diff == "" && o.why == "" {
 		fmt.Fprintf(out, "%s %s\n", t.slug, t.status)
-		fmt.Fprintln(errout, hintAfterStart(t, t.body, t.path))
+		if len(o.blocks) == 0 {
+			fmt.Fprintln(errout, hintAfterStart(t, t.body, t.path))
+		}
 		return 0, true
 	}
 	if owner != "" && !strings.EqualFold(owner, o.by) && !o.take {
@@ -3861,6 +3903,8 @@ func lintTicket(path, shown string) ([]string, error) {
 	}
 	body := string(bodyBytes)
 	var issues []string
+	subjectStatus := lineValue(body, "Статус: ")
+	subjectActive := subjectStatus != "готово" && subjectStatus != "отклонён"
 	project := filepath.Dir(filepath.Dir(filepath.Dir(path)))
 	for _, ref := range headerLinks(body, blockedPrefix) {
 		dir, neighbor, err := linkedPath(project, ref)
@@ -3879,8 +3923,12 @@ func lintTicket(path, shown string) ([]string, error) {
 		if !valid {
 			continue
 		}
-		if other.status != "готово" && other.status != "отклонён" && blockPrioRank(other.prio) > blockPrioRank(name.prio) {
+		active := other.status != "готово" && other.status != "отклонён"
+		if active && blockPrioRank(other.prio) > blockPrioRank(name.prio) {
 			issues = append(issues, shown+": priority below blocking ticket "+ref)
+		}
+		if !active || !subjectActive {
+			continue
 		}
 		reverse, refErr := ticketRef(dirProject(dir), project, name.slug)
 		if refErr != nil {

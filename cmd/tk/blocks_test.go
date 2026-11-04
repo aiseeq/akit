@@ -632,3 +632,185 @@ func TestRepeatedTransferFinishesNeighborAfterWriteFailure(t *testing.T) {
 		t.Fatalf("repeat transfer did not finish neighbor update:\n%s", got)
 	}
 }
+
+func TestAttachmentPreflightsReverseReferenceForSetAndNew(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	targetRoot := filepath.Join(home, "work", "a")
+	targetDir := filepath.Join(targetRoot, "docs", "tasks")
+	worktree, sourceDir := blockTestProject(t)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	blockTestWrite(t, targetDir, "t", "HIGH", "# t\n\nСтатус: открыт\n")
+	xPath := filepath.Join(sourceDir, "20260101-0000-LOW-x.md")
+	xBody := "# x\n\nСтатус: открыт\nПричина: synthetic\n"
+	if err := os.WriteFile(xPath, []byte(xBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+	o, err := parseArgs([]string{"set", "x", "--prio", "HIGH", "--why", "synthetic", "--blocks", "work/a/t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(worktree, sourceDir, o, &out, &errout); code == 0 {
+		t.Fatal("set accepted an unaddressable reverse project reference")
+	}
+	if got, err := os.ReadFile(xPath); err != nil || string(got) != xBody {
+		t.Fatalf("set changed source before reverse-reference validation: %s err=%v", got, err)
+	}
+	o, err = parseArgs([]string{"new", "fresh", "--prio", "LOW", "--blocks", "work/a/t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.baseRoot = worktree
+	out.Reset()
+	errout.Reset()
+	if code := createAtBase(worktree, sourceDir, o, &out, &errout); code == 0 {
+		t.Fatal("new accepted an unaddressable reverse project reference")
+	}
+	if matches, err := filepath.Glob(filepath.Join(sourceDir, "*-fresh.md")); err != nil || len(matches) != 0 {
+		t.Fatalf("new created a ticket before reverse-reference validation: %v err=%v", matches, err)
+	}
+}
+
+func TestAttachBlocksPreflightsSourceHeaderBeforeWritingTarget(t *testing.T) {
+	root, dir := blockTestProject(t)
+	sourcePath := filepath.Join(dir, "20260101-0000-MED-x.md")
+	sourceBody := "plain legacy content\n"
+	if err := os.WriteFile(sourcePath, []byte(sourceBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+	target := blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\n")
+	source, err := find(dir, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := attachBlocks(source, options{baseRoot: root, by: "tester"}, &out, &errout, []string{"t"}); code == 0 {
+		t.Fatal("source without insertion point accepted")
+	}
+	got, err := os.ReadFile(target.path)
+	if err != nil || strings.Contains(string(got), blockedPrefix) || strings.Contains(string(got), "блокирует x") {
+		t.Fatalf("target changed despite source insertion preflight: %s err=%v", got, err)
+	}
+	if got, err := os.ReadFile(sourcePath); err != nil || string(got) != sourceBody {
+		t.Fatalf("source changed: %s err=%v", got, err)
+	}
+}
+
+func TestSetBlocksRefreshesPathAndPrintsFinalName(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n")
+	blockTestWrite(t, dir, "t", "HIGH", "# t\n\nСтатус: открыт\n")
+	o, err := parseArgs([]string{"set", "x", "--prio", "MED", "--blocks", "t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("set code=%d stderr=%q", code, errout.String())
+	}
+	if !strings.Contains(out.String(), "-HIGH-x.md") || strings.Contains(out.String(), "-MED-x.md") {
+		t.Fatalf("stdout did not name final ticket file: %q", out.String())
+	}
+	if matches, err := filepath.Glob(filepath.Join(dir, "*-HIGH-x.md")); err != nil || len(matches) != 1 {
+		t.Fatalf("raised source missing: %v err=%v", matches, err)
+	}
+}
+
+func TestNewBlocksPrintsFinalRaisedName(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "t", "HIGH", "# t\n\nСтатус: открыт\n")
+	o, err := parseArgs([]string{"new", "fresh", "--prio", "LOW", "--blocks", "t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.baseRoot = root
+	var out, errout bytes.Buffer
+	if code := createAtBase(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("new code=%d stderr=%q", code, errout.String())
+	}
+	if !strings.Contains(out.String(), "-HIGH-fresh.md") || strings.Contains(out.String(), "-LOW-fresh.md") {
+		t.Fatalf("new stdout did not name final ticket file: %q", out.String())
+	}
+	if !strings.Contains(errout.String(), "-HIGH-fresh.md") || strings.Contains(errout.String(), "-LOW-fresh.md") {
+		t.Fatalf("new hint did not name final ticket file: %q", errout.String())
+	}
+}
+
+func TestStartHintUsesRetaggedName(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n")
+	o, err := parseArgs([]string{"start", "x", "--prio", "HIGH", "--why", "synthetic", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("start code=%d stderr=%q", code, errout.String())
+	}
+	if !strings.Contains(errout.String(), "HIGH-x.md") || strings.Contains(errout.String(), "LOW-x.md") {
+		t.Fatalf("start hint did not name final ticket: %q", errout.String())
+	}
+}
+
+func TestLintDoesNotRequireReverseReferenceForClosedBlocker(t *testing.T) {
+	_, dir := blockTestProject(t)
+	ticket := blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: готово\nЗаблокирован: x\n")
+	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\n")
+	issues, err := lintTicket(ticket.path, "t.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, issue := range issues {
+		if strings.Contains(issue, "has no reverse") {
+			t.Fatalf("closed blocker still requires reverse reference: %v", issues)
+		}
+	}
+}
+
+func TestSetBlocksPrintsTheNameBeforeRaises(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n")
+	blockTestWrite(t, dir, "t", "HIGH", "# t\n\nСтатус: открыт\n")
+	o, err := parseArgs([]string{"set", "x", "--blocks", "t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("set code=%d stderr=%q", code, errout.String())
+	}
+	first, rest, _ := strings.Cut(out.String(), "\n")
+	if !strings.HasSuffix(first, "-HIGH-x.md") || !strings.Contains(rest, "поднят") {
+		t.Fatalf("stdout does not start with the final name: %q", out.String())
+	}
+}
+
+func TestNewBlocksKeepsTheCreateError(t *testing.T) {
+	root, dir := blockTestProject(t)
+	blockTestWrite(t, dir, "x", "MED", "# x\n\nСтатус: открыт\n")
+	blockTestWrite(t, dir, "t", "MED", "# t\n\nСтатус: открыт\n")
+	o, err := parseArgs([]string{"new", "x", "--blocks", "t", "--by", "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	if code := runAtBase(root, dir, o, &out, &errout); code == 0 {
+		t.Fatal("a repeated new was accepted")
+	}
+	if !strings.Contains(errout.String(), "already exists") {
+		t.Fatalf("create error lost: stderr=%q", errout.String())
+	}
+}
+
+func TestTransferredRecordTakesTheLatestBySlugAndExactByStem(t *testing.T) {
+	rows := []transferRecord{{Slug: "x", Stem: "20260101-0000-MED-x", Key: "old"}, {Slug: "x", Stem: "20260202-0000-MED-x", Key: "new"}}
+	if row, ok := transferredRecord(rows, "x"); !ok || row.Key != "new" {
+		t.Fatalf("by slug: %+v %v", row, ok)
+	}
+	if row, ok := transferredRecord(rows, "20260101-0000-MED-x.md"); !ok || row.Key != "old" {
+		t.Fatalf("by stem: %+v %v", row, ok)
+	}
+}

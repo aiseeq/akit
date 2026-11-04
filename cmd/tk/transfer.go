@@ -117,6 +117,27 @@ func transferBlockRelations(t task, o options, key string, errout io.Writer) {
 	}
 }
 
+func finishTransferRelations(dir, id string, source task, o options, errout io.Writer) {
+	rows, err := readTransferLedger(dir)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: warning: cannot update blockers after transfer of %s: %v\n", id, err)
+		return
+	}
+	row, ok := transferredRecord(rows, id)
+	if !ok {
+		fmt.Fprintf(errout, "tk: warning: transferred ticket %s has no ledger record\n", id)
+		return
+	}
+	if source.path == "" {
+		lines := make([]string, 0, len(row.Blocks))
+		for _, ref := range row.Blocks {
+			lines = append(lines, blockedPrefix+ref)
+		}
+		source = task{path: filepath.Join(dir, row.Stem+".md"), slug: row.Slug, body: strings.Join(lines, "\n")}
+	}
+	transferBlockRelations(source, o, row.Key, errout)
+}
+
 func parseTransferResult(data []byte) (transferResult, error) {
 	var result transferResult
 	d := json.NewDecoder(bytes.NewReader(data))
