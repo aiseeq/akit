@@ -46,9 +46,9 @@ var (
 	privateKeyRE   = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
 	awsRE          = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE       = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
-	contextNameRE  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\?["'])?([ \t]*)(:=|=>|=|:)`)
-	headerRE       = regexp.MustCompile(`(?i)(?:proxy-)?authorization\s*[:=]\s*(?:(?:bearer|basic|token|digest|negotiate)\s+)?`)
-	urlRE          = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]+:([^\s/@]+)@`)
+	contextNameRE  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
+	headerRE       = regexp.MustCompile(`(?im)(?:proxy-)?authorization[ \t]*[:=][ \t]*(?:(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
+	urlRE          = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]*:([^\s/@]+)@`)
 	flagRE         = regexp.MustCompile("(?i)(?:^|[ \\t'\"`])--?([a-z0-9_.-]+)(?:=|(?:[ \\t]|\\\\\\n)+)")
 	contextAnchors = map[byte][]string{
 		'a': {"authorization", "api_key", "api-key", "apikey", "access_key"},
@@ -266,7 +266,7 @@ func nameMatches(text string) []contextMatch {
 	var matches []contextMatch
 	coveredUntil := 0
 	for _, ix := range contextNameRE.FindAllStringSubmatchIndex(text, -1) {
-		if ix[0] < coveredUntil {
+		if ix[0] < coveredUntil || withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
 			continue
 		}
 		name := text[ix[2]:ix[3]]
@@ -319,6 +319,9 @@ func flagMatches(text string) []contextMatch {
 		}
 		coveredUntil = value.end
 		separator := text[ix[1]-1]
+		if separator == '=' && ix[1] < len(text) && hasHorizontalSpaceAt(text, ix[1]) {
+			continue
+		}
 		if separator != '=' && !flagValueAllowed(text[value.start:value.end]) {
 			continue
 		}
@@ -332,6 +335,9 @@ func flagMatches(text string) []contextMatch {
 func urlMatches(text string) []contextMatch {
 	var matches []contextMatch
 	for _, ix := range urlRE.FindAllStringSubmatchIndex(text, -1) {
+		if withinMaskMarker(text, ix[2]) {
+			continue
+		}
 		value, ok := scanValue(text, ix[2], false)
 		if !ok {
 			continue
@@ -350,14 +356,16 @@ func curlMatches(text string) []contextMatch {
 	var matches []contextMatch
 	for _, segment := range commandSegments(text) {
 		part := text[segment[0]:segment[1]]
+		quotes := pairedQuoteRanges(part)
 		if command, ok := findCommandWord(part, "curl", false); ok {
+			quoteIndex := 0
 			for at := command.end; ; {
-				start, end, ok := nextShellWord(part, at)
+				start, end, ok := nextShellWord(part, at, quotes, &quoteIndex)
 				if !ok {
 					break
 				}
 				at = end
-				valueAt, found := curlUserValue(part, start, end)
+				valueAt, found := curlUserValue(part, start, end, quotes, quoteIndex)
 				if !found {
 					continue
 				}
@@ -367,6 +375,9 @@ func curlMatches(text string) []contextMatch {
 				}
 				colon := strings.IndexByte(part[value.start:value.end], ':')
 				if colon < 0 {
+					continue
+				}
+				if strings.Contains(part[value.start:value.end], "[скрыто:") {
 					continue
 				}
 				password := contextValue{value.start + colon + 1, value.end, value.quoted}
@@ -379,13 +390,13 @@ func curlMatches(text string) []contextMatch {
 	return matches
 }
 
-func curlUserValue(text string, start, end int) (int, bool) {
+func curlUserValue(text string, start, end int, quotes [][2]int, quoteIndex int) (int, bool) {
 	token := text[start:end]
 	if strings.HasPrefix(token, "--user=") {
 		return start + len("--user="), true
 	}
 	if token == "--user" {
-		value, _, ok := nextShellWord(text, end)
+		value, _, ok := nextShellWord(text, end, quotes, &quoteIndex)
 		return value, ok
 	}
 	if !strings.HasPrefix(token, "-") || strings.HasPrefix(token, "--") {
@@ -403,7 +414,7 @@ func curlUserValue(text string, start, end int) (int, bool) {
 	if after < end {
 		return after, true
 	}
-	value, _, ok := nextShellWord(text, end)
+	value, _, ok := nextShellWord(text, end, quotes, &quoteIndex)
 	return value, ok
 }
 
@@ -411,9 +422,11 @@ func toolPasswordMatches(text string) []contextMatch {
 	var matches []contextMatch
 	for _, segment := range commandSegments(text) {
 		part := text[segment[0]:segment[1]]
+		quotes := pairedQuoteRanges(part)
+		quoteIndex := 0
 		if command, ok := findCommandWord(part, "sshpass", false); ok {
 			for at := command.end; ; {
-				start, end, ok := nextShellWord(part, at)
+				start, end, ok := nextShellWord(part, at, quotes, &quoteIndex)
 				if !ok {
 					break
 				}
@@ -423,7 +436,7 @@ func toolPasswordMatches(text string) []contextMatch {
 					break
 				}
 				if token == "-p" {
-					valueAt, _, ok := nextShellWord(part, end)
+					valueAt, _, ok := nextShellWord(part, end, quotes, &quoteIndex)
 					if ok {
 						addToolPassword(part, segment[0], valueAt, &matches)
 					}
@@ -434,7 +447,7 @@ func toolPasswordMatches(text string) []contextMatch {
 					break
 				}
 				if token == "-f" || token == "-d" {
-					_, at, _ = nextShellWord(part, at)
+					_, at, _ = nextShellWord(part, at, quotes, &quoteIndex)
 				}
 			}
 		}
@@ -444,7 +457,7 @@ func toolPasswordMatches(text string) []contextMatch {
 				continue
 			}
 			for at := command.end; ; {
-				start, end, ok := nextShellWord(part, at)
+				start, end, ok := nextShellWord(part, at, quotes, &quoteIndex)
 				if !ok {
 					break
 				}
@@ -460,7 +473,7 @@ func toolPasswordMatches(text string) []contextMatch {
 
 func addToolPassword(text string, offset, at int, matches *[]contextMatch) {
 	value, ok := scanValue(text, at, false)
-	if ok && flagValueAllowed(text[value.start:value.end]) && valueIsValue(text, value, "", "password", false) {
+	if ok && (value.quoted || flagValueAllowed(text[value.start:value.end])) && valueIsValue(text, value, "", "password", false) {
 		*matches = append(*matches, contextMatch{offset + value.start, offset + value.end, "password"})
 	}
 }
@@ -506,9 +519,17 @@ func commandRightBoundary(text string, at int) bool {
 }
 
 func commandSegments(text string) [][2]int {
+	quoted := pairedQuoteRanges(text)
 	var segments [][2]int
 	start := 0
+	quoteRange := 0
 	for i := 0; i < len(text); i++ {
+		for quoteRange < len(quoted) && i >= quoted[quoteRange][1] {
+			quoteRange++
+		}
+		if quoteRange < len(quoted) && i >= quoted[quoteRange][0] {
+			continue
+		}
 		if text[i] == '\n' && i > 0 && text[i-1] == '\\' {
 			continue
 		}
@@ -520,7 +541,37 @@ func commandSegments(text string) [][2]int {
 	return append(segments, [2]int{start, len(text)})
 }
 
-func nextShellWord(text string, at int) (int, int, bool) {
+func pairedQuoteRanges(text string) [][2]int {
+	type quoteForm struct {
+		quote   byte
+		slashes int
+	}
+	pending := make(map[quoteForm]int)
+	ranges := make([][2]int, 0)
+	for i := 0; i < len(text); i++ {
+		if text[i] != '\'' && text[i] != '"' && text[i] != '`' {
+			continue
+		}
+		start := i
+		for start > 0 && text[start-1] == '\\' {
+			start--
+		}
+		form := quoteForm{text[i], i - start}
+		if open, ok := pending[form]; ok {
+			ranges = append(ranges, [2]int{open, i + 1})
+			delete(pending, form)
+		} else {
+			pending[form] = start
+		}
+	}
+	if len(ranges) < 2 {
+		return ranges
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
+	return ranges
+}
+
+func nextShellWord(text string, at int, quoted [][2]int, quoteIndex *int) (int, int, bool) {
 	for at < len(text) {
 		if text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r' {
 			at++
@@ -536,25 +587,22 @@ func nextShellWord(text string, at int) (int, int, bool) {
 		return 0, 0, false
 	}
 	start := at
-	var quote byte
+	quoteRange := *quoteIndex
+	for quoteRange < len(quoted) && at >= quoted[quoteRange][1] {
+		quoteRange++
+	}
+	*quoteIndex = quoteRange
 	for at < len(text) {
+		for quoteRange < len(quoted) && at >= quoted[quoteRange][1] {
+			quoteRange++
+		}
+		if quoteRange < len(quoted) && at >= quoted[quoteRange][0] {
+			at = quoted[quoteRange][1]
+			quoteRange++
+			*quoteIndex = quoteRange
+			continue
+		}
 		c := text[at]
-		if quote != 0 {
-			if c == '\\' && quote == '"' && at+1 < len(text) {
-				at += 2
-				continue
-			}
-			if c == quote {
-				quote = 0
-			}
-			at++
-			continue
-		}
-		if c == '\'' || c == '"' || c == '`' {
-			quote = c
-			at++
-			continue
-		}
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.HasPrefix(text[at:], "\\\n") {
 			break
 		}
@@ -575,30 +623,40 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		}
 		break
 	}
-	if at >= len(text) || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' {
+	if at >= len(text) || strings.HasPrefix(text[at:], "[скрыто:") || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' {
 		return contextValue{}, false
 	}
-	if strings.HasPrefix(text[at:], `\"`) {
-		start := at + 2
-		for i := start; i+1 < len(text); i++ {
-			if text[i:i+2] == `\"` {
-				return contextValue{start, i, true}, i > start
-			}
-			if text[i] == '\\' {
-				i++
-			}
-		}
+	quoteAt, quote := at, byte(0)
+	if text[at] == '`' {
 		return contextValue{}, false
 	}
 	if text[at] == '\'' || text[at] == '"' {
-		quote, start := text[at], at+1
-		for i := start; i < len(text); i++ {
-			if quote == '"' && text[i] == '\\' && i+1 < len(text) {
-				i++
+		quote = text[at]
+	} else if text[at] == '\\' {
+		i := at
+		for i < len(text) && text[i] == '\\' {
+			i++
+		}
+		if i < len(text) && text[i] == '"' {
+			quoteAt, quote = i, '"'
+		}
+	}
+	if quote != 0 {
+		openStart := quoteAt
+		for openStart > at && text[openStart-1] == '\\' {
+			openStart--
+		}
+		slashes := quoteAt - openStart
+		for i := quoteAt + 1; i < len(text); i++ {
+			if text[i] != quote {
 				continue
 			}
-			if text[i] == quote {
-				return contextValue{start, i, true}, i > start
+			closeStart := i
+			for closeStart > 0 && text[closeStart-1] == '\\' {
+				closeStart--
+			}
+			if i-closeStart == slashes {
+				return contextValue{quoteAt + 1, closeStart, true}, closeStart > quoteAt+1
 			}
 		}
 		return contextValue{}, false
@@ -623,11 +681,11 @@ func valueIsValue(text string, value contextValue, name, kind string, colon bool
 }
 
 func quotedIsValue(value string) bool {
-	return value != "" && !isReference(value) && !isPlaceholder(value) && !strings.HasPrefix(value, "[скрыто:")
+	return value != "" && !isReference(value) && !isPlaceholder(value) && !strings.Contains(value, "[скрыто:")
 }
 
 func bareIsValue(value, name, kind string, colon bool) bool {
-	if value == "" || isReference(value) || isPlaceholder(value) || strings.HasPrefix(value, "[скрыто:") || strings.ContainsAny(value, "('") || strings.EqualFold(value, name) {
+	if value == "" || isReference(value) || isPlaceholder(value) || strings.Contains(value, "[скрыто:") || strings.ContainsAny(value, "('") || equalSecretName(value, name) {
 		return false
 	}
 	if strings.Contains(value, ".") {
@@ -657,8 +715,30 @@ func bareIsValue(value, name, kind string, colon bool) bool {
 	return true
 }
 
+func withinMaskMarker(text string, at int) bool {
+	if at < 0 || at > len(text) {
+		return false
+	}
+	start := max(at-len("[скрыто:"), 0)
+	open := strings.LastIndex(text[start:at], "[скрыто:")
+	if open < 0 {
+		return false
+	}
+	open += start
+	close := strings.IndexByte(text[open:], ']')
+	return close >= 0 && open+close >= at
+}
+
 func isReference(value string) bool {
 	return strings.HasPrefix(value, "${") || strings.HasPrefix(value, "$(") || strings.HasPrefix(value, "`") || len(value) > 1 && value[0] == '$' && ((value[1] >= 'A' && value[1] <= 'Z') || (value[1] >= 'a' && value[1] <= 'z') || value[1] == '_') || strings.HasPrefix(value, `\"$`)
+}
+
+func equalSecretName(value, name string) bool {
+	clean := func(s string) string {
+		s = strings.TrimLeft(s, "-")
+		return strings.NewReplacer("-", "_", ".", "_").Replace(strings.ToLower(s))
+	}
+	return name != "" && clean(value) == clean(name)
 }
 
 var placeholderWords = map[string]bool{"%s": true, "%v": true, "string": true, "str": true, "bool": true, "int": true, "true": true, "false": true, "null": true, "nil": true, "none": true, "undefined": true, "required": true, "optional": true, "yes": true, "no": true}
