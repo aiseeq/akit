@@ -133,7 +133,7 @@ func TestConcurrentStartsAssignTicketToOneActor(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(gatePath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	gate := fmt.Sprintf(`{"at":%q,"open_by_root":{%q:["MED-DO","MED-HUNT","MED-ARCH"]}}`, time.Now().Format(time.RFC3339), base)
+	gate := fmt.Sprintf(`{"at":%q,"live":["%s"],"open":[],"open_by_root":{%q:["MED-DO","MED-HUNT","MED-ARCH"]}}`, time.Now().Format(time.RFC3339), filepath.Base(base), base)
 	if err := os.WriteFile(gatePath, []byte(gate), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestConcurrentStartsAssignTicketToOneActor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err = gateForProject(state, base)
+	state.open, err = gatePairs(state.data, base)
 	if err != nil {
 		t.Fatal(err)
 	}

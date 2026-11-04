@@ -49,7 +49,7 @@ func transferTask(root, dir string, o options, out, errout io.Writer) int {
 
 func transferFoundTask(root string, t task, o options, out, errout io.Writer) int {
 	dir := filepath.Dir(t.path)
-	if t.status == "готово" || t.status == "отклонён" || t.journal || lineValue(t.body, "Вид: ") == "журнал" {
+	if t.status == "готово" || t.status == "отклонён" || isJournal(t) {
 		return transferError(errout, t.path, "ticket status or kind does not allow transfer")
 	}
 	project := o.mainRoot
@@ -74,13 +74,9 @@ func transferFoundTask(root string, t task, o options, out, errout io.Writer) in
 	if o.parent != "" {
 		args = append(args, o.parent)
 	}
-	stdout, stderr, runErr := runBoundedCommand(commandPath, args, []byte(t.body), 30*time.Second)
+	stdout, _, runErr := runBoundedCommand(commandPath, args, []byte(t.body), 30*time.Second)
 	if runErr != nil {
-		reason := externalReason(firstStderrLine(string(stderr)))
-		if reason == "" {
-			reason = runErr.Error()
-		}
-		return transferError(errout, commandPath, reason)
+		return transferError(errout, commandPath, runErr.Error())
 	}
 	result, err := parseTransferResult(stdout)
 	if err != nil {

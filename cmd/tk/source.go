@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/aiseeq/akit/secretmask"
 )
 
 type externalTask struct {
@@ -112,13 +114,13 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 		return nil, stderr.Bytes(), errors.New("output over 1 MiB")
 	}
 	if errors.Is(err, exec.ErrWaitDelay) {
-		return nil, stderr.Bytes(), errors.New("command did not exit")
+		return nil, stderr.Bytes(), commandFailure(errors.New("command did not exit"), stderr.String())
 	}
 	if ctx.Err() != nil {
-		return nil, stderr.Bytes(), errors.New("command timed out")
+		return nil, stderr.Bytes(), commandFailure(errors.New("command timed out"), stderr.String())
 	}
 	if err != nil {
-		return nil, stderr.Bytes(), fmt.Errorf("run source command: %w", err)
+		return nil, stderr.Bytes(), commandFailure(fmt.Errorf("run command: %w", err), stderr.String())
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
@@ -127,13 +129,9 @@ func runTaskSource(path, project string) ([]externalTask, int, string, bool) {
 	if err := trustedSource(path); err != nil {
 		return nil, 0, err.Error(), true
 	}
-	stdout, stderr, err := runBoundedCommand(path, []string{project}, nil, 5*time.Second)
+	stdout, _, err := runBoundedCommand(path, []string{project}, nil, 5*time.Second)
 	if err != nil {
-		reason := firstStderrLine(string(stderr))
-		if reason == "" {
-			reason = err.Error()
-		}
-		return nil, 0, reason, true
+		return nil, 0, err.Error(), true
 	}
 	return parseExternalTasks(stdout)
 }
@@ -141,13 +139,33 @@ func runTaskSource(path, project string) ([]externalTask, int, string, bool) {
 func trustedSource(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("cannot inspect source: %w", err)
+		return fmt.Errorf("cannot inspect command: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("is a symlink")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("not a regular file")
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return errors.New("not executable")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return errors.New("writable by group or others")
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || !ok || int(st.Uid) != os.Getuid() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
-		return errors.New("source is not trusted")
+	if !ok || int(st.Uid) != os.Getuid() {
+		return errors.New("owned by another user")
 	}
 	return nil
+}
+
+func commandFailure(err error, stderr string) error {
+	message := err.Error()
+	if line := firstStderrLine(stderr); line != "" {
+		message += ": " + line
+	}
+	return errors.New(message)
 }
 
 func firstStderrLine(stderr string) string {
@@ -160,7 +178,8 @@ func firstStderrLine(stderr string) string {
 		}
 		line = line[:limit]
 	}
-	return line
+	masked, _ := secretmask.Mask(line)
+	return strings.ReplaceAll(masked, "\n", " ")
 }
 
 func parseExternalTasks(output []byte) ([]externalTask, int, string, bool) {
@@ -230,5 +249,5 @@ func safeSourceString(s string) string {
 	}, s)
 }
 func sourceWarning(w io.Writer, path, reason string) {
-	fmt.Fprintf(w, "tk: source %s: %s; showing local tickets only\n", path, externalReason(reason))
+	fmt.Fprintf(w, "tk: source %s: %s; showing local tickets only\n", path, firstStderrLine(reason))
 }

@@ -22,10 +22,8 @@ import (
 	"syscall"
 	"time"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/aiseeq/akit/proc"
-	"github.com/aiseeq/akit/secretmask"
 	"github.com/aiseeq/akit/timearg"
 )
 
@@ -71,7 +69,7 @@ Flags:
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
   --note TEXT    review: add a review note to the journal
   --check TEXT   done: describe independent verification (required)
-  --doer NAME    done: specify the executor of a legacy ticket
+  --doer NAME    done: specify the executor of an older ticket
   --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject: why declined; skip: why item skipped (required)
   --take         start: take a ticket assigned to another session
@@ -141,7 +139,6 @@ func (o options) planLimit() time.Duration {
 type task struct {
 	path, slug, status, prio, diff, title, body string
 	created, changed                            time.Time
-	journal                                     bool
 }
 
 func main() {
@@ -439,8 +436,6 @@ func validateSimpleCommand(o *options, pos []string) error {
 	switch o.cmd {
 	case "new":
 		return validateNew(o, pos)
-	case "transfer":
-		return validateTransfer(o, pos)
 	case "ls":
 		return validateList(o, pos)
 	case "start", "wait", "review", "done", "reject", "show", "set":
@@ -612,7 +607,7 @@ func validatePriorityOptions(o *options) error {
 		return errors.New("--diff must be DO, HUNT, or ARCH")
 	}
 	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && !o.journal {
-		return errors.New("set needs --prio, --diff, or --why")
+		return errors.New("set needs --prio, --diff, --why, or --journal")
 	}
 	return nil
 }
@@ -881,8 +876,6 @@ func runFoundTask(root string, t task, o options, out, errout io.Writer) int {
 		return skipPlanItem(t, o, out, errout)
 	case "note":
 		return addNote(t, o, out, errout)
-	case "transfer":
-		return transferFoundTask(root, t, o, out, errout)
 	default:
 		return transition(t, o, out, errout)
 	}
@@ -1279,7 +1272,7 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 			}
 			st, _ = explicitStatus(s)
 		}
-		ts = append(ts, task{path: p, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(s), body: s, created: created, changed: lastChange(s, info.ModTime()), journal: lineValue(s, "Вид: ") == "журнал"})
+		ts = append(ts, task{path: p, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(s), body: s, created: created, changed: lastChange(s, info.ModTime())})
 	}
 	return ts, nil
 }
@@ -2703,26 +2696,6 @@ func transition(t task, o options, out, errout io.Writer) int {
 }
 
 func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
-	if o.cmd == "start" && t.status == "открыт" {
-		project := o.mainRoot
-		if project == "" {
-			project = o.baseRoot
-		}
-		if project != "" {
-			gate, err := readTaskGate()
-			if err != nil {
-				return fail(errout, err), true
-			}
-			gate, err = gateForProject(gate, project)
-			if err != nil {
-				return fail(errout, err), true
-			}
-			if !gateVisible(t, gate, gate.live) {
-				fmt.Fprintf(errout, "tk: start is closed by the queue gate for %s\n", project)
-				return exitUsage, true
-			}
-		}
-	}
 	if o.cmd != "start" || t.status != "в работе" {
 		return 0, false
 	}
@@ -2866,18 +2839,18 @@ func applyMetadata(body string, o options) (string, error) {
 	return setHeaderValue(body, "Причина: ", o.why)
 }
 
-func setJournalKind(body string) string {
+func setJournalKind(body string) (string, error) {
 	lines := strings.Split(body, "\n")
 	if slices.Contains(lines, "Вид: журнал") {
-		return body
+		return body, nil
 	}
 	for i, line := range lines {
 		if strings.HasPrefix(line, "Статус: ") {
 			lines = append(lines[:i+1], append([]string{"Вид: журнал"}, lines[i+1:]...)...)
-			return strings.Join(lines, "\n")
+			return strings.Join(lines, "\n"), nil
 		}
 	}
-	return body
+	return "", errors.New("ticket has no Статус line")
 }
 
 func setHeaderValue(body, prefix, value string) (string, error) {
@@ -2940,7 +2913,10 @@ func setTask(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	if o.journal {
-		body = setJournalKind(body)
+		body, err = setJournalKind(body)
+		if err != nil {
+			return fail(errout, err)
+		}
 	}
 	newName, err := retaggedName(filepath.Base(t.path), o)
 	if err != nil {
@@ -3026,7 +3002,8 @@ type taskJSON struct {
 	Check          string     `json:"check"`
 	Checker        string     `json:"checker"`
 	CheckerSession string     `json:"checker_session"`
-	Journal        any        `json:"journal,omitempty"`
+	Journal        any        `json:"journal,omitempty"` // ls: true for journals; show: journal lines
+	Kind           string     `json:"kind,omitempty"`
 	Plan           []planJSON `json:"plan,omitempty"`
 }
 
@@ -3057,13 +3034,16 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 		}
 	}
 	prio := normalizePrio(t.prio)
-	isJournal := t.journal || lineValue(t.body, "Вид: ") == "журнал"
+	journalEntry := isJournal(t)
 	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: lineValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
 		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
 		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, NoCheck: noCheck(t.body)}
 	if details {
 		obj.Journal = journalLines(t.body)
-	} else if isJournal {
+		if journalEntry {
+			obj.Kind = "журнал"
+		}
+	} else if journalEntry {
 		obj.Journal = true
 	}
 	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
@@ -3073,8 +3053,8 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 
 type taskGate struct {
 	At         string               `json:"at"`
-	Live       *[]string            `json:"live"`
-	Open       *[]string            `json:"open"`
+	Live       []string             `json:"live"`
+	Open       []string             `json:"open"`
 	OpenByRoot *map[string][]string `json:"open_by_root"`
 }
 
@@ -3110,10 +3090,6 @@ type gateState struct {
 	problem string
 	valid   bool
 	open    []string
-	scoped  bool
-	legacy  bool
-	live    bool
-	logMode bool
 }
 
 func readTaskGate() (gateState, error) {
@@ -3121,7 +3097,7 @@ func readTaskGate() (gateState, error) {
 	if err != nil {
 		return gateState{}, fmt.Errorf("determine gate directory: %w", err)
 	}
-	state := gateState{path: filepath.Join(home, ".local/state/queue/gate.json"), problem: "gate.json is missing", live: true}
+	state := gateState{path: filepath.Join(home, ".local/state/queue/gate.json"), problem: "gate.json is missing"}
 	content, err := os.ReadFile(state.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil
@@ -3134,8 +3110,6 @@ func readTaskGate() (gateState, error) {
 		state.problem = "cannot parse gate.json: " + err.Error()
 		return state, nil
 	}
-	state.legacy = state.data.Live != nil && state.data.Open != nil
-	state.logMode = state.legacy && len(*state.data.Live) == 0
 	at, err := time.Parse(time.RFC3339, state.data.At)
 	if err != nil {
 		state.problem = "gate.json has invalid at timestamp: " + err.Error()
@@ -3157,30 +3131,17 @@ func readTaskGate() (gateState, error) {
 	return state, nil
 }
 
-func gateForProject(state gateState, project string) (gateState, error) {
-	if state.legacy {
-		state.live = false
-		for _, name := range *state.data.Live {
-			if name == filepath.Base(project) {
-				state.live = true
-				break
-			}
-		}
-		state.open = *state.data.Open
-		state.scoped = state.live
-		if !state.valid {
-			return state, nil
-		}
-	}
-	if !state.valid {
-		return state, nil
+func gatePairs(data taskGate, project string) ([]string, error) {
+	if data.OpenByRoot == nil || len(*data.OpenByRoot) == 0 {
+		return data.Open, nil
 	}
 	resolvedProject, err := normalizedRoot(project)
 	if err != nil {
-		return state, fmt.Errorf("resolve project root %s: %w", project, err)
+		return nil, fmt.Errorf("resolve project root %s: %w", project, err)
 	}
 	best := ""
-	for candidate, pairs := range *state.data.OpenByRoot {
+	pairs := data.Open
+	for candidate, rootPairs := range *data.OpenByRoot {
 		if !filepath.IsAbs(candidate) {
 			continue
 		}
@@ -3189,21 +3150,18 @@ func gateForProject(state gateState, project string) (gateState, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return state, fmt.Errorf("resolve gate root %s: %w", candidate, err)
+			return nil, fmt.Errorf("resolve gate root %s: %w", candidate, err)
 		}
 		rel, err := filepath.Rel(resolvedRoot, resolvedProject)
 		if err != nil {
-			return state, fmt.Errorf("compare gate root %s with project %s: %w", resolvedRoot, resolvedProject, err)
+			return nil, fmt.Errorf("compare gate root %s with project %s: %w", resolvedRoot, resolvedProject, err)
 		}
 		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || len(resolvedRoot) <= len(best) {
 			continue
 		}
-		best, state.open, state.scoped = resolvedRoot, pairs, true
+		best, pairs = resolvedRoot, rootPairs
 	}
-	if state.legacy && state.live && !state.scoped {
-		state.scoped = true
-	}
-	return state, nil
+	return pairs, nil
 }
 
 func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
@@ -3218,33 +3176,10 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if !choice.gate.valid {
 		fmt.Fprintf(errout, "tk: %s; showing started work and of new work CRIT and HIGH only (%s)\n", choice.gate.problem, choice.gate.path)
 	}
-	var external []externalTask
-	sourceFailed := false
-	if sourcePath, ok, pathErr := taskSourcePath(project); pathErr != nil {
-		return fail(errout, pathErr)
-	} else if ok {
-		if _, statErr := os.Lstat(sourcePath); statErr == nil {
-			var bad int
-			var reason string
-			external, bad, reason, sourceFailed = runTaskSource(sourcePath, filepath.Base(project))
-			if sourceFailed {
-				sourceWarning(errout, sourcePath, reason)
-			} else if bad > 0 {
-				fmt.Fprintf(errout, "tk: source %s: skipped %d bad records (first: %s)\n", sourcePath, bad, externalReason(reason))
-			}
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			sourceFailed = true
-			sourceWarning(errout, sourcePath, "cannot inspect source: "+statErr.Error())
-		}
+	visible, sourceFailed, err := visibleExternal(project, choice, errout)
+	if err != nil {
+		return fail(errout, err)
 	}
-	visible := make([]externalTask, 0, len(external))
-	for _, item := range external {
-		t := task{prio: item.Prio, diff: "", status: "открыт"}
-		if gateVisible(t, choice.gate, choice.live) {
-			visible = append(visible, item)
-		}
-	}
-	sortExternal(visible)
 	localGroup := 99
 	if choice.found {
 		localGroup = nextGroup(choice.task, o.by, choice.gate, choice.live)
@@ -3263,32 +3198,8 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	return printCombinedNext(root, choice, visible, o.json, out, errout)
 }
 
-func externalGroup(t externalTask) int {
-	switch t.Prio {
-	case "CRIT":
-		return 0
-	case "HIGH":
-		return 2
-	case "MED":
-		return 3
-	default:
-		return 4
-	}
-}
 func externalWinsLocal(t externalTask, localGroup int) bool {
-	return externalGroup(t) <= localGroup
-}
-func externalReason(s string) string {
-	s = safeSourceString(s)
-	if len(s) > 200 {
-		limit := 200
-		for limit > 0 && !utf8.RuneStart(s[limit]) {
-			limit--
-		}
-		s = s[:limit]
-	}
-	masked, _ := secretmask.Mask(s)
-	return strings.ReplaceAll(masked, "\n", " ")
+	return nextGroup(task{prio: t.Prio, status: "открыт"}, "", gateState{}, false) <= localGroup
 }
 
 type nextChoice struct {
@@ -3318,11 +3229,14 @@ func chooseNext(dir, project, actor string) (nextChoice, error) {
 	if err != nil {
 		return nextChoice{}, err
 	}
-	gate, err = gateForProject(gate, project)
-	if err != nil {
-		return nextChoice{}, err
+	live := slices.Contains(gate.data.Live, filepath.Base(project))
+	if gate.valid {
+		gate.open, err = gatePairs(gate.data, project)
+		if err != nil {
+			return nextChoice{}, err
+		}
 	}
-	choice := nextChoice{gate: gate, live: gate.live}
+	choice := nextChoice{gate: gate, live: live}
 	candidates := nextCandidates(tasks, actor, gate, choice.live)
 	if len(candidates) != 0 {
 		sortNextCandidates(candidates, actor, gate, choice.live)
@@ -3348,35 +3262,11 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return
 	}
-	var ext []externalTask
-	if p, ok, pathErr := taskSourcePath(project); pathErr != nil {
-		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", pathErr)
+	ext, _, err := visibleExternal(project, choice, errout)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return
-	} else if ok {
-		if _, e := os.Lstat(p); e == nil {
-			var bad int
-			var reason string
-			var failed bool
-			ext, bad, reason, failed = runTaskSource(p, filepath.Base(project))
-			if failed {
-				sourceWarning(errout, p, reason)
-			} else if bad > 0 {
-				fmt.Fprintf(errout, "tk: source %s: skipped %d bad records (first: %s)\n", p, bad, externalReason(reason))
-			}
-		} else if !errors.Is(e, os.ErrNotExist) {
-			sourceWarning(errout, p, "cannot inspect source: "+e.Error())
-		}
 	}
-	if len(ext) > 0 {
-		filtered := ext[:0]
-		for _, x := range ext {
-			if gateVisible(task{prio: x.Prio, status: "открыт"}, choice.gate, choice.live) {
-				filtered = append(filtered, x)
-			}
-		}
-		ext = filtered
-	}
-	sortExternal(ext)
 	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate, choice.live))) {
 		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.valid && !choice.live))
 	} else if choice.found {
@@ -3385,11 +3275,43 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 }
 
 func sortExternal(items []externalTask) {
-	for i := 1; i < len(items); i++ {
-		for j := i; j > 0 && externalGroup(items[j]) < externalGroup(items[j-1]); j-- {
-			items[j], items[j-1] = items[j-1], items[j]
+	sort.SliceStable(items, func(i, j int) bool {
+		left := nextGroup(task{prio: items[i].Prio, status: "открыт"}, "", gateState{}, false)
+		right := nextGroup(task{prio: items[j].Prio, status: "открыт"}, "", gateState{}, false)
+		return left < right
+	})
+}
+
+func visibleExternal(project string, choice nextChoice, errout io.Writer) (items []externalTask, failed bool, err error) {
+	path, ok, err := taskSourcePath(project)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	} else if err != nil {
+		failed = true
+		sourceWarning(errout, path, "cannot inspect source: "+err.Error())
+		return nil, true, nil
+	}
+	var bad int
+	var reason string
+	items, bad, reason, failed = runTaskSource(path, filepath.Base(project))
+	if failed {
+		sourceWarning(errout, path, reason)
+		return nil, true, nil
+	}
+	if bad > 0 {
+		fmt.Fprintf(errout, "tk: source %s: skipped %d bad records (first: %s)\n", path, bad, firstStderrLine(reason))
+	}
+	visible := items[:0]
+	for _, item := range items {
+		if gateVisible(task{prio: item.Prio, status: "открыт"}, choice.gate, choice.live) {
+			visible = append(visible, item)
 		}
 	}
+	sortExternal(visible)
+	return visible, false, nil
 }
 func externalLine(t externalTask, closed bool) string {
 	s := strings.TrimSpace(strings.Join([]string{t.Key, t.Prio, t.Status, t.Title, t.URL}, " "))
@@ -3445,12 +3367,7 @@ func printExternalNext(root string, choice nextChoice, ext []externalTask, local
 		}
 		if len(ext) > 1 {
 			n := len(ext) - 1
-			if local {
-				n = len(ext) - 1
-			}
-			if n > 0 {
-				fmt.Fprintf(out, "ещё из источника: %d\n", n)
-			}
+			fmt.Fprintf(out, "ещё из источника: %d\n", n)
 		}
 		return 0
 	}
@@ -3501,11 +3418,16 @@ func gatePasses(t task, gate gateState, live bool) bool {
 	if !gate.valid {
 		return gateOpen(t, nil)
 	}
-	return !live || !gate.scoped || gateOpen(t, gate.open)
+	return !live || gateOpen(t, gate.open)
 }
 
 func eligibleForNext(t task, actor string) bool {
-	if (t.journal || lineValue(t.body, "Вид: ") == "журнал") && !(t.status == "ждёт" && dueWaitingTicket(t.body)) {
+	waitDueNow := false
+	if t.status == "ждёт" {
+		at, ok := waitDue(waiting(t.body), time.Now())
+		waitDueNow = ok && !at.After(time.Now())
+	}
+	if isJournal(t) && !waitDueNow {
 		return false
 	}
 	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
@@ -3514,14 +3436,10 @@ func eligibleForNext(t task, actor string) bool {
 	if t.status != "ждёт" {
 		return false
 	}
-	at, ok := waitDue(waiting(t.body), time.Now())
-	return ok && !at.After(time.Now())
+	return waitDueNow
 }
 
-func dueWaitingTicket(body string) bool {
-	at, ok := waitDue(waiting(body), time.Now())
-	return ok && !at.After(time.Now())
-}
+func isJournal(t task) bool { return lineValue(t.body, "Вид: ") == "журнал" }
 
 // nextGroup orders the queue. Work already begun under a closed pair stays in the
 // queue without pushing out CRIT and HIGH, and goes ahead of new work.

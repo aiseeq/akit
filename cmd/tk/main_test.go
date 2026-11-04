@@ -2033,6 +2033,41 @@ func TestLegacyTaskJSONHasNormalizedMetadataFields(t *testing.T) {
 	}
 }
 
+func TestJournalJSONUsesListFlagAndShowKind(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20260101-1000-MED-journal.md")
+	body := "# Journal\n\nСтатус: открыт\nВид: журнал\n\n## Приёмка\n- check\n\n## Журнал\n- entry\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var listOut, listErr bytes.Buffer
+	if code := list(root, options{json: true}, &listOut, &listErr); code != 0 {
+		t.Fatalf("list: code %d, stderr %q", code, listErr.String())
+	}
+	var listRows []map[string]any
+	if err := json.Unmarshal(listOut.Bytes(), &listRows); err != nil {
+		t.Fatal(err)
+	}
+	if len(listRows) != 1 || listRows[0]["journal"] != true {
+		t.Fatalf("ls JSON = %#v", listRows)
+	}
+	var showOut, showErr bytes.Buffer
+	if code := showJSON(root, task{path: path, slug: "journal", status: "открыт", prio: "MED", body: body}, &showOut, &showErr); code != 0 {
+		t.Fatalf("show: code %d, stderr %q", code, showErr.String())
+	}
+	var showRow map[string]any
+	if err := json.Unmarshal(showOut.Bytes(), &showRow); err != nil {
+		t.Fatal(err)
+	}
+	if showRow["kind"] != "журнал" || len(showRow["journal"].([]any)) != 1 {
+		t.Fatalf("show JSON = %#v", showRow)
+	}
+}
+
 func TestLintRequiresReasonOnlyAfterCutoff(t *testing.T) {
 	dir := t.TempDir()
 	body := "# Ticket\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2020-01-01 10:00 открыт — actor\n"
@@ -2356,8 +2391,8 @@ func TestNextOrdersCandidatesAndAppliesGateStates(t *testing.T) {
 		wantClosed bool
 		wantDiag   bool
 	}{
-		{"root gate", `{"at":%q,"open_by_root":{"%s":["MED-DO"]}}`, "med-do", false, false},
-		{"project outside configured root", `{"at":%q,"open_by_root":{"%s":["MED-DO"]}}`, "med-hunt", false, false},
+		{"root gate", `{"at":%q,"live":["project"],"open":[],"open_by_root":{"%s":["MED-DO"]}}`, "med-do", false, false},
+		{"project outside configured root", `{"at":%q,"live":["project"],"open":["MED-HUNT"],"open_by_root":{"%s":["MED-DO"]}}`, "med-hunt", false, false},
 		{"gate missing", "", "high", false, true},
 		{"gate malformed", "{", "high", false, true},
 		{"gate stale", `{"at":"2000-01-01T00:00:00Z","open_by_root":{}}`, "high", false, true},
@@ -2695,10 +2730,10 @@ func TestNextStartedWorkOrderUnderGate(t *testing.T) {
 	}
 	order := func(t *testing.T, gate string) string {
 		t.Helper()
-		_, dir := queueProject(t, gate, tickets)
+		root, dir := queueProject(t, gate, tickets)
 		var got []string
 		for {
-			choice, err := chooseNext(dir, "project", "master")
+			choice, err := chooseNext(dir, root, "master")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2730,7 +2765,7 @@ func TestNextStartedWorkOrderUnderGate(t *testing.T) {
 
 // A wait that came due under a closed pair follows HIGH as well.
 func TestNextDueWaitOrderUnderClosedGate(t *testing.T) {
-	_, dir := queueProject(t, `{"at":"NOW","live":["project"],"open":[]}`, map[string]string{
+	root, dir := queueProject(t, `{"at":"NOW","live":["project"],"open":[]}`, map[string]string{
 		"20261101-1000-MED-DO-waited": "ждёт",
 		"20261101-1001-HIGH-high":     "открыт",
 	})
@@ -2743,7 +2778,7 @@ func TestNextDueWaitOrderUnderClosedGate(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	choice, err := chooseNext(dir, "project", "master")
+	choice, err := chooseNext(dir, root, "master")
 	if err != nil {
 		t.Fatal(err)
 	}

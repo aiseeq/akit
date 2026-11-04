@@ -30,7 +30,7 @@ func TestTaskSourceRejectsUntrustedFile(t *testing.T) {
 	if err := os.Chmod(path, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, reason, failed := runTaskSource(path, "project"); !failed || reason != "source is not trusted" {
+	if _, _, reason, failed := runTaskSource(path, "project"); !failed || reason != "writable by group or others" {
 		t.Fatalf("untrusted source = failed %v, reason %q", failed, reason)
 	}
 }
@@ -53,7 +53,7 @@ func TestExternalCandidateGroups(t *testing.T) {
 	if got := []string{items[0].Key, items[1].Key, items[2].Key}; strings.Join(got, ",") != "crit,high,med" {
 		t.Fatalf("source order = %v", got)
 	}
-	if externalGroup(externalTask{Prio: "CRIT"}) != 0 || externalGroup(externalTask{Prio: "HIGH"}) != 2 || externalGroup(externalTask{Prio: "MED"}) != 3 || externalGroup(externalTask{Prio: "LOW"}) != 4 {
+	if nextGroup(task{prio: "CRIT", status: "открыт"}, "", gateState{}, false) != 0 || nextGroup(task{prio: "HIGH", status: "открыт"}, "", gateState{}, false) != 2 || nextGroup(task{prio: "MED", status: "открыт"}, "", gateState{}, false) != 4 || nextGroup(task{prio: "LOW", status: "открыт"}, "", gateState{}, false) != 5 {
 		t.Fatal("unexpected external candidate groups")
 	}
 }
@@ -78,14 +78,14 @@ func TestExternalCandidateGate(t *testing.T) {
 	if !gateVisible(closed, gateState{valid: true}, false) {
 		t.Fatal("non-live project should not require an open pair")
 	}
-	if gateVisible(closed, gateState{valid: true, open: []string{"OTHER"}, scoped: true}, true) {
+	if gateVisible(closed, gateState{valid: true, open: []string{"OTHER"}}, true) {
 		t.Fatal("closed pair should hide candidate in live project")
 	}
 }
 
 func TestJournalEligibilityAndGateRoots(t *testing.T) {
 	now := time.Now().Add(-time.Minute).Format(time.RFC3339)
-	journal := task{status: "открыт", prio: "CRIT", journal: true, body: "Вид: журнал\n"}
+	journal := task{status: "открыт", prio: "CRIT", body: "Вид: журнал\n"}
 	if eligibleForNext(journal, "") {
 		t.Fatal("open journal ticket is eligible")
 	}
@@ -101,31 +101,34 @@ func TestJournalEligibilityAndGateRoots(t *testing.T) {
 	if err := os.MkdirAll(project, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	state := gateState{valid: true, data: taskGate{OpenByRoot: func() *map[string][]string {
+	state := gateState{valid: true, data: taskGate{Open: []string{"MED-HUNT"}, OpenByRoot: func() *map[string][]string {
 		m := map[string][]string{root: {"MED-DO"}, filepath.Join(root, "group"): {}}
 		return &m
 	}()}}
-	got, err := gateForProject(state, project)
+	got, err := gatePairs(state.data, project)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.scoped || len(got.open) != 0 {
+	if len(got) != 0 {
 		t.Fatalf("most specific root gate = %#v", got)
 	}
 	workshop := filepath.Join(base, "workshop", "project")
 	if err := os.MkdirAll(workshop, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	boundary, err := gateForProject(state, workshop)
+	boundary, err := gatePairs(state.data, workshop)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if boundary.scoped {
-		t.Fatalf("component boundary matched unrelated root: %#v", boundary)
+	if len(boundary) != 1 || boundary[0] != "MED-HUNT" {
+		t.Fatalf("fallback gate at component boundary = %#v", boundary)
 	}
-	legacy := gateState{problem: "gate.json has no open_by_root"}
-	if gateVisible(task{status: "открыт", prio: "MED"}, legacy, true) || !gateVisible(task{status: "открыт", prio: "HIGH"}, legacy, true) {
+	broken := gateState{problem: "gate.json has no open_by_root"}
+	if gateVisible(task{status: "открыт", prio: "MED"}, broken, true) || !gateVisible(task{status: "открыт", prio: "HIGH"}, broken, true) {
 		t.Fatal("missing root map should expose only CRIT/HIGH")
+	}
+	if !gateVisible(task{status: "в работе", prio: "MED"}, broken, true) {
+		t.Fatal("started ticket must remain visible with a broken gate")
 	}
 }
 
