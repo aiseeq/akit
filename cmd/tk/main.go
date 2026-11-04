@@ -2896,7 +2896,7 @@ func chooseNext(dir, project, actor string) (nextChoice, error) {
 	choice := nextChoice{gate: gate, live: slices.Contains(gate.data.Live, filepath.Base(project))}
 	candidates := nextCandidates(tasks, actor, gate, choice.live)
 	if len(candidates) != 0 {
-		sortNextCandidates(candidates, actor)
+		sortNextCandidates(candidates, actor, gate, choice.live)
 		choice.task, choice.found = candidates[0], true
 	}
 	return choice, nil
@@ -2944,9 +2944,10 @@ func nextCandidates(tasks []task, actor string, gate gateState, live bool) []tas
 // tells which pairs are open or which projects are live, so of new work only what
 // is always open stays visible.
 func gateVisible(t task, gate gateState, live bool) bool {
-	if t.status != "открыт" {
-		return true
-	}
+	return t.status != "открыт" || gatePasses(t, gate, live)
+}
+
+func gatePasses(t task, gate gateState, live bool) bool {
 	if !gate.valid {
 		return gateOpen(t, nil)
 	}
@@ -2964,10 +2965,15 @@ func eligibleForNext(t task, actor string) bool {
 	return ok && !at.After(time.Now())
 }
 
-func nextGroup(t task, actor string) int {
+// nextGroup orders the queue. Work already begun under a closed pair stays in the
+// queue without pushing out CRIT and HIGH, and goes ahead of new work.
+func nextGroup(t task, actor string, gate gateState, live bool) int {
 	prio := normalizePrio(t.prio)
 	if prio == "CRIT" {
 		return 0
+	}
+	if t.status != "открыт" && !gatePasses(t, gate, live) {
+		return 3
 	}
 	if t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
 		return 1
@@ -2976,16 +2982,17 @@ func nextGroup(t task, actor string) int {
 		return 2
 	}
 	if prio == "MED" {
-		return 3
+		return 4
 	}
-	return 4
+	return 5
 }
 
-func sortNextCandidates(candidates []task, actor string) {
+func sortNextCandidates(candidates []task, actor string, gate gateState, live bool) {
 	sort.Slice(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
-		if nextGroup(left, actor) != nextGroup(right, actor) {
-			return nextGroup(left, actor) < nextGroup(right, actor)
+		leftGroup, rightGroup := nextGroup(left, actor, gate, live), nextGroup(right, actor, gate, live)
+		if leftGroup != rightGroup {
+			return leftGroup < rightGroup
 		}
 		return left.created.Before(right.created)
 	})

@@ -2680,3 +2680,72 @@ func TestDoneHintKeepsStartedWorkUnderClosedGate(t *testing.T) {
 		t.Errorf("hint %q", out.String())
 	}
 }
+
+// Under a closed pair started work follows CRIT and HIGH and goes ahead of new work;
+// under an open pair own work in progress stays ahead of HIGH.
+func TestNextStartedWorkOrderUnderGate(t *testing.T) {
+	tickets := map[string]string{
+		"20261101-1000-MED-DO-begun":  "в работе",
+		"20261101-1001-HIGH-high":     "открыт",
+		"20261101-1002-CRIT-crit":     "открыт",
+		"20261101-1003-MED-HUNT-new":  "открыт",
+		"20261101-1004-LOW-ARCH-late": "открыт",
+	}
+	order := func(t *testing.T, gate string) string {
+		t.Helper()
+		_, dir := queueProject(t, gate, tickets)
+		var got []string
+		for {
+			choice, err := chooseNext(dir, "project", "master")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !choice.found {
+				return strings.Join(got, " ")
+			}
+			got = append(got, choice.task.slug)
+			if err := os.Remove(choice.task.path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	const allMed = `"MED-DO","MED-HUNT","MED-ARCH"`
+	for _, tc := range []struct{ name, gate, want string }{
+		{"closed pair", `{"at":"NOW","live":["project"],"open":[]}`, "crit high begun"},
+		{"unreadable", "{", "crit high begun"},
+		{"missing", "", "crit high begun"},
+		{"open pair", `{"at":"NOW","live":["project"],"open":[` + allMed + `]}`, "crit begun high new"},
+		{"other pair open", `{"at":"NOW","live":["project"],"open":["MED-HUNT"]}`, "crit high begun new"},
+		{"not live", `{"at":"NOW","live":[],"open":[]}`, "crit begun high new late"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := order(t, tc.gate); got != tc.want {
+				t.Errorf("order %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A wait that came due under a closed pair follows HIGH as well.
+func TestNextDueWaitOrderUnderClosedGate(t *testing.T) {
+	_, dir := queueProject(t, `{"at":"NOW","live":["project"],"open":[]}`, map[string]string{
+		"20261101-1000-MED-DO-waited": "ждёт",
+		"20261101-1001-HIGH-high":     "открыт",
+	})
+	path := filepath.Join(dir, "20261101-1000-MED-DO-waited.md")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(content), "\n\n## Приёмка", "\nЖдёт: 2020-01-01 10:00\n\n## Приёмка", 1)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	choice, err := chooseNext(dir, "project", "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !choice.found || choice.task.slug != "high" {
+		t.Errorf("first %q", choice.task.slug)
+	}
+}

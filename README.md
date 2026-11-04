@@ -182,7 +182,7 @@ the trailing slash: git treats a symlink as a file). Worktrees then use the main
 `tk archive` moves closed tickets to `docs/tasks/archive/` inside the store instead of
 `docs/tasks-archive/` in the repository.
 
-Queue gates close only the start of new work: a ticket the agent already took and a wait that came due stay visible to `tk next` under a closed pair and under an unreadable gate file.
+Queue gates close only the start of new work: a ticket the agent already took and a wait that came due stay visible to `tk next` under a closed pair and under an unreadable gate file, after CRIT and HIGH and ahead of new work.
 `tk done` ends with a `следующий:` line when the queue has a ticket: the one `tk next` would give the
 ticket's executor.
 
