@@ -285,6 +285,9 @@ func nameMatches(text string) []contextMatch {
 			continue
 		}
 		coveredUntil = value.end
+		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
+			continue
+		}
 		// After := and => a bare value is an expression in code; a literal has quotes.
 		if !value.quoted && (delimiter == ":=" || delimiter == "=>") {
 			continue
@@ -352,125 +355,6 @@ func urlMatches(text string) []contextMatch {
 	return matches
 }
 
-func curlMatches(text string) []contextMatch {
-	var matches []contextMatch
-	for _, segment := range commandSegments(text) {
-		part := text[segment[0]:segment[1]]
-		quotes := pairedQuoteRanges(part)
-		if command, ok := findCommandWord(part, "curl", false); ok {
-			quoteIndex := 0
-			for at := command.end; ; {
-				start, end, ok := nextShellWord(part, at, quotes, &quoteIndex)
-				if !ok {
-					break
-				}
-				at = end
-				valueAt, found := curlUserValue(part, start, end, quotes, quoteIndex)
-				if !found {
-					continue
-				}
-				value, ok := scanValue(part, valueAt, false)
-				if !ok {
-					continue
-				}
-				colon := strings.IndexByte(part[value.start:value.end], ':')
-				if colon < 0 {
-					continue
-				}
-				if strings.Contains(part[value.start:value.end], "[скрыто:") {
-					continue
-				}
-				password := contextValue{value.start + colon + 1, value.end, value.quoted}
-				if valueIsValue(part, password, "", "password", false) {
-					matches = append(matches, contextMatch{segment[0] + password.start, segment[0] + password.end, "password"})
-				}
-			}
-		}
-	}
-	return matches
-}
-
-func curlUserValue(text string, start, end int, quotes [][2]int, quoteIndex int) (int, bool) {
-	token := text[start:end]
-	if strings.HasPrefix(token, "--user=") {
-		return start + len("--user="), true
-	}
-	if token == "--user" {
-		value, _, ok := nextShellWord(text, end, quotes, &quoteIndex)
-		return value, ok
-	}
-	if !strings.HasPrefix(token, "-") || strings.HasPrefix(token, "--") {
-		return 0, false
-	}
-	body := token[1:]
-	u := strings.IndexByte(body, 'u')
-	if u < 0 {
-		return 0, false
-	}
-	after := start + 1 + u + 1
-	if after < end && text[after] == '=' {
-		return after + 1, true
-	}
-	if after < end {
-		return after, true
-	}
-	value, _, ok := nextShellWord(text, end, quotes, &quoteIndex)
-	return value, ok
-}
-
-func toolPasswordMatches(text string) []contextMatch {
-	var matches []contextMatch
-	for _, segment := range commandSegments(text) {
-		part := text[segment[0]:segment[1]]
-		quotes := pairedQuoteRanges(part)
-		quoteIndex := 0
-		if command, ok := findCommandWord(part, "sshpass", false); ok {
-			for at := command.end; ; {
-				start, end, ok := nextShellWord(part, at, quotes, &quoteIndex)
-				if !ok {
-					break
-				}
-				token := part[start:end]
-				at = end
-				if !strings.HasPrefix(token, "-") {
-					break
-				}
-				if token == "-p" {
-					valueAt, _, ok := nextShellWord(part, end, quotes, &quoteIndex)
-					if ok {
-						addToolPassword(part, segment[0], valueAt, &matches)
-					}
-					break
-				}
-				if strings.HasPrefix(token, "-p") && len(token) > 2 {
-					addToolPassword(part, segment[0], start+2, &matches)
-					break
-				}
-				if token == "-f" || token == "-d" {
-					_, at, _ = nextShellWord(part, at, quotes, &quoteIndex)
-				}
-			}
-		}
-		for _, tool := range [...]string{"mysql", "mariadb"} {
-			command, ok := findCommandWord(part, tool, true)
-			if !ok {
-				continue
-			}
-			for at := command.end; ; {
-				start, end, ok := nextShellWord(part, at, quotes, &quoteIndex)
-				if !ok {
-					break
-				}
-				at = end
-				if strings.HasPrefix(part[start:end], "-p") && end-start > 2 {
-					addToolPassword(part, segment[0], start+2, &matches)
-				}
-			}
-		}
-	}
-	return matches
-}
-
 func addToolPassword(text string, offset, at int, matches *[]contextMatch) {
 	value, ok := scanValue(text, at, false)
 	if ok && (value.quoted || flagValueAllowed(text[value.start:value.end])) && valueIsValue(text, value, "", "password", false) {
@@ -484,7 +368,13 @@ func findCommandWord(text, name string, prefix bool) (contextValue, bool) {
 			continue
 		}
 		end := start + len(name)
-		if prefix || commandRightBoundary(text, end) {
+		if prefix {
+			for end < len(text) && !strings.ContainsRune(" \t\r\n'\"`)", rune(text[end])) {
+				end++
+			}
+			return contextValue{start, end, false}, true
+		}
+		if commandRightBoundary(text, end) {
 			return contextValue{start, end, false}, true
 		}
 	}
@@ -519,7 +409,7 @@ func commandRightBoundary(text string, at int) bool {
 }
 
 func commandSegments(text string) [][2]int {
-	quoted := pairedQuoteRanges(text)
+	quoted := quoteSpans(text)
 	var segments [][2]int
 	start := 0
 	quoteRange := 0
@@ -541,76 +431,6 @@ func commandSegments(text string) [][2]int {
 	return append(segments, [2]int{start, len(text)})
 }
 
-func pairedQuoteRanges(text string) [][2]int {
-	type quoteForm struct {
-		quote   byte
-		slashes int
-	}
-	pending := make(map[quoteForm]int)
-	ranges := make([][2]int, 0)
-	for i := 0; i < len(text); i++ {
-		if text[i] != '\'' && text[i] != '"' && text[i] != '`' {
-			continue
-		}
-		start := i
-		for start > 0 && text[start-1] == '\\' {
-			start--
-		}
-		form := quoteForm{text[i], i - start}
-		if open, ok := pending[form]; ok {
-			ranges = append(ranges, [2]int{open, i + 1})
-			delete(pending, form)
-		} else {
-			pending[form] = start
-		}
-	}
-	if len(ranges) < 2 {
-		return ranges
-	}
-	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
-	return ranges
-}
-
-func nextShellWord(text string, at int, quoted [][2]int, quoteIndex *int) (int, int, bool) {
-	for at < len(text) {
-		if text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r' {
-			at++
-			continue
-		}
-		if strings.HasPrefix(text[at:], "\\\n") {
-			at += 2
-			continue
-		}
-		break
-	}
-	if at >= len(text) {
-		return 0, 0, false
-	}
-	start := at
-	quoteRange := *quoteIndex
-	for quoteRange < len(quoted) && at >= quoted[quoteRange][1] {
-		quoteRange++
-	}
-	*quoteIndex = quoteRange
-	for at < len(text) {
-		for quoteRange < len(quoted) && at >= quoted[quoteRange][1] {
-			quoteRange++
-		}
-		if quoteRange < len(quoted) && at >= quoted[quoteRange][0] {
-			at = quoted[quoteRange][1]
-			quoteRange++
-			*quoteIndex = quoteRange
-			continue
-		}
-		c := text[at]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.HasPrefix(text[at:], "\\\n") {
-			break
-		}
-		at++
-	}
-	return start, at, true
-}
-
 func scanValue(text string, at int, colon bool) (contextValue, bool) {
 	for at < len(text) {
 		if text[at] == ' ' || text[at] == '\t' {
@@ -623,43 +443,21 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		}
 		break
 	}
-	if at >= len(text) || strings.HasPrefix(text[at:], "[скрыто:") || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' {
+	if at >= len(text) || strings.HasPrefix(text[at:], maskMarker) || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' || text[at] == '`' {
 		return contextValue{}, false
 	}
-	quoteAt, quote := at, byte(0)
-	if text[at] == '`' {
-		return contextValue{}, false
+	quoteAt := at
+	for quoteAt < len(text) && text[quoteAt] == '\\' {
+		quoteAt++
 	}
-	if text[at] == '\'' || text[at] == '"' {
-		quote = text[at]
-	} else if text[at] == '\\' {
-		i := at
-		for i < len(text) && text[i] == '\\' {
-			i++
+	if slashes := quoteAt - at; quoteAt < len(text) && (text[quoteAt] == '\'' || text[quoteAt] == '"') && opensQuote(text[quoteAt], slashes) {
+		end := closingQuote(text, quoteAt, slashes)
+		if end < 0 {
+			return contextValue{}, false
 		}
-		if i < len(text) && text[i] == '"' {
-			quoteAt, quote = i, '"'
-		}
-	}
-	if quote != 0 {
-		openStart := quoteAt
-		for openStart > at && text[openStart-1] == '\\' {
-			openStart--
-		}
-		slashes := quoteAt - openStart
-		for i := quoteAt + 1; i < len(text); i++ {
-			if text[i] != quote {
-				continue
-			}
-			closeStart := i
-			for closeStart > 0 && text[closeStart-1] == '\\' {
-				closeStart--
-			}
-			if i-closeStart == slashes {
-				return contextValue{quoteAt + 1, closeStart, true}, closeStart > quoteAt+1
-			}
-		}
-		return contextValue{}, false
+		// The closing mark of a nested string takes its slashes with it.
+		end -= slashes
+		return contextValue{quoteAt + 1, end, true}, end > quoteAt+1
 	}
 	start := at
 	for at < len(text) {
@@ -681,11 +479,12 @@ func valueIsValue(text string, value contextValue, name, kind string, colon bool
 }
 
 func quotedIsValue(value string) bool {
-	return value != "" && !isReference(value) && !isPlaceholder(value) && !strings.Contains(value, "[скрыто:")
+	// A value starting with a space is the gap between two neighbouring quotes: "NAME=" .env "...".
+	return value != "" && !strings.ContainsRune(" \t\r\n", rune(value[0])) && !isReference(value) && !isPlaceholder(value) && !strings.Contains(value, maskMarker)
 }
 
 func bareIsValue(value, name, kind string, colon bool) bool {
-	if value == "" || isReference(value) || isPlaceholder(value) || strings.Contains(value, "[скрыто:") || strings.ContainsAny(value, "('") || equalSecretName(value, name) {
+	if value == "" || isReference(value) || isPlaceholder(value) || strings.Contains(value, maskMarker) || strings.ContainsAny(value, "('") || equalSecretName(value, name) {
 		return false
 	}
 	if strings.Contains(value, ".") {
@@ -701,36 +500,34 @@ func bareIsValue(value, name, kind string, colon bool) bool {
 		}
 	}
 	if kind == "token" {
-		digits := true
-		for i := 0; i < len(value); i++ {
-			if value[i] < '0' || value[i] > '9' {
-				digits = false
-				break
-			}
-		}
-		if digits && len(value) < 8 || colon && !digits && len(value) < 8 {
+		if len(value) < 8 && (colon || onlyDigits(value)) {
 			return false
 		}
 	}
 	return true
 }
 
+const (
+	maskMarker     = "[скрыто:"
+	maskMarkerSpan = 64 // the longest marker fits: a kind is a short word
+)
+
 func withinMaskMarker(text string, at int) bool {
 	if at < 0 || at > len(text) {
 		return false
 	}
-	start := max(at-len("[скрыто:"), 0)
-	open := strings.LastIndex(text[start:at], "[скрыто:")
+	start := max(at-len(maskMarker), 0)
+	open := strings.LastIndex(text[start:at], maskMarker)
 	if open < 0 {
 		return false
 	}
 	open += start
-	close := strings.IndexByte(text[open:], ']')
+	close := strings.IndexByte(text[open:min(open+maskMarkerSpan, len(text))], ']')
 	return close >= 0 && open+close >= at
 }
 
 func isReference(value string) bool {
-	return strings.HasPrefix(value, "${") || strings.HasPrefix(value, "$(") || strings.HasPrefix(value, "`") || len(value) > 1 && value[0] == '$' && ((value[1] >= 'A' && value[1] <= 'Z') || (value[1] >= 'a' && value[1] <= 'z') || value[1] == '_') || strings.HasPrefix(value, `\"$`)
+	return len(value) > 1 && value[0] == '$' && (onlyDigits(value[1:]) || value == "$@" || value == "$*") || strings.HasPrefix(value, "${") || strings.HasPrefix(value, "$(") || strings.HasPrefix(value, "`") || len(value) > 1 && value[0] == '$' && ((value[1] >= 'A' && value[1] <= 'Z') || (value[1] >= 'a' && value[1] <= 'z') || value[1] == '_') || strings.HasPrefix(value, `\"$`)
 }
 
 func equalSecretName(value, name string) bool {
@@ -1019,4 +816,283 @@ func boundaryBefore(text string, index int) bool {
 func escapeBefore(text string, index int) bool {
 	start := max(index-32, 0)
 	return escapeRE.MatchString(text[start:index])
+}
+
+// notSecretHere keeps forms of ordinary output that look like a name and a value:
+// test results (PASS: x, pass=0), messages of the passwd tool, a path before a colon.
+func notSecretHere(text string, at int, name, delimiter, value string) bool {
+	if delimiter == ":" && at > 0 && text[at-1] == '/' {
+		return true
+	}
+	if lower := strings.ToLower(name); lower != "pass" && lower != "passwd" {
+		return false
+	}
+	return delimiter == ":" || onlyDigits(value)
+}
+
+func curlMatches(text string) []contextMatch {
+	var matches []contextMatch
+	for _, segment := range commandSegments(text) {
+		part := text[segment[0]:segment[1]]
+		command, ok := findCommandWord(part, "curl", false)
+		if !ok {
+			continue
+		}
+		words := wordsAfter(part, command.end)
+		for {
+			start, end, ok := words.next()
+			if !ok {
+				break
+			}
+			valueAt, found := curlUserValue(part, start, end, words)
+			if !found {
+				continue
+			}
+			if password, ok := curlPassword(part, valueAt); ok {
+				matches = append(matches, contextMatch{segment[0] + password.start, segment[0] + password.end, "password"})
+			}
+		}
+	}
+	return matches
+}
+
+func curlUserValue(text string, start, end int, words *shellWords) (int, bool) {
+	token := text[start:end]
+	if strings.HasPrefix(token, "--user=") {
+		return start + len("--user="), true
+	}
+	if token == "--user" {
+		value, _, ok := words.next()
+		return value, ok
+	}
+	if !strings.HasPrefix(token, "-") || strings.HasPrefix(token, "--") {
+		return 0, false
+	}
+	body := token[1:]
+	u := strings.IndexByte(body, 'u')
+	if u < 0 || !onlyLetters(body[:u]) {
+		return 0, false
+	}
+	after := start + 1 + u + 1
+	if after < end && text[after] == '=' {
+		return after + 1, true
+	}
+	if after < end {
+		return after, true
+	}
+	value, _, ok := words.next()
+	return value, ok
+}
+
+// curlPassword finds the part after the first colon of user:password, in one
+// value or split by quotes: admin:'x' and 'admin':'x'.
+func curlPassword(text string, at int) (contextValue, bool) {
+	value, ok := scanValue(text, at, false)
+	if !ok || strings.Contains(text[value.start:value.end], maskMarker) {
+		return contextValue{}, false
+	}
+	password := contextValue{}
+	colon := strings.IndexByte(text[value.start:value.end], ':')
+	switch {
+	case colon >= 0 && value.start+colon+1 < value.end:
+		password = contextValue{value.start + colon + 1, value.end, value.quoted}
+	case colon >= 0 && !value.quoted && value.end < len(text) && (text[value.end] == '\'' || text[value.end] == '"'):
+		password, ok = scanValue(text, value.end, false)
+	case colon < 0 && value.quoted:
+		after := value.end
+		for after < len(text) && text[after] == '\\' {
+			after++
+		}
+		if after+1 >= len(text) || text[after+1] != ':' {
+			return contextValue{}, false
+		}
+		password, ok = scanValue(text, after+2, false)
+	default:
+		return contextValue{}, false
+	}
+	return password, ok && valueIsValue(text, password, "", "password", false)
+}
+
+func toolPasswordMatches(text string) []contextMatch {
+	var matches []contextMatch
+	for _, segment := range commandSegments(text) {
+		part := text[segment[0]:segment[1]]
+		sshpassMatches(part, segment[0], &matches)
+		for _, tool := range [...]string{"mysql", "mariadb"} {
+			if command, ok := findCommandWord(part, tool, true); ok {
+				words := wordsAfter(part, command.end)
+				for {
+					start, end, ok := words.next()
+					if !ok {
+						break
+					}
+					if strings.HasPrefix(part[start:end], "-p") && end-start > 2 {
+						addToolPassword(part, segment[0], start+2, &matches)
+					}
+				}
+			}
+		}
+	}
+	return matches
+}
+
+func sshpassMatches(part string, offset int, matches *[]contextMatch) {
+	command, ok := findCommandWord(part, "sshpass", false)
+	if !ok {
+		return
+	}
+	words := wordsAfter(part, command.end)
+	for {
+		start, end, ok := words.next()
+		if !ok || !strings.HasPrefix(part[start:end], "-") {
+			return
+		}
+		token := part[start:end]
+		switch {
+		case token == "-p":
+			if valueAt, _, ok := words.next(); ok {
+				addToolPassword(part, offset, valueAt, matches)
+			}
+			return
+		case strings.HasPrefix(token, "-p"):
+			addToolPassword(part, offset, start+2, matches)
+			return
+		case token == "-f" || token == "-d":
+			words.next()
+		}
+	}
+}
+
+// quoteSpans lists closed quotes from left to right, so a quote inside another is
+// data. A quote without a pair is an ordinary character. Each form is searched to
+// the end of the text at most once.
+func quoteSpans(text string) [][2]int {
+	type quoteForm struct {
+		quote   byte
+		slashes int
+	}
+	var spans [][2]int
+	unclosed := map[quoteForm]bool{}
+	for i := 0; i < len(text); i++ {
+		if text[i] != '\'' && text[i] != '"' && text[i] != '`' {
+			continue
+		}
+		start := i
+		for start > 0 && text[start-1] == '\\' {
+			start--
+		}
+		form := quoteForm{text[i], i - start}
+		if !opensQuote(text[i], form.slashes) || unclosed[form] {
+			continue
+		}
+		end := closingQuote(text, i, form.slashes)
+		if end < 0 {
+			unclosed[form] = true
+			continue
+		}
+		spans = append(spans, [2]int{start, end + 1})
+		i = end
+	}
+	return spans
+}
+
+// opensQuote: a backslash before an apostrophe only escapes it; before a double
+// quote 1, 3, 7... backslashes are the quote of a string nested in a string.
+func opensQuote(quote byte, slashes int) bool {
+	if quote != '"' {
+		return slashes == 0
+	}
+	return slashes&(slashes+1) == 0
+}
+
+// closingQuote returns the index of the quote closing the one at quoteAt, or -1.
+// Apostrophes have no escapes. A double quote at its nesting level closes with an
+// even number of escaped backslashes before it: each such backslash takes
+// slashes+1 characters, and an odd one would escape the quote itself.
+func closingQuote(text string, quoteAt, slashes int) int {
+	quote := text[quoteAt]
+	for i := quoteAt + 1; i < len(text); i++ {
+		if text[i] != quote {
+			continue
+		}
+		if quote != '"' {
+			return i
+		}
+		count := 0
+		for i-count-1 > quoteAt && text[i-count-1] == '\\' {
+			count++
+		}
+		extra := count - slashes
+		if extra >= 0 && extra%(slashes+1) == 0 && extra/(slashes+1)%2 == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// shellWords walks the words after a command. Quotes are counted from the end of
+// the command word: a command inside a quote ends at that quote's closing mark,
+// which then has no pair and is an ordinary character.
+type shellWords struct {
+	text   string
+	at     int
+	base   int
+	quotes [][2]int
+}
+
+func wordsAfter(text string, at int) *shellWords {
+	return &shellWords{text: text, at: at, base: at, quotes: quoteSpans(text[at:])}
+}
+
+func (w *shellWords) next() (int, int, bool) {
+	text, at := w.text, w.at
+	for at < len(text) {
+		if text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r' {
+			at++
+			continue
+		}
+		if strings.HasPrefix(text[at:], "\\\n") {
+			at += 2
+			continue
+		}
+		break
+	}
+	w.at = at
+	if at >= len(text) {
+		return 0, 0, false
+	}
+	start := at
+	for at < len(text) {
+		for len(w.quotes) > 0 && at >= w.base+w.quotes[0][1] {
+			w.quotes = w.quotes[1:]
+		}
+		if len(w.quotes) > 0 && at >= w.base+w.quotes[0][0] {
+			at = w.base + w.quotes[0][1]
+			continue
+		}
+		if c := text[at]; c == ' ' || c == '\t' || c == '\n' || c == '\r' || strings.HasPrefix(text[at:], "\\\n") {
+			break
+		}
+		at++
+	}
+	w.at = at
+	return start, at, true
+}
+
+func onlyLetters(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isLetter(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func onlyDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
