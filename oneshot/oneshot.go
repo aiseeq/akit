@@ -309,10 +309,11 @@ func run(ctx context.Context, cmd *exec.Cmd, dir, stdin string) (out []byte, std
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err = cmd.Output()
+	stderrText = strings.TrimSpace(stderr.String())
 	if err != nil && ctx.Err() != nil {
-		err = ctx.Err()
+		return out, stderrText, ctx.Err() // срыв по сроку важнее кода, с которым убитый CLI вышел
 	}
-	return out, strings.TrimSpace(stderr.String()), err
+	return out, stderrText, err
 }
 
 // cliError — сбой запуска CLI с его причиной, сокращённой до хвоста.
