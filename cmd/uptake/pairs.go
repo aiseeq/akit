@@ -307,6 +307,11 @@ func clipOutput(s string, keep int) string {
 	if len(s) <= 2*keep {
 		return s
 	}
+	// Cells mask what they get; a value cut here would no longer be recognized.
+	s = maskSecrets(s)
+	if len(s) <= 2*keep {
+		return s
+	}
 	head, tail := keep, len(s)-keep
 	for head > 0 && !utf8.RuneStart(s[head]) {
 		head--
@@ -907,7 +912,7 @@ func (u *run) collectTKRefusal(path, agent string, e transcript.Event, c shellcm
 		if !strings.HasPrefix(line, "tk: ") || strings.Contains(line, " -h for usage") {
 			continue
 		}
-		msg := strings.TrimPrefix(line, "tk: ")
+		msg := maskSecrets(strings.TrimPrefix(line, "tk: "))
 		kind := strings.ToLower(u.pairPatterns.tkTicketID.ReplaceAllString(u.pairPatterns.tkPath.ReplaceAllString(msg, " "), " "))
 		kind = u.pairPatterns.tkKindClean.ReplaceAllString(kind, " ")
 		kind = strings.Join(strings.Fields(kind), " ")

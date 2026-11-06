@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/secretmask"
+	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -78,5 +79,36 @@ func TestTableFileReadsCleanAsAWhole(t *testing.T) {
 	}
 	if masked, found := secretmask.Mask(file); len(found) > 0 {
 		t.Errorf("the file as a whole still has %v:\n%s", found, masked)
+	}
+}
+
+// Long output keeps only its ends: the cut must not leave a piece of a secret the
+// mask no longer recognizes. Wide runes bring the cut inside the cell's limit.
+func TestClippedOutputMasksSecretAtTheCut(t *testing.T) {
+	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
+	out := strings.Repeat("─", 1361) + key + strings.Repeat("─", 3000)
+	u := newRun(time.Time{}, time.Time{}, 3, t.TempDir(), t.TempDir())
+	u.pairCalls = []pairCall{{tool: "prior", way: "new", id: "synthetic:1", code: -1, outcome: "unknown", command: "prior x", out: clipOutput(out, pairOutputKeep)}}
+	if err := u.writePairUnknown(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(u.outputDir, "pair-unknown.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), key[:12]) {
+		t.Errorf("a piece of the secret stayed beside the cut:\n%s", data)
+	}
+}
+
+func TestTKRefusalKindMasksSecret(t *testing.T) {
+	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
+	u := newRun(time.Time{}, time.Time{}, 3, t.TempDir(), t.TempDir())
+	u.collectTKRefusal("synthetic", "claude", transcript.Event{}, shellcmd.Call{Name: "tk", Args: []string{"note", "x"}}, "tk: "+key, 1)
+	if len(u.tkRefusals) != 1 {
+		t.Fatalf("the fixture made %d refusals", len(u.tkRefusals))
+	}
+	if kind := u.tkRefusals[0].kind; strings.Contains(kind, "proj") {
+		t.Errorf("the refusal kind keeps the secret: %q", kind)
 	}
 }
