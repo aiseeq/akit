@@ -106,6 +106,41 @@ func TestClaudeRefusalInErrors(t *testing.T) {
 	}
 }
 
+// Поле errors другой формы не отнимает ни ответ, ни причину отказа.
+func TestClaudeErrorsOfAnyShape(t *testing.T) {
+	for _, errs := range []string{`[{"message":"warn"}]`, `"warn"`, `[1,2]`, `null`, `[]`} {
+		fakeCLI(t, "claude", `{"is_error":false,"result":"ответ","errors":`+errs+`,"usage":{"output_tokens":7}}`)
+		res, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)})
+		if err != nil || res.Text != "ответ" || res.Usage.Output != 7 {
+			t.Errorf("errors %s, answer: %+v %v", errs, res, err)
+		}
+		fakeCLI(t, "claude", `{"is_error":false,"result":"","structured_output":{"a":1},"errors":`+errs+`,"usage":{}}`)
+		res, err = Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)})
+		if err != nil || res.Text != `{"a":1}` {
+			t.Errorf("errors %s, schema answer: %+v %v", errs, res, err)
+		}
+		refusal := `{"is_error":true,"result":"refused","errors":` + errs + `,"usage":{}}`
+		fakeCLI(t, "claude", refusal)
+		if _, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)}); err == nil ||
+			!strings.Contains(err.Error(), "refused") {
+			t.Errorf("errors %s, code 0 refusal: %v", errs, err)
+		}
+		fakeFailing(t, "claude", refusal, "")
+		if _, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)}); err == nil ||
+			!strings.Contains(err.Error(), "exit status 1: refused") {
+			t.Errorf("errors %s, code 1 refusal: %v", errs, err)
+		}
+	}
+}
+
+func TestClaudeOutputNotJSON(t *testing.T) {
+	fakeCLI(t, "claude", "not json")
+	_, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)})
+	if err == nil || !strings.Contains(err.Error(), "not JSON") {
+		t.Errorf("err %v", err)
+	}
+}
+
 // Ненулевой код без отказа в JSON: причина остаётся в stderr.
 func TestClaudeNonZeroExitKeepsStderr(t *testing.T) {
 	for _, stdout := range []string{"not json", `{"is_error":false,"result":"частичный ответ","usage":{}}`,
@@ -199,6 +234,8 @@ func TestCodexNonZeroExit(t *testing.T) {
 {"type":"turn.failed","error":{"message":"out of credits"}}`, "", "exit status 1: out of credits", "credits; out"},
 		{"only error events, stderr stays too", `{"type":"error","message":"Reconnecting... 5/5"}`, "auth.json is corrupt",
 			"exit status 1: Reconnecting... 5/5; auth.json is corrupt", ""},
+		{"long stderr does not push out the event", `{"type":"error","message":"model is overloaded"}`,
+			strings.Repeat("W", 400), "exit status 1: model is overloaded; …WWW", ""},
 		{"turn.failed without text, stderr stays too", `{"type":"error","message":"boom"}
 {"type":"turn.failed","error":{}}`, "auth.json is corrupt", "exit status 1: boom; auth.json is corrupt", ""},
 		{"no events, stderr stays", `{"type":"thread.started"}`, "config is broken",
@@ -238,14 +275,16 @@ func TestCodexNonZeroExitKeepsUsage(t *testing.T) {
 
 // Строка длиннее буфера не отнимает уже прочитанный отказ, и сбой чтения виден в причине.
 func TestCodexOverlongLineKeepsRefusal(t *testing.T) {
-	out := []byte(`{"type":"turn.failed","error":{"message":"out of credits"}}` + "\n" + strings.Repeat("x", 65<<20))
-	events, parseErr := parseCodex(out)
-	if parseErr == nil {
-		t.Fatal("an overlong line must be a read error")
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"out of credits\"}}'\n" +
+		"head -c 68157440 /dev/zero | tr '\\0' x\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	why := events.exitReason("", parseErr)
-	if !strings.Contains(why, "out of credits") || !strings.Contains(why, "read codex output") {
-		t.Errorf("reason %q", why)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	_, err := Ask(context.Background(), Request{Model: "sol", Input: "x", Approved: approved(t)})
+	if err == nil || !strings.Contains(err.Error(), "out of credits") || !strings.Contains(err.Error(), "read codex output") {
+		t.Errorf("err %v", err)
 	}
 }
 

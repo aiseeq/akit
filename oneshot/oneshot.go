@@ -52,8 +52,8 @@ type Result struct {
 	Usage price.Usage
 }
 
-// Ask отдаёт запрос модели и ждёт её последний ответ. Ошибка CLI несёт хвост его stderr, а у codex при ненулевом
-// коде — текст отказа из событий stdout, если он там есть.
+// Ask отдаёт запрос модели и ждёт её последний ответ. Ошибка CLI при ненулевом коде несёт текст отказа со stdout,
+// если он там есть, иначе хвост stderr; у codex при одних событиях error — и то и другое.
 func Ask(ctx context.Context, req Request) (Result, error) {
 	path := req.Approved
 	if path == "" {
@@ -138,10 +138,10 @@ func askClaude(ctx context.Context, req Request) (string, price.Usage, error) {
 	if err != nil {
 		// Отказ («исчерпан бюджет») claude пишет в JSON на stdout с кодом 1, stderr при этом пуст.
 		why := r.reason()
-		if parseErr != nil || !r.IsError || why == "" {
+		if !r.IsError || why == "" {
 			why = stderr
 		}
-		return "", u, cliError("claude", err, why)
+		return "", u, cliError("claude", err, short(why))
 	}
 	if parseErr != nil {
 		return "", price.Usage{}, fmt.Errorf("oneshot: claude output is not JSON: %w", parseErr)
@@ -158,8 +158,9 @@ func askClaude(ctx context.Context, req Request) (string, price.Usage, error) {
 // claudeOutput — ответ `claude -p --output-format json`, нужные поля.
 type claudeOutput struct {
 	Result string `json:"result"`
-	// Errors — причины отказа; result при этом бывает пуст.
-	Errors []string `json:"errors"`
+	// Errors — причины отказа; result при этом бывает пуст. Форма поля не описана, видели список строк: сырой JSON,
+	// чтобы другая форма не отняла готовый ответ.
+	Errors json.RawMessage `json:"errors"`
 	// StructuredOutput — ответ по --json-schema.
 	StructuredOutput json.RawMessage `json:"structured_output"`
 	IsError          bool            `json:"is_error"`
@@ -171,10 +172,16 @@ type claudeOutput struct {
 	} `json:"usage"`
 }
 
-// reason — текст отказа: result и errors, без пустых.
+// reason — текст отказа: result и errors, без пустых; errors другой формы — как есть.
 func (r claudeOutput) reason() string {
-	all := slices.DeleteFunc(slices.Concat([]string{r.Result}, r.Errors), func(s string) bool { return s == "" })
-	return strings.Join(all, "; ")
+	all := []string{r.Result}
+	var list []string
+	if err := json.Unmarshal(r.Errors, &list); err == nil {
+		all = append(all, list...)
+	} else if len(r.Errors) > 0 {
+		all = append(all, string(r.Errors))
+	}
+	return strings.Join(slices.DeleteFunc(all, func(s string) bool { return s == "" }), "; ")
 }
 
 // codexOff — возможности codex, которые разовому ответу не нужны: без них ответ без вызова инструментов, а вход
@@ -254,11 +261,14 @@ func (e codexEvents) reasons() []string {
 
 // exitReason — причина ненулевого кода. Отказ («кончились кредиты») codex пишет событием в stdout, stderr при этом
 // пуст. Текст turn.failed называет причину сам; одни события error могут быть переподключениями, и тогда причина
-// в stderr, поэтому он остаётся.
+// в stderr, поэтому он остаётся. Части сокращаются порознь: длинный stderr не вытесняет текст событий.
 func (e codexEvents) exitReason(stderr string, parseErr error) string {
-	why := e.reasons()
+	var why []string
+	if events := strings.Join(e.reasons(), "; "); events != "" {
+		why = append(why, short(events))
+	}
 	if strings.Join(e.failed, "") == "" && stderr != "" {
-		why = append(why, stderr)
+		why = append(why, short(stderr))
 	}
 	if parseErr != nil {
 		why = append(why, parseErr.Error())
@@ -344,9 +354,9 @@ func run(ctx context.Context, cmd *exec.Cmd, dir, stdin string) (out []byte, std
 	return out, stderrText, err
 }
 
-// cliError — сбой запуска CLI с его причиной, сокращённой до хвоста.
+// cliError — сбой запуска CLI с его причиной, уже сокращённой вызывающим.
 func cliError(name string, err error, why string) error {
-	return fmt.Errorf("oneshot: %s: %w: %s", name, err, short(why))
+	return fmt.Errorf("oneshot: %s: %w: %s", name, err, why)
 }
 
 // short — хвост сообщения не длиннее 300 рун.
