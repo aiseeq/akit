@@ -1,0 +1,24 @@
+# Report path: %S/akit/uptake/current/report.md. A run is written beside it and
+# swapped in whole on success, so a killed or failed run leaves the last report
+# untouched and its age tells the reader that the run is missing.
+# Install with `systemctl --user link` of both files, then `enable --now` the timer.
+[Unit]
+Description=uptake: rolling 7-day report of agent tools
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h
+# The tables quote commands from transcripts.
+UMask=0077
+Nice=10
+# graft does not move a command out of a service, so its IO weight and default ceiling are set here.
+IOWeight=10
+MemoryMax=34%
+# Covers the wait in the heavy queue too.
+TimeoutStartSec=4h
+ExecStartPre=/usr/bin/rm -rf %S/akit/uptake/next
+ExecStartPre=/usr/bin/mkdir -p %S/akit/uptake/current
+# --local: the transcripts are on this machine, a busy queue must not send the run elsewhere.
+ExecStart=%h/bin/graft exec --heavy --local -- %h/bin/uptake --since 7d --out %S/akit/uptake/next
+ExecStartPost=/usr/bin/mv -T --exchange %S/akit/uptake/next %S/akit/uptake/current
