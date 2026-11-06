@@ -838,7 +838,7 @@ func (u *run) collectCandidate(path string, evs []transcript.Event, i int, cmd, 
 		_, yes := u.pairOldIDs[eventID][pair]
 		id := pair + ":" + eventID
 		context := u.candidateContext(evs, i)
-		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: id, pair: pair, command: truncateRunes(cmd, 300), context: context, yes: yes, agent: agent})
+		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: id, pair: pair, command: truncateRunes(maskSecrets(cmd), 300), context: context, yes: yes, agent: agent})
 	}
 }
 
@@ -1080,7 +1080,7 @@ func (u *run) writePairUnknown() error {
 		}
 		reason := pairUnknownReason(*c)
 		counts[reason]++
-		fmt.Fprintf(&b, "%s\t%s\t%d\t%s\t%s\t%s\n", c.tool, c.id, c.code, escapePairField(truncateRunes(c.command, 300)), escapePairField(truncateRunes(c.out, 2000)), reason)
+		fmt.Fprintf(&b, "%s\t%s\t%d\t%s\t%s\t%s\n", c.tool, c.id, c.code, escapePairField(truncateRunes(maskSecrets(c.command), 300)), escapePairField(truncateRunes(maskSecrets(c.out), 2000)), reason)
 	}
 	u.pairUnknownReasons = counts
 	return u.save("pair-unknown.tsv", b.String())

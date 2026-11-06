@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aiseeq/akit/secretmask"
 	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
@@ -128,7 +129,13 @@ func (u *run) valid(t time.Time) bool {
 	b, errB := time.Parse(time.RFC3339Nano, u.end)
 	return errA == nil && errB == nil && !t.Before(a) && t.Before(b)
 }
+func maskSecrets(s string) string {
+	masked, _ := secretmask.Mask(s)
+	return masked
+}
+
 func (u *run) clean(s string) string {
+	s = maskSecrets(s)
 	s = strings.ReplaceAll(s, "\t", " ")
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", "\\n")
@@ -1724,7 +1731,7 @@ func (u *run) appendUnknownExamples(rng *rand.Rand) {
 func (u *run) writeExampleRows(f *os.File, w *bufio.Writer) error {
 	fmt.Fprintln(w, "kind\tfile:line\tagent\tcommand\toutput\tnext\treason")
 	for _, e := range u.examples {
-		cmd := e.command
+		cmd := maskSecrets(e.command)
 		if len([]rune(cmd)) > 300 {
 			cmd = string([]rune(cmd)[:300])
 		}
