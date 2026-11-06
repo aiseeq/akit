@@ -1,7 +1,6 @@
 // Package oneshot — разовый вызов одобренной модели через её CLI: текст на вход, последний ответ и расход на выход.
 // opus — `claude -p` без инструментов, настроек и MCP; sol и luna — `codex exec` без пользовательского конфига,
 // правил, доков проекта и инструментов, в песочнице только для чтения. Подписки те же, что у агентов.
-// и других потребителей.
 package oneshot
 
 import (
@@ -14,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +38,9 @@ type Request struct {
 	Timeout time.Duration
 	// Approved — файл одобренных моделей; пусто — ~/.config/models/approved.
 	Approved string
+	// CodexHome — абсолютный путь, CODEX_HOME дочернего codex: так вызывающий выбирает учётку; пусто — окружение
+	// процесса. С моделью claude — ошибка: у неё нет такой настройки, и вызов ушёл бы не туда, куда просили.
+	CodexHome string
 }
 
 // Result — ответ модели.
@@ -49,7 +52,8 @@ type Result struct {
 	Usage price.Usage
 }
 
-// Ask отдаёт запрос модели и ждёт её последний ответ. Ошибка CLI несёт хвост его stderr.
+// Ask отдаёт запрос модели и ждёт её последний ответ. Ошибка CLI несёт хвост его stderr, а у codex при ненулевом
+// коде — текст отказа из событий stdout, если он там есть.
 func Ask(ctx context.Context, req Request) (Result, error) {
 	path := req.Approved
 	if path == "" {
@@ -82,6 +86,9 @@ func Ask(ctx context.Context, req Request) (Result, error) {
 	}
 	res := Result{ID: id}
 	if req.Model == "opus" {
+		if req.CodexHome != "" {
+			return Result{}, fmt.Errorf("oneshot: CodexHome is set for model %q, which does not run on codex", req.Model)
+		}
 		res.Text, res.Usage, err = askClaude(ctx, req)
 	} else {
 		res.Text, res.Usage, err = askCodex(ctx, req, id, tmp)
@@ -123,9 +130,9 @@ func askClaude(ctx context.Context, req Request) (string, price.Usage, error) {
 	if req.Schema != "" {
 		args = append(args, "--json-schema", req.Schema)
 	}
-	out, err := run(ctx, exec.CommandContext(ctx, "claude", args...), req.Dir, req.Input)
+	out, stderr, err := run(ctx, exec.CommandContext(ctx, "claude", args...), req.Dir, req.Input)
 	if err != nil {
-		return "", price.Usage{}, err
+		return "", price.Usage{}, cliError("claude", err, stderr)
 	}
 	var r struct {
 		Result string `json:"result"`
@@ -183,9 +190,18 @@ func askCodex(ctx context.Context, req Request, id, tmp string) (string, price.U
 		}
 		args = append(args, "--output-schema", p)
 	}
-	out, err := run(ctx, exec.CommandContext(ctx, "codex", append(args, "-")...), req.Dir, req.Input)
+	cmd := exec.CommandContext(ctx, "codex", append(args, "-")...)
+	if req.CodexHome != "" {
+		cmd.Env = []string{"CODEX_HOME=" + req.CodexHome}
+	}
+	out, stderr, err := run(ctx, cmd, req.Dir, req.Input)
 	if err != nil {
-		return "", price.Usage{}, err
+		// Отказ («кончились кредиты») codex пишет событием в stdout, stderr при этом пуст.
+		events, parseErr := parseCodex(out)
+		if why := events.refusal(); parseErr == nil && why != "" {
+			return "", events.usage, cliError("codex", err, why)
+		}
+		return "", price.Usage{}, cliError("codex", err, stderr)
 	}
 	return codexAnswer(out)
 }
@@ -208,12 +224,23 @@ type codexEvent struct {
 	} `json:"usage"`
 }
 
-// codexAnswer — последнее сообщение агента и расход из событий codex. Кэш codex входит в input_tokens, reasoning —
-// в output_tokens.
-func codexAnswer(out []byte) (string, price.Usage, error) {
-	var msg string
-	var u price.Usage
-	var failed, errs []string // turn.failed — ход не удался; error — и переподключения, после которых ответ бывает
+// codexEvents — что вынесено из событий codex одного вызова.
+type codexEvents struct {
+	msg    string // последнее сообщение агента
+	usage  price.Usage
+	failed []string // turn.failed — ход не удался
+	errs   []string // error — и переподключения, после которых ответ бывает
+}
+
+// refusal — текст отказа из событий: сначала error, в конце turn.failed, потому что short оставляет хвост. Отказ
+// codex пишет обоими событиями с одним текстом: повтор подряд убирается.
+func (e codexEvents) refusal() string {
+	return strings.Join(slices.Compact(slices.Concat(e.errs, e.failed)), "; ")
+}
+
+// parseCodex разбирает вывод `codex exec --json`. Кэш codex входит в input_tokens, reasoning — в output_tokens.
+func parseCodex(out []byte) (codexEvents, error) {
+	var ev codexEvents
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
 	for sc.Scan() {
@@ -224,28 +251,37 @@ func codexAnswer(out []byte) (string, price.Usage, error) {
 		switch e.Type {
 		case "item.completed":
 			if e.Item.Type == "agent_message" {
-				msg = e.Item.Text
+				ev.msg = e.Item.Text
 			}
 		case "turn.completed":
-			u.Input += e.Usage.Input - e.Usage.CachedInput
-			u.CacheRead += e.Usage.CachedInput
-			u.Output += e.Usage.Output
+			ev.usage.Input += e.Usage.Input - e.Usage.CachedInput
+			ev.usage.CacheRead += e.Usage.CachedInput
+			ev.usage.Output += e.Usage.Output
 		case "turn.failed":
-			failed = append(failed, e.Error.Message)
+			ev.failed = append(ev.failed, e.Error.Message)
 		case "error":
-			errs = append(errs, e.Message)
+			ev.errs = append(ev.errs, e.Message)
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return "", u, fmt.Errorf("oneshot: read codex output: %w", err)
+		return ev, fmt.Errorf("oneshot: read codex output: %w", err)
 	}
-	if len(failed) > 0 || msg == "" && len(errs) > 0 {
-		return "", u, fmt.Errorf("oneshot: codex failed: %s", short(strings.Join(append(errs, failed...), "; ")))
+	return ev, nil
+}
+
+// codexAnswer — ответ вызова с кодом 0: последнее сообщение агента и расход, или отказ из событий.
+func codexAnswer(out []byte) (string, price.Usage, error) {
+	ev, err := parseCodex(out)
+	if err != nil {
+		return "", ev.usage, err
 	}
-	if msg == "" {
-		return "", u, errors.New("oneshot: codex gave no agent message")
+	if len(ev.failed) > 0 || ev.msg == "" && len(ev.errs) > 0 {
+		return "", ev.usage, fmt.Errorf("oneshot: codex failed: %s", short(ev.refusal()))
 	}
-	return msg, u, nil
+	if ev.msg == "" {
+		return "", ev.usage, errors.New("oneshot: codex gave no agent message")
+	}
+	return ev.msg, ev.usage, nil
 }
 
 // env — окружение без признаков сессии-родителя: вложенный claude иначе принял бы чужое имя сессии и CLAUDE_PID.
@@ -262,23 +298,26 @@ func env() []string {
 	return out
 }
 
-// run запускает CLI с текстом на stdin; ошибка несёт хвост stderr.
-func run(ctx context.Context, cmd *exec.Cmd, dir, stdin string) ([]byte, error) {
+// run запускает CLI с текстом на stdin и отдаёт stdout и stderr и при сбое: причина бывает в любом из них. cmd.Env
+// дополняет окружение env(), при повторе имени верх берёт дополнение.
+func run(ctx context.Context, cmd *exec.Cmd, dir, stdin string) (out []byte, stderrText string, err error) {
 	cmd.Dir = dir
-	cmd.Env = env()
+	cmd.Env = append(env(), cmd.Env...)
 	// По таймауту контекст убивает сам CLI, а его потомки держат stdout: без WaitDelay вызов ждал бы их.
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdin = strings.NewReader(stdin)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			err = ctx.Err()
-		}
-		return nil, fmt.Errorf("oneshot: %s: %w: %s", cmd.Args[0], err, short(strings.TrimSpace(stderr.String())))
+	out, err = cmd.Output()
+	if err != nil && ctx.Err() != nil {
+		err = ctx.Err()
 	}
-	return out, nil
+	return out, strings.TrimSpace(stderr.String()), err
+}
+
+// cliError — сбой запуска CLI с его причиной, сокращённой до хвоста.
+func cliError(name string, err error, why string) error {
+	return fmt.Errorf("oneshot: %s: %w: %s", name, err, short(why))
 }
 
 // short — хвост сообщения не длиннее 300 рун.

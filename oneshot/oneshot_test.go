@@ -2,8 +2,11 @@ package oneshot
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -142,6 +145,107 @@ func TestCodexFailed(t *testing.T) {
 	}
 }
 
+// fakeFailing кладёт в PATH скрипт name, который пишет stdout и stderr и выходит с кодом 1.
+func fakeFailing(t *testing.T, name, stdout, stderr string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncat <<'EOF'\n" + stdout + "\nEOF\ncat >&2 <<'EOF'\n" + stderr + "\nEOF\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+}
+
+// Ненулевой код: причина из событий stdout, при их отсутствии — stderr, как раньше.
+func TestCodexNonZeroExit(t *testing.T) {
+	cases := []struct{ name, stdout, stderr, want, wantNot string }{
+		{"turn.failed, empty stderr", `{"type":"turn.failed","error":{"message":"out of credits"}}`, "",
+			"exit status 1: out of credits", ""},
+		{"error event", `{"type":"error","message":"model is overloaded"}`, "",
+			"exit status 1: model is overloaded", ""},
+		{"events win over stderr noise", `{"type":"error","message":"retrying"}
+{"type":"turn.failed","error":{"message":"out of credits"}}`, "Reading prompt from stdin",
+			"exit status 1: retrying; out of credits", "Reading prompt"},
+		{"same text in both events is said once", `{"type":"error","message":"out of credits"}
+{"type":"turn.failed","error":{"message":"out of credits"}}`, "", "exit status 1: out of credits", "credits; out"},
+		{"no events, stderr stays", `{"type":"thread.started"}`, "config is broken",
+			"exit status 1: config is broken", ""},
+		{"stdout is not JSON", "panic", "config is broken", "exit status 1: config is broken", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fakeFailing(t, "codex", c.stdout, c.stderr)
+			_, err := Ask(context.Background(), Request{Model: "sol", Input: "x", Approved: approved(t)})
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err %v, want %q", err, c.want)
+			}
+			if c.wantNot != "" && strings.Contains(err.Error(), c.wantNot) {
+				t.Errorf("err %v must not carry %q", err, c.wantNot)
+			}
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Errorf("err %v lost the exit error", err)
+			}
+		})
+	}
+}
+
+// Срыв по сроку остаётся срывом по сроку, даже если codex успел написать событие error.
+func TestCodexTimeoutKeepsContextError(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho '{\"type\":\"error\",\"message\":\"Reconnecting... 1/5\"}'\nsleep 10\n"
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	_, err := Ask(context.Background(), Request{Model: "sol", Input: "x", Timeout: 100 * time.Millisecond,
+		Approved: approved(t)})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err %v, want deadline exceeded", err)
+	}
+}
+
+func envValue(t *testing.T, path, name string) (values []string) {
+	t.Helper()
+	for l := range strings.SplitSeq(read(t, path), "\n") {
+		if v, ok := strings.CutPrefix(l, name+"="); ok {
+			values = append(values, v)
+		}
+	}
+	return values
+}
+
+func TestCodexHome(t *testing.T) {
+	answer := `{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}`
+	t.Setenv("CODEX_HOME", "/parent/home")
+	dir := fakeCLI(t, "codex", answer)
+	if _, err := Ask(context.Background(), Request{Model: "sol", Input: "x", Approved: approved(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := envValue(t, dir+"/env", "CODEX_HOME"); !slices.Equal(got, []string{"/parent/home"}) {
+		t.Errorf("empty CodexHome: child sees %q, want the parent's", got)
+	}
+	if _, err := Ask(context.Background(), Request{Model: "sol", Input: "x", CodexHome: "/chosen/home",
+		Approved: approved(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := envValue(t, dir+"/env", "CODEX_HOME"); !slices.Equal(got, []string{"/chosen/home"}) {
+		t.Errorf("CodexHome set: child sees %q", got)
+	}
+}
+
+func TestCodexHomeWithClaudeIsAnError(t *testing.T) {
+	dir := fakeCLI(t, "claude", `{"result":"ответ","is_error":false,"usage":{}}`)
+	_, err := Ask(context.Background(), Request{Model: "opus", Input: "x", CodexHome: "/chosen/home",
+		Approved: approved(t)})
+	if err == nil || !strings.Contains(err.Error(), "CodexHome") {
+		t.Errorf("err %v", err)
+	}
+	if _, statErr := os.Stat(dir + "/args"); statErr == nil {
+		t.Error("claude ran despite the error")
+	}
+}
+
 func TestClaudeSchema(t *testing.T) {
 	dir := fakeCLI(t, "claude", `{"result":"","structured_output":{"city":"Париж"},"is_error":false,"usage":{}}`)
 	res, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Schema: `{"type":"object"}`,
@@ -175,15 +279,17 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
-// TestLive зовёт настоящие CLI: ONESHOT_LIVE=opus,luna go test ./oneshot -run Live -v.
+// TestLive зовёт настоящие CLI: ONESHOT_LIVE=opus,luna go test ./oneshot -run Live -v; ONESHOT_CODEX_HOME — учётка
+// codex, только для моделей на codex.
 func TestLive(t *testing.T) {
 	models := os.Getenv("ONESHOT_LIVE")
 	if models == "" {
 		t.Skip("ONESHOT_LIVE not set")
 	}
+	home := os.Getenv("ONESHOT_CODEX_HOME")
 	for m := range strings.SplitSeq(models, ",") {
 		res, err := Ask(context.Background(), Request{Model: m, Effort: "low", System: "Отвечай одним словом.",
-			Input: "Столица Франции?", Timeout: 3 * time.Minute})
+			Input: "Столица Франции?", Timeout: 3 * time.Minute, CodexHome: home})
 		if err != nil {
 			t.Fatalf("%s: %v", m, err)
 		}
@@ -191,7 +297,7 @@ func TestLive(t *testing.T) {
 		t.Logf("%s %s: %q %+v $%.4f", m, res.ID, res.Text, res.Usage, cost)
 		res, err = Ask(context.Background(), Request{Model: m, Effort: "low", Input: "Столица Франции?",
 			Schema: `{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],` +
-				`"additionalProperties":false}`, Timeout: 3 * time.Minute})
+				`"additionalProperties":false}`, Timeout: 3 * time.Minute, CodexHome: home})
 		if err != nil || !strings.Contains(res.Text, `"city"`) {
 			t.Fatalf("%s schema: %q %v", m, res.Text, err)
 		}
