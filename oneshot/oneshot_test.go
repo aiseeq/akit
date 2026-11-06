@@ -3,6 +3,7 @@ package oneshot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -130,6 +131,47 @@ func TestClaudeErrorsOfAnyShape(t *testing.T) {
 			!strings.Contains(err.Error(), "exit status 1: refused") {
 			t.Errorf("errors %s, code 1 refusal: %v", errs, err)
 		}
+	}
+}
+
+func TestClaudeRawErrorsAreTheReason(t *testing.T) {
+	fakeFailing(t, "claude", `{"is_error":true,"result":"","errors":[{"message":"budget"}],"usage":{}}`, "")
+	_, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)})
+	if err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("err %v", err)
+	}
+}
+
+// Причина в ошибке сокращена до хвоста на каждом пути, где её текст приходит от CLI.
+func TestLongReasonIsCut(t *testing.T) {
+	long := strings.Repeat("W", 5000) + "END"
+	failed := `{"type":"turn.failed","error":{"message":"` + long + `"}}`
+	refusal := `{"is_error":true,"result":"` + long + `","usage":{}}`
+	cases := []struct {
+		name, cli, stdout string
+		exit              bool
+	}{
+		{"codex code 0", "codex", failed, false},
+		{"codex code 1", "codex", failed, true},
+		{"claude code 0", "claude", refusal, false},
+		{"claude code 1", "claude", refusal, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			model := "sol"
+			if c.cli == "claude" {
+				model = "opus"
+			}
+			if c.exit {
+				fakeFailing(t, c.cli, c.stdout, "")
+			} else {
+				fakeCLI(t, c.cli, c.stdout)
+			}
+			_, err := Ask(context.Background(), Request{Model: model, Input: "x", Approved: approved(t)})
+			if err == nil || !strings.HasSuffix(err.Error(), "END") || len([]rune(err.Error())) > 400 {
+				t.Errorf("err of %d runes: %.80v", len([]rune(fmt.Sprint(err))), err)
+			}
+		})
 	}
 }
 
