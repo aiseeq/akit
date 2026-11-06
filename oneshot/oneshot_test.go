@@ -89,6 +89,35 @@ func TestClaudeError(t *testing.T) {
 	}
 }
 
+func TestClaudeRefusalInErrors(t *testing.T) {
+	refusal := `{"is_error":true,"result":"","errors":["Reached maximum budget"],"usage":{"input_tokens":3}}`
+	fakeCLI(t, "claude", refusal)
+	if _, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)}); err == nil ||
+		!strings.Contains(err.Error(), "Reached maximum budget") {
+		t.Errorf("code 0: err %v", err)
+	}
+	fakeFailing(t, "claude", refusal, "")
+	res, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)})
+	if err == nil || !strings.Contains(err.Error(), "exit status 1: Reached maximum budget") {
+		t.Errorf("code 1: err %v", err)
+	}
+	if res.Usage.Input != 3 {
+		t.Errorf("code 1: usage %+v", res.Usage)
+	}
+}
+
+// Ненулевой код без отказа в JSON: причина остаётся в stderr.
+func TestClaudeNonZeroExitKeepsStderr(t *testing.T) {
+	for _, stdout := range []string{"not json", `{"is_error":false,"result":"частичный ответ","usage":{}}`,
+		`{"is_error":true,"result":"","usage":{}}`} {
+		fakeFailing(t, "claude", stdout, "config is broken")
+		_, err := Ask(context.Background(), Request{Model: "opus", Input: "x", Approved: approved(t)})
+		if err == nil || !strings.Contains(err.Error(), "exit status 1: config is broken") {
+			t.Errorf("stdout %q: err %v", stdout, err)
+		}
+	}
+}
+
 func TestCodex(t *testing.T) {
 	dir := fakeCLI(t, "codex", `{"type":"thread.started"}
 {"type":"item.completed","item":{"type":"agent_message","text":"первый"}}
@@ -168,6 +197,10 @@ func TestCodexNonZeroExit(t *testing.T) {
 			"exit status 1: retrying; out of credits", "Reading prompt"},
 		{"same text in both events is said once", `{"type":"error","message":"out of credits"}
 {"type":"turn.failed","error":{"message":"out of credits"}}`, "", "exit status 1: out of credits", "credits; out"},
+		{"only error events, stderr stays too", `{"type":"error","message":"Reconnecting... 5/5"}`, "auth.json is corrupt",
+			"exit status 1: Reconnecting... 5/5; auth.json is corrupt", ""},
+		{"turn.failed without text, stderr stays too", `{"type":"error","message":"boom"}
+{"type":"turn.failed","error":{}}`, "auth.json is corrupt", "exit status 1: boom; auth.json is corrupt", ""},
 		{"no events, stderr stays", `{"type":"thread.started"}`, "config is broken",
 			"exit status 1: config is broken", ""},
 		{"stdout is not JSON", "panic", "config is broken", "exit status 1: config is broken", ""},
@@ -187,6 +220,32 @@ func TestCodexNonZeroExit(t *testing.T) {
 				t.Errorf("err %v lost the exit error", err)
 			}
 		})
+	}
+}
+
+// Расход уже сделанных ходов доходит до вызывающего и при ненулевом коде, с отказом и без него.
+func TestCodexNonZeroExitKeepsUsage(t *testing.T) {
+	completed := `{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50}}`
+	want := price.Usage{Input: 200, CacheRead: 800, Output: 50}
+	for _, stdout := range []string{completed, completed + "\n" + `{"type":"turn.failed","error":{"message":"out of credits"}}`} {
+		fakeFailing(t, "codex", stdout, "")
+		res, err := Ask(context.Background(), Request{Model: "sol", Input: "x", Approved: approved(t)})
+		if err == nil || res.Usage != want {
+			t.Errorf("stdout %q: usage %+v, err %v", stdout, res.Usage, err)
+		}
+	}
+}
+
+// Строка длиннее буфера не отнимает уже прочитанный отказ, и сбой чтения виден в причине.
+func TestCodexOverlongLineKeepsRefusal(t *testing.T) {
+	out := []byte(`{"type":"turn.failed","error":{"message":"out of credits"}}` + "\n" + strings.Repeat("x", 65<<20))
+	events, parseErr := parseCodex(out)
+	if parseErr == nil {
+		t.Fatal("an overlong line must be a read error")
+	}
+	why := events.exitReason("", parseErr)
+	if !strings.Contains(why, "out of credits") || !strings.Contains(why, "read codex output") {
+		t.Errorf("reason %q", why)
 	}
 }
 

@@ -131,33 +131,50 @@ func askClaude(ctx context.Context, req Request) (string, price.Usage, error) {
 		args = append(args, "--json-schema", req.Schema)
 	}
 	out, stderr, err := run(ctx, exec.CommandContext(ctx, "claude", args...), req.Dir, req.Input)
-	if err != nil {
-		return "", price.Usage{}, cliError("claude", err, stderr)
-	}
-	var r struct {
-		Result string `json:"result"`
-		// StructuredOutput — ответ по --json-schema.
-		StructuredOutput json.RawMessage `json:"structured_output"`
-		IsError          bool            `json:"is_error"`
-		Usage            struct {
-			Input      int64 `json:"input_tokens"`
-			CacheWrite int64 `json:"cache_creation_input_tokens"`
-			CacheRead  int64 `json:"cache_read_input_tokens"`
-			Output     int64 `json:"output_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(out, &r); err != nil {
-		return "", price.Usage{}, fmt.Errorf("oneshot: claude output is not JSON: %w", err)
-	}
+	var r claudeOutput
+	parseErr := json.Unmarshal(out, &r)
 	u := price.Usage{Input: r.Usage.Input, CacheWrite: r.Usage.CacheWrite, CacheRead: r.Usage.CacheRead,
 		Output: r.Usage.Output}
+	if err != nil {
+		// Отказ («исчерпан бюджет») claude пишет в JSON на stdout с кодом 1, stderr при этом пуст.
+		why := r.reason()
+		if parseErr != nil || !r.IsError || why == "" {
+			why = stderr
+		}
+		return "", u, cliError("claude", err, why)
+	}
+	if parseErr != nil {
+		return "", price.Usage{}, fmt.Errorf("oneshot: claude output is not JSON: %w", parseErr)
+	}
 	if r.IsError {
-		return "", u, fmt.Errorf("oneshot: claude returned an error: %s", short(r.Result))
+		return "", u, fmt.Errorf("oneshot: claude returned an error: %s", short(r.reason()))
 	}
 	if len(r.StructuredOutput) > 0 && string(r.StructuredOutput) != "null" {
 		return string(r.StructuredOutput), u, nil
 	}
 	return r.Result, u, nil
+}
+
+// claudeOutput — ответ `claude -p --output-format json`, нужные поля.
+type claudeOutput struct {
+	Result string `json:"result"`
+	// Errors — причины отказа; result при этом бывает пуст.
+	Errors []string `json:"errors"`
+	// StructuredOutput — ответ по --json-schema.
+	StructuredOutput json.RawMessage `json:"structured_output"`
+	IsError          bool            `json:"is_error"`
+	Usage            struct {
+		Input      int64 `json:"input_tokens"`
+		CacheWrite int64 `json:"cache_creation_input_tokens"`
+		CacheRead  int64 `json:"cache_read_input_tokens"`
+		Output     int64 `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// reason — текст отказа: result и errors, без пустых.
+func (r claudeOutput) reason() string {
+	all := slices.DeleteFunc(slices.Concat([]string{r.Result}, r.Errors), func(s string) bool { return s == "" })
+	return strings.Join(all, "; ")
 }
 
 // codexOff — возможности codex, которые разовому ответу не нужны: без них ответ без вызова инструментов, а вход
@@ -196,12 +213,8 @@ func askCodex(ctx context.Context, req Request, id, tmp string) (string, price.U
 	}
 	out, stderr, err := run(ctx, cmd, req.Dir, req.Input)
 	if err != nil {
-		// Отказ («кончились кредиты») codex пишет событием в stdout, stderr при этом пуст.
 		events, parseErr := parseCodex(out)
-		if why := events.refusal(); parseErr == nil && why != "" {
-			return "", events.usage, cliError("codex", err, why)
-		}
-		return "", price.Usage{}, cliError("codex", err, stderr)
+		return "", events.usage, cliError("codex", err, events.exitReason(stderr, parseErr))
 	}
 	return codexAnswer(out)
 }
@@ -232,10 +245,25 @@ type codexEvents struct {
 	errs   []string // error — и переподключения, после которых ответ бывает
 }
 
-// refusal — текст отказа из событий: сначала error, в конце turn.failed, потому что short оставляет хвост. Отказ
+// reasons — тексты отказа из событий: сначала error, в конце turn.failed, потому что short оставляет хвост. Отказ
 // codex пишет обоими событиями с одним текстом: повтор подряд убирается.
-func (e codexEvents) refusal() string {
-	return strings.Join(slices.Compact(slices.Concat(e.errs, e.failed)), "; ")
+func (e codexEvents) reasons() []string {
+	all := slices.DeleteFunc(slices.Concat(e.errs, e.failed), func(s string) bool { return s == "" })
+	return slices.Compact(all)
+}
+
+// exitReason — причина ненулевого кода. Отказ («кончились кредиты») codex пишет событием в stdout, stderr при этом
+// пуст. Текст turn.failed называет причину сам; одни события error могут быть переподключениями, и тогда причина
+// в stderr, поэтому он остаётся.
+func (e codexEvents) exitReason(stderr string, parseErr error) string {
+	why := e.reasons()
+	if strings.Join(e.failed, "") == "" && stderr != "" {
+		why = append(why, stderr)
+	}
+	if parseErr != nil {
+		why = append(why, parseErr.Error())
+	}
+	return strings.Join(why, "; ")
 }
 
 // parseCodex разбирает вывод `codex exec --json`. Кэш codex входит в input_tokens, reasoning — в output_tokens.
@@ -276,7 +304,7 @@ func codexAnswer(out []byte) (string, price.Usage, error) {
 		return "", ev.usage, err
 	}
 	if len(ev.failed) > 0 || ev.msg == "" && len(ev.errs) > 0 {
-		return "", ev.usage, fmt.Errorf("oneshot: codex failed: %s", short(ev.refusal()))
+		return "", ev.usage, fmt.Errorf("oneshot: codex failed: %s", short(strings.Join(ev.reasons(), "; ")))
 	}
 	if ev.msg == "" {
 		return "", ev.usage, errors.New("oneshot: codex gave no agent message")
