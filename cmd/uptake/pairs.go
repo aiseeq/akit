@@ -871,7 +871,7 @@ func (u *run) candidateContext(evs []transcript.Event, i int) string {
 			lines = append(lines, evs[j].Text)
 		}
 	}
-	return truncateRunes(strings.Join(lines, " | "), candidateContextRunes)
+	return truncateRunes(maskSecrets(strings.Join(lines, " | ")), candidateContextRunes)
 }
 func (u *run) isBusyProbeCall(cmd string) bool {
 	cs, err := shellcmd.Calls(cmd)
@@ -1062,7 +1062,7 @@ func (u *run) writePairFailSamples() error {
 		for i := range samples {
 			c := &samples[i]
 			out := u.clean(c.out)
-			out = truncateRunes(out, 300)
+			out = finishCell(truncateRunes(out, 300))
 			fmt.Fprintf(&b, "%s\t%s\t%d\t%s\n", tool, c.id, c.code, out)
 		}
 	}
@@ -1080,7 +1080,7 @@ func (u *run) writePairUnknown() error {
 		}
 		reason := pairUnknownReason(*c)
 		counts[reason]++
-		fmt.Fprintf(&b, "%s\t%s\t%d\t%s\t%s\t%s\n", c.tool, c.id, c.code, escapePairField(truncateRunes(maskSecrets(c.command), 300)), escapePairField(truncateRunes(maskSecrets(c.out), 2000)), reason)
+		fmt.Fprintf(&b, "%s\t%s\t%d\t%s\t%s\t%s\n", c.tool, c.id, c.code, finishCell(escapePairField(truncateRunes(maskSecrets(c.command), 300))), finishCell(escapePairField(truncateRunes(maskSecrets(c.out), 2000))), reason)
 	}
 	u.pairUnknownReasons = counts
 	return u.save("pair-unknown.tsv", b.String())
@@ -1103,6 +1103,7 @@ func pairUnknownReason(c pairCall) string {
 
 func escapePairField(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\x00", "\\0")
 	s = strings.ReplaceAll(s, "\t", "\\t")
 	s = strings.ReplaceAll(s, "\r", "\\r")
 	return strings.ReplaceAll(s, "\n", "\\n")

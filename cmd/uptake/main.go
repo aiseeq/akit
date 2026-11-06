@@ -134,12 +134,45 @@ func maskSecrets(s string) string {
 	return masked
 }
 
+// closeQuote ends a cell whose quote a cut left open: read as a whole file, the
+// next row would otherwise become part of a quoted value.
+func closeQuote(s string) string {
+	var open rune
+	escaped := false
+	for _, r := range s {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && open != '\'':
+			escaped = true
+		case open == 0 && (r == '"' || r == '\''):
+			open = r
+		case r == open:
+			open = 0
+		}
+	}
+	if escaped {
+		s += `\`
+	}
+	if open != 0 {
+		s += string(open)
+	}
+	return s
+}
+
+// finishCell is the last step of a table cell, after its line breaks are written
+// out: a label and the next line now stand side by side, and the mask sees them so.
+func finishCell(s string) string {
+	return closeQuote(maskSecrets(s))
+}
+
 func (u *run) clean(s string) string {
 	s = maskSecrets(s)
+	s = strings.ReplaceAll(s, "\x00", " ")
 	s = strings.ReplaceAll(s, "\t", " ")
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", "\\n")
-	return strings.TrimSpace(s)
+	return finishCell(strings.TrimSpace(s))
 }
 func (u *run) modelMap(path string) map[int]string {
 	f, e := os.Open(path)
