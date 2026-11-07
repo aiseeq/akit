@@ -2127,7 +2127,7 @@ func TestNewRejectsInvalidCommandFlagsAndBack(t *testing.T) {
 		{[]string{"start", "task", "--back", "request"}, "--to/--back: flag only for new"},
 		{[]string{"ls", "--diff", "DO"}, "--prio/--diff: flag only for new, set, or start"},
 		{[]string{"next", "--prio", "HIGH"}, "--prio/--diff: flag only for new, set, or start"},
-		{[]string{"show", "task", "--why", "reason"}, "--why: flag only for new, set, start, reject, skip, or plan --repin"},
+		{[]string{"show", "task", "--why", "reason"}, "--why: flag only for new, set, start, reject, skip, unskip, or plan --repin"},
 		{[]string{"new", "task", "--back", "two words"}, "--back must be a name without spaces"},
 		{[]string{"new", "task", "--back", "bad\nname"}, "--back must be a name without spaces"},
 	} {

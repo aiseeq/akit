@@ -37,6 +37,7 @@ Usage:
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
   tk plan ID --repin 'NAME: COMMAND' --why TEXT [--by NAME]
   tk skip ID NAME --why TEXT [--by NAME]
+  tk unskip ID NAME --why TEXT [--by NAME]   return a skipped plan item; its command stays as added
   tk check ID [--timeout D]
   tk lint [--root DIR]
   tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take]
@@ -108,6 +109,9 @@ const mandatoryWhySince = "20261104-0000" // с этого штампа прич
 // planSkipRE — строка журнала, которую пишет tk skip (и прежняя форма без автора), целиком с начала:
 // «пропущен:» внутри заметки или причины другого пункта пропуском не считается.
 var planSkipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:план — \S+: )?пропущен: ([a-z0-9-]+) — (.*)$`)
+
+// planUnskipRE — строка журнала tk unskip: пропуск пункта снят, пункт снова исполняется.
+var planUnskipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — \S+: возвращён: ([a-z0-9-]+) — (.*)$`)
 
 // planAddRE — строка журнала tk plan --add; «обязательный» — с --required, тогда после имени — команда пункта.
 var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
@@ -337,7 +341,7 @@ func validateCommand(o *options, pos []string) error {
 	switch o.cmd {
 	case "plan":
 		return validatePlanCommand(o, pos)
-	case "skip":
+	case "skip", "unskip":
 		return validateSkipCommand(o, pos)
 	case "check":
 		return validateCheckCommand(o, pos)
@@ -395,10 +399,10 @@ func validatePriorityFlags(o *options) error {
 }
 
 func validateWhyFlag(o *options) error {
-	if o.why == "" || o.cmd == "new" || o.cmd == "set" || o.cmd == "start" || o.cmd == "reject" || o.cmd == "skip" || o.cmd == "plan" && o.repin != "" {
+	if o.why == "" || o.cmd == "new" || o.cmd == "set" || o.cmd == "start" || o.cmd == "reject" || o.cmd == "skip" || o.cmd == "unskip" || o.cmd == "plan" && o.repin != "" {
 		return nil
 	}
-	return errors.New("--why: flag only for new, set, start, reject, skip, or plan --repin")
+	return errors.New("--why: flag only for new, set, start, reject, skip, unskip, or plan --repin")
 }
 
 func validateJSONFlag(o *options) error {
@@ -495,14 +499,14 @@ func validatePlanCommand(o *options, pos []string) error {
 
 func validateSkipCommand(o *options, pos []string) error {
 	if len(pos) != 2 || !validID(pos[0]) {
-		return errors.New("skip needs a ticket ID and plan name")
+		return fmt.Errorf("%s needs a ticket ID and plan name", o.cmd)
 	}
 	o.id, o.item = pos[0], pos[1]
 	if !planNameRE.MatchString(o.item) {
-		return errors.New("skip needs a valid plan name")
+		return fmt.Errorf("%s needs a valid plan name", o.cmd)
 	}
 	if strings.TrimSpace(o.why) == "" {
-		return errors.New("skip requires --why")
+		return fmt.Errorf("%s requires --why", o.cmd)
 	}
 
 	return validateActorFlag(o)
@@ -1124,6 +1128,8 @@ func runFoundTask(root string, t task, o options, out, errout io.Writer) int {
 		return addPlanItem(t, o, out, errout)
 	case "skip":
 		return skipPlanItem(t, o, out, errout)
+	case "unskip":
+		return unskipPlanItem(t, o, out, errout)
 	case "note":
 		return addNote(t, o, out, errout)
 	default:
@@ -2323,11 +2329,14 @@ func validatePlanSection(body string) error {
 }
 
 // planSkipReason — причина последнего пропуска пункта; пропуск до последнего добавления пункта с тем же
-// именем к новому пункту не относится.
+// именем или до его возврата (tk unskip) к пункту больше не относится.
 func planSkipReason(body, name string) (string, bool) {
 	lines := journalLines(body)
 	for i := len(lines) - 1; i >= 0; i-- {
 		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[3] == name {
+			return "", false
+		}
+		if m := planUnskipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
 			return "", false
 		}
 		if m := planSkipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
@@ -2615,6 +2624,33 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	fmt.Fprintf(out, "%s plan skipped\n", t.slug)
 	return 0
+}
+
+// unskipPlanItem снимает действующий пропуск пункта строкой журнала: команда пункта в «## План» не меняется,
+// пропуск в истории остаётся, а check и done снова исполняют пункт. Пункт без пропуска — ошибка: возврат
+// не пишется впрок и не подменяет пропуск, сделанный после него.
+func unskipPlanItem(t task, o options, out, errout io.Writer) int {
+	for _, item := range planItems(t.body) {
+		if item.Name != o.item || item.Missing {
+			continue
+		}
+		if item.Invalid != "" {
+			fmt.Fprintf(errout, "tk: plan item %q is invalid: %s\n", o.item, item.Invalid)
+			return exitUsage
+		}
+		if !item.Skipped {
+			fmt.Fprintf(errout, "tk: plan item %q is not skipped; nothing to return\n", o.item)
+			return exitUsage
+		}
+		line := fmt.Sprintf("- %s план — %s: возвращён: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, o.why)
+		if err := writeTask(t.path, journal(t.body, line)); err != nil {
+			return fail(errout, err)
+		}
+		fmt.Fprintf(out, "%s plan item %s returned; tk check runs it again\n", t.slug, o.item)
+		return 0
+	}
+	fmt.Fprintf(errout, "tk: plan name %q not found\n", o.item)
+	return exitNone
 }
 
 type planResult struct {
