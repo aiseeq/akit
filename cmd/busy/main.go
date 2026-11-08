@@ -283,6 +283,27 @@ func sessionName() (string, error) {
 	return info.Name, nil
 }
 
+// sourceParts — замеры диска от источника состояния: заморозка, давление окна 5 с и признание
+// ожидания под потолком io.max, если источник его даёт.
+func sourceParts(m pressure.Load, l pressure.Limits) []string {
+	var parts []string
+	if m.Disk.Open {
+		freeze := fmt.Sprintf("disk freeze for %d ms", m.Disk.OpenMs)
+		if m.Disk.OpenCapped {
+			freeze += " under io.max caps, not counted"
+		}
+		parts = append(parts, freeze)
+	}
+	pressureText := fmt.Sprintf("IO pressure %.1f%% of 5s from the disk state source (limit %v%%)", m.IOFull, l.MaxIOFull)
+	if c := m.Disk.Five.Capped; c != nil {
+		if c.Capped {
+			pressureText += " under io.max caps, not counted"
+		}
+		pressureText += fmt.Sprintf(": waits outside caps %.0f ms, at caps %.0f ms", c.OutsideMS, c.CappedMS)
+	}
+	return append(parts, pressureText)
+}
+
 // line — ответ одной строкой: занята или свободна, почему и все замеры.
 func line(v pressure.Verdict, l pressure.Limits) string {
 	head := "free"
@@ -305,21 +326,7 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 	}
 	if l.MaxIOFull < 100 && (m.Disk != nil || !skipped(pressure.ErrNoIOPressure)) {
 		if m.Disk != nil {
-			if m.Disk.Open {
-				freeze := fmt.Sprintf("disk freeze for %d ms", m.Disk.OpenMs)
-				if m.Disk.OpenCapped {
-					freeze += " under io.max caps, not counted"
-				}
-				parts = append(parts, freeze)
-			}
-			pressureText := fmt.Sprintf("IO pressure %.1f%% of 5s from the disk state source (limit %v%%)", m.IOFull, l.MaxIOFull)
-			if c := m.Disk.Five.Capped; c != nil {
-				if c.Capped {
-					pressureText += " under io.max caps, not counted"
-				}
-				pressureText += fmt.Sprintf(": waits outside caps %.0f ms, at caps %.0f ms", c.OutsideMS, c.CappedMS)
-			}
-			parts = append(parts, pressureText)
+			parts = append(parts, sourceParts(m, l)...)
 		} else {
 			parts = append(parts, fmt.Sprintf("IO pressure %.1f%% of %s, /proc/pressure/io total (limit %v%%)", m.IOFull, m.IOWindow.String(), l.MaxIOFull))
 		}
