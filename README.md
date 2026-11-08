@@ -44,7 +44,11 @@ threshold is slightly higher) —
 a write-out to disk in progress, which a new heavy task would only lengthen — or memory pressure (some avg10) above
 10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
 from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
-in full total from `/proc/pressure/io` over the swap window. Use `--io-full` to change the threshold
+in full total from `/proc/pressure/io` over the swap window. Waiting under an `io.max` cap is a task
+waiting for its own limit, not for the disk: when the source judges that only cgroups at their caps
+waited in the 5-second window, or in the freeze in progress, that pressure or freeze is not busy, and
+the busy line says so. Without the source, or with a source that gives no such judgement, caps are
+not told apart and the line names the missing judgement. Use `--io-full` to change the threshold
 (100 disables disk checks, the freeze too) and `--kind K` to request a profile kind. Your own thresholds go in
 `$XDG_CONFIG_HOME/akit/pressure.yaml` as `key: value` lines (`runnable`, `max_io_full`, `max_mem_some`,
 `max_swap_kbs`, `swap_window`, `max_dirty_mb`), shared with graft; flags override the file, and a value that is not a
@@ -65,12 +69,17 @@ source.
 
 The client reads `v`, `error`, `at` (RFC 3339 with nanoseconds), `1s`, `5s`, `30s`, `nproc`, `open`, and `profile`. Each window
 contains `steps`, `io_full_ms`, `stall_ms`, `write_bps`, `read_bps`, `w_await_ms`, `inflight_max`,
-`cpu_some_ms`, and `runnable_max`. `open` contains `open` and `ms`. `profile` is passed through
-byte for byte without interpretation. Extra response fields are ignored.
+`cpu_some_ms`, and `runnable_max`, and optionally `capped`: `{"capped":…,"outside_ms":…,"capped_ms":…}`,
+whether only cgroups at their `io.max` caps waited in that window, the largest wait of a cgroup outside
+caps and the wait of leaves at caps, in ms. `open` contains `open`, `ms`, and optionally `capped`,
+the same judgement for the freeze in progress; a source that sends `capped` in the 5-second window
+must send it in an open freeze too. `profile` is passed through byte for byte without interpretation.
+Extra response fields are ignored.
 
 The client allows 200 ms for connection and response. A response with a version other than 1, a
-nonempty `error`, an invalid JSON line, or an `at` timestamp more than two seconds from the client's
-current time means the source failed. When the source is unavailable or fails, busy falls back to the
+nonempty `error`, an invalid JSON line, an open freeze without `capped` next to a judged 5-second
+window, or an `at` timestamp more than two seconds from the client's current time means the source
+failed. When the source is unavailable or fails, busy falls back to the
 change in `full total` from `/proc/pressure/io` over the sampling interval.
 
     busy                        # busy: runnable 31 is at or above 22; runnable 31 (busy at 22, threads 22); …

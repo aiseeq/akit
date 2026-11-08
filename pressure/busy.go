@@ -178,16 +178,26 @@ func Rule(m Load, l Limits, skipped []error) Verdict {
 }
 
 // diskBusy — занята ли машина по диску: заморозка от источника или давление IO на пороге maxIOFull;
-// порог 100 и выше выключает проверку, пропущенная мера без источника не судится.
+// порог 100 и выше выключает проверку, пропущенная мера без источника не судится. Ожидание, которое
+// источник признал ожиданием под потолком io.max (задача ждёт свой предел, а не диск), не занятость:
+// ни заморозка, ни давление окна 5 с. Без источника потолки не различаются.
 func diskBusy(m Load, maxIOFull float64, skipped []error) bool {
 	if maxIOFull >= 100 || (m.Disk == nil && skippedAny(skipped, ErrNoIOPressure)) {
 		return false
+	}
+	if m.Disk != nil {
+		if m.Disk.Open && !m.Disk.OpenCapped {
+			return true
+		}
+		if m.Disk.Five.Capped != nil && m.Disk.Five.Capped.Capped {
+			return false
+		}
 	}
 	ioFull := m.IOFull
 	if m.hasIOFullExact {
 		ioFull = m.ioFullExact
 	}
-	return (m.Disk != nil && m.Disk.Open) || ioFull >= maxIOFull
+	return ioFull >= maxIOFull
 }
 
 // effectiveLimits — пороги правила с умолчаниями на месте нулевых: диск, процессор (число потоков машины),
@@ -329,6 +339,9 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 		load.ioFullExact = load.Disk.Five.IOFullMS / 50
 		load.IOFull, load.IOWindow = math.Round(load.ioFullExact*10)/10, 5*time.Second
 		load.hasIOFullExact = true
+		if load.Disk.Five.Capped == nil {
+			skipped = append(skipped, ErrNoCapJudgement)
+		}
 	} else {
 		if load.IOWindow == 0 {
 			load.IOWindow = time.Second

@@ -315,3 +315,61 @@ func containsError(errs []error, target error) bool {
 	}
 	return false
 }
+
+// Ожидание под потолком io.max: системный io full гасится признанием источника, что в окне ждали
+// только упёршиеся в потолок cgroup; заморозка — тем же признанием идущего случая.
+func TestMeterDiskCapped(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		five    string // поле capped окна 5s; пусто — нет поля (старый источник)
+		open    string // объект open; пусто — нет
+		want    string
+		noCap   bool // в Skipped сентинел «нет признания потолков»
+		failed  bool // источник нарушил протокол
+		outside float64
+	}{
+		{"waits under caps only", `{"capped":true,"outside_ms":51,"capped_ms":1400}`, "", "", false, false, 51},
+		{"waits outside caps", `{"capped":false,"outside_ms":900,"capped_ms":600}`, "", IO, false, false, 900},
+		{"old source counts the system measure", "", "", IO, true, false, 0},
+		{"freeze under caps", `{"capped":true,"outside_ms":20,"capped_ms":1400}`, `{"open":true,"ms":800,"capped":true}`, "", false, false, 20},
+		{"freeze outside caps", `{"capped":true,"outside_ms":20,"capped_ms":1400}`, `{"open":true,"ms":800,"capped":false}`, IO, false, false, 20},
+		{"freeze without its judgement", `{"capped":true,"outside_ms":20,"capped_ms":1400}`, `{"open":true,"ms":800}`, "", false, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, now := fakeProc(t, map[string]string{
+				"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1\n",
+				"pressure/memory": "some avg10=0 avg60=0 avg300=0 total=1\n",
+				"vmstat":          "pswpin 1\npswpout 1\n",
+			})
+			five := `"io_full_ms":1500`
+			if tc.five != "" {
+				five += `,"capped":` + tc.five
+			}
+			open := ""
+			if tc.open != "" {
+				open = `,"open":` + tc.open
+			}
+			m.disk = socket(t, func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = bufio.NewReader(conn).ReadBytes('\n')
+				_, _ = fmt.Fprintf(conn, `{"v":1,"at":%q,"5s":{%s}%s}`+"\n", now.Format(time.RFC3339Nano), five, open)
+			})
+			v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 9.6}, "", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.failed {
+				if v.Load.Disk != nil || !containsError(v.Skipped, ErrIOSourceFailed) {
+					t.Fatalf("нарушение протокола принято: %+v, Disk %+v", v, v.Load.Disk)
+				}
+				return
+			}
+			if v.Measure != tc.want || containsError(v.Skipped, ErrNoCapJudgement) != tc.noCap {
+				t.Fatalf("Check = %+v, Disk %+v", v, v.Load.Disk)
+			}
+			if c := v.Load.Disk.Five.Capped; tc.five != "" && (c == nil || c.OutsideMS != tc.outside) {
+				t.Errorf("capped = %+v", c)
+			}
+		})
+	}
+}

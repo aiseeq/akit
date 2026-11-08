@@ -91,6 +91,25 @@ func TestLineIOWindow(t *testing.T) {
 	}
 }
 
+func TestLineIOUnderCaps(t *testing.T) {
+	// Признанное ожидание под потолком — в строке, чтобы агент видел, почему давление IO не судится.
+	limits := pressure.Limits{MaxIOFull: 9.6}
+	disk := &pressure.DiskNow{Open: true, OpenMs: 800, OpenCapped: true,
+		Five: pressure.DiskWindow{Capped: &pressure.DiskCapped{Capped: true, OutsideMS: 51, CappedMS: 1400}}}
+	got := line(pressure.Verdict{Load: pressure.Load{IOFull: 30, IOWindow: 5 * time.Second, Disk: disk}}, limits)
+	for _, want := range []string{"free; ", "disk freeze for 800 ms under io.max caps, not counted",
+		"IO pressure 30.0% of 5s from the disk state source (limit 9.6%) under io.max caps, not counted: waits outside caps 51 ms, at caps 1400 ms"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("строка = %q, нет %q", got, want)
+		}
+	}
+	disk.Five.Capped.Capped = false
+	got = line(pressure.Verdict{Load: pressure.Load{IOFull: 30, IOWindow: 5 * time.Second, Disk: disk}}, limits)
+	if !strings.Contains(got, "(limit 9.6%): waits outside caps 51 ms, at caps 1400 ms") || strings.Contains(got, "pressure 30.0% of 5s from the disk state source (limit 9.6%) under") {
+		t.Errorf("строка без признания = %q", got)
+	}
+}
+
 func TestLineWriteback(t *testing.T) {
 	// Значение выброса — в строке и у свободной машины, как прочие меры; нет meminfo — пометка.
 	free := line(pressure.Rule(pressure.Load{DirtyMB: 12.4, DirtyLimitMB: 64}, pressure.Limits{MaxIOFull: 100}, nil), pressure.Limits{MaxIOFull: 100})

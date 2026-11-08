@@ -306,9 +306,20 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 	if l.MaxIOFull < 100 && (m.Disk != nil || !skipped(pressure.ErrNoIOPressure)) {
 		if m.Disk != nil {
 			if m.Disk.Open {
-				parts = append(parts, fmt.Sprintf("disk freeze for %d ms", m.Disk.OpenMs))
+				freeze := fmt.Sprintf("disk freeze for %d ms", m.Disk.OpenMs)
+				if m.Disk.OpenCapped {
+					freeze += " under io.max caps, not counted"
+				}
+				parts = append(parts, freeze)
 			}
-			parts = append(parts, fmt.Sprintf("IO pressure %.1f%% of 5s from the disk state source (limit %v%%)", m.IOFull, l.MaxIOFull))
+			pressureText := fmt.Sprintf("IO pressure %.1f%% of 5s from the disk state source (limit %v%%)", m.IOFull, l.MaxIOFull)
+			if c := m.Disk.Five.Capped; c != nil {
+				if c.Capped {
+					pressureText += " under io.max caps, not counted"
+				}
+				pressureText += fmt.Sprintf(": waits outside caps %.0f ms, at caps %.0f ms", c.OutsideMS, c.CappedMS)
+			}
+			parts = append(parts, pressureText)
 		} else {
 			parts = append(parts, fmt.Sprintf("IO pressure %.1f%% of %s, /proc/pressure/io total (limit %v%%)", m.IOFull, m.IOWindow.String(), l.MaxIOFull))
 		}

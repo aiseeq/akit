@@ -19,16 +19,31 @@ var ErrNoIOSource = errors.New("no disk state source")
 // ErrIOSourceFailed означает, что источник состояния диска ответил с ошибкой или нарушил протокол.
 var ErrIOSourceFailed = errors.New("disk state source failed")
 
+// ErrNoCapJudgement означает, что источник не признаёт ожидание под потолком io.max (старая версия):
+// давление IO судится по всей машине, и ожидание упёршихся в потолок cgroup считается занятостью.
+var ErrNoCapJudgement = errors.New("no io.max cap judgement from the disk state source: IO waits under caps count as busy")
+
 // DiskNow — текущий снимок источника состояния диска.
 type DiskNow struct {
-	At      time.Time
-	One     DiskWindow
-	Five    DiskWindow
-	Thirty  DiskWindow
-	NProc   int
-	Open    bool
-	OpenMs  int64
-	Profile json.RawMessage
+	At     time.Time
+	One    DiskWindow
+	Five   DiskWindow
+	Thirty DiskWindow
+	NProc  int
+	Open   bool
+	OpenMs int64
+	// OpenCapped — идущая заморозка по своим детальным записям признана ожиданием под потолком io.max.
+	OpenCapped bool
+	Profile    json.RawMessage
+}
+
+// DiskCapped — признание источника по окну: ждали только упёршиеся в потолок io.max cgroup
+// (их простой больше половины простоя листьев, вне потолков никто не ждал заметно, диск занят меньше
+// половины окна). Тогда системное давление IO окна — не занятость диска.
+type DiskCapped struct {
+	Capped    bool    `json:"capped"`
+	OutsideMS float64 `json:"outside_ms"` // наибольший простой cgroup вне потолков за окно, мс
+	CappedMS  float64 `json:"capped_ms"`  // простой листьев, упиравшихся в потолки, мс
 }
 
 // DiskWindow — замеры окна источника состояния диска.
@@ -42,6 +57,8 @@ type DiskWindow struct {
 	InflightMax int64   `json:"inflight_max"`
 	CPUSomeMS   float64 `json:"cpu_some_ms"`
 	RunnableMax int64   `json:"runnable_max"`
+	// Capped — признание ожидания под потолком; nil — источник его не даёт.
+	Capped *DiskCapped `json:"capped"`
 }
 
 type diskRequest struct {
@@ -59,8 +76,9 @@ type diskResponse struct {
 	Thirty DiskWindow `json:"30s"`
 	NProc  int        `json:"nproc"`
 	Open   struct {
-		Open bool  `json:"open"`
-		MS   int64 `json:"ms"`
+		Open   bool  `json:"open"`
+		MS     int64 `json:"ms"`
+		Capped *bool `json:"capped"`
 	} `json:"open"`
 	Profile json.RawMessage `json:"profile"`
 }
@@ -110,7 +128,10 @@ func readDisk(ctx context.Context, path, kind string, now time.Time) (*DiskNow, 
 	if now.Sub(at) > 2*time.Second || at.Sub(now) > 2*time.Second {
 		return nil, fmt.Errorf("%w: snapshot at %s is stale", ErrIOSourceFailed, response.At)
 	}
+	if response.Five.Capped != nil && response.Open.Open && response.Open.Capped == nil {
+		return nil, fmt.Errorf("%w: the 5s window judges io.max caps, the open freeze does not", ErrIOSourceFailed)
+	}
 	return &DiskNow{At: at, One: response.One, Five: response.Five, Thirty: response.Thirty,
 		NProc: response.NProc, Open: response.Open.Open, OpenMs: response.Open.MS,
-		Profile: response.Profile}, nil
+		OpenCapped: response.Open.Capped != nil && *response.Open.Capped, Profile: response.Profile}, nil
 }
