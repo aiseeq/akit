@@ -77,8 +77,8 @@ must send it in an open freeze too. `profile` is passed through byte for byte wi
 Extra response fields are ignored.
 
 The client allows 200 ms for connection and response. A response with a version other than 1, a
-nonempty `error`, an invalid JSON line, an open freeze without `capped` next to a judged 5-second
-window, or an `at` timestamp more than two seconds from the client's current time means the source
+nonempty `error`, an invalid JSON line, `capped` in only one of the 5-second window and an open
+freeze, or an `at` timestamp more than two seconds from the client's current time means the source
 failed. When the source is unavailable or fails, busy falls back to the
 change in `full total` from `/proc/pressure/io` over the sampling interval.
 

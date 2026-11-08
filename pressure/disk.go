@@ -131,6 +131,9 @@ func readDisk(ctx context.Context, path, kind string, now time.Time) (*DiskNow, 
 	if response.Five.Capped != nil && response.Open.Open && response.Open.Capped == nil {
 		return nil, fmt.Errorf("%w: the 5s window judges io.max caps, the open freeze does not", ErrIOSourceFailed)
 	}
+	if response.Five.Capped == nil && response.Open.Capped != nil {
+		return nil, fmt.Errorf("%w: the open freeze judges io.max caps, the 5s window does not", ErrIOSourceFailed)
+	}
 	return &DiskNow{At: at, One: response.One, Five: response.Five, Thirty: response.Thirty,
 		NProc: response.NProc, Open: response.Open.Open, OpenMs: response.Open.MS,
 		OpenCapped: response.Open.Capped != nil && *response.Open.Capped, Profile: response.Profile}, nil

@@ -112,7 +112,7 @@ func (v Verdict) Why() string {
 		}
 		return fmt.Sprintf("runnable %.0f is at or above %v", v.Value, v.Limit)
 	case IO:
-		if v.Load.Disk != nil && v.Load.Disk.Open {
+		if v.Load.Disk != nil && v.Load.Disk.Open && !v.Load.Disk.OpenCapped {
 			return fmt.Sprintf("disk freeze in progress for %d ms", v.Load.Disk.OpenMs)
 		}
 		return fmt.Sprintf("IO pressure %.1f%% of the last %s is at or above %v%%", v.Value, v.Load.IOWindow.String(), v.Limit)
