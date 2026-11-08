@@ -128,13 +128,21 @@ func readDisk(ctx context.Context, path, kind string, now time.Time) (*DiskNow, 
 	if now.Sub(at) > 2*time.Second || at.Sub(now) > 2*time.Second {
 		return nil, fmt.Errorf("%w: snapshot at %s is stale", ErrIOSourceFailed, response.At)
 	}
-	if response.Five.Capped != nil && response.Open.Open && response.Open.Capped == nil {
-		return nil, fmt.Errorf("%w: the 5s window judges io.max caps, the open freeze does not", ErrIOSourceFailed)
-	}
-	if response.Five.Capped == nil && response.Open.Capped != nil {
-		return nil, fmt.Errorf("%w: the open freeze judges io.max caps, the 5s window does not", ErrIOSourceFailed)
+	if err := response.checkCapped(); err != nil {
+		return nil, err
 	}
 	return &DiskNow{At: at, One: response.One, Five: response.Five, Thirty: response.Thirty,
 		NProc: response.NProc, Open: response.Open.Open, OpenMs: response.Open.MS,
 		OpenCapped: response.Open.Capped != nil && *response.Open.Capped, Profile: response.Profile}, nil
+}
+
+// checkCapped — признание ожидания под потолком есть в окне 5 с и в идущей заморозке вместе или нигде.
+func (r diskResponse) checkCapped() error {
+	if r.Five.Capped != nil && r.Open.Open && r.Open.Capped == nil {
+		return fmt.Errorf("%w: the 5s window judges io.max caps, the open freeze does not", ErrIOSourceFailed)
+	}
+	if r.Five.Capped == nil && r.Open.Capped != nil {
+		return fmt.Errorf("%w: the open freeze judges io.max caps, the 5s window does not", ErrIOSourceFailed)
+	}
+	return nil
 }
