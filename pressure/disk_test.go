@@ -336,6 +336,7 @@ func TestMeterDiskCapped(t *testing.T) {
 		{"freeze outside caps", `{"capped":true,"outside_ms":20,"capped_ms":1400}`, `{"open":true,"ms":800,"capped":false}`, IO, false, false, 20},
 		{"freeze without its judgement", `{"capped":true,"outside_ms":20,"capped_ms":1400}`, `{"open":true,"ms":800}`, "", false, true, 0},
 		{"freeze judged, window not", "", `{"open":true,"ms":800,"capped":true}`, "", false, true, 0},
+		{"closed freeze judged, window not", "", `{"open":false,"capped":false}`, "", false, true, 0},
 		{"freeze under caps, window outside", `{"capped":false,"outside_ms":900,"capped_ms":600}`, `{"open":true,"ms":800,"capped":true}`, IO, false, false, 900},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
