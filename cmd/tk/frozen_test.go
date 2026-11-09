@@ -141,7 +141,7 @@ func TestFrozenOtherProjectOrNoFileAsUsual(t *testing.T) {
 
 // An incomplete line still names the project: it stays frozen, and says so.
 func TestFrozenIncompleteLineStaysFrozen(t *testing.T) {
-	for name, line := range map[string]string{"path only": "~/work/sample\n", "spaces": "~/work/sample user 2026-11-09 why\n", "no newline": "~/work/sample\tuser"} {
+	for name, line := range map[string]string{"path only": "~/work/sample\n", "spaces": "~/work/sample user 2026-11-09 why\n", "no newline": "~/work/sample\tuser", "words before the first tab": "~/work/sample user\t2026-11-09\twhy\n", "tab only at the end": "~/work/sample u d why with\ttab\n"} {
 		t.Run(name, func(t *testing.T) {
 			_, project, _ := frozenProject(t, line)
 			code, out, errOut := tkIn(t, project, "admin", "next")
@@ -149,6 +149,14 @@ func TestFrozenIncompleteLineStaysFrozen(t *testing.T) {
 				t.Errorf("code %d, out %q, err %q", code, out, errOut)
 			}
 		})
+	}
+}
+
+func TestFrozenLeadingWhitespaceKeepsTheFields(t *testing.T) {
+	_, project, _ := frozenProject(t, "\t  ~/work/sample\tuser\t2026-11-09\tgiven reason\n")
+	code, out, errOut := tkIn(t, project, "admin", "next")
+	if code != exitNone || strings.Contains(out, "subject") || !strings.Contains(errOut, "given reason") {
+		t.Errorf("code %d, out %q, err %q", code, out, errOut)
 	}
 }
 

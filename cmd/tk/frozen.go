@@ -11,6 +11,10 @@ import (
 	sessions "github.com/aiseeq/akit/session"
 )
 
+// frozenFields is the number of tab-separated fields of a complete line: path,
+// who, date, why.
+const frozenFields = 4
+
 // frozenRefusal says why work of the project is not given to who, or "" when it
 // may be. A frozen project is worked on only by its running master.
 func frozenRefusal(project, who string, errout io.Writer) (string, error) {
@@ -33,7 +37,8 @@ func frozenRefusal(project, who string, errout io.Writer) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve project %s: %w", project, err)
 	}
-	for number, line := range strings.Split(string(content), "\n") {
+	for number, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
 		place := fmt.Sprintf("%s:%d", path, number+1)
 		matches, err := frozenLineNames(line, home, want)
 		if err != nil {
@@ -61,7 +66,7 @@ func frozenRefusal(project, who string, errout io.Writer) (string, error) {
 // not exist names nothing; an error is about this line only, so the caller goes
 // on to the others.
 func frozenLineNames(line, home, want string) (bool, error) {
-	if strings.HasPrefix(strings.TrimSpace(line), "#") {
+	if strings.HasPrefix(line, "#") {
 		return false, nil
 	}
 	listed := frozenPath(line)
@@ -84,11 +89,12 @@ func frozenLineNames(line, home, want string) (bool, error) {
 	return resolved == want, nil
 }
 
-// frozenPath is the first tab-separated field, or the first word of a line
-// written without tabs.
+// frozenPath is the first tab-separated field of a complete line. Any other line
+// is read by its first word: malformed, it still names a project and keeps it
+// frozen.
 func frozenPath(line string) string {
-	if first, _, tabbed := strings.Cut(line, "\t"); tabbed {
-		return strings.TrimSpace(first)
+	if parts := strings.Split(line, "\t"); len(parts) >= frozenFields {
+		return strings.TrimSpace(parts[0])
 	}
 	if fields := strings.Fields(line); len(fields) != 0 {
 		return fields[0]
@@ -99,10 +105,10 @@ func frozenPath(line string) string {
 // frozenWhy is the fourth tab-separated field; "" when the line lacks it.
 func frozenWhy(line string) string {
 	parts := strings.Split(line, "\t")
-	if len(parts) < 4 {
+	if len(parts) < frozenFields {
 		return ""
 	}
-	return strings.TrimSpace(parts[3])
+	return strings.TrimSpace(parts[frozenFields-1])
 }
 
 func liveMaster(home, who, master string, errout io.Writer) bool {
