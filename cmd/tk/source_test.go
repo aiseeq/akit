@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"github.com/aiseeq/akit/queuegate"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestExternalCandidateGroups(t *testing.T) {
 	if got := []string{items[0].Key, items[1].Key, items[2].Key}; strings.Join(got, ",") != "crit,high,med" {
 		t.Fatalf("source order = %v", got)
 	}
-	if nextGroup(task{prio: "CRIT", status: "открыт"}, "", gateState{}, false) != 0 || nextGroup(task{prio: "HIGH", status: "открыт"}, "", gateState{}, false) != 2 || nextGroup(task{prio: "MED", status: "открыт"}, "", gateState{}, false) != 4 || nextGroup(task{prio: "LOW", status: "открыт"}, "", gateState{}, false) != 5 {
+	if nextGroup(task{prio: "CRIT", status: "открыт"}, "", queuegate.Scope{}) != 0 || nextGroup(task{prio: "HIGH", status: "открыт"}, "", queuegate.Scope{}) != 2 || nextGroup(task{prio: "MED", status: "открыт"}, "", queuegate.Scope{}) != 4 || nextGroup(task{prio: "LOW", status: "открыт"}, "", queuegate.Scope{}) != 5 {
 		t.Fatal("unexpected external candidate groups")
 	}
 }
@@ -73,13 +74,13 @@ func TestParseExternalTasksPartialAndFailures(t *testing.T) {
 
 func TestExternalCandidateGate(t *testing.T) {
 	closed := task{prio: "MED", status: "открыт", diff: "DO"}
-	if gateVisible(closed, gateState{}, false) {
+	if gateVisible(closed, queuegate.Scope{}) {
 		t.Fatal("unknown gate should hide HIGH")
 	}
-	if !gateVisible(closed, gateState{valid: true}, false) {
+	if !gateVisible(closed, queuegate.Scope{Valid: true}) {
 		t.Fatal("non-live project should not require an open pair")
 	}
-	if gateVisible(closed, gateState{valid: true, open: []string{"OTHER"}}, true) {
+	if gateVisible(closed, queuegate.Scope{Valid: true, Live: true, Open: []string{"OTHER"}}) {
 		t.Fatal("closed pair should hide candidate in live project")
 	}
 }
@@ -102,11 +103,8 @@ func TestJournalEligibilityAndGateRoots(t *testing.T) {
 	if err := os.MkdirAll(project, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	state := gateState{valid: true, data: taskGate{Open: []string{"MED-HUNT"}, OpenByRoot: func() *map[string][]string {
-		m := map[string][]string{root: {"MED-DO"}, filepath.Join(root, "group"): {}}
-		return &m
-	}()}}
-	got, err := gatePairs(state.data, project)
+	state := queuegate.Gate{Valid: true, Open: []string{"MED-HUNT"}, OpenByRoot: map[string][]string{root: {"MED-DO"}, filepath.Join(root, "group"): {}}}
+	got, err := state.Pairs(project)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,18 +115,18 @@ func TestJournalEligibilityAndGateRoots(t *testing.T) {
 	if err := os.MkdirAll(workshop, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	boundary, err := gatePairs(state.data, workshop)
+	boundary, err := state.Pairs(workshop)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(boundary) != 1 || boundary[0] != "MED-HUNT" {
 		t.Fatalf("fallback gate at component boundary = %#v", boundary)
 	}
-	broken := gateState{problem: "gate.json has no open_by_root"}
-	if gateVisible(task{status: "открыт", prio: "MED"}, broken, true) || !gateVisible(task{status: "открыт", prio: "HIGH"}, broken, true) {
+	broken := queuegate.Scope{Live: true, Problem: "gate.json has no open_by_root"}
+	if gateVisible(task{status: "открыт", prio: "MED"}, broken) || !gateVisible(task{status: "открыт", prio: "HIGH"}, broken) {
 		t.Fatal("missing root map should expose only CRIT/HIGH")
 	}
-	if !gateVisible(task{status: "в работе", prio: "MED"}, broken, true) {
+	if !gateVisible(task{status: "в работе", prio: "MED"}, broken) {
 		t.Fatal("started ticket must remain visible with a broken gate")
 	}
 }
@@ -469,17 +467,17 @@ func TestNextShowsStartedExternalUnderClosedGate(t *testing.T) {
 }
 
 func TestExternalStartedOrder(t *testing.T) {
-	closed := gateState{valid: true, open: []string{}}
+	closed := queuegate.Scope{Valid: true, Live: true, Open: []string{}}
 	items := []externalTask{{Key: "new", Prio: "MED"}, {Key: "begun", Prio: "MED", Started: true}, {Key: "low-begun", Prio: "LOW", Started: true}, {Key: "high", Prio: "HIGH"}, {Key: "crit", Prio: "CRIT"}}
 	got := []string{}
-	for _, item := range orderExternal(items, closed, true) {
+	for _, item := range orderExternal(items, closed) {
 		got = append(got, item.Key)
 	}
 	if strings.Join(got, " ") != "crit high begun low-begun" {
 		t.Fatalf("closed pair order %v", got)
 	}
 	got = got[:0]
-	for _, item := range orderExternal(items, gateState{valid: true, open: []string{"MED-DO", "MED-HUNT", "MED-ARCH", "LOW-DO", "LOW-HUNT", "LOW-ARCH"}}, true) {
+	for _, item := range orderExternal(items, queuegate.Scope{Valid: true, Live: true, Open: []string{"MED-DO", "MED-HUNT", "MED-ARCH", "LOW-DO", "LOW-HUNT", "LOW-ARCH"}}) {
 		got = append(got, item.Key)
 	}
 	if strings.Join(got, " ") != "crit high new begun low-begun" {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aiseeq/akit/queuegate"
 	"maps"
 	"os"
 	"os/exec"
@@ -2434,7 +2435,7 @@ func TestClosedFieldIsOnlyAddedToNextJSON(t *testing.T) {
 		t.Fatalf("standard task JSON has closed: %s %v", standard, err)
 	}
 	var out, errout bytes.Buffer
-	if code := printCombinedNext("", nextChoice{task: ticket, found: true, gate: gateState{valid: true}}, nil, true, &out, &errout); code != 0 {
+	if code := printCombinedNext("", nextChoice{task: ticket, found: true, gate: queuegate.Scope{Valid: true}}, nil, true, &out, &errout); code != 0 {
 		t.Fatalf("next JSON = %d %s", code, errout.String())
 	}
 	var next map[string]any
@@ -2459,7 +2460,7 @@ func TestNextWaitDeadlinesExcludeFutureTickets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates := nextCandidates(tasks, "actor", gateState{valid: true}, false)
+	candidates := nextCandidates(tasks, "actor", queuegate.Scope{Valid: true})
 	if len(candidates) != 1 || candidates[0].slug != "past" {
 		t.Fatalf("waiting candidates = %#v", candidates)
 	}
@@ -2610,7 +2611,6 @@ func TestRetagOldWordNeedsPrio(t *testing.T) {
 }
 
 func TestGateOpenTicketWithoutDifficultyNeedsAllPairs(t *testing.T) {
-	med := task{prio: "MED"}
 	for _, tc := range []struct {
 		open []string
 		want bool
@@ -2621,11 +2621,12 @@ func TestGateOpenTicketWithoutDifficultyNeedsAllPairs(t *testing.T) {
 		{[]string{"MEDIUM-DO", "MEDIUM-HUNT", "MEDIUM-ARCH"}, true},
 		{[]string{"LOW-DO", "LOW-HUNT", "LOW-ARCH"}, false},
 	} {
-		if got := gateOpen(med, tc.open); got != tc.want {
-			t.Errorf("gateOpen(MED, %v) = %v, want %v", tc.open, got, tc.want)
+		if got := (queuegate.Scope{Valid: true, Live: true, Open: tc.open}).Passes("MED", ""); got != tc.want {
+			t.Errorf("Passes(MED) with open %v = %v, want %v", tc.open, got, tc.want)
 		}
 	}
-	if !gateOpen(task{prio: "HIGH"}, nil) || !gateOpen(task{prio: "CRIT"}, nil) {
+	closed := queuegate.Scope{Valid: true, Live: true}
+	if !closed.Passes("HIGH", "") || !closed.Passes("CRIT", "") {
 		t.Error("CRIT and HIGH are always open")
 	}
 }

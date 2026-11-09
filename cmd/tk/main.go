@@ -24,6 +24,7 @@ import (
 	"unicode"
 
 	"github.com/aiseeq/akit/proc"
+	"github.com/aiseeq/akit/queuegate"
 	"github.com/aiseeq/akit/timearg"
 )
 
@@ -3516,119 +3517,6 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	return obj
 }
 
-type taskGate struct {
-	At         string               `json:"at"`
-	Live       []string             `json:"live"`
-	Open       []string             `json:"open"`
-	OpenByRoot *map[string][]string `json:"open_by_root"`
-}
-
-func gateOpen(t task, open []string) bool {
-	p := normalizePrio(t.prio)
-	if p == "CRIT" || p == "HIGH" {
-		return true
-	}
-	if t.diff != "" {
-		return pairOpen(p, t.diff, open)
-	}
-	// A ticket without a difficulty may turn out to be any of them.
-	for _, diff := range []string{"DO", "HUNT", "ARCH"} {
-		if !pairOpen(p, diff, open) {
-			return false
-		}
-	}
-	return true
-}
-
-func pairOpen(prio, diff string, open []string) bool {
-	for _, pair := range open {
-		if pair == prio+"-"+diff || prio == "MED" && pair == "MEDIUM-"+diff {
-			return true
-		}
-	}
-	return false
-}
-
-type gateState struct {
-	data    taskGate
-	path    string
-	problem string
-	valid   bool
-	open    []string
-}
-
-func readTaskGate() (gateState, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return gateState{}, fmt.Errorf("determine gate directory: %w", err)
-	}
-	state := gateState{path: filepath.Join(home, ".local/state/queue/gate.json"), problem: "gate.json is missing"}
-	content, err := os.ReadFile(state.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return state, nil
-	}
-	if err != nil {
-		state.problem = "cannot read gate.json: " + err.Error()
-		return state, nil
-	}
-	if err := json.Unmarshal(content, &state.data); err != nil {
-		state.problem = "cannot parse gate.json: " + err.Error()
-		return state, nil
-	}
-	at, err := time.Parse(time.RFC3339, state.data.At)
-	if err != nil {
-		state.problem = "gate.json has invalid at timestamp: " + err.Error()
-		return state, nil
-	}
-	if time.Since(at) > 26*time.Hour {
-		state.problem = "gate.json is older than 26 hours"
-		return state, nil
-	}
-	if at.After(time.Now()) {
-		state.problem = "gate.json timestamp is in the future"
-		return state, nil
-	}
-	if state.data.OpenByRoot == nil {
-		state.problem = "gate.json has no open_by_root"
-		return state, nil
-	}
-	state.valid = true
-	return state, nil
-}
-
-func gatePairs(data taskGate, project string) ([]string, error) {
-	if data.OpenByRoot == nil || len(*data.OpenByRoot) == 0 {
-		return data.Open, nil
-	}
-	resolvedProject, err := normalizedRoot(project)
-	if err != nil {
-		return nil, fmt.Errorf("resolve project root %s: %w", project, err)
-	}
-	best := ""
-	pairs := data.Open
-	for candidate, rootPairs := range *data.OpenByRoot {
-		if !filepath.IsAbs(candidate) {
-			continue
-		}
-		resolvedRoot, err := normalizedRoot(candidate)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return nil, fmt.Errorf("resolve gate root %s: %w", candidate, err)
-		}
-		rel, err := filepath.Rel(resolvedRoot, resolvedProject)
-		if err != nil {
-			return nil, fmt.Errorf("compare gate root %s with project %s: %w", resolvedRoot, resolvedProject, err)
-		}
-		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || len(resolvedRoot) <= len(best) {
-			continue
-		}
-		best, pairs = resolvedRoot, rootPairs
-	}
-	return pairs, nil
-}
-
 func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	project := root
 	if main != "" {
@@ -3648,8 +3536,8 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if err != nil {
 		return fail(errout, err)
 	}
-	if !choice.gate.valid {
-		fmt.Fprintf(errout, "tk: %s; showing started work and of new work CRIT and HIGH only (%s)\n", choice.gate.problem, choice.gate.path)
+	if !choice.gate.Valid {
+		fmt.Fprintf(errout, "tk: %s; showing started work and of new work CRIT and HIGH only (%s)\n", choice.gate.Problem, choice.gate.Path)
 	}
 	visible, sourceFailed, err := visibleExternal(project, choice, errout)
 	if err != nil {
@@ -3657,7 +3545,7 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	}
 	localGroup := 99
 	if choice.found {
-		localGroup = nextGroup(choice.task, o.by, choice.gate, choice.live)
+		localGroup = nextGroup(choice.task, o.by, choice.gate)
 	}
 	if len(visible) > 0 && (!choice.found || externalWinsLocal(visible[0], localGroup, choice)) {
 		return printExternalNext(root, choice, visible, choice.found, o.json, out, errout)
@@ -3675,30 +3563,30 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 
 // externalWinsLocal: of the same group the source goes first.
 func externalWinsLocal(t externalTask, localGroup int, choice nextChoice) bool {
-	return externalGroup(t, choice.gate, choice.live) <= localGroup
+	return externalGroup(t, choice.gate) <= localGroup
 }
 
 // externalGroup places a source record in the order of nextGroup. A started record
 // under a closed pair is begun work: after CRIT and HIGH and ahead of new work.
-func externalGroup(t externalTask, gate gateState, live bool) int {
+func externalGroup(t externalTask, gate queuegate.Scope) int {
 	open := task{prio: t.Prio, status: "открыт"}
-	if t.Started && !gatePasses(open, gate, live) {
+	if t.Started && !gate.Passes(open.prio, open.diff) {
 		return 3
 	}
-	return nextGroup(open, "", gate, live)
+	return nextGroup(open, "", gate)
 }
 
 // orderExternal keeps the records the gates show, in queue order; within a group
 // the source order stays.
-func orderExternal(items []externalTask, gate gateState, live bool) []externalTask {
+func orderExternal(items []externalTask, gate queuegate.Scope) []externalTask {
 	visible := make([]externalTask, 0, len(items))
 	for _, item := range items {
-		if item.Started || gatePasses(task{prio: item.Prio, status: "открыт"}, gate, live) {
+		if item.Started || gate.Passes(item.Prio, "") {
 			visible = append(visible, item)
 		}
 	}
 	sort.SliceStable(visible, func(i, j int) bool {
-		return externalGroup(visible[i], gate, live) < externalGroup(visible[j], gate, live)
+		return externalGroup(visible[i], gate) < externalGroup(visible[j], gate)
 	})
 	return visible
 }
@@ -3706,8 +3594,15 @@ func orderExternal(items []externalTask, gate gateState, live bool) []externalTa
 type nextChoice struct {
 	task  task
 	found bool
-	gate  gateState
-	live  bool
+	gate  queuegate.Scope
+}
+
+func readTaskGate(project string) (queuegate.Scope, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return queuegate.Scope{}, fmt.Errorf("determine gate directory: %w", err)
+	}
+	return queuegate.Read(queuegate.Path(home), time.Now()).For(project)
 }
 
 func chooseNext(dir, project, actor string) (nextChoice, error) {
@@ -3726,21 +3621,14 @@ func chooseNext(dir, project, actor string) (nextChoice, error) {
 	if err != nil {
 		return nextChoice{}, err
 	}
-	gate, err := readTaskGate()
+	gate, err := readTaskGate(project)
 	if err != nil {
 		return nextChoice{}, err
 	}
-	live := slices.Contains(gate.data.Live, filepath.Base(project))
-	if gate.valid {
-		gate.open, err = gatePairs(gate.data, project)
-		if err != nil {
-			return nextChoice{}, err
-		}
-	}
-	choice := nextChoice{gate: gate, live: live}
-	candidates := nextCandidates(tasks, actor, gate, choice.live)
+	choice := nextChoice{gate: gate}
+	candidates := nextCandidates(tasks, actor, gate)
 	if len(candidates) != 0 {
-		sortNextCandidates(candidates, actor, gate, choice.live)
+		sortNextCandidates(candidates, actor, gate)
 		choice.task, choice.found = candidates[0], true
 	}
 	return choice, nil
@@ -3777,8 +3665,8 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return
 	}
-	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate, choice.live), choice)) {
-		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.valid && !choice.live))
+	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate), choice)) {
+		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.Valid && !choice.gate.Live))
 	} else if choice.found {
 		fmt.Fprintln(out, "следующий: "+nextLine(choice, errout))
 	}
@@ -3786,8 +3674,8 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 
 func sortExternal(items []externalTask) {
 	sort.SliceStable(items, func(i, j int) bool {
-		left := nextGroup(task{prio: items[i].Prio, status: "открыт"}, "", gateState{}, false)
-		right := nextGroup(task{prio: items[j].Prio, status: "открыт"}, "", gateState{}, false)
+		left := nextGroup(task{prio: items[i].Prio, status: "открыт"}, "", queuegate.Scope{})
+		right := nextGroup(task{prio: items[j].Prio, status: "открыт"}, "", queuegate.Scope{})
 		return left < right
 	})
 }
@@ -3843,7 +3731,7 @@ func visibleExternal(project string, choice nextChoice, errout io.Writer) (items
 		sourceWarning(errout, path, failure)
 		return nil, true, nil
 	}
-	return orderExternal(items, choice.gate, choice.live), false, nil
+	return orderExternal(items, choice.gate), false, nil
 }
 func externalLine(t externalTask, closed bool) string {
 	s := strings.TrimSpace(strings.Join([]string{t.Key, t.Prio, t.Status, t.Title, t.URL}, " "))
@@ -3871,19 +3759,19 @@ func printCombinedNext(root string, choice nextChoice, ext []externalTask, jsonO
 	if !jsonOutput {
 		fmt.Fprintln(out, nextLine(choice, errout))
 		if len(ext) > 0 {
-			fmt.Fprintln(out, "также: "+externalLine(ext[0], choice.gate.valid && !choice.live))
+			fmt.Fprintln(out, "также: "+externalLine(ext[0], choice.gate.Valid && !choice.gate.Live))
 			if len(ext) > 1 {
 				fmt.Fprintf(out, "ещё из источника: %d\n", len(ext)-1)
 			}
 		}
 		return 0
 	}
-	obj, e := localNextObject(root, choice.task, choice.gate.valid && !choice.live)
+	obj, e := localNextObject(root, choice.task, choice.gate.Valid && !choice.gate.Live)
 	if e != nil {
 		return fail(errout, e)
 	}
 	if len(ext) > 0 {
-		obj["also"] = externalJSON(ext[0], choice.gate.valid && !choice.live)
+		obj["also"] = externalJSON(ext[0], choice.gate.Valid && !choice.gate.Live)
 		if len(ext) > 1 {
 			obj["more"] = len(ext) - 1
 		}
@@ -3891,7 +3779,7 @@ func printCombinedNext(root string, choice nextChoice, ext []externalTask, jsonO
 	return encodeNext(obj, out, errout)
 }
 func printExternalNext(root string, choice nextChoice, ext []externalTask, local bool, jsonOutput bool, out, errout io.Writer) int {
-	closed := choice.gate.valid && !choice.live
+	closed := choice.gate.Valid && !choice.gate.Live
 	if !jsonOutput {
 		fmt.Fprintln(out, externalLine(ext[0], closed))
 		if local {
@@ -3923,14 +3811,14 @@ func encodeNext(obj any, out, errout io.Writer) int {
 	return 0
 }
 
-func nextCandidates(tasks []task, actor string, gate gateState, live bool) []task {
+func nextCandidates(tasks []task, actor string, gate queuegate.Scope) []task {
 	var candidates []task
 	for i := range tasks {
 		t := tasks[i]
 		if !eligibleForNext(t, actor) {
 			continue
 		}
-		if !gateVisible(t, gate, live) {
+		if !gateVisible(t, gate) {
 			continue
 		}
 		candidates = append(candidates, t)
@@ -3942,15 +3830,8 @@ func nextCandidates(tasks []task, actor string, gate gateState, live bool) []tas
 // began and a wait that came due stay visible. Without readable gates nothing
 // tells which pairs are open or which projects are live, so of new work only what
 // is always open stays visible.
-func gateVisible(t task, gate gateState, live bool) bool {
-	return t.status != "открыт" || gatePasses(t, gate, live)
-}
-
-func gatePasses(t task, gate gateState, live bool) bool {
-	if !gate.valid {
-		return gateOpen(t, nil)
-	}
-	return !live || gateOpen(t, gate.open)
+func gateVisible(t task, gate queuegate.Scope) bool {
+	return t.status != "открыт" || gate.Passes(t.prio, t.diff)
 }
 
 func eligibleForNext(t task, actor string) bool {
@@ -3975,12 +3856,12 @@ func isJournal(t task) bool { return lineValue(t.body, "Вид: ") == "журн�
 
 // nextGroup orders the queue. Work already begun under a closed pair stays in the
 // queue without pushing out CRIT and HIGH, and goes ahead of new work.
-func nextGroup(t task, actor string, gate gateState, live bool) int {
+func nextGroup(t task, actor string, gate queuegate.Scope) int {
 	prio := normalizePrio(t.prio)
 	if prio == "CRIT" {
 		return 0
 	}
-	if t.status != "открыт" && !gatePasses(t, gate, live) {
+	if t.status != "открыт" && !gate.Passes(t.prio, t.diff) {
 		return 3
 	}
 	if t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
@@ -3995,10 +3876,10 @@ func nextGroup(t task, actor string, gate gateState, live bool) int {
 	return 5
 }
 
-func sortNextCandidates(candidates []task, actor string, gate gateState, live bool) {
+func sortNextCandidates(candidates []task, actor string, gate queuegate.Scope) {
 	sort.Slice(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
-		leftGroup, rightGroup := nextGroup(left, actor, gate, live), nextGroup(right, actor, gate, live)
+		leftGroup, rightGroup := nextGroup(left, actor, gate), nextGroup(right, actor, gate)
 		if leftGroup != rightGroup {
 			return leftGroup < rightGroup
 		}
@@ -4010,7 +3891,7 @@ func nextLine(choice nextChoice, errout io.Writer) string {
 	var row bytes.Buffer
 	printTask(&row, choice.task, "", errout)
 	line := strings.TrimSuffix(row.String(), "\n")
-	if choice.gate.valid && !choice.live {
+	if choice.gate.Valid && !choice.gate.Live {
 		line += " закрыто"
 	}
 	return line

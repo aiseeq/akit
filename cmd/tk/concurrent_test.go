@@ -137,15 +137,11 @@ func TestConcurrentStartsAssignTicketToOneActor(t *testing.T) {
 	if err := os.WriteFile(gatePath, []byte(gate), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	state, err := readTaskGate()
+	state, err := readTaskGate(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.open, err = gatePairs(state.data, base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !gateVisible(task{status: "открыт", prio: "MED", diff: "DO"}, state, true) {
+	if !gateVisible(task{status: "открыт", prio: "MED", diff: "DO"}, state) {
 		t.Fatalf("test gate is closed: %#v", state)
 	}
 	dir := filepath.Join(base, "docs", "tasks")
