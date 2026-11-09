@@ -586,3 +586,21 @@ func TestMaskLiveKeyBodyWithSeparators(t *testing.T) {
 		}
 	}
 }
+
+// A secret name glued to a key stays for the context rule, or the value after it
+// would be printed.
+func TestMaskLiveKeyGluedAssignmentKeepsValueHidden(t *testing.T) {
+	key := "sk" + "_live_" + strings.Repeat("a1B2", 6)
+	const value = "hunter2value"
+	for _, name := range []string{"_password=", "-token: ", "_PASSWORD=", "_api_key="} {
+		got, _ := Mask(key + name + value)
+		if strings.Contains(got, value) || strings.Contains(got, key) {
+			t.Errorf("%q: value or key left, output length %d", name, len(got))
+		}
+	}
+	// A body going on before a delimiter is still the key, not a name.
+	tail := "_Ab12_cD34-eF56"
+	if got, _ := Mask(key + tail + "=rest"); strings.Contains(got, tail) {
+		t.Errorf("tail before a delimiter left: output length %d", len(got))
+	}
+}

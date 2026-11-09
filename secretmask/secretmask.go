@@ -13,7 +13,11 @@
 //     can leak without one (github_pat_ 0.56%, sk-proj- and sk-ant- 3.3%, xox?-
 //     17.8% at the minimum length), real keys of these kinds being much longer.
 //   - A key of the sk_live kinds takes the token characters after its body, so
-//     text glued to it with _ or - is hidden with it.
+//     text glued to it with _ or - is hidden with it, unless that text is a
+//     secret name before a delimiter, which the context rules need. It is
+//     recognized by the body before the first separator: with _ or - before the
+//     16th body character, or no digit before it next to a joiner, rk_ and pk_
+//     keys stay visible (sk_ ones fall to generic sk).
 //   - Base64url under generic sk can split into short fragments: at length 32,
 //     0.47% after a space and 28.34% after a letter.
 //   - Escapes outside escapeRE grammar can leak, including byte 0x9b.
@@ -49,6 +53,7 @@ var (
 	awsRE          = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE       = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
 	contextNameRE  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
+	gluedNameRE    = regexp.MustCompile(`^` + contextNameRE.String())
 	headerRE       = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	urlRE          = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]*:([^\s/@]+)@`)
 	flagRE         = regexp.MustCompile("(?i)(?:^|[ \\t'\"`])--?([a-z0-9_.-]+)")
@@ -676,7 +681,7 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 		}
 		if acceptsToken(text, offset, body, end, p, scan.runs) {
 			if p.bodyGoesOn {
-				end = bodyEnd(text, end, tokenChars, &bodyEnds)
+				end = bodyContinuation(text, end, &bodyEnds)
 			}
 			accepted = append(accepted, []int{offset, end})
 			offset = end
@@ -685,6 +690,22 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 		}
 	}
 	return accepted, scan
+}
+
+// bodyContinuation is where an accepted key ends once the token characters after
+// its body count. A secret name glued to the key is left for the context rules:
+// taken into the key, it would no longer hide the value after it.
+func bodyContinuation(text string, end int, caches *[4]bodyEndCache) int {
+	next := bodyEnd(text, end, tokenChars, caches)
+	if next == end {
+		return end
+	}
+	if m := gluedNameRE.FindStringSubmatch(text[end:]); m != nil {
+		if _, secret := secretName(m[1]); secret {
+			return end
+		}
+	}
+	return next
 }
 
 func matchingPrefix(text string, start int, variants []tokenVariant) (tokenVariant, bool) {
