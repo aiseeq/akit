@@ -163,7 +163,7 @@ func TestFrozenMasterNameFromTheTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Both alive: the folder's name still is not the master.
-	if err := os.WriteFile(filepath.Join(sessionsDir, "folder-name.json"), []byte(strings.Replace(string(own), "special-master", "sample-master", 1)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(sessionsDir, "2.json"), []byte(strings.Replace(string(own), "special-master", "sample-master", 1)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if code, out, _ := tkIn(t, project, "", "next", "--by", "sample-master"); code != exitNone || strings.Contains(out, "subject") {
@@ -176,6 +176,47 @@ func TestFrozenMasterNameFromTheTable(t *testing.T) {
 	_, _, errOut := tkIn(t, project, "special-master", "next")
 	if strings.Contains(errOut, "line ignored") {
 		t.Errorf("a home line of the table is not an error: %q", errOut)
+	}
+}
+
+func TestFrozenByNeedsTheMasterItselfAlive(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "someone-else")
+	if code, out, _ := tkIn(t, project, "", "next", "--by", "sample-master"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("master dead, another session alive: code %d, out %q", code, out)
+	}
+}
+
+func TestFrozenRegistryNameIsReadWithoutCase(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "SAMPLE-MASTER")
+	nextGives(t, project, "sample-master")
+}
+
+func TestFrozenTableLastLineOfAFolderWins(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	writeNames(t, home, "~/work/sample\tfirst-name\n~/work/sample\tlast-name\n")
+	liveSession(t, home, "first-name")
+	if code, out, _ := tkIn(t, project, "first-name", "next"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("first of two lines: code %d, out %q", code, out)
+	}
+	liveSession(t, home, "last-name")
+	nextGives(t, project, "last-name")
+}
+
+func TestFrozenTableNameIsTrimmed(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	writeNames(t, home, "~/work/sample\t  special-master\n")
+	liveSession(t, home, "special-master")
+	nextGives(t, project, "special-master")
+}
+
+func TestFrozenTableLineWithoutTabGivesNoName(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "sample-master")
+	writeNames(t, home, "~/work/sample special-master\n")
+	if code, out, errOut := tkIn(t, project, "sample-master", "next"); code == 0 || strings.Contains(out, "subject") || !strings.Contains(errOut, "names.tsv:1") {
+		t.Errorf("space for a tab: code %d, out %q, err %q", code, out, errOut)
 	}
 }
 

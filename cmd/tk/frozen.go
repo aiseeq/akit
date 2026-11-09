@@ -136,12 +136,16 @@ func masterName(home, want string, errout io.Writer) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read session names: %w", err)
 	}
+	master, lastLine := "", 0
 	for number, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		listed, name, _ := strings.Cut(line, "\t")
+		listed, name, separated := strings.Cut(line, "\t")
+		if !separated { // malformed: it still names the project, and gives no name
+			listed = strings.Fields(line)[0]
+		}
 		matches, err := listedPathIs(strings.TrimSpace(listed), home, want)
 		if err != nil {
 			fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, number+1, err)
@@ -150,13 +154,15 @@ func masterName(home, want string, errout io.Writer) (string, error) {
 		if !matches {
 			continue
 		}
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return "", fmt.Errorf("%s:%d: no session name for the project", path, number+1)
-		}
-		return name, nil
+		master, lastLine = strings.TrimSpace(name), number+1 // the last line of a folder wins, as for session starts
 	}
-	return fallback, nil
+	if lastLine == 0 {
+		return fallback, nil
+	}
+	if master == "" {
+		return "", fmt.Errorf("%s:%d: no session name for the project", path, lastLine)
+	}
+	return master, nil
 }
 
 func liveMaster(home, who, master string, errout io.Writer) bool {
