@@ -3334,6 +3334,7 @@ type taskJSON struct {
 	Executor       string     `json:"executor"`
 	Waits          string     `json:"waits"`
 	Overdue        bool       `json:"overdue"`
+	Due            string     `json:"due,omitempty"`
 	NoCheck        bool       `json:"no_check"`
 	Check          string     `json:"check"`
 	Checker        string     `json:"checker"`
@@ -3365,17 +3366,18 @@ func (p planJSON) label() string {
 
 func taskObject(root string, t task, repo string, details bool) taskJSON {
 	waits := waiting(t.body)
-	overdue := false
+	overdue, due := false, ""
 	if t.status == "ждёт" {
-		if at, ok := waitDue(waits, time.Now()); ok && !at.After(time.Now()) {
-			overdue = true
+		if at, ok := waitDue(waits, time.Now()); ok {
+			due = at.Format(time.RFC3339)
+			overdue = !at.After(time.Now())
 		}
 	}
 	prio := normalizePrio(t.prio)
 	journalEntry := isJournal(t)
 	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: lineValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
 		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
-		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, NoCheck: noCheck(t.body)}
+		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, Due: due, NoCheck: noCheck(t.body)}
 	if details {
 		obj.Journal = journalLines(t.body)
 		if journalEntry {

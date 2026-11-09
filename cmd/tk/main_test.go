@@ -2871,3 +2871,35 @@ func TestRepeatedStartNamesNextStep(t *testing.T) {
 		t.Fatalf("repeat start = %d %v %q %q", code, done, out.String(), errOut.String())
 	}
 }
+
+// due in tk ls --json is the deadline waitDue parses, so a reader does not parse
+// the wait text again; a wait without a parsed deadline leaves it empty.
+func TestListJSONDueMatchesWaitDue(t *testing.T) {
+	for _, wait := range []string{"2020-01-01T12:00", "2020-01-01 12:00 итог", "31.12 23:59: итог", "10.11 12:00: ответ", "2999-01-01 12:00 CET (x)", "2020-13-45 12:00: срок", "2020-01-01-ответ", "после ответа"} {
+		waiting := task{status: "ждёт", body: "Статус: ждёт\nЖдёт: " + wait}
+		want := ""
+		if at, ok := waitDue(wait, time.Now()); ok {
+			want = at.Format(time.RFC3339)
+		}
+		obj := taskObject("", waiting, "", false)
+		if obj.Due != want {
+			t.Errorf("due for %q = %q, want %q", wait, obj.Due, want)
+		}
+		encoded, err := json.Marshal(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), `"due"`) != (want != "") {
+			t.Errorf("due field presence for %q: %s", wait, encoded)
+		}
+	}
+	if got := taskObject("", task{status: "ждёт", body: "Статус: ждёт\nЖдёт: 31.12 23:59: итог"}, "", false).Due; got == "" {
+		t.Error("a day-month deadline should be parsed")
+	}
+	if taskObject("", task{status: "ждёт", body: "Статус: ждёт\nЖдёт: 2999-01-01 12:00 итог"}, "", false).Overdue {
+		t.Error("a deadline ahead is not overdue")
+	}
+	if got := taskObject("", task{status: "открыт", body: "Статус: открыт\nЖдёт: 2020-01-01 12:00"}, "", false).Due; got != "" {
+		t.Errorf("due on a ticket that does not wait = %q", got)
+	}
+}

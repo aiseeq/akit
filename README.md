@@ -260,7 +260,7 @@ When `.glint.yaml` exists at the task base, `tk done` checks all glint severitie
 completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
 `--slug PREFIX` filters by a case-insensitive slug prefix, and `--json` emits the filtered list with
-completion details. `tk archive --root DIR` archives each repository's tasks to its own
+completion details; a waiting ticket whose deadline parses has it in `due` (RFC3339), the same time `--due` compares. `tk archive --root DIR` archives each repository's tasks to its own
 `docs/tasks-archive/` and prints paths relative to DIR. Completion journal entries record the
 checker session when it differs from `--by` (`checker_session` in JSON): a fresh sub-agent runs in its
 parent's session, so the session alone does not tell a self-check apart; `tk done` only warns when it matches the executor. `tk done` refuses tickets with an empty `Приёмка` or `Чем проверить` section.
