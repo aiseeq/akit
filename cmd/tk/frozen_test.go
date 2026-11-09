@@ -1,0 +1,221 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/aiseeq/akit/proc"
+)
+
+// frozenProject makes HOME/work/sample with a ticket and an optional frozen file.
+func frozenProject(t *testing.T, frozen string) (home, project, worktree string) {
+	t.Helper()
+	project, worktree = linkedProject(t)
+	home = filepath.Dir(filepath.Dir(project))
+	store := filepath.Join(home, "work", "tasks", "sample")
+	if err := os.WriteFile(filepath.Join(store, "20261101-1000-HIGH-DO-subject.md"), []byte("# subject\n\nСтатус: открыт\nПричина: x\n\n## Приёмка\n- check\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if frozen != "" {
+		dir := filepath.Join(home, ".config", "queue")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "frozen"), []byte(frozen), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return home, project, worktree
+}
+
+// liveSession registers this test process under name, so it counts as running.
+func liveSession(t *testing.T, home, name string) {
+	t.Helper()
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := proc.ReadStat("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := fmt.Sprintf(`{"pid":%d,"procStart":%q,"name":%q,"startedAt":1}`, os.Getpid(), st.Start, name)
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.json", os.Getpid())), []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tkIn(t *testing.T, dir, name string, args ...string) (int, string, string) {
+	t.Helper()
+	t.Chdir(dir)
+	previous := session
+	session = func() string { return name }
+	t.Cleanup(func() { session = previous })
+	o, err := parseArgs(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := run(o, &out, &errOut)
+	return code, out.String(), errOut.String()
+}
+
+const frozenLine = "~/work/sample\tuser\t2026-11-09\tstopped on purpose\n"
+
+func refused(t *testing.T, dir, actor string, args ...string) {
+	t.Helper()
+	code, out, errOut := tkIn(t, dir, actor, append([]string{"next"}, args...)...)
+	if code != exitNone || strings.Contains(out, "subject") || !strings.Contains(errOut, "stopped on purpose") {
+		t.Errorf("next by %q: code %d, out %q, err %q", actor, code, out, errOut)
+	}
+	code, out, errOut = tkIn(t, dir, actor, append([]string{"start", "subject"}, args...)...)
+	if code != exitNone || !strings.Contains(errOut, "stopped on purpose") {
+		t.Errorf("start by %q: code %d, out %q, err %q", actor, code, out, errOut)
+	}
+}
+
+func TestFrozenRefusesAnyoneButLiveMaster(t *testing.T) {
+	home, project, worktree := frozenProject(t, frozenLine)
+	refused(t, project, "admin")
+	refused(t, worktree, "admin")
+	refused(t, project, "", "--by", "sample-master") // no session: nothing says it is the master
+	refused(t, project, "sample-master")
+	liveSession(t, home, "admin")
+	refused(t, project, "admin")
+}
+
+func TestFrozenNameGivenByFlagDoesNotCount(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "sample-master")
+	refused(t, project, "admin", "--by", "sample-master")
+}
+
+func TestFrozenLiveMasterWorksAsUsual(t *testing.T) {
+	home, project, worktree := frozenProject(t, frozenLine)
+	liveSession(t, home, "sample-master")
+	for _, dir := range []string{project, worktree} {
+		if code, out, errOut := tkIn(t, dir, "sample-master", "next"); code != 0 || !strings.Contains(out, "subject") {
+			t.Errorf("next in %s: code %d, out %q, err %q", dir, code, out, errOut)
+		}
+	}
+	if code, _, errOut := tkIn(t, project, "SAMPLE-master", "start", "subject"); code != 0 {
+		t.Errorf("start, name in another case: code %d, err %q", code, errOut)
+	}
+}
+
+func TestFrozenTicketsStillAccumulate(t *testing.T) {
+	_, project, _ := frozenProject(t, frozenLine)
+	if code, _, errOut := tkIn(t, project, "admin", "new", "more", "--by", "admin"); code != 0 {
+		t.Fatalf("new: code %d, err %q", code, errOut)
+	}
+	if code, out, errOut := tkIn(t, project, "admin", "ls"); code != 0 || !strings.Contains(out, "more") {
+		t.Fatalf("ls: code %d, out %q, err %q", code, out, errOut)
+	}
+	if code, _, errOut := tkIn(t, project, "admin", "note", "more", "text", "--by", "admin"); code != 0 {
+		t.Fatalf("note: code %d, err %q", code, errOut)
+	}
+}
+
+func TestFrozenOtherProjectOrNoFileAsUsual(t *testing.T) {
+	for name, frozen := range map[string]string{
+		"no file":        "",
+		"other project":  "~/work/sample-api\tuser\t2026-11-09\tnot this one\n",
+		"comment only":   "# ~/work/sample\tuser\t2026-11-09\tnot in force\n",
+		"another prefix": "~/work/sam\tuser\t2026-11-09\tnot this one\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, project, _ := frozenProject(t, frozen)
+			if code, out, errOut := tkIn(t, project, "admin", "next"); code != 0 || !strings.Contains(out, "subject") {
+				t.Errorf("next: code %d, out %q, err %q", code, out, errOut)
+			}
+			if code, _, errOut := tkIn(t, project, "admin", "start", "subject"); code != 0 {
+				t.Errorf("start: code %d, err %q", code, errOut)
+			}
+		})
+	}
+}
+
+// An incomplete line still names the project: it stays frozen, and says so.
+func TestFrozenIncompleteLineStaysFrozen(t *testing.T) {
+	for name, line := range map[string]string{"path only": "~/work/sample\n", "spaces": "~/work/sample user 2026-11-09 why\n", "no newline": "~/work/sample\tuser"} {
+		t.Run(name, func(t *testing.T) {
+			_, project, _ := frozenProject(t, line)
+			code, out, errOut := tkIn(t, project, "admin", "next")
+			if code != exitNone || strings.Contains(out, "subject") || !strings.Contains(errOut, "incomplete") {
+				t.Errorf("code %d, out %q, err %q", code, out, errOut)
+			}
+		})
+	}
+}
+
+func TestFrozenUnreadableFileIsAnError(t *testing.T) {
+	home, project, _ := frozenProject(t, "")
+	dir := filepath.Join(home, ".config", "queue", "frozen")
+	if err := os.MkdirAll(dir, 0o755); err != nil { // a directory cannot be read as a file
+		t.Fatal(err)
+	}
+	code, out, errOut := tkIn(t, project, "admin", "next")
+	if code != exitUsage || strings.Contains(out, "subject") || !strings.Contains(errOut, "frozen") {
+		t.Errorf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestFrozenSourceAndDoneHintGiveNoWork(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	writeSource(t, filepath.Dir(project), `echo '[{"key":"K-ext","title":"ext","status":"To Do","prio":"HIGH","url":"u"}]'`)
+	code, out, errOut := tkIn(t, project, "admin", "next")
+	if code != exitNone || strings.Contains(out, "K-ext") {
+		t.Errorf("next: code %d, out %q, err %q", code, out, errOut)
+	}
+	store := filepath.Join(home, "work", "tasks", "sample")
+	if err := os.WriteFile(filepath.Join(store, "20261101-1001-MED-DO-begun.md"), []byte("# begun\n\nСтатус: в работе\nИсполнитель: gone\n\n## Приёмка\n- check\n\n## Журнал\n- 2026-11-01 10:00 в работе — gone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut = tkIn(t, project, "checker", "done", "begun", "--check", "checked by test", "--by", "checker")
+	if code != 0 || strings.Contains(out, "следующий") {
+		t.Errorf("done: code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestFrozenSymlinkedProjectIsTheSame(t *testing.T) {
+	home, project, _ := frozenProject(t, "~/link\tuser\t2026-11-09\tstopped on purpose\n")
+	if err := os.Symlink(project, filepath.Join(home, "link")); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, project, "admin")
+}
+
+func TestFrozenCasesOfPathAreDifferentProjects(t *testing.T) {
+	_, project, _ := frozenProject(t, "~/work/SAMPLE\tuser\t2026-11-09\tanother folder\n")
+	if code, out, errOut := tkIn(t, project, "admin", "next"); code != 0 || !strings.Contains(out, "subject") {
+		t.Errorf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+// A listed parent or name prefix that exists is another folder, and a comment
+// never names a project, whatever the working directory holds.
+func TestFrozenExistingPrefixAndCommentDoNotCount(t *testing.T) {
+	for name, frozen := range map[string]string{
+		"existing prefix": "~/work/sam\tuser\t2026-11-09\tnot this one\n",
+		"parent":          "~/work\tuser\t2026-11-09\tnot this one\n",
+		"comment":         "#self\tuser\t2026-11-09\tnot in force\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home, project, _ := frozenProject(t, frozen)
+			if err := os.MkdirAll(filepath.Join(home, "work", "sam"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(project, "#self")
+			if err := os.Symlink(project, link); err != nil {
+				t.Fatal(err)
+			}
+			if code, out, errOut := tkIn(t, project, "admin", "next"); code != 0 || !strings.Contains(out, "subject") {
+				t.Errorf("code %d, out %q, err %q", code, out, errOut)
+			}
+		})
+	}
+}

@@ -3024,6 +3024,11 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "set" {
 		return setTask(t, o, out, errout)
 	}
+	if o.cmd == "start" {
+		if code := refuseFrozenStart(o, errout); code != 0 {
+			return code
+		}
+	}
 	if o.cmd == "release" && t.status != "в работе" {
 		fmt.Fprintf(errout, "tk: release requires status в работе; ticket is %s\n", t.status)
 		return exitNone
@@ -3102,6 +3107,22 @@ func prepareTransition(t task, o options, errout io.Writer) (int, func(), int) {
 	}
 	findings, release, code := checkDone(&t, o, errout)
 	return findings, release, code
+}
+
+func refuseFrozenStart(o options, errout io.Writer) int {
+	project := o.mainRoot
+	if project == "" {
+		project = o.baseRoot
+	}
+	refusal, err := frozenRefusal(project, errout)
+	if err != nil {
+		return fail(errout, err)
+	}
+	if refusal != "" {
+		fmt.Fprintln(errout, "tk: "+refusal)
+		return exitNone
+	}
+	return 0
 }
 
 func transitionStatus(cmd string) string {
@@ -3613,6 +3634,15 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if main != "" {
 		project = main
 	}
+	refusal, err := frozenRefusal(project, errout)
+	if err != nil {
+		return fail(errout, err)
+	}
+	if refusal != "" {
+		fmt.Fprintln(errout, "tk: "+refusal)
+		fmt.Fprintln(out, "работы нет")
+		return exitNone
+	}
 	choice, err := chooseNext(dir, project, o.by)
 	if err != nil {
 		return fail(errout, err)
@@ -3726,6 +3756,14 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 	actor := executor(t.body)
 	if actor == "" {
 		actor = o.by
+	}
+	refusal, err := frozenRefusal(project, errout)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
+		return
+	}
+	if refusal != "" {
+		return
 	}
 	choice, err := chooseNext(dir, project, actor)
 	if err != nil {
