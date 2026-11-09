@@ -225,12 +225,12 @@ func TestCanTakeInALinkedWorktreeIsOfItsProject(t *testing.T) {
 	}
 }
 
-func TestCanTakeBadProjectCostsOnlyItself(t *testing.T) {
+func TestCanTakeBadNameRowOfAFrozenProjectCostsOnlyItself(t *testing.T) {
 	home, base, _ := takeSetup(t)
-	writeNames(t, home, "~/git/high\n")
-	writeTakeTicket(t, base, takeCase{project: "high", file: "20261102-1000-HIGH-DO-second.md", status: "открыт"})
+	writeNames(t, home, "~/git/frozenlive\n")
+	writeTakeTicket(t, base, takeCase{project: "frozenlive", file: "20261102-1000-HIGH-DO-second.md", status: "открыт"})
 	takes, errOut := listTakes(t, base, "--all", "--root", base)
-	if takes["high"] {
+	if takes["frozenlive"] {
 		t.Fatal("no master can be named: can_take must be false")
 	}
 	if !takes["medopen"] {
@@ -238,6 +238,113 @@ func TestCanTakeBadProjectCostsOnlyItself(t *testing.T) {
 	}
 	if strings.Count(errOut, "can_take is false") != 1 || !strings.Contains(errOut, "names.tsv:1") {
 		t.Fatalf("the reason once, with its place: %q", errOut)
+	}
+	if code, _, _ := tkIn(t, filepath.Join(base, "frozenlive"), "", "next", "--by", "frozenlive-master"); code == 0 {
+		t.Fatal("tk next must not give work here")
+	}
+}
+
+func TestCanTakeNameTableDecidesOnlyForAFrozenProject(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		table func(t *testing.T, home string)
+	}{
+		{"row without a name", func(t *testing.T, home string) { writeNames(t, home, "~/git/high\n") }},
+		{"table cannot be read", func(t *testing.T, home string) {
+			if err := os.Remove(filepath.Join(home, ".config", "cl", "names.tsv")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(home, ".config", "cl", "names.tsv"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, base, _ := takeSetup(t)
+			tc.table(t, home)
+			takes, _ := listTakes(t, filepath.Join(base, "high"))
+			if !takes[""] {
+				t.Fatal("tk next gives this ticket, can_take must say so")
+			}
+			if !nextFinds(t, filepath.Join(base, "high"), "high-master") {
+				t.Fatal("tk next does not give it")
+			}
+		})
+	}
+}
+
+func TestCanTakeFrozenMasterNamedByTheTable(t *testing.T) {
+	home, base, _ := takeSetup(t)
+	writeTakeTicket(t, base, takeCase{project: "frozennamed", file: "20261101-1000-HIGH-DO-subject.md", status: "открыт"})
+	list := filepath.Join(home, ".config", "queue", "frozen")
+	if err := os.WriteFile(list, []byte("~/git/frozennamed\tuser\t2026-11-09\tstopped\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeNames(t, home, "~/git/frozennamed\tkeeper\n")
+	liveSession(t, home, "keeper")
+	takes, _ := listTakes(t, base, "--all", "--root", base)
+	if !takes["frozennamed"] {
+		t.Fatal("its master by the table is running")
+	}
+	if !nextFinds(t, filepath.Join(base, "frozennamed"), "keeper") {
+		t.Fatal("tk next does not give it")
+	}
+}
+
+func TestCanTakeBadGateRootGivesNothingAndSaysSo(t *testing.T) {
+	home, base, _ := takeSetup(t)
+	file := filepath.Join(home, "plain")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, err := json.Marshal(map[string]any{"at": time.Now().Format(time.RFC3339), "live": []string{"high"}, "open": []string{}, "open_by_root": map[string][]string{filepath.Join(file, "below"): {"MED-DO"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".local", "state", "queue", "gate.json"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	takes, errOut := listTakes(t, filepath.Join(base, "high"))
+	if takes[""] || !strings.Contains(errOut, "can_take is false") {
+		t.Fatalf("takes %v, stderr %q", takes, errOut)
+	}
+	if code, _, _ := tkIn(t, filepath.Join(base, "high"), "", "next", "--by", "high-master"); code == 0 {
+		t.Fatal("tk next must fail here too")
+	}
+}
+
+func TestCanTakeThroughASymlinkedRootKnowsTheProject(t *testing.T) {
+	home, base, _ := takeSetup(t)
+	links := filepath.Join(home, "links")
+	if err := os.MkdirAll(links, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "lowclosed"), filepath.Join(links, "other")); err != nil { // the name is not in the live list
+		t.Fatal(err)
+	}
+	link := filepath.Join(links, "other")
+	takes, _ := listTakes(t, link, "--all", "--root", link)
+	if len(takes) != 1 {
+		t.Fatalf("one row expected: %v", takes)
+	}
+	for _, can := range takes {
+		if can {
+			t.Fatalf("a project under the bar, by another name: %v", takes)
+		}
+	}
+}
+
+func TestCanTakeBadFileLinesAddNothingToExternalStderr(t *testing.T) {
+	home, base, _ := takeSetup(t)
+	writeNames(t, home, "relative/path\tname\n")
+	list := filepath.Join(home, ".config", "queue", "frozen")
+	if err := os.WriteFile(list, []byte("relative/path\tuser\t2026-11-09\tstopped\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSource(t, base, `echo '[{"key":"K1","title":"one","status":"open","prio":"HIGH","url":"u"}]'`)
+	code, out, errOut := tkIn(t, filepath.Join(base, "high"), "", "external", "--json")
+	if code != 0 || errOut != "" || !strings.Contains(out, `"can_take":true`) {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 }
 
@@ -263,10 +370,13 @@ func TestCanTakeExternal(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		frozen bool
+		open   []string
 		want   string
 	}{
-		{"open project", false, "HIGH-1 true,LOW-2 false,LOW-3 true"},
-		{"frozen without its master", true, "HIGH-1 false,LOW-2 false,LOW-3 false"},
+		{"open project", false, nil, "HIGH-1 true,LOW-2 false,LOW-3 true"},
+		{"frozen without its master", true, nil, "HIGH-1 false,LOW-2 false,LOW-3 false"},
+		{"one difficulty open is not enough", false, []string{"LOW-DO"}, "HIGH-1 true,LOW-2 false,LOW-3 true"},
+		{"every difficulty open", false, []string{"LOW-DO", "LOW-HUNT", "LOW-ARCH"}, "HIGH-1 true,LOW-2 true,LOW-3 true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home, err := filepath.EvalSymlinks(t.TempDir())
@@ -278,7 +388,7 @@ func TestCanTakeExternal(t *testing.T) {
 			if err := os.MkdirAll(filepath.Join(project, "docs", "tasks"), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			writeTakeGate(t, home, []string{"sample"}, nil)
+			writeTakeGate(t, home, []string{"sample"}, tc.open)
 			if tc.frozen {
 				dir := filepath.Join(home, ".config", "queue")
 				if err := os.MkdirAll(dir, 0o755); err != nil {

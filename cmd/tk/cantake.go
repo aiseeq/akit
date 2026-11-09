@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/aiseeq/akit/queuegate"
@@ -39,12 +40,14 @@ func newTakeView() *takeView {
 
 // project is the state of one project, worked out once. Where it cannot be
 // worked out tk next fails too and so gives nothing: the answer is false and the
-// reason goes to errout, and the list of other projects stays whole.
+// reason goes to errout, and the list of other projects stays whole. A problem
+// of a single line of the files is reported by the commands that act on it; a
+// list would only repeat it for each project.
 func (v *takeView) project(project string, errout io.Writer) takeProject {
 	if state, ok := v.projects[project]; ok {
 		return state
 	}
-	state, err := v.resolve(project, errout)
+	state, err := v.resolve(project)
 	if err != nil {
 		fmt.Fprintf(errout, "tk: %s: can_take is false: %v\n", project, err)
 		state = takeProject{refused: true}
@@ -53,7 +56,7 @@ func (v *takeView) project(project string, errout io.Writer) takeProject {
 	return state
 }
 
-func (v *takeView) resolve(project string, errout io.Writer) (takeProject, error) {
+func (v *takeView) resolve(project string) (takeProject, error) {
 	if v.broken != nil {
 		return takeProject{}, v.broken
 	}
@@ -61,15 +64,17 @@ func (v *takeView) resolve(project string, errout io.Writer) (takeProject, error
 	if err != nil {
 		return takeProject{}, fmt.Errorf("resolve project %s: %w", project, err)
 	}
-	master, err := v.files.masterName(want, errout)
+	// tk next asks the table only about a frozen project, and there refusal below
+	// fails the same way. Elsewhere the name only tells whose work is in progress.
+	master, nameErr := v.files.masterName(want, io.Discard)
+	if nameErr != nil {
+		master = filepath.Base(want) + "-master"
+	}
+	refusal, err := v.files.refusal(project, master, io.Discard)
 	if err != nil {
 		return takeProject{}, err
 	}
-	refusal, err := v.files.refusal(project, master, errout)
-	if err != nil {
-		return takeProject{}, err
-	}
-	scope, err := v.gate.For(project)
+	scope, err := v.gate.For(want)
 	if err != nil {
 		return takeProject{}, err
 	}
