@@ -31,7 +31,7 @@ const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
   tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--journal] [--text FILE|-] [--blocks ID]
-  tk set ID [--prio P] [--diff D] [--why TEXT] [--by NAME] [--journal] [--blocks ID] [--unblocks ID]
+  tk set ID [--prio P] [--diff D] [--why TEXT] [--title TEXT] [--back NAME] [--by NAME] [--journal] [--blocks ID] [--unblocks ID]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
@@ -48,6 +48,7 @@ Usage:
   tk review ID [--by NAME] [--note TEXT]
   tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]   ends with the next ticket, as tk next chooses it for the executor
   tk reject ID --why TEXT [--by NAME]
+  tk release ID --why TEXT [--by NAME]
   tk show ID [--json]
   tk archive [--older DURATION] [--root DIR]
 
@@ -60,9 +61,9 @@ Flags:
   --parent KEY   transfer: parent item key passed to the transfer command
   --blocks ID    new/set: ticket this ticket blocks (repeatable)
   --unblocks ID  set: remove a blocking relation (repeatable)
-  --back NAME    new: requesting session
-  --title TEXT   new: ticket title (default: slug)
-  --by NAME      actor name (default: current session); ls: show tickets assigned to NAME
+  --back NAME    new: requesting session; set: replace requester
+  --title TEXT   new: ticket title (default: slug); set: replace title
+  --by NAME      actor name (default: current session); done: checker (fresh sub-agent or worker, e.g. worker-<id>); release: actor; ls: show tickets assigned to NAME
   --text FILE|-  new: fill ticket sections from FILE, or standard input with -
   --all          ls: include closed tickets
 
@@ -75,7 +76,7 @@ Flags:
   --check TEXT   done: describe independent verification (required)
   --doer NAME    done: specify the executor of an older ticket
   --glint-debt S done: link findings to an open ticket when glint reports them
-  --why TEXT     reject: why declined; skip: why item skipped (required)
+  --why TEXT     reject/release: reason (required); skip: why item skipped (required)
   --take         start: take a ticket assigned to another session
   --add TEXT     plan: add a named command to the ticket plan (required)
   --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command; command syntax is checked with bash -n
@@ -375,8 +376,14 @@ func validateTakeFlag(o *options) error {
 }
 
 func validateDestinationFlags(o *options) error {
-	if (o.to != "" || o.back != "") && o.cmd != "new" {
-		return errors.New("--to/--back: flag only for new")
+	if o.to != "" && o.cmd != "new" {
+		return errors.New("--to: flag only for new")
+	}
+	if o.back != "" && o.cmd != "new" && o.cmd != "set" {
+		return errors.New("--back: flag only for new or set")
+	}
+	if o.title != "" && o.cmd != "new" && o.cmd != "set" {
+		return errors.New("--title: flag only for new or set")
 	}
 	return nil
 }
@@ -399,10 +406,10 @@ func validatePriorityFlags(o *options) error {
 }
 
 func validateWhyFlag(o *options) error {
-	if o.why == "" || o.cmd == "new" || o.cmd == "set" || o.cmd == "start" || o.cmd == "reject" || o.cmd == "skip" || o.cmd == "unskip" || o.cmd == "plan" && o.repin != "" {
+	if o.why == "" || o.cmd == "new" || o.cmd == "set" || o.cmd == "start" || o.cmd == "reject" || o.cmd == "release" || o.cmd == "skip" || o.cmd == "unskip" || o.cmd == "plan" && o.repin != "" {
 		return nil
 	}
-	return errors.New("--why: flag only for new, set, start, reject, skip, unskip, or plan --repin")
+	return errors.New("--why: flag only for new, set, start, reject, release, skip, unskip, or plan --repin")
 }
 
 func validateJSONFlag(o *options) error {
@@ -446,7 +453,7 @@ func validateSimpleCommand(o *options, pos []string) error {
 		return validateNew(o, pos)
 	case "ls":
 		return validateList(o, pos)
-	case "start", "wait", "review", "done", "reject", "show", "set":
+	case "start", "wait", "review", "done", "reject", "release", "show", "set":
 		return validateTicketAction(o, pos)
 	case "next":
 		if len(pos) != 0 {
@@ -583,6 +590,12 @@ func validateActionIdentity(o *options) error {
 	if o.by != "" && !nameRE.MatchString(o.by) {
 		return errors.New("--by must be a name without spaces; use --by NAME")
 	}
+	if o.back != "" && !nameRE.MatchString(o.back) {
+		return errors.New("--back must be a name without spaces; use --back NAME")
+	}
+	if o.title != "" && strings.TrimSpace(o.title) == "" {
+		return errors.New("--title must not be empty")
+	}
 	if o.doer != "" && !nameRE.MatchString(o.doer) {
 		return errors.New("--doer must be a name without spaces; use --doer NAME")
 	}
@@ -605,8 +618,8 @@ func validateActionOptions(o *options) error {
 	if o.cmd == "done" && o.check == "" {
 		return errors.New("done requires --check")
 	}
-	if o.cmd == "reject" && o.why == "" {
-		return errors.New("reject requires --why")
+	if (o.cmd == "reject" || o.cmd == "release") && strings.TrimSpace(o.why) == "" {
+		return fmt.Errorf("%s requires --why", o.cmd)
 	}
 
 	return nil
@@ -622,8 +635,8 @@ func validatePriorityOptions(o *options) error {
 	if !validDiff(o.diff) {
 		return errors.New("--diff must be DO, HUNT, or ARCH")
 	}
-	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && !o.journal && len(o.blocks) == 0 && len(o.unblocks) == 0 {
-		return errors.New("set needs --prio, --diff, --why, or --journal")
+	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && o.title == "" && o.back == "" && !o.journal && len(o.blocks) == 0 && len(o.unblocks) == 0 {
+		return errors.New("set needs a field to change")
 	}
 	return nil
 }
@@ -1929,14 +1942,7 @@ func setWaiting(s, value string) string {
 }
 
 func removeWaiting(s string) string {
-	ls := strings.Split(s, "\n")
-	kept := ls[:0]
-	for _, line := range ls {
-		if !strings.HasPrefix(line, "Ждёт: ") {
-			kept = append(kept, line)
-		}
-	}
-	return strings.Join(kept, "\n")
+	return removeHeaderLine(s, "Ждёт: ")
 }
 
 func fillTicket(template, text string) string {
@@ -2101,6 +2107,21 @@ func executor(s string) string {
 	}
 	return ""
 }
+func removeExecutor(s string) string {
+	return removeHeaderLine(s, "Исполнитель: ")
+}
+
+func removeHeaderLine(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if !strings.HasPrefix(line, prefix) {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
 func setExecutor(s, n string) string {
 	ls := strings.Split(s, "\n")
 	for i, l := range ls {
@@ -2907,7 +2928,7 @@ func prepareDone(t *task, o options, errout io.Writer) (int, int) {
 	}
 	// Не отказ: свежий суб-агент исполнителя — независимый проверяющий, а сессия у него родительская.
 	if s := session(); s != "" && strings.EqualFold(s, doer) {
-		fmt.Fprintf(errout, "tk: checked from the executor's session %s: counts only as a fresh sub-agent's check\n", s)
+		fmt.Fprintf(errout, "tk: checked from the executor's session %s: counts only as a check by a fresh sub-agent or a worker\n", s)
 	}
 	if o.glintDebt != "" {
 		valid, err := openDebtTicket(filepath.Dir(t.path), o.glintDebt)
@@ -2989,6 +3010,10 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "set" {
 		return setTask(t, o, out, errout)
 	}
+	if o.cmd == "release" && t.status != "в работе" {
+		fmt.Fprintf(errout, "tk: release requires status в работе; ticket is %s\n", t.status)
+		return exitNone
+	}
 	if code, handled := guardStart(t, o, out, errout); handled {
 		return code
 	}
@@ -3066,12 +3091,15 @@ func prepareTransition(t task, o options, errout io.Writer) (int, func(), int) {
 }
 
 func transitionStatus(cmd string) string {
-	return map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён"}[cmd]
+	return map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён", "release": "открыт"}[cmd]
 }
 
 func transitionBody(body string, o *options, next string, errout io.Writer) (string, error) {
 	if o.cmd == "start" || o.cmd == "review" && executor(body) == "" {
 		body = setExecutor(body, o.by)
+	}
+	if o.cmd == "release" {
+		body = removeExecutor(body)
 	}
 	if o.cmd == "wait" {
 		o.until = datedWait(o.until, time.Now())
@@ -3103,7 +3131,7 @@ func transitionJournal(o options, next string, glintFindings int) string {
 			line += fmt.Sprintf("; glint: %d findings, debt %s", glintFindings, o.glintDebt)
 		}
 	}
-	if o.cmd == "reject" {
+	if o.cmd == "reject" || o.cmd == "release" {
 		line += " — " + o.why
 	}
 	if o.cmd == "review" && o.note != "" {
@@ -3244,7 +3272,7 @@ func setTask(t task, o options, out, errout io.Writer) int {
 		fmt.Fprintln(errout, "tk: --prio CRIT/HIGH requires --why or an existing Причина")
 		return exitUsage
 	}
-	body, err := applyMetadata(t.body, o)
+	body, err := applySetFields(t, o)
 	if err != nil {
 		return fail(errout, err)
 	}
@@ -3278,6 +3306,63 @@ func setTask(t task, o options, out, errout io.Writer) int {
 	}
 	fmt.Fprintln(out, newName)
 	return 0
+}
+
+func applySetFields(t task, o options) (string, error) {
+	body, err := applyMetadata(t.body, o)
+	if err != nil {
+		return "", err
+	}
+	if o.title != "" {
+		body, err = setTicketTitle(body, o.title)
+		if err != nil {
+			return "", err
+		}
+		body = journal(body, fieldChangeJournal(o.by, "заголовок", t.title, o.title))
+	}
+	if o.back != "" {
+		body, err = setRequester(body, o.back)
+		if err != nil {
+			return "", err
+		}
+		body = journal(body, fieldChangeJournal(o.by, "заказчик", lineValue(t.body, "Заказчик: "), o.back))
+	}
+	return body, nil
+}
+
+func fieldChangeJournal(actor, field, oldValue, newValue string) string {
+	return fmt.Sprintf("- %s %s — %s: %s → %s", time.Now().Format("2006-01-02 15:04"), field, actor, oldValue, newValue)
+}
+
+func setRequester(body, name string) (string, error) {
+	lines := strings.Split(body, "\n")
+	found := false
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Заказчик: ") {
+			if !found {
+				kept = append(kept, "Заказчик: "+name)
+				found = true
+			}
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !found {
+		return setHeaderValue(strings.Join(kept, "\n"), "Заказчик: ", name)
+	}
+	return strings.Join(kept, "\n"), nil
+}
+
+func setTicketTitle(body, title string) (string, error) {
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "# ") {
+			lines[i] = "# " + title
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	return "", errors.New("ticket has no title")
 }
 
 func writeRenamedTask(oldPath, newPath, body string) error {

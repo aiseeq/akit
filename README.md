@@ -183,6 +183,8 @@ after an independent review.
     tk skip fix-login tests --why 'covered by another check'
     tk ls                              # open tickets, oldest first
     tk start fix-login --by agent
+    tk release fix-login --why 'The assigned session ended' --by any-worker
+    tk set fix-login --title 'Repair login' --back requester
     tk wait fix-login --until '2026-10-28 09:00' --by agent
     tk review fix-login --by reviewer
     tk done fix-login --check 'graft gate' --by reviewer
@@ -263,7 +265,7 @@ completion unless `--glint-debt SLUG` links them to an open ticket.
 completion details; a waiting ticket whose deadline parses has it in `due` (RFC3339), the same time `--due` compares. `tk archive --root DIR` archives each repository's tasks to its own
 `docs/tasks-archive/` and prints paths relative to DIR. Completion journal entries record the
 checker session when it differs from `--by` (`checker_session` in JSON): a fresh sub-agent runs in its
-parent's session, so the session alone does not tell a self-check apart; `tk done` only warns when it matches the executor. `tk done` refuses tickets with an empty `Приёмка` or `Чем проверить` section.
+parent's session, so the session alone does not tell a self-check apart. `tk done --by` names the checker (a fresh sub-agent or worker); use `--doer` for the executor of an older ticket. `tk done` warns when the check runs in the executor's session and counts only as a check by a fresh sub-agent or a worker. It refuses tickets with an empty `Приёмка` or `Чем проверить` section. `tk release` returns an in-progress ticket to the open queue and clears its executor.
 `tk show ID` prints the ticket path and full text with lines over 150 characters wrapped at spaces (the file keeps them whole), or
 structured details with `--json`. `tk note ID TEXT` appends a journal entry without changing status.
 `tk lint` checks ticket names, statuses, acceptance sections, and independent completion checks;

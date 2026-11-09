@@ -1213,7 +1213,89 @@ func TestDoneSessionAndEmptyAcceptance(t *testing.T) {
 	}
 }
 
-// Тесты не видят сессию машины, на которой идут; нужная тесту — подменой session.
+func TestReleaseReturnsInProgressTicketToOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20260101-1000-MED-released.md")
+	body := "# Released\n\nСтатус: в работе\nИсполнитель: departed-worker\n\n## Приёмка\n- check\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := transition(task{path: path, slug: "released", status: "в работе", body: body}, options{cmd: "release", by: "available-worker", why: "owner session ended"}, &out, &errOut)
+	updated, err := os.ReadFile(path)
+	if code != 0 || err != nil || strings.Contains(string(updated), "Исполнитель:") || !strings.Contains(string(updated), "Статус: открыт") || !strings.Contains(string(updated), "открыт — available-worker — owner session ended") {
+		t.Fatalf("release result=%d body=%q err=%v stderr=%q", code, updated, err, errOut.String())
+	}
+	if _, err := parseArgs([]string{"release", "released"}); err == nil {
+		t.Fatal("release without --why succeeded")
+	}
+}
+
+func TestReleaseRejectsOtherStatusesWithoutWriting(t *testing.T) {
+	for _, status := range []string{"открыт", "ждёт", "на проверке", "готово"} {
+		t.Run(status, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "20260101-1000-MED-task.md")
+			body := "# Task\n\nСтатус: " + status + "\nИсполнитель: worker\n\n## Журнал\n"
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var out, errOut bytes.Buffer
+			code := transition(task{path: path, slug: "task", status: status, body: body}, options{cmd: "release", why: "reason", by: "worker"}, &out, &errOut)
+			updated, err := os.ReadFile(path)
+			if code == 0 || err != nil || string(updated) != body {
+				t.Fatalf("release status %q result=%d body=%q err=%v", status, code, updated, err)
+			}
+		})
+	}
+}
+
+func TestSetTitleAndRequesterJournalChangesWithoutRenaming(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20260101-1000-MED-task.md")
+	body := "# Old title\n\nСтатус: открыт\nЗаказчик: old-requester\nЗаказчик: duplicate\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := setTask(task{path: path, slug: "task", body: body, title: "Old title"}, options{cmd: "set", title: "New title", back: "new-requester", by: "editor"}, &out, &errOut)
+	updated, err := os.ReadFile(path)
+	if code != 0 || err != nil || !strings.HasPrefix(string(updated), "# New title\n") || strings.Count(string(updated), "Заказчик: ") != 1 || !strings.Contains(string(updated), "Заказчик: new-requester") || !strings.Contains(string(updated), "заголовок — editor: Old title → New title") || !strings.Contains(string(updated), "заказчик — editor: old-requester → new-requester") {
+		t.Fatalf("set result=%d body=%q err=%v stderr=%q", code, updated, err, errOut.String())
+	}
+	if out.String() != filepath.Base(path)+"\n" {
+		t.Fatalf("set renamed ticket: %q", out.String())
+	}
+	if _, err := parseArgs([]string{"set", "task"}); err == nil {
+		t.Fatal("set without fields succeeded")
+	}
+	if _, err := parseArgs([]string{"set", "task", "--title", "Updated"}); err != nil {
+		t.Fatalf("set --title: %v", err)
+	}
+	if _, err := parseArgs([]string{"set", "task", "--back", "requester"}); err != nil {
+		t.Fatalf("set --back: %v", err)
+	}
+}
+
+func TestListJSONIncludesWhyAndPath(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20260101-1000-MED-json-fields.md")
+	body := "# JSON fields\n\nСтатус: открыт\nПричина: synthetic reason\n\n## Приёмка\n- check\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := list(root, options{json: true}, &out, &errOut); code != 0 {
+		t.Fatalf("list JSON code %d: %s", code, errOut.String())
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil || len(rows) != 1 || rows[0]["why"] != "synthetic reason" || rows[0]["path"] == "" {
+		t.Fatalf("ls JSON fields = %#v, err=%v", rows, err)
+	}
+}
+
+// Тесты не видят сессию машины, на которой идут; нужную тесту задаёт подмена session.
 func init() { session = func() string { return "" } }
 
 func TestDoneCheckerSession(t *testing.T) {
@@ -2123,11 +2205,11 @@ func TestNewRejectsInvalidCommandFlagsAndBack(t *testing.T) {
 		want string
 	}{
 		{[]string{"new", "task", "--take"}, "--take: flag only for start"},
-		{[]string{"set", "task", "--to", "project"}, "--to/--back: flag only for new"},
-		{[]string{"start", "task", "--back", "request"}, "--to/--back: flag only for new"},
+		{[]string{"set", "task", "--to", "project"}, "--to: flag only for new"},
+		{[]string{"start", "task", "--back", "request"}, "--back: flag only for new or set"},
 		{[]string{"ls", "--diff", "DO"}, "--prio/--diff: flag only for new, set, or start"},
 		{[]string{"next", "--prio", "HIGH"}, "--prio/--diff: flag only for new, set, or start"},
-		{[]string{"show", "task", "--why", "reason"}, "--why: flag only for new, set, start, reject, skip, unskip, or plan --repin"},
+		{[]string{"show", "task", "--why", "reason"}, "--why: flag only for new, set, start, reject, release, skip, unskip, or plan --repin"},
 		{[]string{"new", "task", "--back", "two words"}, "--back must be a name without spaces"},
 		{[]string{"new", "task", "--back", "bad\nname"}, "--back must be a name without spaces"},
 	} {
