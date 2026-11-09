@@ -207,6 +207,9 @@ func rawContainsFoldedASCII(raw, pattern []byte) bool {
 			return false
 		}
 		i += from
+		if i > len(raw)-len(pattern) {
+			return false
+		}
 		candidate := raw[i : i+len(pattern)]
 		matched := true
 		for j, b := range candidate {
