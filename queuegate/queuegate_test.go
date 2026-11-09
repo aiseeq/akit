@@ -63,7 +63,7 @@ func TestReadUntrusted(t *testing.T) {
 
 func TestReadAtTheEdgesOfTrust(t *testing.T) {
 	offset := time.FixedZone("", 3600)
-	for _, at := range []time.Time{now.Add(-26 * time.Hour), now, now.Add(-time.Hour).In(offset)} {
+	for _, at := range []time.Time{now.Add(-26 * time.Hour), now, now.In(offset)} {
 		if g := Read(writeGate(t, gateAt(at)), now); !g.Valid {
 			t.Errorf("at %v: %q", at, g.Problem)
 		}
