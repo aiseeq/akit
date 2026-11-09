@@ -162,6 +162,13 @@ written, 1 mismatch, 2 usage/IO error.
 blocks after it. With a FILE argument a path line may only repeat that file (`./a.go` for
 `a.go` is fine), another path is an error. `sub -h` prints the full format.
 
+## mut
+
+Runs Go tests against each exact-text mutation in isolation, restores the source file, and reports whether the mutant was killed or survived. A mutant that hits the memory ceiling of `graft exec --heavy` counts as killed; a test red without the mutant, a build error or no test run is an error.
+
+    mut OLD NEW FILE -- <go test arguments>
+    mut [-F SPEC] -- <go test arguments>
+
 ## tk
 
 `tk new` and `tk set` can link tickets with repeatable `--blocks` flags; `tk set --unblocks` removes a link. A ticket that blocks other work inherits at least its priority, so work hidden by queue gates can rise with the ticket it blocks. Links can point across projects under `$HOME/git` and `$HOME/work` using `git/PROJECT/SLUG` or `work/PROJECT/SLUG`.
