@@ -17,6 +17,7 @@ type takeView struct {
 	gate     queuegate.Gate
 	files    frozenFiles
 	broken   error // why tk next could not run for any project
+	warn     io.Writer
 	projects map[string]takeProject
 }
 
@@ -26,8 +27,9 @@ type takeProject struct {
 	refused bool
 }
 
-func newTakeView() *takeView {
-	view := &takeView{projects: map[string]takeProject{}}
+// newTakeView reports what only makes an answer less exact to warn.
+func newTakeView(warn io.Writer) *takeView {
+	view := &takeView{projects: map[string]takeProject{}, warn: warn}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		view.broken = fmt.Errorf("determine gate directory: %w", err)
@@ -69,6 +71,7 @@ func (v *takeView) resolve(project string) (takeProject, error) {
 	master, nameErr := v.files.masterName(want, io.Discard)
 	if nameErr != nil {
 		master = filepath.Base(want) + "-master"
+		fmt.Fprintf(v.warn, "tk: %s: work in progress is matched to %s: %v\n", project, master, nameErr)
 	}
 	refusal, err := v.files.refusal(project, master, io.Discard)
 	if err != nil {

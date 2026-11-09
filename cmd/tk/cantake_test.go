@@ -262,9 +262,12 @@ func TestCanTakeNameTableDecidesOnlyForAFrozenProject(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			home, base, _ := takeSetup(t)
 			tc.table(t, home)
-			takes, _ := listTakes(t, filepath.Join(base, "high"))
+			takes, errOut := listTakes(t, filepath.Join(base, "high"))
 			if !takes[""] {
 				t.Fatal("tk next gives this ticket, can_take must say so")
+			}
+			if !strings.Contains(errOut, "work in progress is matched to high-master") {
+				t.Fatalf("the less exact answer is not reported: %q", errOut)
 			}
 			if !nextFinds(t, filepath.Join(base, "high"), "high-master") {
 				t.Fatal("tk next does not give it")
@@ -336,7 +339,7 @@ func TestCanTakeThroughASymlinkedRootKnowsTheProject(t *testing.T) {
 
 func TestCanTakeBadFileLinesAddNothingToExternalStderr(t *testing.T) {
 	home, base, _ := takeSetup(t)
-	writeNames(t, home, "relative/path\tname\n")
+	writeNames(t, home, "relative/path\tname\n~/git/high\n")
 	list := filepath.Join(home, ".config", "queue", "frozen")
 	if err := os.WriteFile(list, []byte("relative/path\tuser\t2026-11-09\tstopped\n"), 0o644); err != nil {
 		t.Fatal(err)

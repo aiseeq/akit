@@ -3722,7 +3722,7 @@ func listExternal(project string, out, errout io.Writer) int {
 	if items == nil {
 		items = []externalTask{}
 	}
-	takes := newTakeView()
+	takes := newTakeView(io.Discard) // an outside reader takes stderr for a failed source
 	for i := range items {
 		items[i].CanTake = takes.canTakeExternal(items[i], project, errout)
 	}
@@ -3942,7 +3942,7 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 			return fail(errout, err)
 		}
 	}
-	takes := newTakeView()
+	takes := newTakeView(errout)
 	objects := make([]taskJSON, 0, len(ts))
 	for i := range ts {
 		t := &ts[i]
