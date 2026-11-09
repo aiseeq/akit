@@ -12,6 +12,8 @@
 //     digit: their bodies can hold phrases, and the shortest forms accepted here
 //     can leak without one (github_pat_ 0.56%, sk-proj- and sk-ant- 3.3%, xox?-
 //     17.8% at the minimum length), real keys of these kinds being much longer.
+//   - A key of the sk_live kinds takes the token characters after its body, so
+//     text glued to it with _ or - is hidden with it.
 //   - Base64url under generic sk can split into short fragments: at length 32,
 //     0.47% after a space and 28.34% after a letter.
 //   - Escapes outside escapeRE grammar can leak, including byte 0x9b.
@@ -158,6 +160,10 @@ type pattern struct {
 	acceptance acceptance
 	firstBytes string
 	re         *regexp.Regexp
+	// bodyGoesOn: an accepted token also covers the token characters right after
+	// its body. Recognition stays on the plain body, so ordinary names do not
+	// start to match, while a key with _ or - in its body is hidden whole.
+	bodyGoesOn bool
 }
 
 type tokenVariant struct {
@@ -170,7 +176,7 @@ type tokenVariant struct {
 // last so it sees the text after more specific tokens have been replaced.
 var patterns = [...]pattern{
 	{kind: "private-key", re: privateKeyRE},
-	{kind: "sk_live", variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, acceptance: acceptAlsoStandingAlone, firstBytes: "srp"},
+	{kind: "sk_live", variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, bodyGoesOn: true, acceptance: acceptAlsoStandingAlone, firstBytes: "srp"},
 	{kind: "sk", variants: []tokenVariant{{"sk-proj-", tokenChars, 28}, {"sk-ant-", tokenChars, skAntMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "s"},
 	{kind: "github", variants: []tokenVariant{{"github_pat_", alphaUnderscore, githubPatMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "g"},
 	{kind: "github", variants: []tokenVariant{{"ghp_", alphaNum, githubTokenMinimumLength}, {"gho_", alphaNum, githubTokenMinimumLength}, {"ghu_", alphaNum, githubTokenMinimumLength}, {"ghs_", alphaNum, githubTokenMinimumLength}, {"ghr_", alphaNum, githubTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone, firstBytes: "g"},
@@ -669,6 +675,9 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 			scan.runs = newRunIndex(text)
 		}
 		if acceptsToken(text, offset, body, end, p, scan.runs) {
+			if p.bodyGoesOn {
+				end = bodyEnd(text, end, tokenChars, &bodyEnds)
+			}
 			accepted = append(accepted, []int{offset, end})
 			offset = end
 		} else {

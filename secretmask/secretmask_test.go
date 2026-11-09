@@ -567,3 +567,22 @@ func TestMaskLinearOnBackslashSeries(t *testing.T) {
 		}
 	}
 }
+
+// Keys of this form can carry _ and - inside the body: a mask that stops at the
+// first separator would print the rest of the key.
+func TestMaskLiveKeyBodyWithSeparators(t *testing.T) {
+	r := func(s string, n int) string { return strings.Repeat(s, n) }
+	tail := "_" + r("Ab", 2) + "_" + r("c1", 2) + "-" + r("Xy9", 3)
+	for _, prefix := range []string{"sk" + "_live_", "sk" + "_test_", "rk" + "_live_", "pk" + "_test_"} {
+		key := prefix + r("a1B2", 6) + tail
+		got, found := Mask("before " + key + " after")
+		if got != "before [скрыто:sk_live] after" || !maps.Equal(found, map[string]int{"sk_live": 1}) {
+			t.Errorf("%s: output length %d, tail left %v, counts %v", prefix, len(got), strings.Contains(got, r("Xy9", 3)), found)
+		}
+	}
+	for _, name := range []string{"pk" + "_test_returns_value_when_missing_key", "rk" + "_live_short-name"} {
+		if got, found := Mask(name); got != name || len(found) != 0 {
+			t.Errorf("plain name %q changed: %q, %v", name, got, found)
+		}
+	}
+}
