@@ -3524,7 +3524,7 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if choice.found {
 		localGroup = nextGroup(choice.task, o.by, choice.gate, choice.live)
 	}
-	if len(visible) > 0 && (!choice.found || externalWinsLocal(visible[0], localGroup)) {
+	if len(visible) > 0 && (!choice.found || externalWinsLocal(visible[0], localGroup, choice)) {
 		return printExternalNext(root, choice, visible, choice.found, o.json, out, errout)
 	}
 	if !choice.found {
@@ -3538,8 +3538,34 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	return printCombinedNext(root, choice, visible, o.json, out, errout)
 }
 
-func externalWinsLocal(t externalTask, localGroup int) bool {
-	return nextGroup(task{prio: t.Prio, status: "открыт"}, "", gateState{}, false) <= localGroup
+// externalWinsLocal: of the same group the source goes first.
+func externalWinsLocal(t externalTask, localGroup int, choice nextChoice) bool {
+	return externalGroup(t, choice.gate, choice.live) <= localGroup
+}
+
+// externalGroup places a source record in the order of nextGroup. A started record
+// under a closed pair is begun work: after CRIT and HIGH and ahead of new work.
+func externalGroup(t externalTask, gate gateState, live bool) int {
+	open := task{prio: t.Prio, status: "открыт"}
+	if t.Started && !gatePasses(open, gate, live) {
+		return 3
+	}
+	return nextGroup(open, "", gate, live)
+}
+
+// orderExternal keeps the records the gates show, in queue order; within a group
+// the source order stays.
+func orderExternal(items []externalTask, gate gateState, live bool) []externalTask {
+	visible := make([]externalTask, 0, len(items))
+	for _, item := range items {
+		if item.Started || gatePasses(task{prio: item.Prio, status: "открыт"}, gate, live) {
+			visible = append(visible, item)
+		}
+	}
+	sort.SliceStable(visible, func(i, j int) bool {
+		return externalGroup(visible[i], gate, live) < externalGroup(visible[j], gate, live)
+	})
+	return visible
 }
 
 type nextChoice struct {
@@ -3607,7 +3633,7 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return
 	}
-	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate, choice.live))) {
+	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate, choice.live), choice)) {
 		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.valid && !choice.live))
 	} else if choice.found {
 		fmt.Fprintln(out, "следующий: "+nextLine(choice, errout))
@@ -3673,13 +3699,7 @@ func visibleExternal(project string, choice nextChoice, errout io.Writer) (items
 		sourceWarning(errout, path, failure)
 		return nil, true, nil
 	}
-	visible := items[:0]
-	for _, item := range items {
-		if gateVisible(task{prio: item.Prio, status: "открыт"}, choice.gate, choice.live) {
-			visible = append(visible, item)
-		}
-	}
-	return visible, false, nil
+	return orderExternal(items, choice.gate, choice.live), false, nil
 }
 func externalLine(t externalTask, closed bool) string {
 	s := strings.TrimSpace(strings.Join([]string{t.Key, t.Prio, t.Status, t.Title, t.URL}, " "))

@@ -418,3 +418,71 @@ func TestExternalNeedsJSONFlag(t *testing.T) {
 		t.Fatal("external without --json accepted")
 	}
 }
+
+// A source record marked started is work already begun: under a closed pair it
+// stays visible after CRIT and HIGH, while a new record of the same priority is hidden.
+func TestNextShowsStartedExternalUnderClosedGate(t *testing.T) {
+	project, _ := linkedProject(t)
+	home := filepath.Dir(filepath.Dir(project))
+	state := filepath.Join(home, ".local", "state", "queue")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gate := `{"at":"` + time.Now().Format(time.RFC3339) + `","live":["sample"],"open_by_root":{"` + project + `":[]}}`
+	if err := os.WriteFile(filepath.Join(state, "gate.json"), []byte(gate), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := filepath.Join(home, "work", "tasks", "sample")
+	high := filepath.Join(store, "20261101-1000-HIGH-high.md")
+	if err := os.WriteFile(high, []byte("# high\n\nСтатус: открыт\n\n## Приёмка\n- check\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSource(t, filepath.Dir(project), `echo '[{"key":"K-new","title":"new","status":"To Do","prio":"MED","url":"u1"},{"key":"K-begun","title":"begun","status":"In Progress","prio":"MED","url":"u2","started":true}]'`)
+	t.Chdir(project)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	next := func() string {
+		t.Helper()
+		o, err := parseArgs([]string{"next", "--by", "me"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, errOut bytes.Buffer
+		if code := run(o, &out, &errOut); code != 0 {
+			t.Fatalf("next: code %d, stdout %q, stderr %q", code, out.String(), errOut.String())
+		}
+		return out.String()
+	}
+	got := next()
+	if lines := strings.Split(got, "\n"); !strings.Contains(lines[0], "high") || !strings.HasPrefix(lines[1], "также: K-begun") || strings.Contains(got, "K-new") || strings.Contains(got, "ещё из источника") {
+		t.Fatalf("with HIGH: %q", got)
+	}
+	if err := os.Remove(high); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(store, "20261101-1001-MED-DO-mine.md")
+	if err := os.WriteFile(mine, []byte("# mine\n\nСтатус: в работе\nИсполнитель: me\n\n## Приёмка\n- check\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got = next(); !strings.HasPrefix(got, "K-begun") || !strings.Contains(got, "также: mine") || strings.Contains(got, "K-new") {
+		t.Fatalf("without HIGH, with local work begun: %q", got)
+	}
+}
+
+func TestExternalStartedOrder(t *testing.T) {
+	closed := gateState{valid: true, open: []string{}}
+	items := []externalTask{{Key: "new", Prio: "MED"}, {Key: "begun", Prio: "MED", Started: true}, {Key: "low-begun", Prio: "LOW", Started: true}, {Key: "high", Prio: "HIGH"}, {Key: "crit", Prio: "CRIT"}}
+	got := []string{}
+	for _, item := range orderExternal(items, closed, true) {
+		got = append(got, item.Key)
+	}
+	if strings.Join(got, " ") != "crit high begun low-begun" {
+		t.Fatalf("closed pair order %v", got)
+	}
+	got = got[:0]
+	for _, item := range orderExternal(items, gateState{valid: true, open: []string{"MED-DO", "MED-HUNT", "MED-ARCH", "LOW-DO", "LOW-HUNT", "LOW-ARCH"}}, true) {
+		got = append(got, item.Key)
+	}
+	if strings.Join(got, " ") != "crit high new begun low-begun" {
+		t.Fatalf("open pair order %v", got)
+	}
+}

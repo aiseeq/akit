@@ -206,7 +206,8 @@ ticket's executor.
 
 In projects under `$HOME/git` or `$HOME/work`, `tk next` can read an executable `.tk-next-source`
 in the projects root. It receives the project directory name and prints a JSON array of tickets with
-`key`, `title`, `status`, `prio` and `url`; it has a five second limit, and a failed source leaves
+`key`, `title`, `status`, `prio` and `url`, and optionally `"started": true` for work already begun
+there, which the queue gates treat as a ticket in progress; it has a five second limit, and a failed source leaves
 local tickets available with a warning. `tk external --json` prints that whole list for an outside
 reader, without gates and local tickets: `[]` when the project has no source, a nonzero code and
 nothing on stdout when the source fails. `tk new --to NAME` resolves names in either projects root

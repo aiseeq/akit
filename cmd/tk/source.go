@@ -25,6 +25,9 @@ type externalTask struct {
 	Status string `json:"status"`
 	Prio   string `json:"prio"`
 	URL    string `json:"url"`
+	// Started marks work already begun at the source; the queue keeps it
+	// visible under a closed pair, as it does a local ticket in progress.
+	Started bool `json:"started,omitempty"`
 }
 
 type cappedBuffer struct {
