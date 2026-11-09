@@ -93,6 +93,7 @@ func TestPairs(t *testing.T) {
 	}
 	work, group, project := mk("work"), mk("work", "group"), mk("work", "group", "project")
 	sibling := mk("workshop", "project")
+	dotted := mk("work", "..dotted", "project")
 	link := filepath.Join(base, "link")
 	if err := os.Symlink(project, link); err != nil {
 		t.Fatal(err)
@@ -112,6 +113,7 @@ func TestPairs(t *testing.T) {
 		{"root itself", work, []string{"WORK"}},
 		{"symlink resolves", link, []string{"GROUP"}},
 		{"relative project path", "work/group/project", []string{"GROUP"}},
+		{"a folder named with leading dots is inside", dotted, []string{"WORK"}},
 		{"a prefix of the name is not a parent", sibling, []string{"COMMON"}},
 	} {
 		got, err := g.Pairs(tc.project)
@@ -124,6 +126,9 @@ func TestPairs(t *testing.T) {
 	}
 	if got, err := (Gate{Open: []string{"COMMON"}}).Pairs(filepath.Join(base, "no-such")); err != nil || !slices.Equal(got, []string{"COMMON"}) {
 		t.Errorf("no roots: %v, %v", got, err)
+	}
+	if got, err := (Gate{Open: []string{"COMMON"}, OpenByRoot: map[string][]string{work: {}}}).Pairs(project); err != nil || len(got) != 0 {
+		t.Errorf("a root with no open pairs closes them: %v, %v", got, err)
 	}
 	if got, err := (Gate{Open: []string{"COMMON"}, OpenByRoot: map[string][]string{}}).Pairs(filepath.Join(base, "no-such")); err != nil || !slices.Equal(got, []string{"COMMON"}) {
 		t.Errorf("empty roots: %v, %v", got, err)
@@ -186,6 +191,35 @@ func TestAdmits(t *testing.T) {
 	} {
 		got, err := tc.gate.Admits(tc.project, tc.prio, "DO")
 		if (err != nil) != tc.fails || got != tc.want {
+			t.Errorf("%s: %v, %v", tc.name, got, err)
+		}
+	}
+}
+
+func TestAdmitsReadsLiveAndDifficulty(t *testing.T) {
+	dir := t.TempDir()
+	project := filepath.Join(dir, "p")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	roots := func(pairs ...string) map[string][]string { return map[string][]string{dir: pairs} }
+	live := []string{"p"}
+	for _, tc := range []struct {
+		name string
+		gate Gate
+		prio string
+		diff string
+		want bool
+	}{
+		{"untrusted and not live is still closed", Gate{OpenByRoot: roots("MED-DO")}, "MED", "DO", false},
+		{"another project is live, this one has no bar", Gate{Valid: true, Live: []string{"other"}, OpenByRoot: roots()}, "MED", "DO", true},
+		{"HUNT reads its own pair, closed", Gate{Valid: true, Live: live, OpenByRoot: roots("MED-DO")}, "MED", "HUNT", false},
+		{"HUNT reads its own pair, open", Gate{Valid: true, Live: live, OpenByRoot: roots("MED-HUNT")}, "MED", "HUNT", true},
+		{"no difficulty needs every pair", Gate{Valid: true, Live: live, OpenByRoot: roots("MED-DO")}, "MED", "", false},
+		{"no difficulty with every pair", Gate{Valid: true, Live: live, OpenByRoot: roots("MED-DO", "MED-HUNT", "MED-ARCH")}, "MED", "", true},
+	} {
+		got, err := tc.gate.Admits(project, tc.prio, tc.diff)
+		if err != nil || got != tc.want {
 			t.Errorf("%s: %v, %v", tc.name, got, err)
 		}
 	}
