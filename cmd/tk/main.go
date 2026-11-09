@@ -55,7 +55,7 @@ Usage:
 Flags:
   --prio P       new/set/start: CRIT, HIGH, MED, MEDIUM, or LOW (new default MED)
   --diff D       new/set/start: difficulty DO, HUNT, or ARCH
-  --why TEXT     new: required for CRIT/HIGH; set/start: required when promoting to CRIT/HIGH; reject: reason
+  --why TEXT     new: required for CRIT/HIGH; set/start: required when promoting to CRIT/HIGH; reject/release: reason
   --to PROJECT   new: create in PROJECT/docs/tasks; absolute path or project name
   --journal      new/set: mark the ticket as a journal entry, hidden from next unless a wait is due
   --parent KEY   transfer: parent item key passed to the transfer command
@@ -2112,14 +2112,27 @@ func removeExecutor(s string) string {
 }
 
 func removeHeaderLine(s, prefix string) string {
-	lines := strings.Split(s, "\n")
+	head, rest := splitHeader(s)
+	lines := strings.Split(head, "\n")
 	kept := lines[:0]
 	for _, line := range lines {
 		if !strings.HasPrefix(line, prefix) {
 			kept = append(kept, line)
 		}
 	}
-	return strings.Join(kept, "\n")
+	return strings.Join(kept, "\n") + rest
+}
+
+// splitHeader cuts a ticket before its first section: header fields live above
+// it, and a body line of the same form is the ticket's text.
+func splitHeader(s string) (head, rest string) {
+	if strings.HasPrefix(s, "## ") {
+		return "", s
+	}
+	if at := strings.Index(s, "\n## "); at >= 0 {
+		return s[:at], s[at:]
+	}
+	return s, ""
 }
 
 func setExecutor(s, n string) string {
@@ -3237,7 +3250,7 @@ func setHeaderValue(body, prefix, value string) (string, error) {
 			return strings.Join(lines, "\n"), nil
 		}
 	}
-	return "", errors.New("cannot insert Причина: ticket has no title or status")
+	return "", fmt.Errorf("cannot insert %s: ticket has no title or status", strings.TrimSuffix(prefix, ": "))
 }
 
 func moveMetadataAfterStatus(body string) string {
@@ -3335,7 +3348,8 @@ func fieldChangeJournal(actor, field, oldValue, newValue string) string {
 }
 
 func setRequester(body, name string) (string, error) {
-	lines := strings.Split(body, "\n")
+	head, rest := splitHeader(body)
+	lines := strings.Split(head, "\n")
 	found := false
 	kept := lines[:0]
 	for _, line := range lines {
@@ -3349,17 +3363,19 @@ func setRequester(body, name string) (string, error) {
 		kept = append(kept, line)
 	}
 	if !found {
-		return setHeaderValue(strings.Join(kept, "\n"), "Заказчик: ", name)
+		edited, err := setHeaderValue(strings.Join(kept, "\n"), "Заказчик: ", name)
+		return edited + rest, err
 	}
-	return strings.Join(kept, "\n"), nil
+	return strings.Join(kept, "\n") + rest, nil
 }
 
 func setTicketTitle(body, title string) (string, error) {
-	lines := strings.Split(body, "\n")
+	head, rest := splitHeader(body)
+	lines := strings.Split(head, "\n")
 	for i, line := range lines {
 		if strings.HasPrefix(line, "# ") {
 			lines[i] = "# " + title
-			return strings.Join(lines, "\n"), nil
+			return strings.Join(lines, "\n") + rest, nil
 		}
 	}
 	return "", errors.New("ticket has no title")

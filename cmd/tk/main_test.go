@@ -2985,3 +2985,36 @@ func TestListJSONDueMatchesWaitDue(t *testing.T) {
 		t.Errorf("due on a ticket that does not wait = %q", got)
 	}
 }
+
+// Header fields live above the first section: a body line of the same form is text.
+func TestHeaderEditsLeaveBodyLinesAlone(t *testing.T) {
+	const body = "# Title\n\nСтатус: в работе\nИсполнитель: gone\nЗаказчик: old\nЖдёт: 2020-01-01\n\n## Что сделать\nИсполнитель: строка тела\nЗаказчик: строка тела\nЖдёт: строка тела\n```\n# comment\n```\n"
+	if got := removeExecutor(body); strings.Contains(got, "Исполнитель: gone") || !strings.Contains(got, "Исполнитель: строка тела") {
+		t.Errorf("removeExecutor:\n%s", got)
+	}
+	if got := removeWaiting(body); strings.Contains(got, "Ждёт: 2020-01-01") || !strings.Contains(got, "Ждёт: строка тела") {
+		t.Errorf("removeWaiting:\n%s", got)
+	}
+	got, err := setRequester(body, "fresh")
+	if err != nil || !strings.Contains(got, "Заказчик: fresh\nЖдёт") || !strings.Contains(got, "Заказчик: строка тела") || strings.Contains(got, "Заказчик: old") {
+		t.Errorf("setRequester, header has it (%v):\n%s", err, got)
+	}
+	noHeader := strings.Replace(body, "Заказчик: old\n", "", 1)
+	got, err = setRequester(noHeader, "fresh")
+	if err != nil || !strings.Contains(got, "Статус: в работе\nЗаказчик: fresh\n") || !strings.Contains(got, "Заказчик: строка тела") {
+		t.Errorf("setRequester, header lacks it (%v):\n%s", err, got)
+	}
+	dup := strings.Replace(body, "Заказчик: old\n", "Заказчик: old\nЗаказчик: older\n", 1)
+	got, err = setRequester(dup, "fresh")
+	if err != nil || strings.Count(got, "Заказчик: fresh") != 1 || strings.Contains(got, "older") || !strings.Contains(got, "Заказчик: строка тела") {
+		t.Errorf("setRequester, duplicate in header (%v):\n%s", err, got)
+	}
+	got, err = setTicketTitle(body, "New")
+	if err != nil || !strings.HasPrefix(got, "# New\n") || !strings.Contains(got, "# comment") {
+		t.Errorf("setTicketTitle (%v):\n%s", err, got)
+	}
+	untitled := "Статус: открыт\n\n## Что сделать\n```\n# comment\n```\n"
+	if got, err = setTicketTitle(untitled, "New"); err == nil {
+		t.Errorf("a comment in the body taken for the title:\n%s", got)
+	}
+}
