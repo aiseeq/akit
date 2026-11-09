@@ -621,3 +621,42 @@ func TestMaskLinearOnGluedKeyChains(t *testing.T) {
 		}
 	}
 }
+
+// Output differs from the context rules' only by the removed rest of a key, so
+// no construction glued to a key loses the masking of its value.
+func TestMaskLiveKeyGluedConstructionsKeepValueHidden(t *testing.T) {
+	key := "sk" + "_live_" + strings.Repeat("a1B2", 6)
+	const value = "hunter2value"
+	for _, glued := range []string{"_authorization: Bearer ", "-Proxy-Authorization: Basic ", "_authorization=", "-Authorization: ", "-https://user:", "_mysql://user:", "-ftp://u:"} {
+		tail := "@host/x"
+		if !strings.Contains(glued, "://") {
+			tail = ""
+		}
+		got, _ := Mask(key + glued + value + tail)
+		if strings.Contains(got, value) || strings.Contains(got, key) {
+			t.Errorf("%q: value or key left, output length %d", glued, len(got))
+		}
+	}
+	marker := "[скрыто:sk_live]"
+	if got, found := Mask("x " + marker + "_rest y"); got != "x "+marker+"_rest y" || len(found) != 0 {
+		t.Errorf("a marker already in the text changed: %q %v", got, found)
+	}
+	if got, found := Mask(key + "_" + key); got != marker+marker || found["sk_live"] != 2 {
+		t.Errorf("two glued keys: output length %d, counts %v", len(got), found)
+	}
+}
+
+func TestMaskLinearOnKeyRunEndingInName(t *testing.T) {
+	key := "sk" + "_live_" + strings.Repeat("a1B2", 6)
+	const size = 1 << 20
+	for _, glue := range []string{"_", "-"} {
+		for _, end := range []string{"token=x", "password:x"} {
+			text := strings.Repeat(key+glue, size/(len(key)+1)) + end
+			start := time.Now()
+			Mask(text)
+			if took := time.Since(start); took > 5*time.Second {
+				t.Errorf("glue %q, end %q: %v on 1 MiB", glue, end, took)
+			}
+		}
+	}
+}

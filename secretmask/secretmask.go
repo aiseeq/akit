@@ -12,9 +12,8 @@
 //     digit: their bodies can hold phrases, and the shortest forms accepted here
 //     can leak without one (github_pat_ 0.56%, sk-proj- and sk-ant- 3.3%, xox?-
 //     17.8% at the minimum length), real keys of these kinds being much longer.
-//   - A key of the sk_live kinds takes the token characters after its body, so
-//     text glued to it with _ or - is hidden with it, unless that text is a
-//     secret name before a delimiter, which the context rules need. It is
+//   - After a key of the sk_live kinds the token characters are dropped from the
+//     output, so text glued to it with _ or - goes with it. The key itself is
 //     recognized by the body before the first separator: with _ or - before the
 //     16th body character, or no digit before it next to a joiner, rk_ and pk_
 //     keys stay visible (sk_ ones fall to generic sk).
@@ -157,6 +156,7 @@ const (
 	githubPatMinimumLength   = 41
 	githubTokenMinimumLength = 34
 	googleTokenMinimumLength = 34
+	liveKeyKind              = "sk_live"
 )
 
 type pattern struct {
@@ -165,10 +165,6 @@ type pattern struct {
 	acceptance acceptance
 	firstBytes string
 	re         *regexp.Regexp
-	// bodyGoesOn: an accepted token also covers the token characters right after
-	// its body. Recognition stays on the plain body, so ordinary names do not
-	// start to match, while a key with _ or - in its body is hidden whole.
-	bodyGoesOn bool
 }
 
 type tokenVariant struct {
@@ -181,7 +177,7 @@ type tokenVariant struct {
 // last so it sees the text after more specific tokens have been replaced.
 var patterns = [...]pattern{
 	{kind: "private-key", re: privateKeyRE},
-	{kind: "sk_live", variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, bodyGoesOn: true, acceptance: acceptAlsoStandingAlone, firstBytes: "srp"},
+	{kind: liveKeyKind, variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, acceptance: acceptAlsoStandingAlone, firstBytes: "srp"},
 	{kind: "sk", variants: []tokenVariant{{"sk-proj-", tokenChars, 28}, {"sk-ant-", tokenChars, skAntMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "s"},
 	{kind: "github", variants: []tokenVariant{{"github_pat_", alphaUnderscore, githubPatMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "g"},
 	{kind: "github", variants: []tokenVariant{{"ghp_", alphaNum, githubTokenMinimumLength}, {"gho_", alphaNum, githubTokenMinimumLength}, {"ghu_", alphaNum, githubTokenMinimumLength}, {"ghs_", alphaNum, githubTokenMinimumLength}, {"ghr_", alphaNum, githubTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone, firstBytes: "g"},
@@ -215,7 +211,32 @@ func Mask(text string) (string, map[string]int) {
 	if hasContextAnchor(text) || strings.Contains(text, "://") {
 		text = maskContext(text, found)
 	}
+	if found[liveKeyKind] != 0 {
+		text = dropLiveKeyTails(text)
+	}
 	return text, found
+}
+
+// dropLiveKeyTails removes the token characters right after a sk_live marker: a
+// key of these kinds can carry _ and - in its body, and recognition stops at the
+// first of them. It runs last, so the context rules still see whatever is glued
+// to the key and the output differs from theirs only by what is removed here.
+func dropLiveKeyTails(text string) string {
+	marker := "[скрыто:" + liveKeyKind + "]"
+	var out strings.Builder
+	for {
+		at := strings.Index(text, marker)
+		if at < 0 {
+			out.WriteString(text)
+			return out.String()
+		}
+		end := at + len(marker)
+		out.WriteString(text[:end])
+		for end < len(text) && bodyContains(tokenChars, text[end]) {
+			end++
+		}
+		text = text[end:]
+	}
 }
 
 func hasContextAnchor(text string) bool {
@@ -680,9 +701,6 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 			scan.runs = newRunIndex(text)
 		}
 		if acceptsToken(text, offset, body, end, p, scan.runs) {
-			if p.bodyGoesOn {
-				end = bodyContinuation(text, end, &bodyEnds)
-			}
 			accepted = append(accepted, []int{offset, end})
 			offset = end
 		} else {
@@ -690,34 +708,6 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 		}
 	}
 	return accepted, scan
-}
-
-// bodyContinuation is where an accepted key ends once the token characters after
-// its body count. A secret name glued to the key is left for the context rules:
-// taken into the key, it would no longer hide the value after it.
-func bodyContinuation(text string, end int, caches *[4]bodyEndCache) int {
-	next := bodyEnd(text, end, tokenChars, caches)
-	if next > end && beforeDelimiter(text, next) {
-		if _, secret := secretName(text[end:next]); secret {
-			return end
-		}
-	}
-	return next
-}
-
-// beforeDelimiter: what stands at text[at:] is the delimiter of an assignment,
-// past the quote and blanks contextNameRE allows there.
-func beforeDelimiter(text string, at int) bool {
-	for at < len(text) && text[at] == '\\' {
-		at++
-	}
-	if at < len(text) && (text[at] == '"' || text[at] == '\'') {
-		at++
-	}
-	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
-		at++
-	}
-	return at < len(text) && (text[at] == ':' || text[at] == '=')
 }
 
 func matchingPrefix(text string, start int, variants []tokenVariant) (tokenVariant, bool) {
