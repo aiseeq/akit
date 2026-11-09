@@ -71,7 +71,7 @@ func (g Gate) Pairs(project string) ([]string, error) {
 	if len(g.OpenByRoot) == 0 {
 		return g.Open, nil
 	}
-	resolvedProject, err := resolve(project)
+	resolvedProject, err := Resolve(project)
 	if err != nil {
 		return nil, fmt.Errorf("resolve project root %s: %w", project, err)
 	}
@@ -80,7 +80,7 @@ func (g Gate) Pairs(project string) ([]string, error) {
 		if !filepath.IsAbs(candidate) {
 			continue
 		}
-		resolvedRoot, err := resolve(candidate)
+		resolvedRoot, err := Resolve(candidate)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -99,7 +99,9 @@ func (g Gate) Pairs(project string) ([]string, error) {
 	return pairs, nil
 }
 
-func resolve(path string) (string, error) {
+// Resolve makes a path absolute and free of symlinks, the form project and root
+// paths are compared in.
+func Resolve(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve absolute path %s: %w", path, err)

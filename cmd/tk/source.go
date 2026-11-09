@@ -16,6 +16,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/aiseeq/akit/queuegate"
 	"github.com/aiseeq/akit/secretmask"
 )
 
@@ -50,13 +51,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 func (b *cappedBuffer) Bytes() []byte  { return b.data }
 func (b *cappedBuffer) String() string { return string(b.data) }
 
-func normalizedRoot(path string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve absolute path %s: %w", path, err)
-	}
-	return filepath.EvalSymlinks(abs)
-}
+var normalizedRoot = queuegate.Resolve
 
 func taskSourcePath(main string) (string, bool, error) {
 	return taskCommandPath(main, ".tk-next-source")
