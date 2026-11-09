@@ -3114,7 +3114,7 @@ func refuseFrozenStart(o options, errout io.Writer) int {
 	if project == "" {
 		project = o.baseRoot
 	}
-	refusal, err := frozenRefusal(project, errout)
+	refusal, err := frozenRefusal(project, session(), errout)
 	if err != nil {
 		return fail(errout, err)
 	}
@@ -3634,7 +3634,8 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if main != "" {
 		project = main
 	}
-	refusal, err := frozenRefusal(project, errout)
+	// The session itself, not --by, which is free text.
+	refusal, err := frozenRefusal(project, session(), errout)
 	if err != nil {
 		return fail(errout, err)
 	}
@@ -3757,7 +3758,8 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 	if actor == "" {
 		actor = o.by
 	}
-	refusal, err := frozenRefusal(project, errout)
+	// A hint gives no work: it names what the ticket's executor would get.
+	refusal, err := frozenRefusal(project, actor, errout)
 	if err != nil {
 		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return

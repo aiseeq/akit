@@ -219,3 +219,48 @@ func TestFrozenExistingPrefixAndCommentDoNotCount(t *testing.T) {
 		})
 	}
 }
+
+// The hint of tk done is for the ticket's executor, whoever closes the ticket.
+func TestFrozenDoneHintFollowsExecutor(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "sample-master")
+	store := filepath.Join(home, "work", "tasks", "sample")
+	begun := "# begun\n\nСтатус: в работе\nИсполнитель: sample-master\n\n## Приёмка\n- check\n\n## Журнал\n- 2026-11-01 10:00 в работе — sample-master\n"
+	if err := os.WriteFile(filepath.Join(store, "20261101-1001-MED-DO-begun.md"), []byte(begun), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := tkIn(t, project, "checker", "done", "begun", "--check", "checked by test", "--by", "checker")
+	if code != 0 || !strings.Contains(out, "следующий: subject") {
+		t.Errorf("code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestFrozenPathIsTheFirstTabField(t *testing.T) {
+	home, project, _ := frozenProject(t, "~/work/sample x\tuser\t2026-11-09\tanother folder\n")
+	if err := os.MkdirAll(filepath.Join(home, "work", "sample x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, errOut := tkIn(t, project, "admin", "next"); code != 0 || !strings.Contains(out, "subject") {
+		t.Errorf("a path with a space froze its neighbour: code %d, out %q, err %q", code, out, errOut)
+	}
+	if matches, err := frozenLineNames("~/work/sample x\tuser\td\twhy", home, filepath.Join(home, "work", "sample x")); err != nil || !matches {
+		t.Errorf("a path with a space is not matched: %v, %v", matches, err)
+	}
+}
+
+// Anything but an absolute or ~/ path could name whatever the working directory
+// is; an unresolvable line concerns its own folder only.
+func TestFrozenBadPathsConcernOnlyThemselves(t *testing.T) {
+	for line, warning := range map[string]string{".": "absolute", "work/sample": "absolute", "~/.config/queue/frozen/x": "not a directory"} {
+		t.Run(line, func(t *testing.T) {
+			_, project, _ := frozenProject(t, line+"\tuser\t2026-11-09\tbad path\n")
+			code, out, errOut := tkIn(t, project, "admin", "next")
+			if code != 0 || !strings.Contains(out, "subject") {
+				t.Errorf("code %d, out %q, err %q", code, out, errOut)
+			}
+			if !strings.Contains(errOut, warning) {
+				t.Errorf("warning %q is missing: %q", warning, errOut)
+			}
+		})
+	}
+}

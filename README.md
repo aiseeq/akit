@@ -202,7 +202,7 @@ the trailing slash: git treats a symlink as a file). Worktrees then use the main
 `tk archive` moves closed tickets to `docs/tasks/archive/` inside the store instead of
 `docs/tasks-archive/` in the repository.
 
-A project listed in `~/.config/queue/frozen` (one per line: path, who, date, why, tab-separated; `#` starts a comment) is worked on only by its running master, the session named `<folder>-master`: for any other session `tk next` gives no work and `tk start` refuses with the reason from the file. `tk new`, `tk ls` and `tk note` work as usual, so tickets accumulate. The identity is the session itself, not `--by`.
+A project listed in `~/.config/queue/frozen` (one per line: absolute or `~/` path, who, date, why, tab-separated; `#` starts a comment) is worked on only by its running master, the session named `<folder>-master`: for any other session `tk next` gives no work and `tk start` refuses with the reason from the file. `tk new`, `tk ls` and `tk note` work as usual, so tickets accumulate. The identity is the session itself, not `--by`.
 
 Queue gates close only the start of new work: a ticket the agent already took and a wait that came due stay visible to `tk next` under a closed pair and under an unreadable gate file, after CRIT and HIGH and ahead of new work.
 `tk done` ends with a `следующий:` line when the queue has a ticket: the one `tk next` would give the
