@@ -144,6 +144,26 @@ func (s Scope) Passes(prio, diff string) bool {
 	return !s.Live || pairsAdmit(prio, diff, s.Open)
 }
 
+// Admits is Passes for a reader that decides ticket by ticket: the project's bar
+// is looked up only when the answer depends on it, so a bad root costs only the
+// tickets it decides.
+func (g Gate) Admits(project, prio, diff string) (bool, error) {
+	if pairsAdmit(prio, diff, nil) {
+		return true, nil
+	}
+	if !g.Valid {
+		return false, nil
+	}
+	if !slices.Contains(g.Live, filepath.Base(project)) {
+		return true, nil
+	}
+	open, err := g.Pairs(project)
+	if err != nil {
+		return false, err
+	}
+	return pairsAdmit(prio, diff, open), nil
+}
+
 func pairsAdmit(prio, diff string, open []string) bool {
 	if prio == "MEDIUM" {
 		prio = "MED"

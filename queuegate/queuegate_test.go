@@ -46,7 +46,7 @@ func TestReadUntrusted(t *testing.T) {
 	for _, tc := range []struct{ name, body, problem string }{
 		{"broken json", `{`, "cannot parse gate.json"},
 		{"bad at", `{"at":"yesterday","open_by_root":{}}`, "invalid at timestamp"},
-		{"older than a day and two hours", gateAt(now.Add(-maxAge - time.Second)), "older than 26 hours"},
+		{"older than a day and two hours", gateAt(now.Add(-26*time.Hour - time.Second)), "older than 26 hours"},
 		{"from the future", gateAt(now.Add(time.Second)), "in the future"},
 		{"no open_by_root", fmt.Sprintf(`{"at":%q}`, now.Format(time.RFC3339)), "no open_by_root"},
 		{"null open_by_root", fmt.Sprintf(`{"at":%q,"open_by_root":null}`, now.Format(time.RFC3339)), "no open_by_root"},
@@ -61,7 +61,7 @@ func TestReadUntrusted(t *testing.T) {
 }
 
 func TestReadAtTheEdgesOfTrust(t *testing.T) {
-	for _, at := range []time.Time{now.Add(-maxAge), now} {
+	for _, at := range []time.Time{now.Add(-26 * time.Hour), now} {
 		if g := Read(writeGate(t, gateAt(at)), now); !g.Valid {
 			t.Errorf("at %v: %q", at, g.Problem)
 		}
@@ -111,6 +111,7 @@ func TestPairs(t *testing.T) {
 		{"longest root wins", project, []string{"GROUP"}},
 		{"root itself", work, []string{"WORK"}},
 		{"symlink resolves", link, []string{"GROUP"}},
+		{"relative project path", "work/group/project", []string{"GROUP"}},
 		{"a prefix of the name is not a parent", sibling, []string{"COMMON"}},
 	} {
 		got, err := g.Pairs(tc.project)
@@ -124,8 +125,69 @@ func TestPairs(t *testing.T) {
 	if got, err := (Gate{Open: []string{"COMMON"}}).Pairs(filepath.Join(base, "no-such")); err != nil || !slices.Equal(got, []string{"COMMON"}) {
 		t.Errorf("no roots: %v, %v", got, err)
 	}
+	if got, err := (Gate{Open: []string{"COMMON"}, OpenByRoot: map[string][]string{}}).Pairs(filepath.Join(base, "no-such")); err != nil || !slices.Equal(got, []string{"COMMON"}) {
+		t.Errorf("empty roots: %v, %v", got, err)
+	}
 	if _, err := g.Pairs(filepath.Join(base, "no-such")); err == nil {
 		t.Error("a missing project under roots must be an error")
+	}
+}
+
+func TestPairsComparesRootsResolved(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shallow, deep := filepath.Join(base, "a"), filepath.Join(base, "a", "b")
+	project := filepath.Join(deep, "p")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Longer as written than the deep root, shorter once resolved.
+	link := filepath.Join(base, "a-link-with-a-name-longer-than-the-deep-root")
+	if err := os.Symlink(shallow, link); err != nil {
+		t.Fatal(err)
+	}
+	g := Gate{OpenByRoot: map[string][]string{link: {"SHALLOW"}, deep: {"DEEP"}}}
+	for range 64 { // map order decides which root is seen first
+		got, err := g.Pairs(project)
+		if err != nil || !slices.Equal(got, []string{"DEEP"}) {
+			t.Fatalf("Pairs = %v, %v", got, err)
+		}
+	}
+}
+
+func TestAdmits(t *testing.T) {
+	dir := t.TempDir()
+	project := filepath.Join(dir, "p")
+	file := filepath.Join(dir, "file")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badRoot := map[string][]string{filepath.Join(file, "below"): {"MED-DO"}}
+	open := map[string][]string{dir: {"MED-DO"}}
+	missing := filepath.Join(dir, "no-such")
+	for _, tc := range []struct {
+		name          string
+		gate          Gate
+		project, prio string
+		want, fails   bool
+	}{
+		{"HIGH does not need the roots", Gate{Valid: true, Live: []string{"p"}, OpenByRoot: badRoot}, project, "HIGH", true, false},
+		{"CRIT with a missing project", Gate{Valid: true, Live: []string{"no-such"}, OpenByRoot: badRoot}, missing, "CRIT", true, false},
+		{"untrusted closes the rest", Gate{Live: []string{"p"}, OpenByRoot: open}, project, "MED", false, false},
+		{"not live does not need the roots", Gate{Valid: true, OpenByRoot: badRoot}, project, "MED", true, false},
+		{"live and open", Gate{Valid: true, Live: []string{"p"}, OpenByRoot: open}, project, "MED", true, false},
+		{"live and closed", Gate{Valid: true, Live: []string{"p"}, OpenByRoot: open}, project, "LOW", false, false},
+		{"a bad root fails what it decides", Gate{Valid: true, Live: []string{"p"}, OpenByRoot: badRoot}, project, "MED", false, true},
+	} {
+		got, err := tc.gate.Admits(tc.project, tc.prio, "DO")
+		if (err != nil) != tc.fails || got != tc.want {
+			t.Errorf("%s: %v, %v", tc.name, got, err)
+		}
 	}
 }
 
@@ -188,7 +250,9 @@ func TestPasses(t *testing.T) {
 		{"MED ticket reads MEDIUM pairs", Scope{Valid: true, Live: true, Open: []string{"MEDIUM-DO"}}, "MED", "DO", true},
 		{"LOW ticket does not read MEDIUM pairs", Scope{Valid: true, Live: true, Open: []string{"MEDIUM-DO"}}, "LOW", "DO", false},
 		{"no difficulty: all pairs open", Scope{Valid: true, Live: true, Open: all}, "MED", "", true},
-		{"no difficulty: one pair closed", Scope{Valid: true, Live: true, Open: all[:2]}, "MED", "", false},
+		{"no difficulty: ARCH closed", Scope{Valid: true, Live: true, Open: all[:2]}, "MED", "", false},
+		{"no difficulty: HUNT closed", Scope{Valid: true, Live: true, Open: []string{"MED-DO", "MED-ARCH"}}, "MED", "", false},
+		{"no difficulty: DO closed", Scope{Valid: true, Live: true, Open: []string{"MED-HUNT", "MED-ARCH"}}, "MED", "", false},
 	} {
 		if got := tc.scope.Passes(tc.prio, tc.diff); got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
