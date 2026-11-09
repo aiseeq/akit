@@ -3522,8 +3522,13 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 	if main != "" {
 		project = main
 	}
-	// The session itself, not --by, which is free text.
-	refusal, err := frozenRefusal(project, session(), errout)
+	// The session itself. --by is free text and counts only where no session can
+	// be told, as under a daemon: next changes nothing, tk start never trusts it.
+	who := session()
+	if who == "" {
+		who = o.by
+	}
+	refusal, err := frozenRefusal(project, who, errout)
 	if err != nil {
 		return fail(errout, err)
 	}

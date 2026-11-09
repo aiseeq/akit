@@ -53,7 +53,10 @@ func frozenRefusal(project, who string, errout io.Writer) (string, error) {
 			fmt.Fprintf(errout, "tk: %s: incomplete line, the project stays frozen\n", place)
 			reason = "incomplete line in the frozen list"
 		}
-		master := filepath.Base(want) + "-master"
+		master, err := masterName(home, want, errout)
+		if err != nil {
+			return "", err
+		}
 		if liveMaster(home, who, master, errout) {
 			return "", nil
 		}
@@ -72,6 +75,15 @@ func frozenLineNames(line, home, want string) (bool, error) {
 	listed := frozenPath(line)
 	if listed == "" {
 		return false, nil
+	}
+	return listedPathIs(listed, home, want)
+}
+
+// listedPathIs: the path of a list file is the project want. A listed folder that
+// does not exist names nothing.
+func listedPathIs(listed, home, want string) (bool, error) {
+	if listed == "~" {
+		listed = home
 	}
 	if rest, ok := strings.CutPrefix(listed, "~/"); ok {
 		listed = filepath.Join(home, rest)
@@ -109,6 +121,42 @@ func frozenWhy(line string) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[frozenFields-1])
+}
+
+// masterName is the session name the table of session names gives the project,
+// else its folder name with -master. A table that exists but cannot be read is
+// an error: another name would admit the wrong session.
+func masterName(home, want string, errout io.Writer) (string, error) {
+	fallback := filepath.Base(want) + "-master"
+	path := filepath.Join(home, ".config", "cl", "names.tsv")
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return fallback, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read session names: %w", err)
+	}
+	for number, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		listed, name, _ := strings.Cut(line, "\t")
+		matches, err := listedPathIs(strings.TrimSpace(listed), home, want)
+		if err != nil {
+			fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, number+1, err)
+			continue
+		}
+		if !matches {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return "", fmt.Errorf("%s:%d: no session name for the project", path, number+1)
+		}
+		return name, nil
+	}
+	return fallback, nil
 }
 
 func liveMaster(home, who, master string, errout io.Writer) bool {

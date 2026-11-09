@@ -94,6 +94,121 @@ func TestFrozenNameGivenByFlagDoesNotCount(t *testing.T) {
 	refused(t, project, "admin", "--by", "sample-master")
 }
 
+func nextGives(t *testing.T, dir, actor string, args ...string) {
+	t.Helper()
+	code, out, errOut := tkIn(t, dir, actor, append([]string{"next"}, args...)...)
+	if code != 0 || !strings.Contains(out, "subject") {
+		t.Errorf("next by %q %v: code %d, out %q, err %q", actor, args, code, out, errOut)
+	}
+}
+
+func writeNames(t *testing.T, home, body string) {
+	t.Helper()
+	dir := filepath.Join(home, ".config", "cl")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "names.tsv"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFrozenByCountsOnlyWithoutSessionAndOnlyForNext(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "sample-master")
+	nextGives(t, project, "", "--by", "sample-master")
+	if code, _, errOut := tkIn(t, project, "", "start", "subject", "--by", "sample-master"); code != exitNone || !strings.Contains(errOut, "stopped on purpose") {
+		t.Errorf("start without a session: code %d, err %q", code, errOut)
+	}
+	if code, out, errOut := tkIn(t, project, "", "next", "--by", "someone-else"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("next by another name: code %d, out %q, err %q", code, out, errOut)
+	}
+	if code, out, _ := tkIn(t, project, "", "next"); code == 0 || strings.Contains(out, "subject") {
+		t.Errorf("next without a name: code %d, out %q", code, out)
+	}
+	if code, out, _ := tkIn(t, project, "other-master", "next", "--by", "sample-master"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("known session of another master with --by: code %d, out %q", code, out)
+	}
+}
+
+func TestFrozenByOfADeadMasterIsRefused(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := fmt.Sprintf(`{"pid":%d,"procStart":"1","name":"sample-master","startedAt":1}`, os.Getpid())
+	if err := os.WriteFile(filepath.Join(dir, "1.json"), []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, errOut := tkIn(t, project, "", "next", "--by", "sample-master"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("pid reused by another process: code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestFrozenMasterNameFromTheTable(t *testing.T) {
+	home, project, worktree := frozenProject(t, frozenLine)
+	writeNames(t, home, "# comment\n~\tlead\n~/work\twork-admin\n~/work/sample\tspecial-master\n")
+	liveSession(t, home, "sample-master")
+	if code, out, errOut := tkIn(t, project, "sample-master", "next"); code != exitNone || strings.Contains(out, "subject") || !strings.Contains(errOut, "special-master") {
+		t.Errorf("the folder's name when the table gives another: code %d, out %q, err %q", code, out, errOut)
+	}
+	if code, out, _ := tkIn(t, project, "", "next", "--by", "sample-master"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("--by the folder's name: code %d, out %q", code, out)
+	}
+	liveSession(t, home, "special-master")
+	sessionsDir := filepath.Join(home, ".claude", "sessions")
+	own, err := os.ReadFile(filepath.Join(sessionsDir, fmt.Sprintf("%d.json", os.Getpid())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both alive: the folder's name still is not the master.
+	if err := os.WriteFile(filepath.Join(sessionsDir, "folder-name.json"), []byte(strings.Replace(string(own), "special-master", "sample-master", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := tkIn(t, project, "", "next", "--by", "sample-master"); code != exitNone || strings.Contains(out, "subject") {
+		t.Errorf("--by the folder's name with both alive: code %d, out %q", code, out)
+	}
+	for _, dir := range []string{project, worktree} {
+		nextGives(t, dir, "special-master")
+	}
+	nextGives(t, project, "", "--by", "special-master")
+	_, _, errOut := tkIn(t, project, "special-master", "next")
+	if strings.Contains(errOut, "line ignored") {
+		t.Errorf("a home line of the table is not an error: %q", errOut)
+	}
+}
+
+func TestFrozenTableWithoutTheProjectKeepsTheFolderName(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	writeNames(t, home, "~/work/other\tother-name\n")
+	liveSession(t, home, "sample-master")
+	nextGives(t, project, "sample-master")
+}
+
+func TestFrozenTableProblemsGiveNoOtherName(t *testing.T) {
+	home, project, _ := frozenProject(t, frozenLine)
+	liveSession(t, home, "sample-master")
+	writeNames(t, home, "~/work/sample\t\n")
+	if code, out, errOut := tkIn(t, project, "sample-master", "next"); code == 0 || strings.Contains(out, "subject") || !strings.Contains(errOut, "names.tsv:1") {
+		t.Errorf("line without a name: code %d, out %q, err %q", code, out, errOut)
+	}
+	writeNames(t, home, "relative\tx\n~/work/sample\tsample-master\n")
+	if code, _, errOut := tkIn(t, project, "sample-master", "next"); code != 0 || !strings.Contains(errOut, "names.tsv:1: line ignored") {
+		t.Errorf("a bad line concerns only itself: code %d, err %q", code, errOut)
+	}
+	path := filepath.Join(home, ".config", "cl", "names.tsv")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, errOut := tkIn(t, project, "sample-master", "next"); code == 0 || strings.Contains(out, "subject") || !strings.Contains(errOut, "read session names") {
+		t.Errorf("unreadable table: code %d, out %q, err %q", code, out, errOut)
+	}
+}
+
 func TestFrozenLiveMasterWorksAsUsual(t *testing.T) {
 	home, project, worktree := frozenProject(t, frozenLine)
 	liveSession(t, home, "sample-master")
