@@ -148,7 +148,7 @@ func TestFrozenByOfADeadMasterIsRefused(t *testing.T) {
 
 func TestFrozenMasterNameFromTheTable(t *testing.T) {
 	home, project, worktree := frozenProject(t, frozenLine)
-	writeNames(t, home, "# comment\n~\tlead\n~/work\twork-admin\n~/work/sample\tspecial-master\n")
+	writeNames(t, home, "# comment\n~\thome-name\n~/work\tspace-name\n~/work/sample\tspecial-master\n")
 	liveSession(t, home, "sample-master")
 	if code, out, errOut := tkIn(t, project, "sample-master", "next"); code != exitNone || strings.Contains(out, "subject") || !strings.Contains(errOut, "special-master") {
 		t.Errorf("the folder's name when the table gives another: code %d, out %q, err %q", code, out, errOut)

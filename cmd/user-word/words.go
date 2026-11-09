@@ -1622,7 +1622,7 @@ func (c *briefQuoteCollector) keep(raw []byte) bool {
 		if askCall {
 			// Запоминаем связь вызова и результата для разбора ответа AskUserQuestion.
 			if _, err := c.parser.Parse(raw); err != nil {
-				return true //nolint:fallback-return // true means "hand it to the reader", not "parsed": the reader parses the record again and reports it as malformed.
+				return true // Hand it to the reader, not "parsed": the reader parses the record again and reports it as malformed.
 			}
 			if stamp, err := transcriptTimestamp(raw); err == nil {
 				c.agentRaw[stamp.Format(time.RFC3339Nano)] = c.lastAgent
