@@ -453,3 +453,12 @@ func TestCanTakeInAWorktreeWithItsOwnTicketsIsOfTheMainProject(t *testing.T) {
 		t.Fatalf("the worktree of a frozen project: %s", out)
 	}
 }
+
+func TestCanTakeBadNameRowStillMatchesWorkOfTheFolderMaster(t *testing.T) {
+	home, base, _ := takeSetup(t)
+	writeNames(t, home, "~/git/startedbymaster\n")
+	takes, _ := listTakes(t, filepath.Join(base, "startedbymaster"))
+	if !takes[""] {
+		t.Fatal("work in progress of the folder's master must count")
+	}
+}
