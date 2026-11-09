@@ -214,7 +214,8 @@ in the projects root. It receives the project directory name and prints a JSON a
 there, which the queue gates treat as a ticket in progress; it has a five second limit, and a failed source leaves
 local tickets available with a warning. `tk external --json` prints that whole list for an outside
 reader, without gates and local tickets: `[]` when the project has no source, a nonzero code and
-nothing on stdout when the source fails. `tk new --to NAME` resolves names in either projects root
+nothing on stdout when the source fails; `can_take` on each record says whether `tk next` would show
+it to the project's master under the current gate and frozen list. `tk new --to NAME` resolves names in either projects root
 and reports an error if both contain that name. When creating tickets in an eligible repository,
 `tk new` links `docs/tasks` to the shared `tasks/PROJECT` store and records the ignore rule in the
 repository's exclude file when needed.
@@ -264,7 +265,7 @@ When `.glint.yaml` exists at the task base, `tk done` checks all glint severitie
 completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
 `--slug PREFIX` filters by a case-insensitive slug prefix, and `--json` emits the filtered list with
-completion details; a waiting ticket whose deadline parses has it in `due` (RFC3339), the same time `--due` compares. `tk archive --root DIR` archives each repository's tasks to its own
+completion details; a waiting ticket whose deadline parses has it in `due` (RFC3339), the same time `--due` compares. `can_take` on each row is whether `tk next` would give the ticket to its project's master, decided by the same code; filters do not change it, and where that cannot be worked out it is false with the reason on stderr. `tk archive --root DIR` archives each repository's tasks to its own
 `docs/tasks-archive/` and prints paths relative to DIR. Completion journal entries record the
 checker session when it differs from `--by` (`checker_session` in JSON): a fresh sub-agent runs in its
 parent's session, so the session alone does not tell a self-check apart. `tk done --by` names the checker (a fresh sub-agent or worker); use `--doer` for the executor of an older ticket. `tk done` warns when the check runs in the executor's session and counts only as a check by a fresh sub-agent or a worker. It refuses tickets with an empty `Приёмка` or `Чем проверить` section. `tk release` returns an in-progress ticket to the open queue and clears its executor.

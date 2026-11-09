@@ -21,23 +21,50 @@ func frozenRefusal(project, who string, errout io.Writer) (string, error) {
 	if project == "" {
 		return "", nil
 	}
+	files, err := readFrozenFiles()
+	if err != nil {
+		return "", err
+	}
+	return files.refusal(project, who, errout)
+}
+
+// frozenFiles are the frozen list and the session names table, read once per
+// command. A table that cannot be read matters only where a name is needed.
+type frozenFiles struct {
+	home, listPath, list string
+	namesPath, names     string
+	namesErr             error
+}
+
+func readFrozenFiles() (frozenFiles, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("determine frozen list home: %w", err)
+		return frozenFiles{}, fmt.Errorf("determine frozen list home: %w", err)
 	}
-	path := filepath.Join(home, ".config", "queue", "frozen")
-	content, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	files := frozenFiles{home: home, listPath: filepath.Join(home, ".config", "queue", "frozen"), namesPath: filepath.Join(home, ".config", "cl", "names.tsv")}
+	list, err := os.ReadFile(files.listPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return frozenFiles{}, fmt.Errorf("read frozen list: %w", err)
+	}
+	files.list = string(list)
+	names, err := os.ReadFile(files.namesPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		files.namesErr = err
+	}
+	files.names = string(names)
+	return files, nil
+}
+
+func (f frozenFiles) refusal(project, who string, errout io.Writer) (string, error) {
+	if f.list == "" {
 		return "", nil
 	}
-	if err != nil {
-		return "", fmt.Errorf("read frozen list: %w", err)
-	}
+	home, path := f.home, f.listPath
 	want, err := normalizedRoot(project)
 	if err != nil {
 		return "", fmt.Errorf("resolve project %s: %w", project, err)
 	}
-	for number, raw := range strings.Split(string(content), "\n") {
+	for number, raw := range strings.Split(f.list, "\n") {
 		line := strings.TrimSpace(raw)
 		place := fmt.Sprintf("%s:%d", path, number+1)
 		matches, err := frozenLineNames(line, home, want)
@@ -53,7 +80,7 @@ func frozenRefusal(project, who string, errout io.Writer) (string, error) {
 			fmt.Fprintf(errout, "tk: %s: incomplete line, the project stays frozen\n", place)
 			reason = "incomplete line in the frozen list"
 		}
-		master, err := masterName(home, want, errout)
+		master, err := f.masterName(want, errout)
 		if err != nil {
 			return "", err
 		}
@@ -126,18 +153,14 @@ func frozenWhy(line string) string {
 // masterName is the session name the table of session names gives the project,
 // else its folder name with -master. A table that exists but cannot be read is
 // an error: another name would admit the wrong session.
-func masterName(home, want string, errout io.Writer) (string, error) {
+func (f frozenFiles) masterName(want string, errout io.Writer) (string, error) {
 	fallback := filepath.Base(want) + "-master"
-	path := filepath.Join(home, ".config", "cl", "names.tsv")
-	content, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return fallback, nil
+	if f.namesErr != nil {
+		return "", fmt.Errorf("read session names: %w", f.namesErr)
 	}
-	if err != nil {
-		return "", fmt.Errorf("read session names: %w", err)
-	}
+	home, path := f.home, f.namesPath
 	master, lastLine := "", 0
-	for number, raw := range strings.Split(string(content), "\n") {
+	for number, raw := range strings.Split(f.names, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

@@ -69,7 +69,7 @@ Flags:
   --all          ls: include closed tickets
 
   --due          ls: show waiting tickets whose parsed deadline has passed
-  --json         ls: output JSON array; show: ticket and journal JSON; next: top ticket JSON
+  --json         ls: output JSON array with can_take; show: ticket and journal JSON; next: top ticket JSON
   --status S     ls: show only status S
   --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
@@ -3468,6 +3468,7 @@ type taskJSON struct {
 	Plan           []planJSON `json:"plan,omitempty"`
 	Blocks         []string   `json:"blocks,omitempty"`
 	BlockedBy      []string   `json:"blocked_by,omitempty"`
+	CanTake        *bool      `json:"can_take,omitempty"` // ls only: would tk next give it to the project's master
 }
 
 type planJSON struct {
@@ -3586,7 +3587,7 @@ func externalGroup(t externalTask, gate queuegate.Scope) int {
 func orderExternal(items []externalTask, gate queuegate.Scope) []externalTask {
 	visible := make([]externalTask, 0, len(items))
 	for _, item := range items {
-		if item.Started || gate.Passes(item.Prio, "") {
+		if externalVisible(item, gate) {
 			visible = append(visible, item)
 		}
 	}
@@ -3720,6 +3721,10 @@ func listExternal(project string, out, errout io.Writer) int {
 	}
 	if items == nil {
 		items = []externalTask{}
+	}
+	takes := newTakeView()
+	for i := range items {
+		items[i].CanTake = takes.canTakeExternal(items[i], project, errout)
 	}
 	if err := json.NewEncoder(out).Encode(items); err != nil {
 		return fail(errout, err)
@@ -3937,6 +3942,7 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 			return fail(errout, err)
 		}
 	}
+	takes := newTakeView()
 	objects := make([]taskJSON, 0, len(ts))
 	for i := range ts {
 		t := &ts[i]
@@ -3944,7 +3950,16 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 		if o.root != "" {
 			repo = labels[t.path]
 		}
-		objects = append(objects, taskObject(root, *t, repo, false))
+		obj := taskObject(root, *t, repo, false)
+		project := root
+		if o.root != "" {
+			project = taskProject(t.path)
+		} else if o.mainRoot != "" {
+			project = o.mainRoot
+		}
+		can := takes.canTake(*t, project, errout)
+		obj.CanTake = &can
+		objects = append(objects, obj)
 	}
 	if err := json.NewEncoder(out).Encode(objects); err != nil {
 		return fail(errout, err)

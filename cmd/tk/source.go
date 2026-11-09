@@ -29,6 +29,8 @@ type externalTask struct {
 	// Started marks work already begun at the source; the queue keeps it
 	// visible under a closed pair, as it does a local ticket in progress.
 	Started bool `json:"started,omitempty"`
+	// CanTake is whether tk next would show it to the master of the project.
+	CanTake bool `json:"can_take"`
 }
 
 type cappedBuffer struct {

@@ -314,7 +314,7 @@ func writeSource(t *testing.T, root, body string) {
 
 func TestExternalList(t *testing.T) {
 	const good = `{"key":"K1","title":"one","status":"open","prio":"LOW","url":"u1"},{"key":"K2","title":"two","status":"open","prio":"CRIT","url":"u2"}`
-	want := `[{"key":"K2","title":"two","status":"open","prio":"CRIT","url":"u2"},{"key":"K1","title":"one","status":"open","prio":"LOW","url":"u1"}]` + "\n"
+	want := `[{"key":"K2","title":"two","status":"open","prio":"CRIT","url":"u2","can_take":true},{"key":"K1","title":"one","status":"open","prio":"LOW","url":"u1","can_take":false}]` + "\n"
 	cases := []struct {
 		name, source, stdout, stderr string
 		failed                       bool
