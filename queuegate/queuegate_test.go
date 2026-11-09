@@ -49,6 +49,7 @@ func TestReadUntrusted(t *testing.T) {
 		{"older than a day and two hours", gateAt(now.Add(-26*time.Hour - time.Second)), "older than 26 hours"},
 		{"from the future", gateAt(now.Add(time.Second)), "in the future"},
 		{"no open_by_root", fmt.Sprintf(`{"at":%q}`, now.Format(time.RFC3339)), "no open_by_root"},
+		{"open without open_by_root", fmt.Sprintf(`{"at":%q,"open":["MED-DO"]}`, now.Format(time.RFC3339)), "no open_by_root"},
 		{"null open_by_root", fmt.Sprintf(`{"at":%q,"open_by_root":null}`, now.Format(time.RFC3339)), "no open_by_root"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -61,7 +62,8 @@ func TestReadUntrusted(t *testing.T) {
 }
 
 func TestReadAtTheEdgesOfTrust(t *testing.T) {
-	for _, at := range []time.Time{now.Add(-26 * time.Hour), now} {
+	offset := time.FixedZone("", 3600)
+	for _, at := range []time.Time{now.Add(-26 * time.Hour), now, now.Add(-time.Hour).In(offset)} {
 		if g := Read(writeGate(t, gateAt(at)), now); !g.Valid {
 			t.Errorf("at %v: %q", at, g.Problem)
 		}
@@ -212,6 +214,8 @@ func TestAdmitsReadsLiveAndDifficulty(t *testing.T) {
 		want bool
 	}{
 		{"untrusted and not live is still closed", Gate{OpenByRoot: roots("MED-DO")}, "MED", "DO", false},
+		{"untrusted ignores the common list", Gate{Live: live, Open: []string{"MED-DO"}, OpenByRoot: roots("MED-DO")}, "MED", "DO", false},
+		{"an empty root ignores the common list", Gate{Valid: true, Live: live, Open: []string{"MED-DO"}, OpenByRoot: roots()}, "MED", "DO", false},
 		{"another project is live, this one has no bar", Gate{Valid: true, Live: []string{"other"}, OpenByRoot: roots()}, "MED", "DO", true},
 		{"HUNT reads its own pair, closed", Gate{Valid: true, Live: live, OpenByRoot: roots("MED-DO")}, "MED", "HUNT", false},
 		{"HUNT reads its own pair, open", Gate{Valid: true, Live: live, OpenByRoot: roots("MED-HUNT")}, "MED", "HUNT", true},
