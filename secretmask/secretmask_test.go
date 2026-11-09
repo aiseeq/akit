@@ -1,6 +1,7 @@
 package secretmask
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"math/rand"
@@ -658,5 +659,32 @@ func TestMaskLinearOnKeyRunEndingInName(t *testing.T) {
 				t.Errorf("glue %q, end %q: %v on 1 MiB", glue, end, took)
 			}
 		}
+	}
+}
+
+// A sed expression that reads a variable is not its value, at any escaping depth,
+// and a real value inside the same JSON string is still hidden.
+func TestMaskKeepsJSONValid(t *testing.T) {
+	for _, tc := range []struct{ name, input, hidden string }{
+		{"sed, one level", `{"cmd":"sudo sed -n \"s/^NAME_SECRET=\\(.*\\)$/\\1/p\" /opt/x/.env"}`, ""},
+		{"sed, two levels", `{"cmd":"sudo sed -n \\\"s/^NAME_SECRET=\\\\(.*\\\\)$/\\\\1/p\\\" /opt/x/.env"}`, ""},
+		{"real value in escaped quotes", `{"cmd":"x --password=\"hunter2pass\" y"}`, "hunter2pass"},
+		{"real value behind an escaped quote", `{"password":"a\\\"hunter2pass"}`, "hunter2pass"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !json.Valid([]byte(tc.input)) {
+				t.Fatalf("bad fixture: %s", tc.input)
+			}
+			got, _ := Mask(tc.input)
+			if !json.Valid([]byte(got)) {
+				t.Errorf("not valid after the mask: %s", got)
+			}
+			if tc.hidden == "" && got != tc.input {
+				t.Errorf("a command with no value was changed: %s", got)
+			}
+			if tc.hidden != "" && strings.Contains(got, tc.hidden) {
+				t.Errorf("value left: %s", got)
+			}
+		})
 	}
 }
