@@ -25,3 +25,10 @@ func TestRawContainsFoldedASCIIMatchAtTheEnd(t *testing.T) {
 		t.Fatal("a match ending at the last byte must count")
 	}
 }
+
+func TestRawContainsFoldedASCIIFirstLetterOnePastTheLastStart(t *testing.T) {
+	raw := append(make([]byte, 0, 3), "abs"...)
+	if rawContainsFoldedASCII(raw, []byte("sw")) {
+		t.Fatal("the pattern does not fit after its first letter")
+	}
+}
