@@ -82,7 +82,7 @@ func transferFoundTask(root string, t task, o options, out, errout io.Writer) in
 	if err != nil {
 		return transferError(errout, commandPath, err.Error())
 	}
-	row := transferRecord{At: time.Now().Format(time.RFC3339), Slug: t.slug, Stem: stem, Back: lineValue(t.body, "Заказчик: "), Key: result.Key, URL: result.URL, Blocks: headerLinks(t.body, blockedPrefix)}
+	row := transferRecord{At: time.Now().Format(time.RFC3339), Slug: t.slug, Stem: stem, Back: headerValue(t.body, "Заказчик: "), Key: result.Key, URL: result.URL, Blocks: headerLinks(t.body, blockedPrefix)}
 	if err := appendTransferRecord(dir, row); err != nil {
 		fmt.Fprintf(out, "%s %s\n", result.Key, result.URL)
 		return transferError(errout, filepath.Join(dir, ".transferred.jsonl"), err.Error())

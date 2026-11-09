@@ -598,9 +598,26 @@ func TestMaskLiveKeyGluedAssignmentKeepsValueHidden(t *testing.T) {
 			t.Errorf("%q: value or key left, output length %d", name, len(got))
 		}
 	}
+	// With no delimiter after it the same word is the rest of the key.
+	if got, _ := Mask(key + "_token rest"); got != "[скрыто:sk_live] rest" {
+		t.Errorf("secret-looking tail without a delimiter left: output length %d", len(got))
+	}
 	// A body going on before a delimiter is still the key, not a name.
 	tail := "_Ab12_cD34-eF56"
 	if got, _ := Mask(key + tail + "=rest"); strings.Contains(got, tail) {
 		t.Errorf("tail before a delimiter left: output length %d", len(got))
+	}
+}
+
+func TestMaskLinearOnGluedKeyChains(t *testing.T) {
+	key := "sk" + "_live_" + strings.Repeat("a1B2", 6)
+	const size = 1 << 20
+	for _, glue := range []string{"_.", "_a ", "-", "_token "} {
+		text := strings.Repeat(key+glue, size/(len(key)+len(glue)))
+		start := time.Now()
+		Mask(text)
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("glue %q: %v on 1 MiB", glue, took)
+		}
 	}
 }

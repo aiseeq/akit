@@ -49,11 +49,11 @@ import (
 )
 
 var (
-	privateKeyRE   = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
-	awsRE          = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	escapeRE       = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
-	contextNameRE  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
-	gluedNameRE    = regexp.MustCompile(`^` + contextNameRE.String())
+	privateKeyRE  = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
+	awsRE         = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	escapeRE      = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
+	contextNameRE = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
+
 	headerRE       = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	urlRE          = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]*:([^\s/@]+)@`)
 	flagRE         = regexp.MustCompile("(?i)(?:^|[ \\t'\"`])--?([a-z0-9_.-]+)")
@@ -697,15 +697,27 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 // taken into the key, it would no longer hide the value after it.
 func bodyContinuation(text string, end int, caches *[4]bodyEndCache) int {
 	next := bodyEnd(text, end, tokenChars, caches)
-	if next == end {
-		return end
-	}
-	if m := gluedNameRE.FindStringSubmatch(text[end:]); m != nil {
-		if _, secret := secretName(m[1]); secret {
+	if next > end && beforeDelimiter(text, next) {
+		if _, secret := secretName(text[end:next]); secret {
 			return end
 		}
 	}
 	return next
+}
+
+// beforeDelimiter: what stands at text[at:] is the delimiter of an assignment,
+// past the quote and blanks contextNameRE allows there.
+func beforeDelimiter(text string, at int) bool {
+	for at < len(text) && text[at] == '\\' {
+		at++
+	}
+	if at < len(text) && (text[at] == '"' || text[at] == '\'') {
+		at++
+	}
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	return at < len(text) && (text[at] == ':' || text[at] == '=')
 }
 
 func matchingPrefix(text string, start int, variants []tokenVariant) (tokenVariant, bool) {

@@ -3018,3 +3018,34 @@ func TestHeaderEditsLeaveBodyLinesAlone(t *testing.T) {
 		t.Errorf("a comment in the body taken for the title:\n%s", got)
 	}
 }
+
+// An executor or a requester written below the first section is the ticket's text.
+func TestHeaderFieldsReadAndWrittenInHeaderOnly(t *testing.T) {
+	const body = "# Title\n\nСтатус: в работе\n\n## Что сделать\nИсполнитель: text-owner\nЗаказчик: text-requester\n"
+	if got := executor(body); got != "" {
+		t.Errorf("executor read from the body: %q", got)
+	}
+	if got := headerValue(body, "Заказчик: "); got != "" {
+		t.Errorf("requester read from the body: %q", got)
+	}
+	got := setExecutor(body, "fresh")
+	if !strings.Contains(got, "Статус: в работе\nИсполнитель: fresh\n") || !strings.Contains(got, "Исполнитель: text-owner") {
+		t.Errorf("setExecutor:\n%s", got)
+	}
+	if owner := executor(got); owner != "fresh" {
+		t.Errorf("executor after setExecutor = %q", owner)
+	}
+	if owner := executor(removeExecutor(got)); owner != "" {
+		t.Errorf("executor after release = %q", owner)
+	}
+	const header = "# Title\n\nСтатус: в работе\nИсполнитель: real\nЗаказчик: boss\n\n## Что сделать\nИсполнитель: text-owner\n"
+	if got := executor(header); got != "real" {
+		t.Errorf("executor = %q", got)
+	}
+	if got := headerValue(header, "Заказчик: "); got != "boss" {
+		t.Errorf("requester = %q", got)
+	}
+	if got := setExecutor(header, "fresh"); !strings.Contains(got, "Исполнитель: fresh\nЗаказчик: boss") || !strings.Contains(got, "Исполнитель: text-owner") {
+		t.Errorf("setExecutor over the header line:\n%s", got)
+	}
+}

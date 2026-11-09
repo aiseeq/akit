@@ -2100,12 +2100,12 @@ func sectionBody(s, heading string) (string, bool) {
 }
 
 func executor(s string) string {
-	for l := range strings.SplitSeq(s, "\n") {
-		if after, ok := strings.CutPrefix(l, "Исполнитель: "); ok {
-			return strings.TrimSpace(after)
-		}
-	}
-	return ""
+	return strings.TrimSpace(headerValue(s, "Исполнитель: "))
+}
+
+func headerValue(s, prefix string) string {
+	head, _ := splitHeader(s)
+	return lineValue(head, prefix)
 }
 func removeExecutor(s string) string {
 	return removeHeaderLine(s, "Исполнитель: ")
@@ -2136,23 +2136,24 @@ func splitHeader(s string) (head, rest string) {
 }
 
 func setExecutor(s, n string) string {
-	ls := strings.Split(s, "\n")
+	head, rest := splitHeader(s)
+	ls := strings.Split(head, "\n")
 	for i, l := range ls {
 		if strings.HasPrefix(l, "Исполнитель: ") {
 			ls[i] = "Исполнитель: " + n
-			return strings.Join(ls, "\n")
+			return strings.Join(ls, "\n") + rest
 		}
 	}
 	for i, l := range ls {
 		if strings.HasPrefix(l, "Статус: ") {
 			ls = append(ls[:i+1], append([]string{"Исполнитель: " + n}, ls[i+1:]...)...)
-			return strings.Join(ls, "\n")
+			return strings.Join(ls, "\n") + rest
 		}
 	}
 	for i, l := range ls {
 		if strings.HasPrefix(l, "# ") {
 			ls = append(ls[:i+1], append([]string{"Исполнитель: " + n}, ls[i+1:]...)...)
-			return strings.Join(ls, "\n")
+			return strings.Join(ls, "\n") + rest
 		}
 	}
 	return s
@@ -3338,7 +3339,7 @@ func applySetFields(t task, o options) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		body = journal(body, fieldChangeJournal(o.by, "заказчик", lineValue(t.body, "Заказчик: "), o.back))
+		body = journal(body, fieldChangeJournal(o.by, "заказчик", headerValue(t.body, "Заказчик: "), o.back))
 	}
 	return body, nil
 }
@@ -3476,7 +3477,7 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	}
 	prio := normalizePrio(t.prio)
 	journalEntry := isJournal(t)
-	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: lineValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
+	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: headerValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
 		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
 		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, Due: due, NoCheck: noCheck(t.body)}
 	if details {
