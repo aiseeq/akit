@@ -194,6 +194,16 @@ func TestAllSkipped(t *testing.T) {
 	f.unchanged(t)
 }
 
+// A parent whose subtests were all skipped passes, yet checked nothing.
+func TestAllSubtestsSkipped(t *testing.T) {
+	f := newFixture(t, "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){for _, n := range []string{\"one\", \"two\"} {t.Run(n, func(t *testing.T){t.SkipNow()})}}\n")
+	out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./...")
+	if code != 2 || !strings.Contains(out, "every test skipped (TestAdd/one: no reason printed)") {
+		t.Fatalf("got %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
 // A survivor beside skipped tests names them: the skipped one may be the test
 // that would have caught the mutant.
 func TestSurvivedBesideSkipped(t *testing.T) {

@@ -512,7 +512,7 @@ type testSummary struct {
 	packages, runs            []string
 	skipped                   []string
 	skipReason                string
-	passed                    int
+	passed, skippedKeys       []string
 	outputs, build            map[string][]string
 	testOutputs               map[string][]string
 	buildOrder                []string
@@ -540,9 +540,10 @@ func summarize(events []event) testSummary {
 		if e.Test != "" {
 			switch e.Action {
 			case "pass":
-				s.passed++
+				s.passed = append(s.passed, pkg+"\x00"+e.Test)
 			case "skip":
 				s.skipped = append(s.skipped, e.Test)
+				s.skippedKeys = append(s.skippedKeys, pkg+"\x00"+e.Test)
 				if len(s.skipped) == 1 {
 					s.skipReason = skipReason(s.testOutputs[pkg+"\x00"+e.Test])
 				}
@@ -630,7 +631,7 @@ func classify(events []event, stderr string, exit int) verdict {
 	if exit != 0 {
 		return verdictOf(fmt.Sprintf("error: go test exit %d: %s", exit, strings.TrimSpace(stderr)), 2, false)
 	}
-	if s.passed == 0 && len(s.skipped) > 0 {
+	if s.leafPasses() == 0 && len(s.skipped) > 0 {
 		return verdictOf(fmt.Sprintf("error: every test skipped (%s: %s)", s.skipped[0], s.skipReason), 2, false)
 	}
 	text := "survived: ok " + strings.Join(s.packages, " ")
@@ -638,6 +639,24 @@ func classify(events []event, stderr string, exit int) verdict {
 		text += fmt.Sprintf(" (%d skipped: %s)", len(s.skipped), strings.Join(firstN(s.skipped, 3), " "))
 	}
 	return verdictOf(text, 1, false)
+}
+
+// leafPasses counts passed tests that ran no subtests: a parent passes when its subtests are all
+// skipped, and that checked nothing.
+func (s testSummary) leafPasses() int {
+	parents := map[string]bool{}
+	for _, name := range slices.Concat(s.passed, s.skippedKeys) {
+		for i := strings.LastIndexByte(name, '/'); i > 0; i = strings.LastIndexByte(name[:i], '/') {
+			parents[name[:i]] = true
+		}
+	}
+	leaves := 0
+	for _, name := range s.passed {
+		if !parents[name] {
+			leaves++
+		}
+	}
+	return leaves
 }
 
 // skipReason is what a skipped test printed, without go test's own lines.
