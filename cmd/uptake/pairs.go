@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,14 +21,15 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-const pairToolNames = "busy prior user-word page-shot claude-rules-export wfor"
-const pairCode2Tools = "busy prior user-word wfor claude-rules-export"
+const pairToolNames = "busy prior user-word page-shot claude-rules-export timeit wfor"
+const pairCode2Tools = "busy prior user-word wfor claude-rules-export timeit"
 const candidateContextRunes = 600
 
 type pairPatterns struct {
 	busyProbe, searchTool, copyTool, heavyCommand, spaces *regexp.Regexp
 	waitGoals                                             []*regexp.Regexp
 	tkKindClean, tkPath, tkTicketID                       *regexp.Regexp
+	timeCommand                                           *regexp.Regexp
 }
 
 func newPairPatterns() pairPatterns {
@@ -46,6 +48,7 @@ func newPairPatterns() pairPatterns {
 		tkKindClean: regexp.MustCompile(`[0-9]+|[^\p{L}\w -]`),
 		tkPath:      regexp.MustCompile(`(?:^|\s)(?:/\S+|\S*\.md)(?:\s|$)`),
 		tkTicketID:  regexp.MustCompile(`\b[0-9]{8}-[0-9]{4}-[A-Za-z0-9-]+\b`),
+		timeCommand: regexp.MustCompile(`(?:^|[;&|()]\s*)(?:/usr/bin/)?time(?:\s|$)`),
 	}
 }
 
@@ -372,9 +375,25 @@ func pairGoal(tool string, c shellcmd.Call) string {
 		return pageGoal(c.Args)
 	case "claude-rules-export":
 		return lastArg(positionals(c.Args, "src-home", "rules"))
+	case "timeit":
+		args := c.Args
+		if at := slices.Index(args, "--"); at >= 0 {
+			args = args[at+1:]
+		} else {
+			return ""
+		}
+		return normalizePairGoal(strings.Join(args, " "))
 	default:
 		return ""
 	}
+}
+
+func normalizePairGoal(goal string) string {
+	return strings.ToLower(strings.Join(strings.Fields(goal), " "))
+}
+
+func callPairGoal(c shellcmd.Call) string {
+	return normalizePairGoal(strings.Join(append([]string{c.Name}, c.Args...), " "))
 }
 
 // positionals returns the arguments that are neither flags nor values of the named value flags (names
@@ -525,6 +544,9 @@ func pairOutcome(c pairCall) string {
 	if usage || c.code == 2 && contains(strings.Fields(pairCode2Tools), c.tool) {
 		return "callerr"
 	}
+	if c.tool == "timeit" {
+		return timeitOutcome(c)
+	}
 	if c.code >= 128 || strings.HasPrefix(strings.TrimSpace(c.out), "panic:") || strings.HasPrefix(strings.TrimSpace(c.out), "fatal error:") {
 		return "fail"
 	}
@@ -555,6 +577,16 @@ func pairOutcome(c pairCall) string {
 	return "unknown"
 }
 
+func timeitOutcome(c pairCall) string {
+	if c.code == 0 && pairOutputAnswer(c.tool, c.out) {
+		return "answer"
+	}
+	if c.code > 0 {
+		return "fail"
+	}
+	return "unknown"
+}
+
 func pageShotOutputFailure(output string) bool {
 	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
@@ -579,6 +611,8 @@ func pairCodeAnswer(tool string, code int) bool {
 		return code == 0 || code == 2
 	case "wfor":
 		return code == 0 || code == 1
+	case "timeit":
+		return code == 0
 	}
 	return false
 }
@@ -617,6 +651,15 @@ func pairOutputAnswer(tool, out string) bool {
 		return lineHas("claude-rules-export: ") && !strings.Contains(out, " -h for usage")
 	case "wfor":
 		return lineHas("wfor: done in") || lineHas("wfor: not yet after")
+	case "timeit":
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				if _, err := strconv.ParseInt(line, 10, 64); err == nil {
+					return true
+				}
+			}
+		}
 	case "page-shot":
 		return strings.Contains(out, ".png") || lineHas("page-shot: ")
 	}
@@ -666,6 +709,9 @@ func (u *run) heavyCommandGoal(cmd string) string {
 }
 
 func (u *run) oldPair(c shellcmd.Call, cmd string) (string, string) {
+	if tool, goal := oldTimeitPair(c, cmd); tool != "" {
+		return tool, goal
+	}
 	if u.isPairBusyProbe(c) {
 		return "busy", ""
 	}
@@ -682,6 +728,71 @@ func (u *run) oldPair(c shellcmd.Call, cmd string) (string, string) {
 		return "claude-rules-export", goal
 	}
 	return "", ""
+}
+
+var timeitDateRead = regexp.MustCompile(`\bdate\s+\+%s(?:%3N|%N)?\b`)
+var timeitDateSubtract = regexp.MustCompile(`\$\(\(.*-.*\)\)|\bexpr\b[^;|&]*-[^;|&]*|(?:echo|printf)\s+[^;|]*-[^;|&]*\|\s*bc\b`)
+
+// oldTimeitPair recognises shell time commands and date readings used as an elapsed-time subtraction.
+func oldTimeitPair(c shellcmd.Call, cmd string) (string, string) {
+	if c.Name == "time" {
+		if goal := timeCommandGoal(c); goal != "" {
+			return "timeit", goal
+		}
+	}
+	return oldDateTimingPair(c, cmd)
+}
+
+func timeCommandGoal(c shellcmd.Call) string {
+	if slices.Contains(c.Via, "time") {
+		return callPairGoal(c)
+	}
+	raw := strings.TrimSpace(c.Raw)
+	if strings.HasPrefix(raw, "time ") {
+		calls, err := shellcmd.Calls(raw)
+		if err == nil {
+			for i := range calls {
+				if slices.Contains(calls[i].Via, "time") {
+					return callPairGoal(calls[i])
+				}
+			}
+		}
+		return ""
+	}
+	if strings.HasPrefix(raw, "/usr/bin/time ") {
+		args := c.Args
+		if len(args) > 0 && args[0] == "-p" {
+			args = args[1:]
+		}
+		return normalizePairGoal(strings.Join(args, " "))
+	}
+	return ""
+}
+
+func oldDateTimingPair(c shellcmd.Call, cmd string) (string, string) {
+	if c.Name != "date" || !timeitDateRead.MatchString(c.Raw) {
+		return "", ""
+	}
+	reads := timeitDateRead.FindAllStringIndex(cmd, -1)
+	if len(reads) != 2 || c.Offset != reads[0][0] || !timeitDateSubtract.MatchString(cmd) {
+		return "", ""
+	}
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil { //nolint:fallback-return,silent-error-handling // Calls parsed before a nested shell error still identify the measured command.
+		slog.Debug("parse date timing", "error", err)
+	}
+	var measured []string
+	for i := range calls {
+		call := calls[i]
+		if call.Offset > reads[0][1] && call.Offset < reads[1][0] && call.Name != "date" && call.Name != "printf" && call.Name != "echo" && call.Name != "expr" && call.Name != "bc" {
+			measured = append(measured, callPairGoal(call))
+		}
+	}
+	goal := normalizePairGoal(strings.Join(measured, " "))
+	if goal == "" {
+		return "", ""
+	}
+	return "timeit", goal
 }
 
 func (u *run) oldSearchPair(c shellcmd.Call, cmd string) (string, string) {
@@ -864,6 +975,9 @@ func (u *run) candidateClasses(l, cmd string) map[string]bool {
 	}
 	if u.pairPatterns.copyTool.MatchString(l) {
 		candidates["claude-rules-export"] = u.oldPairCandidate("claude-rules-export", cmd)
+	}
+	if strings.Contains(l, "+%s") || u.pairPatterns.timeCommand.MatchString(l) {
+		candidates["timeit"] = u.oldPairCandidate("timeit", cmd)
 	}
 	return candidates
 }

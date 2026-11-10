@@ -97,7 +97,7 @@ func newRun(since, until time.Time, seed int, out, home string) *run {
 		start: since.Format(time.RFC3339Nano), end: until.Format(time.RFC3339Nano), seed: seed,
 		outputDir: out, home: home,
 		counts: map[string]int{}, habitCandidates: map[string][]example{}, refusalSamples: map[string][]example{},
-		tkPair: map[string]*[2]int{}, utilityNames: []string{"busy", "prior", "tk", "user-word", "page-shot", "webtext", "claude-rules-export", "sub", "tl", "wfor"},
+		tkPair: map[string]*[2]int{}, utilityNames: []string{"busy", "prior", "tk", "user-word", "page-shot", "webtext", "claude-rules-export", "sub", "tl", "timeit", "wfor"},
 		errorStats:   map[string]*errorStat{},
 		hookCounts:   map[string]int{},
 		pairPatterns: newPairPatterns(),
