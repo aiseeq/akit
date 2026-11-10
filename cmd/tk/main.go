@@ -1885,6 +1885,12 @@ var waitAgo = regexp.MustCompile(`^[0-9]+[smhd]$`)
 // waitISO — дата и часы через T, без пояса или с Z (2026-10-31T12:00, 2026-10-31T12:00Z), не RFC3339.
 var waitISO = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{1,2}:[0-9]{2}(:[0-9]{2})?)(Z?)$`)
 
+var dayMonthWaitPattern = regexp.MustCompile(`(?s)^\s*([0-9]{1,2}\.[0-9]{1,2})(?:\s+([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?))?(.*)$`)
+
+type dayMonthWait struct {
+	date, clock, rest, layout string
+}
+
 // waitDue — срок ожидания: время в начале строки «Ждёт:» (дата, дата с часами, «ДД.ММ ЧЧ:ММ», ISO с T, RFC3339,
 // часы; UTC после часов — в UTC, иначе местное), дальше — текст. Без времени в начале — условие, срока нет.
 // «Назад» (30m) сроком не бывает.
@@ -1906,6 +1912,11 @@ func waitDue(wait string, now time.Time) (time.Time, bool) {
 			f = append(f[:2], append([]string{"UTC"}, f[2:]...)...)
 		}
 	}
+	if parsed, ok := parseDayMonthWait(wait); ok {
+		if t, ok := closestWaitDate(parsed, now); ok {
+			return t, true
+		}
+	}
 	for n := min(2, len(f)); n >= 1; n-- {
 		// Без двух слов срока пробуем одно: «2026-11-06 итог» — срок одним словом, второе — заметка.
 		if t, err := timearg.Parse(strings.Join(f[:n], " "), now); err == nil {
@@ -1918,11 +1929,81 @@ func waitDue(wait string, now time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// datedWait дописывает дату к ожиданию, которое начинается с часов: иначе срок сдвигался бы на каждый новый день.
+// parseDayMonthWait распознаёт ДД.ММ[ ЧЧ:ММ[:СС]] и принимает только границу перед текстом.
+func parseDayMonthWait(value string) (dayMonthWait, bool) {
+	m := dayMonthWaitPattern.FindStringSubmatch(value)
+	if m == nil || (m[3] != "" && !strings.ContainsRune(" :,;", rune(m[3][0]))) {
+		return dayMonthWait{}, false
+	}
+	parsed := dayMonthWait{date: m[1], clock: m[2], rest: m[3], layout: "02.01 2006"}
+	if parsed.clock != "" {
+		parsed.layout = "02.01 15:04 2006"
+		if strings.Count(parsed.clock, ":") == 2 {
+			parsed.layout = "02.01 15:04:05 2006"
+		}
+	}
+	if _, ok := parsed.at(2000, time.Local); !ok {
+		return dayMonthWait{}, false
+	}
+	return parsed, true
+}
+
+func (w dayMonthWait) at(year int, loc *time.Location) (time.Time, bool) {
+	value := w.date + " "
+	if w.clock != "" {
+		value = w.date + " " + w.clock + " "
+	}
+	candidate, err := time.ParseInLocation(w.layout, value+strconv.Itoa(year), loc)
+	return candidate, err == nil
+}
+
+// closestWaitDate выбирает для старой даты ДД.ММ ближайшее к now наступление.
+// Проверка прошлого, текущего и следующего года сохраняет смысл даты через Новый год.
+func closestWaitDate(wait dayMonthWait, now time.Time) (time.Time, bool) {
+	var closest time.Time
+	var distance time.Duration
+	for year := now.Year() - 1; year <= now.Year()+1; year++ {
+		candidate, ok := wait.at(year, now.Location())
+		if !ok {
+			continue
+		}
+		delta := candidate.Sub(now)
+		if delta < 0 {
+			delta = -delta
+		}
+		if closest.IsZero() || delta < distance {
+			closest, distance = candidate, delta
+		}
+	}
+	return closest, !closest.IsZero()
+}
+
+// datedWait записывает год у ожидания ДД.ММ, чтобы срок не сдвигался после Нового года.
 func datedWait(wait string, now time.Time) string {
 	f := strings.Fields(wait)
 	if len(f) > 0 && waitClock.MatchString(f[0]) {
 		return now.Format("2006-01-02 ") + strings.TrimSpace(wait)
+	}
+	parsed, ok := parseDayMonthWait(wait)
+	if !ok {
+		return wait
+	}
+	dayMonth, valid := parsed.at(2000, now.Location())
+	if !valid {
+		return wait
+	}
+	year := now.Year()
+	if dayMonth.Month() < now.Month() || (dayMonth.Month() == now.Month() && dayMonth.Day() < now.Day()) {
+		year++
+	}
+	for ; year <= now.Year()+8; year++ {
+		if candidate, ok := parsed.at(year, now.Location()); ok {
+			value := candidate.Format("2006-01-02")
+			if parsed.clock != "" {
+				value += " " + parsed.clock
+			}
+			return value + parsed.rest
+		}
 	}
 	return wait
 }
