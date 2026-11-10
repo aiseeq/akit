@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// tk ls --json gives, per ticket, the time of the last journal record of each
+// tk ls --json gives, per ticket, the time of the latest journal record of each
 // author: a watcher sees that a master keeps working an open ticket.
 func TestListJSONActorsLastRecordByAuthor(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -17,14 +17,18 @@ func TestListJSONActorsLastRecordByAuthor(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := "# subject\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n" +
-		"- 2026-11-07 15:00 открыт — lead\n" +
-		"- 2026-11-07 16:30 note — dream-master: first look\n" +
-		"- 2026-11-07 16:40 ждёт — dream-master — 2026-11-07 16:50\n" +
-		"- 2026-11-07 16:45 ждёт — tester — 2026-11-07 18:00\n" +
-		"- 2026-11-07 16:46 в работе — doer\n" +
-		"- 2026-11-07 16:55 note — dream-master: a reply quoting «note — lead» and — lead: nothing\n" +
-		"- 2026-11-07 17:34 note — aguard: alert\n"
-	if err := os.WriteFile(filepath.Join(dir, "20261107-1500-HIGH-subject.md"), []byte(body), 0o644); err != nil {
+		"- 2030-01-02 09:00 открыт — opener\n" +
+		"- 2030-01-02 10:30 note — alpha-master: first look\n" +
+		"- 2030-01-02 10:40 ждёт — alpha-master — 2030-01-02 10:50\n" +
+		"- 2030-01-02 10:45 ждёт — tester — 2030-01-02 12:00\n" +
+		"- 2030-01-02 10:46 в работе — doer\n" +
+		"- 2030-01-02 10:55 note — alpha-master: a reply quoting «note — opener» and — opener: nothing\n" +
+		"- 2030-01-02 10:50 note — alpha-master: written by hand, back in time\n" +
+		"- 2030-01-02 11:00 готово — checker (session beta-master): ok: verified\n" +
+		"- 2030-01-02 11:05 note — odd:: colon name\n" +
+		"- 2030-01-02 11:06 в работе — odd:\n" +
+		"- 2030-01-02 11:34 note — watcher: alert\n"
+	if err := os.WriteFile(filepath.Join(dir, "20300102-0900-HIGH-subject.md"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	code, out, errOut := tkIn(t, project, "", "ls", "--json")
@@ -41,8 +45,9 @@ func TestListJSONActorsLastRecordByAuthor(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows: %s", out)
 	}
-	want := map[string]string{"lead": "2026-11-07 15:00", "dream-master": "2026-11-07 16:55", "aguard": "2026-11-07 17:34",
-		"tester": "2026-11-07 16:45", "doer": "2026-11-07 16:46"}
+	want := map[string]string{"opener": "2030-01-02 09:00", "alpha-master": "2030-01-02 10:55", "watcher": "2030-01-02 11:34",
+		"tester": "2030-01-02 10:45", "doer": "2030-01-02 10:46", "checker": "2030-01-02 11:00", "beta-master": "2030-01-02 11:00",
+		"odd:": "2030-01-02 11:06"}
 	got := rows[0].Actors
 	if len(got) != len(want) {
 		t.Errorf("actors %v, want %v", got, want)

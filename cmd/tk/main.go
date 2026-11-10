@@ -120,8 +120,8 @@ var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план �
 var planRepinRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): перезакреплён обязательный пункт ([a-z0-9-]+): (.+) → (.+) — (.+)$`)
 
 // journalActorRE takes the time and the author of a journal record: the name after the first « — », ended by «: »,
-// « — » or the line end.
-var journalActorRE = regexp.MustCompile(`^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) [^—]+? — (\S+?)(?:: | — |:?$)`)
+// « — » or the line end; tk done by another checker adds « (session S)», the session that wrote it.
+var journalActorRE = regexp.MustCompile(`^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) [^—]+? — (\S+?)(?: \(session (\S+)\))?(?:: | — |$)`)
 
 var executorHistoryRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:в работе|на проверке) — (\S+)(?:$| — )`)
 
@@ -3619,13 +3619,19 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	return obj
 }
 
-// journalActors maps each journal author to the time of their last record; the journal is kept in time order.
+// journalActors maps each journal author to the time of their latest record; a hand-written journal may go back
+// in time, so the latest time wins, not the last line.
 func journalActors(body string) map[string]string {
 	actors := map[string]string{}
 	for _, line := range journalLines(body) {
 		m := journalActorRE.FindStringSubmatch(line)
-		if m != nil {
-			actors[m[2]] = m[1]
+		if m == nil {
+			continue
+		}
+		for _, who := range m[2:] {
+			if who != "" && m[1] > actors[who] {
+				actors[who] = m[1]
+			}
 		}
 	}
 	if len(actors) == 0 {
