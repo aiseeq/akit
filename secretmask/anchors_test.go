@@ -100,3 +100,57 @@ func TestMaskLinearOnJSONArrayLikeText(t *testing.T) {
 		}
 	}
 }
+
+// A command word right after ; | or & is an anchor, as it starts a segment for
+// the rules; a secret name before a structure leaves the names inside it to
+// their own rules.
+func TestMaskAfterSeparatorAndInsideStructures(t *testing.T) {
+	for _, input := range []string{
+		"true;mysql -uroot -pVvalue123 db",
+		"a|sshpass -p Vvalue123 ssh h",
+		"true&&curl -u admin:Vvalue123 x",
+		"ok||mysql -pVvalue123",
+		"x;curl --user='user:Vvalue123' x",
+		"cat f >/dev/null;mysql -pVvalue123 db",
+		"make 2>&1;curl -u admin:Vvalue123 x",
+		"auth: {password: Vvalue123}",
+		"auth: password: Vvalue123",
+		"credentials: {token: Vvalue123}",
+		"auth: [password: Vvalue123]",
+		"auth: (password: Vvalue123)",
+		`auth='{"password":"Vvalue123"}'`,
+		`credentials: "{\"password\":\"Vvalue123\"}"`,
+		"token: {password: Vvalue123}",
+		"basic_auth: {password: Vvalue123, user: u}",
+		"auth=::X-API-KEY: Vvalue123",
+		`note:\nauth=Vvalue123`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			if got, _ := Mask(input); strings.Contains(got, formValue) {
+				t.Fatalf("value left in %q", got)
+			}
+		})
+	}
+	// The structure stays; only the inner value goes.
+	for input, want := range map[string]string{
+		"auth: {password: Vvalue123}":     "auth: {password: [скрыто:password]}",
+		"auth: password: Vvalue123":       "auth: password: [скрыто:password]",
+		`auth='{"password":"Vvalue123"}'`: `auth='{"password":"[скрыто:password]"}'`,
+	} {
+		if got, _ := Mask(input); got != want {
+			t.Errorf("%q: got %q, want %q", input, got, want)
+		}
+	}
+	for _, input := range []string{"pwd: /home/user/project", "pwd=~/src", "--pwd /tmp/x", "token: abc-note:"} {
+		got, found := Mask(input)
+		if input == "token: abc-note:" {
+			if got == input {
+				t.Errorf("a word ending in a colon is still a value: %q", got)
+			}
+			continue
+		}
+		if got != input || len(found) != 0 {
+			t.Errorf("%q changed to %q, %v", input, got, found)
+		}
+	}
+}
