@@ -5,6 +5,7 @@ package edit
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -42,24 +43,32 @@ The path line names the file for the blocks after it, until the next path line.
 "<<<<<<< SEARCH 3" expects exactly 3 matches (default 1). Text is matched
 exactly, as a substring: whitespace and indentation count. A line that is a
 marker (spaces around it ignored) cannot be part of the text; use the OLD NEW
-argument form for such edits.
+argument form for such edits. A few unambiguous foreign forms are accepted;
+SEARCH/REPLACE remains the recommended form.
 `
 
-// ParseSpec разбирает задание из блоков SEARCH/REPLACE. Строки вне блоков — только путь к файлу и пустые: любая
-// другая строка — ошибка, чтобы опечатка в маркере не превратилась в молча пропущенную правку.
+// ParseSpec разбирает задание из блоков SEARCH/REPLACE или однозначной поддерживаемой чужой формы. Неизвестная
+// разметка завершается ошибкой с образцом, чтобы опечатка не превратилась в молча пропущенную правку.
 func ParseSpec(r io.Reader) ([]Edit, error) {
 	return parseSpec(r, "")
 }
 
-// ParseSpecFor разбирает задание, все блоки которого правят file: строка пути не нужна, а если есть — должна
-// называть тот же файл. Агенты пишут `sub FILE <<'EOF'` с блоками без строки пути (6 из 19 ошибок sub
-// за сутки).
+// ParseSpecFor разбирает задание, все блоки которого правят file: строка пути не нужна для SEARCH/REPLACE,
+// а если есть — должна называть тот же файл.
 func ParseSpecFor(r io.Reader, file string) ([]Edit, error) {
 	return parseSpec(r, file)
 }
 
 func parseSpec(r io.Reader, fixed string) ([]Edit, error) {
-	sc := bufio.NewScanner(r)
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read spec: %w", err)
+	}
+	raw = bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	if !hasSearchMarkers(raw) {
+		return parseForeignSpec(raw, fixed)
+	}
+	sc := bufio.NewScanner(bytes.NewReader(raw))
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	p := &specParser{file: fixed, fixed: fixed}
 	for sc.Scan() {
@@ -81,6 +90,16 @@ func parseSpec(r io.Reader, fixed string) ([]Edit, error) {
 		return nil, fmt.Errorf("spec has no SEARCH/REPLACE blocks")
 	}
 	return p.edits, nil
+}
+
+func hasSearchMarkers(spec []byte) bool {
+	for line := range bytes.SplitSeq(spec, []byte("\n")) {
+		mark := strings.TrimSpace(string(line))
+		if mark == markSearch || mark == markDivider || mark == markReplace || strings.HasPrefix(mark, markSearch+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 // Где разбор задания: вне блока, в части SEARCH или в части REPLACE.
