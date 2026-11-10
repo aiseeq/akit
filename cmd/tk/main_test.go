@@ -212,7 +212,7 @@ func TestShowSectionMissingListsAvailableAndMatchesCaseInsensitively(t *testing.
 func TestShowSizeThreshold(t *testing.T) {
 	prefix := "# T\n\nСтатус: открыт\n\n## Что сделать\nwork\n\n## Приёмка\ncheck\n\n## Журнал\n"
 	records := []string{"- old-marker " + strings.Repeat("x", maxFullShowBytes)}
-	for range defaultShowJournalLines {
+	for range defaultShowJournalEntries {
 		records = append(records, "- record")
 	}
 	base := prefix + strings.Join(records, "\n")

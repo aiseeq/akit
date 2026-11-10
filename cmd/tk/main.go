@@ -67,7 +67,7 @@ Flags:
   --by NAME      actor name (default: current session); done: checker (fresh sub-agent or worker, e.g. worker-<id>); release: actor; ls: show tickets assigned to NAME
   --text FILE|-  new/set: fill or replace ticket sections from FILE, or standard input with -
   --section NAME show: print only named sections (repeatable)
-  --tail N       show: header, sections, and last N journal lines; 0 prints all
+  --tail N       show: header, sections, and last N journal entries; 0 prints all
   --head         show: header and status only
   --all          ls: include closed tickets
 
@@ -1233,7 +1233,7 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 	} else if o.tailSet || largeDefault {
 		body = showTail(body, func() int {
 			if largeDefault {
-				return defaultShowJournalLines
+				return defaultShowJournalEntries
 			}
 			return o.tail
 		}())
@@ -1244,8 +1244,8 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 	}
 	if largeDefault {
 		n := len(journalLines(t.body))
-		if n > defaultShowJournalLines {
-			fmt.Fprintf(out, "… ещё %d строк журнала: tk show %s --tail 0\n", n-defaultShowJournalLines, t.slug)
+		if n > defaultShowJournalEntries {
+			fmt.Fprintf(out, "… ещё %d записей журнала: tk show %s --tail 0\n", n-defaultShowJournalEntries, t.slug)
 		}
 	}
 	return 0
@@ -1253,8 +1253,8 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 
 // Full ticket output is capped by size; the short view keeps a useful journal tail.
 const (
-	maxFullShowBytes        = 20 * 1024
-	defaultShowJournalLines = 30
+	maxFullShowBytes          = 20 * 1024
+	defaultShowJournalEntries = 30
 )
 
 // ticketSection stores one heading and the ordered lines until the next heading.
