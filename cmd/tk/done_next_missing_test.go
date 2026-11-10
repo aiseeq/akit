@@ -99,3 +99,27 @@ func TestDoneHintFileNamedLikeProject(t *testing.T) {
 		t.Errorf("output %q, stderr %q", out.String(), errout.String())
 	}
 }
+
+// A candidate folder whose docs/tasks is a file is no project either.
+func TestDoneHintTasksFileIsNoProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "tool")
+	dir := filepath.Join(root, "docs", "tasks")
+	scopeTicket(t, dir, "closing", "в работе", "tool-master")
+	scopeTicket(t, dir, "root-open", "открыт", "")
+	if err := os.MkdirAll(filepath.Join(root, "tool", "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "tool", "docs", "tasks"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	o := options{cmd: "done", id: "closing", by: "checker", check: "checked by test", baseRoot: root}
+	if code := runLockedCommand(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("done = %d, stderr %q", code, errout.String())
+	}
+	if !strings.Contains(out.String(), "следующий: root-open ") || errout.Len() != 0 {
+		t.Errorf("output %q, stderr %q", out.String(), errout.String())
+	}
+}
