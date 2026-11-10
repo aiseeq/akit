@@ -759,7 +759,7 @@ var briefLink = regexp.MustCompile("user-word\\s+((?:/|~/)[^\\s'\"`]*(?:\\.jsonl
 // пропадает молча. Образец вроде `user-word <jsonl> '<кусок>'` без .jsonl сюда не попадает.
 var briefLinkLike = regexp.MustCompile("user-word\\s+[^\\s'\"`]*(?:\\.jsonl|…jsonl)")
 
-var userMarker = regexp.MustCompile(`(?i)пользовател[а-яё]*\s*,?\s+\(?\s*(\d{1,2}\.\d{1,2}(?:\.(?:\d{4}|\d{2}))?)`)
+var userMarker = regexp.MustCompile(`(?i)(?:пользовател[а-яё]*\s*,?\s+\(?\s*|;\s*)(\d{1,2}\.\d{1,2}(?:\.(?:\d{4}|\d{2}))?)`)
 
 // markerDate — дата пометки в тексте между пометкой и цитатой: значит, цитата принадлежит другой пометке.
 var markerDate = regexp.MustCompile(`\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b`)
@@ -1093,11 +1093,34 @@ func shellWord(s string, at int) (string, int, bool) {
 
 func extractBriefQuotes(row string, until time.Time, loc *time.Location) []briefWord {
 	var words []briefWord
+	lastEnd := -1 // end of the last quote of a user word in this row
 	for _, marker := range userMarker.FindAllStringSubmatchIndex(row, -1) {
+		// A date right after «;» continues the user's list only when the «;» follows
+		// a user quote directly: another speaker's list and plain dates stay out.
+		if row[marker[0]] == ';' && (lastEnd < 0 || strings.TrimSpace(row[lastEnd:marker[0]]) != "") {
+			continue
+		}
+		lastEnd = -1
 		start, colon, ok := quoteStart(row, marker[1])
+		questionAnswer := false
+		if ok {
+			if answer := answerAfterQuotedQuestion(row, start); answer >= 0 {
+				start, questionAnswer = answer, true
+			}
+		}
 		if !ok {
-			// Дата пометки без цитаты — пересказ: проверяющему нечего сверить, это видно в итоге.
-			words = append(words, briefWord{raw: row[marker[0]:marker[1]], isQuote: true, invalidCause: "no «quote» after a colon right after the marker"})
+			rawEnd := marker[1]
+			if low := strings.Index(row[marker[1]:], "„"); low >= 0 {
+				end := strings.Index(row[marker[1]+low+len("„"):], "“")
+				if end >= 0 {
+					rawEnd = marker[1] + low + len("„") + end + len("“")
+				}
+			}
+			cause := "no «quote» after a colon"
+			if rawEnd > marker[1] {
+				cause = "saw „…“ but expected «…»"
+			}
+			words = append(words, briefWord{raw: row[marker[0]:rawEnd], isQuote: true, invalidCause: cause})
 			continue
 		}
 		zone, zoneCause := markerZone(row[marker[2]:colon], loc)
@@ -1105,8 +1128,7 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 		if cause == "" {
 			cause = zoneCause
 		}
-		markedAt := time.Time{}
-		window := markerWindow
+		markedAt, window := time.Time{}, markerWindow
 		if cause == "" {
 			markedAt, window, cause = markerTimeAndZone(row[marker[1]:colon], day, window)
 		}
@@ -1121,18 +1143,40 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 				word.invalidCause = "empty quote"
 			}
 			words = append(words, word)
+			lastEnd = end
+			if questionAnswer {
+				break
+			}
 			next := strings.Index(row[end:], "«")
 			if next < 0 {
 				break
 			}
 			pos = end + next
-			between := strings.Trim(row[end:pos], " \t\r\n,;.")
-			if between != "" {
+			if strings.Trim(row[end:pos], " \t\r\n,;.") != "" {
 				break
 			}
 		}
 	}
 	return words
+}
+
+// answerAfterQuotedQuestion returns the opening quote of the user's answer when
+// the marker is followed by a quoted question and an answer verb.
+func answerAfterQuotedQuestion(row string, question int) int {
+	end := quoteEnd(row, question)
+	if end < 0 {
+		return -1
+	}
+	rest := strings.TrimLeft(row[end:], " \t")
+	loc := answerVerb.FindStringIndex(rest)
+	if loc == nil {
+		return -1
+	}
+	answer, _, ok := quoteStart(row, len(row)-len(rest)+loc[1])
+	if !ok {
+		return -1
+	}
+	return answer
 }
 
 // quoteStart — начало цитаты пометки: первая «» после пометки, перед ней двоеточие, а между ними ни другой даты, ни
@@ -1152,10 +1196,51 @@ func quoteStart(row string, after int) (int, int, bool) {
 				return open, colon, true
 			}
 		}
+		prefix := strings.TrimSpace(row[after:open])
+		if colon < 0 && strings.Contains(prefix, "вопрос") {
+			if quote, separator, ok := questionQuote(row, open); ok {
+				return quote, separator, true
+			}
+		}
+		// Without a colon, accept a direct quote after the date/time/zone, or the
+		// established short “said «quote»” form.
+		prefix = strings.TrimSpace(strings.TrimPrefix(prefix, "по слову"))
+		clock := markerClock.FindStringIndex(prefix)
+		if colon < 0 && !strings.Contains(prefix, ";") && !strings.Contains(prefix, "«") && (prefix == "" || clock != nil && clock[0] == 0) {
+			tail := ""
+			if clock != nil {
+				tail = strings.TrimSpace(prefix[clock[1]:])
+			}
+			if tail == "" || markerZoneLike(strings.Trim(tail, "()")) {
+				return open, open, true
+			}
+		}
 		search = open + len("«")
 	}
 	return 0, 0, false
 }
+
+// questionQuote distinguishes a quoted question from the answer or citation after it.
+func questionQuote(row string, open int) (int, int, bool) {
+	end := quoteEnd(row, open)
+	if end < 0 {
+		return 0, 0, false
+	}
+	rest := strings.TrimSpace(row[end:])
+	if answerVerb.MatchString(rest) {
+		return open, open, true
+	}
+	if !strings.HasPrefix(rest, ":") {
+		return 0, 0, false
+	}
+	next := strings.Index(rest[1:], "«")
+	if next < 0 {
+		return 0, 0, false
+	}
+	return end + 1 + next, end, true
+}
+
+var answerVerb = regexp.MustCompile(`(?i)^(?:ответил[а]?|сказал[а]?|написал[а]?)\s+`)
 
 // markerColon skips the colon between hour and minute in a marker timestamp.
 func markerColon(row string, after, before int) int {
