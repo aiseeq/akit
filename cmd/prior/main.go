@@ -84,14 +84,24 @@ func parseArgs(args []string) ([]string, error) {
 type query struct {
 	words []*regexp.Regexp
 	any   *regexp.Regexp
-	// phrases — аргументы из трёх слов и больше: каждый ищется одной фразой целиком, и слова темы, отданные
-	// одним аргументом в кавычках, молча не находят ничего.
+	// phrases — аргументы, где фраза из phraseWords слов и больше: каждый ищется одной фразой целиком, и слова
+	// темы, отданные одним аргументом в кавычках, молча не находят ничего.
 	phrases []string
 }
 
-// phraseWords — с какого числа слов аргумент считается фразой, о которой стоит предупредить: «окн[оа] сжатия» из
-// двух слов — обычная форма поиска.
-const phraseWords = 3
+// phraseWords — с какого числа слов аргумент считается фразой, о которой стоит предупредить. Короткие фразы
+// («окн[оа] сжатия», «Demo App Client», «more than one secret») — обычная форма поиска, её и советует подсказка;
+// слова считаются в самой длинной ветке альтернации: 'a b|c d' — две фразы по два слова.
+const phraseWords = 5
+
+// phraseLen — число слов в самой длинной ветке альтернации аргумента.
+func phraseLen(arg string) int {
+	longest := 0
+	for branch := range strings.SplitSeq(arg, "|") {
+		longest = max(longest, len(strings.Fields(branch)))
+	}
+	return longest
+}
 
 func newQuery(words []string) (query, error) {
 	var q query
@@ -101,7 +111,7 @@ func newQuery(words []string) (query, error) {
 			return q, fmt.Errorf("слово %q: %w", w, err)
 		}
 		q.words = append(q.words, re)
-		if len(strings.Fields(w)) >= phraseWords {
+		if phraseLen(w) >= phraseWords {
 			q.phrases = append(q.phrases, w)
 		}
 	}
@@ -180,7 +190,7 @@ func (r *report) print(w io.Writer) {
 func run(q query, home string, w io.Writer) {
 	for _, p := range q.phrases {
 		fmt.Fprintf(w, "prior: «%s» — один аргумент из %d слов, ищется одной фразой целиком; слова и короткие фразы темы — отдельными аргументами, каждый в своих кавычках\n",
-			cut(p), len(strings.Fields(p)))
+			cut(p), phraseLen(p))
 	}
 	s := sources(home)
 	var r report
