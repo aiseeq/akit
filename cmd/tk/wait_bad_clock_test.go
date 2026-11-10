@@ -18,6 +18,7 @@ func TestWaitWarnsOnImpossibleHoursAfterDate(t *testing.T) {
 		{"2026-11-12; 25:00 build done", "date and time that do not exist"},
 		{"31.11 9:00 build done", "date and time that do not exist"},
 		{"build done", "has no time at the start"},
+		{"2026-11-12,09:00 build done", "has no time at the start"},
 	} {
 		var errout strings.Builder
 		o := &options{cmd: "wait", until: tc.until, by: "someone"}
@@ -34,7 +35,7 @@ func TestWaitWarnsOnImpossibleHoursAfterDate(t *testing.T) {
 // stores after dating it agree for every separator after the date.
 func TestDatedWaitKeepsDeadline(t *testing.T) {
 	now := time.Date(2026, 11, 10, 15, 0, 0, 0, time.FixedZone("CET", 3600))
-	for _, wait := range []string{"12.11, 9:00 x", "12.11: 9:00 x", "12.11; 9:00 x", "12.11,9:00 x", "12.11:9:00 x", "12.11; 25:00 x", "12.11,25:00 x", "12.11; текст"} {
+	for _, wait := range []string{"12.11, 9:00 x", "12.11: 9:00 x", "12.11; 9:00 x", "12.11; 25:00 x", "12.11; текст", "12.11; 9:00 UTC x"} {
 		before, okBefore := timearg.Deadline(wait, now)
 		after, okAfter := timearg.Deadline(datedWait(wait, now), now)
 		if okBefore != okAfter || !before.Equal(after) {
