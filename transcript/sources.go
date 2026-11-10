@@ -80,10 +80,9 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			if err != nil {
-				return nil, fmt.Errorf("transcript %s: %w", p, err)
-			}
-			if known && started.After(until) {
+			// Any other read error leaves the start unknown: the source stays, and reading it
+			// reports the file as unreadable without stopping the others.
+			if err == nil && known && started.After(until) {
 				continue
 			}
 		}
