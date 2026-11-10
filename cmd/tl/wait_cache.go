@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	transcriptwaits "github.com/aiseeq/akit/transcript/waits"
 )
 
 const waitCacheMaxAge = 30 * 24 * time.Hour
@@ -24,14 +25,15 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 var afterWaitRead = func(string) {}
 
 // waitCacheVersion — формат записи: 3 добавляет данные для начала вызова по соседнему результату, 4 — последовательные
-// инструменты без команды и вывод только у ошибок, 5 — ключ по коду (waitCacheCode) вместо отпечатка бинаря.
-const waitCacheVersion = 5
+// инструменты без команды и вывод только у ошибок, 5 — ключ по коду вместо отпечатка бинаря, 6 — текст активной сессии.
+const waitCacheVersion = 6
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
 type cachedWaitEvent struct {
 	Role      transcript.Role
 	CallID    string
+	Text      string
 	Time      time.Time
 	Line      int
 	MessageID string
@@ -211,14 +213,17 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
 		if ev.Role == transcript.Cmd {
 			command, bg := waitCommand(ev)
+			if _, poll := waitPollSession(cacheWaitCall(ev, command, bg, nil, false)); poll {
+				events = append(events, cacheWaitCall(ev, command, bg, nil, false))
+				return
+			}
 			if command == "" && ev.MessageID != "" && !ev.Sidechain && isSerialTool(ev.Who) {
 				// Последовательный инструмент без команды (Edit, Write) — предшественник для начала соседа.
-				//nolint:struct-mapping-drops-field // ввод инструмента (Raw) предшественнику не нужен, а текст Write раздул бы кэш
-				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error})
+				events = append(events, cacheWaitCall(ev, "", false, nil, false))
 			}
 			if command != "" {
 				cachedCalls, invalid := parseWaitCalls(command)
-				events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: append([]byte(nil), ev.Raw...), Command: command, BG: bg, Calls: cachedCalls, Invalid: invalid})
+				events = append(events, cacheWaitCall(ev, command, bg, cachedCalls, invalid))
 			}
 		} else if ev.Role == transcript.Out {
 			// Текст вывода нужен только ошибке: по нему узнаётся отказ разрешения; весь вывод раздул бы кэш.
@@ -226,7 +231,11 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 			if ev.Error {
 				raw = append([]byte(nil), ev.Raw...)
 			}
-			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw})
+			text := ""
+			if _, running := transcriptwaits.Running(ev.Text); running {
+				text = ev.Text
+			}
+			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Text: text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw})
 		}
 	})
 	if err != nil {
@@ -238,6 +247,24 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 		c.saveRecord(key, events)
 	}
 	return events, nil
+}
+
+func cacheWaitCall(ev transcript.Event, command string, bg bool, calls []cachedShellCall, invalid bool) cachedWaitEvent {
+	var cached cachedWaitEvent
+	cached.Role = ev.Role
+	cached.CallID = ev.CallID
+	cached.Time = ev.Time
+	cached.Line = ev.Line
+	cached.MessageID = ev.MessageID
+	cached.Who = ev.Who
+	cached.Sidechain = ev.Sidechain
+	cached.Error = ev.Error
+	cached.Raw = append([]byte(nil), ev.Raw...)
+	cached.Command = command
+	cached.BG = bg
+	cached.Calls = calls
+	cached.Invalid = invalid
+	return cached
 }
 
 // saveRecord пишет запись атомарно: временный файл, Sync, переименование — усечённой записи читатель не

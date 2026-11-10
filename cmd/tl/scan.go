@@ -640,7 +640,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		}
 		for i := range events {
 			event := &events[i]
-			if f.inWindow(transcript.Event{Role: event.Role, Time: event.Time, CallID: event.CallID, Line: event.Line,
+			if f.inWindow(transcript.Event{Role: event.Role, Text: event.Text, Time: event.Time, CallID: event.CallID, Line: event.Line,
 				MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw}) {
 				wt.cachedEvent(*event)
 			}
