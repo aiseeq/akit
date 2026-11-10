@@ -29,7 +29,7 @@ tasks:
     env: {GOWORK: "off"}
     run: [glint check .]
 
-# Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок.
+# Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок high (low и medium гейт пропускает, их не пускает tk done).
 gate:
   - sh: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
   - task: test
