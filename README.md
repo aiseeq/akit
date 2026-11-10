@@ -134,7 +134,8 @@ layout fault found (window and culprits in stderr).
 
 Has this come up before, and what do we already have: one search over the decision log, the mechanism
 cards, the nightly review's probes and queues, its reports and the user's replies, before asking the
-user or building a new mechanism. Words are case-insensitive regular expressions, any of them matches.
+user or building a new mechanism. Rules the review removed are found in its archive with the reason and the
+removed text, so they can be brought back. Words are case-insensitive regular expressions, any of them matches.
 Reads the author's setup under `~/.claude`; the nightly review's programs (`inventory` to refresh
 stale cards, `daydigest` to append replies) are called by path in `~/.claude/improve/bin`. Reports show at most 3 matches per day, then fill remaining slots in freshness order.
 

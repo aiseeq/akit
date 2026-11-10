@@ -249,3 +249,38 @@ func TestPhraseArgumentHint(t *testing.T) {
 		}
 	}
 }
+
+func TestRemovedRulesArchive(t *testing.T) {
+	home := t.TempDir()
+	state := filepath.Join(home, ".claude", "improve", "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	archive := "# Снятые правила\n\nВступление со словом zebra не запись.\nПричина: пример zebra.\n\n" +
+		"## rules/a.md:12 — 2026-01-02\nКласс: дубль\nПричина: повторяет правило b\n> Всегда проверять zebra\n> перед коммитом.\n\n" +
+		"## rules/b.md:3 — 2026-01-03\nКласс: устарело\nПричина: инструмент удалён\n> Звать giraffe раз в день.\n"
+	if err := os.WriteFile(filepath.Join(state, "removed-rules.md"), []byte(archive), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	q, err := newQuery([]string{"zebra"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	run(q, home, &out)
+	got := out.String()
+	for _, want := range []string{"== снятые правила", "removed-rules.md:6 rules/a.md:12 — 2026-01-02 [дубль]", "причина: повторяет правило b", "правило: Всегда проверять zebra перед коммитом."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "giraffe") || strings.Contains(got, "Вступление") || strings.Contains(got, "пример zebra") {
+		t.Errorf("unmatched entry or preamble shown:\n%s", got)
+	}
+	// Absent archive: nothing was removed, the section is empty.
+	var empty bytes.Buffer
+	run(q, t.TempDir(), &empty)
+	if !strings.Contains(empty.String(), "пусто:") || !strings.Contains(empty.String(), "снятые правила") || strings.Contains(empty.String(), "== снятые правила") {
+		t.Errorf("absent archive:\n%s", empty.String())
+	}
+}
