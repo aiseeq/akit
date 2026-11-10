@@ -54,6 +54,10 @@
 //   - Context rules run only for texts holding their anchor words
 //     (contextAnchors); a secret name counts where it is used as a name, before
 //     : or =, or as an option.
+//   - A secret name before a structure ({…}, […], (…), a quoted structure) or
+//     before the next secret name takes no value: the names inside get their
+//     own match, so auth: {note: x} leaves x visible. A pwd name with a value
+//     starting with / or ~ is a directory and stays.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
 package secretmask
@@ -263,14 +267,20 @@ func nameBeforeDelimiter(text string, at int) bool {
 	return at < len(text) && (text[at] == ':' || text[at] == '=' || text[at] == ',')
 }
 
+// anchorCommandStart: a command word can start here in some segment of
+// commandSegments, which also starts after ; | and &.
+func anchorCommandStart(text string, start int) bool {
+	return commandLeftBoundary(text, start) || strings.ContainsRune(";|&", rune(text[start-1]))
+}
+
 func anchorEdgeAt(text string, start, end int, edge anchorEdge) bool {
 	switch edge {
 	case edgeNameUse:
 		return nameUsedAt(text, start, end)
 	case edgeCommand:
-		return commandLeftBoundary(text, start) && (end == len(text) || !isAlphaNum(text[end]))
+		return anchorCommandStart(text, start) && (end == len(text) || !isAlphaNum(text[end]))
 	case edgeCommandPrefix:
-		return commandLeftBoundary(text, start)
+		return anchorCommandStart(text, start)
 	default:
 		return true
 	}
@@ -680,13 +690,14 @@ func headerMatches(text string) []contextMatch {
 
 func nameMatches(text string) []contextMatch {
 	var matches []contextMatch
-	coveredUntil := 0
 	for _, ix := range contextNameRE.FindAllStringSubmatchIndex(text, -1) {
-		if ix[0] < coveredUntil || withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
+		if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
 			continue
 		}
-		name := text[ix[2]:ix[3]]
-		kind, ok := secretName(name)
+		// A name inside the value before it still counts: its own value can lie
+		// past that value's end (auth=::X-API-KEY: value). Overlaps are dropped
+		// in maskContext.
+		name, kind, ok := contextSecretName(text, ix[2], ix[3])
 		if !ok {
 			continue
 		}
@@ -700,7 +711,14 @@ func nameMatches(text string) []contextMatch {
 		if !ok {
 			continue
 		}
-		coveredUntil = value.end
+		// A structure or the next name is no value: the names inside it get
+		// their own match.
+		if valueIsStructure(text[value.start:value.end]) {
+			continue
+		}
+		if pwdPath(name, text[value.start:value.end]) {
+			continue
+		}
 		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
 			continue
 		}
@@ -713,6 +731,18 @@ func nameMatches(text string) []contextMatch {
 		}
 	}
 	return matches
+}
+
+// contextSecretName is secretName for the name at text[start:end]. After a
+// written line break the letter of \n can be no part of the name.
+func contextSecretName(text string, start, end int) (string, string, bool) {
+	name := text[start:end]
+	kind, ok := secretName(name)
+	if !ok && start > 0 && text[start-1] == '\\' && len(name) > 1 && strings.ContainsRune("nrt", rune(name[0])) {
+		name = name[1:]
+		kind, ok = secretName(name)
+	}
+	return name, kind, ok
 }
 
 func flagMatches(text string) []contextMatch {
@@ -741,8 +771,11 @@ func flagMatches(text string) []contextMatch {
 		if !ok {
 			continue
 		}
+		if valueIsStructure(text[value.start:value.end]) {
+			continue
+		}
 		coveredUntil = value.end
-		if !assigned && !flagValueAllowed(text[value.start:value.end]) {
+		if !assigned && !flagValueAllowed(text[value.start:value.end]) || pwdPath(name, text[value.start:value.end]) {
 			continue
 		}
 		if valueIsValue(text, value, name, kind, false) {
@@ -1112,6 +1145,32 @@ func flagValueAllowed(value string) bool {
 
 func hasHorizontalSpaceAt(text string, at int) bool {
 	return at < len(text) && (text[at] == ' ' || text[at] == '\t')
+}
+
+// valueIsStructure: what follows a name is an object, an array, a group or the
+// next secret name (auth: {password: x}, auth: password: x), not the value
+// itself. Another word ending in a colon stays a value.
+func valueIsStructure(value string) bool {
+	if value != "" && strings.ContainsRune("{[(", rune(value[0])) && strings.ContainsAny(value, ":=") {
+		return true
+	}
+	name := strings.TrimSuffix(value, ":")
+	if name == value || name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isNameByte(name[i]) {
+			return false
+		}
+	}
+	_, secret := secretName(name)
+	return secret
+}
+
+// pwdPath: a pwd name with a path is the working directory, not a password.
+func pwdPath(name, value string) bool {
+	n := strings.TrimRight(strings.ToLower(name), "0123456789")
+	return strings.HasSuffix(n, "pwd") && value != "" && (value[0] == '/' || value[0] == '~')
 }
 
 func secretName(name string) (string, bool) {
