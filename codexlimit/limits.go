@@ -21,6 +21,9 @@ const WeekMins = 10080
 type Resets struct {
 	Available int               `json:"availableCount"`
 	Credits   []json.RawMessage `json:"credits"`
+	// Known is false when the answer had no rateLimitResetCredits at all, so a
+	// missing report is not read as zero resets.
+	Known bool `json:"-"`
 }
 
 // Limits contains the weekly account limits reported by the app server.
@@ -54,8 +57,8 @@ type rateLimitsResult struct {
 		} `json:"primary"`
 		PlanType string `json:"planType"`
 	} `json:"rateLimits"`
-	AccountID string `json:"accountId"`
-	Resets    Resets `json:"rateLimitResetCredits"`
+	AccountID string  `json:"accountId"`
+	Resets    *Resets `json:"rateLimitResetCredits"`
 }
 
 const initializeRequests = "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"akit\",\"title\":\"akit\",\"version\":\"0\"}}}\n" +
@@ -216,6 +219,11 @@ func parseAnswer(r rateLimitsResult) (Limits, error) {
 	if p.WindowDurationMins != WeekMins {
 		return Limits{}, fmt.Errorf("codexlimit: window is %d minutes, want %d", p.WindowDurationMins, WeekMins)
 	}
+	var resets Resets
+	if r.Resets != nil {
+		resets = *r.Resets
+		resets.Known = true
+	}
 	return Limits{
 		UsedPercent:          p.UsedPercent,
 		WindowMins:           p.WindowDurationMins,
@@ -223,6 +231,6 @@ func parseAnswer(r rateLimitsResult) (Limits, error) {
 		PlanType:             r.RateLimits.PlanType,
 		AccountID:            r.AccountID,
 		OrdinaryUsageAllowed: r.OrdinaryUsageAllowed,
-		Resets:               r.Resets,
+		Resets:               resets,
 	}, nil
 }

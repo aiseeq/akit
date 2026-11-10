@@ -389,3 +389,25 @@ func TestConsumeCancelledContextDoesNotStart(t *testing.T) {
 		t.Fatalf("server was started (pid %d)", cmd.Process.Pid)
 	}
 }
+
+// An answer without rateLimitResetCredits says the resets are unknown; an empty
+// object says they are known and zero.
+func TestReadResetsPresence(t *testing.T) {
+	without := `{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":5,"windowDurationMins":10080,"resetsAt":1794148763}}}}`
+	empty := `{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":5,"windowDurationMins":10080,"resetsAt":1794148763}},"rateLimitResetCredits":{"availableCount":0,"credits":[]}}}`
+	for _, c := range []struct {
+		name, answer string
+		known        bool
+	}{{"without", without, false}, {"empty", empty, true}, {"full", fullAnswer, true}} {
+		got, err := Read(context.Background(), helperCommand(t, "answer", `{"id":1,"result":{}}`+"\n"+c.answer+"\n"))
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got.Resets.Known != c.known {
+			t.Errorf("%s: Resets.Known = %v, want %v", c.name, got.Resets.Known, c.known)
+		}
+		if !c.known && (got.Resets.Available != 0 || got.Resets.Credits != nil) {
+			t.Errorf("%s: unknown resets carry values %+v", c.name, got.Resets)
+		}
+	}
+}
