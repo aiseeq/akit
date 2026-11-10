@@ -28,7 +28,8 @@ Usage:
 
 Each SEARCH/REPLACE block is an independent mutant based on the original file.
 Output: killed (the mutant fails a test), survived (tests pass; skipped ones are
-named), or error (also when every test that ran was skipped, with the reason).
+named, and a survivor whose only passes were parents of skipped subtests says so),
+or error (also when every test that ran was skipped, with the reason).
 Exit: 0 all killed, 1 at least one survived, 2 an error; 130/143/129 on
 SIGINT/SIGTERM/SIGHUP. Build errors are included in the verdict, up to 5 lines.
 The mutated file is restored with its original bytes, mode, and modification time.
@@ -631,18 +632,23 @@ func classify(events []event, stderr string, exit int) verdict {
 	if exit != 0 {
 		return verdictOf(fmt.Sprintf("error: go test exit %d: %s", exit, strings.TrimSpace(stderr)), 2, false)
 	}
-	if s.leafPasses() == 0 && len(s.skipped) > 0 {
+	if len(s.passed) == 0 && len(s.skipped) > 0 {
 		return verdictOf(fmt.Sprintf("error: every test skipped (%s: %s)", s.skipped[0], s.skipReason), 2, false)
 	}
 	text := "survived: ok " + strings.Join(s.packages, " ")
 	if len(s.skipped) > 0 {
-		text += fmt.Sprintf(" (%d skipped: %s)", len(s.skipped), strings.Join(firstN(s.skipped, 3), " "))
+		// A parent passes when its subtests are all skipped; whether its own code checked anything
+		// the events do not tell, so such a survivor says so instead of becoming an error.
+		only := ""
+		if s.leafPasses() == 0 {
+			only = "only parent tests passed, "
+		}
+		text += fmt.Sprintf(" (%s%d skipped: %s)", only, len(s.skipped), strings.Join(firstN(s.skipped, 3), " "))
 	}
 	return verdictOf(text, 1, false)
 }
 
-// leafPasses counts passed tests that ran no subtests: a parent passes when its subtests are all
-// skipped, and that checked nothing.
+// leafPasses counts passed tests that ran no subtests.
 func (s testSummary) leafPasses() int {
 	parents := map[string]bool{}
 	for _, name := range slices.Concat(s.passed, s.skippedKeys) {

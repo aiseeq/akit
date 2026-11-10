@@ -194,11 +194,33 @@ func TestAllSkipped(t *testing.T) {
 	f.unchanged(t)
 }
 
-// A parent whose subtests were all skipped passes, yet checked nothing.
+// A parent whose subtests were all skipped passes; whether it checked anything
+// itself is unknown, so a survivor says that only parents passed.
 func TestAllSubtestsSkipped(t *testing.T) {
 	f := newFixture(t, "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){for _, n := range []string{\"one\", \"two\"} {t.Run(n, func(t *testing.T){t.SkipNow()})}}\n")
 	out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./...")
-	if code != 2 || !strings.Contains(out, "every test skipped (TestAdd/one: no reason printed)") {
+	if code != 1 || !strings.Contains(out, "(only parent tests passed, 2 skipped: TestAdd/one TestAdd/two)") {
+		t.Fatalf("got %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
+// A parent that checks the code itself kills the mutant though its subtests
+// are skipped.
+func TestParentKillsBesideSkippedSubtests(t *testing.T) {
+	f := newFixture(t, "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){if Add(1,2)!=3 {t.Fatal(\"sum\")}; t.Run(\"one\", func(t *testing.T){t.Skip(\"need SAMPLE_VAR\")})}\n")
+	out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./...")
+	if code != 0 || !strings.Contains(out, "killed: FAIL TestAdd (") {
+		t.Fatalf("got %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
+// A skip that prints nothing is named as such.
+func TestSkipWithoutReason(t *testing.T) {
+	f := newFixture(t, "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){t.SkipNow()}\n")
+	out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./...")
+	if code != 2 || !strings.Contains(out, "every test skipped (TestAdd: no reason printed)") {
 		t.Fatalf("got %d %q", code, out)
 	}
 	f.unchanged(t)
