@@ -1884,6 +1884,9 @@ func waiting(s string) string {
 // waitClock — ведущее время без даты: «12:00» в строке ожидания значит день, когда её записали.
 var waitClock = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
 
+// datedBadClock — в начале дата (ДД.ММ или ГГГГ-ММ-ДД) и слово-часы: срока нет только из-за невозможных часов.
+var datedBadClock = regexp.MustCompile(`^\s*(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})[,:]?\s+[0-9]{1,2}:[0-9]{1,2}`)
+
 // datedWait записывает год у ожидания ДД.ММ, чтобы срок не сдвигался после Нового года.
 func datedWait(wait string, now time.Time) string {
 	f := strings.Fields(wait)
@@ -3127,7 +3130,11 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 	if o.cmd == "wait" {
 		o.until = datedWait(o.until, time.Now())
 		if _, ok := timearg.Deadline(o.until, time.Now()); !ok {
-			fmt.Fprintln(errout, "tk: --until has no time at the start: a condition, tk ls --due will not show it")
+			if datedBadClock.MatchString(o.until) {
+				fmt.Fprintln(errout, "tk: --until starts with a date whose time is impossible: no deadline, tk ls --due will not show it")
+			} else {
+				fmt.Fprintln(errout, "tk: --until has no time at the start: a condition, tk ls --due will not show it")
+			}
 		}
 		body = setWaiting(setStatus(body, next), o.until)
 	}

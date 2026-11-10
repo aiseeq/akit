@@ -88,6 +88,8 @@ func (u *run) explicitSuccess(tool, out string) bool {
 		return regexp.MustCompile(`(?m)^tl: \d+ event\(s\)`).MatchString(out)
 	case "wfor":
 		return strings.Contains(out, "wfor: done in")
+	case "tk":
+		return regexp.MustCompile(`(?m)^\S+ noted$`).MatchString(out)
 	}
 	return false
 }

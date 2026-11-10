@@ -568,7 +568,12 @@ func (u *run) toolFault(tool, out string, code int, cmd string, ordinal int) str
 	if code >= 128 && u.singleUtilityCommand(tool, cmd) && tool != "tk" {
 		return "killed"
 	}
-	if code != 0 && ownError && u.singleUtilityCommand(tool, cmd) {
+	if !u.singleUtilityCommand(tool, cmd) {
+		return ""
+	}
+	// Код неизвестен (общий вывод скрипта): строка «утилита: » бывает и сообщением успешного вызова, отказ —
+	// только по явным словам отказа.
+	if code > 0 && ownError || code < 0 && u.explicitRefusal(tool, out) {
 		return "refusal"
 	}
 	return ""
@@ -827,6 +832,18 @@ func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transc
 	}
 	if len(evs) == 0 {
 		return false, nil, nil, nil, false
+	}
+	if !isClaude {
+		res, err := codexCommandResults(path)
+		if err != nil {
+			slog.Error("read codex command results", "path", path, "error", err)
+			u.unreadFiles++
+			if u.firstUnread == "" {
+				u.firstUnread = path
+			}
+			return false, nil, nil, nil, false
+		}
+		evs = attachCommandResults(evs, res)
 	}
 	outs := map[string]transcript.Event{}
 	for i := range evs {

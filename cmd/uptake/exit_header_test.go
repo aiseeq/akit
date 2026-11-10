@@ -12,7 +12,7 @@ import (
 // succeeded, while a real kill keeps its code.
 func TestEventExitCodeFromHeaderOnly(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
-	shown := "--- 02.11.2026 17:00:27 CET abcd:368 out exec\nExit code 128\nfatal: not a git repository\n"
+	shown := "--- 01.01.2026 10:00:00 CET abcd:12 out exec\nExit code 128\nfatal: not a git repository\n"
 	for _, tc := range []struct {
 		name string
 		e    transcript.Event
