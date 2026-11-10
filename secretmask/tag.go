@@ -99,7 +99,10 @@ func (m *masking) keepRendered(text string) string {
 	}
 	return renderedRE.ReplaceAllStringFunc(text, func(marker string) string {
 		m.kept = append(m.kept, marker)
-		return maskMarker + m.ph.kept + strconv.Itoa(len(m.kept)-1) + "]"
+		// The placeholder takes the marker's length, so the rules that look
+		// for a nearby marker see text laid out as Mask sees it.
+		digits := len(marker) - len(maskMarker) - len(m.ph.kept) - len("]")
+		return fmt.Sprintf("%s%s%0*d]", maskMarker, m.ph.kept, digits, len(m.kept)-1)
 	})
 }
 

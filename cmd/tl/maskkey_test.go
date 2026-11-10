@@ -96,17 +96,20 @@ func TestMaskKeyUnavailable(t *testing.T) {
 // Several tl starting at once on a fresh directory get one whole key, and no
 // temporary file is left next to it.
 func TestMaskKeyCreatedOnceUnderRace(t *testing.T) {
-	for round := range 20 {
+	for round := range 50 {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "akit", "mask-key")
-		keys := make([][]byte, 8)
+		keys := make([][]byte, 16)
 		errs := make([]error, len(keys))
+		start := make(chan struct{})
 		var wg sync.WaitGroup
 		for i := range keys {
 			wg.Go(func() {
+				<-start
 				keys[i], errs[i] = loadMaskKey(path)
 			})
 		}
+		close(start)
 		wg.Wait()
 		for i := range keys {
 			if errs[i] != nil || !bytes.Equal(keys[i], keys[0]) || len(keys[i]) != maskKeyLen {

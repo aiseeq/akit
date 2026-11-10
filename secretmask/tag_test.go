@@ -99,6 +99,19 @@ func TestTaggerKeyInKindPlace(t *testing.T) {
 	}
 }
 
+// A drawn marker kept from the input holds its place at its own length, so a
+// value Mask hides next to an unclosed marker stays hidden.
+func TestTaggerKeptMarkerHidesWhatMaskHides(t *testing.T) {
+	tg := testTagger(t)
+	in := "[скрыто:password=hunter2hunter2 [скрыто:sk_live len=29 #0f0f0f]"
+	if got, _ := Mask(in); strings.Contains(got, "hunter2") {
+		t.Fatalf("Mask shows the value: %q", got)
+	}
+	if got, _ := tg.Mask(in); strings.Contains(got, "hunter2") {
+		t.Errorf("Tagger shows the value Mask hides: %q", got)
+	}
+}
+
 // A placeholder written into the input with a number in use takes no value of
 // this call: it stays as written, and a key's tail is not moved onto another
 // key.

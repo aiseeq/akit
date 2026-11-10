@@ -304,8 +304,8 @@ Large transcript reads wait for machine capacity through graft's heavy queue; sm
 threads.
 
 All output, `--raw` included, has secret values masked as `[скрыто:KIND len=N #TAG]`: `N` is the
-hidden value's length in characters and `TAG` a keyed hash of it, so two fragments with the same
-`TAG` are equal across `tl` calls while the value itself is not shown. The key is created on the
+hidden value's length in characters and `TAG` a keyed hash of it: equal values get the same `TAG`
+across `tl` calls, different ones rarely share it (24 bits), and the value itself is not shown. The key is created on the
 first run in `$XDG_STATE_HOME/akit/mask-key` (`~/.local/state/akit/mask-key` when unset); without it
 markers carry the kind only and stderr says why. The mask also hides some names that look like keys,
 such as long `pk_test_…` identifiers: `N` tells whether it may be the name you expect, and the same

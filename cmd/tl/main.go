@@ -70,9 +70,10 @@ diagnostics, …); note — background task notices, compaction, briefs and
 program prompts, Claude Code system records (Who system), codex token counts.
 Masking: all output, --raw too, has secret values replaced with
 [скрыто:KIND len=N #TAG]: N is the hidden value's length in characters, TAG a
-hash of it under a local key ($XDG_STATE_HOME/akit/mask-key, created on first
-run). Equal TAGs mean equal values across tl calls; the value itself is not
-recoverable. The mask also hides some names that look like keys (a long
+hash of it under a local key ($XDG_STATE_HOME/akit/mask-key, by default
+~/.local/state/akit/mask-key, created on first run). Equal values get equal
+TAGs across tl calls; a TAG holds 24 bits, so different values rarely share
+one. The value itself is not recoverable. The mask also hides some names that look like keys (a long
 pk_test_… identifier): N tells whether it may be the name you expect, and the
 same TAG elsewhere shows where the same text recurs. Without the key the
 markers are [скрыто:KIND] and stderr says why.
