@@ -156,7 +156,7 @@ func parseEqualsBlock(path string, body []string) (Edit, error) {
 
 func allBlankLines(lines []string) bool {
 	for _, line := range lines {
-		if line != "" {
+		if strings.TrimSpace(line) != "" {
 			return false
 		}
 	}
@@ -165,10 +165,10 @@ func allBlankLines(lines []string) bool {
 
 func trimBlankLines(lines []string) []string {
 	start, end := 0, len(lines)
-	for start < end && lines[start] == "" {
+	for start < end && strings.TrimSpace(lines[start]) == "" {
 		start++
 	}
-	for start < end && lines[end-1] == "" {
+	for start < end && strings.TrimSpace(lines[end-1]) == "" {
 		end--
 	}
 	return lines[start:end]
@@ -243,6 +243,12 @@ func foreignExample(raw []byte, fixed string) string {
 	if len(lines) > 1 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
+	if path, old, replacement, ok := fileSample(lines); ok {
+		return canonical(path, old, replacement)
+	}
+	if path, old, replacement, ok := unifiedDiffSample(lines); ok {
+		return canonical(path, old, replacement)
+	}
 	path := samplePath(lines, fixed)
 	body := lines
 	if len(body) > 0 {
@@ -250,6 +256,88 @@ func foreignExample(raw []byte, fixed string) string {
 	}
 	old, replacement := sampleText(body)
 	return canonical(path, old, replacement)
+}
+
+func fileSample(lines []string) (path, old, replacement string, ok bool) {
+	if len(lines) == 0 || !strings.HasPrefix(strings.TrimSpace(lines[0]), "FILE ") {
+		return "", "", "", false
+	}
+	path = samplePath(lines, "")
+	oldMarker, newMarker := "OLD", "NEW"
+	if len(lines) > 1 && strings.TrimSpace(lines[1]) == "SEARCH" {
+		oldMarker, newMarker = "SEARCH", "REPLACE"
+	}
+	start := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == oldMarker {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return path, "old text", "", true
+	}
+	separator := start + 1
+	for separator < len(lines) && strings.TrimSpace(lines[separator]) != newMarker {
+		separator++
+	}
+	if separator == len(lines) {
+		return path, strings.Join(trimBlankLines(lines[start+1:]), "\n"), "", true
+	}
+	end := separator + 1
+	for end < len(lines) {
+		mark := strings.TrimSpace(lines[end])
+		if mark == oldMarker || strings.HasPrefix(mark, "FILE ") {
+			break
+		}
+		end++
+	}
+	old = strings.Join(trimBlankLines(lines[start+1:separator]), "\n")
+	replacement = strings.Join(trimBlankLines(lines[separator+1:end]), "\n")
+	if old == "" {
+		old = "old text"
+	}
+	return path, old, replacement, true
+}
+
+func unifiedDiffSample(lines []string) (path, old, replacement string, ok bool) {
+	if len(lines) < 2 || !strings.HasPrefix(strings.TrimSpace(lines[0]), "--- ") || !strings.HasPrefix(strings.TrimSpace(lines[1]), "+++ ") {
+		return "", "", "", false
+	}
+	newPath := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[1]), "+++ "))
+	path = strings.TrimPrefix(newPath, "b/")
+	var oldLines, newLines []string
+	inHunk := false
+	for _, line := range lines[2:] {
+		if strings.HasPrefix(line, "@@") {
+			if inHunk {
+				break
+			}
+			inHunk = true
+			continue
+		}
+		if !inHunk || line == "" {
+			continue
+		}
+		switch line[0] {
+		case ' ':
+			oldLines = append(oldLines, line[1:])
+			newLines = append(newLines, line[1:])
+		case '-':
+			oldLines = append(oldLines, line[1:])
+		case '+':
+			newLines = append(newLines, line[1:])
+		}
+	}
+	if !inHunk {
+		return path, "old text", "", true
+	}
+	old = strings.Join(oldLines, "\n")
+	replacement = strings.Join(newLines, "\n")
+	if old == "" {
+		old = "old text"
+	}
+	return path, old, replacement, true
 }
 
 func samplePath(lines []string, fixed string) string {
