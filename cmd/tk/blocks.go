@@ -258,7 +258,7 @@ func attachBlocks(t task, o options, out, errout io.Writer, targets []string) in
 			return fail(errout, err)
 		}
 		targetTask, err := mutateTask(target.dir, target.id, func(current task) (string, error) {
-			if current.status == "готово" || current.status == "отклонён" {
+			if closedStatus(current.status) {
 				return "", fmt.Errorf("target %s is closed", target.id)
 			}
 			body := current.body
@@ -308,7 +308,7 @@ func validateBlockAttachments(t task, o options, targets []string, errout io.Wri
 		if err != nil {
 			return nil, fail(errout, err)
 		}
-		if target.status == "готово" || target.status == "отклонён" {
+		if closedStatus(target.status) {
 			return nil, fail(errout, fmt.Errorf("target %s is closed", raw))
 		}
 		if sameTicket(taskProject(t.path), t.slug, target.root, target.id) {
@@ -524,7 +524,7 @@ func propagateLink(sourcePath string, source task, ref string, o options, out, e
 		fmt.Fprintf(errout, "tk: warning: missing blocking link %s from %s\n", ref, source.slug)
 		return "", os.ErrNotExist
 	}
-	if isArchivedTask(neighbor.path) || neighbor.status == "готово" || neighbor.status == "отклонён" {
+	if isArchivedTask(neighbor.path) || closedStatus(neighbor.status) {
 		release()
 		return "", nil
 	}
@@ -652,36 +652,48 @@ func removeBlocks(t task, o options, errout io.Writer, refs []string) int {
 	return 0
 }
 
+// closedStatus: a ticket in this status blocks nothing and takes no new links.
+func closedStatus(s string) bool { return s == "готово" || s == "отклонён" }
+
 func blockMark(t task, errout io.Writer) string {
 	project := taskProject(t.path)
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
-		dir, path, err := linkedPath(project, ref)
-		if err == nil {
-			if isArchivedTask(path) {
-				continue
+		if mark := refBlockMark(project, ref, errout); mark != "" {
+			return mark
+		}
+	}
+	return ""
+}
+
+// refBlockMark is the mark of one blocking link when it still blocks: the ticket
+// is open and not archived, or it went to an external tracker; empty otherwise.
+func refBlockMark(project, ref string, errout io.Writer) string {
+	dir, path, err := linkedPath(project, ref)
+	if err == nil {
+		if isArchivedTask(path) {
+			return ""
+		}
+		if b, e := os.ReadFile(path); e == nil {
+			st, statusErr := status(string(b))
+			if statusErr != nil {
+				fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, statusErr)
+				return ""
 			}
-			if b, e := os.ReadFile(path); e == nil {
-				st, statusErr := status(string(b))
-				if statusErr != nil {
-					fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, statusErr)
-					continue
-				}
-				if st != "готово" && st != "отклонён" {
-					return " заблокирован: " + ref
-				}
-			} else if !errors.Is(e, os.ErrNotExist) {
-				fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, e)
+			if !closedStatus(st) {
+				return " заблокирован: " + ref
 			}
-			continue
+		} else if !errors.Is(e, os.ErrNotExist) {
+			fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, e)
 		}
-		rows, ledgerErr := readTransferLedger(dir)
-		if ledgerErr != nil {
-			fmt.Fprintf(errout, "tk: warning: cannot read transfer ledger for %s: %v\n", ref, ledgerErr)
-			continue
-		}
-		if row, ok := transferredRecord(rows, filepath.Base(ref)); ok {
-			return " заблокирован: " + row.Key + " " + row.URL
-		}
+		return ""
+	}
+	rows, ledgerErr := readTransferLedger(dir)
+	if ledgerErr != nil {
+		fmt.Fprintf(errout, "tk: warning: cannot read transfer ledger for %s: %v\n", ref, ledgerErr)
+		return ""
+	}
+	if row, ok := transferredRecord(rows, filepath.Base(ref)); ok {
+		return " заблокирован: " + row.Key + " " + row.URL
 	}
 	return ""
 }
@@ -806,7 +818,7 @@ func validatePriorityFloor(t task, o options, errout io.Writer) int {
 			fmt.Fprintf(errout, "tk: cannot read blocking ticket %s: %v\n", ref, err)
 			return exitUsage
 		}
-		if isArchivedTask(target.path) || target.status == "готово" || target.status == "отклонён" {
+		if isArchivedTask(target.path) || closedStatus(target.status) {
 			continue
 		}
 		if blockPrioRank(o.prio) > blockPrioRank(target.prio) {

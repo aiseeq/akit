@@ -1172,6 +1172,23 @@ func TestLintBadPlan(t *testing.T) {
 	}
 }
 
+func TestPrepareActorRequiresSessionOrExplicitActor(t *testing.T) {
+	previous := session
+	t.Cleanup(func() { session = previous })
+	t.Setenv("USER", "runner")
+	session = func() string { return "" }
+	o := options{cmd: "new"}
+	var errout bytes.Buffer
+	if code := prepareActor(&o, &errout); code != exitUsage || !strings.Contains(errout.String(), "--by") {
+		t.Fatalf("actor=%q code=%d stderr=%q", o.by, code, errout.String())
+	}
+	session = func() string { return "agent-session" }
+	o = options{cmd: "next"}
+	if code := prepareActor(&o, &bytes.Buffer{}); code != 0 || o.by != "agent-session" {
+		t.Fatalf("actor=%q code=%d, want agent-session", o.by, code)
+	}
+}
+
 func TestDoneSessionAndEmptyAcceptance(t *testing.T) {
 	oldSession := session
 	session = func() string { return "checker-session" }

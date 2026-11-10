@@ -49,7 +49,7 @@ func transferTask(root, dir string, o options, out, errout io.Writer) int {
 
 func transferFoundTask(root string, t task, o options, out, errout io.Writer) int {
 	dir := filepath.Dir(t.path)
-	if t.status == "готово" || t.status == "отклонён" || isJournal(t) {
+	if closedStatus(t.status) || isJournal(t) {
 		return transferError(errout, t.path, "ticket status or kind does not allow transfer")
 	}
 	project := o.mainRoot
