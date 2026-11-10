@@ -1299,7 +1299,7 @@ func valueVisibleFor(name, value string) bool {
 		return isPlainPath(value)
 	}
 	n := strings.TrimRight(strings.ToLower(name), "0123456789")
-	return authName(n) && (isPlainPath(value) || ordinaryCamelWord(value) || isPlainWord(value))
+	return authName(n) && (isPlainPath(value) || ordinaryCamelWord(value) || ordinaryAuthWord(value))
 }
 
 // isPlainPath: /a/b, ~/a or ./a, every part a plain word: /Bx4Tq9Wz is no path.
@@ -1321,10 +1321,18 @@ func isPlainPath(value string) bool {
 	return true
 }
 
-// isPlainPathPart: a path part is a plain word or a CamelCase name (myProject);
-// a base64-shaped part (dXNlcmFkbWlu) is not.
+// isPlainPathPart accepts ordinary components and CamelCase file stems with a
+// lowercase extension, such as LoginKeychain.db or ProdKeys.yaml.
 func isPlainPathPart(value string) bool {
-	return isPlainWord(value) || ordinaryCamelWord(value)
+	if ordinaryAuthWord(value) || ordinaryCamelWord(value) {
+		return true
+	}
+	dot := strings.LastIndexByte(value, '.')
+	if dot <= 0 || dot == len(value)-1 || len(value)-dot > 11 {
+		return false
+	}
+	extension, stem := value[dot+1:], value[:dot]
+	return allLower(extension) && isPlainWord(extension) && (isPlainWord(stem) || ordinaryCamelWord(stem))
 }
 
 // ordinaryCamelWord accepts letter-only names made of pronounceable words and
@@ -1333,14 +1341,35 @@ func isPlainPathPart(value string) bool {
 // (HTTPClient). Letter-only base64 splits into one- and two-letter pieces, long
 // capital runs or pieces without vowels (YWJjZGVm: YW Jj ZG Vm) and fails.
 func ordinaryCamelWord(value string) bool {
-	if len(value) < 2 {
+	if len(value) < 2 || !lettersOnly(value) {
 		return false
 	}
+	parts := camelParts(value)
+	if !validCamelParts(parts) {
+		return false
+	}
+	if singleLetterInitialism(parts) {
+		return true
+	}
+	acronyms := 0
+	for i, part := range parts {
+		if !ordinaryCamelPart(part, i, &acronyms) {
+			return false
+		}
+	}
+	return true
+}
+
+func lettersOnly(value string) bool {
 	for i := range len(value) {
 		if !isLetter(value[i]) {
 			return false
 		}
 	}
+	return value != ""
+}
+
+func camelParts(value string) []string {
 	var parts []string
 	start := 0
 	for i := 1; i < len(value); i++ {
@@ -1352,37 +1381,55 @@ func ordinaryCamelWord(value string) bool {
 			start = i - 1
 		}
 	}
-	parts = append(parts, value[start:])
-	if len(parts) < 2 {
-		return false
-	}
-	for i, part := range parts {
-		switch {
-		case len(part) < 2:
-			return false
-		case allUpper(part) && len(part) <= 5:
-		case (i == 0 && allLower(part) || (i == 0 || len(part) >= 3) && isUpper(part[0]) && allLower(part[1:])) && pronounceable(part):
-		default:
-			return false
-		}
-	}
-	return true
+	return append(parts, value[start:])
 }
 
-// pronounceable: a word part of a name carries a vowel and no five consonants in a row (Profile, Postgre, Sync);
-// base64 pieces such as Vm or Bxwdhqk do not.
+func validCamelParts(parts []string) bool {
+	if len(parts) < 2 || len(parts) > 3 {
+		return false
+	}
+	return len(parts) != 3 || allLower(parts[0]) && capitalizedPart(parts[1]) && capitalizedPart(parts[2])
+}
+
+func singleLetterInitialism(parts []string) bool {
+	return len(parts) == 2 && len(parts[0]) == 1 && isUpper(parts[0][0]) && len(parts[1]) >= 4 && capitalizedPart(parts[1]) && pronounceable(parts[1])
+}
+
+func ordinaryCamelPart(part string, index int, acronyms *int) bool {
+	if index == 0 && allLower(part) {
+		return len(part) >= 2 && len(part) <= 8 && (pronounceable(part) || len(part) == 3 && !strings.ContainsAny(part, "aeiouy"))
+	}
+	if allUpper(part) {
+		*acronyms++
+		return len(part) >= 3 && len(part) <= 5 && *acronyms == 1
+	}
+	minLength := 3
+	if index == 0 {
+		minLength = 2
+	}
+	return len(part) >= minLength && capitalizedPart(part) && pronounceable(part)
+}
+
+func capitalizedPart(part string) bool {
+	return len(part) >= 2 && isUpper(part[0]) && allLower(part[1:])
+}
+
+// pronounceable requires vowels and limits consonant clusters; this admits
+// natural spellings such as Postgre and Script while rejecting random pieces.
 func pronounceable(part string) bool {
-	vowel, consonants := false, 0
+	vowels, consonants := 0, 0
 	for _, c := range strings.ToLower(part) {
 		if strings.ContainsRune("aeiouy", c) {
-			vowel, consonants = true, 0
+			vowels++
+			consonants = 0
 			continue
 		}
-		if consonants++; consonants >= 5 {
+		consonants++
+		if consonants >= 5 {
 			return false
 		}
 	}
-	return vowel
+	return vowels*5 >= len(part) || len(part) <= 6 && vowels > 0
 }
 
 func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
@@ -1415,9 +1462,25 @@ func isPlainWord(value string) bool {
 	return ok && !(upper && lower && digit) && plainWordLength(value)
 }
 
+func ordinaryAuthWord(value string) bool {
+	upper, lower, _, ok := wordClasses(value)
+	if !ok || !isPlainWord(value) {
+		return false
+	}
+	if upper && lower && !(isUpper(value[0]) && allLower(value[1:])) {
+		return false
+	}
+	for _, run := range strings.FieldsFunc(strings.ToLower(value), func(r rune) bool { return !(r >= 'a' && r <= 'z') }) {
+		if len(run) >= 8 && !pronounceable(run) {
+			return false
+		}
+	}
+	return true
+}
+
 func plainWordLength(value string) bool {
 	for _, run := range strings.FieldsFunc(value, func(r rune) bool { return r == '-' || r == '_' || r == '.' }) {
-		if len(run) >= 16 && (!longVowelRichWord(run) || isHex(run)) || len(run) >= 12 && strings.ContainsAny(run, "0123456789") && !onlyDigits(run) {
+		if len(run) >= 16 && (!longVowelRichWord(run) || isHex(run)) || len(run) >= 8 && strings.ContainsAny(run, "0123456789") && !onlyDigits(run) {
 			return false
 		}
 	}
@@ -1433,10 +1496,10 @@ func isHex(value string) bool {
 	return value != ""
 }
 
-// longVowelRichWord treats long lowercase alphabetic runs with at least 40%
-// English vowels as ordinary words instead of random-looking token bodies.
+// longVowelRichWord treats long lowercase alphabetic runs with at least 50%
+// English vowels and ordinary consonant sequences as words.
 func longVowelRichWord(value string) bool {
-	vowels := 0
+	vowels, consonants, vowelRun := 0, 0, 0
 	for i := range len(value) {
 		c := value[i]
 		if !isLower(c) {
@@ -1444,9 +1507,20 @@ func longVowelRichWord(value string) bool {
 		}
 		if strings.ContainsRune("aeiou", rune(c)) {
 			vowels++
+			vowelRun++
+			consonants = 0
+			if vowelRun >= 3 {
+				return false
+			}
+		} else {
+			vowelRun = 0
+			consonants++
+			if consonants >= 3 {
+				return false
+			}
 		}
 	}
-	return vowels*5 >= len(value)*2
+	return vowels*2 >= len(value)
 }
 
 // wordClasses reports the character classes of a word; ok is false for an empty

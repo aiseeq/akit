@@ -232,6 +232,9 @@ func TestMaskAuthOrdinaryWordFormsStayVisible(t *testing.T) {
 		"credentials: nodeProfile",
 		"auth: HTTPClient",
 		"credentials: /srv/tools/myProject/creds.json",
+		"credentials: /srv/config/AccountFile.yaml",
+		"credentials: /srv/config/AccountFile.yaml",
+		"credentials: /srv/DataPipeline/serviceAccount.json",
 		"pwd: /home/u/myProject",
 		"auth: internationalization",
 		"auth: PostgreSQL",
@@ -249,6 +252,37 @@ func TestMaskAuthOrdinaryWordFormsStayVisible(t *testing.T) {
 	}
 }
 
+func TestMaskAuthClassifierBoundaries(t *testing.T) {
+	for _, word := range []string{"CedarMaple", "nodeProfile", "HTTPClient", "PostgreSQL", "JavaScript"} {
+		if !ordinaryCamelWord(word) {
+			t.Errorf("ordinary CamelCase word rejected: %q", word)
+		}
+	}
+	for _, value := range []string{"aProfile", "fooBcdfProfile", "gcpAlphaBetaGamma", "CedarMapleHill", "ABCDEFProfile", "dXNlcmFkbWlu"} {
+		if ordinaryCamelWord(value) {
+			t.Errorf("token-shaped CamelCase value accepted: %q", value)
+		}
+	}
+	acronyms := 0
+	if !ordinaryCamelPart("HTTP", 0, &acronyms) || ordinaryCamelPart("API", 1, &acronyms) {
+		t.Error("multiple abbreviations accepted in one name")
+	}
+	if !ordinaryCamelWord("OAuth") || !ordinaryCamelWord("JavaScript") {
+		t.Error("single-letter initialism or CamelCase word classified incorrectly")
+	}
+	if !longVowelRichWord("internationalization") {
+		t.Error("long vowel-rich word rejected")
+	}
+	for _, value := range []string{"qwhxkzjvplmbnrty", "abcedfighojkulma", "abcdefigohujakio", "aeibocudafegihoj", "aeiouaeiouaeiouae"} {
+		if longVowelRichWord(value) {
+			t.Errorf("random-looking lowercase value accepted: %q", value)
+		}
+	}
+	if !isPlainPathPart("AccountFile.yaml") {
+		t.Error("CamelCase filename with a lowercase extension rejected")
+	}
+}
+
 func TestMaskAuthTokenLikeValuesStayHidden(t *testing.T) {
 	for _, input := range []string{
 		"auth: aB3xY9q",
@@ -256,6 +290,13 @@ func TestMaskAuthTokenLikeValuesStayHidden(t *testing.T) {
 		"auth: dXNlcmFkbWlu",
 		`{"auth":"dXNlcmFkbWlu"}`,
 		"auth: qwhxkzjvplmbnrty",
+		"auth: abcedfighojkulma",
+		"auth: aeiobcdefighijka",
+		"auth: aeiouaeiouaeiouae",
+		"auth: aProfile",
+		"auth: fooBcdfghProfile",
+		"auth: gcpAlphaBetaGamma",
+		"auth: ABCDEFProfile",
 		"auth: a1b2c3d4e5f6",
 		"auth: kQzXwPvRtYmN",
 		"auth: abcDef123456",
