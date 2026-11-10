@@ -1100,8 +1100,12 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 		if row[marker[0]] == ';' && (lastEnd < 0 || strings.TrimSpace(row[lastEnd:marker[0]]) != "") {
 			continue
 		}
+		continued := row[marker[0]] == ';'
 		lastEnd = -1
-		start, colon, ok := quoteStart(row, marker[1])
+		start, colon, ok := quoteStart(row, marker[1], continued || bareMarkerWord(row[marker[0]:marker[2]]))
+		if continued && (!ok || !continuationProse(row[marker[1]:colon])) {
+			continue // a date in the list without a quote, or another speaker's word
+		}
 		questionAnswer := false
 		if ok {
 			if answer := answerAfterQuotedQuestion(row, start); answer >= 0 {
@@ -1109,18 +1113,7 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 			}
 		}
 		if !ok {
-			rawEnd := marker[1]
-			if low := strings.Index(row[marker[1]:], "„"); low >= 0 {
-				end := strings.Index(row[marker[1]+low+len("„"):], "“")
-				if end >= 0 {
-					rawEnd = marker[1] + low + len("„") + end + len("“")
-				}
-			}
-			cause := "no «quote» after a colon"
-			if rawEnd > marker[1] {
-				cause = "saw „…“ but expected «…»"
-			}
-			words = append(words, briefWord{raw: row[marker[0]:rawEnd], isQuote: true, invalidCause: cause})
+			words = append(words, unquotedMarker(row, marker[0], marker[1]))
 			continue
 		}
 		zone, zoneCause := markerZone(row[marker[2]:colon], loc)
@@ -1145,7 +1138,8 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 			words = append(words, word)
 			lastEnd = end
 			if questionAnswer {
-				break
+				pos = nextAnswer(row, end)
+				continue
 			}
 			next := strings.Index(row[end:], "«")
 			if next < 0 {
@@ -1160,6 +1154,26 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 	return words
 }
 
+// unquotedMarker: a user marker without a «quote» — a retelling the checker cannot
+// compare; „…“ in the same sentence are named, as the likely intended quote.
+func unquotedMarker(row string, start, after int) briefWord {
+	rawEnd := after
+	sentence := row[after:]
+	if stop := sentenceEnd.FindStringIndex(sentence); stop != nil {
+		sentence = sentence[:stop[0]]
+	}
+	if low := strings.Index(sentence, "„"); low >= 0 {
+		if end := strings.Index(sentence[low+len("„"):], "“"); end >= 0 {
+			rawEnd = after + low + len("„") + end + len("“")
+		}
+	}
+	cause := "no «quote» after a colon"
+	if rawEnd > after {
+		cause = "saw „…“ but expected «…»"
+	}
+	return briefWord{raw: row[start:rawEnd], isQuote: true, invalidCause: cause}
+}
+
 // answerAfterQuotedQuestion returns the opening quote of the user's answer when
 // the marker is followed by a quoted question and an answer verb.
 func answerAfterQuotedQuestion(row string, question int) int {
@@ -1172,7 +1186,7 @@ func answerAfterQuotedQuestion(row string, question int) int {
 	if loc == nil {
 		return -1
 	}
-	answer, _, ok := quoteStart(row, len(row)-len(rest)+loc[1])
+	answer, _, ok := quoteStart(row, len(row)-len(rest)+loc[1], true)
 	if !ok {
 		return -1
 	}
@@ -1182,7 +1196,7 @@ func answerAfterQuotedQuestion(row string, question int) int {
 // quoteStart — начало цитаты пометки: первая «» после пометки, перед ней двоеточие, а между ними ни другой даты, ни
 // «;» — иначе цитата принадлежит другому («пользователь 31.10 просил; лид 31.10: «…»»). Пояс, время и вставка в
 // скобках до двоеточия допустимы.
-func quoteStart(row string, after int) (int, int, bool) {
+func quoteStart(row string, after int, bare bool) (int, int, bool) {
 	for search := after; search < len(row); {
 		rel := strings.Index(row[search:], "«")
 		if rel < 0 {
@@ -1195,6 +1209,9 @@ func quoteStart(row string, after int) (int, int, bool) {
 			if !strings.Contains(between, ";") && !markerDate.MatchString(between) {
 				return open, colon, true
 			}
+		}
+		if !bare {
+			return 0, 0, false
 		}
 		prefix := strings.TrimSpace(row[after:open])
 		if colon < 0 && strings.Contains(prefix, "вопрос") {
@@ -1226,7 +1243,7 @@ func questionQuote(row string, open int) (int, int, bool) {
 	if end < 0 {
 		return 0, 0, false
 	}
-	rest := strings.TrimSpace(row[end:])
+	rest := strings.TrimLeft(row[end:], " \t\r\n")
 	if answerVerb.MatchString(rest) {
 		return open, open, true
 	}
@@ -1237,8 +1254,61 @@ func questionQuote(row string, open int) (int, int, bool) {
 	if next < 0 {
 		return 0, 0, false
 	}
-	return end + 1 + next, end, true
+	// The marker's own text ends at the question: a clock inside it is not the marker time.
+	return len(row) - len(rest) + 1 + next, open, true
 }
+
+// bareMarkerWord: only «пользователь» and «пользователя» («по слову пользователя»)
+// start a marker without a colon; «пользователю 09.11 «x»» names an addressee.
+func bareMarkerWord(word string) bool {
+	w := strings.ToLower(strings.TrimSpace(strings.Fields(word + " ")[0]))
+	return w == "пользователь" || w == "пользователя"
+}
+
+// continuationProse: between a continuation date and its quote only a clock, a
+// zone or prose opened by a preposition («05.11 11:23 о ночи»), not a speaker.
+func continuationProse(text string) bool {
+	text = strings.TrimSpace(text)
+	if clock := markerClock.FindStringIndex(text); clock != nil && clock[0] == 0 {
+		text = strings.TrimSpace(text[clock[1]:])
+	}
+	if text == "" || markerZoneLike(strings.Trim(text, "()")) {
+		return true
+	}
+	switch strings.ToLower(strings.Fields(text)[0]) {
+	case "о", "об", "обо", "про", "на", "в", "во", "по", "после", "до", "к":
+		return true
+	}
+	return false
+}
+
+// nextAnswer: the next «на вопрос «Q» ответил «A»» in the same sentence after
+// end gives the opening quote of A, else -1.
+func nextAnswer(row string, end int) int {
+	sentence := row[end:]
+	if stop := sentenceEnd.FindStringIndex(sentence); stop != nil {
+		sentence = sentence[:stop[0]]
+	}
+	rel := strings.Index(sentence, "вопрос")
+	if rel < 0 {
+		return -1
+	}
+	open := strings.Index(sentence[rel:], "«")
+	if open < 0 {
+		return -1
+	}
+	question := end + rel + open
+	if answer := answerAfterQuotedQuestion(row, question); answer >= 0 {
+		return answer
+	}
+	if answer, _, ok := questionQuote(row, question); ok && answer != question {
+		return answer
+	}
+	return -1
+}
+
+// sentenceEnd: the end of a sentence in a brief row.
+var sentenceEnd = regexp.MustCompile(`[.!?]\s+\p{Lu}`)
 
 var answerVerb = regexp.MustCompile(`(?i)^(?:ответил[а]?|сказал[а]?|написал[а]?)\s+`)
 
