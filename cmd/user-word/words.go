@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 
 	"sort"
 	"strconv"
@@ -607,7 +608,7 @@ func precedingAgent(lines []line, at int, question string) (int, bool) {
 		if nearest < 0 {
 			nearest = i
 		}
-		if question == "" || hasFragment(lines[i].text, question) {
+		if question == "" || hasFragment(lines[i].text, briefBracketedOmission.ReplaceAllString(question, "…")) {
 			return i, true
 		}
 	}
@@ -631,11 +632,20 @@ func showAgentMessage(w io.Writer, l line, loc *time.Location, question string) 
 		showEarlierQuestions(w, text[:start])
 	}
 	fmt.Fprintf(w, "%s\n", string(text[start:end]))
+	if end < len(text) {
+		showLaterQuestions(w, text[end:])
+	}
 }
 
 func questionExcerpt(text []rune, question string) (int, int) {
 	folded, positions := foldedRunesWithPositions(string(text))
-	needle := fold(question)
+	needle := ""
+	for part := range strings.SplitSeq(fold(briefBracketedOmission.ReplaceAllString(question, "…")), "…") {
+		if part = strings.TrimSpace(part); part != "" {
+			needle = part
+			break
+		}
+	}
 	at := strings.Index(folded, needle)
 	if at < 0 || needle == "" {
 		return max(len(text)-agentTail, 0), len(text)
@@ -677,11 +687,22 @@ func foldedRunesWithPositions(text string) (string, []int) {
 }
 
 func showEarlierQuestions(w io.Writer, text []rune) {
-	var questions []string
+	showMessageQuestions(w, text, false, "--- questions earlier in the same message:")
+}
+
+func showLaterQuestions(w io.Writer, text []rune) {
+	showMessageQuestions(w, text, true, "--- questions later in the same message:")
+}
+
+func showMessageQuestions(w io.Writer, text []rune, after bool, header string) {
 	rows := strings.Split(string(text), "\n")
-	if len(rows) > 1 {
+	if !after && len(rows) > 1 {
 		rows = rows[:len(rows)-1] // The excerpt may begin in the middle of a line.
 	}
+	if after && len(rows) > 1 {
+		rows = rows[1:] // The excerpt may end in the middle of a line.
+	}
+	var questions []string
 	for _, row := range rows {
 		row = strings.TrimSpace(row)
 		if strings.HasSuffix(row, "?") {
@@ -698,7 +719,7 @@ func showEarlierQuestions(w io.Writer, text []rune) {
 	if len(questions) == 0 {
 		return
 	}
-	fmt.Fprintln(w, "--- questions earlier in the same message:")
+	fmt.Fprintln(w, header)
 	for _, question := range questions {
 		fmt.Fprintln(w, question)
 	}
@@ -1056,7 +1077,21 @@ func reportBriefWords(words []briefWord, dayHits map[string][]hit, recordDays ma
 
 func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteContexts map[string]briefQuoteContext, until time.Time) ([]line, error) {
 	if word.question != "" {
-		return contextLines(h.path, contexts)
+		if h.context == nil {
+			return nil, fmt.Errorf("missing context for quoted question")
+		}
+		if contextHasQuestion(h.context.lines, h.line, word.question) {
+			return h.context.lines, nil
+		}
+		agents, err := precedingAgentMessages(h.path, h.line)
+		if err != nil {
+			return nil, err
+		}
+		at := findLine(h.context.lines, h.line)
+		if at < 0 || len(agents) == 0 {
+			return h.context.lines, nil
+		}
+		return append(agents, h.context.lines[at:]...), nil
 	}
 	if word.isQuote {
 		if h.context != nil {
@@ -1074,6 +1109,129 @@ func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteC
 		return lines, nil
 	}
 	return contextLines(h.path, contexts)
+}
+
+func contextHasQuestion(lines []line, target line, question string) bool {
+	at := findLine(lines, target)
+	if at < 0 {
+		return false
+	}
+	for i := at - 1; i >= 0 && !lines[i].user; i-- {
+		if lines[i].warning == "" && hasFragment(lines[i].text, briefBracketedOmission.ReplaceAllString(question, "…")) {
+			return true
+		}
+	}
+	return false
+}
+
+func precedingAgentMessages(path string, target line) ([]line, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open transcript context %s: %w", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat transcript context %s: %w", path, err)
+	}
+	ordered, samples, err := transcriptChronological(f, info.Size())
+	if err != nil || !ordered {
+		return nil, err
+	}
+	end, err := transcriptTargetOffset(f, info.Size(), target, samples)
+	if err != nil {
+		return nil, fmt.Errorf("locate transcript context: %w", err)
+	}
+	var agents []line
+	parser := transcript.NewParser()
+	for end > 0 {
+		start, raw, err := previousTranscriptRecord(f, end)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) == 0 {
+			break
+		}
+		events, parseErr := parser.Parse(raw)
+		if parseErr == nil {
+			foundUser := false
+			for i := range events {
+				ev := &events[i]
+				if ev.Role == transcript.User || ev.Role == transcript.Ask {
+					foundUser = true
+					break
+				}
+				if ev.Role == transcript.Agent {
+					agents = append(agents, line{no: ev.Line, t: ev.Time, text: ev.Text})
+				}
+			}
+			if foundUser {
+				break
+			}
+		}
+		end = start
+	}
+	slices.Reverse(agents)
+	return agents, nil
+}
+
+func transcriptTargetOffset(f *os.File, size int64, target line, samples []transcriptSample) (int64, error) {
+	offset, err := transcriptOffset(f, size, target.t, samples)
+	if err != nil {
+		return 0, err
+	}
+	parser := transcript.NewParser()
+	for offset < size {
+		pos, stamp, end, err := transcriptRecordAt(f, offset, size)
+		if err != nil || pos >= size {
+			return offset, err
+		}
+		if stamp.After(target.t) {
+			break
+		}
+		raw := make([]byte, end-pos)
+		if _, err := f.ReadAt(raw, pos); err != nil && !errors.Is(err, io.EOF) {
+			return 0, fmt.Errorf("read target transcript record: %w", err)
+		}
+		events, parseErr := parser.Parse(bytes.TrimSuffix(raw, []byte{'\n'}))
+		if parseErr == nil {
+			for i := range events {
+				ev := &events[i]
+				if (ev.Role == transcript.User || ev.Role == transcript.Ask) && ev.Time.Equal(target.t) && (ev.Line == target.no || ev.Text == target.text) {
+					return pos, nil
+				}
+			}
+		}
+		offset = end
+	}
+	return offset, nil
+}
+
+func previousTranscriptRecord(f *os.File, end int64) (int64, []byte, error) {
+	if end <= 0 {
+		return 0, nil, nil
+	}
+	pos := end - 1
+	var chunk [64 << 10]byte
+	start := pos
+	for start > 0 {
+		blockStart := max(int64(0), start-int64(len(chunk)))
+		n, err := f.ReadAt(chunk[:start-blockStart], blockStart)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, nil, fmt.Errorf("read preceding transcript record: %w", err)
+		}
+		if i := bytes.LastIndexByte(chunk[:n], '\n'); i >= 0 {
+			start = blockStart + int64(i+1)
+			break
+		}
+		start = blockStart
+	}
+	raw := make([]byte, end-start)
+	if _, err := f.ReadAt(raw, start); err != nil && !errors.Is(err, io.EOF) {
+		return 0, nil, fmt.Errorf("read preceding transcript record: %w", err)
+	}
+	raw = bytes.TrimSuffix(raw, []byte{'\n'})
+	return start, raw, nil
 }
 
 // briefAskAnswer — ответ человека в окне вопроса: ключ "answers" внутри toolUseResult. Тот же ключ есть
@@ -1238,13 +1396,14 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 		if cause == "" {
 			markedAt, window, cause = markerTimeAndZone(row[marker[1]:colon], day, window)
 		}
+		answerQuestion := questionText
 		for pos := start; pos >= 0; {
 			end := quoteEnd(row, pos)
 			if end < 0 {
 				break
 			}
 			fragment := row[pos+len("«") : end-len("»")]
-			word := briefWord{raw: row[marker[0]:end], fragment: fragment, question: questionText, day: day, markedAt: markedAt, window: window, isQuote: true, invalidCause: cause}
+			word := briefWord{raw: row[marker[0]:end], fragment: fragment, question: answerQuestion, day: day, markedAt: markedAt, window: window, isQuote: true, invalidCause: cause}
 			if strings.Trim(strings.ReplaceAll(fragment, "[…]", "…"), "… \t") == "" {
 				word.invalidCause = "empty quote"
 			}
@@ -1252,6 +1411,9 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 			lastEnd = end
 			if questionAnswer {
 				pos = nextAnswer(row, end)
+				if pos >= 0 {
+					answerQuestion = questionBeforeAnswer(row, pos)
+				}
 				continue
 			}
 			next := strings.Index(row[end:], "«")
