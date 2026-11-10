@@ -23,8 +23,9 @@ Usage:
   user-word --search 'FRAGMENT' [--since YYYY-MM-DD] [--project S]
   user-word --brief FILE [--until 'YYYY-MM-DD HH:MM']
 
-The first form prints the end of the agent's reply before the user's line with
-FRAGMENT (what the user answered), the line itself and the user's next lines
+The first form prints the agent context before the user's matching line. Long
+replies show their last part; questions cut from it are listed above the excerpt.
+The line itself and the user's next lines
 within MINUTES (default 30). Several lines with FRAGMENT: the last one, since
 the sender refers to the fresh decision; for an earlier one, a longer fragment.
 

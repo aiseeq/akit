@@ -83,6 +83,56 @@ func testEnv(t *testing.T) env {
 	return env{home: t.TempDir(), loc: time.UTC}
 }
 
+func TestBriefQuestionNotFoundUsesPreviousAgent(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-x-proj", "question-missing",
+		agent("2026-10-31T09:59:00Z", "Проверить запасную копию?"),
+		human("2026-10-31T10:00:00Z", "готово"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10 на вопрос «Удалить старую копию?» ответил «готово».\n")
+	code, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	if code != 0 {
+		t.Fatalf("код %d:\n%s", code, out)
+	}
+	mustHave(t, "вопрос не найден", out, "--- question «Удалить старую копию?» not found in agent messages before the line", "Проверить запасную копию?")
+}
+
+func TestBriefQuestionSearchStopsAtPreviousUser(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-x-proj", "question-boundary",
+		agent("2026-10-31T09:57:00Z", "Переносить рабочую папку?"),
+		human("2026-10-31T09:58:00Z", "позже решу"),
+		agent("2026-10-31T09:59:00Z", "Сборка готова."),
+		human("2026-10-31T10:00:00Z", "да"))
+	b := writeBrief(t, t.TempDir(), "Пользователь 31.10 на вопрос «Переносить рабочую папку?» ответил «да».\n")
+	code, out := briefRun(t, e, b, "--until", "2026-10-31 11:00")
+	if code != 0 {
+		t.Fatalf("код %d:\n%s", code, out)
+	}
+	block := agentBlock(t, out)
+	mustLack(t, "вопрос до предыдущей реплики", block, "Переносить рабочую папку?")
+	mustHave(t, "запасной контекст", block, "Сборка готова.")
+	mustHave(t, "вопрос не найден", out, "--- question «Переносить рабочую папку?» not found in agent messages before the line")
+}
+
+func TestFirstFormShowsQuestionsCutFromLongAgentReply(t *testing.T) {
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-x-proj", "long-first-form",
+		agent("2026-10-31T09:59:00Z", "Удалять архив?\n"+strings.Repeat("Подробности без вопроса. ", 100)),
+		human("2026-10-31T10:00:00Z", "оставь архив"))
+	code, out, errOut := runUW(t, e, p, "оставь архив")
+	if code != 0 {
+		t.Fatalf("код %d, ошибка %q:\n%s", code, errOut, out)
+	}
+	mustHave(t, "вопрос из отрезанного начала", out, "--- questions earlier in the same message:", "Удалять архив?")
+}
+
+func TestBriefQuestionColonFormIsStored(t *testing.T) {
+	words := extractBriefQuotes("Пользователь 31.10 на вопрос «Удалить кэш?» : «да».\n", time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), time.UTC)
+	if len(words) != 1 || words[0].question != "Удалить кэш?" || words[0].fragment != "да" {
+		t.Fatalf("не извлечён вопрос с ответом после двоеточия: %#v", words)
+	}
+}
+
 func TestParseArgsErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{}, {"x.jsonl"}, {"x.jsonl", ""}, {"x.jsonl", "a", "-1"}, {"x.jsonl", "a", "1", "2"},
