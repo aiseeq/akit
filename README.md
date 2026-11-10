@@ -171,6 +171,9 @@ Runs Go tests against each exact-text mutation in isolation, restores the source
 
     mut OLD NEW FILE -- <go test arguments>
     mut [-F SPEC] -- <go test arguments>
+    mut --test-db -F SPEC -- -run TestStore ./store   # tests on the database of the graft test_db section
+
+Tests that need the project test database run with `--test-db`: mut then calls `graft exec --heavy --test-db`, which raises that database and passes its DSN to `go test`.
 
 ## tk
 

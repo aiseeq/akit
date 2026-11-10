@@ -37,6 +37,8 @@ If it changed during the run, mut reverts its change when that is unambiguous.
 Vet errors are reported as build failed (exit 2); a mutant outside the test packages survives.
 
   -F SPEC    read blocks from SPEC; "-" or no -F reads stdin when it is not a terminal
+  --test-db  tests need the project's test database: run them as graft exec --heavy --test-db,
+             which raises the database of the graft test_db section and passes its DSN
   -h         show this help
 
 ` + edit.SpecHelp
@@ -51,6 +53,7 @@ type opts struct {
 	spec       string
 	positional []string
 	testArgs   []string
+	testDB     bool
 }
 type event struct{ Action, Package, ImportPath, Test, Output, FailedBuild string }
 type verdict struct {
@@ -97,6 +100,8 @@ func parseArgs(args []string) (opts, error) {
 		switch a {
 		case "-h", "--help":
 			return o, errHelp
+		case "--test-db":
+			o.testDB = true
 		case "-F":
 			if i+1 == len(args) {
 				return o, errors.New("-F needs a value")
@@ -155,10 +160,14 @@ func run(o opts, stdin io.Reader, stdout io.Writer) int {
 		fmt.Fprintf(stdout, "error: %v\n", err)
 		return 2
 	}
-	graft, err := exec.LookPath("graft")
+	graftPath, err := exec.LookPath("graft")
 	if err != nil {
 		fmt.Fprintf(stdout, "error: graft not found: %v\n", err)
 		return 2
+	}
+	graft := []string{graftPath, "exec", "--heavy"}
+	if o.testDB {
+		graft = append(graft, "--test-db")
 	}
 	jsonArgs := testArgs(o.testArgs)
 	// Сигналы ловятся на весь вызов: пришедший между правкой и прогоном не должен убить mut до отката.
@@ -252,7 +261,7 @@ func prepare(e edit.Edit) (*mutation, error) {
 	return &mutation{path, original, changed, st.Mode(), st.ModTime(), line}, nil
 }
 
-func mutant(graft string, e edit.Edit, args []string, baseline **verdict, sigc <-chan os.Signal) (result verdict, resultLine int) {
+func mutant(graft []string, e edit.Edit, args []string, baseline **verdict, sigc <-chan os.Signal) (result verdict, resultLine int) {
 	m, err := prepare(e)
 	if err != nil {
 		return verdictOf("error: "+err.Error(), 2, false), 1
@@ -343,7 +352,7 @@ func emergencyRestore(m *mutation, runStarted bool) error {
 	}
 	return restore(m.path, m.original, m.mode, m.mtime)
 }
-func baselineCheck(result verdict, graft string, args []string, baseline **verdict, sigc <-chan os.Signal) verdict {
+func baselineCheck(result verdict, graft []string, args []string, baseline **verdict, sigc <-chan os.Signal) verdict {
 	if !result.killed {
 		return result
 	}
@@ -426,14 +435,16 @@ func saveOriginal(data []byte) (string, error) {
 	}
 	return f.Name(), nil
 }
-func runTests(graft string, args []string, sigc <-chan os.Signal) verdict {
+
+// runTests runs go test under graft: graft is the graft path and its exec arguments before "--".
+func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 	select {
 	case sig := <-sigc:
 		return verdictOf(fmt.Sprintf("error: interrupted (%v)", sig), signalStatus(sig), false)
 	default:
 	}
-	argv := append([]string{"exec", "--heavy", "--", "go", "test"}, args...)
-	cmd := exec.Command(graft, argv...)
+	argv := append(append(slices.Clone(graft[1:]), "--", "go", "test"), args...)
+	cmd := exec.Command(graft[0], argv...)
 	cmd.Stdin = nil
 	out, err := cmd.StdoutPipe()
 	if err != nil {

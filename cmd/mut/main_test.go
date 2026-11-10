@@ -384,6 +384,29 @@ exec "$@"
 	f.unchanged(t)
 }
 
+// Tests on the project database get its DSN only through graft exec --test-db.
+func TestTestDBRunsThroughGraftTestDB(t *testing.T) {
+	f := newFixture(t, "package calc\nimport (\"os\"; \"testing\")\nfunc TestAdd(t *testing.T){if os.Getenv(\"TEST_DB_DSN\")==\"\"{t.Fatal(\"TEST_DB_DSN is not set\")}; if Add(2,3)!=5{t.Fatal(Add(2,3))}}\n")
+	script := `#!/bin/sh
+while [ "$1" != -- ]; do [ "$1" = --test-db ] && export TEST_DB_DSN=postgres://test; shift; done
+shift
+exec "$@"
+`
+	if err := os.WriteFile(filepath.Join(f.bin, "graft"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "--test-db", "a + b", "a - b", "calc.go", "--", "./..."); code != 0 || !strings.HasPrefix(out, "killed") {
+		t.Fatalf("with --test-db: %d %q", code, out)
+	}
+	if out, code := f.run(t, "--test-db", "a + b", "a + b", "calc.go", "--", "./..."); code != 1 || !strings.HasPrefix(out, "survived") {
+		t.Fatalf("empty edit with --test-db: %d %q", code, out)
+	}
+	if out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./..."); code != 2 || !strings.Contains(out, "fails without the mutant") {
+		t.Fatalf("without --test-db: %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
 // The help shows only spec rules mut follows: no "sub FILE" form, and blocks do
 // not build on each other.
 func TestUsageHasNoSubOnlyRules(t *testing.T) {
