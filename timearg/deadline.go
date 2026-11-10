@@ -13,9 +13,12 @@ var waitAgo = regexp.MustCompile(`^[0-9]+[smhd]$`)
 // waitISO — дата и часы через T, без пояса или с Z (2026-10-31T12:00, 2026-10-31T12:00Z), не RFC3339.
 var waitISO = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{1,2}:[0-9]{2}(:[0-9]{2})?)(Z?)$`)
 
-// Часы после даты — через пробел, запятую, двоеточие или точку с запятой и пробел; минуты и секунды одной цифрой
-// берутся как часы, чтобы At отверг их, а не оставил полночь даты.
-var dayMonthPattern = regexp.MustCompile(`(?s)^\s*([0-9]{1,2}\.[0-9]{1,2})(?:[,:;]?\s+([0-9]{1,2}:[0-9]{1,2}(?::[0-9]{1,2})?))?(.*)$`)
+// isoDatePattern — дата ГГГГ-ММ-ДД в начале, часы после неё — как у dayMonthPattern.
+var isoDatePattern = regexp.MustCompile(`(?s)^\s*([0-9]{4}-[0-9]{2}-[0-9]{2})(?:(?:[,:;]\s*|\s+)([0-9]{1,2}:[0-9]{1,2}(?::[0-9]{1,2})?[Zz]?))?(.*)$`)
+
+// Часы после даты — через пробел или разделитель с пробелом или без; минуты и секунды одной цифрой берутся как часы,
+// чтобы At отверг их, а не оставил полночь даты.
+var dayMonthPattern = regexp.MustCompile(`(?s)^\s*([0-9]{1,2}\.[0-9]{1,2})(?:(?:[,:;]\s*|\s+)([0-9]{1,2}:[0-9]{1,2}(?::[0-9]{1,2})?[Zz]?))?(.*)$`)
 
 // DayMonth — дата ДД.ММ без года из начала строки: Date («31.10»), Clock («12:00» или ""), Rest — текст после.
 type DayMonth struct {
@@ -48,11 +51,14 @@ func Deadline(wait string, now time.Time) (time.Time, bool) {
 	}
 	if parsed, ok := ParseDayMonth(wait); ok {
 		if t, ok := closestDayMonth(parsed, now); ok {
-			words := 1
-			if parsed.Clock != "" {
-				words++
-			}
-			return deadlineZone(t, f, words), true
+			return deadlineZone(t, parsed.Rest), true
+		}
+	}
+	if m := isoDatePattern.FindStringSubmatch(wait); m != nil && (m[3] == "" || strings.ContainsRune(" :,;", rune(m[3][0]))) {
+		clock, rest := splitZone(m[2], m[3])
+		value := strings.TrimSpace(m[1] + " " + clock)
+		if t, err := Parse(value, now); err == nil {
+			return deadlineZone(t, rest), true
 		}
 	}
 	for n := min(2, len(f)); n >= 1; n-- {
@@ -62,16 +68,26 @@ func Deadline(wait string, now time.Time) (time.Time, bool) {
 			break
 		}
 		if t, err := Parse(strings.Join(f[:n], " "), now); err == nil {
-			return deadlineZone(t, f, n), true
+			return deadlineZone(t, strings.Join(f[n:], " ")), true
 		}
 	}
 	return time.Time{}, false
 }
 
+// splitZone takes a zone glued to the hours («9:00Z») off the clock and puts it before the rest,
+// where deadlineZone reads it as it reads «9:00 Z».
+func splitZone(clock, rest string) (string, string) {
+	bare := strings.TrimRight(clock, "Zz")
+	if bare != clock {
+		rest = "Z" + rest
+	}
+	return bare, rest
+}
+
 // deadlineZone применяет UTC после разобранного срока, если метка указана.
-func deadlineZone(t time.Time, fields []string, words int) time.Time {
-	if words < len(fields) {
-		zone := strings.TrimRight(fields[words], ":,;")
+func deadlineZone(t time.Time, rest string) time.Time {
+	if fields := strings.Fields(rest); len(fields) > 0 {
+		zone := strings.TrimRight(fields[0], ":,;")
 		if strings.EqualFold(zone, "UTC") || strings.EqualFold(zone, "Z") {
 			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
 		}
@@ -85,7 +101,8 @@ func ParseDayMonth(value string) (DayMonth, bool) {
 	if m == nil || (m[3] != "" && !strings.ContainsRune(" :,;", rune(m[3][0]))) {
 		return DayMonth{}, false
 	}
-	parsed := DayMonth{Date: m[1], Clock: m[2], Rest: m[3]}
+	clock, rest := splitZone(m[2], m[3])
+	parsed := DayMonth{Date: m[1], Clock: clock, Rest: rest}
 	if _, ok := parsed.At(2000, time.Local); !ok {
 		return DayMonth{}, false
 	}
