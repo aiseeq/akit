@@ -65,8 +65,8 @@
 //   - Under auth and credentials names a plain
 //     word or path stays: same-origin, oauth2, basic, /etc/app/creds.json. A
 //     token-like value (see isPlainWord: mixed case and digits, a lower to
-//     upper turn as in base64, 12 hex characters, 16 letters) is hidden; a
-//     short lower-case password such as hunter2 there is not.
+//     upper turn, 12 mixed alphanumeric characters, or 16 low-vowel letters) is
+//     hidden; ordinary CamelCase words and long vowel-rich words stay visible.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
 package secretmask
@@ -629,7 +629,7 @@ func jsonArraySpans(text string, open int, elements [][2]int, groups anchorGroup
 func jsonKeyedSpans(text, key, kind string, elements [][2]int) []contextSpan {
 	var spans []contextSpan
 	for _, element := range elements {
-		if !plainValueFor(key, text[element[0]:element[1]]) {
+		if !valueVisibleFor(key, text[element[0]:element[1]]) {
 			spans = appendJSONValue(spans, text, element, kind)
 		}
 	}
@@ -680,7 +680,7 @@ func jsonArgumentSpans(text string, elements [][2]int, groups anchorGroup) []con
 			i++
 		case groups&anchorName != 0 && strings.HasPrefix(word, "-") && !strings.Contains(word, "="):
 			name := strings.TrimLeft(word, "-")
-			if kind, ok := optionSecretName(name); ok && flagValueAllowed(text[next[0]:next[1]]) && !plainValueFor(name, text[next[0]:next[1]]) {
+			if kind, ok := optionSecretName(name); ok && flagValueAllowed(text[next[0]:next[1]]) && !valueVisibleFor(name, text[next[0]:next[1]]) {
 				spans = appendJSONValue(spans, text, next, kind)
 				i++
 			}
@@ -747,7 +747,7 @@ func jsonValueMemberSpans(text string) []contextSpan {
 		if !ok {
 			continue
 		}
-		if kind, secret := secretName(name); secret && !plainValueFor(name, text[start:end]) {
+		if kind, secret := secretName(name); secret && !valueVisibleFor(name, text[start:end]) {
 			spans = append(spans, contextSpan{start, end, kind})
 			at = end
 		}
@@ -793,7 +793,7 @@ func nameMatches(text string) []contextMatch {
 		if valueIsStructure(text, value) {
 			continue
 		}
-		if plainValueFor(name, text[value.start:value.end]) {
+		if valueVisibleFor(name, text[value.start:value.end]) {
 			continue
 		}
 		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
@@ -852,7 +852,7 @@ func flagMatches(text string) []contextMatch {
 			continue
 		}
 		coveredUntil = value.end
-		if !assigned && !flagValueAllowed(text[value.start:value.end]) || plainValueFor(name, text[value.start:value.end]) {
+		if !assigned && !flagValueAllowed(text[value.start:value.end]) || valueVisibleFor(name, text[value.start:value.end]) {
 			continue
 		}
 		if valueIsValue(text, value, name, kind, false) {
@@ -1167,7 +1167,7 @@ func bareIsValue(value, name, kind string, colon bool) bool {
 		}
 	}
 	if kind == "token" {
-		if len(value) < 8 && (colon || onlyDigits(value)) {
+		if len(value) < 8 && (colon || onlyDigits(value)) && !authName(strings.TrimRight(strings.ToLower(name), "0123456789")) {
 			return false
 		}
 	}
@@ -1292,16 +1292,14 @@ func onlyNameBytes(s string) bool {
 	return s != ""
 }
 
-// plainValueFor: the value of this name is no secret. A name exactly pwd with
-// a path (/a/b, ~/a) is the working directory. The auth and credentials names
-// often hold a mode, a profile or a file: a plain word (same-origin, oauth2,
-// basic) or a path stays; a value looking like a token is hidden.
-func plainValueFor(name, value string) bool {
+// valueVisibleFor reports whether a value under this name is ordinary text.
+// It is shared by named values in text, JSON objects and JSON argument arrays.
+func valueVisibleFor(name, value string) bool {
 	if strings.EqualFold(name, "pwd") {
 		return isPlainPath(value)
 	}
 	n := strings.TrimRight(strings.ToLower(name), "0123456789")
-	return authName(n) && (isPlainPath(value) || isPlainWord(value))
+	return authName(n) && (isPlainPath(value) || ordinaryCamelWord(value) || isPlainWord(value))
 }
 
 // isPlainPath: /a/b, ~/a or ./a, every part a plain word: /Bx4Tq9Wz is no path.
@@ -1316,28 +1314,139 @@ func isPlainPath(value string) bool {
 		return false
 	}
 	for part := range strings.SplitSeq(rest, "/") {
-		if part != "" && !isPlainWord(part) {
+		if part != "" && !isPlainPathPart(part) {
 			return false
 		}
 	}
 	return true
 }
 
-// isPlainWord: letters, digits, -, _ and . that do not look like a token. A
-// token mixes upper, lower case and digits, turns from lower to upper case
-// inside a word (base64 such as dXNl; OAuth and NTLM are words), or holds a
-// run of 12 hex characters, 12 letters and digits mixed, or 16 letters.
-func isPlainWord(value string) bool {
-	upper, lower, digit, ok := wordClasses(value)
-	if !ok || upper && lower && digit {
+// isPlainPathPart: a path part is a plain word or a CamelCase name (myProject);
+// a base64-shaped part (dXNlcmFkbWlu) is not.
+func isPlainPathPart(value string) bool {
+	return isPlainWord(value) || ordinaryCamelWord(value)
+}
+
+// ordinaryCamelWord accepts letter-only names made of pronounceable words and
+// short abbreviations: a lowercase prefix (nodeProfile), capitalized words of
+// three letters or more (two as the first: MyApp) and runs of 2-5 capitals
+// (HTTPClient). Letter-only base64 splits into one- and two-letter pieces, long
+// capital runs or pieces without vowels (YWJjZGVm: YW Jj ZG Vm) and fails.
+func ordinaryCamelWord(value string) bool {
+	if len(value) < 2 {
 		return false
 	}
-	for _, run := range strings.FieldsFunc(value, func(r rune) bool { return r == '-' || r == '_' || r == '.' }) {
-		if len(run) >= 16 || len(run) >= 12 && (isHex(run) || strings.ContainsAny(run, "0123456789") && !onlyDigits(run)) {
+	for i := range len(value) {
+		if !isLetter(value[i]) {
+			return false
+		}
+	}
+	var parts []string
+	start := 0
+	for i := 1; i < len(value); i++ {
+		if isUpper(value[i]) && isLower(value[i-1]) {
+			parts = append(parts, value[start:i])
+			start = i
+		} else if isLower(value[i]) && isUpper(value[i-1]) && i-start > 1 {
+			parts = append(parts, value[start:i-1])
+			start = i - 1
+		}
+	}
+	parts = append(parts, value[start:])
+	if len(parts) < 2 {
+		return false
+	}
+	for i, part := range parts {
+		switch {
+		case len(part) < 2:
+			return false
+		case allUpper(part) && len(part) <= 5:
+		case (i == 0 && allLower(part) || (i == 0 || len(part) >= 3) && isUpper(part[0]) && allLower(part[1:])) && pronounceable(part):
+		default:
 			return false
 		}
 	}
 	return true
+}
+
+// pronounceable: a word part of a name carries a vowel and no five consonants in a row (Profile, Postgre, Sync);
+// base64 pieces such as Vm or Bxwdhqk do not.
+func pronounceable(part string) bool {
+	vowel, consonants := false, 0
+	for _, c := range strings.ToLower(part) {
+		if strings.ContainsRune("aeiouy", c) {
+			vowel, consonants = true, 0
+			continue
+		}
+		if consonants++; consonants >= 5 {
+			return false
+		}
+	}
+	return vowel
+}
+
+func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
+
+func isLower(c byte) bool { return c >= 'a' && c <= 'z' }
+
+func allLower(value string) bool {
+	for i := range len(value) {
+		if !isLower(value[i]) {
+			return false
+		}
+	}
+	return value != ""
+}
+
+func allUpper(value string) bool {
+	for i := range len(value) {
+		if !isUpper(value[i]) {
+			return false
+		}
+	}
+	return value != ""
+}
+
+// isPlainWord: letters, digits, -, _ and . that do not look like a token. A
+// token mixes upper, lower case and digits, or holds a run of 12 letters and
+// digits mixed, or 16 letters with few vowels.
+func isPlainWord(value string) bool {
+	upper, lower, digit, ok := wordClasses(value)
+	return ok && !(upper && lower && digit) && plainWordLength(value)
+}
+
+func plainWordLength(value string) bool {
+	for _, run := range strings.FieldsFunc(value, func(r rune) bool { return r == '-' || r == '_' || r == '.' }) {
+		if len(run) >= 16 && (!longVowelRichWord(run) || isHex(run)) || len(run) >= 12 && strings.ContainsAny(run, "0123456789") && !onlyDigits(run) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHex(value string) bool {
+	for i := range len(value) {
+		if !(value[i] >= '0' && value[i] <= '9' || value[i] >= 'a' && value[i] <= 'f' || value[i] >= 'A' && value[i] <= 'F') {
+			return false
+		}
+	}
+	return value != ""
+}
+
+// longVowelRichWord treats long lowercase alphabetic runs with at least 40%
+// English vowels as ordinary words instead of random-looking token bodies.
+func longVowelRichWord(value string) bool {
+	vowels := 0
+	for i := range len(value) {
+		c := value[i]
+		if !isLower(c) {
+			return false
+		}
+		if strings.ContainsRune("aeiou", rune(c)) {
+			vowels++
+		}
+	}
+	return vowels*5 >= len(value)*2
 }
 
 // wordClasses reports the character classes of a word; ok is false for an empty
@@ -1360,15 +1469,6 @@ func wordClasses(value string) (upper, lower, digit, ok bool) {
 		}
 	}
 	return upper, lower, digit, value != ""
-}
-
-func isHex(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if !(s[i] >= '0' && s[i] <= '9' || s[i] >= 'a' && s[i] <= 'f' || s[i] >= 'A' && s[i] <= 'F') {
-			return false
-		}
-	}
-	return true
 }
 
 func secretName(name string) (string, bool) {

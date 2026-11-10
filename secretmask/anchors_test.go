@@ -225,3 +225,52 @@ func TestMaskAuthTokensWithoutDigits(t *testing.T) {
 		}
 	}
 }
+
+func TestMaskAuthOrdinaryWordFormsStayVisible(t *testing.T) {
+	for _, input := range []string{
+		"auth: CedarMaple",
+		"credentials: nodeProfile",
+		"auth: HTTPClient",
+		"credentials: /srv/tools/myProject/creds.json",
+		"pwd: /home/u/myProject",
+		"auth: internationalization",
+		"auth: PostgreSQL",
+		"auth: nodeSync",
+		"auth: AWSProfile",
+		"credentials: /Users/me/MyApp/creds.json",
+		"auth: 12345",
+		`{"auth":"CedarMaple"}`,
+		`{"argv":["--auth","CedarMaple"]}`,
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("%q changed to %q, %v", input, got, found)
+		}
+	}
+}
+
+func TestMaskAuthTokenLikeValuesStayHidden(t *testing.T) {
+	for _, input := range []string{
+		"auth: aB3xY9q",
+		"credentials: Zq7xW9v",
+		"auth: dXNlcmFkbWlu",
+		`{"auth":"dXNlcmFkbWlu"}`,
+		"auth: qwhxkzjvplmbnrty",
+		"auth: a1b2c3d4e5f6",
+		"auth: kQzXwPvRtYmN",
+		"auth: abcDef123456",
+		`{"auth":"ghp_syntheticTokenValue123456"}`,
+		`{"argv":["--auth","abcdef0123456789"]}`,
+		"auth: /srv/dXNlcmFkbWlu",
+		"auth: YWJjZGVm",
+		"auth: xurSyjqjIbQe",
+		"auth: kitVTTDAMPCSdib",
+		"auth: GaehCzdzmeCN",
+		"auth: rekXFovaPur",
+	} {
+		got, _ := Mask(input)
+		if !strings.Contains(got, maskMarker+"token") {
+			t.Errorf("token-like value remained in %q", got)
+		}
+	}
+}
