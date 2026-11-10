@@ -255,7 +255,7 @@ func (r *Recognizer) cmd(ev transcript.Event) []Wait {
 	done := r.breakChain()
 	p := &pending{w: Wait{Start: ev.Time, How: how, Class: r.class(how, text), Command: transcript.Short(text, commandWidth),
 		Calls: 1, Line: ev.Line, CallIDs: []string{ev.CallID}}, limit: limitOf(ev.Text), callAt: ev.Time,
-		replies: map[string]bool{}, codex: ev.Who != "Bash" && shells[ev.Who]}
+		replies: map[string]bool{}, codex: CodexShell(ev.Who)}
 	r.count(p, ev)
 	switch {
 	case foreground:
@@ -494,6 +494,11 @@ func (r *Recognizer) wake(ev transcript.Event) []Wait {
 
 // shells — инструменты, которые запускают команду: Bash у Claude, у codex — exec и старые вызовы.
 var shells = map[string]bool{"Bash": true, "exec": true, "exec_command": true, "shell": true, "shell_command": true}
+
+// CodexShell reports whether a tool runs a codex command: only its output can name a running session.
+func CodexShell(who string) bool {
+	return who != "Bash" && shells[who]
+}
 
 var (
 	stdinChars = regexp.MustCompile("\\bchars\\s*:\\s*([\"'`])(.)")
