@@ -375,6 +375,7 @@ func Mask(text string) (string, map[string]int) {
 type masking struct {
 	found  map[string]int
 	tagger *Tagger
+	ph     *placeholders
 	values []string
 	kept   []string
 }
@@ -451,10 +452,10 @@ func (m *masking) placeholderEnd(text string, end *int) (int, bool) {
 		*end++
 		return -1, true
 	}
-	if m.tagger == nil || !strings.HasPrefix(rest, placeholderSep) {
+	if m.tagger == nil || !strings.HasPrefix(rest, m.ph.value) {
 		return -1, false
 	}
-	digits, index := len(placeholderSep), 0
+	digits, index := len(m.ph.value), 0
 	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
 		index = index*10 + int(rest[digits]-'0')
 		if index >= len(m.values) {
@@ -462,7 +463,7 @@ func (m *masking) placeholderEnd(text string, end *int) (int, bool) {
 		}
 		digits++
 	}
-	if digits == len(placeholderSep) || digits == len(rest) || rest[digits] != ']' {
+	if digits == len(m.ph.value) || digits == len(rest) || rest[digits] != ']' {
 		return -1, false
 	}
 	*end += digits + 1
@@ -1433,7 +1434,7 @@ func replaceSpans(text string, spans []contextSpan, m *masking) string {
 		out.WriteString(maskMarker)
 		out.WriteString(span.kind)
 		if m.tagger != nil {
-			out.WriteString(placeholderSep)
+			out.WriteString(m.ph.value)
 			out.WriteString(strconv.Itoa(len(m.values)))
 			m.values = append(m.values, m.original(text[span.start:span.end]))
 		}

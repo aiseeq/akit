@@ -308,7 +308,8 @@ hidden value's length in characters and `TAG` a keyed hash of it, so two fragmen
 `TAG` are equal across `tl` calls while the value itself is not shown. The key is created on the
 first run in `$XDG_STATE_HOME/akit/mask-key` (`~/.local/state/akit/mask-key` when unset); without it
 markers carry the kind only and stderr says why. The mask also hides some names that look like keys,
-such as long `pk_test_…` identifiers: compare `N` and `TAG` with the fragment you expect.
+such as long `pk_test_…` identifiers: `N` tells whether it may be the name you expect, and the same
+`TAG` elsewhere shows where the same text recurs.
 
 `--wait PROG [SUB]` prints the nearest-rank percentile of milliseconds from a shell command call to
 its output; calls without output, background Bash calls, and commands that also run unrelated programs

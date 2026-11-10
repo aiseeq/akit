@@ -46,27 +46,35 @@ func loadMaskKey(path string) ([]byte, error) {
 	return key, nil
 }
 
+// createMaskKey пишет ключ во временный файл рядом и ставит его на место жёсткой ссылкой: другой tl видит
+// ключ целиком или не видит вовсе. Место уже занято — ключ того, кто успел первым.
 func createMaskKey(path string) ([]byte, error) {
 	key := make([]byte, maskKeyLen)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("make mask key: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("make mask key directory: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, fs.ErrExist) { // другой tl создал его первым
+	f, err := os.CreateTemp(dir, ".mask-key-*")
+	if err != nil {
+		return nil, fmt.Errorf("create mask key: %w", err)
+	}
+	defer os.Remove(f.Name())
+	_, werr := f.Write(key)
+	if err := errors.Join(werr, f.Sync(), f.Close()); err != nil {
+		return nil, fmt.Errorf("write mask key: %w", err)
+	}
+	err = os.Link(f.Name(), path)
+	if errors.Is(err, fs.ErrExist) {
 		if key, err = os.ReadFile(path); err != nil {
 			return nil, fmt.Errorf("read mask key: %w", err)
 		}
 		return key, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("create mask key: %w", err)
-	}
-	_, werr := f.Write(key)
-	if err := errors.Join(werr, f.Close()); err != nil {
-		return nil, fmt.Errorf("write mask key: %w", err)
+		return nil, fmt.Errorf("place mask key: %w", err)
 	}
 	return key, nil
 }

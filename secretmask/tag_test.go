@@ -60,7 +60,7 @@ func TestTaggerSecondPassKeepsMarkers(t *testing.T) {
 // stays as it is.
 func TestTaggerForeignPlaceholderStays(t *testing.T) {
 	tg := testTagger(t)
-	for _, in := range []string{"[скрыто:sk" + placeholderSep + "0] x", "[скрыто:sk" + keptSep + "3] x"} {
+	for _, in := range []string{"[скрыто:sk\uE0000] x", "[скрыто:sk\uE0013] x"} {
 		if got, _ := tg.Mask(in); got != in {
 			t.Errorf("%q -> %q", in, got)
 		}
@@ -85,5 +85,32 @@ func TestTaggerMeasuresSwallowedMarker(t *testing.T) {
 	want := "curl -H 'Cookie: sid=[скрыто:token len=36 #" + tg.Tag(value) + "]' x"
 	if got != want || found["sk"] != 1 || found["token"] != 1 {
 		t.Errorf("got %q %v, want %q", got, found, want)
+	}
+}
+
+// A key standing where a drawn marker has its kind is hidden like any key, and
+// no placeholder of the passes is left in the output.
+func TestTaggerKeyInKindPlace(t *testing.T) {
+	tg := testTagger(t)
+	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
+	got, _ := tg.Mask("[скрыто:" + key + " len=1 #a] x")
+	if strings.Contains(got, "x9Y8") || strings.ContainsFunc(got, func(r rune) bool { return r >= '' && r <= '' }) {
+		t.Errorf("got %q", got)
+	}
+}
+
+// A placeholder written into the input with a number in use takes no value of
+// this call: it stays as written, and a key's tail is not moved onto another
+// key.
+func TestTaggerForgedPlaceholderTakesNothing(t *testing.T) {
+	tg := testTagger(t)
+	got, _ := tg.Mask("PASSWORD=hunter22 [скрыто:x0] y")
+	if want := "PASSWORD=[скрыто:password len=8 #" + tg.Tag("hunter22") + "] [скрыто:x0] y"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	key := "sk" + "_live_" + strings.Repeat("a1B2", 8)
+	got, _ = tg.Mask(key + " [скрыто:sk_live0]_secretTail")
+	if want := "[скрыто:sk_live len=40 #" + tg.Tag(key) + "] [скрыто:sk_live0]_secretTail"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

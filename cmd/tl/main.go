@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/buildversion"
-
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 )
@@ -74,7 +73,9 @@ Masking: all output, --raw too, has secret values replaced with
 hash of it under a local key ($XDG_STATE_HOME/akit/mask-key, created on first
 run). Equal TAGs mean equal values across tl calls; the value itself is not
 recoverable. The mask also hides some names that look like keys (a long
-pk_test_… identifier): compare N and TAG with a fragment you expect.
+pk_test_… identifier): N tells whether it may be the name you expect, and the
+same TAG elsewhere shows where the same text recurs. Without the key the
+markers are [скрыто:KIND] and stderr says why.
 Exit: 0 events found, 1 none, 2 usage/IO error.
 `
 

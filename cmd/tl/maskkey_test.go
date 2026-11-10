@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aiseeq/akit/secretmask"
@@ -89,5 +90,31 @@ func TestMaskKeyUnavailable(t *testing.T) {
 	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
 	if got, _ := hide(key); got != "[скрыто:sk]" {
 		t.Errorf("plain mask: %q", got)
+	}
+}
+
+// Several tl starting at once on a fresh directory get one whole key, and no
+// temporary file is left next to it.
+func TestMaskKeyCreatedOnceUnderRace(t *testing.T) {
+	for round := range 20 {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "akit", "mask-key")
+		keys := make([][]byte, 8)
+		errs := make([]error, len(keys))
+		var wg sync.WaitGroup
+		for i := range keys {
+			wg.Go(func() {
+				keys[i], errs[i] = loadMaskKey(path)
+			})
+		}
+		wg.Wait()
+		for i := range keys {
+			if errs[i] != nil || !bytes.Equal(keys[i], keys[0]) || len(keys[i]) != maskKeyLen {
+				t.Fatalf("round %d, caller %d: %d bytes, %v", round, i, len(keys[i]), errs[i])
+			}
+		}
+		if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 1 {
+			t.Fatalf("round %d: directory holds %d entries, %v", round, len(entries), err)
+		}
 	}
 }
