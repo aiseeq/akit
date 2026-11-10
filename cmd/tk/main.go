@@ -3741,7 +3741,10 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 	if project == "" {
 		project = o.baseRoot
 	}
-	actor := executor(t.body)
+	actor := o.doer // the executor named at done, as prepareDone takes it
+	if actor == "" {
+		actor = executor(t.body)
+	}
 	if actor == "" {
 		actor = o.by
 	}

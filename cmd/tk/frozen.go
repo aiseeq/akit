@@ -186,11 +186,13 @@ var errAmbiguousExecutorProject = errors.New("ambiguous executor project")
 // executorProject resolves a session name through names.tsv, then through a
 // conventional <name>-master project folder beside or inside the current root.
 func (f frozenFiles) executorProject(executor, currentRoot string, errout io.Writer) (string, bool, error) {
-	if f.namesErr != nil {
-		return "", false, fmt.Errorf("read session names: %w", f.namesErr)
-	}
 	var mapped string
 	lastLine := 0
+	if f.namesErr != nil {
+		// The hint is advice after the ticket is closed: an unreadable table leaves
+		// the folder convention, and says so.
+		fmt.Fprintf(errout, "tk: next ticket: session names unreadable, project by folder only: %v\n", f.namesErr)
+	}
 	for _, row := range f.sessionNameRows() {
 		if !strings.EqualFold(row.name, executor) {
 			continue
@@ -213,7 +215,8 @@ func (f frozenFiles) executorProject(executor, currentRoot string, errout io.Wri
 	if !strings.HasSuffix(strings.ToLower(executor), suffix) {
 		return "", false, nil
 	}
-	name := executor[:len(executor)-len(suffix)]
+	// Session names are matched without case: the folder is the lower-case name.
+	name := strings.ToLower(executor[:len(executor)-len(suffix)])
 	if name == "" {
 		return "", false, nil
 	}
