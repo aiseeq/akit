@@ -67,22 +67,21 @@ func stopOwners(root string, self int, shells bool) (map[int]bool, error) {
 	if !shells {
 		return owners, nil
 	}
-	// The parent owns its children whatever it is; above it only consecutive
-	// shells do. A non-shell above them (a terminal, a multiplexer, an agent)
-	// runs other jobs too, and is never an owner.
-	for p, parent := s.Ppid, true; p > 1; parent = false {
+	// Only consecutive shells above the caller own targets. A non-shell (a
+	// terminal, a multiplexer, an agent, any program) runs other jobs too and
+	// is never an owner, even as the direct parent: a shell that runs stop as
+	// its last command replaces itself with stop, and the parent seen then is
+	// whatever started that shell. Programs stop their own children with
+	// StopChild.
+	for p := s.Ppid; p > 1; {
 		s, err = ReadStat(root, p)
 		if err != nil {
 			return nil, err
 		}
-		shell := isShell(s.Comm)
-		if serviceManager(p, s) || (!parent && !shell) {
+		if serviceManager(p, s) || !isShell(s.Comm) {
 			break
 		}
 		owners[p] = true
-		if !shell {
-			break
-		}
 		p = s.Ppid
 	}
 	return owners, nil

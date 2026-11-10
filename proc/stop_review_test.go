@@ -56,6 +56,31 @@ func TestValidateStopChainEndsAtNonShell(t *testing.T) {
 	}
 }
 
+// A shell running stop as its last command replaces itself with stop, so the
+// parent seen is the program that started the shell (an agent, a terminal).
+// A non-shell parent is never an owner: its other jobs are refused, and only
+// stop's own children remain reachable.
+func TestValidateStopNonShellParentIsNotOwner(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []struct {
+		pid, parent int
+		name        string
+	}{
+		{1, 0, "init"}, {10, 1, "agent"}, {20, 10, "bash"}, {30, 20, "sleep"},
+		{40, 10, "stop"}, {50, 10, "server"}, {60, 40, "sleep"},
+	} {
+		fakeStat(t, root, p.pid, p.parent, p.name, "S")
+	}
+	for _, pid := range []int{20, 30, 50} {
+		if _, err := validateStop(root, 40, pid, true); err == nil {
+			t.Errorf("accepted %d, a job of the non-shell parent", pid)
+		}
+	}
+	if _, err := validateStop(root, 40, 60, true); err != nil {
+		t.Errorf("refused stop's own child 60: %v", err)
+	}
+}
+
 // The library entry accepts only a direct child and a bounded grace.
 func TestStopTreeLibraryLimits(t *testing.T) {
 	root := t.TempDir()
