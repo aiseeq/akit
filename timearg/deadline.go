@@ -18,8 +18,10 @@ var dayMonthPattern = regexp.MustCompile(`(?s)^\s*([0-9]{1,2}\.[0-9]{1,2})(?:\s+
 // DayMonth — дата ДД.ММ без года из начала строки: Date («31.10»), Clock («12:00» или ""), Rest — текст после.
 type DayMonth struct {
 	Date, Clock, Rest string
-	layout            string
 }
+
+// clockLike — слово-часы после даты (ЧЧ:ММ[:СС]), даже невозможные.
+var clockLike = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
 
 // Deadline — срок ожидания: время в начале строки «Ждёт:» (дата, дата с часами, «ДД.ММ ЧЧ:ММ», ISO с T, RFC3339,
 // часы; UTC после часов — в UTC, иначе местное), дальше — текст. Без времени в начале — условие, срока нет.
@@ -53,6 +55,10 @@ func Deadline(wait string, now time.Time) (time.Time, bool) {
 	}
 	for n := min(2, len(f)); n >= 1; n-- {
 		// Без двух слов срока пробуем одно: «2026-11-06 итог» — срок одним словом, второе — заметка.
+		// Но не часы: «12.11 25:00» с невозможными часами — не полночь 12.11, а срока нет.
+		if n == 1 && len(f) > 1 && clockLike.MatchString(f[1]) {
+			break
+		}
 		if t, err := Parse(strings.Join(f[:n], " "), now); err == nil {
 			return deadlineZone(t, f, n), true
 		}
@@ -77,26 +83,24 @@ func ParseDayMonth(value string) (DayMonth, bool) {
 	if m == nil || (m[3] != "" && !strings.ContainsRune(" :,;", rune(m[3][0]))) {
 		return DayMonth{}, false
 	}
-	parsed := DayMonth{Date: m[1], Clock: m[2], Rest: m[3], layout: "02.01 2006"}
-	if parsed.Clock != "" {
-		parsed.layout = "02.01 15:04 2006"
-		if strings.Count(parsed.Clock, ":") == 2 {
-			parsed.layout = "02.01 15:04:05 2006"
-		}
-	}
+	parsed := DayMonth{Date: m[1], Clock: m[2], Rest: m[3]}
 	if _, ok := parsed.At(2000, time.Local); !ok {
 		return DayMonth{}, false
 	}
 	return parsed, true
 }
 
-// At — эта дата в году year; false, если такого дня в году нет (29.02).
+// At — эта дата в году year; false, если такого дня в году нет (29.02) или часы невозможны. День и месяц —
+// одной или двумя цифрами.
 func (w DayMonth) At(year int, loc *time.Location) (time.Time, bool) {
-	value := w.Date + " "
+	layout, value := "2.1 2006", w.Date+" "
 	if w.Clock != "" {
-		value = w.Date + " " + w.Clock + " "
+		layout, value = "2.1 15:04 2006", w.Date+" "+w.Clock+" "
+		if strings.Count(w.Clock, ":") == 2 {
+			layout = "2.1 15:04:05 2006"
+		}
 	}
-	candidate, err := time.ParseInLocation(w.layout, value+strconv.Itoa(year), loc)
+	candidate, err := time.ParseInLocation(layout, value+strconv.Itoa(year), loc)
 	return candidate, err == nil
 }
 
