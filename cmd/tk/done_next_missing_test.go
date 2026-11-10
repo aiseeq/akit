@@ -34,3 +34,46 @@ func TestDoneHintNamesLineWithMissingFolder(t *testing.T) {
 		t.Errorf("output %q, stderr %q", out.String(), errout.String())
 	}
 }
+
+// The executor named with --doer at done, an upper-case master name and an
+// unreadable names table: the hint still comes from the executor's folder.
+func TestDoneHintExecutorForms(t *testing.T) {
+	run := func(t *testing.T, executor, doer string, unreadable bool) (string, string) {
+		t.Helper()
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "shared")
+		dir := filepath.Join(root, "docs", "tasks")
+		scopeTicket(t, dir, "closing", "в работе", executor)
+		scopeTicket(t, dir, "root-open", "открыт", "")
+		scopeTicket(t, filepath.Join(root, "alpha", "docs", "tasks"), "alpha-own", "открыт", "")
+		if unreadable {
+			namesDir := filepath.Join(home, ".config", "cl")
+			if err := os.MkdirAll(filepath.Join(namesDir, "names.tsv"), 0o755); err != nil { // a folder cannot be read as the table
+				t.Fatal(err)
+			}
+		}
+		var out, errout bytes.Buffer
+		o := options{cmd: "done", id: "closing", by: "checker", doer: doer, check: "checked by test", baseRoot: root}
+		if code := runLockedCommand(root, dir, o, &out, &errout); code != 0 {
+			t.Fatalf("done = %d, stderr %q", code, errout.String())
+		}
+		return out.String(), errout.String()
+	}
+	t.Run("--doer without an executor line", func(t *testing.T) {
+		if out, _ := run(t, "", "alpha-master", false); !strings.Contains(out, "следующий в alpha: alpha-own ") {
+			t.Errorf("output %q", out)
+		}
+	})
+	t.Run("upper-case master name", func(t *testing.T) {
+		if out, _ := run(t, "ALPHA-MASTER", "", false); !strings.Contains(out, "следующий в alpha: alpha-own ") {
+			t.Errorf("output %q", out)
+		}
+	})
+	t.Run("unreadable names table", func(t *testing.T) {
+		out, errout := run(t, "alpha-master", "", true)
+		if !strings.Contains(out, "следующий в alpha: alpha-own ") || !strings.Contains(errout, "session names unreadable") {
+			t.Errorf("output %q, stderr %q", out, errout)
+		}
+	})
+}

@@ -207,7 +207,7 @@ A project listed in `~/.config/queue/frozen` (one per line: absolute or `~/` pat
 Queue gates close only the start of new work: a ticket the agent already took and a wait that came due stay visible to `tk next` under a closed pair and under an unreadable gate file, after CRIT and HIGH and ahead of new work.
 `tk done` ends with a `следующий:` line when the queue has a ticket: the one `tk next` would give the
 ticket's executor. If that executor maps to another project in `~/.config/cl/names.tsv`, or its
-`<name>-master` folder is found beside or inside the current root, the hint uses that project's queue.
+`<name>-master` folder (lower case) is found beside or inside the current root, the hint uses that project's queue; `--doer` names the executor first.
 
 In projects under `$HOME/git` or `$HOME/work`, `tk next` can read an executable `.tk-next-source`
 in the projects root. It receives the project directory name and prints a JSON array of tickets with
