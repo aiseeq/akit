@@ -1914,19 +1914,31 @@ func waitDue(wait string, now time.Time) (time.Time, bool) {
 	}
 	if parsed, ok := parseDayMonthWait(wait); ok {
 		if t, ok := closestWaitDate(parsed, now); ok {
-			return t, true
+			words := 1
+			if parsed.clock != "" {
+				words++
+			}
+			return waitDueZone(t, f, words), true
 		}
 	}
 	for n := min(2, len(f)); n >= 1; n-- {
 		// Без двух слов срока пробуем одно: «2026-11-06 итог» — срок одним словом, второе — заметка.
 		if t, err := timearg.Parse(strings.Join(f[:n], " "), now); err == nil {
-			if len(f) > n && (f[n] == "UTC" || f[n] == "Z") {
-				t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
-			}
-			return t, true
+			return waitDueZone(t, f, n), true
 		}
 	}
 	return time.Time{}, false
+}
+
+// waitDueZone применяет UTC после разобранного срока, если метка указана.
+func waitDueZone(t time.Time, fields []string, words int) time.Time {
+	if words < len(fields) {
+		zone := strings.TrimRight(fields[words], ":,;")
+		if strings.EqualFold(zone, "UTC") || strings.EqualFold(zone, "Z") {
+			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+		}
+	}
+	return t
 }
 
 // parseDayMonthWait распознаёт ДД.ММ[ ЧЧ:ММ[:СС]] и принимает только границу перед текстом.
