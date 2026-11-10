@@ -608,7 +608,7 @@ func precedingAgent(lines []line, at int, question string) (int, bool) {
 		if nearest < 0 {
 			nearest = i
 		}
-		if question == "" || hasFragment(lines[i].text, briefBracketedOmission.ReplaceAllString(question, "…")) {
+		if question == "" || hasBriefQuestion(lines[i].text, question) {
 			return i, true
 		}
 	}
@@ -639,18 +639,11 @@ func showAgentMessage(w io.Writer, l line, loc *time.Location, question string) 
 
 func questionExcerpt(text []rune, question string) (int, int) {
 	folded, positions := foldedRunesWithPositions(string(text))
-	needle := ""
-	for part := range strings.SplitSeq(fold(briefBracketedOmission.ReplaceAllString(question, "…")), "…") {
-		if part = strings.TrimSpace(part); part != "" {
-			needle = part
-			break
-		}
-	}
-	at := strings.Index(folded, needle)
-	if at < 0 || needle == "" {
+	at, firstPartLen := questionPartsAnchor(folded, question)
+	if at < 0 {
 		return max(len(text)-agentTail, 0), len(text)
 	}
-	first, last := utf8.RuneCountInString(folded[:at]), utf8.RuneCountInString(folded[:at+len(needle)])
+	first, last := utf8.RuneCountInString(folded[:at]), utf8.RuneCountInString(folded[:at+firstPartLen])
 	qStart, qEnd := positions[first], positions[last-1]+1
 	if qEnd-qStart >= agentTail {
 		return qStart, qStart + agentTail
@@ -665,7 +658,7 @@ func foldedRunesWithPositions(text string) (string, []int) {
 	var positions []int
 	space := false
 	for i, r := range []rune(text) {
-		if unicode.IsSpace(r) {
+		if unicode.IsSpace(r) || !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '…' {
 			if b.Len() > 0 {
 				space = true
 			}
@@ -1084,6 +1077,9 @@ func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteC
 			return h.context.lines, nil
 		}
 		agents, err := precedingAgentMessages(h.path, h.line)
+		if errors.Is(err, errTranscriptUnordered) {
+			return contextLines(h.path, contexts)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1111,18 +1107,41 @@ func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteC
 	return contextLines(h.path, contexts)
 }
 
+func hasBriefQuestion(text, question string) bool {
+	return hasFragment(briefTextFragment(text), briefQuoteFragment(question))
+}
+
+func questionPartsAnchor(foldedText, question string) (int, int) {
+	at, anchor, anchorLen := 0, -1, 0
+	for part := range strings.SplitSeq(fold(briefQuoteFragment(question)), "…") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		found := indexFrom(foldedText, part, at, false)
+		if found < 0 {
+			return -1, 0
+		}
+		anchor, anchorLen = found, len(part)
+		at = found + len(part)
+	}
+	return anchor, anchorLen
+}
+
 func contextHasQuestion(lines []line, target line, question string) bool {
 	at := findLine(lines, target)
 	if at < 0 {
 		return false
 	}
 	for i := at - 1; i >= 0 && !lines[i].user; i-- {
-		if lines[i].warning == "" && hasFragment(lines[i].text, briefBracketedOmission.ReplaceAllString(question, "…")) {
+		if lines[i].warning == "" && hasBriefQuestion(lines[i].text, question) {
 			return true
 		}
 	}
 	return false
 }
+
+var errTranscriptUnordered = errors.New("transcript timestamps are not chronological")
 
 func precedingAgentMessages(path string, target line) ([]line, error) {
 	f, err := os.Open(path)
@@ -1135,8 +1154,11 @@ func precedingAgentMessages(path string, target line) ([]line, error) {
 		return nil, fmt.Errorf("stat transcript context %s: %w", path, err)
 	}
 	ordered, samples, err := transcriptChronological(f, info.Size())
-	if err != nil || !ordered {
+	if err != nil {
 		return nil, err
+	}
+	if !ordered {
+		return nil, errTranscriptUnordered
 	}
 	end, err := transcriptTargetOffset(f, info.Size(), target, samples)
 	if err != nil {
@@ -1149,8 +1171,12 @@ func precedingAgentMessages(path string, target line) ([]line, error) {
 		if err != nil {
 			return nil, err
 		}
-		if len(raw) == 0 {
+		if start == end {
 			break
+		}
+		if len(raw) == 0 {
+			end = start
+			continue
 		}
 		events, parseErr := parser.Parse(raw)
 		if parseErr == nil {
