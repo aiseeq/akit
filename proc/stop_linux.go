@@ -58,7 +58,7 @@ func isShell(root string, pid int) bool {
 	}
 	exe = strings.TrimSuffix(exe, " (deleted)")
 	switch exe[strings.LastIndexByte(exe, '/')+1:] {
-	case "bash", "sh", "dash", "zsh", "ksh":
+	case "bash", "sh", "dash", "zsh", "ksh", "ksh93", "mksh":
 		return true
 	}
 	return false

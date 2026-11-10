@@ -15,13 +15,14 @@ import (
 
 const usage = `Usage: stop [--grace D] [--signal S] PID
 
-Stop a descendant of stop itself or of the consecutive shells (bash, sh, dash,
-zsh, ksh, told by the program they run, so scripts count) directly above it.
-This permits calls from a shell, a script, $(...) and bash -c. A non-shell (a terminal, a multiplexer, an agent, any program) and a
-service manager are never owners, even as the direct parent: stop does not
-reach jobs of another terminal tab or another agent call. A program stopping
-its own child uses proc.StopChild. This rule is not an isolation boundary
-between jobs of the same shell.
+Stop a descendant of stop itself or of the consecutive shells directly above
+it (bash, sh, dash, zsh, ksh, mksh; told by the program they run, so scripts
+count). This permits calls from a shell, a script, $(...) and bash -c. A
+non-shell (a terminal, a multiplexer, an agent, any program) and a service
+manager are never owners, even as the direct parent: stop does not reach jobs
+of another terminal tab or another agent call. A program stopping its own
+child uses proc.StopChild. Neither rule is a security boundary: jobs of one
+shell can stop each other, and a shell is told by its program file name.
 The request signal goes to the processes observed before it; processes found
 later, such as a cleanup the target starts on the request, are not signalled
 and get SIGKILL only if still alive after the grace. The result reports whether
