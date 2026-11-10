@@ -24,7 +24,13 @@ func TestDeadlineQuirks(t *testing.T) {
 		}
 	}
 	// A DayMonth built by the caller works without ParseDayMonth.
-	if at, ok := (DayMonth{Date: "31.10", Clock: "12:00"}).At(2026, loc); !ok || !at.Equal(time.Date(2026, 10, 31, 12, 0, 0, 0, loc)) {
-		t.Errorf("DayMonth.At = %v, %v", at, ok)
+	for d, want := range map[DayMonth]time.Time{
+		{Date: "31.10"}:                   time.Date(2026, 10, 31, 0, 0, 0, 0, loc),
+		{Date: "31.10", Clock: "12:00"}:   time.Date(2026, 10, 31, 12, 0, 0, 0, loc),
+		{Date: "31.10", Clock: "9:30:15"}: time.Date(2026, 10, 31, 9, 30, 15, 0, loc),
+	} {
+		if at, ok := d.At(2026, loc); !ok || !at.Equal(want) {
+			t.Errorf("%+v.At = %v, %v; want %v", d, at, ok, want)
+		}
 	}
 }
