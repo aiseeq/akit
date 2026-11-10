@@ -86,7 +86,7 @@ func splitZone(clock, rest string) (string, string) {
 
 // deadlineZone применяет UTC после разобранного срока, если метка указана.
 func deadlineZone(t time.Time, rest string) time.Time {
-	if fields := strings.Fields(rest); len(fields) > 0 {
+	if fields := strings.Fields(strings.TrimLeft(rest, " :,;")); len(fields) > 0 {
 		zone := strings.TrimRight(fields[0], ":,;")
 		if strings.EqualFold(zone, "UTC") || strings.EqualFold(zone, "Z") {
 			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)

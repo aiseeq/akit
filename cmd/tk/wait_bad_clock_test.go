@@ -17,6 +17,8 @@ func TestWaitWarnsOnImpossibleHoursAfterDate(t *testing.T) {
 		{"2026-11-12 25:00 build done", "date and time that do not exist"},
 		{"2026-11-12; 25:00 build done", "date and time that do not exist"},
 		{"31.11 9:00 build done", "date and time that do not exist"},
+		{"12.11;25:00 build done", "date and time that do not exist"},
+		{"2026-11-12,25:00 build done", "date and time that do not exist"},
 		{"build done", "has no time at the start"},
 		{"2026-11-12,09:00 build done", ""},
 	} {
