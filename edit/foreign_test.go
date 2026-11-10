@@ -16,7 +16,8 @@ func TestParseForeignSpecForms(t *testing.T) {
 		{"FILE SEARCH REPLACE", "FILE x.go\nSEARCH\nold\nREPLACE\nnew\n", "old", "new"},
 		{"plain separator", "=== x.go\nold\n---\nnew\n", "old", "new"},
 		{"named separators", "=== x.go\n--- old\nold\n--- new\nnew\n", "old", "new"},
-		{"empty edges and CRLF", "=== x.go\r\n\r\nold\r\n\r\n---\r\n\r\nnew\r\n\r\n", "\nold\n", "\nnew\n"},
+		{"named separators with edge blanks", "=== x.go\n\n--- old\n\nold\n\n--- new\n\nnew\n\n", "old", "new"},
+		{"empty edges and CRLF", "=== x.go\r\n\r\nold\r\n\r\n---\r\n\r\nnew\r\n\r\n", "old", "new"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -28,6 +29,16 @@ func TestParseForeignSpecForms(t *testing.T) {
 				t.Fatalf("edits = %#v", edits)
 			}
 		})
+	}
+}
+
+func TestParseForeignKeepsEmptyLinesInsideParts(t *testing.T) {
+	edits, err := ParseSpec(strings.NewReader("=== x.go\nfirst\n\nlast\n---\nnew first\n\nnew last\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edits) != 1 || edits[0].Old != "first\n\nlast" || edits[0].New != "new first\n\nnew last" {
+		t.Fatalf("edits = %#v", edits)
 	}
 }
 
