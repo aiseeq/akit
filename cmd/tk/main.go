@@ -69,7 +69,7 @@ Flags:
   --all          ls: include closed tickets
 
   --due          ls: show waiting tickets whose parsed deadline has passed
-  --json         ls: output JSON array with can_take; show: ticket and journal JSON; next: top ticket JSON
+  --json         ls: output JSON array with can_take and actors; show: ticket and journal JSON; next: top ticket JSON
   --status S     ls: show only status S
   --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
@@ -118,6 +118,11 @@ var planUnskipRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план
 // planAddRE — строка журнала tk plan --add; «обязательный» — с --required, тогда после имени — команда пункта.
 var planAddRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): добавлен (обязательный )?пункт ([a-z0-9-]+)(?:: (.+))?$`)
 var planRepinRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} план — (\S+): перезакреплён обязательный пункт ([a-z0-9-]+): (.+) → (.+) — (.+)$`)
+
+// journalActorRE takes the time and the author of a journal record: the name after the first « — », ended by «: »,
+// « — » or the line end.
+var journalActorRE = regexp.MustCompile(`^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) [^—]+? — (\S+?)(?:: | — |:?$)`)
+
 var executorHistoryRE = regexp.MustCompile(`^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:в работе|на проверке) — (\S+)(?:$| — )`)
 
 // requiredMentionRE — запись «обязательный» где угодно в тексте, без привязки к строке: сверка с целыми строками
@@ -3562,6 +3567,8 @@ type taskJSON struct {
 	Blocks         []string   `json:"blocks,omitempty"`
 	BlockedBy      []string   `json:"blocked_by,omitempty"`
 	CanTake        *bool      `json:"can_take,omitempty"` // ls only: would tk next give it to the project's master
+	// Actors: the time of the last journal record of each author, so a watcher sees work on a ticket left open.
+	Actors map[string]string `json:"actors,omitempty"`
 }
 
 type planJSON struct {
@@ -3608,7 +3615,23 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	obj.Plan = planItems(t.body)
 	obj.Blocks = headerLinks(t.body, blocksPrefix)
 	obj.BlockedBy = headerLinks(t.body, blockedPrefix)
+	obj.Actors = journalActors(t.body)
 	return obj
+}
+
+// journalActors maps each journal author to the time of their last record; the journal is kept in time order.
+func journalActors(body string) map[string]string {
+	actors := map[string]string{}
+	for _, line := range journalLines(body) {
+		m := journalActorRE.FindStringSubmatch(line)
+		if m != nil {
+			actors[m[2]] = m[1]
+		}
+	}
+	if len(actors) == 0 {
+		return nil
+	}
+	return actors
 }
 
 func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
