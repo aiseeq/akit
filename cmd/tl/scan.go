@@ -13,6 +13,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/aiseeq/akit/secretmask"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -810,7 +811,28 @@ func line(h *hit, width int) string {
 		who = strings.TrimSpace(h.ev.Who+" "+h.ev.Subtype) + ": "
 	}
 	return fmt.Sprintf("%s %s:%d %s %s%s", h.ev.Time.Local().Format("02.01 15:04:05"), h.src.ID, h.ev.Line, h.ev.Role,
-		who, transcript.Short(h.ev.Shown(), width))
+		who, maskedShort(h.ev.Shown(), width))
+}
+
+// maskWindow is how far past the cut the text is masked first: a secret that
+// starts before the cut keeps its prefix and context in the masked part.
+const maskWindow = 512
+
+// maskedShort cuts text to width like transcript.Short after masking it, so a
+// cut inside a secret does not leave a piece the mask no longer recognizes.
+// Only the start of a long text is masked: the rest is not shown.
+func maskedShort(text string, width int) string {
+	flat := transcript.Short(text, 0)
+	r := []rune(flat)
+	if width <= 0 || len(r) <= width {
+		return flat
+	}
+	masked, _ := secretmask.Mask(string(r[:min(len(r), width+maskWindow)]))
+	m := []rune(masked)
+	if len(m) > width {
+		m = m[:width]
+	}
+	return string(m) + fmt.Sprintf("…(+%d)", len(r)-width)
 }
 
 func windowNote(opts options, e env) string {
@@ -880,7 +902,7 @@ func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 		}
 		text := ev.Shown()
 		if width > 0 && utf8.RuneCountInString(text) > width {
-			text = transcript.Short(text, width)
+			text = maskedShort(text, width)
 		}
 		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), src.ID, ev.Line, ev.Role, who, text)
 	}

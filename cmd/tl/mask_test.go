@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,41 @@ func TestArgumentErrorMasksSecrets(t *testing.T) {
 		}
 		if code != exitUsage || !strings.Contains(errOut.String(), "[скрыто:sk]") {
 			t.Errorf("tl %s VALUE: code %d, no mask marker in %d bytes of stderr", args[0], code, errOut.Len())
+		}
+	}
+}
+
+// A narrow --width cuts a key inside its body. The cut must not leave a piece
+// of the value that the mask no longer knows by its prefix: the text is masked
+// before it is cut, in the event list and in a whole event.
+func TestTruncatedLineMasksKeyFirst(t *testing.T) {
+	e := fakeHome(t)
+	body := "Q7wK2mXp9LzR4tVb8NcY"
+	key := "sk" + "-proj-" + body
+	line := `{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:00:00.000Z","message":{"role":"user","content":"ключ ` + key + ` для шлюза"}}` + "\n"
+	path := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", "9f8e7d6c-0000-4000-8000-000000000003.jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for width := 6; width <= 40; width++ {
+		for _, args := range [][]string{
+			{"9f8e7d6c", "--width", strconv.Itoa(width)},
+			{"9f8e7d6c:1", "--width", strconv.Itoa(width)},
+		} {
+			code, out, errOut := runTL(t, e, args...)
+			if code != 0 {
+				t.Errorf("tl %v: code %d", args, code)
+				continue
+			}
+			for n := 6; n <= len(body); n++ {
+				for i := 0; i+n <= len(body); i++ {
+					if strings.Contains(out+errOut, body[i:i+n]) {
+						t.Errorf("tl %v: %d characters of the key body are in the output", args, n)
+						goto next
+					}
+				}
+			}
+		next:
 		}
 	}
 }
