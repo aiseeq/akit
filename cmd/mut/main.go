@@ -632,6 +632,12 @@ func classify(events []event, stderr string, exit int) verdict {
 	if exit != 0 {
 		return verdictOf(fmt.Sprintf("error: go test exit %d: %s", exit, strings.TrimSpace(stderr)), 2, false)
 	}
+	return survivedOrSkipped(s)
+}
+
+// survivedOrSkipped judges a run that passed: every test skipped is an error,
+// otherwise the mutant survived, and the answer names what was skipped.
+func survivedOrSkipped(s testSummary) verdict {
 	if len(s.passed) == 0 && len(s.skipped) > 0 {
 		return verdictOf(fmt.Sprintf("error: every test skipped (%s: %s)", s.skipped[0], s.skipReason), 2, false)
 	}
