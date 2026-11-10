@@ -42,9 +42,17 @@ func TestDeadlineSeparatorsAndShortHours(t *testing.T) {
 
 func TestDeadlineUTCAfterDateClock(t *testing.T) {
 	now := time.Date(2026, 11, 10, 15, 0, 0, 0, time.FixedZone("CET", 3600))
-	for _, wait := range []string{"12.11;9:00 UTC x", "12.11;9:00Z x", "2026-11-12;9:00 UTC x", "2026-11-12;9:00Z x"} {
+	for _, wait := range []string{"12.11;9:00 UTC x", "12.11;9:00Z x", "2026-11-12;9:00 UTC x", "2026-11-12;9:00Z x", "12.11 9:00: UTC x", "12.11 9:00, Z x", "2026-11-12 09:00: UTC x"} {
 		at, ok := Deadline(wait, now)
 		want := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+		if !ok || !at.Equal(want) || at.Location() != time.UTC {
+			t.Errorf("Deadline(%q) = %v, %v; want %v UTC", wait, at, ok, want)
+		}
+	}
+	// A zone after the separator of a date without hours is midnight UTC.
+	for _, wait := range []string{"12.11; Z", "12.11, UTC x", "2026-11-12; UTC"} {
+		at, ok := Deadline(wait, now)
+		want := time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
 		if !ok || !at.Equal(want) || at.Location() != time.UTC {
 			t.Errorf("Deadline(%q) = %v, %v; want %v UTC", wait, at, ok, want)
 		}
