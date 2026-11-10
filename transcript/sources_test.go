@@ -105,3 +105,28 @@ func TestAllSourcesWalkOrderAllowsMissingRoots(t *testing.T) {
 		t.Fatal("non-NotExist root error was ignored")
 	}
 }
+
+// A transcript whose start cannot be read stays listed: reading it later reports it
+// as unreadable, while the other transcripts are still read.
+func TestAllSourcesWindowKeepsUnreadableStart(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, ".claude", "projects", "p")
+	if err := os.MkdirAll(filepath.Join(project, "dir.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	good := filepath.Join(project, "good.jsonl")
+	if err := os.WriteFile(good, []byte(`{"timestamp":"2026-01-01T10:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := AllSourcesWindow(home, time.Time{}, time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC), "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, src := range sources {
+		got[filepath.Base(src.Path)] = true
+	}
+	if !got["good.jsonl"] || !got["dir.jsonl"] {
+		t.Fatalf("sources = %v; want both kept", got)
+	}
+}
