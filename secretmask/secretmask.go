@@ -36,6 +36,24 @@
 //   - Command context detection misses some tool-specific options, non-English
 //     key names, and references such as $ecret. An unquoted value can end at a
 //     quote and leave a tail visible (for example PASSWORD=a'b').
+//   - Tools are known by name: sshpass -p, mysql/mariadb -p, redis-cli -a,
+//     mongo -p, docker login -p, htpasswd -b, gh --with-token <<<, curl -u,
+//     --oauth2-bearer, -b and a Cookie header in -H, and echo piped right into
+//     sudo -S (printf and other writers are not). A Cookie header outside curl
+//     and a bare Bearer value are not hidden.
+//   - A URL user without a password is taken for a token only when it is at
+//     least 8 letters, digits, _ or - with both a letter and a digit: git@ and
+//     user@ stay, deploy2024@ is hidden.
+//   - JSON rules read plain JSON, not JSON written inside a JSON string: an
+//     option and its value as neighbouring array elements, an array under a
+//     secret key, a "value" member of an object under a secret key or after a
+//     "name"/"key" member naming a secret ({"value":…,"name":…} in this order
+//     stays), and -u/--user after curl in an argv.
+//   - Tokens recognized only by their shape are the kinds in patterns; JWT,
+//     glpat- and npm_ values are hidden only after a secret name or option.
+//   - Context rules run only for texts holding their anchor words
+//     (contextAnchors); a secret name counts where it is used as a name, before
+//     : or =, or as an option.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
 package secretmask
@@ -52,17 +70,211 @@ var (
 	escapeRE      = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
 	contextNameRE = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
 
-	headerRE     = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
-	urlRE        = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s/:@]*:([^\s/@]+)@`)
-	urlUserRE    = regexp.MustCompile(`(?i)https?://([^\s/:@]+)@`)
-	flagRE       = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
-	jsonArgsRE   = regexp.MustCompile(`"args"\s*:\s*\[\s*"--(password|passwd|token|secret|api-key|api_key)"\s*,\s*"((?:\\.|[^"\\])*)"`)
-	jsonNamedRE  = regexp.MustCompile(`"name"\s*:\s*"(password|passwd|pwd|auth|credentials|token|secret)"\s*,\s*"value"\s*:\s*"((?:\\.|[^"\\])*)"`)
-	jsonArrayRE  = regexp.MustCompile(`"(password|passwd|pwd|auth|credentials|token|secret)"\s*:\s*\[\s*"((?:\\.|[^"\\])*)"`)
-	jsonNestedRE = regexp.MustCompile(`"(password|passwd|pwd|auth|credentials|token|secret)"\s*:\s*\{\s*"value"\s*:\s*"((?:\\.|[^"\\])*)"`)
-	jsonArgvRE   = regexp.MustCompile(`"argv"\s*:\s*\[\s*"curl"\s*,\s*"-u"\s*,\s*"([^"]*:[^"]*)"`)
-	sudoSRE      = regexp.MustCompile(`sudo[ \t]+-S(?:[ \t]|$)`)
+	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
+	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
 )
+
+// Anchor groups say which context rules can find anything in a text. A text
+// without anchors skips the context rules; one with anchors runs only the rules
+// of the groups it has.
+type anchorGroup uint8
+
+const (
+	anchorName   anchorGroup = 1 << iota // secret names: assignments, flags, JSON keys and arrays
+	anchorHeader                         // Authorization headers
+	anchorURL                            // credentials in a URL
+	anchorCurl                           // curl options, also in a JSON argv
+	anchorTool                           // passwords in tool options and pipelines
+)
+
+// anchorEdge is what must surround an anchor for it to count.
+type anchorEdge uint8
+
+const (
+	// edgeNone: anywhere, also inside a longer word.
+	edgeNone anchorEdge = iota
+	// edgeNameUse: the anchor ends a name, digits aside, as secretName requires,
+	// and the name is used the way the name rules take it: before : or = (or the
+	// comma of a JSON name and value), or as an option. "tokens", "passed" and
+	// "no credentials here" are no anchors; "db_password1=", "--db_password" are.
+	edgeNameUse
+	// edgeCommand: a command word, with the left edge of findCommandWord.
+	edgeCommand
+	// edgeCommandPrefix: a command word that can go on (mysqldump).
+	edgeCommandPrefix
+)
+
+type contextAnchor struct {
+	word  string
+	group anchorGroup
+	edge  anchorEdge
+}
+
+var contextAnchors = [...]contextAnchor{
+	{"authorization", anchorHeader, edgeNone},
+	{"password", anchorName, edgeNameUse}, {"passwd", anchorName, edgeNameUse},
+	{"passphrase", anchorName, edgeNameUse}, {"pass", anchorName, edgeNameUse},
+	{"pwd", anchorName, edgeNameUse}, {"token", anchorName, edgeNameUse},
+	{"api_key", anchorName, edgeNameUse}, {"api-key", anchorName, edgeNameUse},
+	{"apikey", anchorName, edgeNameUse}, {"access_key", anchorName, edgeNameUse},
+	{"private_key", anchorName, edgeNameUse}, {"auth", anchorName, edgeNameUse},
+	{"credentials", anchorName, edgeNameUse},
+	// secretName also takes a name holding secret and ending in key.
+	{"secret", anchorName, edgeNone},
+	{"://", anchorURL, edgeNone},
+	{"curl", anchorCurl, edgeCommand},
+	{"sshpass", anchorTool, edgeCommand}, {"mysql", anchorTool, edgeCommandPrefix},
+	{"mariadb", anchorTool, edgeCommandPrefix}, {"redis-cli", anchorTool, edgeCommand},
+	{"mongo", anchorTool, edgeCommand}, {"docker", anchorTool, edgeCommand},
+	{"htpasswd", anchorTool, edgeCommand}, {"gh", anchorTool, edgeCommand},
+	{"sudo", anchorTool, edgeCommand},
+}
+
+// anchorAutomaton is the Aho-Corasick automaton over contextAnchors with the
+// failure links folded in: next is defined for every byte after anchorFold.
+// A target state where anchors end carries anchorHit in its number.
+type anchorAutomaton struct {
+	next    [][128]uint16
+	anchors [][]uint8 // indices into contextAnchors ending in each state
+}
+
+const anchorHit = 1 << 15
+
+// anchorFold lowers ASCII letters and sends other bytes to 0, which no anchor
+// holds: a byte of a multibyte letter breaks an anchor.
+var anchorFold = func() (fold [256]byte) {
+	for c := range 128 {
+		fold[c] = byte(c)
+		if c >= 'A' && c <= 'Z' {
+			fold[c] = byte(c + 32)
+		}
+	}
+	return fold
+}()
+
+var contextAnchorAutomaton = buildAnchorAutomaton()
+
+func buildAnchorAutomaton() anchorAutomaton {
+	children := [][128]uint16{{}}
+	anchors := [][]uint8{nil}
+	for index, anchor := range contextAnchors {
+		state := 0
+		for i := 0; i < len(anchor.word); i++ {
+			c := anchor.word[i]
+			if children[state][c] == 0 {
+				children = append(children, [128]uint16{})
+				anchors = append(anchors, nil)
+				children[state][c] = uint16(len(children) - 1)
+			}
+			state = int(children[state][c])
+		}
+		anchors[state] = append(anchors[state], uint8(index))
+	}
+	next := make([][128]uint16, len(children))
+	fail := make([]int, len(children))
+	queue := make([]int, 0, len(children))
+	for c := range 128 {
+		if child := children[0][c]; child != 0 {
+			queue = append(queue, int(child))
+		}
+		next[0][c] = children[0][c]
+	}
+	for head := 0; head < len(queue); head++ {
+		state := queue[head]
+		anchors[state] = append(anchors[state], anchors[fail[state]]...)
+		for c := range 128 {
+			child := children[state][c]
+			if child == 0 {
+				next[state][c] = next[fail[state]][c]
+				continue
+			}
+			next[state][c] = child
+			fail[child] = int(next[fail[state]][c])
+			queue = append(queue, int(child))
+		}
+	}
+	for state := range next {
+		for c := range 128 {
+			if len(anchors[next[state][c]]) != 0 {
+				next[state][c] |= anchorHit
+			}
+		}
+	}
+	return anchorAutomaton{next: next, anchors: anchors}
+}
+
+// contextAnchorGroups returns the groups of the anchors found in text, in one
+// pass over it.
+func contextAnchorGroups(text string) anchorGroup {
+	var groups anchorGroup
+	automaton := &contextAnchorAutomaton
+	state := uint16(0)
+	for i := 0; i < len(text); i++ {
+		state = automaton.next[state&^anchorHit][anchorFold[text[i]]]
+		if state&anchorHit == 0 {
+			continue
+		}
+		for _, index := range automaton.anchors[state&^anchorHit] {
+			anchor := contextAnchors[index]
+			if groups&anchor.group == 0 && anchorEdgeAt(text, i+1-len(anchor.word), i+1, anchor.edge) {
+				groups |= anchor.group
+			}
+		}
+	}
+	return groups
+}
+
+func isNameByte(c byte) bool {
+	return isAlphaNum(c) || c == '_' || c == '.' || c == '-'
+}
+
+func nameUsedAt(text string, start, end int) bool {
+	for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+		end++
+	}
+	if end < len(text) && isNameByte(text[end]) {
+		return false
+	}
+	return nameIsOption(text, start) || nameBeforeDelimiter(text, end)
+}
+
+// nameIsOption: the name run holding the anchor starts with a dash. A very long
+// run is taken as one.
+func nameIsOption(text string, start int) bool {
+	run := start
+	for run > 0 && start-run < 64 && isNameByte(text[run-1]) {
+		run--
+	}
+	return text[run] == '-' || run > 0 && isNameByte(text[run-1])
+}
+
+// nameBeforeDelimiter: what contextNameRE allows between a name and its
+// delimiter, then : or =, or the comma of a JSON name and value.
+func nameBeforeDelimiter(text string, at int) bool {
+	for at < len(text) && text[at] == '\\' {
+		at++
+	}
+	if at < len(text) && (text[at] == '"' || text[at] == '\'') {
+		at++
+	}
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	return at < len(text) && (text[at] == ':' || text[at] == '=' || text[at] == ',')
+}
+
+func anchorEdgeAt(text string, start, end int, edge anchorEdge) bool {
+	switch edge {
+	case edgeNameUse:
+		return nameUsedAt(text, start, end)
+	case edgeCommand:
+		return commandLeftBoundary(text, start) && (end == len(text) || !isAlphaNum(text[end]))
+	case edgeCommandPrefix:
+		return commandLeftBoundary(text, start)
+	default:
+		return true
+	}
+}
 
 type contextValue struct {
 	start, end int
@@ -108,7 +320,6 @@ type pattern struct {
 	kind       string
 	variants   []tokenVariant
 	acceptance acceptance
-	firstBytes string
 	re         *regexp.Regexp
 }
 
@@ -122,14 +333,14 @@ type tokenVariant struct {
 // last so it sees the text after more specific tokens have been replaced.
 var patterns = [...]pattern{
 	{kind: "private-key", re: privateKeyRE},
-	{kind: liveKeyKind, variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, acceptance: acceptAlsoStandingAlone, firstBytes: "srp"},
-	{kind: "sk", variants: []tokenVariant{{"sk-proj-", tokenChars, 28}, {"sk-ant-", tokenChars, skAntMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "s"},
-	{kind: "github", variants: []tokenVariant{{"github_pat_", alphaUnderscore, githubPatMinimumLength}}, acceptance: acceptDigitAndRun, firstBytes: "g"},
-	{kind: "github", variants: []tokenVariant{{"ghp_", alphaNum, githubTokenMinimumLength}, {"gho_", alphaNum, githubTokenMinimumLength}, {"ghu_", alphaNum, githubTokenMinimumLength}, {"ghs_", alphaNum, githubTokenMinimumLength}, {"ghr_", alphaNum, githubTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone, firstBytes: "g"},
-	{kind: "slack", variants: []tokenVariant{{"xoxa-", alphaDash, 15}, {"xoxb-", alphaDash, 15}, {"xoxe-", alphaDash, 15}, {"xoxo-", alphaDash, 15}, {"xoxp-", alphaDash, 15}, {"xoxr-", alphaDash, 15}, {"xoxs-", alphaDash, 15}}, acceptance: acceptDigitAndRun, firstBytes: "x"},
+	{kind: liveKeyKind, variants: []tokenVariant{{"sk_live_", alphaNum, 24}, {"sk_test_", alphaNum, 24}, {"rk_live_", alphaNum, 24}, {"rk_test_", alphaNum, 24}, {"pk_live_", alphaNum, 24}, {"pk_test_", alphaNum, 24}}, acceptance: acceptAlsoStandingAlone},
+	{kind: "sk", variants: []tokenVariant{{"sk-proj-", tokenChars, 28}, {"sk-ant-", tokenChars, skAntMinimumLength}}, acceptance: acceptDigitAndRun},
+	{kind: "github", variants: []tokenVariant{{"github_pat_", alphaUnderscore, githubPatMinimumLength}}, acceptance: acceptDigitAndRun},
+	{kind: "github", variants: []tokenVariant{{"ghp_", alphaNum, githubTokenMinimumLength}, {"gho_", alphaNum, githubTokenMinimumLength}, {"ghu_", alphaNum, githubTokenMinimumLength}, {"ghs_", alphaNum, githubTokenMinimumLength}, {"ghr_", alphaNum, githubTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone},
+	{kind: "slack", variants: []tokenVariant{{"xoxa-", alphaDash, 15}, {"xoxb-", alphaDash, 15}, {"xoxe-", alphaDash, 15}, {"xoxo-", alphaDash, 15}, {"xoxp-", alphaDash, 15}, {"xoxr-", alphaDash, 15}, {"xoxs-", alphaDash, 15}}, acceptance: acceptDigitAndRun},
 	{kind: "aws", re: awsRE},
-	{kind: "google", variants: []tokenVariant{{"AIza", tokenChars, googleTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone, firstBytes: "A"},
-	{kind: "sk", variants: []tokenVariant{{"sk-", tokenChars, 23}, {"sk_", tokenChars, 23}}, acceptance: acceptGenericSk, firstBytes: "s"},
+	{kind: "google", variants: []tokenVariant{{"AIza", tokenChars, googleTokenMinimumLength}}, acceptance: acceptAlsoStandingAlone},
+	{kind: "sk", variants: []tokenVariant{{"sk-", tokenChars, 23}, {"sk_", tokenChars, 23}}, acceptance: acceptGenericSk},
 }
 
 // Mask replaces every secret in text with [скрыто:<kind>] and returns the text
@@ -153,8 +364,10 @@ func Mask(text string) (string, map[string]int) {
 			scan = nil // replacements invalidate byte offsets and run metadata
 		}
 	}
-	text = maskJSONContext(text, found)
-	text = maskContext(text, found)
+	if groups := contextAnchorGroups(text); groups != 0 {
+		text = maskJSONContext(text, found, groups)
+		text = maskContext(text, found, groups)
+	}
 	if found[liveKeyKind] != 0 {
 		text = dropLiveKeyTails(text)
 	}
@@ -184,15 +397,28 @@ func dropLiveKeyTails(text string) string {
 }
 
 // Context rules recognize values after familiar command and configuration names.
-func maskContext(text string, found map[string]int) string {
+func maskContext(text string, found map[string]int, groups anchorGroup) string {
 	matches := make([]contextMatch, 0)
-	matches = append(matches, headerMatches(text)...)
-	matches = append(matches, nameMatches(text)...)
-	matches = append(matches, flagMatches(text)...)
-	matches = append(matches, urlMatches(text)...)
-	matches = append(matches, curlMatches(text)...)
-	matches = append(matches, toolPasswordMatches(text)...)
-	matches = append(matches, curlExtraMatches(text)...)
+	if groups&anchorHeader != 0 {
+		matches = append(matches, headerMatches(text)...)
+	}
+	if groups&anchorName != 0 {
+		matches = append(matches, nameMatches(text)...)
+		matches = append(matches, flagMatches(text)...)
+	}
+	if groups&anchorURL != 0 {
+		matches = append(matches, urlMatches(text)...)
+	}
+	if groups&(anchorCurl|anchorTool) != 0 {
+		segments := commandSegments(text)
+		if groups&anchorCurl != 0 {
+			matches = append(matches, curlMatches(text, segments)...)
+			matches = append(matches, curlExtraMatches(text, segments)...)
+		}
+		if groups&anchorTool != 0 {
+			matches = append(matches, toolPasswordMatches(text, segments)...)
+		}
+	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
 	spans := make([]contextSpan, 0, len(matches))
 	last := 0
@@ -206,30 +432,239 @@ func maskContext(text string, found map[string]int) string {
 	return replaceSpans(text, spans, found)
 }
 
-func maskJSONContext(text string, found map[string]int) string {
+// maskJSONContext hides values that JSON keeps apart from their name: an
+// option and its value as neighbouring array elements, an array or an object
+// under a secret key, and a {"name": ..., "value": ...} pair.
+func maskJSONContext(text string, found map[string]int, groups anchorGroup) string {
+	if groups&(anchorName|anchorCurl) == 0 {
+		return text
+	}
 	var spans []contextSpan
-	for _, re := range []*regexp.Regexp{jsonArgsRE, jsonNamedRE, jsonArrayRE, jsonNestedRE} {
-		for _, ix := range re.FindAllStringSubmatchIndex(text, -1) {
-			kind, ok := secretName(text[ix[2]:ix[3]])
-			if !ok {
-				kind = "token"
-			}
-			spans = append(spans, contextSpan{ix[4], ix[5], kind})
+	for at := 0; ; {
+		next := strings.IndexByte(text[at:], '[')
+		if next < 0 {
+			break
+		}
+		at += next
+		elements := jsonStringElements(text, at)
+		spans = append(spans, jsonArraySpans(text, at, elements, groups)...)
+		// A bracket inside a string already read opens no array: skipping them
+		// keeps the pass linear.
+		at++
+		if len(elements) != 0 {
+			at = elements[len(elements)-1][1] + 1
 		}
 	}
-	for _, ix := range jsonArgvRE.FindAllStringIndex(text, -1) {
-		segment := text[ix[0]:ix[1]]
-		colon := strings.LastIndexByte(segment, ':')
-		if colon < 0 {
+	if groups&anchorName != 0 {
+		spans = append(spans, jsonValueMemberSpans(text)...)
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	kept := spans[:0]
+	last := 0
+	for _, span := range spans {
+		if span.start >= last {
+			kept = append(kept, span)
+			last = span.end
+		}
+	}
+	return replaceSpans(text, kept, found)
+}
+
+// jsonString returns the content of the JSON string opening at quote, or false.
+func jsonString(text string, quote int) (int, int, bool) {
+	if quote >= len(text) || text[quote] != '"' {
+		return 0, 0, false
+	}
+	for i := quote + 1; i < len(text); i++ {
+		switch text[i] {
+		case '\\':
+			i++
+		case '"':
+			return quote + 1, i, true
+		}
+	}
+	return 0, 0, false
+}
+
+func skipJSONSpace(text string, at int) int {
+	for at < len(text) && strings.ContainsRune(" \t\r\n", rune(text[at])) {
+		at++
+	}
+	return at
+}
+
+func skipJSONSpaceBack(text string, at int) int {
+	for at > 0 && strings.ContainsRune(" \t\r\n", rune(text[at-1])) {
+		at--
+	}
+	return at
+}
+
+// jsonKeyBefore returns the key of the member whose value starts at at: "key": here.
+func jsonKeyBefore(text string, at int) (string, bool) {
+	at = skipJSONSpaceBack(text, at)
+	if at == 0 || text[at-1] != ':' {
+		return "", false
+	}
+	return jsonStringBefore(text, at-1)
+}
+
+// jsonStringBefore returns a short plain string ending right before at, spaces
+// aside: a name has no escapes, and the bound keeps the look back short.
+func jsonStringBefore(text string, at int) (string, bool) {
+	at = skipJSONSpaceBack(text, at)
+	if at == 0 || text[at-1] != '"' {
+		return "", false
+	}
+	end := at - 1
+	start := strings.LastIndexByte(text[max(end-128, 0):end], '"')
+	if start < 0 {
+		return "", false
+	}
+	start += max(end-128, 0) + 1
+	name := text[start:end]
+	if name == "" || strings.ContainsAny(name, "\\ \t\r\n") {
+		return "", false
+	}
+	return name, true
+}
+
+// jsonArraySpans looks at the strings of the array opening at open: under a
+// secret key all of them are values; a secret option hides the element after
+// it; in a curl argv -u hides the password part of the next element.
+func jsonArraySpans(text string, open int, elements [][2]int, groups anchorGroup) []contextSpan {
+	if len(elements) == 0 {
+		return nil
+	}
+	if groups&anchorName != 0 {
+		if key, ok := jsonKeyBefore(text, open); ok {
+			if kind, secret := secretName(key); secret {
+				var spans []contextSpan
+				for _, element := range elements {
+					spans = appendJSONValue(spans, text, element, kind)
+				}
+				return spans
+			}
+		}
+	}
+	return jsonArgumentSpans(text, elements, groups)
+}
+
+// jsonStringElements lists the contents of the leading strings of the array
+// opening at open, up to its end or its first other element.
+func jsonStringElements(text string, open int) [][2]int {
+	var elements [][2]int
+	at := skipJSONSpace(text, open+1)
+	for {
+		start, end, ok := jsonString(text, at)
+		if !ok {
+			return elements
+		}
+		elements = append(elements, [2]int{start, end})
+		at = skipJSONSpace(text, end+1)
+		if at >= len(text) || text[at] != ',' {
+			return elements
+		}
+		at = skipJSONSpace(text, at+1)
+	}
+}
+
+func appendJSONValue(spans []contextSpan, text string, element [2]int, kind string) []contextSpan {
+	if quotedIsValue(text[element[0]:element[1]]) {
+		spans = append(spans, contextSpan{element[0], element[1], kind})
+	}
+	return spans
+}
+
+// jsonArgumentSpans reads the array as command arguments: a secret option hides
+// the next element, and after curl -u or --user hides its password part.
+func jsonArgumentSpans(text string, elements [][2]int, groups anchorGroup) []contextSpan {
+	var spans []contextSpan
+	curl := false
+	for i := 0; i+1 < len(elements); i++ {
+		word := text[elements[i][0]:elements[i][1]]
+		next := elements[i+1]
+		switch {
+		case word == "curl" || strings.HasSuffix(word, "/curl"):
+			curl = groups&anchorCurl != 0
+		case curl && (word == "--user" || jsonCurlUserFlag(word)):
+			if colon := strings.IndexByte(text[next[0]:next[1]], ':'); colon >= 0 {
+				spans = appendJSONValue(spans, text, [2]int{next[0] + colon + 1, next[1]}, "password")
+			}
+			i++
+		case groups&anchorName != 0 && strings.HasPrefix(word, "-") && !strings.Contains(word, "="):
+			if kind, ok := optionSecretName(strings.TrimLeft(word, "-")); ok && flagValueAllowed(text[next[0]:next[1]]) {
+				spans = appendJSONValue(spans, text, next, kind)
+				i++
+			}
+		}
+	}
+	return spans
+}
+
+// optionSecretName is secretName for an option name; options that turn a
+// secret off or ask for it hold none.
+func optionSecretName(name string) (string, bool) {
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, "no-") || strings.HasPrefix(lower, "ask-") || strings.HasPrefix(lower, "prompt-") {
+		return "", false
+	}
+	return secretName(name)
+}
+
+// jsonCurlUserFlag: -u, alone or closing a group of short options (-su).
+func jsonCurlUserFlag(word string) bool {
+	return len(word) >= 2 && word[0] == '-' && word[len(word)-1] == 'u' && onlyLetters(word[1:])
+}
+
+// jsonValueMemberSpans hides the string of a "value" member when its object
+// sits under a secret key, {"token":{"value":"…"}}, or names a secret,
+// {"name":"password","value":"…"}.
+func jsonValueMemberSpans(text string) []contextSpan {
+	const member = `"value"`
+	var spans []contextSpan
+	for at := 0; ; {
+		next := strings.Index(text[at:], member)
+		if next < 0 {
+			return spans
+		}
+		at += next
+		keyAt := at
+		at += len(member)
+		colon := skipJSONSpace(text, at)
+		if colon >= len(text) || text[colon] != ':' {
 			continue
 		}
-		start := ix[0] + colon + 1
-		end := ix[1] - 1
-		if start < end {
-			spans = append(spans, contextSpan{start, end, "password"})
+		start, end, ok := jsonString(text, skipJSONSpace(text, colon+1))
+		if !ok || !quotedIsValue(text[start:end]) {
+			continue
+		}
+		before := skipJSONSpaceBack(text, keyAt)
+		if before == 0 {
+			continue
+		}
+		var name string
+		switch text[before-1] {
+		case '{':
+			name, ok = jsonKeyBefore(text, before-1)
+		case ',':
+			var label string
+			name, ok = jsonStringBefore(text, before-1)
+			if ok {
+				label, ok = jsonKeyBefore(text, before-1-len(name)-2)
+				ok = ok && (label == "name" || label == "key")
+			}
+		default:
+			ok = false
+		}
+		if !ok {
+			continue
+		}
+		if kind, secret := secretName(name); secret {
+			spans = append(spans, contextSpan{start, end, kind})
+			at = end
 		}
 	}
-	return replaceSpans(text, spans, found)
 }
 
 func headerMatches(text string) []contextMatch {
@@ -288,11 +723,7 @@ func flagMatches(text string) []contextMatch {
 			continue
 		}
 		name := text[ix[2]:ix[3]]
-		lower := strings.ToLower(name)
-		if strings.HasPrefix(lower, "no-") || strings.HasPrefix(lower, "ask-") || strings.HasPrefix(lower, "prompt-") {
-			continue
-		}
-		kind, ok := secretName(name)
+		kind, ok := optionSecretName(name)
 		if !ok {
 			continue
 		}
@@ -321,39 +752,97 @@ func flagMatches(text string) []contextMatch {
 	return matches
 }
 
+// urlMatches finds credentials in scheme://user:password@ and a token standing
+// for the user, scheme://token@ (see urlUserIsToken).
 func urlMatches(text string) []contextMatch {
 	var matches []contextMatch
-	for _, ix := range urlRE.FindAllStringSubmatchIndex(text, -1) {
-		if withinMaskMarker(text, ix[2]) {
+	for at := 0; ; {
+		next := strings.Index(text[at:], "://")
+		if next < 0 {
+			return matches
+		}
+		at += next + len("://")
+		if !urlSchemeBefore(text, at-len("://")) {
 			continue
 		}
-		value, ok := scanValue(text, ix[2], false)
-		if !ok {
-			continue
-		}
-		if value.end > ix[3] {
-			value.end = ix[3]
-		}
-		if valueIsValue(text, value, "", "password", false) {
-			matches = append(matches, contextMatch{value.start, value.end, "password"})
+		if match, ok := urlCredential(text, at); ok {
+			matches = append(matches, match)
 		}
 	}
-	for _, ix := range urlUserRE.FindAllStringSubmatchIndex(text, -1) {
-		if withinMaskMarker(text, ix[2]) {
-			continue
+}
+
+// urlCredential reads the authority starting at at: a token user before @, or
+// the password after user: and before @.
+func urlCredential(text string, at int) (contextMatch, bool) {
+	userEnd := at
+	for userEnd < len(text) && !urlStop(text[userEnd]) && text[userEnd] != ':' {
+		userEnd++
+	}
+	if userEnd == len(text) || text[userEnd] == '/' || withinMaskMarker(text, at) {
+		return contextMatch{}, false
+	}
+	if text[userEnd] == '@' {
+		return contextMatch{at, userEnd, "token"}, userEnd > at && urlUserIsToken(text[at:userEnd])
+	}
+	if text[userEnd] != ':' {
+		return contextMatch{}, false
+	}
+	passwordAt := userEnd + 1
+	passwordEnd := passwordAt
+	for passwordEnd < len(text) && !urlStop(text[passwordEnd]) {
+		passwordEnd++
+	}
+	if passwordEnd == passwordAt || passwordEnd == len(text) || text[passwordEnd] != '@' || withinMaskMarker(text, passwordAt) {
+		return contextMatch{}, false
+	}
+	value, ok := scanValue(text, passwordAt, false)
+	if !ok {
+		return contextMatch{}, false
+	}
+	value.end = min(value.end, passwordEnd)
+	return contextMatch{value.start, value.end, "password"}, valueIsValue(text, value, "", "password", false)
+}
+
+// urlStop ends the user and the password of a URL.
+func urlStop(c byte) bool {
+	return c == '@' || c == '/' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+}
+
+// urlSchemeBefore: a scheme with a letter ends at this place.
+func urlSchemeBefore(text string, end int) bool {
+	for i := end - 1; i >= 0; i-- {
+		c := text[i]
+		if isLetter(c) {
+			return true
 		}
-		if ix[3] >= len(text) || text[ix[3]] != '@' {
-			continue
-		}
-		value, ok := scanValue(text, ix[2], false)
-		if ok && value.end > ix[3] {
-			value.end = ix[3]
-		}
-		if ok && valueIsValue(text, value, "", "password", false) {
-			matches = append(matches, contextMatch{value.start, value.end, "password"})
+		if !(c >= '0' && c <= '9' || c == '+' || c == '.' || c == '-') {
+			return false
 		}
 	}
-	return matches
+	return false
+}
+
+// urlUserIsToken: a user name of a URL is taken for a token when it is at
+// least 8 characters of letters, digits, _ and -, with both a letter and a
+// digit. Plain names (git, user, deploy) stay; a name with digits of that
+// length (deploy2024) is hidden too.
+func urlUserIsToken(user string) bool {
+	if len(user) < 8 {
+		return false
+	}
+	letter, digit := false, false
+	for i := 0; i < len(user); i++ {
+		c := user[i]
+		switch {
+		case isLetter(c):
+			letter = true
+		case c >= '0' && c <= '9':
+			digit = true
+		case c != '_' && c != '-':
+			return false
+		}
+	}
+	return letter && digit
 }
 
 func addToolPassword(text string, offset, at int, matches *[]contextMatch) {
@@ -447,21 +936,31 @@ func commandSegments(text string) [][2]int {
 		}
 	}
 	segments = append(segments, [2]int{start, len(text)})
+	// Inside a quote, a command can start a new line or follow a separator:
+	// each piece is searched once more, the pieces not overlapping.
 	for _, span := range quoted {
-		if span[1]-span[0] > 2 {
-			segments = append(segments, [2]int{span[0] + 1, span[1] - 1})
-			for i := span[0] + 1; i < span[1]-1; i++ {
-				n := 0
-				if text[i] == '\n' || text[i] == '\r' {
-					n = 1
-				} else {
-					n = literalSpaceAt(text, i)
-				}
-				if n > 0 && i+n < span[1]-1 {
-					segments = append(segments, [2]int{i + n, span[1] - 1})
-					i += n - 1
+		piece := span[0] + 1
+		for i := piece; i < span[1]-1; i++ {
+			n := 0
+			switch {
+			case strings.ContainsRune("\n\r;|&", rune(text[i])):
+				n = 1
+			case text[i] == '\\':
+				if n = literalSpaceAt(text, i); n > 0 && text[i+n-1] == 't' {
+					n = 0
 				}
 			}
+			if n == 0 {
+				continue
+			}
+			if piece < i {
+				segments = append(segments, [2]int{piece, i})
+			}
+			piece = i + n
+			i += n - 1
+		}
+		if piece < span[1]-1 {
+			segments = append(segments, [2]int{piece, span[1] - 1})
 		}
 	}
 	return segments
@@ -541,7 +1040,8 @@ func quotedIsValue(value string) bool {
 }
 
 func bareIsValue(value, name, kind string, colon bool) bool {
-	if value == "" || isReference(value) || isPlaceholder(value) || strings.Contains(value, maskMarker) || strings.ContainsAny(value, "('") || equalSecretName(value, name) {
+	// A lone bracket opens an array or an object; the JSON rules look inside.
+	if value == "" || value == "[" || value == "{" || isReference(value) || isPlaceholder(value) || strings.Contains(value, maskMarker) || strings.ContainsAny(value, "('") || equalSecretName(value, name) {
 		return false
 	}
 	if strings.Contains(value, ".") {
@@ -680,12 +1180,12 @@ func replaceSpans(text string, spans []contextSpan, found map[string]int) string
 func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIndex) {
 	var accepted [][]int
 	var bodyEnds [4]bodyEndCache
+	heads := prefixHeads(p.variants)
 	for offset := 0; offset < len(text); {
-		relative := strings.IndexAny(text[offset:], p.firstBytes)
-		if relative < 0 {
+		offset = nextPrefixHead(text, offset, heads)
+		if offset < 0 {
 			break
 		}
-		offset += relative
 		variant, matched := matchingPrefix(text, offset, p.variants)
 		if !matched {
 			offset++
@@ -711,6 +1211,47 @@ func findTokenMatches(text string, p pattern, scan *scanIndex) ([][]int, *scanIn
 		}
 	}
 	return accepted, scan
+}
+
+// prefixHead is the start of a variant prefix and its next place in the text
+// at or after the offset last asked; the search for each runs over the text once.
+type prefixHead struct {
+	head string
+	at   int // -1: not searched yet; len(text): none left
+}
+
+func prefixHeads(variants []tokenVariant) []prefixHead {
+	var heads []prefixHead
+	for _, variant := range variants {
+		head := variant.prefix[:min(3, len(variant.prefix))]
+		known := false
+		for _, h := range heads {
+			known = known || h.head == head
+		}
+		if !known {
+			heads = append(heads, prefixHead{head, -1})
+		}
+	}
+	return heads
+}
+
+// nextPrefixHead returns the first place at or after offset where a variant
+// prefix can start, or -1.
+func nextPrefixHead(text string, offset int, heads []prefixHead) int {
+	next := -1
+	for i := range heads {
+		h := &heads[i]
+		if h.at < offset {
+			h.at = len(text)
+			if at := strings.Index(text[offset:], h.head); at >= 0 {
+				h.at = offset + at
+			}
+		}
+		if h.at < len(text) && (next < 0 || h.at < next) {
+			next = h.at
+		}
+	}
+	return next
 }
 
 func matchingPrefix(text string, start int, variants []tokenVariant) (tokenVariant, bool) {
@@ -924,9 +1465,9 @@ func hasFlagSpaceAt(text string, at int) bool {
 	return hasHorizontalSpaceAt(text, at) || strings.HasPrefix(text[at:], "\\\n") || literalSpaceAt(text, at) > 0
 }
 
-func curlMatches(text string) []contextMatch {
+func curlMatches(text string, segments [][2]int) []contextMatch {
 	var matches []contextMatch
-	for _, segment := range commandSegments(text) {
+	for _, segment := range segments {
 		part := text[segment[0]:segment[1]]
 		command, ok := findCommandWord(part, "curl", false)
 		if !ok {
@@ -1012,48 +1553,91 @@ func curlPassword(text string, at int) (contextValue, bool) {
 	return password, ok && valueIsValue(text, password, "", "password", false)
 }
 
-func toolPasswordMatches(text string) []contextMatch {
+func toolPasswordMatches(text string, segments [][2]int) []contextMatch {
 	var matches []contextMatch
-	matches = append(matches, sudoPipelineMatches(text)...)
-	for _, segment := range commandSegments(text) {
+	for _, segment := range segments {
 		part := text[segment[0]:segment[1]]
-		matches = append(matches, commandToolPasswordMatches(part, segment[0])...)
+		sshpassMatches(part, segment[0], &matches)
+		mysqlMatches(part, "mysql", segment[0], &matches)
+		mysqlMatches(part, "mariadb", segment[0], &matches)
+		ghTokenMatches(part, segment[0], &matches)
+		optionPasswordMatches(part, segment[0], "redis-cli", "-a", &matches)
+		optionPasswordMatches(part, segment[0], "mongo", "-p", &matches)
+		dockerPasswordMatches(part, segment[0], &matches)
+		htpasswdMatches(part, segment[0], &matches)
+		sudoStdinMatches(text, segment, &matches)
 	}
 	return matches
 }
 
-func commandToolPasswordMatches(part string, offset int) []contextMatch {
-	var matches []contextMatch
-	sshpassMatches(part, offset, &matches)
-	mysqlMatches(part, "mysql", offset, &matches)
-	mysqlMatches(part, "mariadb", offset, &matches)
-	ghTokenMatches(part, offset, &matches)
-	optionPasswordMatches(part, offset, "redis-cli", "-a", &matches)
-	optionPasswordMatches(part, offset, "mongo", "-p", &matches)
-	dockerPasswordMatches(part, offset, &matches)
-	htpasswdMatches(part, offset, &matches)
-	sudoCommandMatches(part, offset, &matches)
-	return matches
-}
-
-func sudoPipelineMatches(text string) []contextMatch {
-	var matches []contextMatch
-	for _, ix := range sudoSRE.FindAllStringIndex(text, -1) {
-		pipe := strings.LastIndexByte(text[:ix[0]], '|')
-		if pipe < 0 {
-			continue
-		}
-		before := text[:pipe]
-		echo := strings.LastIndex(before, "echo ")
-		if echo < 0 {
-			continue
-		}
-		value, ok := scanValue(text, echo+len("echo "), false)
-		if ok {
-			matches = append(matches, contextMatch{value.start, value.end, "password"})
+// sudoStdinMatches hides the word echo hands to sudo -S, which reads the
+// password from its input: echo VALUE | sudo -S cmd. Echo is the command right
+// before the pipe, with no command separator between them.
+func sudoStdinMatches(text string, segment [2]int, matches *[]contextMatch) {
+	part := text[segment[0]:segment[1]]
+	command, ok := findCommandWord(part, "sudo", false)
+	if !ok || !sudoReadsStdin(wordsAfter(part, command.end), part) {
+		return
+	}
+	pipe := skipJSONSpaceBack(text, segment[0]+command.start) - 1
+	if pipe < 0 || text[pipe] != '|' || pipe > 0 && text[pipe-1] == '|' {
+		return
+	}
+	from := max(pipe-1024, 0)
+	for i := pipe - 1; i >= from; i-- {
+		if strings.ContainsRune(";&|\n\r", rune(text[i])) || i > 0 && text[i-1] == '\\' && (text[i] == 'n' || text[i] == 'r') {
+			from = i + 1
+			break
 		}
 	}
-	return matches
+	command, ok = findCommandWord(text[from:pipe], "echo", false)
+	if !ok {
+		return
+	}
+	echo := text[from:pipe]
+	words := wordsAfter(echo, command.end)
+	for {
+		start, end, ok := words.next()
+		if !ok {
+			return
+		}
+		if !strings.HasPrefix(echo[start:end], "-") {
+			value, ok := scanValue(echo, start, false)
+			if ok && valueIsValue(echo, value, "", "password", false) {
+				*matches = append(*matches, contextMatch{from + value.start, from + value.end, "password"})
+			}
+			return
+		}
+	}
+}
+
+// sudoReadsStdin: the options of sudo, before its command, hold -S or --stdin.
+// The options taking a value skip it.
+func sudoReadsStdin(words *shellWords, part string) bool {
+	for {
+		start, end, ok := words.next()
+		if !ok {
+			return false
+		}
+		word := part[start:end]
+		switch {
+		case word == "--stdin":
+			return true
+		case word == "--":
+			return false
+		case strings.HasPrefix(word, "--"):
+			continue
+		case len(word) > 1 && word[0] == '-' && onlyLetters(word[1:]):
+			if strings.ContainsRune(word, 'S') {
+				return true
+			}
+			if strings.ContainsRune("ugpCDhrtTU", rune(word[len(word)-1])) {
+				words.next()
+			}
+		default:
+			return false
+		}
+	}
 }
 
 func ghTokenMatches(part string, offset int, matches *[]contextMatch) {
@@ -1126,29 +1710,6 @@ func htpasswdMatches(part string, offset int, matches *[]contextMatch) {
 	}
 }
 
-func sudoCommandMatches(part string, offset int, matches *[]contextMatch) {
-	command, ok := findCommandWord(part, "sudo", false)
-	if !ok {
-		return
-	}
-	words := wordsAfter(part, command.end)
-	for {
-		start, end, ok := words.next()
-		if !ok {
-			return
-		}
-		if part[start:end] == "-S" && strings.Contains(part[:start], "echo ") {
-			before := strings.TrimSpace(part[:start])
-			if !strings.HasPrefix(before, "echo ") {
-				return
-			}
-			at := strings.Index(part, "echo ") + len("echo ")
-			addToolPassword(part, offset, at, matches)
-			return
-		}
-	}
-}
-
 func optionPasswordMatches(part string, offset int, tool, option string, matches *[]contextMatch) {
 	commandEnd := 0
 	if tool != "" {
@@ -1178,9 +1739,9 @@ func optionPasswordMatches(part string, offset int, tool, option string, matches
 	}
 }
 
-func curlExtraMatches(text string) []contextMatch {
+func curlExtraMatches(text string, segments [][2]int) []contextMatch {
 	var matches []contextMatch
-	for _, segment := range commandSegments(text) {
+	for _, segment := range segments {
 		part := text[segment[0]:segment[1]]
 		command, ok := findCommandWord(part, "curl", false)
 		if !ok {
