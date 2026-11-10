@@ -281,3 +281,13 @@ func TestGrepFindsComposedText(t *testing.T) {
 		}
 	}
 }
+
+// A flag name other tools use for the event count points to --max.
+func TestUnknownCountFlagNamesMax(t *testing.T) {
+	for _, name := range []string{"--limit", "--head", "-n"} {
+		_, err := parseArgs([]string{name, "3"}, time.Now())
+		if err == nil || !strings.Contains(err.Error(), "--max") {
+			t.Errorf("%s: error %v, want a pointer to --max", name, err)
+		}
+	}
+}

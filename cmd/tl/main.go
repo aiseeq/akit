@@ -273,10 +273,16 @@ func setFlag(opts *options, name, val string, now time.Time) error {
 		opts.width, err = nonNegative(name, val)
 		opts.widthSet = true
 	default:
+		if countFlags[name] {
+			return fmt.Errorf("unknown flag %s: the number of events is --max N", name)
+		}
 		return fmt.Errorf("unknown flag %s", name)
 	}
 	return err
 }
+
+// countFlags — names other tools give to an output limit; tl answers with its own flag instead of a second name for it.
+var countFlags = map[string]bool{"--limit": true, "--head": true, "-n": true}
 
 func nonNegative(name, val string) (int, error) {
 	n, err := strconv.Atoi(val)
