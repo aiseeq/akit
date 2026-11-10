@@ -196,6 +196,75 @@ func TestPairPageShotLocalOnly(t *testing.T) {
 	}
 }
 
+func TestTimeitPairDetection(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	for _, tc := range []struct{ command, goal string }{
+		{"time -p go test ./pkg/sample", "go test ./pkg/sample"},
+		{"time go test ./pkg/sample", "go test ./pkg/sample"},
+		{"/usr/bin/time go test ./pkg/sample", "go test ./pkg/sample"},
+		{"start=$(date +%s%N); go test ./pkg/sample; end=$(date +%s%N); echo $((end-start))", "go test ./pkg/sample"},
+		{"start=$(date +%s); go test ./pkg/sample; end=$(date +%s); expr \"$end - $start\"", "go test ./pkg/sample"},
+	} {
+		calls, err := shellcmd.Calls(tc.command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for i := range calls {
+			if way, goal := u.oldPair(calls[i], tc.command); way == "timeit" {
+				if goal != tc.goal {
+					t.Errorf("%q goal=%q, want %q", tc.command, goal, tc.goal)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%q was not classified as a timeit pair", tc.command)
+		}
+	}
+	for _, command := range []string{
+		"date +%s", "date +%s%N > /synthetic/marker", "grep time /synthetic/file",
+		"echo 'time to go'", "timeout go test ./pkg/sample", "go test -timeout 30s ./pkg/sample",
+	} {
+		calls, err := shellcmd.Calls(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range calls {
+			if way, _ := u.oldPair(calls[i], command); way == "timeit" {
+				t.Errorf("non-timing command %q classified as timeit", command)
+			}
+		}
+	}
+}
+
+func TestTimeitPairNewAndCandidates(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	base := time.Now().UTC()
+	cmd := "timeit --runs 1 -- go test ./pkg/sample"
+	evs := []transcript.Event{
+		{Role: transcript.Cmd, Who: "Bash", CallID: "timed", Line: 1, Time: base, Text: cmd},
+		{Role: transcript.Out, CallID: "timed", Line: 2, Time: base.Add(time.Second), Text: "12\n"},
+	}
+	u.collectPairEvents("synthetic-session", true, nil, evs, map[string]transcript.Event{"timed": evs[1]}, nil)
+	if len(u.pairCalls) != 1 || u.pairCalls[0].tool != "timeit" || u.pairCalls[0].way != "new" || u.pairCalls[0].goal != "go test ./pkg/sample" || u.pairCalls[0].outcome != "answer" {
+		t.Fatalf("timeit new call not collected: %+v", u.pairCalls)
+	}
+	candidates := u.candidateClasses(strings.ToLower("time /synthetic/file"), "time /synthetic/file")
+	if !candidates["timeit"] {
+		t.Fatal("timeit candidate with a recognized old timing command was not yes")
+	}
+	if !contains(u.utilityNames, "timeit") || !strings.Contains(pairToolNames, "timeit") {
+		t.Fatal("timeit missing from utility or pair names")
+	}
+	var report strings.Builder
+	u.writePairReport(&report)
+	if !strings.Contains(report.String(), "| timeit |") {
+		t.Fatal("timeit row missing from report")
+	}
+}
+
 func TestPairPriorTasksSeparate(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
 	cs, _ := shellcmd.Calls("rg deadline docs/tasks/")
@@ -208,7 +277,7 @@ func TestPairReleasesDate(t *testing.T) {
 	d := t.TempDir()
 	path := filepath.Join(d, "releases.tsv")
 	available := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
-	releaseData := fmt.Sprintf("busy\t%s\t\nprior\t\t\nuser-word\t\t\npage-shot\t\t\nclaude-rules-export\t\t\nwfor\t\t\n", available)
+	releaseData := fmt.Sprintf("busy\t%s\t\nprior\t\t\nuser-word\t\t\npage-shot\t\t\nclaude-rules-export\t\t\ntimeit\t\t\nwfor\t\t\n", available)
 	if err := os.WriteFile(path, []byte(releaseData), 0600); err != nil {
 		t.Fatal(err)
 	}
