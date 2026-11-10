@@ -39,11 +39,8 @@ const SpecHelp = `Spec format (stdin or -F file), one or more blocks:
   >>>>>>> REPLACE
 
 The path line names the file for the blocks after it, until the next path line.
-With "sub FILE" the blocks need no path line: all of them go to FILE; a path
-line, if present, must name FILE.
-"<<<<<<< SEARCH 3" expects exactly 3 matches (default 1). Blocks apply in order,
-each to the file as the previous blocks left it. Text is matched exactly, as a
-substring: whitespace and indentation count. A line that is a marker (spaces
+"<<<<<<< SEARCH 3" expects exactly 3 matches (default 1). Text is matched
+exactly, as a substring: whitespace and indentation count. A line that is a marker (spaces
 around it ignored) cannot be part of the text; use OLD NEW FILE... for such
 edits.`
 

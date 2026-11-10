@@ -36,6 +36,13 @@ files with hard links are refused because replacement would break those links. E
 
 `
 
+// subSpecHelp holds the spec rules only sub has: blocks build on each other
+// (mut runs each block as a separate mutant) and the "sub FILE" form.
+const subSpecHelp = `Blocks apply in order, each to the file as the previous blocks left it.
+With "sub FILE" the blocks need no path line: all of them go to FILE; a path
+line, if present, must name FILE.
+`
+
 // exitMismatch — число совпадений не сошлось, exitUsage — ошибка вызова или чтения.
 const (
 	exitMismatch = 1
@@ -52,7 +59,7 @@ type options struct {
 func main() {
 	opts, err := parseArgs(os.Args[1:])
 	if errors.Is(err, errHelp) {
-		fmt.Print(usage + edit.SpecHelp + "\n")
+		fmt.Print(usage + edit.SpecHelp + "\n" + subSpecHelp)
 		return
 	}
 	if err != nil {
