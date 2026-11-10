@@ -29,11 +29,11 @@ tasks:
     env: {GOWORK: "off"}
     run: [glint check .]
 
-# Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок high (low и medium гейт пропускает, их не пускает tk done).
+# Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок high и critical (low и medium гейт пропускает, их не пускает tk done).
 gate:
   - sh: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
   - task: test
-  # glint падает кодом выхода на находке high (умолчание fail_on); остальные проверяет tk done.
+  # glint падает кодом выхода на находке high и выше (умолчание fail_on); остальные проверяет tk done.
   - task: glint
 
 version:
