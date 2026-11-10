@@ -23,6 +23,19 @@ func fakeStat(t *testing.T, root string, pid, parent int, name, state string) {
 	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(line), 0600); err != nil {
 		t.Fatal(err)
 	}
+	fakeExe(t, root, pid, "/usr/bin/"+name)
+}
+
+// fakeExe points the fake process's exe link at a program.
+func fakeExe(t *testing.T, root string, pid int, exe string) {
+	t.Helper()
+	link := filepath.Join(root, strconv.Itoa(pid), "exe")
+	if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(exe, link); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestValidateStop(t *testing.T) {

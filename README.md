@@ -18,8 +18,8 @@ including processes found while waiting (such as a cleanup the target starts on
 the request), after the grace. Its answer says whether SIGKILL was needed and how
 many processes received it. A failure for one process does not stop the others:
 `stop` then exits 1 naming each failed PID. It accepts a descendant of itself or
-of the consecutive shells directly above it, allowing calls from a shell,
-`$(...)`, and `bash -c`. A non-shell (a terminal, a multiplexer, an agent, any
+of the consecutive shells directly above it (told by the program they run, so
+scripts count), allowing calls from a shell, a script, `$(...)`, and `bash -c`. A non-shell (a terminal, a multiplexer, an agent, any
 program) and a service manager are never owners, even as the direct parent: a
 shell running `stop` as its last command replaces itself with it. Stopping a job
 of another terminal tab or another agent call is not this tool's job; a program

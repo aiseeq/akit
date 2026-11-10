@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -98,5 +99,40 @@ func TestStopTreeLibraryLimits(t *testing.T) {
 				t.Errorf("accepted grace %v: %v", g, err)
 			}
 		})
+	}
+}
+
+// A script started by its path with a #!/bin/sh line is named after the script,
+// so a shell is told by the program it runs: the script's shell owns its jobs,
+// a renamed non-shell does not, and an unreadable exe ends the chain.
+func TestValidateStopShellByProgram(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []struct {
+		pid, parent int
+		name        string
+	}{
+		{1, 0, "init"}, {10, 1, "agent"}, {20, 10, "bash"}, {30, 20, "run-jobs"},
+		{40, 30, "stop"}, {50, 20, "sleep"}, {60, 30, "sleep"},
+	} {
+		fakeStat(t, root, p.pid, p.parent, p.name, "S")
+	}
+	fakeExe(t, root, 30, "/usr/bin/bash")
+	for _, pid := range []int{50, 60} {
+		if _, err := validateStop(root, 40, pid, true); err != nil {
+			t.Errorf("refused %d under the script's shell chain: %v", pid, err)
+		}
+	}
+	fakeStat(t, root, 70, 10, "bash", "S")
+	fakeExe(t, root, 70, "/usr/bin/python3")
+	fakeStat(t, root, 80, 70, "stop", "S")
+	fakeStat(t, root, 90, 70, "sleep", "S")
+	if _, err := validateStop(root, 80, 90, true); err == nil {
+		t.Error("accepted a job of a non-shell renamed bash")
+	}
+	if err := os.Remove(root + "/30/exe"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateStop(root, 40, 50, true); err == nil {
+		t.Error("accepted 50 above a parent with an unreadable exe")
 	}
 }

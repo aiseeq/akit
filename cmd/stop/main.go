@@ -16,8 +16,8 @@ import (
 const usage = `Usage: stop [--grace D] [--signal S] PID
 
 Stop a descendant of stop itself or of the consecutive shells (bash, sh, dash,
-zsh, ksh) directly above it. This permits calls from a shell, $(...) and
-bash -c. A non-shell (a terminal, a multiplexer, an agent, any program) and a
+zsh, ksh, told by the program they run, so scripts count) directly above it.
+This permits calls from a shell, a script, $(...) and bash -c. A non-shell (a terminal, a multiplexer, an agent, any program) and a
 service manager are never owners, even as the direct parent: stop does not
 reach jobs of another terminal tab or another agent call. A program stopping
 its own child uses proc.StopChild. This rule is not an isolation boundary

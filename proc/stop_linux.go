@@ -47,8 +47,17 @@ func serviceManager(pid int, s Stat) bool {
 	return pid <= 1 || strings.EqualFold(s.Comm, "systemd")
 }
 
-func isShell(comm string) bool {
-	switch comm {
+// isShell tells a shell by the program it runs, not by comm: a script started
+// by its path with a #!/bin/sh line is named after the script, and comm can be
+// renamed. An unreadable exe (another user's process) is not taken for a shell,
+// so the owner chain ends there.
+func isShell(root string, pid int) bool {
+	exe, err := os.Readlink(root + "/" + strconv.Itoa(pid) + "/exe")
+	if err != nil {
+		return false
+	}
+	exe = strings.TrimSuffix(exe, " (deleted)")
+	switch exe[strings.LastIndexByte(exe, '/')+1:] {
 	case "bash", "sh", "dash", "zsh", "ksh":
 		return true
 	}
@@ -78,7 +87,7 @@ func stopOwners(root string, self int, shells bool) (map[int]bool, error) {
 		if err != nil {
 			return nil, err
 		}
-		if serviceManager(p, s) || !isShell(s.Comm) {
+		if serviceManager(p, s) || !isShell(root, p) {
 			break
 		}
 		owners[p] = true
