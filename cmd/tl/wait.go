@@ -36,6 +36,7 @@ type waitCall struct {
 	invalid   bool
 	parsed    bool
 	poll      bool
+	codex     bool // вызов codex: только его вывод называет запущенную сессию
 	session   string
 }
 
@@ -98,6 +99,7 @@ func (t *waitTracker) trackCall(event cachedWaitEvent) {
 		t.seq++
 		call.command, call.at, call.line = event.Command, event.Time, t.seq
 		call.message, call.sidechain = event.MessageID, event.Sidechain
+		call.codex = transcriptwaits.CodexShell(event.Who)
 	}
 	call.count++
 	call.bg = call.bg || event.BG
@@ -135,9 +137,13 @@ func (t *waitTracker) trackResult(event cachedWaitEvent) {
 	call.done, call.result = true, event.Time
 	call.refused = event.Error && permissionRefusal(event.Raw)
 	delete(t.calls, event.CallID)
-	if session, running := transcriptwaits.Running(event.Text); running && call.command != "" && call.count == 1 && !call.bg && !call.refused && call.matches(t.prog, t.sub) {
-		call.session = session
-		t.sessions[session] = call
+	if session, running := transcriptwaits.Running(event.Text); running && call.codex {
+		// Сессию с тем же номером получила новая команда: брошенное ожидание прежней не кончится её опросом.
+		delete(t.sessions, session)
+		if call.command != "" && call.count == 1 && !call.bg && !call.refused && call.matches(t.prog, t.sub) {
+			call.session = session
+			t.sessions[session] = call
+		}
 		return
 	}
 	if call.command == "" || call.count != 1 || call.bg || call.refused || !call.matches(t.prog, t.sub) {
