@@ -42,7 +42,9 @@ progress reported by the disk state source, dirty and writeback memory (`Dirty`+
 are 0; the kernel also subtracts its page reserve, which `/proc/meminfo` does not show, so this
 threshold is slightly higher) —
 a write-out to disk in progress, which a new heavy task would only lengthen — or memory pressure (some avg10) above
-10% while swapping above 1024 KB/s over a second; swapping alone is not busy. Disk pressure comes
+10% while swapping above 1024 KB/s over a second; swapping alone is not busy. On a fresh check, when the disk
+state source responds and memory pressure is at or below its limit, swapping is not measured because it cannot
+affect the verdict. Disk pressure comes
 from the disk state source at `$XDG_RUNTIME_DIR/io-state.sock`; if unavailable, busy uses the change
 in full total from `/proc/pressure/io` over the swap window. Waiting under an `io.max` cap is a task
 waiting for its own limit, not for the disk: when the source judges that only cgroups at their caps

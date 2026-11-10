@@ -153,6 +153,70 @@ func TestMeterDiskWindowAndKind(t *testing.T) {
 	}
 }
 
+func TestFreshSwapWindowDependsOnMemoryAndDiskSource(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		memSome        float64
+		source         bool
+		memoryPressure bool
+		wantSleep      int
+		wantMarker     bool
+		stale          bool // not fresh: swapping since the last Check, as the queue polls
+	}{
+		{"low memory with disk source", 0.3, true, true, 0, true, false},
+		{"high memory with disk source", 12, true, true, 1, false, false},
+		{"low memory without disk source", 0.3, false, true, 1, false, false},
+		{"missing memory pressure with disk source", 0, true, false, 1, false, false},
+		// The first Check of a meter waits the window either way; a not-fresh one still measures swapping.
+		{"low memory with disk source, not fresh", 0.3, true, true, 1, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1\n",
+				"vmstat": "pswpin 1\npswpout 1\n",
+			}
+			if tc.memoryPressure {
+				files["pressure/memory"] = fmt.Sprintf("some avg10=%g avg60=0 avg300=0 total=1\n", tc.memSome)
+			}
+			m, now := fakeProc(t, files)
+			sleeps := 0
+			m.sleep = func(context.Context, time.Duration) error {
+				sleeps++
+				*now = now.Add(time.Second)
+				return nil
+			}
+			if tc.source {
+				at := *now
+				m.disk = socket(t, func(conn net.Conn) {
+					defer conn.Close()
+					_, _ = bufio.NewReader(conn).ReadBytes('\n')
+					_, _ = fmt.Fprint(conn, response(at, 0))
+				})
+			} else {
+				dir, err := os.MkdirTemp("", "io")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.RemoveAll(dir) })
+				m.disk = filepath.Join(dir, "missing.sock")
+			}
+			v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 100}, "", !tc.stale)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sleeps != tc.wantSleep || v.Load.SwapUnmeasured != tc.wantMarker {
+				t.Errorf("sleep calls = %d, SwapUnmeasured = %t; wanted %d, %t", sleeps, v.Load.SwapUnmeasured, tc.wantSleep, tc.wantMarker)
+			}
+			if tc.wantMarker && (v.Load.SwapKBs != 0 || v.Load.IOWindow != 5*time.Second || v.Measure != "") {
+				t.Errorf("low-pressure verdict and loads = %+v", v)
+			}
+			if !tc.source && !containsError(v.Skipped, ErrNoIOSource) {
+				t.Errorf("missing source was not reported: %+v", v.Skipped)
+			}
+		})
+	}
+}
+
 func TestMeterOmitsEmptyKind(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	m, now := fakeProc(t, map[string]string{

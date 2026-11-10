@@ -32,7 +32,8 @@ or the disk state source reports a disk freeze in progress, dirty and writeback 
 in /proc/meminfo, one reading) is at or above the machine's background write-out threshold
 (vm.dirty_background_bytes, or vm.dirty_background_ratio of free and file memory when the bytes are 0) — a
 write-out to disk in progress — or the memory pressure (some avg10) is above 10% while swapping over
-the window is above 1024 KB/s.
+the window is above 1024 KB/s. With a fresh check, a responding disk state source and memory pressure at or below
+the limit, swapping is not measured because it cannot affect the verdict.
 Swapping alone is not busy. The same rule graft uses to queue heavy tasks. The limits below are the
 defaults; the user's own are flat "key: value" lines in $XDG_CONFIG_HOME/akit/pressure.yaml
 (~/.config/akit/pressure.yaml; keys runnable, max_io_full, max_mem_some, max_swap_kbs, swap_window,
@@ -341,7 +342,9 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 	if !skipped(pressure.ErrNoMemPressure) {
 		parts = append(parts, fmt.Sprintf("memory pressure %.1f%% (some avg10, limit %v%%)", m.MemSome, l.MaxMemSome))
 	}
-	if !skipped(pressure.ErrNoVMStat) {
+	if m.SwapUnmeasured {
+		parts = append(parts, fmt.Sprintf("swapping not measured: memory pressure %.1f%% at or below %v%%", m.MemSome, l.MemSomeLimit()))
+	} else if !skipped(pressure.ErrNoVMStat) {
 		parts = append(parts, fmt.Sprintf("swapping %.0f KB/s (counts above %v only with memory pressure)", m.SwapKBs, l.MaxSwapKBs))
 	}
 	if errors.Is(errors.Join(v.Skipped...), pressure.ErrNoIOSource) || errors.Is(errors.Join(v.Skipped...), pressure.ErrIOSourceFailed) {
