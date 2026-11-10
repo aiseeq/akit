@@ -14,6 +14,17 @@ import (
 
 var mutBinary string
 
+func TestLoadForeignSpec(t *testing.T) {
+	o := opts{testArgs: []string{"go", "test"}}
+	edits, err := loadEdits(o, strings.NewReader("FILE x.go\nOLD\nold\nNEW\nnew\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edits) != 1 || edits[0].Files[0] != "x.go" || edits[0].Old != "old" || edits[0].New != "new" {
+		t.Fatalf("edits = %#v", edits)
+	}
+}
+
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "mut-test-bin-")
 	if err != nil {

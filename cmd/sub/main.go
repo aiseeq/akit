@@ -23,6 +23,7 @@ Usage:
   sub [--dry-run] [-F SPEC]                many edits from SPEC file or stdin
   sub [--dry-run] [-F SPEC] FILE           same, every block edits FILE;
                                            no path line needed in the spec
+Some unambiguous foreign edit forms are accepted; SEARCH/REPLACE is preferred.
 
 If any edit finds a different number of matches, no file is changed and the
 answer says where: expected/found counts and line numbers, or near-misses
@@ -138,6 +139,9 @@ func run(opts options, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "sub: %v\n(sub -h for usage)\n", err)
 		return exitUsage
+	}
+	if notice, ok := edit.ForeignNotice(edits); ok {
+		fmt.Fprintln(stderr, notice)
 	}
 	plan, err := edit.Build(edits)
 	if err != nil {
