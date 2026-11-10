@@ -10,6 +10,22 @@ Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/b
 
 `codexlimit` provides `Read` for weekly account limits, `Consume` for reset credits, and `ReadApproved` for reset approvals.
 
+## stop
+
+`stop [--grace D] [--signal S] PID` sends the request signal to every observed
+process in the tree, including those found while waiting, then sends SIGKILL to
+survivors. Its answer says whether SIGKILL was needed and how many processes
+received it. It accepts a descendant of its parent or of consecutive shell
+ancestors, allowing direct, `$(...)`, and `bash -c` calls; a service manager is
+never an owner. See `stop -h` for the PID identity and tree discovery limits.
+It requires Linux pidfds and refuses unsafe targets. The default grace is 2s.
+
+`proc.StopChild(pid, grace, request)` provides the same observed-tree stopping
+for a direct child; the caller supplies the request (signal, stdin close or
+context cancellation) and remains responsible for `exec.Cmd.Wait` and
+`WaitDelay`. `proc.StopFromShell(pid, grace, signal)` implements the CLI's
+ancestry rule. Both return `proc.StopResult`, including the number sent SIGKILL,
+and an error.
 ## shellcmd
 
 Finds program calls in shell scripts, including nested substitutions, wrapper commands, and scripts
