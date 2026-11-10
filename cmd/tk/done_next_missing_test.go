@@ -77,3 +77,25 @@ func TestDoneHintExecutorForms(t *testing.T) {
 		}
 	})
 }
+
+// A built binary named like the project lies in the root of its repository: a
+// file is no project folder, and the hint comes from the root without an error.
+func TestDoneHintFileNamedLikeProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "tool")
+	dir := filepath.Join(root, "docs", "tasks")
+	scopeTicket(t, dir, "closing", "в работе", "tool-master")
+	scopeTicket(t, dir, "root-open", "открыт", "")
+	if err := os.WriteFile(filepath.Join(root, "tool"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	o := options{cmd: "done", id: "closing", by: "checker", check: "checked by test", baseRoot: root}
+	if code := runLockedCommand(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("done = %d, stderr %q", code, errout.String())
+	}
+	if !strings.Contains(out.String(), "следующий: root-open ") || errout.Len() != 0 {
+		t.Errorf("output %q, stderr %q", out.String(), errout.String())
+	}
+}

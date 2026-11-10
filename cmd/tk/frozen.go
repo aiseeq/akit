@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	sessions "github.com/aiseeq/akit/session"
 )
@@ -223,15 +224,23 @@ func (f frozenFiles) executorProject(executor, currentRoot string, errout io.Wri
 	candidates := []string{filepath.Join(currentRoot, name), filepath.Join(filepath.Dir(currentRoot), name)}
 	var found []string
 	for _, candidate := range candidates {
-		if _, err := os.Stat(filepath.Join(candidate, "docs", "tasks")); err == nil {
-			resolved, err := normalizedRoot(candidate)
-			if err != nil {
-				return "", false, fmt.Errorf("resolve project %s: %w", candidate, err)
+		// A file named like the project (a built binary in the root of its
+		// repository) is no project folder: ENOTDIR means absent too.
+		info, err := os.Stat(filepath.Join(candidate, "docs", "tasks"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				continue
 			}
-			found = append(found, resolved)
-		} else if !errors.Is(err, os.ErrNotExist) {
 			return "", false, fmt.Errorf("inspect project %s: %w", candidate, err)
 		}
+		if !info.IsDir() {
+			continue
+		}
+		resolved, err := normalizedRoot(candidate)
+		if err != nil {
+			return "", false, fmt.Errorf("resolve project %s: %w", candidate, err)
+		}
+		found = append(found, resolved)
 	}
 	if len(found) > 1 {
 		fmt.Fprintf(errout, "tk: executor %s has ambiguous project folders: %s and %s\n", executor, found[0], found[1])
