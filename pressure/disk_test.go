@@ -217,6 +217,70 @@ func TestFreshSwapWindowDependsOnMemoryAndDiskSource(t *testing.T) {
 	}
 }
 
+// A fresh Check that skips the swap window still marks where the next Check starts counting,
+// so the next one that is not fresh measures since then without waiting.
+func TestSkippedWindowMarksBaselineForNextCheck(t *testing.T) {
+	m, now := fakeProc(t, map[string]string{
+		"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1000\n",
+		"pressure/memory": "some avg10=0.3 avg60=0 avg300=0 total=1\n",
+		"vmstat":          "pswpin 10\npswpout 10\n",
+	})
+	sleeps := 0
+	m.sleep = func(context.Context, time.Duration) error {
+		sleeps++
+		return nil
+	}
+	m.disk = socket(t, func(conn net.Conn) {
+		defer conn.Close()
+		_, _ = bufio.NewReader(conn).ReadBytes('\n')
+		_, _ = fmt.Fprint(conn, response(*now, 0))
+	})
+	limits := Limits{Runnable: 100, MaxIOFull: 100}
+	v, err := m.Check(context.Background(), limits, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sleeps != 0 || !v.Load.SwapUnmeasured {
+		t.Fatalf("first Check: sleeps = %d, SwapUnmeasured = %t", sleeps, v.Load.SwapUnmeasured)
+	}
+	*now = now.Add(2 * time.Second)
+	writeProc(t, m.procRoot, "vmstat", "pswpin 110\npswpout 10\n")
+	writeProc(t, m.procRoot, "pressure/io", "full avg10=0 avg60=0 avg300=0 total=21000\n")
+	v, err = m.Check(context.Background(), limits, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSwap := 100 * float64(os.Getpagesize()) / 1024 / 2
+	if sleeps != 0 || v.Load.SwapUnmeasured || v.Load.SwapKBs != wantSwap {
+		t.Errorf("second Check: sleeps = %d, SwapUnmeasured = %t, SwapKBs = %g; wanted 0, false, %g", sleeps, v.Load.SwapUnmeasured, v.Load.SwapKBs, wantSwap)
+	}
+	if v.Load.IOWindow != 2*time.Second || v.Load.IOFull != 1 {
+		t.Errorf("second Check IO: window %s, full %g; wanted 2s, 1", v.Load.IOWindow, v.Load.IOFull)
+	}
+	if containsError(v.Skipped, ErrNoVMStat) || containsError(v.Skipped, ErrNoIOPressure) {
+		t.Errorf("skipped = %v", v.Skipped)
+	}
+}
+
+// Without vmstat and IO pressure the Check that skips the window still says what it could not read.
+func TestSkippedWindowReportsMissingCounters(t *testing.T) {
+	m, now := fakeProc(t, map[string]string{
+		"stat": stat, "pressure/memory": "some avg10=0.3 avg60=0 avg300=0 total=1\n",
+	})
+	m.disk = socket(t, func(conn net.Conn) {
+		defer conn.Close()
+		_, _ = bufio.NewReader(conn).ReadBytes('\n')
+		_, _ = fmt.Fprint(conn, response(*now, 0))
+	})
+	v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 100}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.Load.SwapUnmeasured || !containsError(v.Skipped, ErrNoVMStat) || !containsError(v.Skipped, ErrNoIOPressure) {
+		t.Errorf("SwapUnmeasured = %t, skipped = %v", v.Load.SwapUnmeasured, v.Skipped)
+	}
+}
+
 func TestMeterOmitsEmptyKind(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	m, now := fakeProc(t, map[string]string{

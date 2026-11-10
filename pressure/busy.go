@@ -349,6 +349,9 @@ func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, kind string, f
 	load.Disk, load.DiskFault = readDisk(ctx, m.socketPath(), kind, m.now())
 	if fresh && load.Disk != nil && !skippedAny(*skipped, ErrNoMemPressure) && load.MemSome <= l.MemSomeLimit() {
 		load.SwapUnmeasured = true
+		if err := m.markBaseline(skipped); err != nil {
+			return err
+		}
 	} else if err := m.measureSwapAndIO(ctx, l, fresh, load, skipped); err != nil {
 		return err
 	}
@@ -369,6 +372,25 @@ func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, kind string, f
 		case load.DiskFault != nil:
 			*skipped = append(*skipped, ErrIOSourceFailed)
 		}
+	}
+	return nil
+}
+
+// markBaseline reads swapping and IO pressure counters without a window, so the next Check that is
+// not fresh measures them since now, as it would after a measured window.
+func (m *Meter) markBaseline(skipped *[]error) error {
+	if err := m.readSwap(); errors.Is(err, ErrNoVMStat) {
+		*skipped = append(*skipped, ErrNoVMStat)
+	} else if err != nil {
+		return err
+	}
+	total, valid, err := m.readIOTotal()
+	if err != nil {
+		return err
+	}
+	m.ioTotal, m.ioAt, m.ioValid = total, m.now(), valid
+	if !valid {
+		*skipped = append(*skipped, ErrNoIOPressure)
 	}
 	return nil
 }
