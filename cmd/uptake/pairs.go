@@ -21,7 +21,9 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-const pairToolNames = "busy prior user-word page-shot claude-rules-export timeit wfor"
+// New tools go last: candidates are sampled with one generator in this order, so a tool put in the
+// middle would reshuffle the samples, and the blind labels, of the tools after it.
+const pairToolNames = "busy prior user-word page-shot claude-rules-export wfor timeit"
 const pairCode2Tools = "busy prior user-word wfor claude-rules-export timeit"
 const candidateContextRunes = 600
 
@@ -760,13 +762,26 @@ func timeCommandGoal(c shellcmd.Call) string {
 		return ""
 	}
 	if strings.HasPrefix(raw, "/usr/bin/time ") {
-		args := c.Args
-		if len(args) > 0 && args[0] == "-p" {
-			args = args[1:]
-		}
-		return normalizePairGoal(strings.Join(args, " "))
+		return normalizePairGoal(strings.Join(timedCommand(c.Args), " "))
 	}
 	return ""
+}
+
+// timedCommand is what /usr/bin/time runs: its arguments past the leading options of time itself.
+func timedCommand(args []string) []string {
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		flag := args[0]
+		args = args[1:]
+		switch flag {
+		case "--":
+			return args
+		case "-f", "-o", "--format", "--output":
+			if len(args) > 0 {
+				args = args[1:]
+			}
+		}
+	}
+	return args
 }
 
 func oldDateTimingPair(c shellcmd.Call, cmd string) (string, string) {
@@ -774,7 +789,7 @@ func oldDateTimingPair(c shellcmd.Call, cmd string) (string, string) {
 		return "", ""
 	}
 	reads := timeitDateRead.FindAllStringIndex(cmd, -1)
-	if len(reads) != 2 || c.Offset != reads[0][0] || !timeitDateSubtract.MatchString(cmd) {
+	if len(reads) != 2 || c.Offset != reads[0][0] || !timeitDateSubtract.MatchString(cmd[reads[0][1]:]) {
 		return "", ""
 	}
 	calls, err := shellcmd.Calls(cmd)
@@ -782,9 +797,12 @@ func oldDateTimingPair(c shellcmd.Call, cmd string) (string, string) {
 		slog.Debug("parse date timing", "error", err)
 	}
 	var measured []string
+	seen := map[string]bool{}
 	for i := range calls {
 		call := calls[i]
-		if call.Offset > reads[0][1] && call.Offset < reads[1][0] && call.Name != "date" && call.Name != "printf" && call.Name != "echo" && call.Name != "expr" && call.Name != "bc" {
+		// A wrapper (timeout, nice) and the command it runs are two calls over one text: one goal.
+		if call.Offset > reads[0][1] && call.Offset < reads[1][0] && !seen[call.Raw] && call.Name != "date" && call.Name != "printf" && call.Name != "echo" && call.Name != "expr" && call.Name != "bc" {
+			seen[call.Raw] = true
 			measured = append(measured, callPairGoal(call))
 		}
 	}
