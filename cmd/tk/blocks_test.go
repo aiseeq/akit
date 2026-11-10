@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/queuegate"
 )
 
 func TestCloseBlockingRelations(t *testing.T) {
@@ -346,6 +349,171 @@ func TestTransferUpdatesSameFolderBlockerAfterUnlock(t *testing.T) {
 	if strings.Count(string(got), "заблокированный t перенесён в EXT-1") != 1 {
 		t.Fatalf("repeat transfer duplicated relation note:\n%s", got)
 	}
+}
+
+func TestNextOrdersLocalBlockerAndRanksJSON(t *testing.T) {
+	root, dir := blockTestProject(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	gateDir := filepath.Join(home, ".local", "state", "queue")
+	if err := os.MkdirAll(gateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	gate := fmt.Sprintf(`{"at":%q,"open_by_root":{}}`, time.Now().Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(gate), 0644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := blockTestWrite(t, dir, "blocked", "MED", "# blocked\n\nСтатус: открыт\nЗаблокирован: blocker\n")
+	blocker := blockTestWrite(t, dir, "blocker", "MED", "# blocker\n\nСтатус: открыт\nБлокирует: blocked\n")
+	other := blockTestWrite(t, dir, "other", "MED", "# other\n\nСтатус: открыт\n")
+	ordered := orderedNextCandidates([]task{blocked, blocker, other}, "", queuegate.Scope{Valid: true})
+	if len(ordered) != 3 || ordered[0].slug != "blocker" || ordered[1].slug != "other" || ordered[2].slug != "blocked" {
+		t.Fatalf("order = %v", taskSlugs(ordered))
+	}
+	var marked bytes.Buffer
+	printTask(&marked, blocked, "", &bytes.Buffer{})
+	if !strings.Contains(marked.String(), "заблокирован: blocker") {
+		t.Fatalf("blocked marker missing: %q", marked.String())
+	}
+	var out, errout bytes.Buffer
+	o := options{cmd: "next", by: "tester", json: true, mainRoot: root}
+	if code := runAtBase(root, dir, o, &out, &errout); code != 0 {
+		t.Fatalf("next code=%d stderr=%q", code, errout.String())
+	}
+	var next map[string]any
+	if err := json.Unmarshal(out.Bytes(), &next); err != nil {
+		t.Fatal(err)
+	}
+	if next["slug"] != "blocker" {
+		t.Fatalf("next JSON = %v", next)
+	}
+	out.Reset()
+	if code := list(root, options{json: true, by: "tester"}, &out, &errout); code != 0 {
+		t.Fatalf("ls code=%d stderr=%q", code, errout.String())
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]float64{"blocker": 1, "other": 2, "blocked": 3}
+	for _, row := range rows {
+		if row["next_rank"] != want[row["slug"].(string)] {
+			t.Fatalf("row rank = %v, want %v", row, want[row["slug"].(string)])
+		}
+	}
+	if !strings.Contains(next["title"].(string), "blocker") {
+		t.Fatalf("next output missing blocker: %v", next)
+	}
+}
+
+// A blocker open in another project or moved to an external tracker puts the
+// blocked ticket after the clear ones; a link to a ticket that is gone does not.
+func TestNextDemotesForeignAndJiraBlockedTickets(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	otherDir := filepath.Join(home, "git", "other", "docs", "tasks")
+	if err := os.MkdirAll(otherDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	blockTestWrite(t, otherDir, "holder", "MED", "# holder\n\nСтатус: открыт\n")
+	_, dir := blockTestProject(t)
+	ledger := `{"at":"2026-01-01T00:00:00Z","slug":"moved","stem":"20260101-0000-MED-moved","key":"EXT-123","url":"https://tracker.example/EXT-123"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, ".transferred.jsonl"), []byte(ledger), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Slugs sort against the expected order, so only blocking can explain it.
+	foreign := blockTestWrite(t, dir, "a-foreign", "MED", "# a-foreign\n\nСтатус: открыт\nЗаблокирован: git/other/holder\n")
+	jira := blockTestWrite(t, dir, "b-jira", "MED", "# b-jira\n\nСтатус: открыт\nЗаблокирован: moved\n")
+	gone := blockTestWrite(t, dir, "y-gone", "MED", "# y-gone\n\nСтатус: открыт\nЗаблокирован: git/other/missing\n")
+	clear := blockTestWrite(t, dir, "z-clear", "MED", "# z-clear\n\nСтатус: открыт\n")
+	ordered := orderedNextCandidates([]task{foreign, jira, gone, clear}, "", queuegate.Scope{Valid: true})
+	if got := strings.Join(taskSlugs(ordered), ","); got != "y-gone,z-clear,a-foreign,b-jira" {
+		t.Fatalf("order = %s", got)
+	}
+}
+
+func TestNextOrderingUsesBlockDepthAndIgnoresInputOrder(t *testing.T) {
+	tasks := []task{
+		{slug: "x", status: "открыт", prio: "MED", body: "Заблокирован: y", created: time.Unix(1, 0)},
+		{slug: "y", status: "открыт", prio: "MED", body: "Заблокирован: z", created: time.Unix(3, 0)},
+		{slug: "z", status: "открыт", prio: "MED", created: time.Unix(4, 0)},
+		{slug: "w", status: "открыт", prio: "MED", body: "Заблокирован: v", created: time.Unix(2, 0)},
+	}
+	// v is in progress with someone else: not a candidate, yet it still blocks w.
+	v := task{slug: "v", status: "в работе", prio: "MED", body: "Исполнитель: someone-else", created: time.Unix(5, 0)}
+	want := "z,w,y,x"
+	for i := range tasks {
+		for j := range tasks {
+			for k := range tasks {
+				for l := range tasks {
+					if i == j || i == k || i == l || j == k || j == l || k == l {
+						continue
+					}
+					input := []task{tasks[i], tasks[j], tasks[k], tasks[l], v}
+					got := strings.Join(taskSlugs(orderedNextCandidates(input, "", queuegate.Scope{Valid: true})), ",")
+					if got != want {
+						t.Fatalf("order for permutation %v = %s, want %s", taskSlugs(input), got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestNextBlockDepthHandlesCyclesDeterministically(t *testing.T) {
+	tasks := []task{
+		{slug: "a", status: "открыт", prio: "MED", body: "Заблокирован: b", created: time.Unix(1, 0)},
+		{slug: "b", status: "открыт", prio: "MED", body: "Заблокирован: a", created: time.Unix(2, 0)},
+	}
+	first := strings.Join(taskSlugs(orderedNextCandidates(tasks, "", queuegate.Scope{Valid: true})), ",")
+	second := strings.Join(taskSlugs(orderedNextCandidates([]task{tasks[1], tasks[0]}, "", queuegate.Scope{Valid: true})), ",")
+	if first != second {
+		t.Fatalf("cycle order depends on input: %s vs %s", first, second)
+	}
+}
+
+func TestListNextRankDefaultsToProjectMaster(t *testing.T) {
+	root, dir := blockTestProject(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	gateDir := filepath.Join(home, ".local", "state", "queue")
+	if err := os.MkdirAll(gateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	gate := fmt.Sprintf(`{"at":%q,"open_by_root":{}}`, time.Now().Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(gate), 0644); err != nil {
+		t.Fatal(err)
+	}
+	master := filepath.Base(root) + "-master"
+	blockTestWrite(t, dir, "working", "MED", fmt.Sprintf("# working\n\nСтатус: в работе\nИсполнитель: %s\n", master))
+	blockTestWrite(t, dir, "open", "MED", "# open\n\nСтатус: открыт\n")
+	var nextOut, errout bytes.Buffer
+	if code := runAtBase(root, dir, options{cmd: "next", by: master}, &nextOut, &errout); code != 0 {
+		t.Fatalf("next code=%d stderr=%q", code, errout.String())
+	}
+	want := strings.Fields(nextOut.String())[0]
+	var listOut bytes.Buffer
+	if code := list(root, options{json: true}, &listOut, &errout); code != 0 {
+		t.Fatalf("ls code=%d stderr=%q", code, errout.String())
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(listOut.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row["next_rank"] == float64(1) && row["slug"] == want {
+			return
+		}
+	}
+	t.Fatalf("rank 1 does not match tk next --by %s (%s): %s", master, want, listOut.String())
+}
+
+func taskSlugs(tasks []task) []string {
+	slugs := make([]string, len(tasks))
+	for i := range tasks {
+		slugs[i] = tasks[i].slug
+	}
+	return slugs
 }
 
 func blockTestProject(t *testing.T) (string, string) {

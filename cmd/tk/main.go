@@ -69,7 +69,7 @@ Flags:
   --all          ls: include closed tickets
 
   --due          ls: show waiting tickets whose parsed deadline has passed
-  --json         ls: output JSON array with can_take and actors; show: ticket and journal JSON; next: top ticket JSON
+  --json         ls: output JSON array with can_take, actors, and next_rank; next_rank uses --by or project master; show: ticket and journal JSON; next: top ticket JSON
   --status S     ls: show only status S
   --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
@@ -848,7 +848,7 @@ func validateNewBlockTargets(root, main string, o options, errout io.Writer) int
 		if err != nil {
 			return fail(errout, err)
 		}
-		if target.status == "готово" || target.status == "отклонён" {
+		if closedStatus(target.status) {
 			return fail(errout, fmt.Errorf("target %s is closed", ref))
 		}
 		target.ref, err = ticketRef(root, target.root, target.id)
@@ -3463,7 +3463,8 @@ type taskJSON struct {
 	Plan           []planJSON `json:"plan,omitempty"`
 	Blocks         []string   `json:"blocks,omitempty"`
 	BlockedBy      []string   `json:"blocked_by,omitempty"`
-	CanTake        *bool      `json:"can_take,omitempty"` // ls only: would tk next give it to the project's master
+	CanTake        *bool      `json:"can_take,omitempty"`  // ls only: would tk next give it to the project's master
+	NextRank       *int       `json:"next_rank,omitempty"` // ls only: --by order, or project master when omitted
 	// Actors: the time of the last journal record of each author, so a watcher sees work on a ticket left open.
 	Actors map[string]string `json:"actors,omitempty"`
 }
@@ -3651,9 +3652,8 @@ func chooseNext(dir, project, actor string) (nextChoice, error) {
 		return nextChoice{}, err
 	}
 	choice := nextChoice{gate: gate}
-	candidates := nextCandidates(tasks, actor, gate)
+	candidates := orderedNextCandidates(tasks, actor, gate)
 	if len(candidates) != 0 {
-		sortNextCandidates(candidates, actor, gate)
 		choice.task, choice.found = candidates[0], true
 	}
 	return choice, nil
@@ -3932,15 +3932,66 @@ func nextGroup(t task, actor string, gate queuegate.Scope) int {
 	return 5
 }
 
-func sortNextCandidates(candidates []task, actor string, gate queuegate.Scope) {
-	sort.Slice(candidates, func(i, j int) bool {
+func orderedNextCandidates(tasks []task, actor string, gate queuegate.Scope) []task {
+	candidates := nextCandidates(tasks, actor, gate)
+	bySlug := make(map[string]*task, len(tasks))
+	indices := make([]int, len(tasks))
+	for i := range tasks {
+		bySlug[tasks[i].slug] = &tasks[i]
+		indices[i] = i
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		return tasks[indices[i]].slug < tasks[indices[j]].slug
+	})
+	depths := make(map[string]int, len(tasks))
+	visiting := make(map[string]bool, len(tasks))
+	var depth func(*task) int
+	depth = func(t *task) int {
+		if value, ok := depths[t.slug]; ok {
+			return value
+		}
+		if visiting[t.slug] {
+			return 0
+		}
+		visiting[t.slug] = true
+		maxDepth := 0
+		for _, ref := range headerLinks(t.body, blockedPrefix) {
+			target, found := bySlug[ref]
+			if strings.Contains(ref, "/") || !found {
+				if maxDepth < 1 && refBlockMark(taskProject(t.path), ref, io.Discard) != "" {
+					maxDepth = 1
+				}
+				continue
+			}
+			if closedStatus(target.status) || isArchivedTask(target.path) {
+				continue
+			}
+			if targetDepth := 1 + depth(target); targetDepth > maxDepth {
+				maxDepth = targetDepth
+			}
+		}
+		delete(visiting, t.slug)
+		depths[t.slug] = maxDepth
+		return maxDepth
+	}
+	for _, i := range indices {
+		depth(&tasks[i])
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
 		leftGroup, rightGroup := nextGroup(left, actor, gate), nextGroup(right, actor, gate)
 		if leftGroup != rightGroup {
 			return leftGroup < rightGroup
 		}
-		return left.created.Before(right.created)
+		if depths[left.slug] != depths[right.slug] {
+			return depths[left.slug] < depths[right.slug]
+		}
+		if !left.created.Equal(right.created) {
+			return left.created.Before(right.created)
+		}
+		return left.slug < right.slug
 	})
+	return candidates
 }
 
 func nextLine(choice nextChoice, errout io.Writer) string {
@@ -3989,6 +4040,39 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 		}
 	}
 	takes := newTakeView(errout)
+	ranks := make(map[string]int)
+	projects := make(map[string][]task)
+	for i := range ts {
+		t := &ts[i]
+		project := root
+		if o.root != "" {
+			project = taskProject(t.path)
+		} else if o.mainRoot != "" {
+			project = o.mainRoot
+		}
+		if _, ok := projects[project]; ok {
+			continue
+		}
+		loaded, err := loadTasks(filepath.Join(project, "docs", "tasks"), true)
+		if err != nil {
+			return fail(errout, err)
+		}
+		projects[project] = loaded
+	}
+	for project, loaded := range projects {
+		state := takes.project(project, errout)
+		if state.refused {
+			continue
+		}
+		actor := o.by
+		if actor == "" {
+			actor = state.master
+		}
+		ordered := orderedNextCandidates(loaded, actor, state.scope)
+		for i := range ordered {
+			ranks[ordered[i].path] = i + 1
+		}
+	}
 	objects := make([]taskJSON, 0, len(ts))
 	for i := range ts {
 		t := &ts[i]
@@ -4005,6 +4089,9 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 		}
 		can := takes.canTake(*t, project, errout)
 		obj.CanTake = &can
+		if rank, ok := ranks[t.path]; ok {
+			obj.NextRank = &rank
+		}
 		objects = append(objects, obj)
 	}
 	if err := json.NewEncoder(out).Encode(objects); err != nil {
