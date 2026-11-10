@@ -664,13 +664,9 @@ func (u *run) eventExitCode(e transcript.Event) int {
 			return n
 		}
 	}
-	for _, re := range []*regexp.Regexp{regexp.MustCompile(`(?i)(?:Process exited with )?exit code\s*[:=]?\s*(\d+)`), regexp.MustCompile(`(?i)exit status\s*[:=]?\s*(\d+)`)} {
-		if m := re.FindStringSubmatch(e.Text); len(m) > 1 {
-			n, err := strconv.Atoi(m[1])
-			if err != nil {
-				slog.Debug("parse exit code", "value", m[1], "error", err)
-				continue
-			}
+	// У Claude Code строку кода выхода ставит только неудача; у успешного вызова «Exit code N» — текст вывода.
+	if e.UUID == "" || e.Error {
+		if n := headerExitCode(e.Text); n >= 0 {
 			return n
 		}
 	}
@@ -680,7 +676,9 @@ func (u *run) eventExitCode(e transcript.Event) int {
 		}
 		return 1
 	}
-	if (e.UUID != "" || e.CallID != "") && !e.Error {
+	// Скрипт exec codex («Script completed») сообщает только, что скрипт дошёл до конца: код его команд в шапке
+	// не пишется, и успех команды из этого не следует.
+	if (e.UUID != "" || e.CallID != "") && !e.Error && !codexScriptOutput(e.Raw) {
 		return 0
 	}
 	return -1
@@ -1862,4 +1860,46 @@ func (u *run) sampleReason(e example) string {
 		return "(а) генерация или правка набора файлов"
 	}
 	return "(г) привычка без видимой причины"
+}
+
+// exitHeaderLine — строка кода выхода в шапке вывода: «Exit code 1» (Claude Code), «Exit code: 1» и
+// «Process exited with code 1» (exec_command codex).
+var exitHeaderLine = regexp.MustCompile(`(?i)^(?:Process exited with (?:exit )?code|exit code|exit status)\s*[:=]?\s*(\d+)$`)
+
+// headerExitCode — код выхода из шапки вывода: первая строка или строки до «Output:» в первых восьми. Та же
+// строка глубже — то, что команда напечатала (tl показал старое событие, cat лога), а не её код; -1 — кода нет.
+func headerExitCode(text string) int {
+	lines := strings.SplitN(text, "\n", 9)
+	header := lines[:1]
+	for i, line := range lines[:min(len(lines), 8)] {
+		if strings.TrimSpace(line) == "Output:" {
+			header = lines[:i]
+			break
+		}
+	}
+	for _, line := range header {
+		m := exitHeaderLine.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			slog.Debug("parse exit code", "value", m[1], "error", err)
+			continue
+		}
+		return n
+	}
+	return -1
+}
+
+// codexScriptOutput — вывод exec codex: первая часть начинается шапкой «Script completed», «Script failed» или
+// «Script running».
+func codexScriptOutput(raw json.RawMessage) bool {
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) == 0 {
+		return false
+	}
+	return strings.HasPrefix(parts[0].Text, "Script ")
 }
