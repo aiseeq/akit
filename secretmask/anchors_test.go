@@ -154,3 +154,50 @@ func TestMaskAfterSeparatorAndInsideStructures(t *testing.T) {
 		}
 	}
 }
+
+// A structure needs a name inside; a word with a colon and nothing after it is a
+// value; only a name exactly pwd takes a path; a plain word or a path under auth
+// and credentials is a mode or a file, a token-like value is hidden.
+func TestMaskStructureNeedsNameAndPlainAuthValues(t *testing.T) {
+	for _, input := range []string{
+		"password: {a:Vvalue123}",
+		"--password={a=Vvalue123}",
+		"--password {a:Vvalue123}",
+		"password: Vvalue123:",
+		"password: token:Vvalue123",
+		"MYSQL_PWD=/Vvalue123",
+		"MYSQL_PWD=~Vvalue123",
+		"DB_PWD: ~Vvalue123!",
+		"pwd=/Vvalue123",
+		"auth: Vvalue123",
+		"credentials=/x/Vvalue123",
+		`{"auth":["Vvalue123"]}`,
+		`{"name":"credentials","value":"Vvalue123"}`,
+		`{"args":["--auth","Vvalue123"]}`,
+		"auth=3f9a7c2e1b4d5a6f",
+		"password: token:",
+		"MYSQL_PWD=/var/lib",
+	} {
+		t.Run(input, func(t *testing.T) {
+			if got, _ := Mask(input); strings.Contains(got, formValue) || got == input {
+				t.Fatalf("value left in %q", got)
+			}
+		})
+	}
+	for _, input := range []string{
+		`fetch(u, {credentials: "include"})`,
+		"auth=oauth2",
+		"auth: basic",
+		"credentials: /etc/app/creds.json",
+		"credentials: aws-profile",
+		`{"name":"pwd","value":"/srv"}`,
+		`{"args":["--auth","sso"]}`,
+		`{"auth":["sso"]}`,
+		"pwd=/srv/app",
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("%q changed to %q, %v", input, got, found)
+		}
+	}
+}

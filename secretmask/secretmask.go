@@ -54,10 +54,16 @@
 //   - Context rules run only for texts holding their anchor words
 //     (contextAnchors); a secret name counts where it is used as a name, before
 //     : or =, or as an option.
-//   - A secret name before a structure ({…}, […], (…), a quoted structure) or
-//     before the next secret name takes no value: the names inside get their
-//     own match, so auth: {note: x} leaves x visible. A pwd name with a value
-//     starting with / or ~ is a directory and stays.
+//   - A secret name before a structure with a name inside ({password: x},
+//     {note: x}, a quoted JSON object) or before the next secret name with its
+//     own value (auth: password: x) takes no value: the names inside get their
+//     own match, so auth: {note: x} leaves x visible. {a:b} and token:x are
+//     values. A name exactly pwd with a path of plain words (/srv/app, ~/src)
+//     is a directory and stays; MYSQL_PWD and other *pwd names are passwords.
+//   - Under auth and credentials names a plain
+//     word or path stays: same-origin, oauth2, basic, /etc/app/creds.json. A
+//     value mixing upper, lower case and digits, or a run of 12 letters and
+//     digits, is hidden; a short lower-case password such as hunter2 there is not.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
 package secretmask
@@ -549,15 +555,22 @@ func jsonArraySpans(text string, open int, elements [][2]int, groups anchorGroup
 	if groups&anchorName != 0 {
 		if key, ok := jsonKeyBefore(text, open); ok {
 			if kind, secret := secretName(key); secret {
-				var spans []contextSpan
-				for _, element := range elements {
-					spans = appendJSONValue(spans, text, element, kind)
-				}
-				return spans
+				return jsonKeyedSpans(text, key, kind, elements)
 			}
 		}
 	}
 	return jsonArgumentSpans(text, elements, groups)
+}
+
+// jsonKeyedSpans hides the elements of an array under a secret key.
+func jsonKeyedSpans(text, key, kind string, elements [][2]int) []contextSpan {
+	var spans []contextSpan
+	for _, element := range elements {
+		if !plainValueFor(key, text[element[0]:element[1]]) {
+			spans = appendJSONValue(spans, text, element, kind)
+		}
+	}
+	return spans
 }
 
 // jsonStringElements lists the contents of the leading strings of the array
@@ -603,7 +616,8 @@ func jsonArgumentSpans(text string, elements [][2]int, groups anchorGroup) []con
 			}
 			i++
 		case groups&anchorName != 0 && strings.HasPrefix(word, "-") && !strings.Contains(word, "="):
-			if kind, ok := optionSecretName(strings.TrimLeft(word, "-")); ok && flagValueAllowed(text[next[0]:next[1]]) {
+			name := strings.TrimLeft(word, "-")
+			if kind, ok := optionSecretName(name); ok && flagValueAllowed(text[next[0]:next[1]]) && !plainValueFor(name, text[next[0]:next[1]]) {
 				spans = appendJSONValue(spans, text, next, kind)
 				i++
 			}
@@ -670,7 +684,7 @@ func jsonValueMemberSpans(text string) []contextSpan {
 		if !ok {
 			continue
 		}
-		if kind, secret := secretName(name); secret {
+		if kind, secret := secretName(name); secret && !plainValueFor(name, text[start:end]) {
 			spans = append(spans, contextSpan{start, end, kind})
 			at = end
 		}
@@ -713,10 +727,10 @@ func nameMatches(text string) []contextMatch {
 		}
 		// A structure or the next name is no value: the names inside it get
 		// their own match.
-		if valueIsStructure(text[value.start:value.end]) {
+		if valueIsStructure(text, value) {
 			continue
 		}
-		if pwdPath(name, text[value.start:value.end]) {
+		if plainValueFor(name, text[value.start:value.end]) {
 			continue
 		}
 		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
@@ -771,11 +785,11 @@ func flagMatches(text string) []contextMatch {
 		if !ok {
 			continue
 		}
-		if valueIsStructure(text[value.start:value.end]) {
+		if valueIsStructure(text, value) {
 			continue
 		}
 		coveredUntil = value.end
-		if !assigned && !flagValueAllowed(text[value.start:value.end]) || pwdPath(name, text[value.start:value.end]) {
+		if !assigned && !flagValueAllowed(text[value.start:value.end]) || plainValueFor(name, text[value.start:value.end]) {
 			continue
 		}
 		if valueIsValue(text, value, name, kind, false) {
@@ -1147,30 +1161,131 @@ func hasHorizontalSpaceAt(text string, at int) bool {
 	return at < len(text) && (text[at] == ' ' || text[at] == '\t')
 }
 
-// valueIsStructure: what follows a name is an object, an array, a group or the
-// next secret name (auth: {password: x}, auth: password: x), not the value
-// itself. Another word ending in a colon stays a value.
-func valueIsStructure(value string) bool {
-	if value != "" && strings.ContainsRune("{[(", rune(value[0])) && strings.ContainsAny(value, ":=") {
-		return true
-	}
-	name := strings.TrimSuffix(value, ":")
-	if name == value || name == "" {
+// valueIsStructure: what follows a name is an object, an array or a group with
+// a name inside ({password: x}, {note: x}, '{"token":"x"}'), or the next secret
+// name with its own value after a space (auth: password: x). The names inside
+// get their own match. {a:b}, {a=b} and token:x hold no name: they are values.
+func valueIsStructure(text string, value contextValue) bool {
+	v := text[value.start:value.end]
+	if v == "" {
 		return false
 	}
-	for i := 0; i < len(name); i++ {
-		if !isNameByte(name[i]) {
+	if strings.ContainsRune("{[(", rune(v[0])) {
+		return holdsName(text, value.start+1, value.end)
+	}
+	if value.quoted || v[len(v)-1] != ':' {
+		return false
+	}
+	name := v[:len(v)-1]
+	if _, secret := secretName(name); !secret || !onlyNameBytes(name) {
+		return false
+	}
+	at := value.end
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	return at > value.end && at < len(text) && text[at] != '\n' && text[at] != '\r'
+}
+
+// holdsName: a word in text[start:end] is a name with a delimiter: a secret
+// name before : or =, or any name before ": " as in YAML and JavaScript objects.
+func holdsName(text string, start, end int) bool {
+	for i := start; i < end; i++ {
+		if !isLetter(text[i]) || i > 0 && isNameByte(text[i-1]) {
+			continue
+		}
+		e := i
+		for e < end && isNameByte(text[e]) {
+			e++
+		}
+		name := text[i:e]
+		for e < len(text) && text[e] == '\\' {
+			e++
+		}
+		if e < len(text) && (text[e] == '"' || text[e] == '\'') {
+			e++
+		}
+		if e >= len(text) {
+			return false
+		}
+		if _, secret := secretName(name); secret && (text[e] == ':' || text[e] == '=') {
+			return true
+		}
+		if text[e] == ':' && e+1 < len(text) && (text[e+1] == ' ' || text[e+1] == '\t') {
+			return true
+		}
+		i = e - 1
+	}
+	return false
+}
+
+func onlyNameBytes(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isNameByte(s[i]) {
 			return false
 		}
 	}
-	_, secret := secretName(name)
-	return secret
+	return s != ""
 }
 
-// pwdPath: a pwd name with a path is the working directory, not a password.
-func pwdPath(name, value string) bool {
+// plainValueFor: the value of this name is no secret. A name exactly pwd with
+// a path (/a/b, ~/a) is the working directory. The auth and credentials names
+// often hold a mode, a profile or a file: a plain word (same-origin, oauth2,
+// basic) or a path stays; a value looking like a token is hidden.
+func plainValueFor(name, value string) bool {
+	if strings.EqualFold(name, "pwd") {
+		return isPlainPath(value)
+	}
 	n := strings.TrimRight(strings.ToLower(name), "0123456789")
-	return strings.HasSuffix(n, "pwd") && value != "" && (value[0] == '/' || value[0] == '~')
+	return authName(n) && (isPlainPath(value) || isPlainWord(value))
+}
+
+// isPlainPath: /a/b, ~/a or ./a, every part a plain word: /Bx4Tq9Wz is no path.
+func isPlainPath(value string) bool {
+	var rest string
+	switch {
+	case strings.HasPrefix(value, "~/"), strings.HasPrefix(value, "./"):
+		rest = value[2:]
+	case strings.HasPrefix(value, "/"):
+		rest = value[1:]
+	default:
+		return false
+	}
+	for part := range strings.SplitSeq(rest, "/") {
+		if part != "" && !isPlainWord(part) {
+			return false
+		}
+	}
+	return true
+}
+
+// isPlainWord: letters, digits, -, _ and . that do not look like a token: no
+// mix of upper, lower case and digits, no long run of letters and digits.
+func isPlainWord(value string) bool {
+	upper, lower, digit := false, false, false
+	run, longest := 0, 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			upper = true
+		case c >= 'a' && c <= 'z':
+			lower = true
+		case c >= '0' && c <= '9':
+			digit = true
+		case c == '-' || c == '_' || c == '.':
+			run = 0
+			continue
+		default:
+			return false
+		}
+		run++
+		longest = max(longest, run)
+	}
+	if value == "" || upper && lower && digit {
+		return false
+	}
+	return !(digit && (upper || lower) && longest >= 12) && longest < 20
 }
 
 func secretName(name string) (string, bool) {
