@@ -78,7 +78,7 @@ func find(arg, home string) (string, error) {
 		return t.Path, nil
 	}
 	if len(arg) < 6 || strings.ContainsAny(arg, "*?[") {
-		return "", fmt.Errorf("%q: not a live session name, and too short for a session id (6+ chars)", arg)
+		return "", fmt.Errorf("%q: not a live session name, and too short for a session id (6+ chars); find sessions with --grep or --all --project", arg)
 	}
 	matches, err := filepath.Glob(filepath.Join(projects, "*", arg+"*.jsonl"))
 	if err != nil {
