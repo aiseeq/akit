@@ -296,7 +296,7 @@ func (r *Recognizer) repeat(how string, ev transcript.Event) bool {
 // poll — опрос запущенной команды codex: продолжает ожидание своей сессии или начинает новое.
 func (r *Recognizer) poll(ev transcript.Event) []Wait {
 	done := r.breakChain()
-	sid := sessionOf(ev)
+	sid := SessionOf(ev)
 	if p := r.polls[sid]; p != nil {
 		p.w.Calls++
 		p.w.CallIDs = append(p.w.CallIDs, ev.CallID)
@@ -340,8 +340,8 @@ var (
 	exited      = regexp.MustCompile(`"exit_code"\s*:|Process exited with code`)
 )
 
-// running — сессия команды, которая ещё идёт; ok false — вывод не о запущенной команде или она кончилась.
-func running(text string) (session string, ok bool) {
+// Running returns the session for a command that is still active; ok is false for other output or an ended command.
+func Running(text string) (session string, ok bool) {
 	if exited.MatchString(text) {
 		return "", false
 	}
@@ -354,7 +354,7 @@ func running(text string) (session string, ok bool) {
 func (r *Recognizer) out(ev transcript.Event) []Wait {
 	if cmd, ok := r.shellText[ev.CallID]; ok {
 		delete(r.shellText, ev.CallID)
-		if sid, ok := running(ev.Text); ok {
+		if sid, ok := Running(ev.Text); ok {
 			r.sessionCmd[sid] = cmd
 		}
 	}
@@ -365,7 +365,7 @@ func (r *Recognizer) out(ev transcript.Event) []Wait {
 	delete(r.byCall, ev.CallID)
 	if p.session != "" {
 		p.w.End = ev.Time
-		if _, ok := running(ev.Text); ok {
+		if _, ok := Running(ev.Text); ok {
 			return nil // команда ещё идёт
 		}
 		p.w.Outcome = Done
@@ -376,7 +376,7 @@ func (r *Recognizer) out(ev transcript.Event) []Wait {
 		return []Wait{finish(p)}
 	}
 	// exec_command ждёт не дольше 30 с: wfor или цикл codex идёт дальше в своей сессии, её опросы - то же ожидание
-	if sid, ok := running(ev.Text); ok && p.codex && r.cur == p {
+	if sid, ok := Running(ev.Text); ok && p.codex && r.cur == p {
 		p.session = sid
 		r.polls[sid] = p
 		r.cur = nil
@@ -611,8 +611,8 @@ var (
 	pollSession = regexp.MustCompile(`session_id"?\s*[:=]\s*"?(\d+)`)
 )
 
-// sessionOf — сессия, которую опрашивает write_stdin.
-func sessionOf(ev transcript.Event) string {
+// SessionOf returns the session polled by write_stdin.
+func SessionOf(ev transcript.Event) string {
 	for _, s := range []string{ev.Text, string(ev.Raw)} {
 		if m := pollSession.FindStringSubmatch(s); m != nil {
 			return m[1]

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
+	transcriptwaits "github.com/aiseeq/akit/transcript/waits"
 )
 
 var waitWrappers = map[string]bool{
@@ -34,6 +35,8 @@ type waitCall struct {
 	calls     []cachedShellCall
 	invalid   bool
 	parsed    bool
+	poll      bool
+	session   string
 }
 
 // waitTracker сводит вызов команды с его выводом по ходу чтения одного файла: в памяти только вызовы, ждущие
@@ -45,10 +48,11 @@ type waitTracker struct {
 	current   string                 // id текущего сообщения
 	seq       int                    // порядок вызовов: номер строки у нескольких вызовов одной строки совпал бы
 	waits     []time.Duration
+	sessions  map[string]*waitCall
 }
 
 func newWaitTracker(opts options) *waitTracker {
-	return &waitTracker{prog: opts.waitProg, sub: opts.waitSub, calls: map[string]*waitCall{}, messages: map[string][]*waitCall{}}
+	return &waitTracker{prog: opts.waitProg, sub: opts.waitSub, calls: map[string]*waitCall{}, messages: map[string][]*waitCall{}, sessions: map[string]*waitCall{}}
 }
 
 func (t *waitTracker) event(ev transcript.Event) {
@@ -57,7 +61,7 @@ func (t *waitTracker) event(ev transcript.Event) {
 		command, bg = waitCommand(ev)
 	}
 	t.eventCall(cachedWaitEvent{
-		Role: ev.Role, CallID: ev.CallID, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
+		Role: ev.Role, CallID: ev.CallID, Text: ev.Text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
 		Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: ev.Raw,
 		Command: command, BG: bg,
 	})
@@ -72,6 +76,11 @@ func (t *waitTracker) eventCall(event cachedWaitEvent) {
 }
 
 func (t *waitTracker) trackCall(event cachedWaitEvent) {
+	if session, ok := waitPollSession(event); ok {
+		call := &waitCall{poll: true, session: session, at: event.Time}
+		t.calls[event.CallID] = call
+		return
+	}
 	if event.MessageID != "" && !event.Sidechain && event.MessageID != t.current {
 		// Следующее сообщение модель пишет, получив все результаты прошлого: его вызовы больше ничьё начало не
 		// сдвинут, и в памяти остаётся одно сообщение.
@@ -98,19 +107,48 @@ func (t *waitTracker) trackCall(event cachedWaitEvent) {
 	t.calls[event.CallID] = call
 }
 
+func waitPollSession(event cachedWaitEvent) (string, bool) {
+	if event.Who != "write_stdin" && !(event.Who == "exec" && strings.Contains(event.Command, "write_stdin(") && !strings.Contains(event.Command, "exec_command(")) {
+		return "", false
+	}
+	session := transcriptwaits.SessionOf(transcript.Event{Text: event.Command, Raw: event.Raw})
+	return session, session != ""
+}
+
 func (t *waitTracker) trackResult(event cachedWaitEvent) {
 	call := t.calls[event.CallID]
 	if call == nil || call.done {
 		return
 	}
+	if call.poll {
+		delete(t.calls, event.CallID)
+		if _, running := transcriptwaits.Running(event.Text); running {
+			return
+		}
+		wait := t.sessions[call.session]
+		delete(t.sessions, call.session)
+		if wait != nil {
+			t.addWait(wait, event.Time)
+		}
+		return
+	}
 	call.done, call.result = true, event.Time
 	call.refused = event.Error && permissionRefusal(event.Raw)
 	delete(t.calls, event.CallID)
+	if session, running := transcriptwaits.Running(event.Text); running && call.command != "" && call.count == 1 && !call.bg && !call.refused && call.matches(t.prog, t.sub) {
+		call.session = session
+		t.sessions[session] = call
+		return
+	}
 	if call.command == "" || call.count != 1 || call.bg || call.refused || !call.matches(t.prog, t.sub) {
 		return
 	}
-	start := call.start(t.messages[call.message], event.Time)
-	if duration := event.Time.Sub(start); duration >= 0 {
+	t.addWait(call, event.Time)
+}
+
+func (t *waitTracker) addWait(call *waitCall, end time.Time) {
+	start := call.start(t.messages[call.message], end)
+	if duration := end.Sub(start); duration >= 0 {
 		t.waits = append(t.waits, duration)
 	}
 }
