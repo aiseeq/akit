@@ -519,9 +519,10 @@ const briefLater = 20
 
 // laterView — какие поздние реплики показывать после найденной и что сказать, если их нет.
 type laterView struct {
-	include func(l, u line) bool
-	max     int // 0 — без предела
-	none    string
+	include  func(l, u line) bool
+	max      int // 0 — без предела
+	none     string
+	question string
 }
 
 func show(w io.Writer, lines []line, at, mins int, loc *time.Location) {
@@ -545,9 +546,10 @@ func showBriefQuote(w io.Writer, lines []line, at int, word briefWord, until tim
 		none = "--- no other user lines before brief time"
 	}
 	showContext(w, lines, at, loc, laterView{
-		include: func(l, u line) bool { return !l.t.Before(u.t) && !l.t.After(until) },
-		max:     briefLater,
-		none:    none,
+		include:  func(l, u line) bool { return !l.t.Before(u.t) && !l.t.After(until) },
+		max:      briefLater,
+		none:     none,
+		question: word.question,
 	})
 	if lines[at].moreLater > 0 {
 		fmt.Fprintf(w, "--- %d more user lines not shown (user-word TRANSCRIPT 'FRAGMENT' MINUTES for a window)\n", lines[at].moreLater)
@@ -560,18 +562,16 @@ func showContext(w io.Writer, lines []line, at int, loc *time.Location, view lat
 			fmt.Fprintf(w, "--- warning: %s\n", l.warning)
 		}
 	}
-	for i := at - 1; i >= 0; i-- {
-		if lines[i].warning != "" {
-			continue
+	agentAt, questionFound := precedingAgent(lines, at, view.question)
+	if view.question != "" && !questionFound {
+		fmt.Fprintf(w, "--- question «%s» not found in agent messages before the line\n", view.question)
+	}
+	if agentAt >= 0 {
+		question := ""
+		if questionFound {
+			question = view.question
 		}
-		if !lines[i].user {
-			text := []rune(lines[i].text)
-			if len(text) > agentTail {
-				text = text[len(text)-agentTail:]
-			}
-			fmt.Fprintf(w, "--- agent before the line (%s), end:\n%s\n", lines[i].t.In(loc).Format(stamp), string(text))
-			break
-		}
+		showAgentMessage(w, lines[agentAt], loc, question)
 	}
 	u := lines[at]
 	fmt.Fprintf(w, "--- user %s%s:\n%s\n", u.t.In(loc).Format(stamp), askNote(u), u.text)
@@ -592,6 +592,115 @@ func showContext(w io.Writer, lines []line, at int, loc *time.Location, view lat
 	}
 	if more == 0 {
 		fmt.Fprintln(w, view.none)
+	}
+}
+
+func precedingAgent(lines []line, at int, question string) (int, bool) {
+	nearest := -1
+	for i := at - 1; i >= 0; i-- {
+		if lines[i].user {
+			break
+		}
+		if lines[i].warning != "" {
+			continue
+		}
+		if nearest < 0 {
+			nearest = i
+		}
+		if question == "" || hasFragment(lines[i].text, question) {
+			return i, true
+		}
+	}
+	return nearest, question == ""
+}
+
+func showAgentMessage(w io.Writer, l line, loc *time.Location, question string) {
+	text := []rune(l.text)
+	start, end := 0, len(text)
+	if question != "" {
+		start, end = questionExcerpt(text, question)
+	} else if len(text) > agentTail {
+		start = len(text) - agentTail
+	}
+	header := fmt.Sprintf("--- agent before the line (%s), end:", l.t.In(loc).Format(stamp))
+	if question != "" {
+		header = fmt.Sprintf("--- agent message with question (%s):", l.t.In(loc).Format(stamp))
+	}
+	fmt.Fprintln(w, header)
+	if start > 0 {
+		showEarlierQuestions(w, text[:start])
+	}
+	fmt.Fprintf(w, "%s\n", string(text[start:end]))
+}
+
+func questionExcerpt(text []rune, question string) (int, int) {
+	folded, positions := foldedRunesWithPositions(string(text))
+	needle := fold(question)
+	at := strings.Index(folded, needle)
+	if at < 0 || needle == "" {
+		return max(len(text)-agentTail, 0), len(text)
+	}
+	first, last := utf8.RuneCountInString(folded[:at]), utf8.RuneCountInString(folded[:at+len(needle)])
+	qStart, qEnd := positions[first], positions[last-1]+1
+	if qEnd-qStart >= agentTail {
+		return qStart, qStart + agentTail
+	}
+	start := max(qStart-(agentTail-(qEnd-qStart))/2, 0)
+	end := min(start+agentTail, len(text))
+	return max(end-agentTail, 0), end
+}
+
+func foldedRunesWithPositions(text string) (string, []int) {
+	var b strings.Builder
+	var positions []int
+	space := false
+	for i, r := range []rune(text) {
+		if unicode.IsSpace(r) {
+			if b.Len() > 0 {
+				space = true
+			}
+			continue
+		}
+		if space {
+			b.WriteByte(' ')
+			positions = append(positions, i)
+			space = false
+		}
+		r = unicode.ToLower(r)
+		if r == 'ё' {
+			r = 'е'
+		}
+		b.WriteRune(r)
+		positions = append(positions, i)
+	}
+	return b.String(), positions
+}
+
+func showEarlierQuestions(w io.Writer, text []rune) {
+	var questions []string
+	rows := strings.Split(string(text), "\n")
+	if len(rows) > 1 {
+		rows = rows[:len(rows)-1] // The excerpt may begin in the middle of a line.
+	}
+	for _, row := range rows {
+		row = strings.TrimSpace(row)
+		if strings.HasSuffix(row, "?") {
+			runes := []rune(row)
+			if len(runes) > 300 {
+				runes = append(runes[:299], '?')
+			}
+			questions = append(questions, string(runes))
+			if len(questions) == 5 {
+				break
+			}
+		}
+	}
+	if len(questions) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "--- questions earlier in the same message:")
+	for _, question := range questions {
+		fmt.Fprintln(w, question)
 	}
 }
 
@@ -769,6 +878,7 @@ type briefWord struct {
 	raw          string
 	path         string
 	fragment     string
+	question     string
 	day          time.Time
 	markedAt     time.Time
 	window       time.Duration
@@ -817,13 +927,14 @@ func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string]
 	dayFragments := make(map[string][]string)
 	daySeen := make(map[string]map[string]bool)
 	recordWindows := make(map[string]markerRecordInterval)
-	for _, word := range words {
+	for wordAt := range words {
+		word := &words[wordAt]
 		if word.isQuote && word.invalidCause == "" {
 			if word.markedAt.IsZero() {
 				key := markerRecordDayKey(word.day)
 				recordWindows[key] = markerRecordInterval{start: word.day, end: word.day.AddDate(0, 0, 1)}
 			}
-			for _, day := range briefWordScanDays(word, e.loc) {
+			for _, day := range briefWordScanDays(*word, e.loc) {
 				date := day.Format(time.DateOnly)
 				if daySeen[date] == nil {
 					daySeen[date] = make(map[string]bool)
@@ -872,9 +983,10 @@ func reportBriefWords(words []briefWord, dayHits map[string][]hit, recordDays ma
 	contexts := make(map[string][]line)
 	quoteContexts := make(map[string]briefQuoteContext)
 	found, ambiguous, missing := 0, 0, 0
-	for i, word := range words {
+	for i := range words {
+		word := &words[i]
 		fmt.Fprintf(stdout, "== %d. %s\n", i+1, word.raw)
-		hits, note, err := briefHitsUntil(word, e, contexts, dayHits, recordDays, until)
+		hits, note, err := briefHitsUntil(*word, e, contexts, dayHits, recordDays, until)
 		if err != nil {
 			fmt.Fprintf(stderr, "user-word: %v\n", err)
 			return exitUsage
@@ -909,7 +1021,7 @@ func reportBriefWords(words []briefWord, dayHits map[string][]hit, recordDays ma
 			}
 		}
 		for _, h := range located[:min(len(located), 5)] {
-			lines, err := briefContextLines(h, word, contexts, quoteContexts, until)
+			lines, err := briefContextLines(h, *word, contexts, quoteContexts, until)
 			if err != nil {
 				fmt.Fprintf(stderr, "user-word: read transcript %s: %v\n", h.path, err)
 				return exitUsage
@@ -928,7 +1040,7 @@ func reportBriefWords(words []briefWord, dayHits map[string][]hit, recordDays ma
 				continue
 			}
 			if word.isQuote {
-				showBriefQuote(stdout, lines, at, word, until, e.loc)
+				showBriefQuote(stdout, lines, at, *word, until, e.loc)
 			} else {
 				showBrief(stdout, lines, at, until, e.loc)
 			}
@@ -943,6 +1055,9 @@ func reportBriefWords(words []briefWord, dayHits map[string][]hit, recordDays ma
 }
 
 func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteContexts map[string]briefQuoteContext, until time.Time) ([]line, error) {
+	if word.question != "" {
+		return contextLines(h.path, contexts)
+	}
 	if word.isQuote {
 		if h.context != nil {
 			return h.context.lines, nil
@@ -1106,11 +1221,9 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 		if continued && (!ok || !continuationProse(row[marker[1]:colon])) {
 			continue // a date in the list without a quote, or another speaker's word
 		}
-		questionAnswer := false
+		questionAnswer, questionText := false, ""
 		if ok {
-			if answer := answerAfterQuotedQuestion(row, start); answer >= 0 {
-				start, questionAnswer = answer, true
-			}
+			start, questionAnswer, questionText = briefQuestionAnswer(row, start)
 		}
 		if !ok {
 			words = append(words, unquotedMarker(row, marker[0], marker[1]))
@@ -1131,7 +1244,7 @@ func extractBriefQuotes(row string, until time.Time, loc *time.Location) []brief
 				break
 			}
 			fragment := row[pos+len("«") : end-len("»")]
-			word := briefWord{raw: row[marker[0]:end], fragment: fragment, day: day, markedAt: markedAt, window: window, isQuote: true, invalidCause: cause}
+			word := briefWord{raw: row[marker[0]:end], fragment: fragment, question: questionText, day: day, markedAt: markedAt, window: window, isQuote: true, invalidCause: cause}
 			if strings.Trim(strings.ReplaceAll(fragment, "[…]", "…"), "… \t") == "" {
 				word.invalidCause = "empty quote"
 			}
@@ -1172,6 +1285,40 @@ func unquotedMarker(row string, start, after int) briefWord {
 		cause = "saw „…“ but expected «…»"
 	}
 	return briefWord{raw: row[start:rawEnd], isQuote: true, invalidCause: cause}
+}
+
+func briefQuestionAnswer(row string, start int) (int, bool, string) {
+	question := questionBeforeAnswer(row, start)
+	if answer := answerAfterQuotedQuestion(row, start); answer >= 0 {
+		if question == "" {
+			end := quoteEnd(row, start)
+			question = row[start+len("«") : end-len("»")]
+		}
+		return answer, true, question
+	}
+	return start, false, question
+}
+
+func questionBeforeAnswer(row string, answer int) string {
+	for search := 0; search < answer; {
+		rel := strings.Index(row[search:answer], "«")
+		if rel < 0 {
+			break
+		}
+		open := search + rel
+		search = open + len("«")
+		end := quoteEnd(row, open)
+		if end < 0 || end > answer {
+			continue
+		}
+		if next := answerAfterQuotedQuestion(row, open); next == answer {
+			return row[open+len("«") : end-len("»")]
+		}
+		if next, _, ok := questionQuote(row, open); ok && next == answer {
+			return row[open+len("«") : end-len("»")]
+		}
+	}
+	return ""
 }
 
 // answerAfterQuotedQuestion returns the opening quote of the user's answer when
