@@ -2273,6 +2273,20 @@ func TestJournalTextRejectsApproxFutureTime(t *testing.T) {
 	}
 }
 
+func TestRejectedTimeIsTheLastLineOfTheError(t *testing.T) {
+	now := time.Date(2026, 11, 2, 23, 0, 0, 0, time.Local)
+	var out, errout bytes.Buffer
+	code := runMain([]string{"note", "x", "23:40 сдано", "--by", "tester"}, now, &out, &errout)
+	lines := strings.Split(strings.TrimSpace(errout.String()), "\n")
+	if code != exitUsage || out.Len() != 0 || !strings.Contains(lines[len(lines)-1], "time of the entry") {
+		t.Fatalf("future time: code %d, stdout %q, stderr %q", code, out.String(), errout.String())
+	}
+	errout.Reset()
+	if code := runMain([]string{"note"}, now, &out, &errout); code != exitUsage || !strings.Contains(errout.String(), "tk -h for usage") {
+		t.Fatalf("usage error: code %d, stderr %q", code, errout.String())
+	}
+}
+
 func TestTaskNameParserSupportsCurrentAndLegacyNames(t *testing.T) {
 	for _, tc := range []struct {
 		name, prio, diff, slug string

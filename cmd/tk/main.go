@@ -161,19 +161,26 @@ type task struct {
 }
 
 func main() {
-	o, e := parseArgs(os.Args[1:])
+	os.Exit(runMain(os.Args[1:], time.Now(), os.Stdout, os.Stderr))
+}
+
+func runMain(args []string, now time.Time, out, errout io.Writer) int {
+	o, e := parseArgs(args)
 	if errors.Is(e, errHelp) {
-		fmt.Print(usage)
-		return
-	}
-	if e == nil {
-		e = validateApproxTime(o, time.Now())
+		fmt.Fprint(out, usage)
+		return 0
 	}
 	if e != nil {
-		fmt.Fprintf(os.Stderr, "tk: %v\n(tk -h for usage)\n", e)
-		os.Exit(exitUsage)
+		fmt.Fprintf(errout, "tk: %v\n(tk -h for usage)\n", e)
+		return exitUsage
 	}
-	os.Exit(run(o, os.Stdout, os.Stderr))
+	// A time in the text is no usage mistake: the reason stays the last line, which a caller cutting
+	// the output to its tail still sees.
+	if e = validateApproxTime(o, now); e != nil {
+		fmt.Fprintf(errout, "tk: %v\n", e)
+		return exitUsage
+	}
+	return run(o, out, errout)
 }
 func parseArgs(a []string) (options, error) {
 	if len(a) == 0 {
