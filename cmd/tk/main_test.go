@@ -19,6 +19,19 @@ import (
 	"time"
 )
 
+// Without a session and without --by the actor is unknown: tk refuses rather than guessing a name.
+func TestPrepareActorWithoutSessionNeedsBy(t *testing.T) {
+	oldSession := session
+	session = func() string { return "" }
+	t.Cleanup(func() { session = oldSession })
+	t.Setenv("USER", "synthetic-user")
+	o := options{cmd: "note"}
+	var errOut bytes.Buffer
+	if code := prepareActor(&o, &errOut); code != exitUsage || o.by != "" || !strings.Contains(errOut.String(), "--by") {
+		t.Fatalf("actor = %q, code=%d, stderr=%q", o.by, code, errOut.String())
+	}
+}
+
 func TestParseOptions(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -117,6 +130,62 @@ func TestValidateNew(t *testing.T) {
 				t.Fatalf("priority = %q, error = %v", tt.o.prio, err)
 			}
 		})
+	}
+}
+
+func TestTicketBodyParseRoundTripsSectionBoundaries(t *testing.T) {
+	body := "# T\n\nСтатус: открыт\n\n## Что сделать\nwork\n\n## Журнал\n- entry\n\ncontinuation\n"
+	got := renderTicketDocument(parseTicketBody(body))
+	if got != body {
+		t.Fatalf("parse/render changed body:\nwant %q\n got %q", body, got)
+	}
+	if got := journalLines(body); !reflect.DeepEqual(got, []string{"- entry"}) {
+		t.Fatalf("journal entries = %q", got)
+	}
+	if got := showTail(body, 0); got != body {
+		t.Fatalf("tail 0 changed full journal: %q", got)
+	}
+}
+
+func TestNewTextEmptySectionMatchesTemplate(t *testing.T) {
+	template := "# T\n\nСтатус: открыт\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- opened\n"
+	got := fillTicket(template, "## Приёмка\n")
+	mainBehavior := fillTicket(template, "")
+	if got != mainBehavior {
+		t.Fatalf("empty text section changed template:\nwant %q\n got %q", mainBehavior, got)
+	}
+}
+
+func TestSetTextCannotClearAcceptance(t *testing.T) {
+	body := "# T\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- existing\n"
+	if got, err := replaceExistingTicketSections(body, "## Приёмка\n\n"); err == nil || got != "" {
+		t.Fatalf("empty acceptance replacement = %q, %v", got, err)
+	}
+}
+
+func TestShowTicketSectionsAndTail(t *testing.T) {
+	body := "# T\n\nСтатус: открыт\nИсполнитель: worker\n\n## Что сделать\nwork\n\n## Приёмка\ncheck\n\n## Журнал\n- old\n- middle\n- new\n"
+	got := showSections(body, []string{"Приёмка"})
+	if strings.Contains(got, "Что сделать") || !strings.Contains(got, "## Приёмка\ncheck") {
+		t.Fatalf("sections = %q", got)
+	}
+	got = showTail(body, 2)
+	if strings.Contains(got, "old") || !strings.Contains(got, "middle") || !strings.Contains(got, "new") || !strings.Contains(got, "## Что сделать") {
+		t.Fatalf("tail = %q", got)
+	}
+	if strings.Contains(ticketHeader(body), "## ") {
+		t.Fatalf("head includes sections: %q", ticketHeader(body))
+	}
+}
+
+func TestSetReplacesOnlyProvidedSectionsAndKeepsJournal(t *testing.T) {
+	body := "# T\n\nСтатус: открыт\n\n## Что сделать\nold work\n\n## Приёмка\nold check\n\n## Журнал\n- existing\n"
+	got, err := replaceExistingTicketSections(body, "## Чем проверить\nnew check\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "## Что сделать\nold work") || !strings.Contains(got, "## Приёмка\nnew check") || !strings.Contains(got, "- existing") || strings.Contains(got, "old check") {
+		t.Fatalf("set replacement = %q", got)
 	}
 }
 
@@ -564,7 +633,7 @@ func TestLegacyTicketAndTextPreservation(t *testing.T) {
 
 func TestStartSetsExecutor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "20200101-1200-MEDIUM-new.md")
-	body := "# New\n\nСтатус: открыт\n\n## Постановка\nText.\n"
+	body := "# New\n\nСтатус: открыт\n\n## Постановка\nText.\n\n## Приёмка\ncheck\n"
 	if err := os.WriteFile(path, []byte(body), fileMode); err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +731,7 @@ func TestTicketIDFormsAndInvalidHint(t *testing.T) {
 
 func TestWaitReplaceAndStartClearsWait(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "20200101-1200-MEDIUM-waiting.md")
-	body := "# Waiting\n\nСтатус: открыт\n\n## Что сделать\nне менять\n"
+	body := "# Waiting\n\nСтатус: открыт\n\n## Что сделать\nне менять\n\n## Приёмка\ncheck\n"
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1149,6 +1218,12 @@ func TestFillTicketOldSectionNames(t *testing.T) {
 	}
 	if !noCheck("## Приёмка\n\n## Чем проверить\n\n## Журнал\n") || noCheck("## Приёмка\n\n## Чем проверить\n- тест\n") {
 		t.Error("noCheck судит по первому разделу, а не по всем")
+	}
+	if found, filled := checkSections("## Что сделать\nwork\n"); found || filled {
+		t.Error("missing acceptance must report not found and empty")
+	}
+	if found, filled := checkSections("## Приёмка\n\n## Чем проверить\n- check\n"); !found || !filled {
+		t.Error("filled legacy acceptance must be reported")
 	}
 }
 
@@ -2250,7 +2325,7 @@ func TestSetAndStartInsertWhyWithoutStatus(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			dir := t.TempDir()
 			oldPath := filepath.Join(dir, "20261105-1000-MED-legacy.md")
-			body := "# Legacy title\n\n## Что сделать\nwork\n"
+			body := "# Legacy title\n\n## Что сделать\nwork\n\n## Приёмка\ncheck\n"
 			if err := os.WriteFile(oldPath, []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -2290,9 +2365,9 @@ func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
 			t.Run(command+"/"+tc.name, func(t *testing.T) {
 				dir := t.TempDir()
 				oldPath := filepath.Join(dir, "20261105-1000-"+tc.oldPrio+"-ticket.md")
-				body := "# Ticket\n\nСтатус: открыт\n\n## Журнал\n"
+				body := "# Ticket\n\nСтатус: открыт\n\n## Приёмка\ncheck\n\n## Журнал\n"
 				if command == "start" {
-					body = "# Ticket\n\nСтатус: в работе\nИсполнитель: actor\n\n## Журнал\n"
+					body = "# Ticket\n\nСтатус: в работе\nИсполнитель: actor\n\n## Приёмка\ncheck\n\n## Журнал\n"
 				}
 				if err := os.WriteFile(oldPath, []byte(body), 0o644); err != nil {
 					t.Fatal(err)
@@ -2322,7 +2397,7 @@ func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
 func TestStartUpdatesMetadataOnOwnTicket(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "20261105-1000-MED-ticket.md")
-	body := "# Ticket\\n\\nСтатус: в работе\\nИсполнитель: actor\\n\\n## Журнал\\n"
+	body := "# Ticket\n\nСтатус: в работе\nИсполнитель: actor\n\n## Приёмка\ncheck\n\n## Журнал\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2394,7 +2469,7 @@ func TestRenameRefusesSymlinkAndFailedRenameLeavesJournalUntouched(t *testing.T)
 			dir := t.TempDir()
 			target := filepath.Join(dir, "target.md")
 			link := filepath.Join(dir, "20261105-1000-MED-linked.md")
-			body := "# Linked\n\nСтатус: открыт\n\n## Журнал\n"
+			body := "# Linked\n\nСтатус: открыт\n\n## Приёмка\ncheck\n\n## Журнал\n"
 			if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -2420,7 +2495,7 @@ func TestRenameRefusesSymlinkAndFailedRenameLeavesJournalUntouched(t *testing.T)
 		t.Run(command+"-rename-error", func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "20261105-1000-MED-ticket.md")
-			body := "# Ticket\n\nСтатус: открыт\n\n## Журнал\n"
+			body := "# Ticket\n\nСтатус: открыт\n\n## Приёмка\ncheck\n\n## Журнал\n"
 			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -2921,7 +2996,14 @@ func TestNewAndStartNameNextStep(t *testing.T) {
 			}
 			out.Reset()
 			errOut.Reset()
-			if code := transition(tasks[0], options{cmd: "start", id: "sample", by: "me"}, &out, &errOut); code != 0 {
+			code := transition(tasks[0], options{cmd: "start", id: "sample", by: "me"}, &out, &errOut)
+			if tc.name == "empty ticket" {
+				if code != exitNone || !strings.Contains(errOut.String(), "Приёмка") || !strings.Contains(errOut.String(), "tk set sample --text") {
+					t.Fatalf("empty start = %d: %s", code, errOut.String())
+				}
+				return
+			}
+			if code != 0 {
 				t.Fatalf("start = %d: %s", code, errOut.String())
 			}
 			if strings.TrimSpace(out.String()) != "sample в работе" {

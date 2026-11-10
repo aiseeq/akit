@@ -255,7 +255,7 @@ Each check runs in
 `BASHOPTS`, `LD_*`, `MALLOC_*` and the other variables glibc drops for setuid programs (`GCONV_PATH`, `LOCPATH`, …; `TMPDIR`
 stays) from the caller's environment (what changes bash itself; the
 programs a check calls are found by the caller's `PATH`), within the limit above (8 minutes, or `--timeout`); processes it leaves in its process group are killed. A `## План` section
-can also be supplied with `--text`; a `## Вход` section (context: request source and facts) goes
+can also be supplied with `--text` to `tk new` or `tk set`; set replaces only supplied sections and keeps other sections and the journal. `tk start` requires a nonempty `Приёмка`, except for journal tickets. A `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.
 
 Ticket IDs accept the slug, the full file name, or the file name without `.md`. Outside a Git
@@ -274,7 +274,7 @@ completion details; a waiting ticket whose deadline parses has it in `due` (RFC3
 checker session when it differs from `--by` (`checker_session` in JSON): a fresh sub-agent runs in its
 parent's session, so the session alone does not tell a self-check apart. `tk done --by` names the checker (a fresh sub-agent or worker); use `--doer` for the executor of an older ticket. `tk done` warns when the check runs in the executor's session and counts only as a check by a fresh sub-agent or a worker. It refuses tickets with an empty `Приёмка` or `Чем проверить` section. `tk release` returns an in-progress ticket to the open queue and clears its executor.
 `tk show ID` prints the ticket path and full text with lines over 150 characters wrapped at spaces (the file keeps them whole), or
-structured details with `--json`. `tk note ID TEXT` appends a journal entry without changing status.
+structured details with `--json`. Use `--section NAME` (repeatable) for selected sections, `--head` for the ticket header and status, or `--tail N` for the header, sections and last N journal lines (`--tail 0` prints all journal lines). Tickets over 20 KiB default to the header, sections and last 30 journal lines, followed by the remaining line count and a command to print the full journal. `tk note ID TEXT` appends a journal entry without changing status.
 `tk lint` checks ticket names, statuses, acceptance sections, and independent completion checks;
 `--root DIR` scans DIR and its first-level repositories. Without `--by`, actor commands use the
 current session name when it can be read from the process cgroup. `tk -h` lists commands and flags.

@@ -926,7 +926,7 @@ func TestNewBlocksPrintsFinalRaisedName(t *testing.T) {
 
 func TestStartHintUsesRetaggedName(t *testing.T) {
 	root, dir := blockTestProject(t)
-	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n\n## Что сделать\n\n## Приёмка\n\n## Журнал\n")
+	blockTestWrite(t, dir, "x", "LOW", "# x\n\nСтатус: открыт\nПричина: synthetic\n\n## Что сделать\n\n## Приёмка\n- check\n\n## Журнал\n")
 	o, err := parseArgs([]string{"start", "x", "--prio", "HIGH", "--why", "synthetic", "--by", "tester"})
 	if err != nil {
 		t.Fatal(err)

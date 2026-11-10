@@ -32,7 +32,7 @@ const usage = `tk — track repository tasks in docs/tasks.
 
 Usage:
   tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--journal] [--text FILE|-] [--blocks ID]
-  tk set ID [--prio P] [--diff D] [--why TEXT] [--title TEXT] [--back NAME] [--by NAME] [--journal] [--blocks ID] [--unblocks ID]
+  tk set ID [--prio P] [--diff D] [--why TEXT] [--title TEXT] [--back NAME] [--by NAME] [--journal] [--text FILE|-] [--blocks ID] [--unblocks ID]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
@@ -50,7 +50,7 @@ Usage:
   tk done ID --check TEXT [--by NAME] [--doer NAME] [--glint-debt SLUG] [--timeout D]   ends with the next ticket, as tk next chooses it for the executor
   tk reject ID --why TEXT [--by NAME]
   tk release ID --why TEXT [--by NAME]
-  tk show ID [--json]
+  tk show ID [--json] [--section NAME ... | --tail N | --head]
   tk archive [--older DURATION] [--root DIR]
 
 Flags:
@@ -65,7 +65,10 @@ Flags:
   --back NAME    new: requesting session; set: replace requester
   --title TEXT   new: ticket title (default: slug); set: replace title
   --by NAME      actor name (default: current session); done: checker (fresh sub-agent or worker, e.g. worker-<id>); release: actor; ls: show tickets assigned to NAME
-  --text FILE|-  new: fill ticket sections from FILE, or standard input with -
+  --text FILE|-  new/set: fill or replace ticket sections from FILE, or standard input with -
+  --section NAME show: print only named sections (repeatable)
+  --tail N       show: header, sections, and last N journal lines; 0 prints all
+  --head         show: header and status only
   --all          ls: include closed tickets
 
   --due          ls: show waiting tickets whose parsed deadline has passed
@@ -138,9 +141,10 @@ var planTimeout = 8 * time.Minute
 
 type options struct {
 	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back, parent string
-	all, due, json, required, take, journal                                                                                                                    bool
+	all, due, json, required, take, journal, head, tailSet                                                                                                     bool
 	older, timeout                                                                                                                                             time.Duration
-	blocks, unblocks                                                                                                                                           []string
+	tail                                                                                                                                                       int
+	sections, blocks, unblocks                                                                                                                                 []string
 }
 
 // planLimit — предел пункта плана: --timeout или умолчание.
@@ -283,22 +287,45 @@ var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*([01]?\d|2[0
 // «06:4xyz» — нет.
 var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5][xх](?:$|[^a-z0-9])`)
 
+func parseMultiValueOption(args []string, i *int, v string, o *options) error {
+	if *i+1 == len(args) || strings.HasPrefix(args[*i+1], "--") || strings.TrimSpace(args[*i+1]) == "" {
+		return fmt.Errorf("%s needs a value", v)
+	}
+	*i++
+	switch v {
+	case "--blocks":
+		o.blocks = append(o.blocks, args[*i])
+	case "--unblocks":
+		o.unblocks = append(o.unblocks, args[*i])
+	case "--section":
+		o.sections = append(o.sections, args[*i])
+	}
+	return nil
+}
+
+func parseTailOption(args []string, i *int, o *options) error {
+	if o.tailSet || *i+1 == len(args) {
+		return errors.New("--tail needs one non-negative line count")
+	}
+	(*i)++
+	n, err := strconv.Atoi(args[*i])
+	if err != nil || n < 0 {
+		return errors.New("--tail needs one non-negative line count")
+	}
+	o.tail, o.tailSet = n, true
+	return nil
+}
+
 func parseOptions(args []string, o *options) ([]string, error) {
 	values := map[string]*string{"--prio": &o.prio, "--diff": &o.diff, "--to": &o.to, "--back": &o.back, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin, "--parent": &o.parent}
-	flags := map[string]func(){"--all": func() { o.all = true }, "--due": func() { o.due = true }, "--json": func() { o.json = true }, "--required": func() { o.required = true }, "--take": func() { o.take = true }, "--journal": func() { o.journal = true }}
+	flags := map[string]func(){"--all": func() { o.all = true }, "--due": func() { o.due = true }, "--json": func() { o.json = true }, "--required": func() { o.required = true }, "--take": func() { o.take = true }, "--journal": func() { o.journal = true }, "--head": func() { o.head = true }}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		v := args[i]
-		if v == "--blocks" || v == "--unblocks" {
-			if i+1 == len(args) || strings.HasPrefix(args[i+1], "--") || strings.TrimSpace(args[i+1]) == "" {
-				return nil, fmt.Errorf("%s needs a value", v)
-			}
-			i++
-			if v == "--blocks" {
-				o.blocks = append(o.blocks, args[i])
-			} else {
-				o.unblocks = append(o.unblocks, args[i])
+		if v == "--blocks" || v == "--unblocks" || v == "--section" {
+			if err := parseMultiValueOption(args, &i, v, o); err != nil {
+				return nil, err
 			}
 			continue
 		}
@@ -313,6 +340,12 @@ func parseOptions(args []string, o *options) ([]string, error) {
 			seen[v] = true
 			i++
 			*p = args[i]
+			continue
+		}
+		if v == "--tail" {
+			if err := parseTailOption(args, &i, o); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if v == "--older" || v == "--timeout" {
@@ -362,7 +395,7 @@ func validateCommand(o *options, pos []string) error {
 }
 
 func validateCommandFlags(o *options) error {
-	checks := []func(*options) error{validateTakeFlag, validateDestinationFlags, validateJournalFlag, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
+	checks := []func(*options) error{validateTakeFlag, validateDestinationFlags, validateJournalFlag, validateTextFlag, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
 	for _, check := range checks {
 		if err := check(o); err != nil {
 			return err
@@ -394,6 +427,13 @@ func validateDestinationFlags(o *options) error {
 	return nil
 }
 
+func validateTextFlag(o *options) error {
+	if o.text != "" && o.cmd != "new" && o.cmd != "set" {
+		return errors.New("--text: flag only for new or set")
+	}
+	return nil
+}
+
 func validateJournalFlag(o *options) error {
 	if o.journal && o.cmd != "new" && o.cmd != "set" {
 		return errors.New("--journal: flag only for new or set")
@@ -418,7 +458,26 @@ func validateWhyFlag(o *options) error {
 	return errors.New("--why: flag only for new, set, start, reject, release, skip, unskip, or plan --repin")
 }
 
+func validateShowFlags(o *options) error {
+	if (len(o.sections) > 0 || o.tailSet || o.head) && o.cmd != "show" {
+		return errors.New("--section/--tail/--head: flag only for show")
+	}
+	if o.cmd != "show" {
+		return nil
+	}
+	if (o.head && (o.tailSet || len(o.sections) > 0)) || (o.tailSet && len(o.sections) > 0) {
+		return errors.New("show accepts only one of --head, --tail, or --section")
+	}
+	if o.json && (o.head || o.tailSet || len(o.sections) > 0) {
+		return errors.New("--json cannot be combined with --head, --tail, or --section")
+	}
+	return nil
+}
+
 func validateJSONFlag(o *options) error {
+	if err := validateShowFlags(o); err != nil {
+		return err
+	}
 	if o.json && o.cmd != "ls" && o.cmd != "show" && o.cmd != "next" && o.cmd != "external" {
 		return errors.New("--json: flag only for ls, show, next, or external")
 	}
@@ -641,7 +700,7 @@ func validatePriorityOptions(o *options) error {
 	if !validDiff(o.diff) {
 		return errors.New("--diff must be DO, HUNT, or ARCH")
 	}
-	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && o.title == "" && o.back == "" && !o.journal && len(o.blocks) == 0 && len(o.unblocks) == 0 {
+	if o.cmd == "set" && o.prio == "" && o.diff == "" && o.why == "" && o.title == "" && o.back == "" && o.text == "" && !o.journal && len(o.blocks) == 0 && len(o.unblocks) == 0 {
 		return errors.New("set needs a field to change")
 	}
 	return nil
@@ -1160,11 +1219,189 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 	if o.json {
 		return showJSON(root, t, out, errout)
 	}
-	fmt.Fprintf(out, "%s\n%s", relative(root, t.path), wrapLines(t.body, showWidth))
-	if !strings.HasSuffix(t.body, "\n") {
+	body := t.body
+	largeDefault := len(body) > maxFullShowBytes && !o.tailSet && !o.head && len(o.sections) == 0
+	if len(o.sections) > 0 {
+		body = showSections(body, o.sections)
+	} else if o.head {
+		body = ticketHeader(body)
+	} else if o.tailSet || largeDefault {
+		body = showTail(body, func() int {
+			if largeDefault {
+				return defaultShowJournalLines
+			}
+			return o.tail
+		}())
+	}
+	fmt.Fprintf(out, "%s\n%s", relative(root, t.path), wrapLines(body, showWidth))
+	if !strings.HasSuffix(body, "\n") {
 		fmt.Fprintln(out)
 	}
+	if largeDefault {
+		n := len(journalLines(t.body))
+		if n > defaultShowJournalLines {
+			fmt.Fprintf(out, "… ещё %d строк журнала: tk show %s --tail 0\n", n-defaultShowJournalLines, t.slug)
+		}
+	}
 	return 0
+}
+
+// Full ticket output is capped by size; the short view keeps a useful journal tail.
+const (
+	maxFullShowBytes        = 20 * 1024
+	defaultShowJournalLines = 30
+)
+
+// ticketSection stores one heading and the ordered lines until the next heading.
+type ticketSection struct {
+	heading string
+	lines   []string
+}
+
+type ticketDocument struct {
+	header   string
+	sections []ticketSection
+}
+
+func parseTicketBody(body string) ticketDocument {
+	lines := strings.Split(body, "\n")
+	doc := ticketDocument{}
+	first := len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			first = i
+			break
+		}
+	}
+	doc.header = strings.Join(lines[:first], "\n")
+	for i := first; i < len(lines); {
+		if !strings.HasPrefix(lines[i], "## ") {
+			i++
+			continue
+		}
+		start, end := i, i+1
+		for end < len(lines) && !strings.HasPrefix(lines[end], "## ") {
+			end++
+		}
+		doc.sections = append(doc.sections, ticketSection{heading: lines[start], lines: slices.Clone(lines[start+1 : end])})
+		i = end
+	}
+	return doc
+}
+
+func renderTicketDocument(doc ticketDocument) string {
+	parts := make([]string, 0, len(doc.sections)+1)
+	if doc.header != "" || len(doc.sections) == 0 {
+		parts = append(parts, doc.header)
+	}
+	for _, section := range doc.sections {
+		part := section.heading
+		if len(section.lines) > 0 {
+			part += "\n" + strings.Join(section.lines, "\n")
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func ticketHeader(body string) string {
+	doc := parseTicketBody(body)
+	if len(doc.sections) == 0 {
+		return body
+	}
+	return doc.header + "\n"
+}
+
+func normalizeSectionName(name string) string {
+	name = strings.TrimSpace(name)
+	if !strings.HasPrefix(name, "## ") {
+		name = "## " + name
+	}
+	if alias, ok := sectionAliases[name]; ok {
+		return alias
+	}
+	return name
+}
+
+func showSections(body string, requested []string) string {
+	wanted := map[string]bool{}
+	for _, name := range requested {
+		wanted[normalizeSectionName(name)] = true
+	}
+	doc := parseTicketBody(body)
+	selected := make([]ticketSection, 0, len(requested))
+	for _, section := range doc.sections {
+		if wanted[normalizeSectionName(section.heading)] {
+			selected = append(selected, section)
+		}
+	}
+	return renderTicketDocument(ticketDocument{sections: selected})
+}
+
+func showTail(body string, n int) string {
+	doc := parseTicketBody(body)
+	entries := journalLines(body)
+	if n > 0 && n < len(entries) {
+		entries = entries[len(entries)-n:]
+	}
+	selected := make([]ticketSection, 0, len(doc.sections))
+	for _, section := range doc.sections {
+		if section.heading == "## Журнал" {
+			if n == 0 {
+				selected = append(selected, section)
+			} else if len(entries) > 0 || len(section.lines) > 0 {
+				selected = append(selected, ticketSection{heading: section.heading, lines: entries})
+			}
+			continue
+		}
+		selected = append(selected, section)
+	}
+	doc.sections = selected
+	return renderTicketDocument(doc)
+}
+
+func replaceExistingTicketSections(body, text string) (string, error) {
+	replacements, _ := parseTicketSections(text)
+	if len(replacements) == 0 {
+		return "", errors.New("--text has no ticket sections")
+	}
+	delete(replacements, "## Журнал")
+	if acceptance, ok := replacements["## Приёмка"]; ok && len(trimBlankEdges(acceptance)) == 0 {
+		return "", errors.New("--text cannot clear the Приёмка section")
+	}
+	doc := parseTicketBody(body)
+	seen := map[string]bool{}
+	for i := range doc.sections {
+		name := normalizeSectionName(doc.sections[i].heading)
+		replacement, ok := replacements[name]
+		if !ok {
+			continue
+		}
+		lines := append(trimBlankEdges(replacement), "")
+		doc.sections[i] = ticketSection{heading: name, lines: lines}
+		seen[name] = true
+	}
+	var missing []string
+	for name := range replacements {
+		if !seen[name] {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	insertAt := len(doc.sections)
+	for i, section := range doc.sections {
+		if section.heading == "## Журнал" {
+			insertAt = i
+			break
+		}
+	}
+	added := make([]ticketSection, 0, len(missing))
+	for _, name := range missing {
+		lines := append(trimBlankEdges(replacements[name]), "")
+		added = append(added, ticketSection{heading: name, lines: lines})
+	}
+	doc.sections = append(doc.sections[:insertAt], append(added, doc.sections[insertAt:]...)...)
+	return renderTicketDocument(doc), nil
 }
 
 func bareRepository(main string) (bool, error) {
@@ -1269,7 +1506,7 @@ func prepareActor(o *options, errout io.Writer) int {
 }
 
 func readTicketText(o *options, errout io.Writer) int {
-	if o.cmd != "new" || o.text == "" {
+	if (o.cmd != "new" && o.cmd != "set") || o.text == "" {
 		return 0
 	}
 	var b []byte
@@ -1283,6 +1520,9 @@ func readTicketText(o *options, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	o.text = string(b)
+	if o.cmd == "set" && strings.TrimSpace(o.text) == "" {
+		return fail(errout, errors.New("--text has no ticket sections"))
+	}
 	return 0
 }
 
@@ -1956,6 +2196,9 @@ func parseTicketSections(text string) (map[string][]string, []string) {
 			if alias, ok := sectionAliases[current]; ok {
 				current = alias
 			}
+			if current != "## Журнал" {
+				sections[current] = []string{}
+			}
 			if !standardTicketSection(current) && current != "## Журнал" {
 				extra = append(extra, line)
 			}
@@ -2045,48 +2288,46 @@ func opener(s string) string {
 }
 
 func journalLines(s string) []string {
-	lines := make([]string, 0)
-	inJournal := false
-	for line := range strings.SplitSeq(s, "\n") {
-		if line == "## Журнал" {
-			inJournal = true
-			continue
-		}
-		if inJournal && strings.HasPrefix(line, "## ") {
-			break
-		}
-		if inJournal && strings.HasPrefix(line, "- ") {
-			lines = append(lines, line)
+	body, ok := sectionBody(s, "## Журнал")
+	if !ok {
+		return nil
+	}
+	lines := strings.Split(body, "\n")
+	entries := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(line, "- ") {
+			entries = append(entries, line)
 		}
 	}
-	return lines
+	return entries
+}
+
+func checkSections(s string) (found, filled bool) {
+	for _, heading := range []string{"## Приёмка", "## Чем проверить"} {
+		body, ok := sectionBody(s, heading)
+		if !ok {
+			continue
+		}
+		found = true
+		if strings.TrimSpace(body) != "" {
+			filled = true
+		}
+	}
+	return found, filled
 }
 
 // noCheck — раздел проверки есть, но ни один не заполнен.
 func noCheck(s string) bool {
-	found := false
-	for _, heading := range []string{"## Приёмка", "## Чем проверить"} {
-		if body, ok := sectionBody(s, heading); ok {
-			if strings.TrimSpace(body) != "" {
-				return false
-			}
-			found = true
-		}
-	}
-	return found
+	found, filled := checkSections(s)
+	return found && !filled
 }
 
 func sectionBody(s, heading string) (string, bool) {
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		if line != heading {
-			continue
+	doc := parseTicketBody(s)
+	for _, section := range doc.sections {
+		if section.heading == heading {
+			return strings.Join(section.lines, "\n"), true
 		}
-		end := i + 1
-		for end < len(lines) && !strings.HasPrefix(lines[end], "## ") {
-			end++
-		}
-		return strings.Join(lines[i+1:end], "\n"), true
 	}
 	return "", false
 }
@@ -3017,6 +3258,11 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return setTask(t, o, out, errout)
 	}
 	if o.cmd == "start" {
+		_, acceptanceFilled := checkSections(t.body)
+		if !isJournal(t) && !acceptanceFilled {
+			fmt.Fprintln(errout, "tk: заполни «Приёмка» через tk set "+t.slug+" --text FILE|- прежде чем начинать")
+			return exitNone
+		}
 		if code := refuseFrozenStart(o, errout); code != 0 {
 			return code
 		}
@@ -3306,6 +3552,21 @@ func setTask(t task, o options, out, errout io.Writer) int {
 	body, err := applySetFields(t, o)
 	if err != nil {
 		return fail(errout, err)
+	}
+	if o.text != "" {
+		body, err = replaceExistingTicketSections(body, o.text)
+		if err != nil {
+			return fail(errout, err)
+		}
+		sections, _ := parseTicketSections(o.text)
+		names := make([]string, 0, len(sections))
+		for name := range sections {
+			if name != "## Журнал" {
+				names = append(names, strings.TrimPrefix(name, "## "))
+			}
+		}
+		sort.Strings(names)
+		body = journal(body, "- "+time.Now().Format("2006-01-02 15:04")+" tk set — "+o.by+": разделы: "+strings.Join(names, ", "))
 	}
 	if o.journal {
 		body, err = setJournalKind(body)
