@@ -39,6 +39,8 @@ Vet errors are reported as build failed (exit 2); a mutant outside the test pack
   -F SPEC    read blocks from SPEC; "-" or no -F reads stdin when it is not a terminal
   --test-db  tests need the project's test database: run them as graft exec --heavy --test-db,
              which raises the database of the graft test_db section and passes its DSN
+  --env NAME pass the caller's variable NAME to the tests (repeatable): graft exec --heavy --env NAME,
+             since a run moved to another machine gets only the variables named this way
   -h         show this help
 
 ` + edit.SpecHelp
@@ -54,6 +56,7 @@ type opts struct {
 	positional []string
 	testArgs   []string
 	testDB     bool
+	env        []string
 }
 type event struct{ Action, Package, ImportPath, Test, Output, FailedBuild string }
 type verdict struct {
@@ -102,6 +105,14 @@ func parseArgs(args []string) (opts, error) {
 			return o, errHelp
 		case "--test-db":
 			o.testDB = true
+		case "--env":
+			if i+1 == len(args) {
+				return o, errors.New("--env needs a variable name")
+			}
+			i++
+			if err := o.addEnv(args[i]); err != nil {
+				return o, err
+			}
 		case "-F":
 			if i+1 == len(args) {
 				return o, errors.New("-F needs a value")
@@ -111,6 +122,10 @@ func parseArgs(args []string) (opts, error) {
 		default:
 			if after, ok := strings.CutPrefix(a, "-F="); ok {
 				o.spec = after
+			} else if after, ok := strings.CutPrefix(a, "--env="); ok {
+				if err := o.addEnv(after); err != nil {
+					return o, err
+				}
 			} else if strings.HasPrefix(a, "-") {
 				return o, fmt.Errorf("unknown flag %s", a)
 			} else {
@@ -128,6 +143,28 @@ func parseArgs(args []string) (opts, error) {
 		return o, errors.New("need OLD NEW FILE")
 	}
 	return o, nil
+}
+
+// addEnv принимает имя переменной вызывающего; значение берёт graft, а заданная
+// здесь NAME=VALUE разошлась бы с тем, что видит graft.
+func (o *opts) addEnv(name string) error {
+	if !validEnvName(name) {
+		return fmt.Errorf("--env %q: want a variable name like FOO_BAR", name)
+	}
+	o.env = append(o.env, name)
+	return nil
+}
+
+func validEnvName(name string) bool {
+	if name == "" || name[0] >= '0' && name[0] <= '9' {
+		return false
+	}
+	for _, c := range name {
+		if c != '_' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // loadEdits — мутанты из OLD NEW FILE или из спеки (файл, "-" или stdin не с терминала).
@@ -168,6 +205,9 @@ func run(o opts, stdin io.Reader, stdout io.Writer) int {
 	graft := []string{graftPath, "exec", "--heavy"}
 	if o.testDB {
 		graft = append(graft, "--test-db")
+	}
+	for _, name := range o.env {
+		graft = append(graft, "--env", name)
 	}
 	jsonArgs := testArgs(o.testArgs)
 	// Сигналы ловятся на весь вызов: пришедший между правкой и прогоном не должен убить mut до отката.

@@ -407,6 +407,51 @@ exec "$@"
 	f.unchanged(t)
 }
 
+// A heavy run moved to another machine sees only the variables named with
+// graft's --env; mut passes each --env NAME on, and only those.
+func TestEnvPassesNamedVariablesToGraft(t *testing.T) {
+	f := newFixture(t, "package calc\nimport (\"os\"; \"testing\")\nfunc TestAdd(t *testing.T){if os.Getenv(\"SAMPLE_VAR\")!=\"1\"{t.Fatal(\"SAMPLE_VAR is not passed\")}; if os.Getenv(\"OTHER_VAR\")!=\"\"{t.Fatal(\"OTHER_VAR leaked\")}; if Add(2,3)!=5{t.Fatal(Add(2,3))}}\n")
+	// Как graft на чужой машине: переменные вызывающего доходят, только если названы через --env.
+	script := `#!/bin/sh
+keep=" "
+while [ "$1" != -- ]; do [ "$1" = --env ] && { shift; keep="$keep$1 "; }; shift; done
+shift
+case "$keep" in *" SAMPLE_VAR "*) ;; *) unset SAMPLE_VAR;; esac
+case "$keep" in *" OTHER_VAR "*) ;; *) unset OTHER_VAR;; esac
+exec "$@"
+`
+	if err := os.WriteFile(filepath.Join(f.bin, "graft"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SAMPLE_VAR", "1")
+	t.Setenv("OTHER_VAR", "1")
+	if out, code := f.run(t, "--env", "SAMPLE_VAR", "a + b", "a - b", "calc.go", "--", "./..."); code != 0 || !strings.HasPrefix(out, "killed") {
+		t.Fatalf("with --env SAMPLE_VAR: %d %q", code, out)
+	}
+	if out, code := f.run(t, "--env=SAMPLE_VAR", "a + b", "a + b", "calc.go", "--", "./..."); code != 1 || !strings.HasPrefix(out, "survived") {
+		t.Fatalf("empty edit with --env=SAMPLE_VAR: %d %q", code, out)
+	}
+	if out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./..."); code != 2 || !strings.Contains(out, "fails without the mutant") {
+		t.Fatalf("without --env: %d %q", code, out)
+	}
+	if out, code := f.run(t, "--env", "SAMPLE_VAR", "--env", "OTHER_VAR", "a + b", "a - b", "calc.go", "--", "./..."); code != 2 || !strings.Contains(out, "fails without the mutant") {
+		t.Fatalf("both variables passed: %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
+func TestEnvRejectsAssignmentsAndBadNames(t *testing.T) {
+	for _, args := range [][]string{{"--env"}, {"--env", "FOO=1"}, {"--env="}, {"--env", "1FOO"}, {"--env", "FOO-BAR"}} {
+		if _, err := parseArgs(append(args, "--", "./...")); err == nil {
+			t.Errorf("%q: no error", args)
+		}
+	}
+	o, err := parseArgs([]string{"--env", "A_1", "--env=b", "--", "./..."})
+	if err != nil || strings.Join(o.env, ",") != "A_1,b" {
+		t.Fatalf("valid names: %v %q", err, o.env)
+	}
+}
+
 // The help shows only spec rules mut follows: no "sub FILE" form, and blocks do
 // not build on each other.
 func TestUsageHasNoSubOnlyRules(t *testing.T) {

@@ -172,8 +172,11 @@ Runs Go tests against each exact-text mutation in isolation, restores the source
     mut OLD NEW FILE -- <go test arguments>
     mut [-F SPEC] -- <go test arguments>
     mut --test-db -F SPEC -- -run TestStore ./store   # tests on the database of the graft test_db section
+    SAMPLE_VAR=1 mut --env SAMPLE_VAR OLD NEW FILE -- ./...   # tests read SAMPLE_VAR
 
 Tests that need the project test database run with `--test-db`: mut then calls `graft exec --heavy --test-db`, which raises that database and passes its DSN to `go test`.
+
+A heavy run can move to another machine, which gets only the variables named with graft's `--env`; `mut --env NAME` (repeatable) passes each name on, so a test that reads the variable runs there as it does here.
 
 ## tk
 
