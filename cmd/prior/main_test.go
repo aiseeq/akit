@@ -224,3 +224,21 @@ func TestSaid(t *testing.T) {
 		t.Errorf("unescape: %q", unescape(`a\\n\tb\x`))
 	}
 }
+
+// Topic words given as one quoted argument form a single phrase that matches
+// only where the whole phrase stands; prior says so at the top, and a
+// two-word form stays a plain search.
+func TestPhraseArgumentHint(t *testing.T) {
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".claude", "decisions.md"), "# журнал\n- старый секрет клиента удалить позже\n")
+	out := runPrior(t, home, "старый секрет клиента OAuth")
+	if !strings.HasPrefix(out, "prior: «старый секрет клиента OAuth» — один аргумент из 4 слов") {
+		t.Errorf("no phrase hint at the top:\n%s", out)
+	}
+	if !strings.Contains(out, "отдельными аргументами") {
+		t.Errorf("hint does not say how to search:\n%s", out)
+	}
+	if out := runPrior(t, home, "окн[оа] сжатия", "секрет"); strings.Contains(out, "одной фразой") {
+		t.Errorf("two-word form flagged as a phrase:\n%s", out)
+	}
+}

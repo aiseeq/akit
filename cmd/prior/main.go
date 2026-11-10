@@ -24,7 +24,8 @@ const usage = `prior — было ли это уже и что у нас уже 
 Запускать перед вопросом или предложением пользователю; итог - в строку «Искал: …».
 
 usage: prior <слово> [слово…] - слова темы, любое из них (регулярные выражения, без учёта регистра);
-       берите разные формы и синонимы: prior компак compact 'окн[оа] сжатия' '300 ?тыс'
+       берите разные формы и синонимы: prior компак compact 'окн[оа] сжатия' '300 ?тыс';
+       аргумент в кавычках ищется одной фразой целиком: слова темы - отдельными аргументами
 
 Порядок вывода - по весу источника: журнал решений, сказанное пользователем (правила, решения и обещания дословно),
 механизмы (карточки наших инструментов), опубликованные артефакты claude.ai (по названию), память пространств,
@@ -83,7 +84,14 @@ func parseArgs(args []string) ([]string, error) {
 type query struct {
 	words []*regexp.Regexp
 	any   *regexp.Regexp
+	// phrases — аргументы из трёх слов и больше: каждый ищется одной фразой целиком, и слова темы, отданные
+	// одним аргументом в кавычках, молча не находят ничего.
+	phrases []string
 }
+
+// phraseWords — с какого числа слов аргумент считается фразой, о которой стоит предупредить: «окн[оа] сжатия» из
+// двух слов — обычная форма поиска.
+const phraseWords = 3
 
 func newQuery(words []string) (query, error) {
 	var q query
@@ -93,6 +101,9 @@ func newQuery(words []string) (query, error) {
 			return q, fmt.Errorf("слово %q: %w", w, err)
 		}
 		q.words = append(q.words, re)
+		if len(strings.Fields(w)) >= phraseWords {
+			q.phrases = append(q.phrases, w)
+		}
 	}
 	q.any = regexp.MustCompile("(?i)(?:" + strings.Join(words, ")|(?:") + ")") // каждое слово уже скомпилировалось
 	return q, nil
@@ -167,6 +178,10 @@ func (r *report) print(w io.Writer) {
 }
 
 func run(q query, home string, w io.Writer) {
+	for _, p := range q.phrases {
+		fmt.Fprintf(w, "prior: «%s» — один аргумент из %d слов, ищется одной фразой целиком; слова и короткие фразы темы — отдельными аргументами, каждый в своих кавычках\n",
+			cut(p), len(strings.Fields(p)))
+	}
 	s := sources(home)
 	var r report
 	b := r.section("журнал решений (~/.claude/decisions.md)")
