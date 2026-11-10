@@ -67,3 +67,19 @@ func TestBriefSecondMarkerReviewDefects(t *testing.T) {
 		})
 	}
 }
+
+// Another speaker's answer after the user's one in the same sentence is not the user's.
+func TestBriefSecondAnswerOfAnotherSpeaker(t *testing.T) {
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-sa", "sa000000-0000",
+		agent("2026-11-09T15:00:00Z", "Записываю правки?"),
+		human("2026-11-09T15:01:00Z", "да"),
+		human("2026-11-09T15:06:00Z", "нет"))
+	for _, tc := range []struct{ brief, want string }{
+		{"Пользователь 09.11 на вопрос «Записываю правки?» ответил «да», лид на вопрос «Удаляю?» ответил «нет».\n", "1 user words: 1 found"},
+		{"Пользователь 09.11 на вопрос «Записываю правки?» ответил «да», а на вопрос «Удаляю?» ответил «нет».\n", "2 user words: 2 found"},
+	} {
+		_, out := briefRun(t, e, writeBrief(t, t.TempDir(), tc.brief), "--until", "2026-11-10 10:00")
+		mustHave(t, tc.brief, out, tc.want)
+	}
+}
