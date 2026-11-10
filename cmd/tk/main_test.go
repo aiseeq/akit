@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aiseeq/akit/queuegate"
+	"github.com/aiseeq/akit/timearg"
 	"maps"
 	"os"
 	"os/exec"
@@ -1402,9 +1403,9 @@ func TestWaitDueForms(t *testing.T) {
 		{"2h после деплоя", time.Time{}, false},
 		{"", time.Time{}, false},
 	} {
-		got, ok := waitDue(c.wait, now)
+		got, ok := timearg.Deadline(c.wait, now)
 		if ok != c.ok || !got.Equal(c.want) {
-			t.Errorf("waitDue(%q) = %v, %v; ждали %v, %v", c.wait, got, ok, c.want, c.ok)
+			t.Errorf("timearg.Deadline(%q) = %v, %v; ждали %v, %v", c.wait, got, ok, c.want, c.ok)
 		}
 	}
 	if got := datedWait("12:00 итог", now); got != "2026-10-31 12:00 итог" {
@@ -2961,7 +2962,7 @@ func TestListJSONDueMatchesWaitDue(t *testing.T) {
 	for _, wait := range []string{"2020-01-01T12:00", "2020-01-01 12:00 итог", "31.12 23:59: итог", "10.11 12:00: ответ", "2999-01-01 12:00 CET (x)", "2020-13-45 12:00: срок", "2020-01-01-ответ", "после ответа"} {
 		waiting := task{status: "ждёт", body: "Статус: ждёт\nЖдёт: " + wait}
 		want := ""
-		if at, ok := waitDue(wait, time.Now()); ok {
+		if at, ok := timearg.Deadline(wait, time.Now()); ok {
 			want = at.Format(time.RFC3339)
 		}
 		obj := taskObject("", waiting, "", false)

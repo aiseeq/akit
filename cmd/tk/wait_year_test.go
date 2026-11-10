@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/timearg"
 )
 
 // A new wait written as «DD.MM» is stored with the nearest future year.
@@ -34,9 +36,9 @@ func TestWaitDueOldLineWithoutYear(t *testing.T) {
 		{"10.01 12:00: x", time.Date(2026, 12, 20, 9, 0, 0, 0, time.Local), time.Date(2027, 1, 10, 12, 0, 0, 0, time.Local)},
 		{"31.10 12:00 после замера", time.Date(2026, 10, 31, 15, 0, 0, 0, time.Local), time.Date(2026, 10, 31, 12, 0, 0, 0, time.Local)},
 	} {
-		got, ok := waitDue(c.wait, c.now)
+		got, ok := timearg.Deadline(c.wait, c.now)
 		if !ok || !got.Equal(c.due) {
-			t.Errorf("waitDue(%q) at %v = %v, %v; want %v", c.wait, c.now, got, ok, c.due)
+			t.Errorf("timearg.Deadline(%q) at %v = %v, %v; want %v", c.wait, c.now, got, ok, c.due)
 		}
 	}
 }
