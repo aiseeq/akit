@@ -1293,6 +1293,13 @@ func nextAnswer(row string, end int) int {
 	if rel < 0 {
 		return -1
 	}
+	// Only a connective may stand between the answers: «, лид на вопрос …» is
+	// another speaker's answer.
+	switch strings.ToLower(strings.Trim(sentence[:rel], " \t,;")) {
+	case "на", "а на", "и на":
+	default:
+		return -1
+	}
 	open := strings.Index(sentence[rel:], "«")
 	if open < 0 {
 		return -1
