@@ -28,7 +28,7 @@ func resolve(opts options, e env) ([]source, error) {
 		if since.IsZero() {
 			since = e.now.Add(-sinceDefault)
 		}
-		return transcript.AllSources(e.home, since, opts.project, opts.codex, !opts.noSubagents)
+		return transcript.AllSourcesWindow(e.home, since, opts.until, opts.project, opts.codex, !opts.noSubagents)
 	}
 	args := opts.args
 	if len(args) == 0 {
