@@ -3,7 +3,9 @@ package proc
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,13 +23,19 @@ type StopResult struct {
 // once after the initial tree is captured; it may signal, close stdin or cancel
 // a context. The caller remains responsible for Cmd.Wait and WaitDelay.
 // Descendants that leave the tree before they can be observed cannot be found.
+// A failure for a single process does not stop the rest: the result comes with
+// an error naming each failed PID.
 func StopChild(pid int, grace time.Duration, request func() error) (StopResult, error) {
 	return stopTree("/proc", os.Getpid(), pid, grace, request, 0)
 }
 
-// StopFromShell requests every observed process to exit and stops survivors.
-// It permits descendants of the caller's parent and consecutive shell ancestors.
-// This ancestry rule is not a security boundary between jobs of the same shell.
+// StopFromShell sends sig to the target and the descendants observed before the
+// request, then SIGKILL to tracked survivors after the grace. It permits
+// descendants of the caller's parent and of the consecutive shells directly
+// above it; a non-shell above those shells is not an owner. This ancestry rule
+// is not a security boundary between jobs of the same shell. A failure for a
+// single process does not stop the rest: the result comes with an error naming
+// each failed PID.
 func StopFromShell(pid int, grace time.Duration, sig unix.Signal) (StopResult, error) {
 	if sig <= 0 || sig > 64 {
 		return StopResult{}, fmt.Errorf("invalid signal %d", sig)
@@ -59,16 +67,20 @@ func stopOwners(root string, self int, shells bool) (map[int]bool, error) {
 	if !shells {
 		return owners, nil
 	}
-	for p := s.Ppid; p > 1; {
+	// The parent owns its children whatever it is; above it only consecutive
+	// shells do. A non-shell above them (a terminal, a multiplexer, an agent)
+	// runs other jobs too, and is never an owner.
+	for p, parent := s.Ppid, true; p > 1; parent = false {
 		s, err = ReadStat(root, p)
 		if err != nil {
 			return nil, err
 		}
-		if serviceManager(p, s) {
+		shell := isShell(s.Comm)
+		if serviceManager(p, s) || (!parent && !shell) {
 			break
 		}
 		owners[p] = true
-		if !isShell(s.Comm) {
+		if !shell {
 			break
 		}
 		p = s.Ppid
@@ -125,9 +137,8 @@ func validateStop(root string, self, pid int, shells bool) (Stat, error) {
 }
 
 type trackedProcess struct {
-	fd        int
-	start     string
-	requested bool
+	fd    int
+	start string
 }
 
 type processTree map[int]*trackedProcess
@@ -136,6 +147,46 @@ func (tree processTree) close() {
 	for _, p := range tree {
 		_ = unix.Close(p.fd)
 	}
+}
+
+// stopFailures collects failures of single processes, so that one failure does
+// not keep the request or SIGKILL from the rest of the tree.
+type stopFailures struct {
+	byPID   map[int][]string
+	general []string
+}
+
+func (f *stopFailures) add(pid int, err error) {
+	msg := err.Error()
+	if pid <= 0 {
+		if !slices.Contains(f.general, msg) {
+			f.general = append(f.general, msg)
+		}
+		return
+	}
+	if f.byPID == nil {
+		f.byPID = map[int][]string{}
+	}
+	if !slices.Contains(f.byPID[pid], msg) {
+		f.byPID[pid] = append(f.byPID[pid], msg)
+	}
+}
+
+func (f *stopFailures) err() error {
+	if len(f.byPID) == 0 && len(f.general) == 0 {
+		return nil
+	}
+	parts := slices.Clone(f.general)
+	for _, pid := range slices.Sorted(maps.Keys(f.byPID)) {
+		parts = append(parts, fmt.Sprintf("PID %d: %s", pid, strings.Join(f.byPID[pid], ", ")))
+	}
+	return errors.New(strings.Join(parts, "; "))
+}
+
+// signalProcess sends sig through the process's pidfd. Tests replace it to
+// make the signal fail for one process.
+var signalProcess = func(_ int, p *trackedProcess, sig unix.Signal) error {
+	return unix.PidfdSendSignal(p.fd, sig, nil, 0)
 }
 
 func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, bool, error) {
@@ -161,6 +212,11 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 	return processTree{pid: {fd: fd, start: target.Start}}, false, nil
 }
 
+// stopTree validates and opens the target, captures its tree and sends the
+// request to the captured processes only: processes started later, such as a
+// cleanup the target runs on the request, are tracked and get only SIGKILL if
+// they outlive the grace. Failures before the request abort; later failures of
+// single processes are collected and returned with the result.
 func stopTree(root string, self, pid int, grace time.Duration, request func() error, sig unix.Signal) (StopResult, error) {
 	if grace < 0 || grace > 24*time.Hour {
 		return StopResult{}, errors.New("grace must be between 0 and 24h")
@@ -173,7 +229,8 @@ func stopTree(root string, self, pid int, grace time.Duration, request func() er
 		return StopResult{AlreadyExited: true}, nil
 	}
 	defer tree.close()
-	if err := captureDescendants(root, tree); err != nil {
+	var failures stopFailures
+	if err := captureDescendants(root, tree, &failures); err != nil {
 		return StopResult{}, err
 	}
 	if sig == 0 {
@@ -183,84 +240,71 @@ func stopTree(root string, self, pid int, grace time.Duration, request func() er
 		if err := request(); err != nil {
 			return StopResult{}, fmt.Errorf("stop request: %w", err)
 		}
-	} else if err := requestTree(tree, pid, sig); err != nil {
-		return StopResult{}, err
+	} else {
+		requestTree(tree, pid, sig, &failures)
 	}
-	alive, err := waitTree(root, tree, pid, sig, grace)
-	if err != nil || !alive {
-		return StopResult{}, err
+	var result StopResult
+	if waitTree(root, tree, grace, &failures) {
+		result = killTree(tree, &failures)
 	}
-	return killTree(tree)
+	return result, failures.err()
 }
 
-func sendRequest(pid int, p *trackedProcess, sig unix.Signal) error {
-	if p.requested {
-		return nil
-	}
-	p.requested = true
-	err := unix.PidfdSendSignal(p.fd, sig, nil, 0)
-	if errors.Is(err, unix.ESRCH) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("request PID %d: %w", pid, err)
-	}
-	return nil
-}
-
-func requestTree(tree processTree, leader int, sig unix.Signal) error {
-	if err := sendRequest(leader, tree[leader], sig); err != nil {
-		return err
-	}
-	for pid, p := range tree {
+func requestTree(tree processTree, leader int, sig unix.Signal, failures *stopFailures) {
+	pids := []int{leader}
+	for pid := range tree {
 		if pid != leader {
-			if err := sendRequest(pid, p, sig); err != nil {
-				return err
-			}
+			pids = append(pids, pid)
 		}
 	}
-	return nil
+	for _, pid := range pids {
+		err := signalProcess(pid, tree[pid], sig)
+		if err != nil && !errors.Is(err, unix.ESRCH) {
+			failures.add(pid, fmt.Errorf("request %s: %w", unix.SignalName(sig), err))
+		}
+	}
 }
 
-func processAlive(pid int, p *trackedProcess) (bool, error) {
+func processAlive(p *trackedProcess) (bool, error) {
 	fds := []unix.PollFd{{Fd: int32(p.fd), Events: unix.POLLIN}}
 	n, err := unix.Poll(fds, 0)
+	// The Go runtime's own signals interrupt the call; it is safe to repeat.
+	for errors.Is(err, unix.EINTR) {
+		n, err = unix.Poll(fds, 0)
+	}
 	if err != nil {
-		return false, fmt.Errorf("poll PID %d: %w", pid, err)
+		return false, fmt.Errorf("poll: %w", err)
 	}
 	return n == 0, nil
 }
 
-func treeAlive(tree processTree) (bool, error) {
+// treeAlive treats a process whose state cannot be polled as alive, so that it
+// still gets SIGKILL after the grace.
+func treeAlive(tree processTree, failures *stopFailures) bool {
 	alive := false
 	for pid, p := range tree {
-		running, err := processAlive(pid, p)
+		running, err := processAlive(p)
 		if err != nil {
-			return false, err
+			failures.add(pid, err)
+			running = true
 		}
 		alive = alive || running
 	}
-	return alive, nil
+	return alive
 }
 
-func waitTree(root string, tree processTree, leader int, sig unix.Signal, grace time.Duration) (bool, error) {
+func waitTree(root string, tree processTree, grace time.Duration, failures *stopFailures) bool {
 	deadline := time.Now().Add(grace)
 	for {
-		if err := captureDescendants(root, tree); err != nil {
-			return false, err
+		if err := captureDescendants(root, tree, failures); err != nil {
+			failures.add(0, err)
 		}
-		if sig != 0 {
-			if err := requestTree(tree, leader, sig); err != nil {
-				return false, err
-			}
-		}
-		alive, err := treeAlive(tree)
-		if err != nil || !alive {
-			return alive, err
+		if !treeAlive(tree, failures) {
+			return false
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return true, nil
+			return true
 		}
 		if remaining > 20*time.Millisecond {
 			remaining = 20 * time.Millisecond
@@ -269,22 +313,22 @@ func waitTree(root string, tree processTree, leader int, sig unix.Signal, grace 
 	}
 }
 
-func killTree(tree processTree) (StopResult, error) {
+func killTree(tree processTree, failures *stopFailures) StopResult {
 	killed := processTree{}
 	for pid, p := range tree {
-		alive, err := processAlive(pid, p)
+		alive, err := processAlive(p)
 		if err != nil {
-			return StopResult{}, err
-		}
-		if !alive {
+			failures.add(pid, err)
+		} else if !alive {
 			continue
 		}
-		err = unix.PidfdSendSignal(p.fd, unix.SIGKILL, nil, 0)
+		err = signalProcess(pid, p, unix.SIGKILL)
 		if errors.Is(err, unix.ESRCH) {
 			continue
 		}
 		if err != nil {
-			return StopResult{}, fmt.Errorf("SIGKILL PID %d: %w", pid, err)
+			failures.add(pid, fmt.Errorf("SIGKILL: %w", err))
+			continue
 		}
 		killed[pid] = p
 	}
@@ -292,26 +336,32 @@ func killTree(tree processTree) (StopResult, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for len(killed) > 0 {
 		for pid, p := range killed {
-			alive, err := processAlive(pid, p)
+			alive, err := processAlive(p)
 			if err != nil {
-				return result, err
+				failures.add(pid, fmt.Errorf("after SIGKILL: %w", err))
 			}
-			if !alive {
+			if err != nil || !alive {
 				delete(killed, pid)
-				continue
-			}
-			if time.Now().After(deadline) {
-				return result, fmt.Errorf("PID %d did not exit after SIGKILL", pid)
 			}
 		}
-		if len(killed) > 0 {
-			time.Sleep(10 * time.Millisecond)
+		if len(killed) == 0 {
+			break
 		}
+		if time.Now().After(deadline) {
+			for pid := range killed {
+				failures.add(pid, errors.New("SIGKILL: did not exit within 5s"))
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return result, nil
+	return result
 }
 
-func captureDescendants(root string, tree processTree) error {
+// captureDescendants adds the not yet tracked descendants of tracked
+// processes. Only an unreadable process list is returned as an error; a failure
+// for a single process is collected and the scan goes on.
+func captureDescendants(root string, tree processTree, failures *stopFailures) error {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return fmt.Errorf("read process list %s: %w", root, err)
@@ -332,14 +382,16 @@ func captureDescendants(root string, tree processTree) error {
 		for pid, s := range stats {
 			added, err := captureProcess(root, tree, stats, pid, s)
 			if err != nil {
-				return err
+				failures.add(pid, err)
 			}
-			changed = changed || added
+			changed = added || changed
 		}
 	}
 	return nil
 }
 
+// captureProcess tracks pid if it is a child of a tracked process. An error is
+// a failure for this process alone; the caller collects it and goes on.
 func captureProcess(root string, tree processTree, stats map[int]Stat, pid int, s Stat) (bool, error) {
 	if _, ok := tree[pid]; ok || s.State == "Z" || s.State == "X" || serviceManager(pid, s) {
 		return false, nil
@@ -357,7 +409,7 @@ func captureProcess(root string, tree processTree, stats map[int]Stat, pid int, 
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("pidfd_open %d: %w", pid, err)
+		return false, fmt.Errorf("pidfd_open: %w", err)
 	}
 	current, err := ReadStat(root, pid)
 	if err != nil {
@@ -365,9 +417,21 @@ func captureProcess(root string, tree processTree, stats map[int]Stat, pid int, 
 		if Gone(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("reading pid %d: %w", pid, err)
+		return false, err
 	}
 	if current.Start != s.Start || current.Ppid != s.Ppid {
+		_ = unix.Close(fd)
+		return false, nil
+	}
+	// The parent's stat was read at another moment of the scan: its PID may
+	// have been reused since. While the tracked parent has not exited, its PID
+	// is still its own, so the child's parent PID read above names it.
+	alive, err := processAlive(parent)
+	if err != nil {
+		_ = unix.Close(fd)
+		return false, fmt.Errorf("parent %d: %w", s.Ppid, err)
+	}
+	if !alive {
 		_ = unix.Close(fd)
 		return false, nil
 	}

@@ -30,8 +30,9 @@ func TestValidateStopManagerIsNeverOwner(t *testing.T) {
 	}
 }
 
-// Only consecutive shells extend ownership: a non-shell ancestor above the
-// parent ends the chain.
+// Only the parent and consecutive shells above it own targets: the non-shell
+// process above the shells (a terminal, a multiplexer, an agent) does not, so
+// a job of another tab or call is refused.
 func TestValidateStopChainEndsAtNonShell(t *testing.T) {
 	root := t.TempDir()
 	for _, p := range []struct {
@@ -46,8 +47,12 @@ func TestValidateStopChainEndsAtNonShell(t *testing.T) {
 	if _, err := validateStop(root, 40, 50, true); err == nil {
 		t.Error("accepted 50 under tmux, above the non-shell editor")
 	}
-	if _, err := validateStop(root, 40, 60, true); err != nil {
-		t.Errorf("refused 60 under the shell's parent: %v", err)
+	if _, err := validateStop(root, 40, 60, true); err == nil {
+		t.Error("accepted 60 under the non-shell editor above the shell")
+	}
+	fakeStat(t, root, 70, 30, "worker", "S")
+	if _, err := validateStop(root, 40, 70, true); err != nil {
+		t.Errorf("refused 70 under the shell: %v", err)
 	}
 }
 

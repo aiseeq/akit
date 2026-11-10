@@ -12,13 +12,18 @@ Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/b
 
 ## stop
 
-`stop [--grace D] [--signal S] PID` sends the request signal to every observed
-process in the tree, including those found while waiting, then sends SIGKILL to
-survivors. Its answer says whether SIGKILL was needed and how many processes
-received it. It accepts a descendant of its parent or of consecutive shell
-ancestors, allowing direct, `$(...)`, and `bash -c` calls; a service manager is
-never an owner. See `stop -h` for the PID identity and tree discovery limits.
-It requires Linux pidfds and refuses unsafe targets. The default grace is 2s.
+`stop [--grace D] [--signal S] PID` sends the request signal to the processes
+of the tree observed before the request, then sends SIGKILL to tracked survivors,
+including processes found while waiting (such as a cleanup the target starts on
+the request), after the grace. Its answer says whether SIGKILL was needed and how
+many processes received it. A failure for one process does not stop the others:
+`stop` then exits 1 naming each failed PID. It accepts a descendant of its parent
+or of the consecutive shells directly above that parent, allowing direct,
+`$(...)`, and `bash -c` calls. A non-shell above those shells (a terminal, a
+multiplexer, an agent) and a service manager are never owners, so stopping a
+job of another terminal tab or another agent call is not this tool's job. See
+`stop -h` for the PID identity and tree discovery limits. It requires Linux
+pidfds and refuses unsafe targets. The default grace is 2s.
 
 `proc.StopChild(pid, grace, request)` provides the same observed-tree stopping
 for a direct child; the caller supplies the request (signal, stdin close or

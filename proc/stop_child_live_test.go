@@ -1,7 +1,9 @@
 package proc
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -15,15 +17,16 @@ func TestStopChildLive(t *testing.T) {
 		script string
 		killed bool
 	}{
-		{"exits on request", "exec sleep 30", false},
-		{"ignores request", "trap '' TERM; while :; do sleep 0.05; done", true},
+		{"exits on request", "echo > \"$1\"; exec sleep 30", false},
+		{"ignores request", "trap '' TERM; echo > \"$1\"; while :; do sleep 0.05; done", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cmd := exec.Command("sh", "-c", tc.script)
+			ready := filepath.Join(t.TempDir(), "ready")
+			cmd := exec.Command("sh", "-c", tc.script, "sh", ready)
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
-			time.Sleep(100 * time.Millisecond)
+			waitReady(t, ready)
 			started := time.Now()
 			result, err := StopChild(cmd.Process.Pid, 300*time.Millisecond, func() error {
 				return cmd.Process.Signal(syscall.SIGTERM)
@@ -39,5 +42,20 @@ func TestStopChildLive(t *testing.T) {
 				t.Errorf("killed before the grace: %v", time.Since(started))
 			}
 		})
+	}
+}
+
+// waitReady waits until the child has written its ready file: its trap is set.
+func waitReady(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child did not get ready: %s", path)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

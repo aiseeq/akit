@@ -15,12 +15,17 @@ import (
 
 const usage = `Usage: stop [--grace D] [--signal S] PID
 
-Stop a descendant of the calling process's parent or its consecutive shell
-ancestors (bash, sh, dash, zsh, ksh). This permits direct, $(...) and bash -c
-calls. A service manager is never an owner. This rule is not an isolation
-boundary between jobs of the same shell. The request signal goes to every
-observed process, including those discovered while waiting. The result reports
-whether SIGKILL was needed and how many processes received it.
+Stop a descendant of the calling process's parent or of the consecutive shells
+(bash, sh, dash, zsh, ksh) directly above that parent. This permits direct,
+$(...) and bash -c calls. A non-shell above those shells (a terminal, a
+multiplexer, an agent) and a service manager are never owners: stop does not
+reach jobs of another terminal tab or another agent call. This rule is not an
+isolation boundary between jobs of the same shell.
+The request signal goes to the processes observed before it; processes found
+later, such as a cleanup the target starts on the request, are not signalled
+and get SIGKILL only if still alive after the grace. The result reports whether
+SIGKILL was needed and how many processes received it. A failure for one
+process does not stop the others; stop then exits 1 naming each failed PID.
 PID must identify the original process when stop starts: a PID reused before
 then cannot be distinguished. Descendants already reparented before discovery
 or created and reparented between scans may escape; use a dedicated cgroup for
@@ -56,15 +61,26 @@ func main() {
 	started := time.Now()
 	result, err := proc.StopFromShell(pid, *grace, sig)
 	if err != nil {
+		if result.Killed > 0 {
+			fmt.Println(killedLine(pid, result.Killed, *grace))
+		}
 		fail(err)
 	}
 	if result.AlreadyExited {
 		fmt.Printf("stop: %d already exited\n", pid)
 	} else if result.Killed > 0 {
-		fmt.Printf("stop: %d killed %d processes after %s grace\n", pid, result.Killed, *grace)
+		fmt.Println(killedLine(pid, result.Killed, *grace))
 	} else {
 		fmt.Printf("stop: %d exited after %s in %s\n", pid, unix.SignalName(sig), time.Since(started).Round(time.Millisecond))
 	}
+}
+
+func killedLine(pid, killed int, grace time.Duration) string {
+	noun := "processes"
+	if killed == 1 {
+		noun = "process"
+	}
+	return fmt.Sprintf("stop: %d killed %d %s after %s grace", pid, killed, noun, grace)
 }
 
 func fail(err error) { fmt.Fprintln(os.Stderr, "stop:", err); os.Exit(1) }

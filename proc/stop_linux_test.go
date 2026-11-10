@@ -3,9 +3,14 @@ package proc
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func fakeStat(t *testing.T, root string, pid, parent int, name, state string) {
@@ -86,5 +91,67 @@ func TestZombieReturnsImmediately(t *testing.T) {
 	result, err := stopTree(root, 10, 20, 0, func() error { t.Fatal("request called"); return nil }, 0)
 	if err != nil || !result.AlreadyExited {
 		t.Fatalf("result=%+v error=%v", result, err)
+	}
+}
+
+// A signal that fails for one process does not keep the request or SIGKILL
+// from the others, and the error names the failed PID.
+func TestStopContinuesAfterSignalFailure(t *testing.T) {
+	// The child starts a grandchild that writes a marker on TERM, unless the
+	// child ignores TERM itself: then the grandchild inherits the ignore.
+	const script = `[ "$3" = ignore ] && trap '' TERM
+sh -c 'trap "echo > \"$1\"; exit 0" TERM; echo $$ > "$2.tmp"; mv "$2.tmp" "$2"; while :; do sleep 0.05; done' sh "$1" "$2" &
+while :; do sleep 0.05; done`
+	for _, tc := range []struct {
+		name    string
+		failSig unix.Signal
+		mode    string
+		failure string
+		marker  bool
+	}{
+		{"request fails", unix.SIGTERM, "", "request", true},
+		{"SIGKILL fails", unix.SIGKILL, "ignore", "SIGKILL", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			marker, pidFile := filepath.Join(dir, "marker"), filepath.Join(dir, "pid")
+			cmd := exec.Command("sh", "-c", script, "sh", marker, pidFile, tc.mode)
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			child := cmd.Process.Pid
+			t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+			waitReady(t, pidFile)
+			b, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grandchild, err := strconv.Atoi(strings.TrimSpace(string(b)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			real := signalProcess
+			t.Cleanup(func() { signalProcess = real })
+			signalProcess = func(pid int, p *trackedProcess, sig unix.Signal) error {
+				if pid == child && sig == tc.failSig {
+					return unix.EPERM
+				}
+				return real(pid, p, sig)
+			}
+			result, err := stopTree("/proc", os.Getpid(), child, 300*time.Millisecond, nil, unix.SIGTERM)
+			want := fmt.Sprintf("PID %d: %s", child, tc.failure)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("error %v, want it to name %q", err, want)
+			}
+			if result.Killed == 0 {
+				t.Errorf("no process got SIGKILL: %+v", result)
+			}
+			if _, err := os.Stat(marker); (err == nil) != tc.marker {
+				t.Errorf("grandchild marker present=%v, want %v", err == nil, tc.marker)
+			}
+			if s, err := ReadStat("/proc", grandchild); err == nil && s.State != "Z" {
+				t.Errorf("grandchild %d still alive: %s", grandchild, s.State)
+			}
+		})
 	}
 }
