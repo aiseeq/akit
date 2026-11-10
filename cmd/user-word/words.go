@@ -816,8 +816,13 @@ func runBrief(opts options, e env, stdout, stderr io.Writer) int {
 func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string][]hit, map[string]bool, []line, error) {
 	dayFragments := make(map[string][]string)
 	daySeen := make(map[string]map[string]bool)
+	recordWindows := make(map[string]markerRecordInterval)
 	for _, word := range words {
 		if word.isQuote && word.invalidCause == "" {
+			if word.markedAt.IsZero() {
+				key := markerRecordDayKey(word.day)
+				recordWindows[key] = markerRecordInterval{start: word.day, end: word.day.AddDate(0, 0, 1)}
+			}
 			for _, day := range briefWordScanDays(word, e.loc) {
 				date := day.Format(time.DateOnly)
 				if daySeen[date] == nil {
@@ -838,7 +843,7 @@ func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string]
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return scanBriefQuotes(inventory, dayFragments, until, e.loc)
+	return scanBriefQuotes(inventory, dayFragments, recordWindows, until, e.loc)
 }
 
 func briefWordScanDays(word briefWord, loc *time.Location) []time.Time {
@@ -1224,7 +1229,8 @@ func markerZoneToken(text string) (string, bool) {
 	if text == "" {
 		return "", false
 	}
-	if strings.HasPrefix(strings.ToLower(text), "по москве") {
+	phrase := strings.TrimPrefix(text, "(")
+	if strings.HasPrefix(strings.ToLower(phrase), "по москве") {
 		return "по Москве", true
 	}
 	token, _, _ := strings.Cut(text, " ")
@@ -1232,10 +1238,10 @@ func markerZoneToken(text string) (string, bool) {
 	return token, token != ""
 }
 
-var markerZoneAbbreviation = regexp.MustCompile(`^\(?[A-Z]{2,6}\)?$`)
+var markerZoneAbbreviations = regexp.MustCompile(`^\(?(?:MSK|EST|EDT|PST|PDT|CST|CDT|MST|MDT|AST|ADT|AKST|AKDT|HST|BST|IST|JST|EET|EEST|WET|WEST|KST|HKT|AEST|AEDT|ACST|ACDT|AWST|NZST|NZDT|SGT|ICT|PKT|TRT|GST|EAT|CAT|WAT)\)?$`)
 
 func markerZoneLike(token string) bool {
-	if markerZoneName.MatchString(token) || markerZoneAbbreviation.MatchString(token) || strings.EqualFold(token, "мск") || strings.EqualFold(token, "(мск)") {
+	if markerZoneName.MatchString(token) || markerZoneAbbreviations.MatchString(token) || strings.EqualFold(token, "мск") || strings.EqualFold(token, "(мск)") {
 		return true
 	}
 	return strings.EqualFold(token, "по Москве")
@@ -1349,7 +1355,7 @@ func briefHitsUntil(word briefWord, e env, contexts map[string][]line, cached ma
 		return nil, fmt.Sprintf("no matching user line within %v of marker time", word.window), nil
 	}
 	if len(dayHits) == 0 {
-		if !recordDays[word.day.Format(time.DateOnly)] {
+		if !recordDays[markerRecordDayKey(word.day)] {
 			return nil, "no transcript records on marker day", nil
 		}
 		return nil, "no matching user line on marker day", nil
@@ -1384,15 +1390,28 @@ func hitOnMarkerDay(h hit, word briefWord) bool {
 }
 
 type briefQuoteFilters struct {
-	from     time.Time
-	byDay    map[string][]func([]byte) bool
-	byRawDay map[string][]func([]byte) bool
+	from          time.Time
+	byDay         map[string][]func([]byte) bool
+	byRawDay      map[string][]func([]byte) bool
+	recordWindows map[string]markerRecordInterval
 }
 
-func makeBriefQuoteFilters(fragments map[string][]string, loc *time.Location) (briefQuoteFilters, error) {
+type markerRecordInterval struct {
+	start time.Time
+	end   time.Time
+}
+
+func markerRecordDayKey(day time.Time) string {
+	start := day.UTC().Format(time.RFC3339Nano)
+	end := day.AddDate(0, 0, 1).UTC().Format(time.RFC3339Nano)
+	return start + "|" + end
+}
+
+func makeBriefQuoteFilters(fragments map[string][]string, recordWindows map[string]markerRecordInterval, loc *time.Location) (briefQuoteFilters, error) {
 	filters := briefQuoteFilters{
-		byDay:    make(map[string][]func([]byte) bool, len(fragments)),
-		byRawDay: make(map[string][]func([]byte) bool),
+		byDay:         make(map[string][]func([]byte) bool, len(fragments)),
+		byRawDay:      make(map[string][]func([]byte) bool),
+		recordWindows: recordWindows,
 	}
 	rawSeen := make(map[string]map[string]bool)
 	rawQuotes := make(map[string][]string)
@@ -1438,8 +1457,8 @@ type briefQuoteScanResult struct {
 	err        error
 }
 
-func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string, until time.Time, loc *time.Location) (map[string][]hit, map[string]bool, []line, error) {
-	filters, err := makeBriefQuoteFilters(fragments, loc)
+func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string, recordWindows map[string]markerRecordInterval, until time.Time, loc *time.Location) (map[string][]hit, map[string]bool, []line, error) {
+	filters, err := makeBriefQuoteFilters(fragments, recordWindows, loc)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1627,8 +1646,14 @@ func quoteLineKey(l line) briefQuoteLineKey {
 
 func (c *briefQuoteCollector) setRawDay(day, raw []byte) {
 	c.rawDay = day
-	if stamp, err := transcriptTimestamp(raw); err == nil && !stamp.IsZero() {
-		c.recordDays[stamp.In(c.loc).Format(time.DateOnly)] = true
+	stamp, err := transcriptTimestamp(raw)
+	if err != nil || stamp.IsZero() {
+		return
+	}
+	for key, interval := range c.filters.recordWindows {
+		if !stamp.Before(interval.start) && stamp.Before(interval.end) {
+			c.recordDays[key] = true
+		}
 	}
 }
 
@@ -2069,7 +2094,16 @@ func readChronologicalBriefLines(path string, f *os.File, size int64, from, unti
 		return nil, err
 	}
 	if !ordered {
-		lines, err := readLines(path, keep)
+		trackedKeep := keep
+		if setDay != nil {
+			trackedKeep = func(raw []byte) bool {
+				if stamp, stampErr := transcriptTimestamp(raw); stampErr == nil && !stamp.IsZero() {
+					setDay([]byte(stamp.UTC().Format(time.DateOnly)), raw)
+				}
+				return keep == nil || keep(raw)
+			}
+		}
+		lines, err := readLines(path, trackedKeep)
 		for i := range lines {
 			if lines[i].warning != "" {
 				lines[i].warning = fmt.Sprintf("%s in %s", lines[i].warning, path)

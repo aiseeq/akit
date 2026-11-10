@@ -39,12 +39,13 @@ FRAGMENT matches ignoring case, ё/е and line breaks or runs of spaces.
 User lines: typed or queued by the human, and answers in a question dialog.
 Question dialog searches match only the human's answer; the question is shown
 as context. A brief marker zone may follow its date or clock: CET, CEST, UTC,
-GMT, Z, UTC+H (any case, optional parentheses and trailing punctuation). An
-uppercase Latin abbreviation of 2–6 letters (MSK, EST), мск, «по Москве», or
-such a token in parentheses is treated as a zone and reported as not found if
-unknown. Known zones are accepted in any case. Other text after the clock is
-ignored for timezone selection, so the quote is searched
-in the default timezone. Two-digit marker years use the usual 00–68 and 69–99
+GMT, Z, UTC+H (any case, optional parentheses and trailing punctuation). Only
+listed uppercase Latin timezone abbreviations such as MSK, EST, or PST are
+considered zone-like; «мск» and «по Москве» are too, with optional parentheses.
+Known named zones are accepted in any case. Other text after the clock is
+ignored for timezone selection, so the quote is searched in the default timezone.
+If there are no transcript records on the marker day, not found reports this
+reason. Two-digit marker years use the usual 00–68 and 69–99
 year ranges.
 Exit: 0 found, 1 not found, 2 usage/IO error.
 `
