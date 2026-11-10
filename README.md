@@ -303,6 +303,13 @@ read their token counts.
 Large transcript reads wait for machine capacity through graft's heavy queue; smaller ones run at once on two
 threads.
 
+All output, `--raw` included, has secret values masked as `[скрыто:KIND len=N #TAG]`: `N` is the
+hidden value's length in characters and `TAG` a keyed hash of it, so two fragments with the same
+`TAG` are equal across `tl` calls while the value itself is not shown. The key is created on the
+first run in `$XDG_STATE_HOME/akit/mask-key` (`~/.local/state/akit/mask-key` when unset); without it
+markers carry the kind only and stderr says why. The mask also hides some names that look like keys,
+such as long `pk_test_…` identifiers: compare `N` and `TAG` with the fragment you expect.
+
 `--wait PROG [SUB]` prints the nearest-rank percentile of milliseconds from a shell command call to
 its output; calls without output, background Bash calls, and commands that also run unrelated programs
 are excluded. The default percentile is 50; `--q` accepts 1–99. Fewer matching events than the

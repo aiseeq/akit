@@ -1,6 +1,8 @@
 // Package secretmask hides secret values in text before it goes further: to a
 // log, a report or a model of another provider. It replaces each match with
-// [скрыто:<kind>] and counts matches by kind; it never returns a value.
+// [скрыто:<kind>] and counts matches by kind; it never returns a value. A
+// Tagger writes [скрыто:<kind> len=<characters> #<tag>] instead, the tag being
+// a hash of the value under the caller's key.
 //
 // Detection has deliberate limits:
 //   - Short fragments after a bare letter or digit, and generic sk values
@@ -72,6 +74,7 @@ package secretmask
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -363,7 +366,20 @@ var patterns = [...]pattern{
 // Mask replaces every secret in text with [скрыто:<kind>] and returns the text
 // and the number of matches by kind (empty, not nil, when there are none).
 func Mask(text string) (string, map[string]int) {
-	found := map[string]int{}
+	m := masking{found: map[string]int{}}
+	return m.mask(text), m.found
+}
+
+// masking is one Mask call: the counts by kind and, when tagging, the hidden
+// values in the order their placeholders were written.
+type masking struct {
+	found  map[string]int
+	tagger *Tagger
+	values []string
+	kept   []string
+}
+
+func (m *masking) mask(text string) string {
 	var scan *scanIndex
 	for _, p := range patterns {
 		var indices [][]int
@@ -377,26 +393,30 @@ func Mask(text string) (string, map[string]int) {
 			}
 		}
 		if len(indices) != 0 {
-			text = replaceMatches(text, indices, p.kind, found)
+			text = replaceMatches(text, indices, p.kind, m)
 			scan = nil // replacements invalidate byte offsets and run metadata
 		}
 	}
 	if groups := contextAnchorGroups(text); groups != 0 {
-		text = maskJSONContext(text, found, groups)
-		text = maskContext(text, found, groups)
+		text = maskJSONContext(text, m, groups)
+		text = maskContext(text, m, groups)
 	}
-	if found[liveKeyKind] != 0 {
-		text = dropLiveKeyTails(text)
+	if m.found[liveKeyKind] != 0 {
+		text = m.dropLiveKeyTails(text)
 	}
-	return text, found
+	if m.tagger != nil {
+		text = m.render(text)
+	}
+	return text
 }
 
 // dropLiveKeyTails removes the token characters right after a sk_live marker: a
 // key of these kinds can carry _ and - in its body, and recognition stops at the
 // first of them. It runs last, so the context rules still see whatever is glued
 // to the key and the output differs from theirs only by what is removed here.
-func dropLiveKeyTails(text string) string {
-	marker := "[скрыто:" + liveKeyKind + "]"
+// A tagged value takes its removed tail along.
+func (m *masking) dropLiveKeyTails(text string) string {
+	marker := maskMarker + liveKeyKind
 	var out strings.Builder
 	for {
 		at := strings.Index(text, marker)
@@ -405,16 +425,57 @@ func dropLiveKeyTails(text string) string {
 			return out.String()
 		}
 		end := at + len(marker)
+		index, closed := m.placeholderEnd(text, &end)
 		out.WriteString(text[:end])
-		for end < len(text) && bodyContains(tokenChars, text[end]) {
-			end++
+		if !closed {
+			text = text[end:]
+			continue
 		}
-		text = text[end:]
+		tail := end
+		for tail < len(text) && bodyContains(tokenChars, text[tail]) {
+			tail++
+		}
+		if index >= 0 {
+			m.extend(index, text[end:tail])
+		}
+		text = text[tail:]
 	}
 }
 
+// placeholderEnd moves end past the close of a marker whose kind ends at end:
+// "]" or a placeholder number and "]". It returns the placeholder number (-1
+// for a plain marker) and false when no close follows, as after sk_live_x.
+func (m *masking) placeholderEnd(text string, end *int) (int, bool) {
+	rest := text[*end:]
+	if strings.HasPrefix(rest, "]") {
+		*end++
+		return -1, true
+	}
+	if m.tagger == nil || !strings.HasPrefix(rest, placeholderSep) {
+		return -1, false
+	}
+	digits, index := len(placeholderSep), 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		index = index*10 + int(rest[digits]-'0')
+		if index >= len(m.values) {
+			return -1, false // also keeps the number from overflowing
+		}
+		digits++
+	}
+	if digits == len(placeholderSep) || digits == len(rest) || rest[digits] != ']' {
+		return -1, false
+	}
+	*end += digits + 1
+	return index, true
+}
+
+// extend adds the dropped tail of a sk_live key to the value it belongs to.
+func (m *masking) extend(index int, tail string) {
+	m.values[index] = m.values[index] + tail
+}
+
 // Context rules recognize values after familiar command and configuration names.
-func maskContext(text string, found map[string]int, groups anchorGroup) string {
+func maskContext(text string, m *masking, groups anchorGroup) string {
 	matches := make([]contextMatch, 0)
 	if groups&anchorHeader != 0 {
 		matches = append(matches, headerMatches(text)...)
@@ -446,13 +507,13 @@ func maskContext(text string, found map[string]int, groups anchorGroup) string {
 		spans = append(spans, contextSpan{match.start, match.end, match.kind})
 		last = match.end
 	}
-	return replaceSpans(text, spans, found)
+	return replaceSpans(text, spans, m)
 }
 
 // maskJSONContext hides values that JSON keeps apart from their name: an
 // option and its value as neighbouring array elements, an array or an object
 // under a secret key, and a {"name": ..., "value": ...} pair.
-func maskJSONContext(text string, found map[string]int, groups anchorGroup) string {
+func maskJSONContext(text string, m *masking, groups anchorGroup) string {
 	if groups&(anchorName|anchorCurl) == 0 {
 		return text
 	}
@@ -484,7 +545,7 @@ func maskJSONContext(text string, found map[string]int, groups anchorGroup) stri
 			last = span.end
 		}
 	}
-	return replaceSpans(text, kept, found)
+	return replaceSpans(text, kept, m)
 }
 
 // jsonString returns the content of the JSON string opening at quote, or false.
@@ -1343,7 +1404,7 @@ func authName(name string) bool {
 	return name == "auth" || name == "credentials" || strings.HasSuffix(name, "_auth") || strings.HasSuffix(name, "-auth") || strings.HasSuffix(name, "_credentials") || strings.HasSuffix(name, "-credentials")
 }
 
-func replaceMatches(text string, indices [][]int, kind string, found map[string]int) string {
+func replaceMatches(text string, indices [][]int, kind string, m *masking) string {
 	if len(indices) == 0 {
 		return text
 	}
@@ -1351,10 +1412,10 @@ func replaceMatches(text string, indices [][]int, kind string, found map[string]
 	for _, index := range indices {
 		spans = append(spans, contextSpan{index[0], index[1], kind})
 	}
-	return replaceSpans(text, spans, found)
+	return replaceSpans(text, spans, m)
 }
 
-func replaceSpans(text string, spans []contextSpan, found map[string]int) string {
+func replaceSpans(text string, spans []contextSpan, m *masking) string {
 	if len(spans) == 0 {
 		return text
 	}
@@ -1362,11 +1423,21 @@ func replaceSpans(text string, spans []contextSpan, found map[string]int) string
 	last := 0
 	for _, span := range spans {
 		out.WriteString(text[last:span.start])
-		out.WriteString("[скрыто:")
-		out.WriteString(span.kind)
-		out.WriteByte(']')
 		last = span.end
-		found[span.kind]++
+		m.found[span.kind]++
+		if m.tagger != nil && m.isPlaceholder(text[span.start:span.end]) {
+			// A rule that reads a marker as a value hides what is hidden already.
+			out.WriteString(text[span.start:span.end])
+			continue
+		}
+		out.WriteString(maskMarker)
+		out.WriteString(span.kind)
+		if m.tagger != nil {
+			out.WriteString(placeholderSep)
+			out.WriteString(strconv.Itoa(len(m.values)))
+			m.values = append(m.values, m.original(text[span.start:span.end]))
+		}
+		out.WriteByte(']')
 	}
 	out.WriteString(text[last:])
 	return out.String()

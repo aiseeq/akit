@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/buildversion"
-	"github.com/aiseeq/akit/secretmask"
+
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 )
@@ -41,7 +41,8 @@ path (Claude Code or codex rollout).
   --until T     up to time T, same forms
   --grep RE     events whose text matches RE (case-insensitive)
                 Unparsable line counts include only lines retained for parsing.
-  --raw RE      raw jsonl lines matching RE (case-insensitive), e.g. --raw '"hook_cancelled"'
+  --raw RE      raw jsonl lines matching RE (case-insensitive), e.g. --raw '"hook_cancelled"';
+                masked like all output (see Masking)
   -C N          with --grep: N events around each hit
   --all         all transcripts in ~/.claude/projects, including subagents
   --no-subagents with --all: omit subagent transcripts
@@ -68,6 +69,12 @@ think — the agent's thinking (often empty: not saved); cmd — a tool call (Ba
 command as is); out — tool output; attach — a Claude Code attachment (hook,
 diagnostics, …); note — background task notices, compaction, briefs and
 program prompts, Claude Code system records (Who system), codex token counts.
+Masking: all output, --raw too, has secret values replaced with
+[скрыто:KIND len=N #TAG]: N is the hidden value's length in characters, TAG a
+hash of it under a local key ($XDG_STATE_HOME/akit/mask-key, created on first
+run). Equal TAGs mean equal values across tl calls; the value itself is not
+recoverable. The mask also hides some names that look like keys (a long
+pk_test_… identifier): compare N and TAG with a fragment you expect.
 Exit: 0 events found, 1 none, 2 usage/IO error.
 `
 
@@ -127,12 +134,15 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 		return exitUsage
 	}
+	if err := useMaskKey(maskKeyPath(home)); err != nil {
+		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
+	}
 	return run(opts, env{home: home, sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now}, stdout, stderr)
 }
 
 // printMasked prints like fmt.Fprint, with secret values masked.
 func printMasked(w io.Writer, text string) {
-	masked, _ := secretmask.Mask(text)
+	masked, _ := hide(text)
 	fmt.Fprint(w, masked)
 }
 
@@ -343,7 +353,7 @@ func writeMasked(w io.Writer, text string) error {
 	if text == "" {
 		return nil
 	}
-	masked, _ := secretmask.Mask(text)
+	masked, _ := hide(text)
 	_, err := io.WriteString(w, masked)
 	return err
 }

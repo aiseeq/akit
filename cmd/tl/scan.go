@@ -13,7 +13,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/aiseeq/akit/secretmask"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -832,7 +831,7 @@ func maskedShort(text string, width int) string {
 	}
 	n := min(len(r), width+maskWindow)
 	for {
-		masked, _ := secretmask.Mask(string(r[:n]))
+		masked, _ := hide(string(r[:n]))
 		m := []rune(masked)
 		if n == len(r) && len(m) <= width {
 			return masked
