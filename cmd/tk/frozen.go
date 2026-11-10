@@ -106,9 +106,7 @@ func frozenLineNames(line, home, want string) (bool, error) {
 	return listedPathIs(listed, home, want)
 }
 
-// listedPathIs: the path of a list file is the project want. A listed folder that
-// does not exist names nothing.
-func listedPathIs(listed, home, want string) (bool, error) {
+func resolveListedPath(listed, home string) (string, error) {
 	if listed == "~" {
 		listed = home
 	}
@@ -116,9 +114,15 @@ func listedPathIs(listed, home, want string) (bool, error) {
 		listed = filepath.Join(home, rest)
 	}
 	if !filepath.IsAbs(listed) {
-		return false, errors.New("path must be absolute or start with ~/")
+		return "", errors.New("path must be absolute or start with ~/")
 	}
-	resolved, err := normalizedRoot(listed)
+	return normalizedRoot(listed)
+}
+
+// listedPathIs: the path of a list file is the project want. A listed folder that
+// does not exist names nothing.
+func listedPathIs(listed, home, want string) (bool, error) {
+	resolved, err := resolveListedPath(listed, home)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
@@ -150,6 +154,92 @@ func frozenWhy(line string) string {
 	return strings.TrimSpace(parts[frozenFields-1])
 }
 
+type sessionNameRow struct {
+	path, name string
+	line       int
+}
+
+// sessionNameRows parses the shared tab-separated names table for all users of
+// its project and session mappings.
+func (f frozenFiles) sessionNameRows() []sessionNameRow {
+	var rows []sessionNameRow
+	for number, raw := range strings.Split(f.names, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		path, name, separated := strings.Cut(line, "\t")
+		if !separated { // malformed: it still names the project, and gives no name
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			path = fields[0]
+		}
+		rows = append(rows, sessionNameRow{path: strings.TrimSpace(path), name: strings.TrimSpace(name), line: number + 1})
+	}
+	return rows
+}
+
+var errAmbiguousExecutorProject = errors.New("ambiguous executor project")
+
+// executorProject resolves a session name through names.tsv, then through a
+// conventional <name>-master project folder beside or inside the current root.
+func (f frozenFiles) executorProject(executor, currentRoot string, errout io.Writer) (string, bool, error) {
+	if f.namesErr != nil {
+		return "", false, fmt.Errorf("read session names: %w", f.namesErr)
+	}
+	var mapped string
+	lastLine := 0
+	for _, row := range f.sessionNameRows() {
+		if !strings.EqualFold(row.name, executor) {
+			continue
+		}
+		resolved, err := resolveListedPath(row.path, f.home)
+		if errors.Is(err, os.ErrNotExist) { // a listed folder that does not exist names nothing
+			continue
+		}
+		if err != nil {
+			fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", f.namesPath, row.line, err)
+			continue
+		}
+		mapped, lastLine = resolved, row.line
+	}
+	if lastLine != 0 {
+		return mapped, true, nil
+	}
+
+	suffix := "-master"
+	if !strings.HasSuffix(strings.ToLower(executor), suffix) {
+		return "", false, nil
+	}
+	name := executor[:len(executor)-len(suffix)]
+	if name == "" {
+		return "", false, nil
+	}
+	candidates := []string{filepath.Join(currentRoot, name), filepath.Join(filepath.Dir(currentRoot), name)}
+	var found []string
+	for _, candidate := range candidates {
+		if _, err := os.Stat(filepath.Join(candidate, "docs", "tasks")); err == nil {
+			resolved, err := normalizedRoot(candidate)
+			if err != nil {
+				return "", false, fmt.Errorf("resolve project %s: %w", candidate, err)
+			}
+			found = append(found, resolved)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", false, fmt.Errorf("inspect project %s: %w", candidate, err)
+		}
+	}
+	if len(found) > 1 {
+		fmt.Fprintf(errout, "tk: executor %s has ambiguous project folders: %s and %s\n", executor, found[0], found[1])
+		return "", false, errAmbiguousExecutorProject
+	}
+	if len(found) == 1 {
+		return found[0], true, nil
+	}
+	return "", false, nil
+}
+
 // masterName is the session name the table of session names gives the project,
 // else its folder name with -master. A table that exists but cannot be read is
 // an error: another name would admit the wrong session.
@@ -160,24 +250,16 @@ func (f frozenFiles) masterName(want string, errout io.Writer) (string, error) {
 	}
 	home, path := f.home, f.namesPath
 	master, lastLine := "", 0
-	for number, raw := range strings.Split(f.names, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		listed, name, separated := strings.Cut(line, "\t")
-		if !separated { // malformed: it still names the project, and gives no name
-			listed = strings.Fields(line)[0]
-		}
-		matches, err := listedPathIs(strings.TrimSpace(listed), home, want)
+	for _, row := range f.sessionNameRows() {
+		matches, err := listedPathIs(row.path, home, want)
 		if err != nil {
-			fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, number+1, err)
+			fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, row.line, err)
 			continue
 		}
 		if !matches {
 			continue
 		}
-		master, lastLine = strings.TrimSpace(name), number+1 // the last line of a folder wins, as for session starts
+		master, lastLine = row.name, row.line // the last line of a folder wins, as for session starts
 	}
 	if lastLine == 0 {
 		return fallback, nil
