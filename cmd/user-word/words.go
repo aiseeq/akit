@@ -805,15 +805,15 @@ func runBrief(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "no user words in %s\n", opts.path)
 		return 0
 	}
-	dayHits, warnings, err := briefQuoteHitsByDay(words, e, until)
+	dayHits, recordDays, warnings, err := briefQuoteHitsByDay(words, e, until)
 	if err != nil {
 		fmt.Fprintf(stderr, "user-word: %v\n", err)
 		return exitUsage
 	}
-	return reportBriefWords(words, dayHits, warnings, e, until, stdout, stderr)
+	return reportBriefWords(words, dayHits, recordDays, warnings, e, until, stdout, stderr)
 }
 
-func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string][]hit, []line, error) {
+func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string][]hit, map[string]bool, []line, error) {
 	dayFragments := make(map[string][]string)
 	daySeen := make(map[string]map[string]bool)
 	for _, word := range words {
@@ -832,11 +832,11 @@ func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string]
 		}
 	}
 	if len(dayFragments) == 0 {
-		return map[string][]hit{}, nil, nil
+		return map[string][]hit{}, map[string]bool{}, nil, nil
 	}
 	inventory, err := briefTranscriptInventory(e.home)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	return scanBriefQuotes(inventory, dayFragments, until, e.loc)
 }
@@ -862,14 +862,14 @@ func localDate(t time.Time, loc *time.Location) time.Time {
 	return time.Date(year, month, day, 0, 0, 0, 0, loc)
 }
 
-func reportBriefWords(words []briefWord, dayHits map[string][]hit, warnings []line, e env, until time.Time, stdout, stderr io.Writer) int {
+func reportBriefWords(words []briefWord, dayHits map[string][]hit, recordDays map[string]bool, warnings []line, e env, until time.Time, stdout, stderr io.Writer) int {
 	writeWarnings(stderr, warnings)
 	contexts := make(map[string][]line)
 	quoteContexts := make(map[string]briefQuoteContext)
 	found, ambiguous, missing := 0, 0, 0
 	for i, word := range words {
 		fmt.Fprintf(stdout, "== %d. %s\n", i+1, word.raw)
-		hits, note, err := briefHitsUntil(word, e, contexts, dayHits, until)
+		hits, note, err := briefHitsUntil(word, e, contexts, dayHits, recordDays, until)
 		if err != nil {
 			fmt.Fprintf(stderr, "user-word: %v\n", err)
 			return exitUsage
@@ -929,6 +929,7 @@ func reportBriefWords(words []briefWord, dayHits map[string][]hit, warnings []li
 			}
 		}
 	}
+
 	fmt.Fprintf(stdout, "brief: %d user words: %d found, %d ambiguous, %d not found\n", len(words), found, ambiguous, missing)
 	if missing > 0 {
 		return exitNone
@@ -1193,11 +1194,11 @@ var markerClock = regexp.MustCompile(`([~≈])?(\d{1,2}:\d{2}(?::\d{2})?)`)
 // markerZoneName — поддерживаемые пояса в любом регистре, с необязательными скобками.
 var markerZoneName = regexp.MustCompile(`(?i)^\(?(?:(cest|cet|z)|(?:utc|gmt)(?:([+-])(\d{1,2})(?::(\d{2}))?)?)\)?$`)
 
-// markerZone распознаёт пояс после часов или даты; другое слово после часов даёт причину not found.
+// markerZone распознаёт пояс после часов или даты; обычный текст после часов не влияет на пояс.
 func markerZone(prefix string, loc *time.Location) (*time.Location, string) {
 	clock := markerClock.FindStringIndex(prefix)
 	if clock != nil {
-		if zone, present := markerZoneToken(prefix[clock[1]:]); present {
+		if zone, present := markerZoneToken(prefix[clock[1]:]); present && markerZoneLike(zone) {
 			return parseMarkerZone(zone, loc)
 		}
 	}
@@ -1220,12 +1221,24 @@ func markerZone(prefix string, loc *time.Location) (*time.Location, string) {
 
 func markerZoneToken(text string) (string, bool) {
 	text = strings.TrimLeft(text, " \t")
-	first, _ := utf8.DecodeRuneInString(text)
-	if !unicode.IsLetter(first) && !strings.ContainsRune("(+-", first) {
+	if text == "" {
 		return "", false
 	}
+	if strings.HasPrefix(strings.ToLower(text), "по москве") {
+		return "по Москве", true
+	}
 	token, _, _ := strings.Cut(text, " ")
-	return strings.TrimRight(token, ",;.:!?"), true
+	token = strings.TrimRight(token, ",;.:!?")
+	return token, token != ""
+}
+
+var markerZoneAbbreviation = regexp.MustCompile(`^\(?[A-Z]{2,6}\)?$`)
+
+func markerZoneLike(token string) bool {
+	if markerZoneName.MatchString(token) || markerZoneAbbreviation.MatchString(token) || strings.EqualFold(token, "мск") || strings.EqualFold(token, "(мск)") {
+		return true
+	}
+	return strings.EqualFold(token, "по Москве")
 }
 
 func parseMarkerZone(zone string, loc *time.Location) (*time.Location, string) {
@@ -1324,7 +1337,7 @@ func markerTimeAndZone(prefix string, day time.Time, window time.Duration) (time
 
 const cestOffsetSeconds = 2 * 60 * 60
 
-func briefHitsUntil(word briefWord, e env, contexts map[string][]line, cached map[string][]hit, until time.Time) ([]hit, string, error) {
+func briefHitsUntil(word briefWord, e env, contexts map[string][]line, cached map[string][]hit, recordDays map[string]bool, until time.Time) ([]hit, string, error) {
 	if word.invalidCause != "" {
 		return nil, word.invalidCause, nil
 	}
@@ -1336,6 +1349,9 @@ func briefHitsUntil(word briefWord, e env, contexts map[string][]line, cached ma
 		return nil, fmt.Sprintf("no matching user line within %v of marker time", word.window), nil
 	}
 	if len(dayHits) == 0 {
+		if !recordDays[word.day.Format(time.DateOnly)] {
+			return nil, "no transcript records on marker day", nil
+		}
 		return nil, "no matching user line on marker day", nil
 	}
 	return dayHits, "", nil
@@ -1415,28 +1431,29 @@ func makeBriefQuoteFilters(fragments map[string][]string, loc *time.Location) (b
 }
 
 type briefQuoteScanResult struct {
-	path     string
-	hits     []hit
-	warnings []line
-	err      error
+	path       string
+	hits       []hit
+	warnings   []line
+	recordDays map[string]bool
+	err        error
 }
 
-func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string, until time.Time, loc *time.Location) (map[string][]hit, []line, error) {
+func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string, until time.Time, loc *time.Location) (map[string][]hit, map[string]bool, []line, error) {
 	filters, err := makeBriefQuoteFilters(fragments, loc)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if filters.from.IsZero() {
-		return map[string][]hit{}, nil, nil
+		return map[string][]hit{}, map[string]bool{}, nil, nil
 	}
 	foldedFragments := foldBriefQuotes(fragments)
 	paths := recentBriefTranscripts(inventory, filters.from)
 	results := scanBriefTranscriptPaths(paths, filters, foldedFragments, until, loc)
-	hits, warnings, err := mergeBriefQuoteResults(results, len(fragments), loc)
+	hits, recordDays, warnings, err := mergeBriefQuoteResults(results, len(fragments), loc)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return hits, warnings, nil
+	return hits, recordDays, warnings, nil
 }
 
 const briefContextLookback = 24 * time.Hour
@@ -1589,6 +1606,7 @@ type briefQuoteCollector struct {
 	lateRawFrom    string
 	lateRawUntil   string
 	rawDay         []byte
+	recordDays     map[string]bool
 }
 
 type briefLateQuote struct {
@@ -1607,8 +1625,11 @@ func quoteLineKey(l line) briefQuoteLineKey {
 	return briefQuoteLineKey{time: l.t.UnixNano(), text: l.text, match: searchableText(l)}
 }
 
-func (c *briefQuoteCollector) setRawDay(day []byte) {
+func (c *briefQuoteCollector) setRawDay(day, raw []byte) {
 	c.rawDay = day
+	if stamp, err := transcriptTimestamp(raw); err == nil && !stamp.IsZero() {
+		c.recordDays[stamp.In(c.loc).Format(time.DateOnly)] = true
+	}
 }
 
 func (c *briefQuoteCollector) keep(raw []byte) bool {
@@ -1785,6 +1806,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 		lateCounts:     make(map[briefQuoteLineKey]int),
 		lateQuoteIndex: make(map[briefQuoteLineKey]int),
 		lateShown:      make(map[briefQuoteLineKey]map[string]bool),
+		recordDays:     make(map[string]bool),
 	}
 	keep := collector.keep
 	// Один хронологический проход собирает цитаты и строки их контекста, включая прежние ответы агента.
@@ -1844,7 +1866,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 			warnings = append(warnings, l)
 		}
 	}
-	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings}
+	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings, recordDays: collector.recordDays}
 }
 
 func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line, shownForQuote ...map[string]bool) []line {
@@ -1998,15 +2020,19 @@ func matchPartsFolded(text, fragment string, bounded bool) bool {
 	return true
 }
 
-func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *time.Location) (map[string][]hit, []line, error) {
+func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *time.Location) (map[string][]hit, map[string]bool, []line, error) {
 	out := make(map[string][]hit, capacity)
+	recordDays := make(map[string]bool)
 	var warnings []line
 	seen := make(map[string]bool)
 	for _, result := range results {
 		if result.err != nil {
-			return nil, nil, fmt.Errorf("read transcript %s: %w", result.path, result.err)
+			return nil, nil, nil, fmt.Errorf("read transcript %s: %w", result.path, result.err)
 		}
 		warnings = append(warnings, result.warnings...)
+		for date := range result.recordDays {
+			recordDays[date] = true
+		}
 		for _, h := range result.hits {
 			date := h.t.In(loc).Format(time.DateOnly)
 			key := date + "\x00" + h.t.String() + "\x00" + h.text
@@ -2017,7 +2043,7 @@ func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *t
 			out[date] = append(out[date], h)
 		}
 	}
-	return out, warnings, nil
+	return out, recordDays, warnings, nil
 }
 
 func briefUserRecord(raw []byte) bool {
@@ -2027,7 +2053,7 @@ func briefUserRecord(raw []byte) bool {
 		bytes.Contains(raw, []byte(`"type":"event_msg","payload":{"type":"user_message"`))
 }
 
-func readChronologicalBriefLines(path string, f *os.File, size int64, from, until time.Time, keep func([]byte) bool, setDay func([]byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
+func readChronologicalBriefLines(path string, f *os.File, size int64, from, until time.Time, keep func([]byte) bool, setDay func([]byte, []byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
 	var head [4 << 10]byte
 	n, err := f.ReadAt(head[:], 0)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -2100,7 +2126,7 @@ type briefScan struct {
 	badErr      error
 }
 
-func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte) bool, setDay func([]byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
+func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte) bool, setDay func([]byte, []byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
 	var out []line
 	lineNo := 0
 	untilDate := []byte(until.UTC().Format(time.DateOnly))
@@ -2118,7 +2144,7 @@ func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time
 				return s.finish(out)
 			}
 			if setDay != nil {
-				setDay(rawDay)
+				setDay(rawDay, raw)
 			}
 			if keep == nil || keep(raw) {
 				events, err := parseBriefRecord(raw, parser, parsed)
