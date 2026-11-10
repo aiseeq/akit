@@ -55,7 +55,8 @@ Flags:
   --proc DIR      read DIR instead of /proc
   --quiet-until T quiet mode until T: 14:45 today, "30.10 09:00", or RFC3339
   --quiet D       quiet mode for D from now: 2h, 90m
-  --why TEXT      why quiet mode is set, shown to everyone it holds back
+  --why TEXT      why quiet mode is set, shown to everyone it holds back; over ssh the
+                  remote shell splits it again: ssh HOST "busy --quiet 2h --why 'a long reason'"
   --quiet-off     end quiet mode
   --ignore-quiet  judge by the measurements alone, as if quiet mode were off (for a measurement
                   that runs inside quiet mode); the line still names the quiet mode
@@ -110,6 +111,9 @@ func parseArgs(args []string, now time.Time) (options, error) {
 			continue
 		}
 		if !strings.HasPrefix(a, "--") {
+			if opts.why != "" {
+				return opts, fmt.Errorf("unexpected argument %q: a --why of several words needs quotes, over ssh a second layer of them", a)
+			}
 			return opts, fmt.Errorf("unexpected argument %q", a)
 		}
 		name, value, ok := strings.Cut(a, "=")
@@ -201,7 +205,7 @@ func (opts *options) setQuiet(name, value string, now time.Time) error {
 			return fmt.Errorf("duration: %w", err)
 		}
 		if d <= 0 {
-			return errors.New("must be positive")
+			return errors.New("must be positive; --quiet-off ends quiet mode")
 		}
 		opts.quiet = now.Add(d)
 	default:
