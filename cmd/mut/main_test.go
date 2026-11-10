@@ -182,6 +182,33 @@ func TestNoTestRan(t *testing.T) {
 	}
 	f.unchanged(t)
 }
+
+// A run whose tests were all skipped tested nothing: the mutant did not survive
+// them, and the answer names the skip reason.
+func TestAllSkipped(t *testing.T) {
+	f := newFixture(t, "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){t.Skip(\"SAMPLE_VAR empty\")}\n")
+	out, code := f.run(t, "a + b", "a - b", "calc.go", "--", "./...")
+	if code != 2 || !strings.Contains(out, "every test skipped") || !strings.Contains(out, "SAMPLE_VAR empty") {
+		t.Fatalf("got %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
+// A survivor beside skipped tests names them: the skipped one may be the test
+// that would have caught the mutant.
+func TestSurvivedBesideSkipped(t *testing.T) {
+	f := newFixture(t, goodTest)
+	skip := "package calc\nimport \"testing\"\nfunc TestSub(t *testing.T){t.Skip(\"no sample service\")}\n"
+	if err := os.WriteFile(filepath.Join(f.dir, "sub_test.go"), []byte(skip), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := f.run(t, "a + b", "b + a", "calc.go", "--", "./...")
+	if code != 1 || !strings.Contains(out, "survived: ok ") || !strings.Contains(out, "1 skipped: TestSub") {
+		t.Fatalf("got %d %q", code, out)
+	}
+	f.unchanged(t)
+}
+
 func TestFailsWithoutMutant(t *testing.T) {
 	f := newFixture(t, "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){t.Fatal(\"baseline\")}\n")
 	out, code := f.run(t, "a + b", "b + a", "calc.go", "--", "./...")

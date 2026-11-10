@@ -164,7 +164,7 @@ blocks after it. With a FILE argument a path line may only repeat that file (`./
 
 ## mut
 
-Runs Go tests against each exact-text mutation in isolation, restores the source file, and reports whether the mutant was killed or survived. A mutant that hits the memory ceiling of `graft exec --heavy` counts as killed; a test red without the mutant, a build error or no test run is an error.
+Runs Go tests against each exact-text mutation in isolation, restores the source file, and reports whether the mutant was killed or survived. A mutant that hits the memory ceiling of `graft exec --heavy` counts as killed; a test red without the mutant, a build error, no test run or every test skipped is an error, and a survivor names the tests skipped beside it.
 
     mut OLD NEW FILE -- <go test arguments>
     mut [-F SPEC] -- <go test arguments>

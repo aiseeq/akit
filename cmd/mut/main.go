@@ -27,7 +27,8 @@ Usage:
   mut [-F SPEC] -- <go test arguments>
 
 Each SEARCH/REPLACE block is an independent mutant based on the original file.
-Output: killed (the mutant fails a test), survived (tests pass), or error.
+Output: killed (the mutant fails a test), survived (tests pass; skipped ones are
+named), or error (also when every test that ran was skipped, with the reason).
 Exit: 0 all killed, 1 at least one survived, 2 an error; 130/143/129 on
 SIGINT/SIGTERM/SIGHUP. Build errors are included in the verdict, up to 5 lines.
 The mutated file is restored with its original bytes, mode, and modification time.
@@ -509,12 +510,16 @@ func signalName(code int) string {
 type testSummary struct {
 	failedTests, packageFails []event
 	packages, runs            []string
+	skipped                   []string
+	skipReason                string
+	passed                    int
 	outputs, build            map[string][]string
+	testOutputs               map[string][]string
 	buildOrder                []string
 }
 
 func summarize(events []event) testSummary {
-	s := testSummary{outputs: map[string][]string{}, build: map[string][]string{}}
+	s := testSummary{outputs: map[string][]string{}, build: map[string][]string{}, testOutputs: map[string][]string{}}
 	for _, e := range events {
 		pkg := e.Package
 		if pkg == "" {
@@ -528,6 +533,20 @@ func summarize(events []event) testSummary {
 		}
 		if e.Action == "output" {
 			s.addOutput(pkg, e.Output)
+			if line := strings.TrimSpace(e.Output); e.Test != "" && line != "" {
+				s.testOutputs[pkg+"\x00"+e.Test] = append(s.testOutputs[pkg+"\x00"+e.Test], line)
+			}
+		}
+		if e.Test != "" {
+			switch e.Action {
+			case "pass":
+				s.passed++
+			case "skip":
+				s.skipped = append(s.skipped, e.Test)
+				if len(s.skipped) == 1 {
+					s.skipReason = skipReason(s.testOutputs[pkg+"\x00"+e.Test])
+				}
+			}
 		}
 		if e.FailedBuild != "" || e.Action == "build-fail" || e.Action == "build-output" {
 			s.addBuild(pkg, e.Output)
@@ -611,7 +630,28 @@ func classify(events []event, stderr string, exit int) verdict {
 	if exit != 0 {
 		return verdictOf(fmt.Sprintf("error: go test exit %d: %s", exit, strings.TrimSpace(stderr)), 2, false)
 	}
-	return verdictOf("survived: ok "+strings.Join(s.packages, " "), 1, false)
+	if s.passed == 0 && len(s.skipped) > 0 {
+		return verdictOf(fmt.Sprintf("error: every test skipped (%s: %s)", s.skipped[0], s.skipReason), 2, false)
+	}
+	text := "survived: ok " + strings.Join(s.packages, " ")
+	if len(s.skipped) > 0 {
+		text += fmt.Sprintf(" (%d skipped: %s)", len(s.skipped), strings.Join(firstN(s.skipped, 3), " "))
+	}
+	return verdictOf(text, 1, false)
+}
+
+// skipReason is what a skipped test printed, without go test's own lines.
+func skipReason(lines []string) string {
+	var said []string
+	for _, l := range lines {
+		if !strings.HasPrefix(l, "=== ") && !strings.HasPrefix(l, "--- SKIP") {
+			said = append(said, l)
+		}
+	}
+	if len(said) == 0 {
+		return "no reason printed"
+	}
+	return strings.Join(firstN(said, 2), " | ")
 }
 
 func collectFailures(s testSummary) []failure {
