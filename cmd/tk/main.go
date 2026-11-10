@@ -3746,7 +3746,31 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		actor = o.by
 	}
 	// A hint gives no work: it names what the ticket's executor would get.
-	refusal, err := frozenRefusal(project, actor, errout)
+	label := "следующий: "
+	files, err := readFrozenFiles()
+	if err != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
+		return
+	}
+	currentRoot, err := normalizedRoot(project)
+	if err != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: resolve project %s: %v\n", project, err)
+		return
+	}
+	executorProject, foundProject, err := files.executorProject(actor, currentRoot, errout)
+	if errors.Is(err, errAmbiguousExecutorProject) {
+		return
+	}
+	if err != nil {
+		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
+		return
+	}
+	if foundProject && executorProject != currentRoot {
+		project = executorProject
+		dir = filepath.Join(project, "docs", "tasks")
+		label = "следующий в " + filepath.Base(project) + ": "
+	}
+	refusal, err := files.refusal(project, actor, errout)
 	if err != nil {
 		fmt.Fprintf(errout, "tk: next ticket is unknown: %v\n", err)
 		return
@@ -3765,9 +3789,9 @@ func hintNext(t task, dir string, o options, out, errout io.Writer) {
 		return
 	}
 	if len(ext) > 0 && (!choice.found || externalWinsLocal(ext[0], nextGroup(choice.task, actor, choice.gate), choice)) {
-		fmt.Fprintln(out, "следующий: "+externalLine(ext[0], choice.gate.Valid && !choice.gate.Live))
+		fmt.Fprintln(out, label+externalLine(ext[0], choice.gate.Valid && !choice.gate.Live))
 	} else if choice.found {
-		fmt.Fprintln(out, "следующий: "+nextLine(choice, errout))
+		fmt.Fprintln(out, label+nextLine(choice, errout))
 	}
 }
 
