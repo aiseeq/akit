@@ -204,6 +204,8 @@ func TestTimeitPairDetection(t *testing.T) {
 		{"/usr/bin/time go test ./pkg/sample", "go test ./pkg/sample"},
 		{"start=$(date +%s%N); go test ./pkg/sample; end=$(date +%s%N); echo $((end-start))", "go test ./pkg/sample"},
 		{"start=$(date +%s); go test ./pkg/sample; end=$(date +%s); expr \"$end - $start\"", "go test ./pkg/sample"},
+		{"/usr/bin/time -f '%e' -o /synthetic/t go test ./pkg/sample", "go test ./pkg/sample"},
+		{"s=$(date +%s); timeout 300 bash tests/run.sh; e=$(date +%s); echo $((e-s))", "timeout 300 bash tests/run.sh"},
 	} {
 		calls, err := shellcmd.Calls(tc.command)
 		if err != nil {
@@ -226,6 +228,7 @@ func TestTimeitPairDetection(t *testing.T) {
 	for _, command := range []string{
 		"date +%s", "date +%s%N > /synthetic/marker", "grep time /synthetic/file",
 		"echo 'time to go'", "timeout go test ./pkg/sample", "go test -timeout 30s ./pkg/sample",
+		"x=$(( 5 - 3 )); date +%s; go test ./pkg/sample; date +%s",
 	} {
 		calls, err := shellcmd.Calls(command)
 		if err != nil {
