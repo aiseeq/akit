@@ -6,7 +6,7 @@ import (
 )
 
 func TestCheckAlign(t *testing.T) {
-	allocCtx := newLayoutTestBrowser(t)
+	browserCtx := newLayoutTestBrowser(t)
 	cases := []layoutTestCase{
 		{
 			name:     "inline svg shifted down",
@@ -108,7 +108,7 @@ func TestCheckAlign(t *testing.T) {
 		},
 	}
 
-	testLayoutCases(t, allocCtx, cases, func(ctx context.Context) (int, string, error) {
+	testLayoutCases(t, browserCtx, cases, func(ctx context.Context) (int, string, error) {
 		res, err := checkAlign(ctx)
 		if err != nil || res == nil {
 			return 0, "", err

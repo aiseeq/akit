@@ -1,17 +1,12 @@
 package main
 
 import (
-	"context"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/chromedp/chromedp"
 )
 
 func TestElementNames(t *testing.T) {
@@ -34,15 +29,7 @@ const cards = `<!doctype html><body style="margin:0;font:16px sans-serif">
 </div></body>`
 
 func TestShootElements(t *testing.T) {
-	if _, err := exec.LookPath("google-chrome"); err != nil {
-		if _, err := exec.LookPath("chromium-browser"); err != nil {
-			t.Skip("нет Chrome для headless-съёмки")
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, chromedp.DefaultExecAllocatorOptions[:]...)
-	defer cancelAlloc()
+	allocCtx := newTestAllocator(t)
 	dir := t.TempDir()
 	page := filepath.Join(dir, "cards.html")
 	if err := os.WriteFile(page, []byte(cards), 0o644); err != nil {

@@ -36,13 +36,13 @@ const (
 )
 
 func TestCheckOverlap(t *testing.T) {
-	allocCtx := newLayoutTestBrowser(t)
+	browserCtx := newLayoutTestBrowser(t)
 	cases := []layoutTestCase{
 		{name: "svg", html: svgOverlap, pairs: 1},
 		{name: "html", html: htmlOverlap, pairs: 1},
 		{name: "clean", html: clean, pairs: 0},
 	}
-	testLayoutCases(t, allocCtx, cases, func(ctx context.Context) (int, string, error) {
+	testLayoutCases(t, browserCtx, cases, func(ctx context.Context) (int, string, error) {
 		res, err := checkOverlap(ctx)
 		if err != nil || res == nil {
 			return 0, "", err

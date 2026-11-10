@@ -18,7 +18,8 @@ type layoutTestCase struct {
 	contains   string
 }
 
-func newLayoutTestBrowser(t *testing.T) context.Context {
+// newTestAllocator starts Chrome for a test, or skips it where there is none.
+func newTestAllocator(t *testing.T) context.Context {
 	t.Helper()
 	chrome := ""
 	for _, name := range []string{"google-chrome", "chromium-browser", "/usr/bin/google-chrome"} {
@@ -32,13 +33,27 @@ func newLayoutTestBrowser(t *testing.T) context.Context {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome))...)
+	// The pages are synthetic files of the test; without Chrome's own sandbox it also runs inside
+	// a sandbox that forbids new user namespaces.
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.NoSandbox)...)
 	t.Cleanup(cancelAlloc)
 	return allocCtx
 }
 
+// newLayoutTestBrowser is one browser for the test: each case opens a tab in it instead of
+// starting its own Chrome.
+func newLayoutTestBrowser(t *testing.T) context.Context {
+	t.Helper()
+	browserCtx, cancelBrowser := chromedp.NewContext(newTestAllocator(t))
+	t.Cleanup(cancelBrowser)
+	if err := chromedp.Do(browserCtx); err != nil {
+		t.Fatalf("start Chrome: %v", err)
+	}
+	return browserCtx
+}
+
 func TestCheckGazette(t *testing.T) {
-	allocCtx := newLayoutTestBrowser(t)
+	browserCtx := newLayoutTestBrowser(t)
 	cases := []struct {
 		name    string
 		html    string
@@ -53,7 +68,7 @@ func TestCheckGazette(t *testing.T) {
 			if err := os.WriteFile(path, []byte(c.html), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			tabCtx, cancelTab := chromedp.NewContext(allocCtx)
+			tabCtx, cancelTab := chromedp.NewContext(browserCtx)
 			defer cancelTab()
 			if err := chromedp.Do(tabCtx, chromedp.EmulateViewport(800, 600), chromedp.Navigate("file://"+path)); err != nil {
 				t.Fatal(err)
@@ -69,7 +84,7 @@ func TestCheckGazette(t *testing.T) {
 	}
 }
 
-func testLayoutCases(t *testing.T, allocCtx context.Context, cases []layoutTestCase, check func(context.Context) (int, string, error), failure string) {
+func testLayoutCases(t *testing.T, browserCtx context.Context, cases []layoutTestCase, check func(context.Context) (int, string, error), failure string) {
 	t.Helper()
 	dir := t.TempDir()
 	for _, c := range cases {
@@ -78,7 +93,7 @@ func testLayoutCases(t *testing.T, allocCtx context.Context, cases []layoutTestC
 			if err := os.WriteFile(path, []byte(c.html), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			tabCtx, cancelTab := chromedp.NewContext(allocCtx)
+			tabCtx, cancelTab := chromedp.NewContext(browserCtx)
 			defer cancelTab()
 			if err := chromedp.Do(tabCtx, chromedp.EmulateViewport(800, 600), chromedp.Navigate("file://"+path)); err != nil {
 				t.Fatal(err)
