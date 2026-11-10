@@ -255,7 +255,7 @@ Each check runs in
 `BASHOPTS`, `LD_*`, `MALLOC_*` and the other variables glibc drops for setuid programs (`GCONV_PATH`, `LOCPATH`, …; `TMPDIR`
 stays) from the caller's environment (what changes bash itself; the
 programs a check calls are found by the caller's `PATH`), within the limit above (8 minutes, or `--timeout`); processes it leaves in its process group are killed. A `## План` section
-can also be supplied with `--text` to `tk new` or `tk set`; set replaces only supplied sections and keeps other sections and the journal. `tk start` requires a nonempty `Приёмка`, except for journal tickets. A `## Вход` section (context: request source and facts) goes
+can also be supplied with `--text` to `tk new` or `tk set`; set replaces only supplied sections and keeps other sections and the journal. `tk start` requires a nonempty `Приёмка` or `Чем проверить` section; a missing section also blocks start, except for journal tickets. A `## Вход` section (context: request source and facts) goes
 before `Что сделать` and is omitted when absent.
 
 Ticket IDs accept the slug, the full file name, or the file name without `.md`. Outside a Git

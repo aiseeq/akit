@@ -1222,7 +1222,12 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 	body := t.body
 	largeDefault := len(body) > maxFullShowBytes && !o.tailSet && !o.head && len(o.sections) == 0
 	if len(o.sections) > 0 {
-		body = showSections(body, o.sections)
+		selected, err := showSections(body, o.sections)
+		if err != nil {
+			fmt.Fprintln(errout, "tk:", err)
+			return exitNone
+		}
+		body = selected
 	} else if o.head {
 		body = ticketHeader(body)
 	} else if o.tailSet || largeDefault {
@@ -1317,40 +1322,74 @@ func normalizeSectionName(name string) string {
 	if !strings.HasPrefix(name, "## ") {
 		name = "## " + name
 	}
-	if alias, ok := sectionAliases[name]; ok {
-		return alias
+	for _, from := range slices.Sorted(maps.Keys(sectionAliases)) {
+		if strings.EqualFold(name, from) {
+			return sectionAliases[from]
+		}
 	}
 	return name
 }
 
-func showSections(body string, requested []string) string {
+func sectionNameKey(name string) string {
+	return strings.ToLower(normalizeSectionName(name))
+}
+
+func showSections(body string, requested []string) (string, error) {
+	doc := parseTicketBody(body)
+	available := make([]string, 0, len(doc.sections))
+	present := map[string]bool{}
+	for _, section := range doc.sections {
+		key := sectionNameKey(section.heading)
+		if !present[key] {
+			present[key] = true
+			available = append(available, strings.TrimPrefix(section.heading, "## "))
+		}
+	}
 	wanted := map[string]bool{}
 	for _, name := range requested {
-		wanted[normalizeSectionName(name)] = true
+		wanted[sectionNameKey(name)] = true
 	}
-	doc := parseTicketBody(body)
+	for _, name := range requested {
+		if !present[sectionNameKey(name)] {
+			list := strings.Join(available, ", ")
+			if list == "" {
+				list = "(none)"
+			}
+			return "", fmt.Errorf("section %q not found; available sections: %s", strings.TrimPrefix(normalizeSectionName(name), "## "), list)
+		}
+	}
 	selected := make([]ticketSection, 0, len(requested))
 	for _, section := range doc.sections {
-		if wanted[normalizeSectionName(section.heading)] {
+		if wanted[sectionNameKey(section.heading)] {
 			selected = append(selected, section)
 		}
 	}
-	return renderTicketDocument(ticketDocument{sections: selected})
+	return renderTicketDocument(ticketDocument{sections: selected}), nil
 }
 
 func showTail(body string, n int) string {
 	doc := parseTicketBody(body)
-	entries := journalLines(body)
-	if n > 0 && n < len(entries) {
-		entries = entries[len(entries)-n:]
+	var journalLines []string
+	journalFound := false
+	if n == 0 {
+		journalLines, journalFound = allJournalLines(doc)
+	} else {
+		records := journalRecords(doc)
+		if n < len(records) {
+			records = records[len(records)-n:]
+		}
+		for _, record := range records {
+			journalLines = append(journalLines, record...)
+		}
+		_, journalFound = allJournalLines(doc)
 	}
 	selected := make([]ticketSection, 0, len(doc.sections))
+	journalAdded := false
 	for _, section := range doc.sections {
 		if section.heading == "## Журнал" {
-			if n == 0 {
-				selected = append(selected, section)
-			} else if len(entries) > 0 || len(section.lines) > 0 {
-				selected = append(selected, ticketSection{heading: section.heading, lines: entries})
+			if !journalAdded && journalFound {
+				selected = append(selected, ticketSection{heading: "## Журнал", lines: journalLines})
+				journalAdded = true
 			}
 			continue
 		}
@@ -1361,6 +1400,10 @@ func showTail(body string, n int) string {
 }
 
 func replaceExistingTicketSections(body, text string) (string, error) {
+	input := parseTicketBody(text)
+	if len(input.sections) == 0 {
+		return "", errors.New("--text has no ticket sections")
+	}
 	replacements, _ := parseTicketSections(text)
 	if len(replacements) == 0 {
 		return "", errors.New("--text has no ticket sections")
@@ -1382,26 +1425,54 @@ func replaceExistingTicketSections(body, text string) (string, error) {
 		seen[name] = true
 	}
 	var missing []string
-	for name := range replacements {
-		if !seen[name] {
+	for _, section := range input.sections {
+		name := normalizeSectionName(section.heading)
+		if _, ok := replacements[name]; ok && !seen[name] {
 			missing = append(missing, name)
+			seen[name] = true
 		}
 	}
-	sort.Strings(missing)
-	insertAt := len(doc.sections)
-	for i, section := range doc.sections {
-		if section.heading == "## Журнал" {
-			insertAt = i
+	var remaining []string
+	for name := range replacements {
+		if !seen[name] {
+			remaining = append(remaining, name)
+		}
+	}
+	sort.Strings(remaining)
+	missing = append(missing, remaining...)
+	for _, name := range missing {
+		lines := append(trimBlankEdges(replacements[name]), "")
+		insertTicketSection(&doc, ticketSection{heading: name, lines: lines})
+	}
+	return renderTicketDocument(doc), nil
+}
+
+// ticketSectionOrder — место раздела в порядке шаблона; -1 — раздел не из шаблона.
+func ticketSectionOrder(name string) int {
+	return slices.Index(standardTicketSections, normalizeSectionName(name))
+}
+
+func insertTicketSection(doc *ticketDocument, section ticketSection) {
+	rank := ticketSectionOrder(section.heading)
+	at := len(doc.sections)
+	for i, existing := range doc.sections {
+		if rank >= 0 {
+			if existingRank := ticketSectionOrder(existing.heading); existingRank > rank {
+				at = i
+				break
+			}
+			if existing.heading == "## Журнал" {
+				at = i
+				break
+			}
+		} else if existing.heading == "## План" || existing.heading == "## Журнал" {
+			at = i
 			break
 		}
 	}
-	added := make([]ticketSection, 0, len(missing))
-	for _, name := range missing {
-		lines := append(trimBlankEdges(replacements[name]), "")
-		added = append(added, ticketSection{heading: name, lines: lines})
-	}
-	doc.sections = append(doc.sections[:insertAt], append(added, doc.sections[insertAt:]...)...)
-	return renderTicketDocument(doc), nil
+	doc.sections = append(doc.sections, ticketSection{})
+	copy(doc.sections[at+1:], doc.sections[at:])
+	doc.sections[at] = section
 }
 
 func bareRepository(main string) (bool, error) {
@@ -2220,8 +2291,11 @@ func parseTicketSections(text string) (map[string][]string, []string) {
 
 var sectionAliases = map[string]string{"## Постановка": "## Вход", "## Чем проверить": "## Приёмка"}
 
+// standardTicketSections — разделы шаблона тикета в их порядке.
+var standardTicketSections = []string{"## Вход", "## Что сделать", "## Приёмка", "## План"}
+
 func standardTicketSection(section string) bool {
-	return section == "## Что сделать" || section == "## Приёмка" || section == "## Вход" || section == "## План"
+	return slices.Contains(standardTicketSections, section)
 }
 
 func replaceTicketSections(template string, sections map[string][]string, extra []string) string {
@@ -2288,18 +2362,61 @@ func opener(s string) string {
 }
 
 func journalLines(s string) []string {
-	body, ok := sectionBody(s, "## Журнал")
-	if !ok {
-		return nil
-	}
-	lines := strings.Split(body, "\n")
-	entries := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if strings.HasPrefix(line, "- ") {
-			entries = append(entries, line)
+	doc := parseTicketBody(s)
+	entries := make([]string, 0)
+	for _, section := range doc.sections {
+		if section.heading != "## Журнал" {
+			continue
+		}
+		for _, line := range section.lines {
+			if strings.HasPrefix(line, "- ") {
+				entries = append(entries, line)
+			}
 		}
 	}
 	return entries
+}
+
+func journalRecords(doc ticketDocument) [][]string {
+	var records [][]string
+	for _, section := range doc.sections {
+		if section.heading != "## Журнал" {
+			continue
+		}
+		var current []string
+		flush := func() {
+			for len(current) > 0 && strings.TrimSpace(current[len(current)-1]) == "" {
+				current = current[:len(current)-1]
+			}
+			if len(current) > 0 {
+				records = append(records, current)
+			}
+			current = nil
+		}
+		for _, line := range section.lines {
+			if strings.HasPrefix(line, "- ") {
+				flush()
+				current = []string{line}
+			} else if len(current) > 0 {
+				current = append(current, line)
+			}
+		}
+		flush()
+	}
+	return records
+}
+
+func allJournalLines(doc ticketDocument) ([]string, bool) {
+	var lines []string
+	found := false
+	for _, section := range doc.sections {
+		if section.heading != "## Журнал" {
+			continue
+		}
+		found = true
+		lines = append(lines, section.lines...)
+	}
+	return lines, found
 }
 
 func checkSections(s string) (found, filled bool) {
@@ -3260,7 +3377,7 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "start" {
 		_, acceptanceFilled := checkSections(t.body)
 		if !isJournal(t) && !acceptanceFilled {
-			fmt.Fprintln(errout, "tk: заполни «Приёмка» через tk set "+t.slug+" --text FILE|- прежде чем начинать")
+			fmt.Fprintln(errout, "tk: нужен непустой раздел «Приёмка» или «Чем проверить»; добавь или заполни его через tk set "+t.slug+" --text FILE|-")
 			return exitNone
 		}
 		if code := refuseFrozenStart(o, errout); code != 0 {

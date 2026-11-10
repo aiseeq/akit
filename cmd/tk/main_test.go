@@ -133,6 +133,126 @@ func TestValidateNew(t *testing.T) {
 	}
 }
 
+func TestSetTextWithoutSectionHeadingsFails(t *testing.T) {
+	body := "# T\n\nСтатус: открыт\n\n## Что сделать\nold\n\n## Приёмка\ncheck\n\n## Журнал\n"
+	path := filepath.Join(t.TempDir(), "20260101-1000-MED-t.md")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := setTask(task{path: path, slug: "t", status: "открыт", body: body}, options{cmd: "set", text: "ordinary prose", by: "tester"}, &out, &errOut)
+	if code != exitUsage || !strings.Contains(errOut.String(), "--text has no ticket sections") {
+		t.Fatalf("set prose = %d %q", code, errOut.String())
+	}
+}
+
+func TestSetAddsMissingSectionsInTemplateOrder(t *testing.T) {
+	body := "# T\n\nСтатус: открыт\n\n## Журнал\n- existing\n"
+	text := "## План\nplan\n\n## Приёмка\ncheck\n\n## Что сделать\nwork\n\n## Вход\ncontext\n\n## Ссылки\nref\n"
+	got, err := replaceExistingTicketSections(body, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := []string{"## Вход", "## Что сделать", "## Приёмка", "## Ссылки", "## План", "## Журнал"}
+	last := -1
+	for _, heading := range order {
+		at := strings.Index(got, heading)
+		if at <= last {
+			t.Fatalf("section order not template-like at %q: %s", heading, got)
+		}
+		last = at
+	}
+}
+
+func TestRepeatedJournalSectionsKeepCompletionAndActors(t *testing.T) {
+	body := "# Closed\n\nСтатус: готово\nИсполнитель: worker\n\n## Приёмка\ncheck\n\n## Журнал\n- 2026-01-01 10:00 готово — old-checker: old check\n## Журнал\n- 2026-01-02 10:00 готово — final-checker: final check\n"
+	checker, check, _ := completion(body)
+	if checker != "final-checker" || check != "final check" {
+		t.Fatalf("completion = %q %q", checker, check)
+	}
+	if got := journalLines(body); len(got) != 2 || !strings.Contains(got[1], "final-checker") {
+		t.Fatalf("journal lines = %q", got)
+	}
+	if got := journalActors(body); got["final-checker"] == "" {
+		t.Fatalf("actors omit second journal: %#v", got)
+	}
+}
+
+func TestTailMergesJournalSectionsAndKeepsContinuations(t *testing.T) {
+	body := "# T\n\nСтатус: готово\n\n## Журнал\n- first entry\n first continuation\n\n## Журнал\n- second entry\n second continuation\n"
+	got := showTail(body, 5)
+	if strings.Count(got, "## Журнал") != 1 || !strings.Contains(got, "first continuation") || !strings.Contains(got, "second continuation") {
+		t.Fatalf("merged journal = %q", got)
+	}
+	got = showTail(body, 1)
+	if strings.Contains(got, "first entry") || !strings.Contains(got, "second entry") || !strings.Contains(got, "second continuation") {
+		t.Fatalf("last journal record = %q", got)
+	}
+}
+
+func TestShowSectionMissingListsAvailableAndMatchesCaseInsensitively(t *testing.T) {
+	body := "# T\n\n## Приёмка\ncheck\n\n## Журнал\n"
+	got, err := showSections(body, []string{"приёмка"})
+	if err != nil || !strings.Contains(got, "## Приёмка") {
+		t.Fatalf("case-insensitive section = %q, %v", got, err)
+	}
+	if got, err := showSections(body, []string{"чем проверить"}); err != nil || !strings.Contains(got, "check") {
+		t.Fatalf("old name of the section in another case = %q, %v", got, err)
+	}
+	if _, err := showSections(body, []string{"План"}); err == nil || !strings.Contains(err.Error(), "Приёмка") || !strings.Contains(err.Error(), "Журнал") {
+		t.Fatalf("missing section error = %v", err)
+	}
+	var out, errOut bytes.Buffer
+	code := showTask(".", task{path: "20260101-1000-MED-t.md", slug: "t", body: body}, options{sections: []string{"План"}}, &out, &errOut)
+	if code != exitNone || out.Len() != 0 || !strings.Contains(errOut.String(), "Приёмка") {
+		t.Fatalf("show missing section = %d %q %q", code, out.String(), errOut.String())
+	}
+}
+
+func TestShowSizeThreshold(t *testing.T) {
+	prefix := "# T\n\nСтатус: открыт\n\n## Что сделать\nwork\n\n## Приёмка\ncheck\n\n## Журнал\n"
+	records := []string{"- old-marker " + strings.Repeat("x", maxFullShowBytes)}
+	for range defaultShowJournalLines {
+		records = append(records, "- record")
+	}
+	base := prefix + strings.Join(records, "\n")
+	target := maxFullShowBytes - 1
+	small := prefix + strings.Replace(strings.Join(records, "\n"), strings.Repeat("x", maxFullShowBytes), strings.Repeat("x", maxFullShowBytes-(len(base)-target)), 1)
+	if len(small) != target {
+		t.Fatalf("small fixture size = %d, want %d", len(small), target)
+	}
+	large := small + "xx"
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantOld bool
+	}{{"under", small, true}, {"over", large, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			showTask(".", task{path: "20260101-1000-MED-t.md", slug: "t", body: tc.body}, options{}, &out, &errOut)
+			if strings.Contains(out.String(), "old-marker") != tc.wantOld {
+				t.Fatalf("short display marker=%v, want %v", strings.Contains(out.String(), "old-marker"), tc.wantOld)
+			}
+			if !tc.wantOld && !strings.Contains(out.String(), "--tail 0") {
+				t.Fatalf("large display lacks journal hint: %q", out.String())
+			}
+		})
+	}
+}
+
+func TestJournalTicketStartsWithoutAcceptance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20260101-1000-MED-journal.md")
+	body := "# Journal\n\nСтатус: открыт\nВид: журнал\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := transition(task{path: path, slug: "journal", status: "открыт", body: body}, options{cmd: "start", by: "tester"}, &out, &errOut)
+	if code != 0 || !strings.Contains(out.String(), "в работе") {
+		t.Fatalf("journal start = %d %q %q", code, out.String(), errOut.String())
+	}
+}
+
 func TestTicketBodyParseRoundTripsSectionBoundaries(t *testing.T) {
 	body := "# T\n\nСтатус: открыт\n\n## Что сделать\nwork\n\n## Журнал\n- entry\n\ncontinuation\n"
 	got := renderTicketDocument(parseTicketBody(body))
@@ -165,8 +285,8 @@ func TestSetTextCannotClearAcceptance(t *testing.T) {
 
 func TestShowTicketSectionsAndTail(t *testing.T) {
 	body := "# T\n\nСтатус: открыт\nИсполнитель: worker\n\n## Что сделать\nwork\n\n## Приёмка\ncheck\n\n## Журнал\n- old\n- middle\n- new\n"
-	got := showSections(body, []string{"Приёмка"})
-	if strings.Contains(got, "Что сделать") || !strings.Contains(got, "## Приёмка\ncheck") {
+	got, err := showSections(body, []string{"Приёмка"})
+	if err != nil || strings.Contains(got, "Что сделать") || !strings.Contains(got, "## Приёмка\ncheck") {
 		t.Fatalf("sections = %q", got)
 	}
 	got = showTail(body, 2)
