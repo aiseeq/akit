@@ -1,8 +1,10 @@
 package main
 
 import (
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -83,6 +85,53 @@ func TestTruncatedLineMasksKeyFirst(t *testing.T) {
 				}
 			}
 		next:
+		}
+	}
+}
+
+// Keys one per line, longer than the window: the mask shrinks each key to a short
+// label, so the visible part reaches past the first window. A key cut by the
+// window's end must not show; the hidden count follows the masked text.
+func TestTruncatedLineMasksKeysPastShrunkWindow(t *testing.T) {
+	e := fakeHome(t)
+	const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+	rng := rand.New(rand.NewPCG(7, 7))
+	keys := []string{"cat keys.txt"}
+	var bodies []string
+	for i := range 40 {
+		b := make([]byte, 48)
+		for j := range b {
+			b[j] = alphabet[rng.IntN(len(alphabet))]
+		}
+		body := string(b) + strconv.Itoa(i%10)
+		bodies = append(bodies, body)
+		keys = append(keys, "sk"+"-proj-"+body)
+	}
+	text := strings.Join(keys, "\n")
+	line := `{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:00:00.000Z","message":{"role":"user","content":` + strconv.Quote(text) + `}}` + "\n"
+	path := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", "9f8e7d6c-0000-4000-8000-000000000004.jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for width := 20; width <= 400; width += 7 {
+		for _, args := range [][]string{
+			{"9f8e7d6c", "--width", strconv.Itoa(width)},
+			{"9f8e7d6c:1", "--width", strconv.Itoa(width)},
+		} {
+			code, out, errOut := runTL(t, e, args...)
+			if code != 0 {
+				t.Errorf("tl %v: code %d", args, code)
+				continue
+			}
+			if strings.Contains(out+errOut, "sk"+"-proj-") {
+				t.Errorf("tl %v: a key prefix is in the output", args)
+			}
+			for _, body := range bodies {
+				if strings.Contains(out+errOut, body[:4]) {
+					t.Errorf("tl %v: a piece of key %d is in the output", args, slices.Index(bodies, body))
+					break
+				}
+			}
 		}
 	}
 }

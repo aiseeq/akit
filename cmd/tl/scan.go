@@ -820,19 +820,28 @@ const maskWindow = 512
 
 // maskedShort cuts text to width like transcript.Short after masking it, so a
 // cut inside a secret does not leave a piece the mask no longer recognizes.
-// Only the start of a long text is masked: the rest is not shown.
+// Only the start of a long text is masked: the rest is not shown. Masking shrinks
+// secrets to short labels, so the window grows until its masked form still runs
+// maskWindow past the cut; a key cut by the window's end then stays out of sight.
+// The hidden count is of the masked text: of the whole text once it is all masked.
 func maskedShort(text string, width int) string {
 	flat := transcript.Short(text, 0)
 	r := []rune(flat)
 	if width <= 0 || len(r) <= width {
 		return flat
 	}
-	masked, _ := secretmask.Mask(string(r[:min(len(r), width+maskWindow)]))
-	m := []rune(masked)
-	if len(m) > width {
-		m = m[:width]
+	n := min(len(r), width+maskWindow)
+	for {
+		masked, _ := secretmask.Mask(string(r[:n]))
+		m := []rune(masked)
+		if n == len(r) && len(m) <= width {
+			return masked
+		}
+		if n == len(r) || len(m) >= width+maskWindow {
+			return string(m[:width]) + fmt.Sprintf("…(+%d)", len(m)-width+len(r)-n)
+		}
+		n = min(len(r), 2*n)
 	}
-	return string(m) + fmt.Sprintf("…(+%d)", len(r)-width)
 }
 
 func windowNote(opts options, e env) string {
