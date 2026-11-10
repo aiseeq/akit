@@ -326,9 +326,12 @@ times search within 15 minutes; exact times search within two minutes. A zone
 may follow the date or clock: `CET` and `CEST` mean UTC offsets +1 and +2;
 `UTC`, `GMT`, and `Z` mean UTC, with an offset such as `UTC+3` or `GMT-2:30`;
 all forms accept any case, optional parentheses and trailing punctuation. A zone
-without a clock sets the timezone for the whole day. A clock followed by no zone
-is local; any other word (`MSK`, `мск`, `по`) is reported as not found with the
-zone named in the reason. A year after the day (`31.10.2025` or `31.10.25`) is
+without a clock sets the timezone for the whole day. A clock followed by a zone
+uses it; an uppercase Latin abbreviation of 2–6 letters (`MSK`, `EST`), `мск`,
+`по Москве`, or such a token in parentheses is treated as a zone and reported
+as not found if unknown. Known zones are accepted in any case. Other text
+after the clock is ignored for timezone selection, so the quote is searched in
+the default timezone. A year after the day (`31.10.2025` or `31.10.25`) is
 used; two-digit years follow Go's 00–68 = 2000–2068 and 69–99 = 1969–1999 rule.
 Several consecutive quotes after one marker are checked separately. The quote
 matches whole words; `…` and `[…]` mark omitted text between ordered pieces. More
