@@ -81,6 +81,7 @@ type Load struct {
 	hasIOFullExact bool
 	MemSome        float64 // % последних 10 с, когда хоть одна задача ждала память (some avg10)
 	SwapKBs        float64 // обмен со свопом, KB/s
+	SwapUnmeasured bool    // свежий замер свопа пропущен: источник диска ответил, давление памяти не выше порога
 	DirtyMB        float64 // грязных и пишущихся на диск страниц сейчас (Dirty+Writeback из /proc/meminfo), MiB
 	// DirtyLimitMB — порог фонового сброса машины, MiB, приближённо: vm.dirty_background_bytes, а если
 	// он 0 — vm.dirty_background_ratio % от свободной и файловой памяти (см. dirtyLimit).
@@ -203,17 +204,22 @@ func diskBusy(m Load, maxIOFull float64, skipped []error) bool {
 // effectiveLimits — пороги правила с умолчаниями на месте нулевых: диск, процессор (число потоков машины),
 // память.
 func effectiveLimits(m Load, l Limits) (maxIOFull, runnable, memSome float64) {
-	maxIOFull, runnable, memSome = l.MaxIOFull, l.Runnable, l.MaxMemSome
+	maxIOFull, runnable = l.MaxIOFull, l.Runnable
 	if maxIOFull <= 0 {
 		maxIOFull = DefaultLimits.MaxIOFull
 	}
 	if runnable <= 0 {
 		runnable = float64(m.Threads)
 	}
-	if memSome <= 0 {
-		memSome = DefaultMemSome
+	return maxIOFull, runnable, l.MemSomeLimit()
+}
+
+// MemSomeLimit — порог давления памяти: MaxMemSome, а 0 — DefaultMemSome.
+func (l Limits) MemSomeLimit() float64 {
+	if l.MaxMemSome <= 0 {
+		return DefaultMemSome
 	}
-	return maxIOFull, runnable, memSome
+	return l.MaxMemSome
 }
 
 // WritebackLimit — порог выброса записи, MiB: свой MaxDirtyMB или порог фонового сброса машины m;
@@ -253,8 +259,10 @@ func NewMeter(procRoot string) *Meter {
 	return &Meter{procRoot: procRoot, now: time.Now, sleep: sleepCtx}
 }
 
-// Check замеряет машину и применяет правило. fresh — обмен со свопом за l.SwapWindow (ждёт окно);
-// иначе — с прошлого Check, а у первого — тоже за окно. Файл тихого режима читается первым, затем
+// Check замеряет машину и применяет правило. fresh — обмен со свопом за l.SwapWindow (ждёт окно),
+// кроме случая, когда источник диска ответил и давление памяти не выше порога: тогда своп не влияет
+// на правило и не измеряется. Иначе обмен — с прошлого Check, а у первого — тоже за окно. Файл тихого
+// режима читается первым, затем
 // меры из procRoot: и в тихом режиме вердикт несёт все замеры. Ошибка — без вердикта: файл тихого
 // режима не читается или не разбирается, мера есть, но не читается.
 func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (Verdict, error) {
@@ -331,16 +339,25 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 			return Verdict{}, fmt.Errorf("CPU pressure: %w", err)
 		}
 	}
-	if err := m.measureSwapAndIO(ctx, l, fresh, &load, &skipped); err != nil {
+	if err := m.measureSwapAndDisk(ctx, l, kind, fresh, &load, &skipped); err != nil {
 		return Verdict{}, err
 	}
+	return Rule(load, l, skipped), nil
+}
+
+func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, kind string, fresh bool, load *Load, skipped *[]error) error {
 	load.Disk, load.DiskFault = readDisk(ctx, m.socketPath(), kind, m.now())
+	if fresh && load.Disk != nil && !skippedAny(*skipped, ErrNoMemPressure) && load.MemSome <= l.MemSomeLimit() {
+		load.SwapUnmeasured = true
+	} else if err := m.measureSwapAndIO(ctx, l, fresh, load, skipped); err != nil {
+		return err
+	}
 	if load.Disk != nil {
 		load.ioFullExact = load.Disk.Five.IOFullMS / 50
 		load.IOFull, load.IOWindow = math.Round(load.ioFullExact*10)/10, 5*time.Second
 		load.hasIOFullExact = true
 		if load.Disk.Five.Capped == nil {
-			skipped = append(skipped, ErrNoCapJudgement)
+			*skipped = append(*skipped, ErrNoCapJudgement)
 		}
 	} else {
 		if load.IOWindow == 0 {
@@ -348,12 +365,12 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 		}
 		switch {
 		case errors.Is(load.DiskFault, ErrNoIOSource):
-			skipped = append(skipped, ErrNoIOSource)
+			*skipped = append(*skipped, ErrNoIOSource)
 		case load.DiskFault != nil:
-			skipped = append(skipped, ErrIOSourceFailed)
+			*skipped = append(*skipped, ErrIOSourceFailed)
 		}
 	}
-	return Rule(load, l, skipped), nil
+	return nil
 }
 
 func (m *Meter) measureSwapAndIO(ctx context.Context, l Limits, fresh bool, load *Load, skipped *[]error) error {
