@@ -83,11 +83,13 @@ func parseFileOldNew(lines []string, fixed string) ([]Edit, error) {
 			}
 			next++
 		}
-		old := strings.Join(lines[oldStart:newMark], "\n")
+		oldLines := trimBlankLines(lines[oldStart:newMark])
+		newLines := trimBlankLines(lines[newStart:next])
+		old := strings.Join(oldLines, "\n")
 		if old == "" {
 			return nil, fmt.Errorf("empty OLD text")
 		}
-		edits = append(edits, Edit{Files: []string{path}, Old: old, New: strings.Join(lines[newStart:next], "\n"), Want: 1})
+		edits = append(edits, Edit{Files: []string{path}, Old: old, New: strings.Join(newLines, "\n"), Want: 1})
 		i = next
 	}
 	if len(edits) == 0 {
@@ -131,7 +133,7 @@ func parseEqualsBlock(path string, body []string) (Edit, error) {
 	}
 	var old, replacement []string
 	if oldMark >= 0 {
-		if oldMark != 0 || newMark <= oldMark {
+		if !allBlankLines(body[:oldMark]) || newMark <= oldMark {
 			return Edit{}, fmt.Errorf("expected --- old followed by --- new")
 		}
 		old, replacement = body[oldMark+1:newMark], body[newMark+1:]
@@ -140,6 +142,8 @@ func parseEqualsBlock(path string, body []string) (Edit, error) {
 	} else {
 		return Edit{}, fmt.Errorf("missing --- separator")
 	}
+	old = trimBlankLines(old)
+	replacement = trimBlankLines(replacement)
 	if err := checkForeignText(old, replacement); err != nil {
 		return Edit{}, err
 	}
@@ -148,6 +152,26 @@ func parseEqualsBlock(path string, body []string) (Edit, error) {
 		return Edit{}, fmt.Errorf("empty old text")
 	}
 	return Edit{Files: []string{path}, Old: oldText, New: strings.Join(replacement, "\n"), Want: 1}, nil
+}
+
+func allBlankLines(lines []string) bool {
+	for _, line := range lines {
+		if line != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func trimBlankLines(lines []string) []string {
+	start, end := 0, len(lines)
+	for start < end && lines[start] == "" {
+		start++
+	}
+	for start < end && lines[end-1] == "" {
+		end--
+	}
+	return lines[start:end]
 }
 
 func findEqualsSeparators(body []string) (plain, oldMark, newMark int, err error) {
