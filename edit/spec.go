@@ -40,9 +40,10 @@ const SpecHelp = `Spec format (stdin or -F file), one or more blocks:
 
 The path line names the file for the blocks after it, until the next path line.
 "<<<<<<< SEARCH 3" expects exactly 3 matches (default 1). Text is matched
-exactly, as a substring: whitespace and indentation count. A line that is a marker (spaces
-around it ignored) cannot be part of the text; use OLD NEW FILE... for such
-edits.`
+exactly, as a substring: whitespace and indentation count. A line that is a
+marker (spaces around it ignored) cannot be part of the text; use the OLD NEW
+argument form for such edits.
+`
 
 // ParseSpec разбирает задание из блоков SEARCH/REPLACE. Строки вне блоков — только путь к файлу и пустые: любая
 // другая строка — ошибка, чтобы опечатка в маркере не превратилась в молча пропущенную правку.

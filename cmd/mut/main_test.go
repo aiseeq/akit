@@ -317,7 +317,7 @@ exec "$@"
 // The help shows only spec rules mut follows: no "sub FILE" form, and blocks do
 // not build on each other.
 func TestUsageHasNoSubOnlyRules(t *testing.T) {
-	for _, s := range []string{"sub FILE", "previous blocks"} {
+	for _, s := range []string{"sub FILE", "previous blocks", "FILE..."} {
 		if strings.Contains(usage, s) {
 			t.Errorf("mut usage mentions %q", s)
 		}
