@@ -542,6 +542,16 @@ func (u *run) commandHasTruncator(cmd string) bool {
 	return false
 }
 
+// lastCall — утилита стоит последней командой цепочки, и код всей команды — её код.
+func (u *run) lastCall(tool, cmd string) bool {
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil {
+		slog.Debug("parse utility command", "error", err)
+		return false
+	}
+	return len(calls) > 0 && calls[len(calls)-1].Name == tool
+}
+
 func (u *run) singleUtilityCommand(tool, cmd string) bool {
 	calls, err := shellcmd.Calls(cmd)
 	if err != nil {
@@ -721,17 +731,17 @@ func (u *run) findIsError(raw json.RawMessage) (bool, bool) {
 
 func (u *run) utilityCode(e transcript.Event, tool, cmd, out string) (int, error) {
 	code := u.eventExitCode(e)
-	if u.explicitSuccess(tool, out) {
-		if code < 0 {
+	success := u.explicitSuccess(tool, out)
+	if success || u.explicitRefusal(tool, out) {
+		// Код команды — код утилиты, только когда она последняя в цепочке: иначе это код следующего шага
+		// (тесты после «&&», head в конвейере), а исход утилиты — её собственные слова.
+		if code >= 0 && u.lastCall(tool, cmd) {
+			return code, nil
+		}
+		if success {
 			return 0, nil
 		}
-		return code, nil
-	}
-	if u.explicitRefusal(tool, out) {
-		if code < 0 {
-			return 1, nil
-		}
-		return code, nil
+		return 1, nil
 	}
 	cs, err := shellcmd.Calls(cmd)
 	if err != nil {

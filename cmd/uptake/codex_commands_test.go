@@ -112,3 +112,28 @@ func TestCodexCompletionNotTakenFromLaterCall(t *testing.T) {
 		t.Errorf("codes = %v, want [-1 0]: the first call never completed", got)
 	}
 }
+
+// The exit code of a chain belongs to its last command: a utility that said
+// it succeeded before a failing next step is not a failure, and one that said
+// it refused before a pipe filter is not a success.
+func TestExplicitOutcomeOwnsChainCode(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	out := func(code int, text string) transcript.Event {
+		return transcript.Event{CallID: "c1", Text: "Process exited with code " + strconv.Itoa(code) + "\nOutput:\n" + text}
+	}
+	for _, tc := range []struct {
+		name, tool, cmd string
+		e               transcript.Event
+		want            int
+	}{
+		{"success, then failing tests", "sub", "sub -F spec.txt && bash tests/run.sh", out(1, "sub: 1 replacement in 1 file: a.sh 1 (line 3)\nFAIL\n"), 0},
+		{"refusal piped to head", "tl", "tl --grep x abcd | head -5", out(0, "tl: no events in 1 transcript(s)\n"), 1},
+		{"refusal as the last step", "sub", "cd /src && sub a b f.go", out(1, "sub: nothing changed: expected 1, found 0\n"), 1},
+		{"success alone", "sub", "sub a b f.go", out(0, "sub: 1 replacement in 1 file: f.go 1 (line 2)\n"), 0},
+	} {
+		code, err := u.utilityCode(tc.e, tc.tool, tc.cmd, tc.e.Text)
+		if err != nil || code != tc.want {
+			t.Errorf("%s: utilityCode = %d, %v; want %d", tc.name, code, err, tc.want)
+		}
+	}
+}
