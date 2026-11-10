@@ -406,6 +406,23 @@ func TestNextOrdersLocalBlockerAndRanksJSON(t *testing.T) {
 	}
 }
 
+// A closed or archived blocker whose link is still in the header blocks nothing;
+// tickets created at the same time go by slug.
+func TestNextIgnoresClosedLocalBlockerAndBreaksTiesBySlug(t *testing.T) {
+	at := time.Unix(10, 0)
+	tasks := []task{
+		{slug: "b-held", status: "открыт", prio: "MED", body: "Заблокирован: done", created: at},
+		{slug: "a-free", status: "открыт", prio: "MED", created: at},
+		{slug: "c-free", status: "открыт", prio: "MED", created: at},
+		{slug: "done", status: "готово", prio: "MED", created: time.Unix(1, 0)},
+	}
+	for _, input := range [][]task{tasks, {tasks[2], tasks[0], tasks[3], tasks[1]}} {
+		if got := strings.Join(taskSlugs(orderedNextCandidates(input, "", queuegate.Scope{Valid: true})), ","); got != "a-free,b-held,c-free" {
+			t.Fatalf("order = %s", got)
+		}
+	}
+}
+
 // A blocker open in another project or moved to an external tracker puts the
 // blocked ticket after the clear ones; a link to a ticket that is gone does not.
 func TestNextDemotesForeignAndJiraBlockedTickets(t *testing.T) {
