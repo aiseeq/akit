@@ -301,6 +301,10 @@ func fileSample(lines []string) (path, old, replacement string, ok bool) {
 }
 
 func unifiedDiffSample(lines []string) (path, old, replacement string, ok bool) {
+	// Шапка git diff до «--- a/p»: «diff --git …», «index …», режимы файла.
+	for len(lines) > 0 && !strings.HasPrefix(strings.TrimSpace(lines[0]), "--- ") && gitDiffHeader(lines[0]) {
+		lines = lines[1:]
+	}
 	if len(lines) < 2 || !strings.HasPrefix(strings.TrimSpace(lines[0]), "--- ") || !strings.HasPrefix(strings.TrimSpace(lines[1]), "+++ ") {
 		return "", "", "", false
 	}
@@ -316,8 +320,14 @@ func unifiedDiffSample(lines []string) (path, old, replacement string, ok bool) 
 			inHunk = true
 			continue
 		}
-		if !inHunk || line == "" {
+		if !inHunk {
 			continue
+		}
+		if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "diff --git ") {
+			break // заголовок следующего файла: кусок кончился
+		}
+		if line == "" {
+			line = " " // редактор срезал пробел пустой строки контекста
 		}
 		switch line[0] {
 		case ' ':
@@ -416,4 +426,13 @@ func ForeignNotice(edits []Edit) (string, bool) {
 		translated = strings.Join(rows[:20], "\n") + fmt.Sprintf("\n… (+%d lines)", len(rows)-20)
 	}
 	return fmt.Sprintf("sub: read %s form; translated to SEARCH/REPLACE:\n%s", form, translated), true
+}
+
+func gitDiffHeader(line string) bool {
+	for _, prefix := range []string{"diff --git ", "index ", "new file mode ", "deleted file mode ", "old mode ", "new mode ", "similarity index ", "rename from ", "rename to "} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
 }
