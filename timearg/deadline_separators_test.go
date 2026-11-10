@@ -5,7 +5,8 @@ import (
 	"time"
 )
 
-// Hours after a date are read through a comma or a colon too, and impossible
+// Hours after a date are read through a comma, a colon or a semicolon too,
+// with or without a space after it, and impossible
 // or short hours there give no deadline instead of the date's midnight.
 func TestDeadlineSeparatorsAndShortHours(t *testing.T) {
 	loc := time.FixedZone("CET", 3600)
@@ -13,6 +14,10 @@ func TestDeadlineSeparatorsAndShortHours(t *testing.T) {
 	for wait, want := range map[string]time.Time{
 		"12.11, 9:00 x":  time.Date(2026, 11, 12, 9, 0, 0, 0, loc),
 		"12.11: 9:00 x":  time.Date(2026, 11, 12, 9, 0, 0, 0, loc),
+		"12.11; 9:00 x":  time.Date(2026, 11, 12, 9, 0, 0, 0, loc),
+		"12.11,9:00 x":   time.Date(2026, 11, 12, 9, 0, 0, 0, loc),
+		"12.11:9:00 x":   time.Date(2026, 11, 12, 9, 0, 0, 0, loc),
+		"12.11; текст":   time.Date(2026, 11, 12, 0, 0, 0, 0, loc),
 		"12.11, 9:00":    time.Date(2026, 11, 12, 9, 0, 0, 0, loc),
 		"12.11, текст":   time.Date(2026, 11, 12, 0, 0, 0, 0, loc),
 		"12.11: 3 файла": time.Date(2026, 11, 12, 0, 0, 0, 0, loc),
@@ -21,7 +26,7 @@ func TestDeadlineSeparatorsAndShortHours(t *testing.T) {
 			t.Errorf("Deadline(%q) = %v, %v; want %v", wait, at, ok, want)
 		}
 	}
-	for _, wait := range []string{"12.11, 25:00 x", "12.11: 25:00 x", "12.11 9:5 x", "12.11, 9:5"} {
+	for _, wait := range []string{"12.11, 25:00 x", "12.11: 25:00 x", "12.11 9:5 x", "12.11, 9:5", "12.11; 25:00 x", "12.11,25:00 x"} {
 		if at, ok := Deadline(wait, now); ok {
 			t.Errorf("Deadline(%q) = %v; want no deadline", wait, at)
 		}
