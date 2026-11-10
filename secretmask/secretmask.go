@@ -62,8 +62,9 @@
 //     is a directory and stays; MYSQL_PWD and other *pwd names are passwords.
 //   - Under auth and credentials names a plain
 //     word or path stays: same-origin, oauth2, basic, /etc/app/creds.json. A
-//     value mixing upper, lower case and digits, or a run of 12 letters and
-//     digits, is hidden; a short lower-case password such as hunter2 there is not.
+//     token-like value (see isPlainWord: mixed case and digits, a lower to
+//     upper turn as in base64, 12 hex characters, 16 letters) is hidden; a
+//     short lower-case password such as hunter2 there is not.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
 package secretmask
@@ -1177,7 +1178,8 @@ func valueIsStructure(text string, value contextValue) bool {
 		return false
 	}
 	name := v[:len(v)-1]
-	if _, secret := secretName(name); !secret || !onlyNameBytes(name) {
+	// A trailing digit makes a word (Secret1), not the next name.
+	if _, secret := secretName(name); !secret || !onlyNameBytes(name) || name[len(name)-1] >= '0' && name[len(name)-1] <= '9' {
 		return false
 	}
 	at := value.end
@@ -1259,33 +1261,52 @@ func isPlainPath(value string) bool {
 	return true
 }
 
-// isPlainWord: letters, digits, -, _ and . that do not look like a token: no
-// mix of upper, lower case and digits, no long run of letters and digits.
+// isPlainWord: letters, digits, -, _ and . that do not look like a token. A
+// token mixes upper, lower case and digits, turns from lower to upper case
+// inside a word (base64 such as dXNl; OAuth and NTLM are words), or holds a
+// run of 12 hex characters, 12 letters and digits mixed, or 16 letters.
 func isPlainWord(value string) bool {
-	upper, lower, digit := false, false, false
-	run, longest := 0, 0
+	upper, lower, digit, ok := wordClasses(value)
+	if !ok || upper && lower && digit {
+		return false
+	}
+	for _, run := range strings.FieldsFunc(value, func(r rune) bool { return r == '-' || r == '_' || r == '.' }) {
+		if len(run) >= 16 || len(run) >= 12 && (isHex(run) || strings.ContainsAny(run, "0123456789") && !onlyDigits(run)) {
+			return false
+		}
+	}
+	return true
+}
+
+// wordClasses reports the character classes of a word; ok is false for an empty
+// word, another character, or a turn from lower to upper case.
+func wordClasses(value string) (upper, lower, digit, ok bool) {
 	for i := 0; i < len(value); i++ {
 		c := value[i]
 		switch {
 		case c >= 'A' && c <= 'Z':
 			upper = true
+			if i > 0 && value[i-1] >= 'a' && value[i-1] <= 'z' {
+				return upper, lower, digit, false
+			}
 		case c >= 'a' && c <= 'z':
 			lower = true
 		case c >= '0' && c <= '9':
 			digit = true
-		case c == '-' || c == '_' || c == '.':
-			run = 0
-			continue
-		default:
+		case c != '-' && c != '_' && c != '.':
+			return upper, lower, digit, false
+		}
+	}
+	return upper, lower, digit, value != ""
+}
+
+func isHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !(s[i] >= '0' && s[i] <= '9' || s[i] >= 'a' && s[i] <= 'f' || s[i] >= 'A' && s[i] <= 'F') {
 			return false
 		}
-		run++
-		longest = max(longest, run)
 	}
-	if value == "" || upper && lower && digit {
-		return false
-	}
-	return !(digit && (upper || lower) && longest >= 12) && longest < 20
+	return true
 }
 
 func secretName(name string) (string, bool) {

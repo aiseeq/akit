@@ -201,3 +201,27 @@ func TestMaskStructureNeedsNameAndPlainAuthValues(t *testing.T) {
 		}
 	}
 }
+
+// Tokens without digits under auth and credentials are hidden; plain words
+// stay. A name with a trailing digit is no next name.
+func TestMaskAuthTokensWithoutDigits(t *testing.T) {
+	for input, secret := range map[string]string{
+		"auth: dXNlcjpwYXNz":       "dXNlcjpwYXNz",
+		"_auth=dXNlcjpwYXNz":       "dXNlcjpwYXNz",
+		`"auth": "aHVudGVyMg"`:     "aHVudGVyMg",
+		"auth: deadbeefcafebabe":   "deadbeefcafebabe",
+		"auth: ABCDEFGHIJKLMNOP":   "ABCDEFGHIJKLMNOP",
+		"auth=abcdefghijklmnopqrs": "abcdefghijklmnopqrs",
+		"password: Secret1: x":     "Secret1",
+	} {
+		if got, _ := Mask(input); strings.Contains(got, secret) {
+			t.Errorf("%q: value left in %q", input, got)
+		}
+	}
+	for _, word := range []string{"none", "kerberos", "ldap", "trust", "true", "include", "omit", "same-origin", "aws-profile", "ntlm", "OAuth", "NTLM", "Kerberos"} {
+		input := "auth: " + word
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("%q changed to %q, %v", input, got, found)
+		}
+	}
+}
