@@ -874,32 +874,45 @@ func typeExpressionHead(text string, value contextValue) bool {
 // such as HashMap. Requiring letter-only title-case parts avoids token-like
 // names that mix digits with case changes.
 func plainTypeName(value string) bool {
-	if value == "" || !isIdentifierStart(value[0]) {
+	if value == "" || !isLetterOnly(value) {
 		return false
 	}
+	if isPlainWord(value) && plainTypeCase(value) {
+		return true
+	}
+	return titleCaseTypeParts(value)
+}
+
+func isLetterOnly(value string) bool {
 	for i := 0; i < len(value); i++ {
 		if !(value[i] >= 'A' && value[i] <= 'Z' || value[i] >= 'a' && value[i] <= 'z') {
 			return false
 		}
 	}
+	return true
+}
+
+func plainTypeCase(value string) bool {
 	allLower, allUpper := true, true
 	for i := 0; i < len(value); i++ {
 		allLower = allLower && value[i] >= 'a' && value[i] <= 'z'
 		allUpper = allUpper && value[i] >= 'A' && value[i] <= 'Z'
 	}
-	if isPlainWord(value) {
-		if allLower || allUpper {
-			return true
-		}
-		if value[0] >= 'A' && value[0] <= 'Z' {
-			for i := 1; i < len(value); i++ {
-				if value[i] >= 'A' && value[i] <= 'Z' {
-					return false
-				}
-			}
-			return true
+	if allLower || allUpper {
+		return true
+	}
+	if value[0] < 'A' || value[0] > 'Z' {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		if value[i] >= 'A' && value[i] <= 'Z' {
+			return false
 		}
 	}
+	return true
+}
+
+func titleCaseTypeParts(value string) bool {
 	parts := 0
 	for i := 0; i < len(value); {
 		if value[i] < 'A' || value[i] > 'Z' {

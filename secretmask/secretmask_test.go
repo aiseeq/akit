@@ -374,9 +374,12 @@ func TestGenericHeadAndTailRejectTokenLikeValues(t *testing.T) {
 		"auth=Record<2Kind,",
 		"auth=Record<Kind",
 		"auth=fooBar<Kind>",
+		"auth=fooBarBaz<Kind>",
 		"auth=Zq7xW9vK2m<Kind>",
 		"auth=map[string]Zq7xW9vK2m{",
 		"auth=pa55w0rd<x>",
+		"auth=P123<x>",
+		"auth=Foo_bar<x>",
 		"auth=KxQzWp<abc>",
 		"auth=Kxqzwprtmnbvcxzlk<abc>",
 		"auth=abcdefghijklmnopqr<abc>",
@@ -399,10 +402,26 @@ func TestGenericHeadAndTailRejectTokenLikeValues(t *testing.T) {
 		"auth=Promise<void>;",
 		"auth=HashMap<String, Vec>",
 		"auth=Map<string, number> = new Map()",
+		"auth=Map<UUID>",
+		"auth: Record<Kind>\tx",
+		"auth=Record<Kind>\r\n",
 	} {
 		got, found := Mask(text)
 		if got != text || len(found) != 0 {
 			t.Errorf("ordinary type expression changed: %q -> %q %v", text, got, found)
+		}
+	}
+}
+
+func TestPlainTypeNameBoundaries(t *testing.T) {
+	for _, name := range []string{"", "_", "1Type", "P123", "Foo_bar", "QFCa", "KxQzWp", "Kxqzwprtmnbvcxzlk"} {
+		if plainTypeName(name) {
+			t.Errorf("token-like type name accepted: %q", name)
+		}
+	}
+	for _, name := range []string{"string", "Record", "HashMap", "UUID"} {
+		if !plainTypeName(name) {
+			t.Errorf("plain type name rejected: %q", name)
 		}
 	}
 }
