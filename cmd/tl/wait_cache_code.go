@@ -2,4 +2,4 @@ package main
 
 // waitCacheCode — sha256 исходников, от которых зависит запись кэша tl --wait: пакеты модуля из go list -deps
 // ./cmd/tl (без тестов) и версии внешних модулей. Пишет и сверяет TestWaitCacheCodeMatchesSources.
-const waitCacheCode = "3cf9ff898f180f16ba58098e686fa432c6abef5532e30037dc78d27706f7c3c7"
+const waitCacheCode = "c9f0767ca278cb3470dfed15e00aae0e32835cb59623dd4a4569989bdd28c1dc"

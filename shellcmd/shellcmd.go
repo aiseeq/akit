@@ -748,7 +748,7 @@ func shellNoExec(args []string) bool {
 		if !option {
 			return false
 		}
-		if args[i] == "--noexec" || args[i] == "--no-exec" || strings.HasPrefix(args[i], "-") && !strings.HasPrefix(args[i], "--") && strings.Contains(args[i][1:], "n") {
+		if strings.HasPrefix(args[i], "-") && !strings.HasPrefix(args[i], "--") && strings.Contains(args[i][1:], "n") {
 			return true
 		}
 		if takesValue {
@@ -782,7 +782,7 @@ func shellArgumentOption(arg string) (option, takesValue, stdin, command bool) {
 		return true, true, false, false
 	}
 	if strings.HasPrefix(arg, "--") {
-		return true, false, false, arg == "--command"
+		return true, false, false, false
 	}
 	if len(arg) < 2 || (arg[0] != '-' && arg[0] != '+') {
 		return false, false, false, false
@@ -1266,26 +1266,35 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 		parallelOffset = index + 1
 		parallelArgs = c.call.Args[parallelOffset:]
 	}
-	start := wrapperOptionEnd("parallel", parallelArgs, 0)
-	marker := slices.Index(parallelArgs[start:], ":::")
-	if marker < 0 {
-		marker = slices.Index(parallelArgs[start:], "::::")
-	}
-	if marker < 0 {
+	start, ok := parallelCommandStart(parallelArgs)
+	if !ok {
 		return cmd{}, false
 	}
-	marker += start
-	if marker == start {
-		return cmd{}, false
+	globalStart := parallelOffset + start
+	commandWord := c.words[globalStart+1]
+	args := make([]string, 0, len(parallelArgs)-start-1)
+	words := []word{commandWord}
+	for i := start + 1; i < len(parallelArgs); i++ {
+		if parallelArgs[i] == ":::" || parallelArgs[i] == "::::" {
+			continue
+		}
+		args = append(args, parallelArgs[i])
+		words = append(words, c.words[parallelOffset+i+1])
 	}
-	globalStart, globalMarker := parallelOffset+start, parallelOffset+marker
-	args := append(slices.Clone(parallelArgs[start:marker]), parallelArgs[marker+1:]...)
-	words := slices.Clone(c.words[globalStart+1 : globalMarker+1])
-	words = append(words, c.words[globalMarker+2:]...)
-	child := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: c.via(wrapperVia...), Offset: words[0].offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
+	child := cmd{call: Call{Name: commandName(parallelArgs[start]), Args: args, Raw: c.call.Raw, Line: c.call.Line,
+		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words}
 	return child, true
+}
+
+func parallelCommandStart(args []string) (int, bool) {
+	start := wrapperOptionEnd("parallel", args, 0)
+	for i := start + 1; i < len(args); i++ {
+		if args[i] == ":::" || args[i] == "::::" {
+			return start, true
+		}
+	}
+	return start, false
 }
 
 // expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).
@@ -1809,19 +1818,17 @@ func wrapperRunsScript(name string, args []string) bool {
 
 func unwrapOnce(name string, args []string) ([]string, bool) {
 	if name == "parallel" {
-		start := wrapperOptionEnd(name, args, 0)
-		marker := slices.Index(args[start:], ":::")
-		if marker < 0 {
-			marker = slices.Index(args[start:], "::::")
-		}
-		if marker < 0 {
+		start, ok := parallelCommandStart(args)
+		if !ok {
 			return nil, false
 		}
-		marker += start
-		if marker == start {
-			return nil, false
+		target := make([]string, 0, len(args)-start)
+		for _, arg := range args[start:] {
+			if arg != ":::" && arg != "::::" {
+				target = append(target, arg)
+			}
 		}
-		return append(slices.Clone(args[start:marker]), args[marker+1:]...), true
+		return target, true
 	}
 	if name == "command" && commandIsLookup(args) {
 		return nil, false
@@ -1906,17 +1913,17 @@ var valueOptions = map[string]map[string]bool{
 	"taskset":     set("-c", "--cpu-list", "-p", "--pid"),
 	"chrt":        set("-p", "--pid", "-P", "-T", "-D", "--sched-period", "--sched-runtime", "--sched-deadline"),
 	"strace":      set("-o", "--output", "-e", "-p", "-u", "-s", "-O", "-I", "-E", "-P", "-a", "-S", "-X", "-b", "-U", "--secontext"),
-	"setpriv":     set("--reuid", "--ruid", "--regid", "--rgid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig"),
+	"setpriv":     set("--reuid", "--ruid", "--euid", "--regid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig"),
 	"unshare":     set("-S", "-G", "-R", "-w", "--setuid", "--setgid", "--root", "--wd", "--map-user", "--map-group", "--propagation"),
 	"flock":       set("-E", "--conflict-exit-code", "-w", "--wait", "--timeout"),
-	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--nice"),
+	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--on-clock-change", "--on-timezone-change", "--timer-property", "--nice"),
 	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "-s", "--shell", "-w", "--whitelist-environment"),
 	"su":          set("-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
 	"doas":        set("-u", "-C", "-s"),
 	"watch":       set("-n", "--interval"),
-	"script":      set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io"),
-	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "--halt", "--timeout", "--delay"),
-	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e"),
+	"script":      set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io", "-m", "--logging-format", "-o", "--output-limit"),
+	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "--sshloginfile", "--arg-file", "--joblog", "--results", "--workdir", "--env", "--block", "--recstart", "--recend", "--regexp", "--tagstring", "--halt", "--timeout", "--delay", "--memfree", "--load", "--nice"),
+	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e", "-F"),
 }
 
 func set(items ...string) map[string]bool {

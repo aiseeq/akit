@@ -468,6 +468,110 @@ E`, "kill", []string{"1"}, []string{"bash"}},
 	}
 }
 
+func TestWrapperOptionAndProgressRegressions(t *testing.T) {
+	tests := []struct {
+		command string
+		name    string
+		args    []string
+		via     []string
+	}{
+		{command: `runuser - a -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser a -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser -l a -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser - postgres -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `taskset -c0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
+		{command: `taskset --cpu-list=0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
+		{command: `taskset -ac 0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
+		{command: `unshare --fork --pid --mount-proc kill 1`, name: "kill", args: []string{"1"}, via: []string{"unshare"}},
+		{command: `flock --timeout 5 /tmp/x -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"flock"}},
+		{command: `flock --conflict-exit-code 3 /tmp/x kill 1`, name: "kill", args: []string{"1"}, via: []string{"flock"}},
+		{command: `strace --output /tmp/x -U name --trace=process kill 1`, name: "kill", args: []string{"1"}, via: []string{"strace"}},
+		{command: `systemd-run --on-active 5 --on-calendar '*-*-* 00:00' --machine m kill 1`, name: "kill", args: []string{"1"}, via: []string{"systemd-run"}},
+		{command: `setpriv --ruid 1 --euid 2 --rgid 3 --egid 4 kill 1`, name: "kill", args: []string{"1"}, via: []string{"setpriv"}},
+		{command: `chrt -T 1 -P 2 -D 3 -d 0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"chrt"}},
+		{command: `script -E never -O /tmp/out -B /tmp/io -T /tmp/time -I /tmp/in -m advanced -o 1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"script"}},
+		{command: `su --session-command 'kill 1' u1`, name: "kill", args: []string{"1"}, via: []string{"su"}},
+		{command: `tmux new -F '#{session_name}' -d -e X=1 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"tmux"}},
+		{command: `env -S 'echo a' b`, name: "echo", args: []string{"a", "b"}, via: []string{"env"}},
+		{command: `parallel kill ::: 1 ::: 2`, name: "kill", args: []string{"1", "2"}, via: []string{"parallel"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := 0
+			for _, call := range calls {
+				if call.Name == tt.name {
+					found++
+					if !reflect.DeepEqual(call.Args, tt.args) || !reflect.DeepEqual(call.Via, tt.via) {
+						t.Errorf("call = %#v, want %s %q via %q", call, tt.name, tt.args, tt.via)
+					}
+				}
+			}
+			if found != 1 {
+				t.Fatalf("found %d calls named %q: %#v", found, tt.name, calls)
+			}
+		})
+	}
+}
+
+func TestNonCommandMarkersAndArguments(t *testing.T) {
+	for _, command := range []string{`trap - SIG`, `parallel ::: 1`, `bash --command 'kill 1'`, `su u1 extra -c 'kill 1'`} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		if command == `trap - SIG` {
+			if len(calls) != 1 || calls[0].Name != "trap" {
+				t.Errorf("trap - expanded as a script: %#v", calls)
+			}
+			continue
+		}
+		if command == `parallel ::: 1` {
+			if len(calls) != 1 || calls[0].Name != "parallel" {
+				t.Errorf("empty parallel command expanded: %#v", calls)
+			}
+			continue
+		}
+		for _, call := range calls {
+			if call.Name == "kill" {
+				t.Errorf("%q unexpectedly expanded as a kill command: %#v", command, calls)
+			}
+		}
+	}
+}
+
+func TestWrapperArgumentScansAlwaysAdvance(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{command: `runuser -`},
+		{command: `runuser - a -c 'kill 1'`, want: true},
+		{command: `sudo runuser - a`},
+		{command: `script -`},
+		{command: `script - x`},
+		{command: `runuser - postgres -c 'kill 1'`, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				found = found || call.Name == "kill"
+			}
+			if found != tt.want {
+				t.Errorf("kill found = %t, want %t; calls = %#v", found, tt.want, calls)
+			}
+		})
+	}
+}
+
 func TestUnknownShellScriptInput(t *testing.T) {
 	for _, command := range []string{
 		`echo 'kill 1' | bash`,
@@ -497,6 +601,10 @@ func TestUnknownShellScriptInput(t *testing.T) {
 	calls, err = Calls(`bash -n <<< 'kill 1'`)
 	if err != nil || len(calls) != 1 || calls[0].ScriptInput {
 		t.Errorf("bash -n here-string = %#v, %v", calls, err)
+	}
+	calls, err = Calls(`echo k | bash --noexec`)
+	if err != nil || len(calls) != 2 || !calls[1].ScriptInput {
+		t.Errorf("unsupported --noexec option marked incorrectly: %#v, %v", calls, err)
 	}
 	for _, command := range []string{`echo k | bash -n`, `bash -n <(echo k)`} {
 		calls, err = Calls(command)
@@ -599,7 +707,7 @@ func TestNestedScriptDepthLimit(t *testing.T) {
 	}
 
 	script = "kill 1"
-	for range 64 {
+	for range 5000 {
 		script = "find . -exec " + script + ` \;`
 	}
 	calls, err = Calls(script)
