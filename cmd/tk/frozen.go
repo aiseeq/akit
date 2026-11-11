@@ -39,7 +39,7 @@ func readFrozenFiles() (frozenFiles, error) {
 	if err != nil {
 		return frozenFiles{}, fmt.Errorf("determine frozen list home: %w", err)
 	}
-	files := frozenFiles{home: home, listPath: filepath.Join(home, ".config", "queue", "frozen"), namesPath: filepath.Join(home, ".config", "cl", "names.tsv")}
+	files := frozenFiles{home: home, listPath: frozen.Path(home), namesPath: filepath.Join(home, ".config", "cl", "names.tsv")}
 	list, err := os.ReadFile(files.listPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return frozenFiles{}, fmt.Errorf("read frozen list: %w", err)
@@ -63,16 +63,16 @@ func (f frozenFiles) refusal(project, who string, errout io.Writer) (string, err
 		return "", fmt.Errorf("resolve project %s: %w", project, err)
 	}
 	list := frozen.NewList(f.list, home)
-	reason, isFrozen, err := list.Frozen(project, func(number int, lineErr error) {
+	result, err := list.Frozen(project, func(number int, line string, lineErr error) {
 		fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, number, lineErr)
 	})
 	if err != nil {
 		return "", err
 	}
-	if isFrozen {
-		if reason == "incomplete line in the frozen list" {
-			fmt.Fprintf(errout, "tk: %s: incomplete line, the project stays frozen\n", path)
-		}
+	if result.Incomplete {
+		fmt.Fprintf(errout, "tk: %s:%d: incomplete line, the project stays frozen\n", path, result.Line)
+	}
+	if result.Frozen {
 		master, err := f.masterName(want, errout)
 		if err != nil {
 			return "", err
@@ -80,7 +80,7 @@ func (f frozenFiles) refusal(project, who string, errout io.Writer) (string, err
 		if liveMaster(home, who, master, errout) {
 			return "", nil
 		}
-		return fmt.Sprintf("project %s is frozen (%s): only its running %s takes work here", filepath.Base(want), reason, master), nil
+		return fmt.Sprintf("project %s is frozen (%s): only its running %s takes work here", filepath.Base(want), result.Reason, master), nil
 	}
 	return "", nil
 }

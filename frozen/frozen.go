@@ -6,29 +6,61 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aiseeq/akit/queuegate"
 )
 
+// fields is the number of tab-separated fields: path, who, date, why.
 const fields = 4
+
+// Result describes one project's entry in a frozen-project list.
+type Result struct {
+	Reason     string
+	Frozen     bool
+	Incomplete bool
+	Line       int
+}
 
 // List is a frozen-project list and the home directory used to expand ~/ paths.
 type List struct {
-	content, home string
+	content, home, path string
+}
+
+// Path returns the frozen-project list path for home.
+func Path(home string) string {
+	return filepath.Join(home, ".config", "queue", "frozen")
+}
+
+// Read loads the frozen-project list for home. A missing list is an empty list.
+func Read(home string) (List, error) {
+	path := Path(home)
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		err = nil
+	}
+	if err != nil {
+		return List{}, fmt.Errorf("read frozen list: %w", err)
+	}
+	return List{content: string(content), home: home, path: path}, nil
 }
 
 // NewList creates a list from content already read by the caller.
 func NewList(content, home string) List {
-	return List{content: content, home: home}
+	return List{content: content, home: home, path: Path(home)}
 }
 
-// Frozen reports why project is frozen. A malformed matching row still freezes
-// it; onLineError receives malformed paths that do not identify a project.
-func (l List) Frozen(project string, onLineError func(number int, err error)) (reason string, frozen bool, err error) {
+// Path returns the path of the list held by l.
+func (l List) Path() string { return l.path }
+
+// Frozen reports whether project is listed. onLineError receives invalid rows
+// with their one-based line number and trimmed text; missing paths are ignored.
+func (l List) Frozen(project string, onLineError func(number int, line string, err error)) (Result, error) {
 	if l.content == "" {
-		return "", false, nil
+		return Result{}, nil
 	}
-	want, err := filepath.EvalSymlinks(project)
+	want, err := queuegate.Resolve(project)
 	if err != nil {
-		return "", false, fmt.Errorf("resolve project %s: %w", project, err)
+		return Result{}, fmt.Errorf("resolve project %s: %w", project, err)
 	}
 	for number, raw := range strings.Split(l.content, "\n") {
 		line := strings.TrimSpace(raw)
@@ -42,37 +74,50 @@ func (l List) Frozen(project string, onLineError func(number int, err error)) (r
 		matches, lineErr := ListedPathIs(listed, l.home, want)
 		if lineErr != nil {
 			if onLineError != nil {
-				onLineError(number+1, lineErr)
+				onLineError(number+1, line, lineErr)
 			}
 			continue
 		}
 		if !matches {
 			continue
 		}
-		reason = LineReason(line)
-		if reason == "" {
-			return "incomplete line in the frozen list", true, nil
+		result := Result{Reason: LineReason(line), Frozen: true, Line: number + 1}
+		if result.Reason == "" {
+			result.Reason = "incomplete line in the frozen list"
+			result.Incomplete = true
 		}
-		return reason, true, nil
+		return result, nil
 	}
-	return "", false, nil
+	return Result{}, nil
 }
 
-// Frozen reads ~/.config/queue/frozen and checks project against it.
+// Frozen reads the default list and checks project. Invalid rows are returned as
+// errors with the list path and line number instead of being silently discarded.
 func Frozen(project string) (reason string, frozen bool, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", false, fmt.Errorf("determine frozen list home: %w", err)
 	}
-	path := filepath.Join(home, ".config", "queue", "frozen")
-	content, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
+	list, err := Read(home)
 	if err != nil {
-		return "", false, fmt.Errorf("read frozen list: %w", err)
+		return "", false, err
 	}
-	return NewList(string(content), home).Frozen(project, nil)
+	var rowErr error
+	result, err := list.Frozen(project, func(number int, line string, lineErr error) {
+		if rowErr == nil {
+			rowErr = fmt.Errorf("%s:%d: line %q: %w", list.Path(), number, line, lineErr)
+		}
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if rowErr != nil {
+		return "", false, rowErr
+	}
+	if result.Incomplete {
+		return result.Reason, true, nil
+	}
+	return result.Reason, result.Frozen, nil
 }
 
 // LineNames reports whether a frozen-list line names want.
@@ -119,11 +164,7 @@ func ResolveListedPath(listed, home string) (string, error) {
 	if !filepath.IsAbs(listed) {
 		return "", errors.New("path must be absolute or start with ~/")
 	}
-	abs, err := filepath.Abs(listed)
-	if err != nil {
-		return "", fmt.Errorf("resolve listed path %s: %w", listed, err)
-	}
-	return filepath.EvalSymlinks(abs)
+	return queuegate.Resolve(listed)
 }
 
 // ListedPathIs compares a listed path with a resolved project. Missing paths
