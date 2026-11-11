@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"errors"
+	"fmt"
 
 	"os"
 	"path/filepath"
@@ -23,6 +24,11 @@ const version = 1
 const maxEntry = 256 << 20
 const maxCache = 512 << 20
 const maxAge = 30 * 24 * time.Hour
+const liveAge = 10 * time.Minute
+const privateMode = 0700
+const otherPermissions = 0077
+
+var errBadPrefilter = errors.New("bad lines require filtered reading")
 
 type key struct {
 	Path               string
@@ -62,7 +68,7 @@ type Cache struct {
 // New uses the standard user cache directory. An unavailable cache is harmless.
 func New() *Cache {
 	root, err := os.UserCacheDir()
-	if err != nil {
+	if err != nil { //nolint:silent-error-handling // Без каталога кэша потребитель читает оригинал.
 		return &Cache{}
 	}
 	root = filepath.Join(root, "akit", "transcript-replies")
@@ -73,7 +79,7 @@ func New() *Cache {
 func fileKey(path string) (key, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return key{}, err
+		return key{}, fmt.Errorf("stat transcript: %w", err)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.Mode().IsRegular() {
@@ -89,7 +95,7 @@ func (c *Cache) path(path string) string {
 
 func privateDir(path string) bool {
 	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+	if err != nil || !info.IsDir() || info.Mode().Perm()&otherPermissions != 0 {
 		return false
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
@@ -107,28 +113,55 @@ func (c *Cache) open(path string, rejectBad bool) (*os.File, *gob.Decoder, heade
 	// Stat alone does not check that the transcript can still be opened.
 	original, err := os.Open(path)
 	if err != nil {
-		return nil, nil, header{}, err
+		return nil, nil, header{}, fmt.Errorf("open transcript: %w", err)
 	}
 	original.Close()
 	info, err := os.Lstat(c.path(path))
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&otherPermissions != 0 {
 		return nil, nil, header{}, errors.New("unsafe cache entry")
 	}
 	f, err := os.Open(c.path(path))
 	if err != nil {
-		return nil, nil, header{}, err
+		return nil, nil, header{}, fmt.Errorf("open cache entry: %w", err)
 	}
 	dec := gob.NewDecoder(f)
 	var h header
-	if err = dec.Decode(&h); err != nil || h.Key != k || h.Length < 0 || h.Length > maxEntry || (rejectBad && h.Bad != 0) {
+	if err = dec.Decode(&h); err != nil || h.Key != k || h.Length < 0 || h.Length > maxEntry {
 		f.Close()
 		return nil, nil, header{}, errors.New("cache miss")
+	}
+	if rejectBad && h.Bad > 0 {
+		f.Close()
+		return nil, nil, header{}, errBadPrefilter
 	}
 	return f, dec, h, nil
 }
 
+func recentlyModified(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && time.Since(info.ModTime()) < liveAge
+}
+
+// writable checks actual creation, including ACLs and a read-only filesystem.
+func (c *Cache) writable() bool {
+	if c == nil || c.dir == "" || os.MkdirAll(c.dir, privateMode) != nil || !privateDir(c.dir) {
+		return false
+	}
+	f, err := os.CreateTemp(c.dir, ".probe-*")
+	if err != nil { //nolint:error-masked-as-false-bool // Ошибка пробы означает отказ от кэша и чтение оригинала.
+		return false
+	}
+	name := f.Name()
+	closeErr := f.Close()
+	removeErr := os.Remove(name)
+	return closeErr == nil && removeErr == nil
+}
+
 // Valid checks the header only, for estimating admission cost.
 func (c *Cache) Valid(path string, rejectBad bool) bool {
+	if rejectBad && recentlyModified(path) {
+		return false
+	}
 	f, _, _, err := c.open(path, rejectBad)
 	if err != nil {
 		return false
@@ -137,24 +170,50 @@ func (c *Cache) Valid(path string, rejectBad bool) bool {
 	return true
 }
 
+func (c *Cache) load(path string, rejectBad bool) ([]transcript.Event, transcript.Meta, error) {
+	f, dec, h, err := c.open(path, rejectBad)
+	if err != nil {
+		return nil, transcript.Meta{}, err
+	}
+	defer f.Close()
+	var payload []byte
+	if err := dec.Decode(&payload); err != nil {
+		return nil, transcript.Meta{}, fmt.Errorf("decode cache: %w", err)
+	}
+	if int64(len(payload)) != h.Length || sha256.Sum256(payload) != h.Sum {
+		return nil, transcript.Meta{}, errors.New("invalid cache checksum")
+	}
+	var rec record
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&rec); err != nil {
+		return nil, transcript.Meta{}, fmt.Errorf("decode cache payload: %w", err)
+	}
+	if rec.Bad != h.Bad {
+		return nil, transcript.Meta{}, errors.New("invalid cache diagnostics")
+	}
+	if k, err := fileKey(path); err != nil || k != h.Key {
+		return nil, transcript.Meta{}, errors.New("transcript changed")
+	}
+	return unpack(rec), meta(rec), nil
+}
+
 // Events returns a complete record, or usable=false for bad lines with a query-dependent prefilter.
 // Read errors are returned so the caller can use its original reader and its diagnostics.
 func (c *Cache) Events(path string, rejectBad bool) ([]transcript.Event, transcript.Meta, bool, error) {
-	if f, dec, h, err := c.open(path, rejectBad); err == nil {
-		var payload []byte
-		err = dec.Decode(&payload)
-		f.Close()
-		if err == nil && int64(len(payload)) == h.Length && sha256.Sum256(payload) == h.Sum {
-			var rec record
-			if gob.NewDecoder(bytes.NewReader(payload)).Decode(&rec) == nil && rec.Bad == h.Bad {
-				if k, err := fileKey(path); err == nil && k == h.Key {
-					return unpack(rec), meta(rec), true, nil
-				}
-			}
-		}
+	if rejectBad && recentlyModified(path) {
+		return nil, transcript.Meta{}, false, nil
+	}
+	events, cachedMeta, loadErr := c.load(path, rejectBad)
+	if errors.Is(loadErr, errBadPrefilter) {
+		return nil, transcript.Meta{}, false, nil
+	}
+	if loadErr == nil {
+		return events, cachedMeta, true, nil
 	}
 	if c == nil {
 		return nil, transcript.Meta{}, false, errors.New("cache unavailable")
+	}
+	if rejectBad && !c.writable() {
+		return nil, transcript.Meta{}, false, nil
 	}
 	c.Misses.Add(1)
 	before, err := fileKey(path)
@@ -216,11 +275,11 @@ func (c *Cache) save(k key, rec record) {
 	if gob.NewEncoder(&payload).Encode(rec) != nil || payload.Len() > maxEntry {
 		return
 	}
-	if os.MkdirAll(c.dir, 0700) != nil || !privateDir(c.dir) {
+	if os.MkdirAll(c.dir, privateMode) != nil || !privateDir(c.dir) {
 		return
 	}
 	f, err := os.CreateTemp(c.dir, ".entry-*")
-	if err != nil {
+	if err != nil { //nolint:silent-error-handling // Запись кэша необязательна для ответа.
 		return
 	}
 	defer os.Remove(f.Name())
@@ -234,9 +293,12 @@ func (c *Cache) save(k key, rec record) {
 		err = closeErr
 	}
 	if err == nil {
-		_ = os.Rename(f.Name(), c.path(k.Path))
+		_ = os.Rename(f.Name(), c.path(k.Path)) //nolint:ignored-error // Следующий вызов перечитает оригинал.
 	}
 }
+
+// cleanupInfo позволяет проверить ошибку метаданных исчезнувшей записи.
+var cleanupInfo = func(entry os.DirEntry) (os.FileInfo, error) { return entry.Info() }
 
 // Cleanup occasionally removes obsolete entries, other code versions and excess bytes.
 func (c *Cache) Cleanup(now time.Time) {
@@ -244,7 +306,7 @@ func (c *Cache) Cleanup(now time.Time) {
 		return
 	}
 	dirs, err := os.ReadDir(c.root)
-	if err != nil {
+	if err != nil { //nolint:silent-error-handling // Уборка кэша повторится позже.
 		return
 	}
 	type item struct {
@@ -260,39 +322,39 @@ func (c *Cache) Cleanup(now time.Time) {
 			continue
 		}
 		if path != c.dir {
-			_ = os.RemoveAll(path)
+			_ = os.RemoveAll(path) //nolint:ignored-error // Недоступный каталог останется до следующей уборки.
 			continue
 		}
 		entries, err := os.ReadDir(path)
-		if err != nil {
+		if err != nil { //nolint:silent-error-handling // Недоступный каталог пропускается при уборке.
 			continue
 		}
 		for _, entry := range entries {
 			p := filepath.Join(path, entry.Name())
-			info, err := entry.Info()
-			if err != nil {
-				return
+			info, err := cleanupInfo(entry)
+			if err != nil { //nolint:fallback-return,silent-error-handling // Исчезнувшая запись не мешает уборке остальных.
+				continue
 			}
 			if !info.Mode().IsRegular() {
 				continue
 			}
 			if now.Sub(info.ModTime()) > maxAge {
-				_ = os.Remove(p)
+				_ = os.Remove(p) //nolint:ignored-error // Неудалённая запись останется до следующей уборки.
 				continue
 			}
 			f, err := os.Open(p)
-			if err != nil {
+			if err != nil { //nolint:silent-error-handling // Исчезнувшая или недоступная запись пропускается.
 				continue
 			}
 			var h header
 			err = gob.NewDecoder(f).Decode(&h)
 			f.Close()
-			if err != nil {
-				_ = os.Remove(p)
+			if err != nil { //nolint:silent-error-handling // Битую запись можно удалить и восстановить из оригинала.
+				_ = os.Remove(p) //nolint:ignored-error // Неудалённая запись останется до следующей уборки.
 				continue
 			}
 			if _, err := os.Stat(h.Key.Path); errors.Is(err, os.ErrNotExist) {
-				_ = os.Remove(p)
+				_ = os.Remove(p) //nolint:ignored-error // Неудалённая запись останется до следующей уборки.
 				continue
 			}
 			total += info.Size()

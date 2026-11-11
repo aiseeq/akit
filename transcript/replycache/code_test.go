@@ -5,32 +5,62 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 )
 
+const listFormat = `{{if .Module}}{{.Module.Path}}\t{{.Module.Version}}\t{{.Module.Dir}}\t` +
+	`{{with .Module.Replace}}{{.Path}}\t{{.Version}}\t{{.Dir}}{{else}}\t\t{{end}}\t{{.Dir}}\t` +
+	`{{join .GoFiles ","}},{{join .CgoFiles ","}},{{join .IgnoredGoFiles ","}},{{join .EmbedFiles ","}},` +
+	`{{join .CFiles ","}},{{join .HFiles ","}},{{join .SFiles ","}},{{join .SysoFiles ","}}{{end}}`
+
 func sourcesHash(t *testing.T) string {
 	t.Helper()
+	format := strings.ReplaceAll(listFormat, `\t`, "\t")
+	out, err := exec.Command("go", "list", "-deps", "-f", format, ".").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gomod, err := exec.Command("go", "env", "GOMOD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(strings.TrimSpace(string(gomod)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	hash := sha256.New()
-	for _, dir := range []string{"..", "."} {
-		files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	fmt.Fprintf(hash, "go.mod %d\n", len(data))
+	hash.Write(data)
+	for line := range strings.SplitSeq(strings.TrimRight(string(out), "\n"), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 8 {
+			t.Fatalf("go list: %q", line)
+		}
+		mod, version, root, replacement, replacementVersion, replacementDir, dir, files := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7]
+		if replacement != "" && replacementVersion != "" || replacement == "" && version != "" {
+			fmt.Fprintf(hash, "module %s@%s => %s@%s\n", mod, version, replacement, replacementVersion)
+			continue
+		}
+		if replacement != "" {
+			root = replacementDir
+		}
+		rel, err := filepath.Rel(root, dir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sort.Strings(files)
-		for _, path := range files {
-			name := filepath.Base(path)
-			if strings.HasSuffix(name, "_test.go") || dir == "." && name == "code.go" {
+		for name := range strings.SplitSeq(files, ",") {
+			if name == "" || strings.HasSuffix(name, "_test.go") || mod == "github.com/aiseeq/akit" && rel == filepath.Join("transcript", "replycache") && name == "code.go" {
 				continue
 			}
-			data, err := os.ReadFile(path)
+			data, err := os.ReadFile(filepath.Join(dir, name))
 			if err != nil {
 				t.Fatal(err)
 			}
-			fmt.Fprintf(hash, "%s/%s %d\n", dir, name, len(data))
+			fmt.Fprintf(hash, "file %s/%s %d\n", mod, filepath.ToSlash(filepath.Join(rel, name)), len(data))
 			hash.Write(data)
 		}
 	}

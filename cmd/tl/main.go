@@ -362,6 +362,22 @@ func writeMasked(w io.Writer, text string) error {
 	return err
 }
 
+var newReplyCache = replycache.New
+
+func replyCacheFor(opts options, now time.Time) *replycache.Cache {
+	if !opts.all || opts.usage || opts.waitProg != "" || opts.raw != "" || len(opts.roles) == 0 {
+		return nil
+	}
+	for role := range opts.roles {
+		if role != transcript.User && role != transcript.Ask {
+			return nil
+		}
+	}
+	cache := newReplyCache()
+	cache.Cleanup(now)
+	return cache
+}
+
 func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 	if opts.version {
 		fmt.Fprintln(stdout, buildversion.String("tl"))
@@ -395,19 +411,7 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		opts.waitCache = newWaitCache(stderr)
 		opts.waitCache.cleanup(e.now)
 	}
-	if opts.all && !opts.usage && opts.waitProg == "" && opts.raw == "" && len(opts.roles) > 0 &&
-		len(opts.roles) <= 2 && (opts.roles[transcript.User] || opts.roles[transcript.Ask]) {
-		onlyReplies := true
-		for role := range opts.roles {
-			if role != transcript.User && role != transcript.Ask {
-				onlyReplies = false
-			}
-		}
-		if onlyReplies {
-			opts.replyCache = replycache.New()
-			opts.replyCache.Cleanup(e.now)
-		}
-	}
+	opts.replyCache = replyCacheFor(opts, e.now)
 	f, err := newFilter(opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)

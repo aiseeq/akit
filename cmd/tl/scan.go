@@ -676,25 +676,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 			before = append(before, ev)
 		}
 	}
-	var meta transcript.Meta
-	var err error
-	used := false
-	if f.opts.replyCache != nil {
-		var events []transcript.Event
-		events, meta, used, err = f.opts.replyCache.Events(src.Path, len(f.needles) > 0)
-		if err != nil {
-			// The original reader supplies the same partial results and diagnostics as without the cache.
-			used = false
-		}
-		if used {
-			for _, ev := range events {
-				consume(ev)
-			}
-		}
-	}
-	if !used {
-		meta, err = transcript.ReadWithTools(src.Path, keep, consume)
-	}
+	meta, err := f.readEvents(src.Path, keep, consume)
 	var waits []time.Duration
 	if wt != nil {
 		waits = wt.waits
@@ -703,6 +685,20 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		return out, waits, meta, fmt.Errorf("read %s: %w", src.Path, err)
 	}
 	return out, waits, meta, nil
+}
+
+// readEvents сохраняет прежний читатель для промахов и его диагностику ошибок.
+func (f *filter) readEvents(path string, keep func([]byte, transcript.ToolNames) bool, consume func(transcript.Event)) (transcript.Meta, error) {
+	if f.opts.replyCache != nil {
+		events, meta, used, err := f.opts.replyCache.Events(path, len(f.needles) > 0)
+		if err == nil && used {
+			for i := range events {
+				consume(events[i])
+			}
+			return meta, nil
+		}
+	}
+	return transcript.ReadWithTools(path, keep, consume)
 }
 
 // waitEvents: through the cache when there is one; a codex rollout without it is
@@ -751,7 +747,8 @@ func scan(sources []source, opts options) (result, error) {
 	}
 	close(jobs)
 	wg.Wait()
-	for i, item := range results {
+	for i := range results {
+		item := &results[i]
 		src := sources[i]
 		res.hits = append(res.hits, item.hits...)
 		res.waits = append(res.waits, item.waits...)
