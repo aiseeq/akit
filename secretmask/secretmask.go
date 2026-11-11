@@ -64,8 +64,8 @@
 //     is a directory and stays; MYSQL_PWD and other *pwd names are passwords.
 //   - Under auth and credentials names a plain
 //     word or path stays: same-origin, oauth2, basic, /etc/app/creds.json. A
-//     token-like value (see isPlainWord: mixed case and digits, a lower to
-//     upper turn, 12 mixed alphanumeric characters, or 16 low-vowel letters) is
+//     token-like value (see isPlainWord: mixed case and digits, long mixed
+//     alphanumeric runs, or 16 low-vowel letters) is
 //     hidden; ordinary CamelCase words and long vowel-rich words stay visible.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
@@ -1302,7 +1302,8 @@ func valueVisibleFor(name, value string) bool {
 	return authName(n) && (isPlainPath(value) || ordinaryCamelWord(value) || ordinaryAuthWord(value))
 }
 
-// isPlainPath: /a/b, ~/a or ./a, every part a plain word: /Bx4Tq9Wz is no path.
+// isPlainPath accepts components that are plain words or ordinary CamelCase
+// names; token-shaped components such as Bx4Tq9Wz are rejected.
 func isPlainPath(value string) bool {
 	var rest string
 	switch {
@@ -1328,45 +1329,59 @@ func isPlainPathPart(value string) bool {
 		return true
 	}
 	dot := strings.LastIndexByte(value, '.')
-	if dot <= 0 || dot == len(value)-1 || len(value)-dot > 11 {
+	if dot <= 0 || len(value)-dot > 11 {
 		return false
 	}
 	extension, stem := value[dot+1:], value[:dot]
-	return allLower(extension) && isPlainWord(extension) && (isPlainWord(stem) || ordinaryCamelWord(stem))
+	return allLower(extension) && (isPlainWord(stem) || ordinaryCamelWord(stem))
 }
 
-// ordinaryCamelWord accepts letter-only names made of pronounceable words and
-// short abbreviations: a lowercase prefix (nodeProfile), capitalized words of
-// three letters or more (two as the first: MyApp) and runs of 2-5 capitals
-// (HTTPClient). Letter-only base64 splits into one- and two-letter pieces, long
-// capital runs or pieces without vowels (YWJjZGVm: YW Jj ZG Vm) and fails.
+// ordinaryCamelWord accepts CamelCase parts with common letter sequences and
+// at most one short abbreviation. Random letter runs tend to have uncommon
+// consonant pairs or too few vowels; base64 tends to split into fragments.
 func ordinaryCamelWord(value string) bool {
-	if len(value) < 2 || !lettersOnly(value) {
-		return false
+	if ordinaryCamelWithDigitSuffix(value) {
+		return true
 	}
 	parts := camelParts(value)
 	if !validCamelParts(parts) {
 		return false
 	}
-	if singleLetterInitialism(parts) {
+	if len(parts) > 1 && singleLetterInitialism(parts) {
 		return true
 	}
+	return ordinaryCamelParts(parts)
+}
+
+func ordinaryCamelWithDigitSuffix(value string) bool {
+	if len(value) < 2 || value[len(value)-1] < '0' || value[len(value)-1] > '9' {
+		return false
+	}
+	base := value[:len(value)-1]
+	return len(camelParts(base)) > 1 && ordinaryCamelWord(base)
+}
+
+func ordinaryCamelParts(parts []string) bool {
 	acronyms := 0
 	for i, part := range parts {
-		if !ordinaryCamelPart(part, i, &acronyms) {
+		if isOrdinarySingleLetterPart(part, parts, i) {
+			continue
+		}
+		if allUpper(part) {
+			acronyms++
+		}
+		if !ordinaryCamelPart(part, i) || allUpper(part) && acronyms > 1 {
 			return false
 		}
 	}
 	return true
 }
 
-func lettersOnly(value string) bool {
-	for i := range len(value) {
-		if !isLetter(value[i]) {
-			return false
-		}
+func isOrdinarySingleLetterPart(part string, parts []string, index int) bool {
+	if index == 0 && len(part) == 1 && isLower(part[0]) && len(parts) > 1 && allUpper(parts[1]) {
+		return true
 	}
-	return value != ""
+	return index == len(parts)-1 && len(part) == 1 && isUpper(part[0]) && index > 0
 }
 
 func camelParts(value string) []string {
@@ -1385,37 +1400,36 @@ func camelParts(value string) []string {
 }
 
 func validCamelParts(parts []string) bool {
-	if len(parts) < 2 || len(parts) > 3 {
+	if len(parts) > 3 {
 		return false
 	}
 	return len(parts) != 3 || allLower(parts[0]) && capitalizedPart(parts[1]) && capitalizedPart(parts[2])
 }
 
 func singleLetterInitialism(parts []string) bool {
-	return len(parts) == 2 && len(parts[0]) == 1 && isUpper(parts[0][0]) && len(parts[1]) >= 4 && capitalizedPart(parts[1]) && pronounceable(parts[1])
+	return len(parts[0]) == 1 && isUpper(parts[0][0]) && len(parts[1]) >= 4 && pronounceable(parts[1])
 }
 
-func ordinaryCamelPart(part string, index int, acronyms *int) bool {
-	if index == 0 && allLower(part) {
-		return len(part) >= 2 && len(part) <= 8 && (pronounceable(part) || len(part) == 3 && !strings.ContainsAny(part, "aeiouy"))
+func ordinaryCamelPart(part string, index int) bool {
+	if allLower(part) {
+		return len(part) >= 2 && len(part) <= 8 && (pronounceable(part) || len(part) == 3 && consonantCount(part) == 3)
 	}
 	if allUpper(part) {
-		*acronyms++
-		return len(part) >= 3 && len(part) <= 5 && *acronyms == 1
+		return len(part) >= 3 && len(part) <= 5
 	}
 	minLength := 3
 	if index == 0 {
 		minLength = 2
 	}
-	return len(part) >= minLength && capitalizedPart(part) && pronounceable(part)
+	return len(part) >= minLength && pronounceable(part)
 }
 
 func capitalizedPart(part string) bool {
 	return len(part) >= 2 && isUpper(part[0]) && allLower(part[1:])
 }
 
-// pronounceable requires vowels and limits consonant clusters; this admits
-// natural spellings such as Postgre and Script while rejecting random pieces.
+// pronounceable requires a balanced vowel share, common consonant pairs and
+// short consonant clusters, separating ordinary spelling from random strings.
 func pronounceable(part string) bool {
 	vowels, consonants := 0, 0
 	for _, c := range strings.ToLower(part) {
@@ -1429,7 +1443,35 @@ func pronounceable(part string) bool {
 			return false
 		}
 	}
-	return vowels*5 >= len(part) || len(part) <= 6 && vowels > 0
+	return (vowels >= (len(part)+3)/4 || len(part) <= 6 && vowels > 0) && commonConsonantPairs(part)
+}
+
+func consonantCount(part string) int {
+	count := 0
+	for _, c := range strings.ToLower(part) {
+		if !strings.ContainsRune("aeiouy", c) {
+			count++
+		}
+	}
+	return count
+}
+
+// commonConsonantPairs checks spelling patterns within consonant runs. The
+// pairs describe common English sound combinations rather than known words.
+func commonConsonantPairs(part string) bool {
+	const pairs = " bb cc dd ff gg ll mm nn pp rr ss tt zz bl br ch ck cl cr ct dg dr ds fl fr gh gl gn gr hn ks ld lf lk lm ln lp ls lt mb mn mp nc nd ng nk nt ph pl pr pt rb rd rg rk rl rm rn rp rs rt rv sc sh sk sl sm sn sp st sw tg th tr ts tw tz wh wr ws "
+	var previous rune
+	for _, c := range strings.ToLower(part) {
+		if strings.ContainsRune("aeiouy", c) {
+			previous = 0
+			continue
+		}
+		if previous != 0 && !strings.Contains(pairs, " "+string(previous)+string(c)+" ") {
+			return false
+		}
+		previous = c
+	}
+	return true
 }
 
 func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
@@ -1463,19 +1505,23 @@ func isPlainWord(value string) bool {
 }
 
 func ordinaryAuthWord(value string) bool {
-	upper, lower, _, ok := wordClasses(value)
-	if !ok || !isPlainWord(value) {
+	upper, lower, _, _ := wordClasses(value)
+	if !isPlainWord(value) {
 		return false
 	}
-	if upper && lower && !(isUpper(value[0]) && allLower(value[1:])) {
+	if upper && lower {
 		return false
 	}
 	for _, run := range strings.FieldsFunc(strings.ToLower(value), func(r rune) bool { return !(r >= 'a' && r <= 'z') }) {
-		if len(run) >= 8 && !pronounceable(run) {
+		if len(run) >= 8 && !ordinaryAuthRun(run) {
 			return false
 		}
 	}
 	return true
+}
+
+func ordinaryAuthRun(run string) bool {
+	return pronounceable(run) || longVowelRichWord(run) || len(run) < 16 && isHex(run)
 }
 
 func plainWordLength(value string) bool {
