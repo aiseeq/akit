@@ -1383,6 +1383,22 @@ func TestDetectorBoundaries(t *testing.T) {
 	if u.waitPairGoal(shellcmd.Call{Name: "sleep", Args: []string{"1"}, Offset: -1}, "sleep 1; test -f /synthetic/ready") != "" {
 		t.Error("sleep without an offset was accepted")
 	}
+	for _, tc := range []struct {
+		cmd    string
+		name   string
+		marker string
+		want   bool
+	}{
+		{"f=$(echo ~/.claude/projects/a.jsonl); grep apple $f", "f", "grep", true},
+		{"grep apple $f; f=$(echo ~/.claude/projects/a.jsonl)", "f", "grep", false},
+		{"for f in ~/.claude/projects/*.jsonl; do grep apple $f; done", "f", "grep", true},
+		{"for f in ~/.claude/projects/*.jsonl; do grep apple $f; done", "f", "for", false},
+		{"for f in ~/.claude/projects/*.jsonl; do echo $f; done; grep apple $f", "f", "grep", false},
+	} {
+		if got := u.transcriptVariableSource(tc.cmd, tc.name, strings.Index(tc.cmd, tc.marker)); got != tc.want {
+			t.Errorf("transcript variable %q: got %v, want %v", tc.cmd, got, tc.want)
+		}
+	}
 	quoted := "bash -c $'  while test -f /synthetic/ready; do sleep 1; done'"
 	if u.waitLoopGoal(quoted, strings.Index(quoted, "sleep")) == "" {
 		t.Error("quoted loop with leading whitespace was not detected")
@@ -1410,6 +1426,8 @@ func TestDetectorPrecision(t *testing.T) {
 		{"grep 'red>blue green' ~/.claude/projects/s.jsonl", "user-word", false},
 
 		{"rg -c wfor ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep -c make ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'graft --flag' ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep -l graft ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep 'graft review job42' ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep 'graft is useful' ~/.claude/projects/s.jsonl", "user-word", true},
@@ -1450,12 +1468,19 @@ func TestDetectorPrecision(t *testing.T) {
 		{"if echo hi; then echo ok; fi; sleep 1; curl -fsS https://example.test", "wfor", true},
 		{"curl -fsS https://example.test; sleep 1; curl -fsS https://example.test", "wfor", false},
 		{"curl -fsS https://example.test/a; sleep 1; curl -fsS https://example.test/b", "wfor", false},
+		{"curl -s https://example.test/a; sleep 1; curl -sf https://example.test/a && echo done", "wfor", true},
+		{"curl -s https://example.test/a; sleep 1; curl -sf https://example.test/a || echo retry", "wfor", true},
+		{"curl -s https://example.test/a; sleep 1; if curl -sf https://example.test/a; then echo done; fi", "wfor", true},
+		{"curl -s https://example.test/a; sleep 1; curl -sf https://example.test/b && echo done", "wfor", false},
+		{"curl -s https://example.test/a; sleep 1; if curl -sf https://example.test/b; then echo done; fi", "wfor", false},
 		{"sleep 1; printf update; test -f /synthetic/ready", "wfor", true},
 		{"sleep 1; touch /synthetic/other", "wfor", false},
 		{"sleep 0; test -f /synthetic/ready", "wfor", false},
 		{"sleep 2; curl -fsS https://example.test", "wfor", true},
 		{"while :; do s=$(curl -fsS https://example.test); case \"$s\" in *done*) break;; esac; sleep 15; done", "wfor", true},
 		{"for x in a b c; do sleep 1; ls /synthetic/data; case $x in c) break;; esac; done", "wfor", false},
+		{"while :; do case $(curl -s https://example.test/a) in done) break;; esac; sleep 1; done", "wfor", true},
+		{"while :; do case $s in done) break;; esac; s=$(curl -s https://example.test/a); sleep 1; done", "wfor", false},
 		{"while true; do if grep -q DONE /synthetic/log; then exit 1; fi; sleep 5; done", "wfor", false},
 		{"while true; do if test -f /synthetic/ready; then return 1; fi; sleep 5; done", "wfor", false},
 		{"bash -c 'key='\"$key\"'; while :; do s=$(curl -fsS https://example.test); case \"$s\" in *done*) break;; esac; sleep 15; done'", "wfor", true},
@@ -1504,6 +1529,8 @@ func TestDetectorPrecision(t *testing.T) {
 		{"rg 'experiment|trial' ~/.claude/improve/runs/report.md", "prior", true},
 		{"rg 'проблема' ~/.claude/improve/runs/report.md", "prior", false},
 		{"rg 'пробы' ~/.claude/improve/runs/report.md", "prior", true},
+		{"rg 'пробовал' ~/.claude/improve/runs/report.md", "prior", true},
+		{"rg 'пробуют' ~/.claude/improve/runs/report.md", "prior", true},
 		{"rg choice ~/.claude/improve/runs/raw/registry.txt", "prior", true},
 		{"grep --include='*.json' choice ~/.claude/improve/runs", "prior", false},
 		{"grep --include '*.json' choice ~/.claude/improve/runs", "prior", false},

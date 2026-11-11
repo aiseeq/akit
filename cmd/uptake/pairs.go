@@ -1021,7 +1021,7 @@ func priorReport(p string) bool {
 	return strings.HasPrefix(base, "report.") || strings.HasPrefix(base, "report-")
 }
 
-var historicalWords = regexp.MustCompile(`(?i)(решени|проб(?:а|ы|у|е|н|овал|уют)|попыт|эксперимент|decision|trial|attempt|experiment)`)
+var historicalWords = regexp.MustCompile(`(?i)(решени|проб(?:а|ы|у|е|н|овал)|попыт|эксперимент|decision|trial|attempt|experiment)`)
 
 func historicalSearch(pattern string) bool { return historicalWords.MatchString(pattern) }
 
@@ -1255,11 +1255,64 @@ func (u *run) waitPairGoal(c shellcmd.Call, cmd string) string {
 		slog.Debug("parse preceding request", "error", err)
 	}
 	for _, check := range calls {
-		if check.Name == "curl" && u.waitGoal(check.Raw) == goal && slices.ContainsFunc(previous, func(c shellcmd.Call) bool { return c.Name == "curl" }) {
+		if check.Name != "curl" || u.waitGoal(check.Raw) != goal {
+			continue
+		}
+		for i := len(previous) - 1; i >= 0; i-- {
+			if previous[i].Name != "curl" {
+				continue
+			}
+			endpoint := curlEndpoint(check)
+			if endpoint != "" && endpoint == curlEndpoint(previous[i]) && conditionalCall(after, check.Offset) {
+				break
+			}
 			return ""
 		}
 	}
 	return goal
+}
+
+// curlEndpoint returns a literal URL, avoiding option values when comparing requests.
+func curlEndpoint(c shellcmd.Call) string {
+	for _, arg := range c.Args {
+		if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
+			return arg
+		}
+	}
+	return ""
+}
+
+// conditionalCall reports whether a call controls an if or a boolean chain.
+func conditionalCall(cmd string, offset int) bool {
+	if offset < 0 {
+		return false
+	}
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		slog.Debug("parse conditional check", "error", err)
+		return false
+	}
+	found := false
+	contains := func(n syntax.Node) bool {
+		return n != nil && int(n.Pos().Offset()) <= offset && offset < int(n.End().Offset())
+	}
+	syntax.Walk(file, func(n syntax.Node) bool {
+		if n == nil || found {
+			return false
+		}
+		switch node := n.(type) {
+		case *syntax.IfClause:
+			for _, condition := range node.Cond {
+				found = found || contains(condition)
+			}
+		case *syntax.BinaryCmd:
+			if node.Op == syntax.AndStmt || node.Op == syntax.OrStmt {
+				found = found || contains(node.X)
+			}
+		}
+		return true
+	})
+	return found
 }
 
 // embeddedWaitGoal handles a literal shell-script fragment joined to a dynamic word.
