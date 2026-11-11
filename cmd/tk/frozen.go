@@ -63,11 +63,15 @@ func (f frozenFiles) refusal(project, who string, errout io.Writer) (string, err
 		return "", fmt.Errorf("resolve project %s: %w", project, err)
 	}
 	list := frozen.NewList(f.list, home, path)
-	result, err := list.Frozen(project, func(number int, line string, lineErr error) {
-		fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, number, lineErr)
-	})
+	result, err := list.Frozen(project)
 	if err != nil {
 		return "", err
+	}
+	for _, problem := range result.Problems {
+		if result.Frozen && problem.Number >= result.Line {
+			continue
+		}
+		fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, problem.Number, problem.Err)
 	}
 	if result.IncompleteLine != 0 {
 		fmt.Fprintf(errout, "tk: %s:%d: incomplete line, the project stays frozen\n", path, result.IncompleteLine)

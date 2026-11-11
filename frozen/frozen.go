@@ -13,11 +13,21 @@ import (
 // fields is the number of tab-separated fields: path, who, date, why.
 const fields = 4
 
-// Result describes one project's entry in a frozen-project list.
+// LineError describes a malformed list row. Err is a path resolution problem;
+// a listed path that does not exist is ignored and does not produce a LineError.
+type LineError struct {
+	Number int
+	Text   string
+	Err    error
+}
+
+// Result describes a project's frozen status and any malformed rows in the list.
 type Result struct {
 	Reason         string
 	Frozen         bool
+	Line           int
 	IncompleteLine int
+	Problems       []LineError
 }
 
 // List is a frozen-project list and the home directory used to expand ~/ paths.
@@ -51,16 +61,14 @@ func NewList(content, home, path string) List {
 // Path returns the path of the list held by l.
 func (l List) Path() string { return l.path }
 
-// Frozen reports whether project is listed. onLineError receives invalid rows
-// with their one-based line number and trimmed text; missing paths are ignored.
-func (l List) Frozen(project string, onLineError func(number int, line string, err error)) (Result, error) {
-	if l.content == "" {
-		return Result{}, nil
-	}
+// Frozen resolves project and checks every row. Invalid rows are returned in
+// Problems, while a valid matching row still sets Frozen and Reason.
+func (l List) Frozen(project string) (Result, error) {
 	want, err := queuegate.Resolve(project)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve project %s: %w", project, err)
 	}
+	var result Result
 	for number, raw := range strings.Split(l.content, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -72,46 +80,39 @@ func (l List) Frozen(project string, onLineError func(number int, line string, e
 		}
 		matches, lineErr := ListedPathIs(listed, l.home, want)
 		if lineErr != nil {
-			if onLineError != nil {
-				onLineError(number+1, line, lineErr)
-			}
+			result.Problems = append(result.Problems, LineError{Number: number + 1, Text: line, Err: lineErr})
 			continue
 		}
-		if !matches {
+		if !matches || result.Frozen {
 			continue
 		}
-		result := Result{Reason: LineReason(line), Frozen: true}
-		if result.Reason == "" {
-			result.Reason = "incomplete line in the frozen list"
-			result.IncompleteLine = number + 1
-		}
-		return result, nil
+		result = frozenResult(line, number+1, result.Problems)
 	}
-	return Result{}, nil
+	return result, nil
 }
 
-// Frozen reads the default list and checks project. Invalid rows are returned as
-// errors with the list path and line number. A matching row still returns frozen
-// true alongside such an error, so callers must honor the frozen result.
-func Frozen(project string) (reason string, frozen bool, err error) {
+func frozenResult(line string, number int, problems []LineError) Result {
+	result := Result{Reason: LineReason(line), Frozen: true, Line: number, Problems: problems}
+	if result.Reason == "" {
+		result.Reason = "incomplete line in the frozen list"
+		result.IncompleteLine = number
+	}
+	return result
+}
+
+// Frozen reads the default list and checks project. Err is fatal (HOME, list
+// reading, or project resolution); malformed rows are reported in Result.Problems
+// and do not prevent a matching row from being returned as frozen.
+func Frozen(project string) (Result, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", false, fmt.Errorf("determine frozen list home: %w", err)
+		return Result{}, fmt.Errorf("determine frozen list home: %w", err)
 	}
 	list, err := Read(home)
 	if err != nil {
-		return "", false, err
+		return Result{}, err
 	}
-	var rowErr error
-	result, err := list.Frozen(project, func(number int, line string, lineErr error) {
-		if rowErr == nil {
-			rowErr = fmt.Errorf("%s:%d: line %q: %w", list.Path(), number, line, lineErr)
-		}
-	})
-	if err != nil {
-		return "", false, err
-	}
-	return result.Reason, result.Frozen, rowErr
+	return list.Frozen(project)
 }
 
 // LineNames reports whether a frozen-list line names want.

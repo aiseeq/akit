@@ -3,7 +3,7 @@ package frozen
 import (
 	"os"
 	"path/filepath"
-	"strings"
+
 	"testing"
 )
 
@@ -31,7 +31,7 @@ func TestFrozenListCases(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := NewList(tc.row+"\n", home, Path(home)).Frozen(project, nil)
+			result, err := NewList(tc.row+"\n", home, Path(home)).Frozen(project)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -56,9 +56,9 @@ func TestFrozenReadsDefaultList(t *testing.T) {
 	if err := os.WriteFile(listPath, []byte(project+"\towner\tdate\twhy\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reason, isFrozen, err := Frozen(project)
-	if err != nil || !isFrozen || reason != "why" {
-		t.Fatalf("Frozen() = (%q, %v, %v)", reason, isFrozen, err)
+	result, err := Frozen(project)
+	if err != nil || !result.Frozen || result.Reason != "why" {
+		t.Fatalf("Frozen() = (%+v, %v)", result, err)
 	}
 	list, err := Read(home)
 	if err != nil {
@@ -79,7 +79,7 @@ func TestNewListKeepsSuppliedPath(t *testing.T) {
 
 func TestFrozenIncompleteResultHasLine(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
-	result, err := NewList("# comment\n"+project+"\n", home, Path(home)).Frozen(project, nil)
+	result, err := NewList("# comment\n"+project+"\n", home, Path(home)).Frozen(project)
 	if err != nil || !result.Frozen || result.IncompleteLine != 2 {
 		t.Fatalf("Frozen() = (%+v, %v), want incomplete line 2", result, err)
 	}
@@ -107,41 +107,31 @@ func TestFrozenRelativeProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chdir(oldWD)
-	reason, isFrozen, err := Frozen("sample")
-	if err != nil || !isFrozen || reason != "reason" {
-		t.Fatalf("Frozen() = (%q, %v, %v)", reason, isFrozen, err)
+	result, err := Frozen("sample")
+	if err != nil || !result.Frozen || result.Reason != "reason" {
+		t.Fatalf("Frozen() = (%+v, %v)", result, err)
 	}
 }
 
-func TestFrozenRowCallback(t *testing.T) {
+func TestFrozenCollectsLineProblems(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
 	invalid := "relative\towner\tdate\treason"
 	missing := filepath.Join(home, "not-there") + "\towner\tdate\treason"
-	var gotNumber int
-	var gotLine string
-	calls := 0
-	result, err := NewList(invalid+"\n"+missing+"\n", home, Path(home)).Frozen(project, func(number int, line string, err error) {
-		calls++
-		gotNumber, gotLine = number, line
-		if err == nil {
-			t.Error("callback error is nil")
-		}
-	})
+	result, err := NewList(invalid+"\n"+missing+"\n", home, Path(home)).Frozen(project)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Frozen || calls != 1 || gotNumber != 1 || gotLine != invalid {
-		t.Fatalf("result=%+v callback=(%d,%d,%q), want no freeze and one callback at line 1", result, calls, gotNumber, gotLine)
+	if result.Frozen || len(result.Problems) != 1 || result.Problems[0].Number != 1 || result.Problems[0].Text != invalid || result.Problems[0].Err == nil {
+		t.Fatalf("result=%+v, want one problem on line 1", result)
 	}
 }
 
-func TestFrozenCommentWithValidPathDoesNotCallBack(t *testing.T) {
+func TestFrozenCommentWithValidPathDoesNotReportProblem(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
 	line := "#" + project + "\towner\tdate\treason"
-	calls := 0
-	result, err := NewList(line+"\n", home, Path(home)).Frozen(project, func(int, string, error) { calls++ })
-	if err != nil || result.Frozen || calls != 0 {
-		t.Fatalf("result=%+v callbacks=%d err=%v", result, calls, err)
+	result, err := NewList(line+"\n", home, Path(home)).Frozen(project)
+	if err != nil || result.Frozen || len(result.Problems) != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
 
@@ -151,11 +141,11 @@ func TestFrozenPathWithSpacesAndHomeShortcut(t *testing.T) {
 	if err := os.Mkdir(withSpaces, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	result, err := NewList(withSpaces+"\towner\tdate\tspace reason\n", home, Path(home)).Frozen(withSpaces, nil)
+	result, err := NewList(withSpaces+"\towner\tdate\tspace reason\n", home, Path(home)).Frozen(withSpaces)
 	if err != nil || !result.Frozen || result.Reason != "space reason" {
 		t.Fatalf("space path result=%+v err=%v", result, err)
 	}
-	result, err = NewList("~\towner\tdate\thome reason\n", home, Path(home)).Frozen(home, nil)
+	result, err = NewList("~\towner\tdate\thome reason\n", home, Path(home)).Frozen(home)
 	if err != nil || !result.Frozen || result.Reason != "home reason" {
 		t.Fatalf("home path result=%+v err=%v", result, err)
 	}
@@ -174,18 +164,30 @@ func TestFrozenReportsInvalidRows(t *testing.T) {
 	if err := os.WriteFile(listPath, []byte("relative\towner\tdate\treason\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := Frozen(project)
-	if err == nil || !strings.Contains(err.Error(), listPath+":1:") {
-		t.Fatalf("Frozen() error = %v, want list path and line", err)
+	result, err := Frozen(project)
+	if err != nil || result.Frozen || len(result.Problems) != 1 || result.Problems[0].Number != 1 || result.Problems[0].Text != "relative\towner\tdate\treason" {
+		t.Fatalf("Frozen() = (%+v, %v), want one invalid row and no match", result, err)
 	}
 }
 
 func TestFrozenMissingListIsEmpty(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
-	reason, isFrozen, err := Frozen(project)
-	if err != nil || isFrozen || reason != "" {
-		t.Fatalf("Frozen() = (%q, %v, %v), want empty result", reason, isFrozen, err)
+	result, err := Frozen(project)
+	if err != nil || result.Frozen || result.Reason != "" || len(result.Problems) != 0 {
+		t.Fatalf("Frozen() = (%+v, %v), want empty result", result, err)
+	}
+}
+
+func TestFrozenReadFailureIsFatal(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(Path(home), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Frozen(project)
+	if err == nil || result.Frozen || len(result.Problems) != 0 {
+		t.Fatalf("Frozen() = (%+v, %v), want fatal list read error", result, err)
 	}
 }
 
@@ -204,18 +206,18 @@ func TestFrozenSurfacesBadRowsWithoutLosingMatch(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(listPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	content := "work/typo\towner\tdate\tbad path\n~/work/sample\towner\tdate\twhy\n"
+	content := "work/typo\towner\tdate\tbad path\n~/work/sample\towner\tdate\twhy\nrelative-again\towner\tdate\tbad path\n"
 	if err := os.WriteFile(listPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	reason, frozen, err := Frozen(project)
-	if !frozen || reason != "why" || err == nil || !strings.Contains(err.Error(), listPath+":1:") {
-		t.Errorf("Frozen(sample) = (%q, %v, %v), want frozen with line 1 reported", reason, frozen, err)
+	result, err := Frozen(project)
+	if err != nil || !result.Frozen || result.Reason != "why" || result.Line != 2 || len(result.Problems) != 2 || result.Problems[0].Number != 1 || result.Problems[1].Number != 3 {
+		t.Errorf("Frozen(sample) = (%+v, %v), want match at line 2 and problems at 1 and 3", result, err)
 	}
-	reason, frozen, err = Frozen(other)
-	if frozen || reason != "" || err == nil || !strings.Contains(err.Error(), listPath+":1:") {
-		t.Errorf("Frozen(other) = (%q, %v, %v), want not frozen with line 1 reported", reason, frozen, err)
+	result, err = Frozen(other)
+	if err != nil || result.Frozen || len(result.Problems) != 2 || result.Problems[0].Number != 1 || result.Problems[1].Number != 3 {
+		t.Errorf("Frozen(other) = (%+v, %v), want no match and both problems", result, err)
 	}
 }
 
@@ -241,9 +243,9 @@ func TestFrozenKeepsMatchAfterSymlinkLoop(t *testing.T) {
 	if err := os.WriteFile(listPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reason, frozen, err := Frozen(project)
-	if !frozen || reason != "why" || err == nil || !strings.Contains(err.Error(), listPath+":1:") {
-		t.Fatalf("Frozen(sample) = (%q, %v, %v), want frozen with loop error", reason, frozen, err)
+	result, err := Frozen(project)
+	if err != nil || !result.Frozen || result.Reason != "why" || len(result.Problems) != 1 || result.Problems[0].Number != 1 {
+		t.Fatalf("Frozen(sample) = (%+v, %v), want frozen with loop problem", result, err)
 	}
 }
 
