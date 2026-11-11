@@ -284,3 +284,73 @@ func TestRemovedRulesArchive(t *testing.T) {
 		t.Errorf("absent archive:\n%s", empty.String())
 	}
 }
+
+// Много совпадений: показываются реплики с наибольшим числом слов темы, а не только последние, — старый ответ,
+// где сошлись все слова, не вытесняется свежими с одним словом; порядок — как в журнале.
+func TestRepliesRankedByTopicWords(t *testing.T) {
+	home := t.TempDir()
+	var b strings.Builder
+	b.WriteString("### 2026-10-01T10:00:00Z · ~/x\nстарый ответ: ключ alpha и beta отдельно\n")
+	for i := range 10 {
+		fmt.Fprintf(&b, "### 2026-10-%02dT10:00:00Z · ~/x\nсвежая реплика %d про beta\n", 10+i, i)
+	}
+	write(t, filepath.Join(home, ".claude/user-replies.md"), b.String())
+	got := sectionOf(runPrior(t, home, "alpha", "beta"), "реплики")[1:] // первая строка — пометка о daydigest
+	if len(got) != 1+2*maxReplies || !strings.HasPrefix(got[0], "(совпадений 11, ниже 8 с наибольшим числом слов темы") {
+		t.Fatalf("реплики:\n%s", strings.Join(got, "\n"))
+	}
+	if got[2] != "  старый ответ: ключ alpha и beta отдельно" || got[len(got)-1] != "  свежая реплика 9 про beta" {
+		t.Errorf("не тот отбор или порядок:\n%s", strings.Join(got, "\n"))
+	}
+	if strings.Contains(strings.Join(got, "\n"), "свежая реплика 2 ") {
+		t.Errorf("при равенстве слов вошла не самая свежая:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+// У реплики из сессии claude — ссылка tl на строку транскрипта: время журнала без хвостовых нулей сверяется с
+// миллисекундами транскрипта; нет транскрипта или строки — сказано явно.
+func TestRepliesLinkTranscriptLine(t *testing.T) {
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".claude/projects/-p/1234abcd-0000-0000-0000-000000000001.jsonl"),
+		`{"type":"user","timestamp":"2026-10-20T09:16:22.400Z","message":{"role":"user","content":"раньше"}}`+"\n"+
+			`{"type":"user","timestamp":"2026-10-20T09:16:22.440Z","message":{"role":"user","content":"ответ про ключслово"}}`+"\n")
+	write(t, filepath.Join(home, ".claude/user-replies.md"),
+		"### 2026-10-20T09:16:22.44Z (20.10 11:16 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001\n  ответ про ключслово\n"+
+			"### 2026-10-20T09:17:00Z (20.10 11:17 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001\n  ещё ключслово\n"+
+			"### 2026-10-21T09:00:00Z (21.10 11:00 CEST) · ~/x · claude 99999999-0000-0000-0000-000000000001\n  снова ключслово\n"+
+			"### 2026-10-22T09:00:00Z (22.10 11:00 CEST) · ~/x · codex 1234abcd-0000-0000-0000-000000000001\n  в codex ключслово\n"+
+			"### 2026-10-23T09:00:00Z (23.10 11:00 CEST) · ~/x · claude 5555aaaa-0000-0000-0000-000000000001\n  двойной ключслово\n")
+	for _, p := range []string{"-p", "-q"} {
+		write(t, filepath.Join(home, ".claude/projects", p, "5555aaaa-0000-0000-0000-000000000001.jsonl"),
+			`{"type":"user","timestamp":"2026-10-23T09:00:00.000Z"}`+"\n")
+	}
+	got := sectionOf(runPrior(t, home, "ключслово"), "реплики")
+	want := []string{
+		"### 2026-10-20T09:16:22.44Z (20.10 11:16 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001 · tl 1234abcd:2",
+		"### 2026-10-20T09:17:00Z (20.10 11:17 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001 · tl: строки с 2026-10-20T09:17:00.000Z в транскрипте нет",
+		"### 2026-10-21T09:00:00Z (21.10 11:00 CEST) · ~/x · claude 99999999-0000-0000-0000-000000000001 · tl: транскриптов сессии 99999999 найдено 0",
+		"### 2026-10-22T09:00:00Z (22.10 11:00 CEST) · ~/x · codex 1234abcd-0000-0000-0000-000000000001",
+		"### 2026-10-23T09:00:00Z (23.10 11:00 CEST) · ~/x · claude 5555aaaa-0000-0000-0000-000000000001 · tl: транскриптов сессии 5555aaaa найдено 2",
+	}
+	var heads []string
+	for _, l := range got {
+		if strings.HasPrefix(l, "### ") {
+			heads = append(heads, l)
+		}
+	}
+	if strings.Join(heads, "\n") != strings.Join(want, "\n") {
+		t.Errorf("заголовки:\n%s", strings.Join(heads, "\n"))
+	}
+}
+
+// Строка транскрипта длиннее буфера чтения считается одной строкой.
+func TestLineWithLongLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.jsonl")
+	write(t, path, strings.Repeat("x", 3<<20)+"\nкороткая\n"+strings.Repeat("y", 2<<20)+"needle\n")
+	if n, err := lineWith(path, []byte("needle")); err != nil || n != 3 {
+		t.Errorf("needle: %d %v", n, err)
+	}
+	if n, err := lineWith(path, []byte("нет такого")); err != nil || n != 0 {
+		t.Errorf("нет такого: %d %v", n, err)
+	}
+}

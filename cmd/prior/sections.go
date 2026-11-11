@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -290,8 +294,17 @@ func firstMatch(q query, path string) (string, error) {
 	return "", nil
 }
 
-// maxReplies — сколько последних совпавших реплик показывать.
+// maxReplies — сколько совпавших реплик показывать.
 const maxReplies = 8
+
+// replyHeader — заголовок блока журнала реплик: время UTC и сессия claude, по ним находится строка транскрипта.
+var replyHeader = regexp.MustCompile(`^### (\S+Z) .* · claude ([0-9a-f]{8})[0-9a-f-]*$`)
+
+// replyHit — совпавшая строка журнала реплик и сколько слов темы в ней нашлось.
+type replyHit struct {
+	head, ctx, line string
+	words           int
+}
 
 // replies — реплики пользователя из журнала, который дописывает программа разбора daydigest: заголовок блока, «в ответ на»
 // (последняя фраза агента) и сама строка.
@@ -304,7 +317,7 @@ func replies(w io.Writer, q query, s paths) {
 		fmt.Fprintf(w, "(нет журнала: %v)\n", err)
 		return
 	}
-	var hits []string
+	var hits []replyHit
 	head, ctx := "", ""
 	for l := range strings.Lines(string(data)) {
 		l = strings.TrimSuffix(l, "\n")
@@ -318,21 +331,115 @@ func replies(w io.Writer, q query, s paths) {
 		if !q.any.MatchString(l) {
 			continue
 		}
-		hit := head + "\n  "
-		if ctx != "" && ctx != l {
-			hit += cut(ctx) + "\n  "
+		hit := replyHit{head: head, line: l}
+		if ctx != l {
+			hit.ctx = ctx
 		}
-		hits = append(hits, hit+cut(l))
+		for _, re := range q.words {
+			if re.MatchString(l) {
+				hit.words++
+			}
+		}
+		hits = append(hits, hit)
 	}
 	if len(hits) == 0 {
 		fmt.Fprintln(w, "(нет)")
 		return
 	}
 	if len(hits) > maxReplies {
-		fmt.Fprintf(w, "(совпадений %d, ниже последние %d: старый ответ мог не войти - сузьте слова)\n", len(hits), maxReplies)
-		hits = hits[len(hits)-maxReplies:]
+		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы, при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
+		hits = topReplies(hits)
 	}
 	for _, h := range hits {
-		fmt.Fprintln(w, h)
+		ref, err := replyRef(s.projects, h.head)
+		if err != nil {
+			ref = " · tl: " + err.Error()
+		}
+		fmt.Fprintln(w, h.head+ref)
+		if h.ctx != "" {
+			fmt.Fprintln(w, "  "+cut(h.ctx))
+		}
+		fmt.Fprintln(w, "  "+cut(h.line))
+	}
+}
+
+// topReplies — maxReplies реплик с наибольшим числом слов темы (при равенстве - поздние), в порядке журнала: последние
+// по времени вытесняли старый ответ, где слов темы больше.
+func topReplies(hits []replyHit) []replyHit {
+	order := make([]int, len(hits))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		if hits[order[a]].words != hits[order[b]].words {
+			return hits[order[a]].words > hits[order[b]].words
+		}
+		return order[a] > order[b]
+	})
+	keep := order[:maxReplies]
+	sort.Ints(keep)
+	top := make([]replyHit, 0, maxReplies)
+	for _, i := range keep {
+		top = append(top, hits[i])
+	}
+	return top
+}
+
+// replyRef — ссылка tl на запись пользователя в транскрипте claude: журнал хранит время и сессию, номер строки
+// ищется по времени записи. Не нашлась - ошибка, её печатают вместо ссылки, а не молчат.
+func replyRef(projects, head string) (string, error) {
+	m := replyHeader.FindStringSubmatch(head)
+	if m == nil {
+		return "", nil
+	}
+	files, err := filepath.Glob(filepath.Join(projects, "*", m[2]+"*.jsonl"))
+	if err != nil {
+		return "", fmt.Errorf("поиск транскрипта сессии %s: %w", m[2], err)
+	}
+	if len(files) != 1 {
+		return "", fmt.Errorf("транскриптов сессии %s найдено %d", m[2], len(files))
+	}
+	at, err := time.Parse(time.RFC3339Nano, m[1])
+	if err != nil {
+		return "", fmt.Errorf("время %s не разобралось: %w", m[1], err)
+	}
+	// Журнал печатает время без хвостовых нулей (.44Z), транскрипт claude — с миллисекундами тремя знаками (.440Z).
+	stamp := at.UTC().Format("2006-01-02T15:04:05.000Z")
+	n, err := lineWith(files[0], []byte(`"timestamp":"`+stamp+`"`))
+	if err != nil {
+		return "", err
+	}
+	if n == 0 {
+		return "", fmt.Errorf("строки с %s в транскрипте нет", stamp)
+	}
+	return fmt.Sprintf(" · tl %s:%d", m[2], n), nil
+}
+
+// lineWith — номер первой строки файла (с 1), где есть needle; 0 - нет такой. Читает потоком: строки транскрипта
+// бывают в мегабайты.
+func lineWith(path string, needle []byte) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("транскрипт не открылся: %w", err)
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 1<<20)
+	var line []byte
+	for n := 1; ; {
+		chunk, err := r.ReadSlice('\n')
+		line = append(line, chunk...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if bytes.Contains(line, needle) {
+			return n, nil
+		}
+		if err == io.EOF {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("транскрипт не прочитался: %w", err)
+		}
+		line, n = line[:0], n+1
 	}
 }

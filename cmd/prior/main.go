@@ -214,7 +214,7 @@ func run(q query, home string, w io.Writer) {
 		fmt.Fprintln(b, "(нет)")
 	}
 	runs(r.section("отчёты ночного разбора (~/.claude/improve/runs), свежие сверху, до 3 за день, затем заполнение до 10 файлов"), q, s.runs)
-	replies(r.section("реплики пользователя (~/.claude/user-replies.md), последние 8"), q, s)
+	replies(r.section("реплики пользователя (~/.claude/user-replies.md), до 8"), q, s)
 	r.print(w)
 }
 
