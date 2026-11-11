@@ -206,7 +206,6 @@ func TestPipedHeredocScripts(t *testing.T) {
 		{name: "expanded body", command: "cat <<E | bash\nkill 1\nE", via: []string{"pipe", "bash"}, line: 2},
 		{name: "body substitutions", command: "cat <<E | bash\n$(kill 1)\nE", via: []string{"pipe", "bash"}, line: 2},
 		{name: "tabs to sh stdin", command: "cat - <<-E | sh -s\n\tkill 1\n\tE", via: []string{"pipe", "sh"}, line: 2},
-		{name: "escaped tab notation to sh stdin", command: "cat <<-E | sh -s\n\\tkill 1\n\\tE", via: []string{"pipe", "sh"}, line: 2},
 		{name: "sudo shell", command: "cat - <<E | sudo bash\nkill 1\nE", via: []string{"pipe", "sudo", "bash"}, line: 2},
 		{name: "tee to bash", command: "tee /tmp/x <<E | bash\nkill 1\nE", via: []string{"pipe", "bash"}, line: 2},
 		{name: "timeout shell", command: "cat <<E | timeout 5 bash\nkill 1\nE", via: []string{"pipe", "timeout", "bash"}, line: 2},
@@ -431,7 +430,8 @@ E`, "kill", []string{"1"}, []string{"bash"}},
 		{`taskset -ac 0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
 		{`unshare --fork --pid --mount-proc kill 1`, "kill", []string{"1"}, []string{"unshare"}},
 		{`tmux new -d -e X=1 'kill 1'`, "kill", []string{"1"}, []string{"tmux"}},
-		{`script /dev/null -c 'kill 1'`, "kill", []string{"1"}, []string{"script"}},
+		{`tmux -L /tmp/socket new -d -e X=1 'kill 1'`, "kill", []string{"1"}, []string{"tmux"}},
+		{`script -E always /dev/null -c 'kill 1'`, "kill", []string{"1"}, []string{"script"}},
 		{`flock --timeout 5 /tmp/x -c 'kill 1'`, "kill", []string{"1"}, []string{"flock"}},
 		{`flock --conflict-exit-code 3 /tmp/x kill 1`, "kill", []string{"1"}, []string{"flock"}},
 		{`strace --output /dev/null kill 1`, "kill", []string{"1"}, []string{"strace"}},
@@ -514,6 +514,190 @@ func TestWrapperOptionAndProgressRegressions(t *testing.T) {
 				t.Fatalf("found %d calls named %q: %#v", found, tt.name, calls)
 			}
 		})
+	}
+}
+
+func TestBaselineFallbackAndWrapperOptions(t *testing.T) {
+	tests := []struct {
+		command string
+		name    string
+		args    []string
+		via     []string
+	}{
+		{command: `env -uSSH_AUTH_SOCK kill -1`, name: "kill", args: []string{"-1"}, via: []string{"env"}},
+		{command: `env -CSOMEDIR kill -1`, name: "kill", args: []string{"-1"}, via: []string{"env"}},
+		{command: `env -a x kill -1`, name: "kill", args: []string{"-1"}, via: []string{"env"}},
+		{command: `env --argv0 x kill -1`, name: "kill", args: []string{"-1"}, via: []string{"env"}},
+		{command: `tmux new-window bash -c 'kill -1'`, name: "kill", args: []string{"-1"}, via: []string{"tmux", "bash", "-c"}},
+		{command: `tmux neww bash -c 'kill -1'`, name: "kill", args: []string{"-1"}, via: []string{"tmux", "bash", "-c"}},
+		{command: `tmux split-window -h bash -c 'kill -1'`, name: "kill", args: []string{"-1"}, via: []string{"tmux", "bash", "-c"}},
+		{command: `parallel bash -c 'kill -1'`, name: "kill", args: []string{"-1"}, via: []string{"parallel", "bash", "-c"}},
+		{command: `parallel bash -c 'kill -1' < list`, name: "kill", args: []string{"-1"}, via: []string{"parallel", "bash", "-c"}},
+		{command: `parallel -a list bash -c 'kill -1'`, name: "kill", args: []string{"-1"}, via: []string{"parallel", "bash", "-c"}},
+		{command: `runuser -u u1 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"runuser"}},
+		{command: `taskset -a -c 0 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"taskset"}},
+		{command: `taskset 1 pkill -c -u u1`, name: "pkill", args: []string{"-c", "-u", "u1"}, via: []string{"taskset"}},
+		{command: `su -s/bin/csh -c 'kill -1' u1`, name: "kill", args: []string{"-1"}, via: []string{"su"}},
+		{command: `tmux new -d kill -1`, name: "kill", args: []string{"-1"}, via: []string{"tmux"}},
+		{command: `sudo -R /x kill -1`, name: "kill", args: []string{"-1"}, via: []string{"sudo"}},
+		{command: `unshare -l binfmt_misc kill -1`, name: "kill", args: []string{"-1"}, via: []string{"unshare"}},
+		{command: `unshare --map-users 0:1000:1 --map-groups 0:1000:1 --monotonic 5 --boottime 5 --setgroups deny kill -1`, name: "kill", args: []string{"-1"}, via: []string{"unshare"}},
+		{command: `setpriv --ptracer any --landlock-access fs --landlock-rule path-beneath:read:/x --seccomp-filter /tmp/x kill -1`, name: "kill", args: []string{"-1"}, via: []string{"setpriv"}},
+		{command: `watch --equexit 3 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"watch"}},
+		{command: `strace --argv0 x --secontext kill -1`, name: "kill", args: []string{"-1"}, via: []string{"strace"}},
+		{command: `strace --user u1 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"strace"}},
+		{command: `strace --string-limit 100 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"strace"}},
+		{command: `strace --env A=1 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"strace"}},
+		{command: `strace --columns 40 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"strace"}},
+		{command: `strace --const-print-style raw kill -1`, name: "kill", args: []string{"-1"}, via: []string{"strace"}},
+		{command: `systemd-run --root-directory /x kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `systemd-run --json pretty kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `systemd-run --job-mode replace kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `systemd-run --path-property PathExists=/x kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `systemd-run --socket-property ListenStream=1 kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `systemd-run --on-clock-change --on-timezone-change kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `parallel --colsep , kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel -C , kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel -I {} kill {} ::: 1`, name: "kill", args: []string{"{}", "1"}, via: []string{"parallel"}},
+		{command: `parallel -E end kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --retries 3 kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --tmpdir /x kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --header : kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --termseq INT kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --sshdelay 1 kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --group-by 1 kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --basefile x kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --compress-program gzip kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --limit 1 kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `parallel --memsuspend 1G kill ::: 1`, name: "kill", args: []string{"1"}, via: []string{"parallel"}},
+		{command: `systemd-run --on-clock-change --on-timezone-change kill -1`, name: "kill", args: []string{"-1"}, via: []string{"systemd-run"}},
+		{command: `su --session-command='kill -1' u1`, name: "kill", args: []string{"-1"}, via: []string{"su"}},
+		{command: `su -gcdrom -c 'kill -1' u1`, name: "kill", args: []string{"-1"}, via: []string{"su"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := 0
+			for _, call := range calls {
+				if call.Name == tt.name {
+					found++
+					if !reflect.DeepEqual(call.Args, tt.args) || !reflect.DeepEqual(call.Via, tt.via) {
+						t.Errorf("call = %#v, want %s %q via %q", call, tt.name, tt.args, tt.via)
+					}
+				}
+			}
+			if found != 1 {
+				t.Fatalf("found %d calls named %q: %#v", found, tt.name, calls)
+			}
+		})
+	}
+}
+
+func TestShellInputWrapperBoundaries(t *testing.T) {
+	for _, command := range []string{
+		`echo x | sudo -u u1 -s`,
+		`echo x | sudo -u u1 -i`,
+	} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		found := false
+		for _, call := range calls {
+			found = found || call.ScriptInput
+		}
+		if !found {
+			t.Errorf("%q: expected ScriptInput, calls=%#v", command, calls)
+		}
+	}
+	for _, command := range []string{
+		`echo x | sudo grep -i x`,
+		`echo x | sudo sort -s`,
+		`echo x | sudo --preserve-env=PATH grep x`,
+		`echo x | sudo -u postgres psql -d db -i`,
+		`echo x | runuser -u u1 cat`,
+		`echo x | su -c ls u1`,
+	} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		for _, call := range calls {
+			if call.ScriptInput {
+				t.Errorf("%q: unexpected ScriptInput: %#v", command, call)
+			}
+		}
+		if strings.Contains(command, "runuser -u") {
+			foundCat := false
+			for _, call := range calls {
+				foundCat = foundCat || call.Name == "cat"
+			}
+			if !foundCat {
+				t.Errorf("%q: cat call was lost: %#v", command, calls)
+			}
+		}
+	}
+	for _, tt := range []struct {
+		command string
+		via     []string
+	}{
+		{"sudo -s <<E\nkill -1\nE", []string{"sudo", "bash"}},
+		{"su u1 <<E\nkill -1\nE", []string{"su", "sh"}},
+	} {
+		calls, err := Calls(tt.command)
+		if err != nil {
+			t.Fatalf("%q: %v", tt.command, err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == "kill" {
+				found = true
+				if !reflect.DeepEqual(call.Via, tt.via) {
+					t.Errorf("%q: kill Via = %q, want %q", tt.command, call.Via, tt.via)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%q: no kill call: %#v", tt.command, calls)
+		}
+	}
+}
+
+func TestPipedCatOptions(t *testing.T) {
+	for _, command := range []string{"cat -v <<E | bash\nkill -1\nE", "cat -vu <<E | bash\nkill -1\nE"} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		found := false
+		for _, call := range calls {
+			found = found || call.Name == "kill"
+		}
+		if !found {
+			t.Errorf("%q: expected kill in unchanged cat output: %#v", command, calls)
+		}
+	}
+	calls, err := Calls("cat -n <<E | bash\nkill -1\nE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "kill" {
+			t.Errorf("numbered cat output parsed as original script: %#v", calls)
+		}
+	}
+}
+
+func TestParseNestedDepthLimitDirectly(t *testing.T) {
+	calls := []Call(nil)
+	via := make([]string, maxNestedScripts+1)
+	err := parseNested("", nil, 0, via, false, false, map[string]string{}, &calls)
+	var nested *NestedError
+	if !errors.As(err, &nested) {
+		t.Fatalf("parseNested over limit returned %v", err)
 	}
 }
 
