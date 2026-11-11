@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,60 @@ func TestWfor(t *testing.T) {
 	}
 }
 
+func TestRunningUsesOnlyWrapperSessionMarkers(t *testing.T) {
+	for _, tc := range []struct{ text, want string }{
+		{`{"chunk_id":"a","wall_time_seconds":30,"session_id":5,"output":"worker session 5 done"}`, "5"},
+		{`{"status":"fulfilled","value":{"chunk_id":"a","wall_time_seconds":1,"session_id":6,"output":""}}`, "6"},
+		{`{"chunk_id":"a","wall_time_seconds":1,"session_id":5,"exit_code":0,"output":"done"}`, ""},
+		{"{\"chunk_id\":\"a\",\"session_id\":5,\"output\":\"\"}\n{\"chunk_id\":\"b\",\"exit_code\":0,\"output\":\"done\"}", "5"},
+		{"session_id=5", "5"},
+		{"SESSION_ID=5", ""},
+		{"Process running with session ID 5", "5"},
+		{"Process exited with code 0\nOutput:\ndone", ""},
+		{"Process exited with code 0\nsession_id=5", ""},
+		{"Process exited with code 0\nProcess running with session ID 5", ""},
+		{"command output: Process running with session ID 5", ""},
+		{"worker session 5 done", ""},
+		{`{"session_id":5,"chunk":"done"}`, ""},
+		{`command output: {"chunk_id":"a","wall_time_seconds":1,"session_id":5,"output":""}`, ""},
+	} {
+		got, ok := Running(tc.text)
+		if tc.want == "" && ok || tc.want != "" && (!ok || got != tc.want) {
+			t.Errorf("Running(%q) = %q, %t; want %q", tc.text, got, ok, tc.want)
+		}
+	}
+}
+
+func TestRunningSkipsBraceDenseNoise(t *testing.T) {
+	text := strings.Repeat(`{"x":[              `, 1<<20/20)
+	if len(text) < 1<<20-20 {
+		t.Fatalf("noise size = %d, want about 1 MiB", len(text))
+	}
+	if session, ok := Running(text); ok {
+		t.Fatalf("noise found session %q", session)
+	}
+}
+
+func TestFinishedSessionWordDoesNotReplaceLiveWait(t *testing.T) {
+	s := newEvents()
+	live := s.tool("exec", "wfor exit 42", map[string]string{"name": "exec_command"}, 0)
+	s.out(live, `{"chunk_id":"a","wall_time_seconds":30,"session_id":5,"output":""}`, 30)
+	finished := s.tool("exec", "wfor exit 43", map[string]string{"name": "exec_command"}, 31)
+	s.out(finished, "worker session 5 done", 32)
+	r := New()
+	for _, ev := range s.evs[:4] {
+		r.Add(ev)
+	}
+	p := r.polls["5"]
+	if p == nil || p.w.Command != "wfor exit 42" {
+		t.Fatalf("live session 5 was replaced: polls=%+v cur=%+v byCall=%+v", r.polls, r.cur, r.byCall)
+	}
+	completed := r.Close()
+	if len(completed) != 2 || completed[1].Command != "wfor exit 43" {
+		t.Fatalf("completed exec_command was not recorded alongside live wait: %+v", completed)
+	}
+}
+
 // Не ожидания: цикл в теле heredoc, короткий sleep, ввод в запущенную команду codex.
 func TestNotWaits(t *testing.T) {
 	s := newEvents()
@@ -177,7 +232,7 @@ func TestCodexStdinPoll(t *testing.T) {
 	}
 	a := s.tool("exec", "tools/repo/gotest.sh -run TestX ./bot/...", "x", 0)
 	tokens(1000, 0)
-	s.out(a, "идёт, session 77", 10)
+	s.out(a, "session_id=77", 10)
 	poll := `const r = await tools.write_stdin({session_id:77,yield_time_ms:30000,max_output_tokens:3000}); text(r.output)`
 	for i, at := range []int{11, 42, 73} {
 		if i == 1 {
@@ -185,7 +240,7 @@ func TestCodexStdinPoll(t *testing.T) {
 		}
 		id := s.tool("exec", poll, "x", at)
 		tokens(500, at)
-		out := "идёт, session 77"
+		out := "session_id=77"
 		if i == 2 {
 			out = "ok  bot 41s"
 		}

@@ -7,6 +7,7 @@
 package waits
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
@@ -334,19 +335,120 @@ var (
 	bgMoved   = regexp.MustCompile(`moved to the background \(ID: (\w+)\)`)
 	exit124   = regexp.MustCompile(`(?i)exit code:? 124\b`)
 	stopped   = regexp.MustCompile(`(?i)interrupted by user|doesn't want to proceed|rejected|\[Request interrupted`)
-	// sessionMark — сессия запущенной команды codex в выводе: «Process running with session ID N», JSON ячейки exec
-	// ({"session_id":N,…}), строка бойца «идёт, session N». exited — команда кончилась: в выводе её код.
-	sessionMark = regexp.MustCompile(`(?i)session[ _]?(?:id)?"?\s*[:= ]\s*(\d+)`)
-	exited      = regexp.MustCompile(`"exit_code"\s*:|Process exited with code`)
+	// Признаки живой сессии — только форматы, которые печатает обвязка exec.
+	processSession = regexp.MustCompile(`^Process running with session ID\s+(\d+)\b`)
+	processExited  = regexp.MustCompile(`^Process exited with code\s+\d+\b`)
+	lineSession    = regexp.MustCompile(`(?m)^\s*session_id=(\d+)\s*$`)
 )
 
 // Running returns the session for a command that is still active; ok is false for other output or an ended command.
 func Running(text string) (session string, ok bool) {
-	if exited.MatchString(text) {
+	if !strings.Contains(text, `"session_id"`) && !strings.Contains(text, "session_id=") &&
+		!strings.Contains(text, "Process running with session ID") && !strings.Contains(text, "Process exited with code") {
 		return "", false
 	}
-	if m := sessionMark.FindStringSubmatch(text); m != nil {
+	if session, ok := jsonSessionID(text); ok {
+		return session, true
+	}
+	if processExited.MatchString(text) {
+		return "", false
+	}
+	if m := lineSession.FindStringSubmatch(text); m != nil {
 		return m[1], true
+	}
+	if m := processSession.FindStringSubmatch(text); m != nil {
+		return m[1], true
+	}
+	return "", false
+}
+
+func jsonSessionID(text string) (string, bool) {
+	for line := range strings.SplitSeq(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "--") {
+			if end := strings.Index(line[2:], "--"); end >= 0 {
+				line = strings.TrimSpace(line[end+4:])
+			}
+		}
+		for strings.HasPrefix(line, "{") {
+			end := jsonObjectEnd(line, 0)
+			if end < 0 {
+				break
+			}
+			object := line[:end]
+			if bytes.Contains([]byte(object), []byte(`"session_id"`)) {
+				decoder := json.NewDecoder(strings.NewReader(object))
+				decoder.UseNumber()
+				var value any
+				if decoder.Decode(&value) == nil {
+					if session, ok := wrapperSession(value); ok {
+						return session, true
+					}
+				}
+			}
+			line = strings.TrimSpace(line[end:])
+		}
+	}
+	return "", false
+}
+
+// jsonObjectEnd returns the end of the next balanced JSON object, ignoring braces inside strings.
+func jsonObjectEnd(line string, start int) int {
+	depth := 0
+	quoted, escaped := false, false
+	for pos := start; pos < len(line); pos++ {
+		c := line[pos]
+		if quoted {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				quoted = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			quoted = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return pos + 1
+			}
+		}
+	}
+	return -1
+}
+
+func wrapperSession(value any) (string, bool) {
+	switch value := value.(type) {
+	case map[string]any:
+		session, hasSession := value["session_id"]
+		_, hasExitCode := value["exit_code"]
+		if hasSession && !hasExitCode && (value["output"] != nil || value["chunk_id"] != nil || value["wall_time_seconds"] != nil) {
+			switch session := session.(type) {
+			case json.Number:
+				return session.String(), true
+			case string:
+				if session != "" {
+					return session, true
+				}
+			}
+		}
+		for _, child := range value {
+			if session, ok := wrapperSession(child); ok {
+				return session, true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if session, ok := wrapperSession(child); ok {
+				return session, true
+			}
+		}
 	}
 	return "", false
 }
