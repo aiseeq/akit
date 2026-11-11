@@ -5,7 +5,7 @@ Console tools for coding agents, one toolkit in the unix way: each tool does one
 Built for Claude Code and codex agents on Linux; some tools read files of the author's own agent
 setup under `~/.claude` (noted per tool). MIT license.
 
-Layout: library packages at the root (`edit`, `transcript`, …), one command per tool in `cmd/<tool>`.
+Layout: library packages at the root (`edit`, `transcript`, `frozen`, …), one command per tool in `cmd/<tool>`. The `frozen` package reads and parses the frozen-project list for `tk` and other callers.
 Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/bin` from committed code only, prints each tool's revision.
 
 `codexlimit` provides `Read` for weekly account limits, `Consume` for reset credits, and `ReadApproved` for reset approvals.

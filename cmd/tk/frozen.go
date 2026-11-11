@@ -9,12 +9,9 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/aiseeq/akit/frozen"
 	sessions "github.com/aiseeq/akit/session"
 )
-
-// frozenFields is the number of tab-separated fields of a complete line: path,
-// who, date, why.
-const frozenFields = 4
 
 // frozenRefusal says why work of the project is not given to who, or "" when it
 // may be. A frozen project is worked on only by its running master.
@@ -65,21 +62,16 @@ func (f frozenFiles) refusal(project, who string, errout io.Writer) (string, err
 	if err != nil {
 		return "", fmt.Errorf("resolve project %s: %w", project, err)
 	}
-	for number, raw := range strings.Split(f.list, "\n") {
-		line := strings.TrimSpace(raw)
-		place := fmt.Sprintf("%s:%d", path, number+1)
-		matches, err := frozenLineNames(line, home, want)
-		if err != nil {
-			fmt.Fprintf(errout, "tk: %s: line ignored: %v\n", place, err)
-			continue
-		}
-		if !matches {
-			continue
-		}
-		reason := frozenWhy(line)
-		if reason == "" {
-			fmt.Fprintf(errout, "tk: %s: incomplete line, the project stays frozen\n", place)
-			reason = "incomplete line in the frozen list"
+	list := frozen.NewList(f.list, home)
+	reason, isFrozen, err := list.Frozen(project, func(number int, lineErr error) {
+		fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, number, lineErr)
+	})
+	if err != nil {
+		return "", err
+	}
+	if isFrozen {
+		if reason == "incomplete line in the frozen list" {
+			fmt.Fprintf(errout, "tk: %s: incomplete line, the project stays frozen\n", path)
 		}
 		master, err := f.masterName(want, errout)
 		if err != nil {
@@ -96,64 +88,7 @@ func (f frozenFiles) refusal(project, who string, errout io.Writer) (string, err
 // frozenLineNames: the line lists the project want. A listed folder that does
 // not exist names nothing; an error is about this line only, so the caller goes
 // on to the others.
-func frozenLineNames(line, home, want string) (bool, error) {
-	if strings.HasPrefix(line, "#") {
-		return false, nil
-	}
-	listed := frozenPath(line)
-	if listed == "" {
-		return false, nil
-	}
-	return listedPathIs(listed, home, want)
-}
-
-func resolveListedPath(listed, home string) (string, error) {
-	if listed == "~" {
-		listed = home
-	}
-	if rest, ok := strings.CutPrefix(listed, "~/"); ok {
-		listed = filepath.Join(home, rest)
-	}
-	if !filepath.IsAbs(listed) {
-		return "", errors.New("path must be absolute or start with ~/")
-	}
-	return normalizedRoot(listed)
-}
-
-// listedPathIs: the path of a list file is the project want. A listed folder that
-// does not exist names nothing.
-func listedPathIs(listed, home, want string) (bool, error) {
-	resolved, err := resolveListedPath(listed, home)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	return resolved == want, nil
-}
-
-// frozenPath is the first tab-separated field of a complete line. Any other line
-// is read by its first word: malformed, it still names a project and keeps it
-// frozen.
-func frozenPath(line string) string {
-	if parts := strings.Split(line, "\t"); len(parts) >= frozenFields {
-		return strings.TrimSpace(parts[0])
-	}
-	if fields := strings.Fields(line); len(fields) != 0 {
-		return fields[0]
-	}
-	return ""
-}
-
-// frozenWhy is the fourth tab-separated field; "" when the line lacks it.
-func frozenWhy(line string) string {
-	parts := strings.Split(line, "\t")
-	if len(parts) < frozenFields {
-		return ""
-	}
-	return strings.TrimSpace(parts[frozenFields-1])
-}
+var frozenLineNames = frozen.LineNames
 
 type sessionNameRow struct {
 	path, name string
@@ -198,7 +133,7 @@ func (f frozenFiles) executorProject(executor, currentRoot string, errout io.Wri
 		if !strings.EqualFold(row.name, executor) {
 			continue
 		}
-		resolved, err := resolveListedPath(row.path, f.home)
+		resolved, err := frozen.ResolveListedPath(row.path, f.home)
 		if errors.Is(err, os.ErrNotExist) { // a listed folder that does not exist names nothing
 			continue
 		}
@@ -263,7 +198,7 @@ func (f frozenFiles) masterName(want string, errout io.Writer) (string, error) {
 	home, path := f.home, f.namesPath
 	master, lastLine := "", 0
 	for _, row := range f.sessionNameRows() {
-		matches, err := listedPathIs(row.path, home, want)
+		matches, err := frozen.ListedPathIs(row.path, home, want)
 		if err != nil {
 			fmt.Fprintf(errout, "tk: %s:%d: line ignored: %v\n", path, row.line, err)
 			continue
