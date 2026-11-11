@@ -812,61 +812,147 @@ func nameMatches(text string) []contextMatch {
 
 // nonSecretValueForm recognizes code and diagnostic syntax that cannot be a credential.
 func nonSecretValueForm(text string, value contextValue, name string) bool {
-	v := text[value.start:value.end]
 	if value.quoted {
 		return false
 	}
-	if strings.EqualFold(name, "pwd") && strings.EqualFold(v, "error") {
-		return true
+	n := strings.TrimRight(strings.ToLower(name), "0123456789")
+	if authName(n) {
+		if typeExpressionHead(text, value) || goCompositeLiteralHead(text[value.start:value.end]) || shortNumberInNumericList(text, value) {
+			return true
+		}
 	}
-	return typeExpressionHead(v) || goCompositeLiteralHead(v) || shortNumberWithComma(v)
+	return strings.EqualFold(name, "pwd") && pwdErrorDiagnostic(text, value)
 }
 
-func typeExpressionHead(value string) bool {
-	angle := strings.IndexByte(value, '<')
-	if angle < 2 || value[0] < 'A' || value[0] > 'Z' {
+func pwdErrorDiagnostic(text string, value contextValue) bool {
+	rest := strings.ToLower(text[value.start:])
+	if end := strings.IndexAny(rest, "\r\n"); end >= 0 {
+		rest = rest[:end]
+	}
+	const getcwd = "error retrieving current directory: getcwd: cannot access parent directories"
+	const shell = "cannot access parent directories"
+	if after, ok := strings.CutPrefix(rest, getcwd); ok {
+		rest = after
+	} else if after, ok := strings.CutPrefix(rest, shell); ok {
+		rest = after
+	} else {
 		return false
 	}
-	for i := 1; i < angle; i++ {
-		c := value[i]
-		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_' || c == '.') {
+	return rest == "" || rest == ": no such file or directory"
+}
+
+func typeExpressionHead(text string, value contextValue) bool {
+	v := text[value.start:value.end]
+	angle := strings.IndexByte(v, '<')
+	if angle < 1 || !simpleTypeName(v[:angle]) {
+		return false
+	}
+	i := angle + 1
+	if i >= len(v) || !isIdentifierStart(v[i]) {
+		return false
+	}
+	for i < len(v) && isIdentifierByte(v[i]) {
+		i++
+	}
+	for i < len(v) && (v[i] == ' ' || v[i] == '\t') {
+		i++
+	}
+	if i < len(v) && (v[i] == ',' || v[i] == '>') {
+		return true
+	}
+	return i == len(v) && value.end < len(text) && text[value.end] == ','
+}
+
+func simpleTypeName(value string) bool {
+	if value == "" || !isIdentifierStart(value[0]) {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		if !isIdentifierByte(value[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-// goCompositeLiteralHead recognizes a type immediately followed by the opening
-// brace of a Go composite literal, such as T{, []T{ or map[string]T{.
+func isIdentifierStart(c byte) bool {
+	return c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+func isIdentifierByte(c byte) bool {
+	return isIdentifierStart(c) || c >= '0' && c <= '9'
+}
+
+// goCompositeLiteralHead accepts map, slice, and short named composite literals.
 func goCompositeLiteralHead(value string) bool {
 	if !strings.HasSuffix(value, "{") {
 		return false
 	}
 	typeName := value[:len(value)-1]
-	if typeName == "" {
+	if strings.HasPrefix(typeName, "map[") {
+		close := strings.IndexByte(typeName[4:], ']')
+		if close < 1 {
+			return false
+		}
+		close += 4
+		return simpleGoType(typeName[4:close]) && simpleGoType(typeName[close+1:])
+	}
+	if strings.HasPrefix(typeName, "[]") {
+		return simpleGoType(typeName[2:])
+	}
+	return len(typeName) <= 8 && simpleGoType(typeName)
+}
+
+func simpleGoType(value string) bool {
+	if value == "" || len(value) > 8 || !isIdentifierStart(value[0]) {
 		return false
 	}
-	identifier := false
-	for i := 0; i < len(typeName); i++ {
-		c := typeName[i]
-		switch {
-		case c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.ContainsRune("_.*[]", rune(c)):
-			identifier = identifier || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
-		default:
+	for i := 1; i < len(value); i++ {
+		if !isIdentifierByte(value[i]) || value[i] >= '0' && value[i] <= '9' {
 			return false
 		}
 	}
-	return identifier
+	return true
 }
 
-func shortNumberWithComma(value string) bool {
-	if !strings.HasSuffix(value, ",") {
+func shortNumberInNumericList(text string, value contextValue) bool {
+	if !shortNumericValue(text[value.start:value.end]) {
 		return false
 	}
-	number := value[:len(value)-1]
-	return len(number) > 0 && len(number) <= 6 && onlyDigits(number)
+	lineStart := strings.LastIndexByte(text[:value.start], '\n') + 1
+	lineEnd := len(text)
+	if end := strings.IndexAny(text[value.end:], "\r\n"); end >= 0 {
+		lineEnd = value.end + end
+	}
+	line := text[lineStart:lineEnd]
+	count := 0
+	for _, ix := range contextNameRE.FindAllStringSubmatchIndex(line, -1) {
+		if line[ix[6]:ix[7]] != "=" {
+			continue
+		}
+		candidate, ok := scanValue(line, ix[1], false)
+		if ok && shortNumericValue(line[candidate.start:candidate.end]) {
+			count++
+		}
+	}
+	return count >= 3
 }
 
+func shortNumericValue(value string) bool {
+	number := strings.TrimSuffix(value, ",")
+	if len(number) == 0 || len(number) > 6 || len(number) != len(value) && !strings.HasSuffix(value, ",") {
+		return false
+	}
+	for i := range len(number) {
+		if number[i] < '0' || number[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// contextSecretName is secretName for the name at text[start:end]. After a
+// written line break the letter of \n can be no part of the name.
 func contextSecretName(text string, start, end int) (string, string, bool) {
 	name := text[start:end]
 	kind, ok := secretName(name)
@@ -1370,50 +1456,30 @@ func isPlainPath(value string) bool {
 	default:
 		return false
 	}
-	relaxed := false
 	for part := range strings.SplitSeq(rest, "/") {
-		if part == "" {
-			continue
-		}
-		if !isPlainPathComponent(part) {
+		if part != "" && !isPlainWord(part) && !isTempDirectoryComponent(part) {
 			return false
-		}
-		if !isPlainWord(part) {
-			relaxed = true
-		}
-	}
-	if relaxed {
-		for part := range strings.SplitSeq(rest, "/") {
-			if strings.ContainsAny(part, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") && strings.ContainsAny(part, "0123456789") && len(part) < 24 {
-				return false
-			}
 		}
 	}
 	return true
 }
 
-// isPlainPathComponent accepts short alphabetic components and long generated
-// directory names; numeric mixed-case components remain token-shaped.
-func isPlainPathComponent(part string) bool {
-	if isPlainWord(part) {
-		return true
+// isTempDirectoryComponent recognizes the letters-plus-number suffix used by
+// temporary test directories without treating arbitrary tokens as paths.
+func isTempDirectoryComponent(part string) bool {
+	digits := len(part)
+	for digits > 0 && part[digits-1] >= '0' && part[digits-1] <= '9' {
+		digits--
 	}
-	longNumeric := len(part) >= 24 && strings.ContainsAny(part, "0123456789")
-	shortAlphabetic := len(part) < 16 && !strings.ContainsAny(part, "0123456789")
-	return (longNumeric || shortAlphabetic) && pathComponentChars(part, longNumeric)
-}
-
-func pathComponentChars(part string, digits bool) bool {
-	for i := range len(part) {
-		c := part[i]
-		letter := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
-		separator := c == '-' || c == '_' || c == '.'
-		number := digits && c >= '0' && c <= '9'
-		if !letter && !separator && !number {
+	if digits < 24 || len(part)-digits < 4 {
+		return false
+	}
+	for i := 0; i < digits; i++ {
+		if !(part[i] >= 'A' && part[i] <= 'Z' || part[i] >= 'a' && part[i] <= 'z') {
 			return false
 		}
 	}
-	return part != ""
+	return true
 }
 
 // isPlainWord: letters, digits, -, _ and . that do not look like a token. A

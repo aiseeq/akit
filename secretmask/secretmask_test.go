@@ -245,15 +245,21 @@ func TestMaskRealTranscriptFalseMaskForms(t *testing.T) {
 	cases := []struct {
 		name, ordinary, secret string
 	}{
-		{"code type", `const auth: Record<map[string]*Thing> = {}`, `auth: sk-` + strings.Repeat("a1B", 10)},
+		{"code type", `const auth: Record<Kind, string> = {}`, `auth: Summer<2024!`},
+		{"equals generic", `auth=Record<Kind, string>`, `auth=Summer<2024!`},
+		{"lowercase generic", `auth: record<T, string>`, `auth: Summer<2024!`},
+		{"single-letter generic", `auth: T<Kind, string>`, `auth: Summer<2024!`},
+		{"digit in generic type", `auth: Record<Kind2, string>`, `auth: Summer<2024!`},
+
 		{"function call", `auth: authority(x)`, `auth: Zq7xW9vK2m`},
 		{"json object", `"https://api.example.com/auth": {"plan": "pro"}`, `"https://api.example.com/auth": "8f3a9c2e7b1d4f60"`},
-		{"go map literal", `"https://api.example.com/auth": map[string]string{"plan": "pro"}`, `auth: sk-` + strings.Repeat("a1B", 10)},
+		{"go map literal", `"https://api.example.com/auth": map[string]string{"plan": "pro"}`, `auth: Zq7xW9vK2mPq8Rt{`},
+		{"go named literal", `auth: MyType{}`, `auth: Zq7xW9vK2mPq8Rt{`},
 		{"pwd error", `pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory`, `pwd: Zq7xW9vK2m`},
-		{"short number", `financial=30, auth=60, general=300`, `auth=8f3a9c2e7b1d`},
-		{"go struct", `{Name:work Home:/tmp/x/001 Auth:/tmp/x/001/auth.json} <nil>`, `Auth:Zq7xW9vK2mPq`},
-		{"simple path", `credentials: /Users/me/MyApp/creds.json`, `credentials: /tmp/ApiKey2024`},
-		{"long temp path", `Auth:/tmp/test-runner-IntegrationSuite987654321/001/auth.json`, `Auth:/tmp/ApiKey2024`},
+		{"pwd cannot error", `pwd: cannot access parent directories`, `pwd: Zq7xW9vK2m`},
+		{"short number list", `financial=30, auth=60, general=300`, `auth=8f3a9c2e7b1d`},
+		{"go struct", `{Name:work Home:/tmp/x/001 Auth:/tmp/x/001/auth.json} <nil>`, `Auth:/tmp/` + strings.Repeat("A1b", 8)},
+		{"long temp path", `Auth:/tmp/TestPickAccountShortTakesLongest141398969/001/auth.json`, `Auth:/tmp/` + strings.Repeat("A1b", 8)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -261,18 +267,93 @@ func TestMaskRealTranscriptFalseMaskForms(t *testing.T) {
 				t.Errorf("ordinary form changed: %q, %v", got, found)
 			}
 			got, found := Mask(tc.secret)
-			if strings.Contains(got, "Zq7xW9vK2m") || strings.Contains(got, "8f3a9c2e7b1d4f60") || strings.Contains(got, strings.Repeat("a1B", 10)) || len(found) == 0 {
+			if got == tc.secret || len(found) == 0 {
 				t.Errorf("secret value remained: %q, %v", got, found)
 			}
 		})
 	}
 }
 
-func TestMaskGoCompositeLiteralStillMasksNestedSecret(t *testing.T) {
-	text := `auth: map[string]string{"password": "sk-` + strings.Repeat("a1B", 10) + `"}`
+func TestTypeExpressionHeadAcceptsSingleCharacterTypeName(t *testing.T) {
+	text := "T<Kind,"
+	value := contextValue{start: 0, end: len("T<Kind")}
+	if !typeExpressionHead(text, value) {
+		t.Fatal("single-character type name with a generic argument was rejected")
+	}
+}
+
+func TestSyntaxExceptionHelpersRejectSecretLikeForms(t *testing.T) {
+	for _, value := range []string{"{", "map[Random123{", "Zq7xW9vK2mPq8Rt{", "T2{"} {
+		if goCompositeLiteralHead(value) {
+			t.Errorf("secret-like or incomplete composite accepted: %q", value)
+		}
+	}
+	for _, value := range []string{"map[string]string{", "[]T{", "T{"} {
+		if !goCompositeLiteralHead(value) {
+			t.Errorf("Go composite literal rejected: %q", value)
+		}
+	}
+	if simpleGoType("") || simpleGoType("T2") || !simpleGoType("Thing") {
+		t.Fatal("simple Go type identifier boundary changed")
+	}
+	if shortNumericValue(",") || shortNumericValue("1234567,") || !shortNumericValue("123456,") || !shortNumericValue("300") {
+		t.Fatal("short numeric value boundary changed")
+	}
+	if !isTempDirectoryComponent("TestPickAccountShortTakesLongest141398969") ||
+		isTempDirectoryComponent(strings.Repeat("a", 23)+"1234") ||
+		isTempDirectoryComponent(strings.Repeat("a", 24)+"123") {
+		t.Fatal("temporary directory suffix boundary changed")
+	}
+	if isPlainPath("/tmp/"+strings.Repeat("A1b", 8)+"}") || isPlainPath("/tmp/"+strings.Repeat("a", 24)+"}1234") {
+		t.Fatal("punctuation-bearing path component was accepted")
+	}
+}
+
+func TestShortNumericExceptionNeedsNumericAssignmentList(t *testing.T) {
+	for _, text := range []string{`auth=123456,`, `financial=30, auth=1234567, general=300`} {
+		got, found := Mask(text)
+		if got == text || len(found) == 0 {
+			t.Errorf("standalone or long numeric secret stayed visible: %q", text)
+		}
+	}
+}
+
+func TestQuotedTypeLookalikeIsStillMasked(t *testing.T) {
+	text := `auth: "Record<Kind>"`
 	got, found := Mask(text)
-	if !strings.Contains(got, `"password": "[скрыто:sk]"`) || len(found) == 0 {
+	if got == text || len(found) == 0 {
+		t.Fatalf("quoted token-like value stayed visible: %q", got)
+	}
+}
+
+func TestShortNumericExceptionIsLimitedToAuthNames(t *testing.T) {
+	for _, text := range []string{`password=123456,`, `DB_PASSWORD=123456,`, `secret=123456,`, `token=123456,`, `api_key=123456,`} {
+		got, found := Mask(text)
+		if got == text || len(found) == 0 {
+			t.Errorf("numeric secret escaped masking: %q", text)
+		}
+	}
+}
+
+func TestMaskGoCompositeLiteralStillMasksNestedSecret(t *testing.T) {
+	text := `auth: map[string]string{"password": "Zq7xW9vK2mPq"}`
+	got, found := Mask(text)
+	if !strings.Contains(got, `"password": "[скрыто:password]"`) || len(found) == 0 {
 		t.Errorf("nested secret was not masked: %q %v", got, found)
+	}
+}
+
+func TestNonSecretValueFormsDoNotApplyToOtherSecretNames(t *testing.T) {
+	for _, text := range []string{
+		`password=123456,`, `secret=304290,`, `token=123456,`,
+		`api_key=Zq7xW9vK2mPq8Rt{`, `DB_PASSWORD=Welcome<1`,
+		`password=Summer<2024!`, `pwd: error retrieving current directory: getcwd: cannot access parent directories: Zq7xW9vK2mPq`,
+		`auth=123456,`, `credentials=985866, user=bob`,
+	} {
+		got, found := Mask(text)
+		if got == text || len(found) == 0 {
+			t.Errorf("secret name was exempted from masking: %q", text)
+		}
 	}
 }
 
