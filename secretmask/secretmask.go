@@ -1340,8 +1340,8 @@ func isPlainPathPart(value string) bool {
 // at most one short abbreviation. Random letter runs tend to have uncommon
 // consonant pairs or too few vowels; base64 tends to split into fragments.
 func ordinaryCamelWord(value string) bool {
-	if ordinaryCamelWithDigitSuffix(value) {
-		return true
+	if !lettersOnly(value) {
+		return false
 	}
 	parts := camelParts(value)
 	if !validCamelParts(parts) {
@@ -1353,35 +1353,32 @@ func ordinaryCamelWord(value string) bool {
 	return ordinaryCamelParts(parts)
 }
 
-func ordinaryCamelWithDigitSuffix(value string) bool {
-	if len(value) < 2 || value[len(value)-1] < '0' || value[len(value)-1] > '9' {
-		return false
+func lettersOnly(value string) bool {
+	for i := range len(value) {
+		if !isUpper(value[i]) && !isLower(value[i]) {
+			return false
+		}
 	}
-	base := value[:len(value)-1]
-	return len(camelParts(base)) > 1 && ordinaryCamelWord(base)
+	return value != ""
 }
 
 func ordinaryCamelParts(parts []string) bool {
-	acronyms := 0
 	for i, part := range parts {
-		if isOrdinarySingleLetterPart(part, parts, i) {
+		if isOrdinarySingleLetterPart(part, parts) {
 			continue
 		}
-		if allUpper(part) {
-			acronyms++
-		}
-		if !ordinaryCamelPart(part, i) || allUpper(part) && acronyms > 1 {
+		if !ordinaryCamelPart(part, i) {
 			return false
 		}
 	}
 	return true
 }
 
-func isOrdinarySingleLetterPart(part string, parts []string, index int) bool {
-	if index == 0 && len(part) == 1 && isLower(part[0]) && len(parts) > 1 && allUpper(parts[1]) {
-		return true
+func isOrdinarySingleLetterPart(part string, parts []string) bool {
+	if len(part) != 1 || len(parts) < 2 {
+		return false
 	}
-	return index == len(parts)-1 && len(part) == 1 && isUpper(part[0]) && index > 0
+	return allLower(part) && allUpper(parts[1]) || allUpper(part) && parts[len(parts)-1] == part
 }
 
 func camelParts(value string) []string {
@@ -1412,7 +1409,7 @@ func singleLetterInitialism(parts []string) bool {
 
 func ordinaryCamelPart(part string, index int) bool {
 	if allLower(part) {
-		return len(part) >= 2 && len(part) <= 8 && (pronounceable(part) || len(part) == 3 && consonantCount(part) == 3)
+		return len(part) >= 2 && len(part) <= 8 && (pronounceable(part) || shortInitialism(part))
 	}
 	if allUpper(part) {
 		return len(part) >= 3 && len(part) <= 5
@@ -1421,7 +1418,16 @@ func ordinaryCamelPart(part string, index int) bool {
 	if index == 0 {
 		minLength = 2
 	}
-	return len(part) >= minLength && pronounceable(part)
+	return len(part) >= minLength && (pronounceable(part) || consonantHeavyPart(part))
+}
+
+func shortInitialism(part string) bool {
+	// A three-letter lowercase prefix can be a short initialism.
+	return len(part) == 3
+}
+
+func consonantHeavyPart(part string) bool {
+	return consonantCount(part) >= 5 && commonConsonantPairs(part)
 }
 
 func capitalizedPart(part string) bool {
@@ -1443,7 +1449,7 @@ func pronounceable(part string) bool {
 			return false
 		}
 	}
-	return (vowels >= (len(part)+3)/4 || len(part) <= 6 && vowels > 0) && commonConsonantPairs(part)
+	return vowels > 0 && vowels >= (len(part)+3)/4 && commonConsonantPairs(part)
 }
 
 func consonantCount(part string) int {
@@ -1459,19 +1465,37 @@ func consonantCount(part string) int {
 // commonConsonantPairs checks spelling patterns within consonant runs. The
 // pairs describe common English sound combinations rather than known words.
 func commonConsonantPairs(part string) bool {
-	const pairs = " bb cc dd ff gg ll mm nn pp rr ss tt zz bl br ch ck cl cr ct dg dr ds fl fr gh gl gn gr hn ks ld lf lk lm ln lp ls lt mb mn mp nc nd ng nk nt ph pl pr pt rb rd rg rk rl rm rn rp rs rt rv sc sh sk sl sm sn sp st sw tg th tr ts tw tz wh wr ws "
-	var previous rune
-	for _, c := range strings.ToLower(part) {
+	// Pairs are ordered by occurrence and include those found in at least 2042
+	// words in an English word list. A rare internal join is allowed when its
+	// neighboring pairs meet the threshold; a final consonant can close a vowel
+	// bearing fragment after a frequent pair.
+	const pairs = " st ng nt ll ch ss tr th nd ph ns pr nc rs bl sh ct sc rt sp cr gr sm pl ck mp rm br tt rd rr ts rc gl dr cl nn rn pt mb hr fl rg ps sl lt pp mm tl rp nf ls ff rb rl fr gh dl ld ds gn sn cc ht np nk sk gg rh rk ms nr dd nv ks hl rv "
+	letters := []rune(strings.ToLower(part))
+	var previous, beforePrevious rune
+	vowels := 0
+	for i, c := range letters {
 		if strings.ContainsRune("aeiouy", c) {
+			vowels++
 			previous = 0
+			beforePrevious = 0
 			continue
 		}
-		if previous != 0 && !strings.Contains(pairs, " "+string(previous)+string(c)+" ") {
-			return false
+		if previous != 0 && !hasCommonPair(pairs, previous, c) {
+			if i+1 >= len(letters) {
+				return vowels > 0 && beforePrevious != 0
+			}
+			if !hasCommonPair(pairs, beforePrevious, previous) || !hasCommonPair(pairs, c, letters[i+1]) {
+				return false
+			}
 		}
+		beforePrevious = previous
 		previous = c
 	}
 	return true
+}
+
+func hasCommonPair(pairs string, first, second rune) bool {
+	return strings.Contains(pairs, " "+string(first)+string(second)+" ")
 }
 
 func isUpper(c byte) bool { return c >= 'A' && c <= 'Z' }
@@ -1521,7 +1545,7 @@ func ordinaryAuthWord(value string) bool {
 }
 
 func ordinaryAuthRun(run string) bool {
-	return pronounceable(run) || longVowelRichWord(run) || len(run) < 16 && isHex(run)
+	return pronounceable(run) || longVowelRichWord(run) || isHex(run)
 }
 
 func plainWordLength(value string) bool {

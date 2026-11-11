@@ -239,6 +239,9 @@ func TestMaskAuthOrdinaryWordFormsStayVisible(t *testing.T) {
 		"auth: internationalization",
 		"auth: PostgreSQL",
 		"auth: abcdefabcdef",
+		"auth: MoroSeku",
+		"auth: sihehuFeco",
+		"auth: LazGog",
 		"auth: nodeSync",
 		"auth: AWSProfile",
 		"credentials: /Users/me/MyApp/creds.json",
@@ -284,17 +287,22 @@ func TestMaskAuthClassifierBoundaries(t *testing.T) {
 }
 
 func TestAuthClassifierRuleBoundaries(t *testing.T) {
-	t.Run("digit suffix", func(t *testing.T) {
-		if !ordinaryCamelWithDigitSuffix("OAuth2") || !ordinaryCamelWithDigitSuffix("OAuth0") || ordinaryCamelWithDigitSuffix("OAuth") || ordinaryCamelWithDigitSuffix("abcdef2") || ordinaryCamelWithDigitSuffix("aProfile2") {
-			t.Fatal("single digit suffix classification changed")
+	t.Run("camel words contain letters only", func(t *testing.T) {
+		if lettersOnly("") || !lettersOnly("JavaScript") || lettersOnly("qo2Vituw") || ordinaryCamelWord("") {
+			t.Fatal("CamelCase letter-only boundary changed")
+		}
+		for _, value := range []string{"OAuth2", "nodeProfile123456", "FollMo84", "qo2Vituw", "mutoJun5"} {
+			if ordinaryCamelWord(value) {
+				t.Errorf("digit-bearing value accepted as CamelCase: %q", value)
+			}
 		}
 	})
 
 	t.Run("single letter name parts", func(t *testing.T) {
-		if !isOrdinarySingleLetterPart("e", []string{"e", "OS"}, 0) || !isOrdinarySingleLetterPart("J", []string{"Intelli", "J"}, 1) {
+		if !isOrdinarySingleLetterPart("e", []string{"e", "OS"}) || !isOrdinarySingleLetterPart("J", []string{"Intelli", "J"}) {
 			t.Fatal("ordinary single-letter edge part rejected")
 		}
-		if isOrdinarySingleLetterPart("a", []string{"a", "Profile"}, 0) || isOrdinarySingleLetterPart("X", []string{"X", "Profile"}, 0) {
+		if isOrdinarySingleLetterPart("a", []string{"a", "Profile"}) || isOrdinarySingleLetterPart("X", []string{"X", "Profile"}) || isOrdinarySingleLetterPart("a", []string{"a"}) || isOrdinarySingleLetterPart("ab", []string{"ab", "OS"}) {
 			t.Fatal("nonordinary single-letter part accepted")
 		}
 	})
@@ -322,17 +330,23 @@ func TestAuthClassifierRuleBoundaries(t *testing.T) {
 	})
 
 	t.Run("part length and abbreviations", func(t *testing.T) {
-		if !ordinaryCamelPart("nodeprof", 0) || !ordinaryCamelPart("node", 1) || ordinaryCamelPart("nodeprofi", 0) {
+		if !ordinaryCamelPart("nodeprof", 0) || !ordinaryCamelPart("node", 1) || ordinaryCamelPart("nodeprofi", 0) || ordinaryCamelPart("a", 0) {
 			t.Fatal("lowercase prefix length boundary changed")
 		}
-		if !ordinaryCamelPart("bcd", 0) || ordinaryCamelPart("bcdf", 0) {
+		if !ordinaryCamelPart("bcd", 0) || !ordinaryCamelPart("aws", 0) || ordinaryCamelPart("bcdf", 0) {
 			t.Fatal("three-consonant prefix exception changed")
 		}
-		if ordinaryCamelPart("ID", 1) || !ordinaryCamelPart("API", 1) {
+		if ordinaryCamelPart("ID", 1) || !ordinaryCamelPart("API", 1) || !ordinaryCamelPart("ABCDE", 1) || ordinaryCamelPart("ABCDEF", 1) {
 			t.Fatal("abbreviation length boundary changed")
 		}
 		if !ordinaryCamelPart("Ab", 0) || ordinaryCamelPart("Ab", 1) {
 			t.Fatal("part-position minimum length changed")
+		}
+		if !consonantHeavyPart("Script") || consonantHeavyPart("stark") {
+			t.Fatal("consonant-heavy part fallback changed")
+		}
+		if !commonConsonantPairs("stgr") || !commonConsonantPairs("authn") || commonConsonantPairs("tgr") || commonConsonantPairs("xtgr") || commonConsonantPairs("stgq") || commonConsonantPairs("stga") || commonConsonantPairs("stg") {
+			t.Fatal("compound consonant seam classification changed")
 		}
 	})
 
@@ -350,21 +364,21 @@ func TestAuthClassifierRuleBoundaries(t *testing.T) {
 	})
 
 	t.Run("auth spelling", func(t *testing.T) {
-		if ordinaryAuthWord("zzzzzzzz") || !ordinaryAuthWord("kerberos") {
+		if ordinaryAuthWord("zzzzzzzz") || !ordinaryAuthWord("kerberos") || ordinaryAuthWord("Bxohug") || ordinaryAuthWord("QNu") {
 			t.Fatal("long auth word pronunciation boundary changed")
 		}
-		if !ordinaryAuthRun("kerberos") || !ordinaryAuthRun("aebqiofug") || !ordinaryAuthRun("abcdefabcdef") || ordinaryAuthRun("abcdefabcdefabcd") {
-			t.Fatal("short hexadecimal word boundary changed")
+		if !ordinaryAuthRun("kerberos") || !ordinaryAuthRun("aebqiofug") || !ordinaryAuthRun("abcdefabcdef") || !ordinaryAuthRun("abcdefabcdefabcd") {
+			t.Fatal("auth run classification changed")
 		}
 	})
 
 	t.Run("pronounceability", func(t *testing.T) {
-		for _, value := range []string{"astrray", "strack", "Cedar"} {
+		for _, value := range []string{"astrray", "brat", "Cedar"} {
 			if !pronounceable(value) {
 				t.Errorf("ordinary spelling rejected: %q", value)
 			}
 		}
-		for _, value := range []string{"astrrry", "strck", "qwhxkz", "aebcdf"} {
+		for _, value := range []string{"", "astrrry", "stark", "strck", "qwhxkz", "aebcdf"} {
 			if pronounceable(value) {
 				t.Errorf("unlikely spelling accepted: %q", value)
 			}
@@ -378,7 +392,7 @@ func TestAuthClassifierRuleBoundaries(t *testing.T) {
 	})
 
 	t.Run("long lowercase word", func(t *testing.T) {
-		if !longVowelRichWord("abecidofug") || longVowelRichWord("abecidofxg") || longVowelRichWord("aBecidofug") {
+		if !longVowelRichWord("abecidofug") || longVowelRichWord("abecidofxg") || longVowelRichWord("aBecidofug") || longVowelRichWord("aeiouaeiouaeiouae") || longVowelRichWord("aeiocdfug") {
 			t.Fatal("long lowercase vowel boundary changed")
 		}
 		if !longVowelRichWord("aebqiofug") || pronounceable("aebqiofug") {
@@ -403,6 +417,16 @@ func TestMaskAuthTokenLikeValuesStayHidden(t *testing.T) {
 		"auth: ABCDEFProfile",
 		"auth: a1b2c3d4e5f6",
 		"auth: kQzXwPvRtYmN",
+		"auth: nodeProfile123456",
+		"auth: qo2Vituw",
+		"auth: mutoJun5",
+		"auth: FollMo84",
+		"auth: qZDU3664",
+		"auth: OVi1yltu",
+		"auth: Exi9iAJA",
+		"auth: bufiNaz1",
+		"auth: GitHub20240917",
+		"credentials: /srv/a/oyGu5.json",
 		"auth: abcDef123456",
 		`{"auth":"ghp_syntheticTokenValue123456"}`,
 		`{"argv":["--auth","abcdef0123456789"]}`,
