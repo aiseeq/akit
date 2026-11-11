@@ -650,7 +650,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		before []transcript.Event // последние -C событий окна до найденного
 		after  int                // сколько событий после найденного ещё показать
 	)
-	meta, err := transcript.ReadWithTools(src.Path, keep, func(ev transcript.Event) {
+	consume := func(ev transcript.Event) {
 		if !f.inWindow(ev) {
 			return
 		}
@@ -675,7 +675,26 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 			}
 			before = append(before, ev)
 		}
-	})
+	}
+	var meta transcript.Meta
+	var err error
+	used := false
+	if f.opts.replyCache != nil {
+		var events []transcript.Event
+		events, meta, used, err = f.opts.replyCache.Events(src.Path, len(f.needles) > 0)
+		if err != nil {
+			// The original reader supplies the same partial results and diagnostics as without the cache.
+			used = false
+		}
+		if used {
+			for _, ev := range events {
+				consume(ev)
+			}
+		}
+	}
+	if !used {
+		meta, err = transcript.ReadWithTools(src.Path, keep, consume)
+	}
 	var waits []time.Duration
 	if wt != nil {
 		waits = wt.waits
@@ -708,37 +727,45 @@ func scan(sources []source, opts options) (result, error) {
 		return result{}, err
 	}
 	res := result{names: map[string]string{}, files: len(sources)}
+	type fileResult struct {
+		hits  []hit
+		waits []time.Duration
+		meta  transcript.Meta
+		err   error
+	}
+	results := make([]fileResult, len(sources))
 	var (
-		mu   sync.Mutex
 		wg   sync.WaitGroup
-		jobs = make(chan source)
+		jobs = make(chan int)
 	)
 	for range scanWorkerCount() {
 		wg.Go(func() {
-			for src := range jobs {
-				hits, waits, meta, err := f.file(src)
-				mu.Lock()
-				res.hits = append(res.hits, hits...)
-				res.waits = append(res.waits, waits...)
-				res.bad += meta.Bad
-				if meta.FirstBad != nil && res.firstBad == nil {
-					res.firstBad = fmt.Errorf("%s %w", src.ID, meta.FirstBad)
-				}
-				if meta.Name != "" {
-					res.names[src.ID] = meta.Name
-				}
-				if err != nil {
-					res.errs = append(res.errs, err)
-				}
-				mu.Unlock()
+			for i := range jobs {
+				hits, waits, meta, err := f.file(sources[i])
+				results[i] = fileResult{hits, waits, meta, err}
 			}
 		})
 	}
-	for _, s := range sources {
-		jobs <- s
+	for i := range sources {
+		jobs <- i
 	}
 	close(jobs)
 	wg.Wait()
+	for i, item := range results {
+		src := sources[i]
+		res.hits = append(res.hits, item.hits...)
+		res.waits = append(res.waits, item.waits...)
+		res.bad += item.meta.Bad
+		if item.meta.FirstBad != nil && res.firstBad == nil {
+			res.firstBad = fmt.Errorf("%s %w", src.ID, item.meta.FirstBad)
+		}
+		if item.meta.Name != "" {
+			res.names[src.ID] = item.meta.Name
+		}
+		if item.err != nil {
+			res.errs = append(res.errs, item.err)
+		}
+	}
 	sort.SliceStable(res.hits, func(i, j int) bool {
 		a, b := res.hits[i], res.hits[j]
 		if !a.ev.Time.Equal(b.ev.Time) {

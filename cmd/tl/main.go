@@ -18,6 +18,7 @@ import (
 	"github.com/aiseeq/akit/buildversion"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/replycache"
 )
 
 const usage = `tl — session transcripts, briefly: a time/role window or a search.
@@ -111,6 +112,7 @@ type options struct {
 	args         []string
 	originalArgs []string
 	waitCache    *waitCache
+	replyCache   *replycache.Cache
 }
 
 var errHelp = errors.New("help")
@@ -393,7 +395,25 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		opts.waitCache = newWaitCache(stderr)
 		opts.waitCache.cleanup(e.now)
 	}
-	code, done, err := admission(sources, opts.originalArgs, stdout, stderr, opts.waitCache)
+	if opts.all && !opts.usage && opts.waitProg == "" && opts.raw == "" && len(opts.roles) > 0 &&
+		len(opts.roles) <= 2 && (opts.roles[transcript.User] || opts.roles[transcript.Ask]) {
+		onlyReplies := true
+		for role := range opts.roles {
+			if role != transcript.User && role != transcript.Ask {
+				onlyReplies = false
+			}
+		}
+		if onlyReplies {
+			opts.replyCache = replycache.New()
+			opts.replyCache.Cleanup(e.now)
+		}
+	}
+	f, err := newFilter(opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "tl: %v\n", err)
+		return exitUsage
+	}
+	code, done, err := admission(sources, opts.originalArgs, stdout, stderr, opts.waitCache, opts.replyCache, len(f.needles) > 0)
 	if done {
 		if err != nil {
 			fmt.Fprintf(stderr, "tl: %v\n", err)

@@ -18,6 +18,7 @@ const sessionID = "1a2b3c4d-0000-4000-8000-000000000001"
 // fakeHome — домашняя папка с одним транскриптом Claude Code из фикстуры пакета transcript.
 func fakeHome(t *testing.T) env {
 	t.Helper()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	home := t.TempDir()
 	dir := filepath.Join(home, ".claude", "projects", "-home-x-proj")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

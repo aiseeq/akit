@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+
+	"github.com/aiseeq/akit/transcript/replycache"
 )
 
 // heavyThreshold — с какого объёма чтения вызов тяжёлый: 512 МиБ — около 5 CPU-с при ~10 CPU-с на ГиБ; меньшее
@@ -21,7 +23,7 @@ const lightThreads = 2
 // admission пускает тяжёлый вызов через очередь graft: перезапускает tl под `graft exec --heavy --local` и
 // отдаёт код дочернего; done — вызов уже выполнен там. Под очередью (GRAFT_THREADS задан) и для лёгкого
 // чтения — done false, читать здесь.
-func admission(sources []source, args []string, stdout, stderr io.Writer, cache *waitCache) (int, bool, error) {
+func admission(sources []source, args []string, stdout, stderr io.Writer, cache *waitCache, replies *replycache.Cache, rejectBad bool) (int, bool, error) {
 	threads, set, err := configuredThreads()
 	if err != nil {
 		return exitUsage, true, err
@@ -34,7 +36,7 @@ func admission(sources []source, args []string, stdout, stderr io.Writer, cache 
 	if !set {
 		var size int64
 		for _, src := range sources {
-			if cache != nil && cache.valid(src.Path) {
+			if cache != nil && cache.valid(src.Path) || replies != nil && replies.Valid(src.Path, rejectBad) {
 				continue
 			}
 			// Файл, пропавший после выбора, не в счёт: его ошибку чтения scan отдаст в итог, как раньше.
