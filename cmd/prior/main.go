@@ -84,6 +84,8 @@ func parseArgs(args []string) ([]string, error) {
 type query struct {
 	words []*regexp.Regexp
 	any   *regexp.Regexp
+	// runs — литералы, без которых q.any не совпадёт; по ним отчёты отсеиваются до построчной проверки.
+	runs []runNeedle
 	// phrases — аргументы, где фраза из phraseWords слов и больше: каждый ищется одной фразой целиком, и слова
 	// темы, отданные одним аргументом в кавычках, молча не находят ничего.
 	phrases []string
@@ -116,6 +118,11 @@ func newQuery(words []string) (query, error) {
 		}
 	}
 	q.any = regexp.MustCompile("(?i)(?:" + strings.Join(words, ")|(?:") + ")") // каждое слово уже скомпилировалось
+	runs, err := newRunFilter(q.any)
+	if err != nil {
+		return q, err
+	}
+	q.runs = runs
 	return q, nil
 }
 

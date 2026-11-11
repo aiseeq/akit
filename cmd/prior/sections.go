@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -211,9 +213,10 @@ func runs(w io.Writer, q query, dir string) {
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(files)))
 
+	results := matchRunFiles(q, files, q.runs)
 	var matches []runMatch
-	for _, f := range files {
-		line, err := firstMatch(q, f)
+	for i, f := range files {
+		line, err := results[i].line, results[i].err
 		if err != nil {
 			fmt.Fprintf(w, "(%v)\n", err)
 			continue
@@ -243,6 +246,31 @@ func runs(w io.Writer, q query, dir string) {
 	if omitted := len(matches) - shown; omitted > 0 {
 		fmt.Fprintf(w, "… ещё %d с совпадением, старейший: %s\n", omitted, oldestOmitted(matches, selected, dir))
 	}
+}
+
+// matchRunFiles читает отчёты параллельно, сохраняя результаты в порядке входного списка.
+func matchRunFiles(q query, files []string, filter []runNeedle) []runFileResult {
+	results := make([]runFileResult, len(files))
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	for range min(len(files), runtime.GOMAXPROCS(0), 4) {
+		workers.Go(func() {
+			for i := range jobs {
+				results[i].line, results[i].err = firstMatchFiltered(q, files[i], filter)
+			}
+		})
+	}
+	for i := range files {
+		jobs <- i
+	}
+	close(jobs)
+	workers.Wait()
+	return results
+}
+
+type runFileResult struct {
+	line string
+	err  error
 }
 
 func selectRuns(matches []runMatch) ([]bool, int) {
@@ -282,12 +310,20 @@ func oldestOmitted(matches []runMatch, selected []bool, dir string) string {
 
 // firstMatch — первая строка файла со словом, пусто — нет такой.
 func firstMatch(q query, path string) (string, error) {
+	return firstMatchFiltered(q, path, nil)
+}
+
+func firstMatchFiltered(q query, path string, filter []runNeedle) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("отчёт не прочитался: %w", err)
 	}
+	if len(filter) > 0 && !runMayMatch(data, filter) {
+		return "", nil
+	}
 	for l := range strings.Lines(string(data)) {
-		if l = strings.TrimSuffix(l, "\n"); q.any.MatchString(l) {
+		l = strings.TrimSuffix(l, "\n")
+		if (len(filter) == 0 || runMayMatch([]byte(l), filter)) && q.any.MatchString(l) {
 			return l, nil
 		}
 	}
