@@ -185,6 +185,7 @@ func TestAdmits(t *testing.T) {
 	}{
 		{"HIGH does not need the roots", Gate{Valid: true, Live: []string{"p"}, OpenByRoot: badRoot}, project, "HIGH", true, false},
 		{"CRIT with a missing project", Gate{Valid: true, Live: []string{"no-such"}, OpenByRoot: badRoot}, missing, "CRIT", true, false},
+		{"CRIT under crit_only does not need the roots", Gate{Valid: true, OpenByRoot: badRoot, CritOnly: map[string]string{filepath.Join(file, "below"): "day off"}}, missing, "CRIT", true, false},
 		{"untrusted closes the rest", Gate{Live: []string{"p"}, OpenByRoot: open}, project, "MED", false, false},
 		{"not live does not need the roots", Gate{Valid: true, OpenByRoot: badRoot}, project, "MED", true, false},
 		{"live and open", Gate{Valid: true, Live: []string{"p"}, OpenByRoot: open}, project, "MED", true, false},
@@ -295,5 +296,79 @@ func TestPasses(t *testing.T) {
 		if got := tc.scope.Passes(tc.prio, tc.diff); got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestReadCritOnly(t *testing.T) {
+	at := now.Format(time.RFC3339)
+	g := Read(writeGate(t, fmt.Sprintf(`{"at":%q,"open_by_root":{"/w":[]},"crit_only":{"/w":"day off"}}`, at)), now)
+	if !g.Valid || g.CritOnly["/w"] != "day off" {
+		t.Fatalf("crit_only on a known root: %+v", g)
+	}
+	g = Read(writeGate(t, fmt.Sprintf(`{"at":%q,"open_by_root":{"/w":[]},"crit_only":{"/x":"day off","/w":"day off","/a":"x"}}`, at)), now)
+	if g.Valid || !strings.HasSuffix(g.Problem, `missing from open_by_root (or empty): "/a", "/x"`) {
+		t.Fatalf("crit_only on unknown roots: Valid=%v Problem=%q", g.Valid, g.Problem)
+	}
+	// "" is what the root choice gives a project under no root, so it cannot name one.
+	g = Read(writeGate(t, fmt.Sprintf(`{"at":%q,"open_by_root":{"":[]},"crit_only":{"":"day off"}}`, at)), now)
+	if g.Valid || !strings.HasSuffix(g.Problem, `missing from open_by_root (or empty): ""`) {
+		t.Fatalf("crit_only on an empty root: Valid=%v Problem=%q", g.Valid, g.Problem)
+	}
+}
+
+func TestCritOnlyClosesAllButCrit(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, other := filepath.Join(base, "w"), filepath.Join(base, "g")
+	inWork, inOther := filepath.Join(work, "p"), filepath.Join(other, "p")
+	for _, d := range []string{inWork, inOther} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all := []string{"MED-DO", "MED-HUNT", "MED-ARCH", "LOW-DO"}
+	roots := map[string][]string{work: all, other: all}
+	closed := Gate{Valid: true, Live: []string{"p"}, OpenByRoot: roots, CritOnly: map[string]string{work: "day off"}}
+	notLive := closed
+	notLive.Live = nil
+	plain := Gate{Valid: true, Live: []string{"p"}, OpenByRoot: roots}
+	for _, tc := range []struct {
+		name          string
+		gate          Gate
+		project, prio string
+		want          bool
+	}{
+		{"CRIT under crit_only", closed, inWork, "CRIT", true},
+		{"HIGH under crit_only", closed, inWork, "HIGH", false},
+		{"MED under crit_only with an open pair", closed, inWork, "MED", false},
+		{"MEDIUM under crit_only", closed, inWork, "MEDIUM", false},
+		{"not live under crit_only", notLive, inWork, "LOW", false},
+		{"HIGH under another root", closed, inOther, "HIGH", true},
+		{"MED under another root", closed, inOther, "MED", true},
+		{"not live under another root", notLive, inOther, "LOW", true},
+		{"no crit_only: HIGH", plain, inWork, "HIGH", true},
+	} {
+		got, err := tc.gate.Admits(tc.project, tc.prio, "DO")
+		if err != nil || got != tc.want {
+			t.Errorf("Admits %s: %v, %v", tc.name, got, err)
+		}
+		s, err := tc.gate.For(tc.project)
+		if err != nil || s.Passes(tc.prio, "DO") != tc.want {
+			t.Errorf("Passes %s: %+v, %v", tc.name, s, err)
+		}
+	}
+	s, err := closed.For(inWork)
+	if err != nil || s.CritRoot != work || s.CritOnly != "day off" {
+		t.Fatalf("For names the root and reason: %+v, %v", s, err)
+	}
+	if s, err := closed.For(inOther); err != nil || s.CritRoot != "" || s.CritOnly != "" {
+		t.Fatalf("another root has no reason: %+v, %v", s, err)
+	}
+	untrusted := closed
+	untrusted.Valid = false
+	if s, err := untrusted.For(inWork); err != nil || s.CritRoot != "" || !s.Passes("HIGH", "DO") {
+		t.Fatalf("an untrusted gate keeps HIGH open: %+v, %v", s, err)
 	}
 }

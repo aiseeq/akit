@@ -234,7 +234,8 @@ repository's exclude file when needed.
 
 Use `tk new --journal` or `tk set ID --journal` to mark a journal ticket; it stays out of `tk next`
 until a wait deadline is due. Queue gates use `open_by_root` in `gate.json`, keyed by absolute project
-roots. `tk transfer ID [--parent KEY]` passes the project name, ticket filename stem, optional parent
+roots; `crit_only` maps such a root to a reason (a day off, say) and closes all new work there but
+CRIT, which `tk next` names when the queue is empty. `tk transfer ID [--parent KEY]` passes the project name, ticket filename stem, optional parent
 key, and full ticket text to the executable `.tk-transfer` in the parent of the project under
 `$HOME/git` or `$HOME/work`. The command prints a JSON object with `key` and `url`. The command must
 make repeated transfers with the same stem idempotent; if tk stops after the transfer command ran,

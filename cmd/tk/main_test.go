@@ -3284,3 +3284,33 @@ func TestHeaderFieldsReadAndWrittenInHeaderOnly(t *testing.T) {
 		t.Errorf("setExecutor over the header line:\n%s", got)
 	}
 }
+
+func TestNextUnderCritOnlySaysWhy(t *testing.T) {
+	root, dir := queueProject(t, `{"at":"NOW","live":["project"],"open":[]}`, map[string]string{"20261101-0900-MED-DO-med": "открыт"})
+	var out, errout bytes.Buffer
+	if code := nextTask(root, "", dir, options{by: "me"}, &out, &errout); code != exitNone || out.String() != "работы нет\n" {
+		t.Fatalf("closed bar without crit_only: code %d, out %q", code, out.String())
+	}
+	if err := os.WriteFile(filepath.Join(dir, "20261101-1000-HIGH-high.md"), []byte("# high\n\nСтатус: открыт\nПричина: x\n\n## Приёмка\n- check\n\n## Журнал\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Dir(root)
+	gate := fmt.Sprintf(`{"at":%q,"live":["project"],"open_by_root":{%q:["MED-DO"]},"crit_only":{%q:"day off"}}`, time.Now().Format(time.RFC3339), home, home)
+	if err := os.WriteFile(filepath.Join(home, ".local", "state", "queue", "gate.json"), []byte(gate), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := nextTask(root, "", dir, options{by: "me"}, &out, &errout); code != exitNone {
+		t.Fatalf("HIGH under crit_only: code %d, out %q, err %q", code, out.String(), errout.String())
+	}
+	if want := "работы нет: " + home + ": day off — новая работа только CRIT\n"; out.String() != want {
+		t.Errorf("out %q, want %q", out.String(), want)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "20261101-1100-CRIT-crit.md"), []byte("# crit\n\nСтатус: открыт\nПричина: x\n\n## Приёмка\n- check\n\n## Журнал\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := nextTask(root, "", dir, options{by: "me"}, &out, &errout); code != 0 || !strings.Contains(out.String(), "crit") {
+		t.Errorf("CRIT under crit_only: code %d, out %q", code, out.String())
+	}
+}

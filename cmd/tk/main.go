@@ -3965,11 +3965,20 @@ func nextTask(root, main, dir string, o options, out, errout io.Writer) int {
 		if sourceFailed {
 			fmt.Fprintln(out, "местных тикетов нет, источник недоступен: очередь неполная")
 		} else {
-			fmt.Fprintln(out, "работы нет")
+			fmt.Fprintln(out, "работы нет"+critOnlyNote(choice.gate))
 		}
 		return exitNone
 	}
 	return printCombinedNext(root, choice, visible, o.json, out, errout)
+}
+
+// critOnlyNote names why new work beyond CRIT is closed, so the reason stays in
+// the gate's output and nowhere else.
+func critOnlyNote(gate queuegate.Scope) string {
+	if gate.CritRoot == "" {
+		return ""
+	}
+	return fmt.Sprintf(": %s: %s — новая работа только CRIT", gate.CritRoot, gate.CritOnly)
 }
 
 // externalWinsLocal: of the same group the source goes first.
