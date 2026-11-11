@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -492,6 +495,13 @@ func TestR5QuoteContextContinuesUntilBriefTime(t *testing.T) {
 	mustHave(t, "контекст цитаты продолжается до времени брифа", out, "1 found", "Продолжение после окна пометки")
 }
 
+func TestPrefilterAnyUsesLaterFailureStates(t *testing.T) {
+	filter := prefilterAny([]string{"abcdeX", "bcdeY"})
+	if !filter([]byte("abcdeY")) {
+		t.Fatal("trie missed a match reached through a failure link")
+	}
+}
+
 func TestR5PrefilterMatchesCaseFoldedQuote(t *testing.T) {
 	e := testEnv(t)
 	writeTranscript(t, e.home, "-home-r5", "77000000-0000", human("2026-10-31T10:00:00Z", "Залей на GitHub"))
@@ -758,6 +768,363 @@ func TestBriefLaterCountsQuestionAnswers(t *testing.T) {
 	writeTranscript(t, e.home, "-home-ask", "askl0000-0000", lines...)
 	_, out := briefRun(t, e, writeBrief(t, t.TempDir(), "Пользователь 31.10: «Склад считаем по четвергам»\n"), "--until", "2026-10-31 17:00")
 	mustHave(t, "ответ в окне вопроса", out, "1 found", "answer in a question dialog", "Северный", "--- 1 more user lines not shown")
+}
+
+func TestTranscriptTimestampAtAdaptiveWindow(t *testing.T) {
+	short := human("2026-10-31T08:00:00Z", "short")
+	long := `{"type":"user","timestamp":"2026-10-31T08:01:00Z","text":"` + strings.Repeat("x", 12000) + `"}`
+	data := []byte(short + "\n" + long + "\n")
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, offset := range []int64{int64(len(short) / 2), int64(len(short) + 1 + 9000)} {
+		stamp, pos, err := transcriptTimestampAt(f, offset, int64(len(data)))
+		if err != nil {
+			t.Fatalf("transcriptTimestampAt(%d): %v", offset, err)
+		}
+		wantPos := int64(0)
+		wantStamp := time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC)
+		if offset > int64(len(short)) {
+			wantPos = int64(len(short) + 1)
+			wantStamp = time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC)
+		}
+		if pos != wantPos || !stamp.Equal(wantStamp) {
+			t.Errorf("transcriptTimestampAt(%d) = (%d, %s), want (%d, %s)", offset, pos, stamp, wantPos, wantStamp)
+		}
+	}
+}
+
+func TestTranscriptRecordAt(t *testing.T) {
+	first := human("2026-10-31T08:00:00Z", "one")
+	long := `{"type":"user","timestamp":"2026-10-31T08:01:00Z","text":"` + strings.Repeat("x", 100000) + `"}`
+	last := human("2026-10-31T08:02:00Z", "three")
+	data := []byte(first + "\n" + long + "\n" + last + "\n")
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	starts := []int64{0, int64(len(first) / 2), int64(len(first) + 1), int64(len(first) + 1 + 80000), int64(len(first) + 1 + len(long)), int64(len(first) + 2 + len(long))}
+	wantStarts := []int64{0, 0, int64(len(first) + 1), int64(len(first) + 1), int64(len(first) + 1), int64(len(first) + 2 + len(long))}
+	wantTimes := []time.Time{
+		time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC),
+		time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC),
+		time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC),
+		time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC),
+		time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC),
+		time.Date(2026, 10, 31, 8, 2, 0, 0, time.UTC),
+	}
+	wantEnds := []int64{int64(len(first) + 1), int64(len(first) + 1), int64(len(first) + 1 + len(long) + 1), int64(len(first) + 1 + len(long) + 1), int64(len(first) + 1 + len(long) + 1), int64(len(data))}
+	for i, offset := range starts {
+		pos, stamp, end, err := transcriptRecordAt(f, offset, int64(len(data)))
+		if err != nil {
+			t.Fatalf("transcriptRecordAt(%d): %v", offset, err)
+		}
+		if pos != wantStarts[i] || !stamp.Equal(wantTimes[i]) || end != wantEnds[i] {
+			t.Errorf("transcriptRecordAt(%d) = (%d, %s, %d), want (%d, %s, %d)", offset, pos, stamp, end, wantStarts[i], wantTimes[i], wantEnds[i])
+		}
+	}
+}
+
+func TestPrefilterRuneFastMappings(t *testing.T) {
+	for input, want := range map[rune]rune{
+		'А': 'а',
+		'Я': 'я',
+		'Ё': 'е',
+		'ё': 'е',
+	} {
+		if got := prefilterRune(input); got != want {
+			t.Errorf("prefilterRune(%U) = %U, want %U", input, got, want)
+		}
+	}
+}
+
+func TestFastJSONValidMatchesStandard(t *testing.T) {
+	cases := [][]byte{
+		[]byte(`{"a":"long string with escaped \\" quote","n":-12.3e+4,"v":[true,false,null]}`),
+		[]byte(`{"a":01}`), []byte(`{"a":"bad\q"}`), []byte(`{"a":"control` + string([]byte{1}) + `"}`),
+		[]byte(`[1,2,]`), []byte(`{"a":-}`), []byte(`null `), []byte(`"ё"`),
+	}
+	for _, raw := range cases {
+		if got, want := fastJSONValid(raw), json.Valid(raw); got != want {
+			t.Errorf("fastJSONValid(%q) = %v, json.Valid = %v", raw, got, want)
+		}
+	}
+	rng := rand.New(rand.NewSource(23))
+	for i := range 10000 {
+		raw := make([]byte, rng.Intn(128))
+		_, _ = rng.Read(raw)
+		if got, want := fastJSONValid(raw), json.Valid(raw); got != want {
+			t.Fatalf("random case %d differs: %q fast=%v std=%v", i, raw, got, want)
+		}
+	}
+}
+
+func TestScanBriefRecordHintsFastAPIRequest(t *testing.T) {
+	for _, kind := range []string{"api-request", "api-request-blob"} {
+		raw := []byte(`{"type":"` + kind + `","timestamp":"2026-10-31T10:00:00Z","messages":[{"type":"user","content":"quoted text"}]}`)
+		hints := scanBriefRecordHints(raw)
+		if !hints.skipQuote || hints.user || hints.agent || hints.askCall {
+			t.Errorf("%s hints = %+v", kind, hints)
+		}
+	}
+	ask := []byte(`{"type":"api-request","name":"AskUserQuestion","timestamp":"2026-10-31T10:00:00Z"}`)
+	if hints := scanBriefRecordHints(ask); !hints.askCall {
+		t.Fatalf("AskUserQuestion marker fell through fast path: %+v", hints)
+	}
+}
+
+func TestKeepBriefQuoteSkipsAPIRequestFilters(t *testing.T) {
+	called := false
+	filters := briefQuoteFilters{byRawDay: map[string][]func([]byte) bool{
+		"2026-10-31": {func([]byte) bool { called = true; return true }},
+	}}
+	raw := []byte(`{"type":"api-request-blob","timestamp":"2026-10-31T10:00:00Z","messages":[{"type":"user","content":"quoted text"}]}`)
+	if keepBriefQuoteRecord(raw, filters, []byte("2026-10-31"), func() bool { return true }) {
+		t.Fatal("API request was kept for quote parsing")
+	}
+	if called {
+		t.Fatal("quote filter ran on API request")
+	}
+}
+
+func TestKeepBriefQuoteSkipsPromptSnapshotFilters(t *testing.T) {
+	called := false
+	filters := briefQuoteFilters{byRawDay: map[string][]func([]byte) bool{
+		"2026-10-31": {func([]byte) bool { called = true; return true }},
+	}}
+	raw := []byte(`{"type":"attachment","timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"prompt_snapshot","tools":[]}}`)
+	if keepBriefQuoteRecord(raw, filters, []byte("2026-10-31"), func() bool { return true }) {
+		t.Fatal("prompt snapshot was kept for quote parsing")
+	}
+	if called {
+		t.Fatal("quote filter ran on prompt snapshot")
+	}
+}
+
+func TestKeepBriefQuoteSkipsToolResultFilters(t *testing.T) {
+	called := false
+	filters := briefQuoteFilters{byRawDay: map[string][]func([]byte) bool{
+		"2026-10-31": {func([]byte) bool { called = true; return true }},
+	}}
+	raw := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"tool_result","content":"result"}]}}`)
+	if keepBriefQuoteRecord(raw, filters, []byte("2026-10-31"), func() bool { return true }) {
+		t.Fatal("tool_result was kept for quote parsing")
+	}
+	if called {
+		t.Fatal("quote filter ran on tool_result")
+	}
+}
+
+func TestBriefToolResultRecord(t *testing.T) {
+	if !briefToolResultRecord([]byte(`{"type":"user","message":{"content":[{"type":"tool_result","content":"result"}]}}`)) {
+		t.Fatal("recognized serialized tool_result was not classified")
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"user","message":{"content":"human words"}}`),
+		[]byte(`{"type":"user","message":{"content":[{"type":"text","text":"tool_result"}]}}`),
+		[]byte(`{"role":"user","content":[{"type":"tool_result"}]}`),
+	} {
+		if briefToolResultRecord(raw) {
+			t.Errorf("briefToolResultRecord(%q) = true", raw)
+		}
+	}
+}
+
+func TestBriefMayContainToolResult(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"assistant","content":[]}`),
+		[]byte(`{"type":"agent_message","text":"answer"}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"agent_message","message":"x"}}`),
+	} {
+		if briefMayContainToolResult(raw) {
+			t.Errorf("briefMayContainToolResult(%q) = true", raw)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"user","content":[]}`),
+		[]byte(`{"type": "assistant","content":[]}`),
+		[]byte(`{"role":"assistant","content":[]}`),
+	} {
+		if !briefMayContainToolResult(raw) {
+			t.Errorf("briefMayContainToolResult(%q) = false", raw)
+		}
+	}
+}
+
+func TestBriefFastHintsByDay(t *testing.T) {
+	c := briefQuoteCollector{
+		filters:     briefQuoteFilters{byRawDay: map[string][]func([]byte) bool{"2026-11-01": {func([]byte) bool { return false }}}},
+		lateRawFrom: "2026-11-03", lateRawUntil: "2026-11-04",
+		lateQuotes: []briefLateQuote{{}},
+	}
+	user := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":"old"}}`)
+	hints, ok := c.fastHintsForRecord(user)
+	if !ok || hints.user || hints.agent || string(hints.rawDay) != "2026-10-31" || string(hints.timestamp) != "2026-10-31T10:00:00Z" {
+		t.Fatalf("irrelevant user hints = (%+v, %v)", hints, ok)
+	}
+	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
+	wantDay, wantPast, wantErr := briefRecordPast(user, []byte("2026-10-31"), until)
+	gotDay, gotPast, gotErr := briefRecordPastWithHints(user, hints, []byte("2026-10-31"), until)
+	if string(gotDay) != string(wantDay) || gotPast != wantPast || (gotErr == nil) != (wantErr == nil) {
+		t.Fatalf("cached record status = (%s, %v, %v), want (%s, %v, %v)", gotDay, gotPast, gotErr, wantDay, wantPast, wantErr)
+	}
+	agent := []byte(`{"type":"assistant","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"text","text":"context"}]}}`)
+	if hints, ok := c.fastHintsForRecord(agent); !ok || !hints.agent {
+		t.Fatalf("irrelevant agent hints = (%+v, %v)", hints, ok)
+	}
+	relevant := []byte(`{"type":"user","timestamp":"2026-11-01T10:00:00Z","message":{"content":"target"}}`)
+	if _, ok := c.fastHintsForRecord(relevant); ok {
+		t.Fatal("relevant day bypassed full hints")
+	}
+	late := []byte(`{"type":"user","timestamp":"2026-11-03T10:00:00Z","message":{"content":"late"}}`)
+	if _, ok := c.fastHintsForRecord(late); ok {
+		t.Fatal("late quote context bypassed full hints")
+	}
+	oddAgent := []byte(`{"timestamp":"2026-10-31T10:00:00Z","type":"assistant","message":{"content":[{"type":"agent_message","text":"context"}]}}`)
+	if _, ok := c.fastHintsForRecord(oddAgent); ok {
+		t.Fatal("noncanonical agent form bypassed full hints")
+	}
+}
+
+func TestReadBriefRecordHints(t *testing.T) {
+	toolResult := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"tool_result","content":"result"}]}}`)
+	raw, hints, consumed, err := readBriefRecord(bufio.NewReader(strings.NewReader(string(toolResult) + "\n")))
+	if err != nil || !consumed || raw != nil || !hints.containsToolResult || hints.containsAnswers {
+		t.Fatalf("readBriefRecord(tool result) = (%q, %+v, %v, %v)", raw, hints, consumed, err)
+	}
+
+	answer := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"tool_result","content":"User answered"}]},"toolUseResult":{"answers":{"q":"a"}}}`)
+	raw, hints, consumed, err = readBriefRecord(bufio.NewReader(strings.NewReader(string(answer) + "\n")))
+	if err != nil || !consumed || string(raw) != string(answer) || !hints.askAnswer || !hints.containsAnswers {
+		t.Fatalf("readBriefRecord(answer) = (%q, %+v, %v, %v)", raw, hints, consumed, err)
+	}
+}
+
+func TestBriefAttachmentFastPath(t *testing.T) {
+	raw := []byte(`{"type":"attachment","timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"blob","data":"payload"}}`)
+	hints, ok := briefAttachmentFastPath(raw)
+	if !ok || !hints.user || !hints.attachment || !hints.skipAttachment {
+		t.Fatalf("briefAttachmentFastPath = (%+v, %v)", hints, ok)
+	}
+	for _, exceptional := range [][]byte{
+		[]byte(`{"type":"attachment","attachment":{"type":"blob"},"type":"queued_command"}`),
+		[]byte(`{"type":"attachment","attachment":{"type":"blob"},"toolUseResult":{"answers":{}}}`),
+	} {
+		if _, ok := briefAttachmentFastPath(exceptional); ok {
+			t.Errorf("briefAttachmentFastPath(%q) unexpectedly used fast path", exceptional)
+		}
+	}
+}
+
+func TestBriefUserFastPath(t *testing.T) {
+	raw := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":"ordinary words"}}`)
+	if hints, ok := briefUserFastPath(raw); !ok || !hints.user || hints.toolResult {
+		t.Fatalf("briefUserFastPath = (%+v, %v)", hints, ok)
+	}
+	for _, exceptional := range [][]byte{
+		[]byte(`{"type":"user","message":{"content":[{"type":"tool_result"}]}}`),
+		[]byte(`{"type":"user","toolUseResult":{"answers":{}}}`),
+		[]byte(`{"type":"user","message":{"content":[{"type":"text","text":"x"},{"type":"assistant"}]}}`),
+	} {
+		if _, ok := briefUserFastPath(exceptional); ok {
+			t.Errorf("briefUserFastPath(%q) unexpectedly used fast path", exceptional)
+		}
+	}
+}
+
+func TestBriefToolResultFastPrefix(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"user","message":{"content":[{"type":"tool_result","content":"result"}]}}`),
+		[]byte(`{"type":"user","content":[{"type":"tool_result"}]}`),
+	} {
+		if !briefToolResultFastPrefix(raw) {
+			t.Errorf("briefToolResultFastPrefix(%q) = false", raw)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"user","message":{"content":"human words"}}`),
+		[]byte(`{"role":"user","content":[{"type":"tool_result"}]}`),
+		[]byte(`{"type":"assistant","content":[{"type":"tool_result"}]}`),
+		[]byte(`{"type":"user","message":{"content":[{"type":"tool_result"}]},"toolUseResult":{"answers":{"q":"a"}}}`),
+	} {
+		if briefToolResultFastPrefix(raw) {
+			t.Errorf("briefToolResultFastPrefix(%q) = true", raw)
+		}
+	}
+}
+
+func TestBriefAgentFastPath(t *testing.T) {
+	for _, tc := range []struct {
+		raw       string
+		agent     bool
+		assistant bool
+	}{
+		{`{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}`, true, true},
+		{`{"type":"agent_message","text":"answer"}`, true, false},
+		{`{"type":"event_msg","payload":{"type":"agent_message","message":"x"}}`, true, false},
+		{`{"type":"assistant","message":{"content":[{"type":"text","text":"answer"},{"type":"tool_use","name":"AskUserQuestion"}]}}`, true, true},
+	} {
+		h := scanBriefRecordHints([]byte(tc.raw))
+		if h.agent != tc.agent || h.assistant != tc.assistant {
+			t.Errorf("scanBriefRecordHints(%q) agent/assistant = %v/%v, want %v/%v", tc.raw, h.agent, h.assistant, tc.agent, tc.assistant)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}`),
+		[]byte(`{"type":"agent_message","text":"answer"}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"agent_message","message":"answer"}}`),
+	} {
+		hints := scanBriefRecordHints(raw)
+		agent, known := briefAgentFastPath(raw, hints)
+		if !known || !agent {
+			t.Errorf("briefAgentFastPath(%q) = false", raw)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"answer"},{"type":"tool_use","name":"AskUserQuestion"}]}}`),
+		[]byte(`{"type":"user","text":"question"}`),
+	} {
+		hints := scanBriefRecordHints(raw)
+		agent, known := briefAgentFastPath(raw, hints)
+		if agent || known {
+			t.Errorf("briefAgentFastPath(%q) = true", raw)
+		}
+	}
+}
+
+func TestBriefUserRecordRecognizesForms(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"user"}`),
+		[]byte(`{"role":"user"}`),
+		[]byte(`{"type":"attachment"}`),
+		[]byte(`{"type":"event_msg","payload":{"type":"user_message"}}`),
+		[]byte(`prefix "type":"user" suffix`),
+	} {
+		if !briefUserRecord(raw) {
+			t.Errorf("briefUserRecord(%q) = false", raw)
+		}
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"assistant"}`),
+		[]byte(`{"type": "user"}`),
+		[]byte(`{"role":"assistant","text":"type user"}`),
+		[]byte(`"type":"event_msg","payload":{"type":"user_message_extra"}`),
+	} {
+		if briefUserRecord(raw) {
+			t.Errorf("briefUserRecord(%q) = true", raw)
+		}
+	}
 }
 
 // Битая запись вызова AskUserQuestion оставляется фильтром и попадает в предупреждение читателя.

@@ -241,29 +241,57 @@ func prefilterAny(fragments []string) func([]byte) bool {
 	if broad {
 		return func([]byte) bool { return true }
 	}
-	ascii := rawFilterTrieASCII(nodes)
-	return func(raw []byte) bool { return rawFilterTrieContains(raw, nodes, short, ascii) }
+	dense := rawFilterTrieDense(nodes)
+	return func(raw []byte) bool { return rawFilterTrieContains(raw, nodes, short, dense) }
 }
 
-func rawFilterTrieASCII(nodes []rawFilterNode) [][128]uint16 {
-	if len(nodes) > int(^uint16(0)) {
+const rawFilterTerminalBit uint16 = 1 << 15
+
+func rawFilterTrieDense(nodes []rawFilterNode) [][384]uint16 {
+	if len(nodes) >= int(rawFilterTerminalBit) {
 		return nil
 	}
-	table := make([][128]uint16, len(nodes))
-	for state := range nodes {
-		for b := range 128 {
+	table := make([][384]uint16, len(nodes))
+	for _, state := range rawFilterTrieFailureOrder(nodes) {
+		for b := range 384 {
 			r := rune(b)
-			if r >= 'A' && r <= 'Z' {
+			if b >= 128 {
+				r = prefilterRune(0x400 + rune(b-128))
+			} else if r >= 'A' && r <= 'Z' {
 				r += 'a' - 'A'
 			}
 			if next, ok := nodes[state].next[r]; ok {
 				table[state][b] = uint16(next)
+				if nodes[next].terminal {
+					table[state][b] |= rawFilterTerminalBit
+				}
 			} else if state != 0 {
 				table[state][b] = table[nodes[state].fail][b]
 			}
 		}
 	}
 	return table
+}
+
+func rawFilterTrieFailureOrder(nodes []rawFilterNode) []int {
+	order := make([]int, 0, len(nodes))
+	seen := make([]bool, len(nodes))
+	seen[0] = true
+	order = append(order, 0)
+	for start := 1; start < len(nodes); start++ {
+		var chain []int
+		state := start
+		for state != 0 && !seen[state] {
+			chain = append(chain, state)
+			state = nodes[state].fail
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			state = chain[i]
+			seen[state] = true
+			order = append(order, state)
+		}
+	}
+	return order
 }
 
 func buildRawFilterTrie(fragments []string) ([]rawFilterNode, []func([]byte) bool, bool) {
@@ -326,14 +354,15 @@ func addRawFilterFailures(nodes []rawFilterNode) {
 	}
 }
 
-func rawFilterTrieContains(raw []byte, nodes []rawFilterNode, short []func([]byte) bool, ascii [][128]uint16) bool {
+func rawFilterTrieContains(raw []byte, nodes []rawFilterNode, short []func([]byte) bool, dense [][384]uint16) bool {
 	original := raw
 	state := 0
 	for len(raw) > 0 {
-		if raw[0] < utf8.RuneSelf && len(ascii) > 0 {
-			state = int(ascii[state][raw[0]])
+		if raw[0] < utf8.RuneSelf && len(dense) > 0 {
+			transition := dense[state][raw[0]]
+			state = int(transition &^ rawFilterTerminalBit)
 			raw = raw[1:]
-			if nodes[state].terminal {
+			if transition&rawFilterTerminalBit != 0 {
 				return true
 			}
 			continue
@@ -345,6 +374,15 @@ func rawFilterTrieContains(raw []byte, nodes []rawFilterNode, short []func([]byt
 		} else {
 			var size int
 			r, size = utf8.DecodeRune(raw)
+			if r >= 0x400 && r <= 0x4ff && len(dense) > 0 {
+				transition := dense[state][128+int(r-0x400)]
+				state = int(transition &^ rawFilterTerminalBit)
+				raw = raw[size:]
+				if transition&rawFilterTerminalBit != 0 {
+					return true
+				}
+				continue
+			}
 			raw = raw[size:]
 		}
 		r = prefilterRune(r)
@@ -441,11 +479,18 @@ func prefilterRune(r rune) rune {
 	if r < utf8.RuneSelf {
 		return r
 	}
-	r = unicode.ToLower(r)
-	if r == 'ё' {
-		return 'е'
+	switch {
+	case r >= 0x0410 && r <= 0x042F:
+		return r + 0x20
+	case r == 0x0451:
+		return 0x0435
+	case r == 0x0401:
+		return 0x0435
+	case r >= 0x0400 && r <= 0x040F:
+		return r + 0x50
+	default:
+		return unicode.ToLower(r)
 	}
-	return r
 }
 
 func rawContainsWord(raw, term []byte) bool {
@@ -1264,8 +1309,7 @@ func previousTranscriptRecord(f *os.File, end int64) (int64, []byte, error) {
 // в схеме AskUserQuestion в снимках запроса (prompt_snapshot, api-request-shape), но не после toolUseResult;
 // в тексте вывода инструментов кавычки экранированы.
 func briefAskAnswer(raw []byte) bool {
-	_, rest, ok := bytes.Cut(raw, []byte(`"toolUseResult":`))
-	return ok && bytes.Contains(rest, []byte(`"answers":`))
+	return scanBriefRecordHints(raw).askAnswer
 }
 
 func briefContextUser(raw []byte) bool {
@@ -1309,9 +1353,182 @@ func briefContextHuman(raw []byte) bool {
 		briefAskAnswer(raw)
 }
 
+type briefRecordHints struct {
+	user               bool
+	agent              bool
+	assistant          bool
+	text               bool
+	agentMessage       bool
+	askCall            bool
+	askAnswer          bool
+	toolResult         bool
+	containsToolResult bool
+	containsAnswers    bool
+	attachment         bool
+	queueAttachment    bool
+	skipAttachment     bool
+	skipQuote          bool
+	rawDay             []byte
+	timestamp          []byte
+}
+
+func scanBriefRecordHints(raw []byte) briefRecordHints {
+	var h briefRecordHints
+	h.skipQuote = bytes.HasPrefix(raw, []byte(`{"type":"api-request",`)) ||
+		bytes.HasPrefix(raw, []byte(`{"type":"api-request-blob",`))
+	if h.skipQuote && !bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) {
+		return h
+	}
+	if hints, ok := briefAttachmentFastPath(raw); ok {
+		return hints
+	}
+	if bytes.HasPrefix(raw, []byte(`{"type":"assistant",`)) &&
+		!bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) {
+		h.assistant = true
+		h.agent = bytes.Contains(raw, []byte(`"type":"text"`))
+		return h
+	}
+	if bytes.HasPrefix(raw, []byte(`{"type":"agent_message",`)) &&
+		!bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) {
+		h.agentMessage = true
+		h.agent = true
+		return h
+	}
+	if bytes.HasPrefix(raw, []byte(`{"type":"event_msg","payload":{"type":"agent_message",`)) &&
+		!bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) {
+		h.agentMessage = true
+		h.agent = true
+		return h
+	}
+	if briefToolResultFastPrefix(raw) {
+		h.user = true
+		h.toolResult = true
+		h.containsToolResult = true
+		return h
+	}
+	if hints, ok := briefUserFastPath(raw); ok {
+		return hints
+	}
+
+	toolUseResult := false
+	for offset := 0; offset < len(raw); {
+		rel := bytes.IndexByte(raw[offset:], 34)
+		if rel < 0 {
+			break
+		}
+		i := offset + rel
+		offset = i + 1
+		if i+1 >= len(raw) {
+			break
+		}
+		switch raw[i+1] {
+		case 116: // t
+			switch {
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"user"`)):
+				h.user = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"attachment"`)):
+				h.user = true
+				h.attachment = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"event_msg","payload":{"type":"user_message"`)):
+				h.user = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"assistant"`)):
+				h.assistant = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"text"`)):
+				h.text = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"agent_message"`)):
+				h.agentMessage = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"tool_result"`)):
+				h.containsToolResult = true
+			case bytes.HasPrefix(raw[i:], []byte(`"type":"queued_command"`)):
+				h.queueAttachment = true
+			case bytes.HasPrefix(raw[i:], []byte(`"toolUseResult":`)):
+				toolUseResult = true
+			}
+		case 114: // r
+			if bytes.HasPrefix(raw[i:], []byte(`"role":"user"`)) {
+				h.user = true
+			}
+		case 110: // n
+			if bytes.HasPrefix(raw[i:], []byte(`"name":"AskUserQuestion"`)) {
+				h.askCall = true
+			}
+		case 97: // a
+			if bytes.HasPrefix(raw[i:], []byte(`"answers":`)) {
+				h.containsAnswers = true
+				h.askAnswer = h.askAnswer || toolUseResult
+			}
+			if bytes.HasPrefix(raw[i:], []byte(`"attachment":{"type":"`)) {
+				h.attachment = true
+			}
+		case 99: // c
+			if bytes.HasPrefix(raw[i:], []byte(`"content":[{"type":"tool_result"`)) {
+				h.toolResult = true
+			}
+		}
+	}
+	h.agent = h.assistant && h.text || h.agentMessage
+	h.skipAttachment = bytes.HasPrefix(raw, []byte(`{"type":"attachment",`)) && h.attachment && !h.queueAttachment
+	return h
+}
+
+func briefAttachmentFastPath(raw []byte) (briefRecordHints, bool) {
+	if !bytes.HasPrefix(raw, []byte(`{"type":"attachment",`)) ||
+		!bytes.Contains(raw, []byte(`"attachment":{"type":"`)) ||
+		bytes.Contains(raw, []byte(`"type":"queued_command"`)) ||
+		bytes.Contains(raw, []byte(`"type":"tool_result"`)) ||
+		bytes.Contains(raw, []byte(`"toolUseResult":`)) ||
+		bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) ||
+		bytes.Contains(raw, []byte(`"type":"assistant"`)) && bytes.Contains(raw, []byte(`"type":"text"`)) {
+		return briefRecordHints{}, false
+	}
+	return briefRecordHints{user: true, attachment: true, skipAttachment: true}, true
+}
+
+func briefUserFastPath(raw []byte) (briefRecordHints, bool) {
+	if !bytes.HasPrefix(raw, []byte(`{"type":"user",`)) {
+		return briefRecordHints{}, false
+	}
+	for _, marker := range [][]byte{
+		[]byte(`"type":"tool_result"`), []byte(`"toolUseResult":`),
+		[]byte(`"name":"AskUserQuestion"`), []byte(`"type":"agent_message"`),
+	} {
+		if bytes.Contains(raw, marker) {
+			return briefRecordHints{}, false
+		}
+	}
+	if bytes.Contains(raw, []byte(`"type":"assistant"`)) && bytes.Contains(raw, []byte(`"type":"text"`)) {
+		return briefRecordHints{}, false
+	}
+	return briefRecordHints{user: true}, true
+}
+
+func briefToolResultFastPrefix(raw []byte) bool {
+	if !bytes.HasPrefix(raw, []byte(`{"type":"user",`)) ||
+		!bytes.Contains(raw, []byte(`"content":[{"type":"tool_result"`)) {
+		return false
+	}
+	return !bytes.Contains(raw, []byte(`"toolUseResult":`)) &&
+		!bytes.Contains(raw, []byte(`"answers":`))
+}
+
+func briefAgentFastPath(raw []byte, h briefRecordHints) (agent, known bool) {
+	known = bytes.HasPrefix(raw, []byte(`{"type":"assistant",`)) ||
+		bytes.HasPrefix(raw, []byte(`{"type":"agent_message",`)) ||
+		bytes.HasPrefix(raw, []byte(`{"type":"event_msg","payload":{"type":"agent_message",`))
+	if !known {
+		return false, false
+	}
+	if h.agent && !h.askCall && !h.user {
+		return true, true
+	}
+	if h.agent {
+		return false, false
+	}
+	return false, true
+}
+
 func briefAgentRecord(raw []byte) bool {
-	return bytes.Contains(raw, []byte(`"type":"assistant"`)) && bytes.Contains(raw, []byte(`"type":"text"`)) ||
-		bytes.Contains(raw, []byte(`"type":"agent_message"`))
+	return scanBriefRecordHints(raw).agent
 }
 
 func findLine(lines []line, target line) int {
@@ -2024,7 +2241,7 @@ func scanBriefQuoteContext(path string, from, at, until time.Time) ([]line, []by
 				return false
 			}
 			if !stamp.After(at) {
-				agent = raw
+				agent = append(agent[:0], raw...)
 			}
 			return false
 		}
@@ -2049,7 +2266,7 @@ func scanBriefQuoteContext(path string, from, at, until time.Time) ([]line, []by
 		later--
 		return true
 	}
-	lines, err := readChronologicalBriefLines(path, f, info.Size(), from, until, keep, nil)
+	lines, err := readChronologicalBriefLines(path, f, info.Size(), from, until, keep, nil, nil, nil)
 	if err == nil && timestampErr != nil {
 		err = timestampErr
 	}
@@ -2101,28 +2318,29 @@ func scanBriefTranscriptPaths(paths []string, filters briefQuoteFilters, fragmen
 }
 
 type briefQuoteCollector struct {
-	filters        briefQuoteFilters
-	fragments      map[string][]string
-	loc            *time.Location
-	until          time.Time
-	parser         *transcript.Parser
-	humanStamps    map[string]bool
-	agentRaw       map[string][]byte
-	lastAgent      []byte
-	timestampErr   error
-	parsedRaw      []byte
-	parsedEvents   []transcript.Event
-	parsedErr      error
-	hasParsed      bool
-	quoteChecks    map[briefQuoteLineKey]uint8
-	lateCounts     map[briefQuoteLineKey]int
-	lateQuotes     []briefLateQuote
-	lateQuoteIndex map[briefQuoteLineKey]int
-	lateShown      map[briefQuoteLineKey]map[string]bool
-	lateRawFrom    string
-	lateRawUntil   string
-	rawDay         []byte
-	recordDays     map[string]bool
+	filters          briefQuoteFilters
+	fragments        map[string][]string
+	loc              *time.Location
+	until            time.Time
+	parser           *transcript.Parser
+	humanStamps      map[string]bool
+	agentRaw         map[string][]byte
+	lastAgent        []byte
+	timestampErr     error
+	parsedRaw        []byte
+	parsedEvents     []transcript.Event
+	parsedErr        error
+	hasParsed        bool
+	quoteChecks      map[briefQuoteLineKey]uint8
+	lateCounts       map[briefQuoteLineKey]int
+	lateQuotes       []briefLateQuote
+	lateQuoteIndex   map[briefQuoteLineKey]int
+	lateShown        map[briefQuoteLineKey]map[string]bool
+	lateRawFrom      string
+	lateRawUntil     string
+	rawDay           []byte
+	recordDays       map[string]bool
+	recordWindowDays map[string]bool
 }
 
 type briefLateQuote struct {
@@ -2141,9 +2359,28 @@ func quoteLineKey(l line) briefQuoteLineKey {
 	return briefQuoteLineKey{time: l.t.UnixNano(), text: l.text, match: searchableText(l)}
 }
 
-func (c *briefQuoteCollector) setRawDay(day, raw []byte) {
+func briefRecordWindowDays(windows map[string]markerRecordInterval) map[string]bool {
+	days := make(map[string]bool, len(windows)*2)
+	for _, interval := range windows {
+		for day := interval.start.UTC().Truncate(24 * time.Hour); !day.After(interval.end.UTC()); day = day.AddDate(0, 0, 1) {
+			days[day.Format(time.DateOnly)] = true
+		}
+	}
+	return days
+}
+
+func (c *briefQuoteCollector) setRawDay(day, raw, timestamp []byte) {
 	c.rawDay = day
-	stamp, err := transcriptTimestamp(raw)
+	if len(day) < len(time.DateOnly) || !c.recordWindowDays[string(day[:len(time.DateOnly)])] {
+		return
+	}
+	var stamp time.Time
+	var err error
+	if len(timestamp) > 0 {
+		stamp, err = time.Parse(time.RFC3339Nano, string(timestamp))
+	} else {
+		stamp, err = transcriptTimestamp(raw)
+	}
 	if err != nil || stamp.IsZero() {
 		return
 	}
@@ -2154,41 +2391,84 @@ func (c *briefQuoteCollector) setRawDay(day, raw []byte) {
 	}
 }
 
-func (c *briefQuoteCollector) keep(raw []byte) bool {
-	userKnown, userRecord := false, false
-	isUserRecord := func() bool {
-		if !userKnown {
-			userRecord = briefUserRecord(raw)
-			userKnown = true
-		}
-		return userRecord
+func (c *briefQuoteCollector) fastHintsForRecord(raw []byte) (briefRecordHints, bool) {
+	_, value, ok := bytes.Cut(raw, []byte(`"timestamp":"`))
+	if !ok {
+		return briefRecordHints{}, false
 	}
-	if keepBriefQuoteRecord(raw, c.filters, c.rawDay, isUserRecord) {
-		askCall := bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`))
-		if askCall {
+	value, _, ok = bytes.Cut(value, []byte{'"'})
+	if !ok || !validUTCTimestampDate(value) {
+		return briefRecordHints{}, false
+	}
+	day := value[:len(time.DateOnly)]
+	prefetched := briefRecordHints{rawDay: day, timestamp: value}
+	if _, relevant := c.filters.byRawDay[string(day)]; relevant ||
+		len(c.lateQuotes) > 0 && string(day) >= c.lateRawFrom && string(day) <= c.lateRawUntil {
+		return prefetched, false
+	}
+	if hints, known := briefAgentHintsFast(raw); known {
+		hints.rawDay = day
+		hints.timestamp = value
+		return hints, true
+	}
+	if bytes.Contains(raw, []byte(`"type":"assistant"`)) || bytes.Contains(raw, []byte(`"type":"agent_message"`)) {
+		return prefetched, false
+	}
+	return prefetched, true
+}
+
+func briefAgentHintsFast(raw []byte) (briefRecordHints, bool) {
+	if bytes.HasPrefix(raw, []byte(`{"type":"assistant",`)) {
+		hints := briefRecordHints{assistant: true}
+		hints.agent = bytes.Contains(raw, []byte(`"type":"text"`))
+		if !hints.agent && bytes.Contains(raw, []byte(`"type":"agent_message"`)) {
+			return briefRecordHints{}, false
+		}
+		return hints, true
+	}
+	if bytes.HasPrefix(raw, []byte(`{"type":"agent_message",`)) ||
+		bytes.HasPrefix(raw, []byte(`{"type":"event_msg","payload":{"type":"agent_message",`)) {
+		return briefRecordHints{agent: true, agentMessage: true}, true
+	}
+	return briefRecordHints{}, false
+}
+
+func (c *briefQuoteCollector) keep(raw []byte) bool {
+	return c.keepWithHints(raw, scanBriefRecordHints(raw))
+}
+
+func (c *briefQuoteCollector) keepWithHints(raw []byte, hints briefRecordHints) bool {
+	agentFast, _ := briefAgentFastPath(raw, hints)
+	if agentFast {
+		c.lastAgent = append(c.lastAgent[:0], raw...)
+		return false
+	}
+	isUserRecord := func() bool { return hints.user }
+	if keepBriefQuoteRecordWithHints(raw, c.filters, c.rawDay, hints) {
+		if hints.askCall {
 			// Запоминаем связь вызова и результата для разбора ответа AskUserQuestion.
 			if _, err := c.parser.Parse(raw); err != nil {
 				return true // Hand it to the reader, not "parsed": the reader parses the record again and reports it as malformed.
 			}
 			if stamp, err := transcriptTimestamp(raw); err == nil {
-				c.agentRaw[stamp.Format(time.RFC3339Nano)] = c.lastAgent
+				c.agentRaw[stamp.Format(time.RFC3339Nano)] = append([]byte(nil), c.lastAgent...)
 			}
 			return true
 		}
 		if c.keepQuote(raw) {
 			return true
 		}
-		if briefAskAnswer(raw) {
+		if hints.askAnswer {
 			if stamp, err := transcriptTimestamp(raw); err == nil {
-				c.agentRaw[stamp.Format(time.RFC3339Nano)] = c.lastAgent
+				c.agentRaw[stamp.Format(time.RFC3339Nano)] = append([]byte(nil), c.lastAgent...)
 			}
 			// Ответ в окне вопроса после цитаты — тоже поздняя реплика: в показ и в счёт.
 			c.keepLaterUser(raw, isUserRecord)
 			return true
 		}
 	}
-	if briefAgentRecord(raw) {
-		c.lastAgent = raw
+	if hints.agent {
+		c.lastAgent = append(c.lastAgent[:0], raw...)
 		return false
 	}
 	if c.keepMalformed(raw, isUserRecord) {
@@ -2223,7 +2503,7 @@ func (c *briefQuoteCollector) keepQuote(raw []byte) bool {
 			if quoteMatch {
 				matched = true
 				check = 2
-				c.agentRaw[ev.Time.Format(time.RFC3339Nano)] = c.lastAgent
+				c.agentRaw[ev.Time.Format(time.RFC3339Nano)] = append([]byte(nil), c.lastAgent...)
 				if c.trackLateUser(l) {
 					c.humanStamps[ev.Time.Format(time.RFC3339Nano)] = true
 				}
@@ -2241,6 +2521,200 @@ func (c *briefQuoteCollector) keepQuote(raw []byte) bool {
 	return matched
 }
 
+type briefJSONValidator struct {
+	raw []byte
+	i   int
+}
+
+func fastJSONValid(raw []byte) bool {
+	v := briefJSONValidator{raw: raw}
+	v.space()
+	if !v.value(0) {
+		return false
+	}
+	v.space()
+	return v.i == len(v.raw)
+}
+
+func (v *briefJSONValidator) space() {
+	for v.i < len(v.raw) {
+		switch v.raw[v.i] {
+		case 32, 9, 13, 10:
+			v.i++
+		default:
+			return
+		}
+	}
+}
+
+func (v *briefJSONValidator) value(depth int) bool {
+	if depth > 10000 || v.i >= len(v.raw) {
+		return false
+	}
+	switch v.raw[v.i] {
+	case 34:
+		return v.string()
+	case "{"[0]:
+		v.i++
+		v.space()
+		if v.take("}") {
+			return true
+		}
+		for {
+			if !v.string() {
+				return false
+			}
+			v.space()
+			if !v.take(":") {
+				return false
+			}
+			v.space()
+			if !v.value(depth + 1) {
+				return false
+			}
+			v.space()
+			if v.take("}") {
+				return true
+			}
+			if !v.take(",") {
+				return false
+			}
+			v.space()
+		}
+	case "["[0]:
+		v.i++
+		v.space()
+		if v.take("]") {
+			return true
+		}
+		for {
+			if !v.value(depth + 1) {
+				return false
+			}
+			v.space()
+			if v.take("]") {
+				return true
+			}
+			if !v.take(",") {
+				return false
+			}
+			v.space()
+		}
+	case "t"[0]:
+		return v.take("true")
+	case "f"[0]:
+		return v.take("false")
+	case "n"[0]:
+		return v.take("null")
+	default:
+		return v.number()
+	}
+}
+
+func (v *briefJSONValidator) take(s string) bool {
+	if len(v.raw)-v.i < len(s) || string(v.raw[v.i:v.i+len(s)]) != s {
+		return false
+	}
+	v.i += len(s)
+	return true
+}
+
+func (v *briefJSONValidator) string() bool {
+	if !v.take(`"`) {
+		return false
+	}
+	for v.i < len(v.raw) {
+		rest := v.raw[v.i:]
+		quote := bytes.IndexByte(rest, '"')
+		backslash := bytes.IndexByte(rest, '\\')
+		special := quote
+		if special < 0 || backslash >= 0 && backslash < special {
+			special = backslash
+		}
+		if special < 0 {
+			return false
+		}
+		for _, b := range rest[:special] {
+			if b < 0x20 {
+				return false
+			}
+		}
+		v.i += special
+		switch v.raw[v.i] {
+		case '"':
+			v.i++
+			return true
+		case '\\':
+			v.i++
+		default:
+			return false
+		}
+		if v.i >= len(v.raw) {
+			return false
+		}
+		esc := v.raw[v.i]
+		v.i++
+		switch esc {
+		case 34, 92, 47, 98, 102, 110, 114, 116:
+		case 117:
+			if len(v.raw)-v.i < 4 {
+				return false
+			}
+			for _, h := range v.raw[v.i : v.i+4] {
+				if !((h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70)) {
+					return false
+				}
+			}
+			v.i += 4
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func (v *briefJSONValidator) number() bool {
+	start := v.i
+	if v.take("-") && v.i >= len(v.raw) {
+		return false
+	}
+	if v.take("0") {
+		if v.i < len(v.raw) && v.raw[v.i] >= "0"[0] && v.raw[v.i] <= "9"[0] {
+			return false
+		}
+	} else {
+		if v.i >= len(v.raw) || v.raw[v.i] < "1"[0] || v.raw[v.i] > "9"[0] {
+			return false
+		}
+		for v.i < len(v.raw) && v.raw[v.i] >= "0"[0] && v.raw[v.i] <= "9"[0] {
+			v.i++
+		}
+	}
+	if v.take(".") {
+		before := v.i
+		for v.i < len(v.raw) && v.raw[v.i] >= "0"[0] && v.raw[v.i] <= "9"[0] {
+			v.i++
+		}
+		if before == v.i {
+			return false
+		}
+	}
+	if v.i < len(v.raw) && (v.raw[v.i] == "e"[0] || v.raw[v.i] == "E"[0]) {
+		v.i++
+		if v.i < len(v.raw) && (v.raw[v.i] == "+"[0] || v.raw[v.i] == "-"[0]) {
+			v.i++
+		}
+		before := v.i
+		for v.i < len(v.raw) && v.raw[v.i] >= "0"[0] && v.raw[v.i] <= "9"[0] {
+			v.i++
+		}
+		if before == v.i {
+			return false
+		}
+	}
+	return v.i > start
+}
+
 func (c *briefQuoteCollector) keepMalformed(raw []byte, isUserRecord func() bool) bool {
 	day := c.rawDay
 	if len(day) < len(time.DateOnly) {
@@ -2251,7 +2725,17 @@ func (c *briefQuoteCollector) keepMalformed(raw []byte, isUserRecord func() bool
 		day = stamp[:len(time.DateOnly)]
 	}
 	_, relevant := c.filters.byRawDay[string(day[:len(time.DateOnly)])]
-	return relevant && isUserRecord() && !json.Valid(raw)
+	if !relevant || !isUserRecord() {
+		return false
+	}
+	if c.hasParsed && bytes.Equal(c.parsedRaw, raw) {
+		var syntaxErr *json.SyntaxError
+		return errors.As(c.parsedErr, &syntaxErr) || errors.Is(c.parsedErr, io.ErrUnexpectedEOF)
+	}
+	if len(raw) > 0 {
+		return !fastJSONValid(raw)
+	}
+	return !json.Valid(raw)
 }
 
 func (c *briefQuoteCollector) takeParsed(raw []byte) ([]transcript.Event, error, bool) {
@@ -2317,20 +2801,22 @@ func (c *briefQuoteCollector) trackLateUser(l line) bool {
 
 func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location) briefQuoteScanResult {
 	collector := briefQuoteCollector{
-		filters:        filters,
-		fragments:      fragments,
-		loc:            loc,
-		until:          until,
-		parser:         transcript.NewParser(),
-		humanStamps:    make(map[string]bool),
-		agentRaw:       make(map[string][]byte),
-		quoteChecks:    make(map[briefQuoteLineKey]uint8),
-		lateCounts:     make(map[briefQuoteLineKey]int),
-		lateQuoteIndex: make(map[briefQuoteLineKey]int),
-		lateShown:      make(map[briefQuoteLineKey]map[string]bool),
-		recordDays:     make(map[string]bool),
+		filters:          filters,
+		fragments:        fragments,
+		loc:              loc,
+		until:            until,
+		parser:           transcript.NewParser(),
+		humanStamps:      make(map[string]bool),
+		agentRaw:         make(map[string][]byte),
+		quoteChecks:      make(map[briefQuoteLineKey]uint8),
+		lateCounts:       make(map[briefQuoteLineKey]int),
+		lateQuoteIndex:   make(map[briefQuoteLineKey]int),
+		lateShown:        make(map[briefQuoteLineKey]map[string]bool),
+		recordDays:       make(map[string]bool),
+		recordWindowDays: briefRecordWindowDays(filters.recordWindows),
 	}
 	keep := collector.keep
+	keepWithHints := collector.keepWithHints
 	// Один хронологический проход собирает цитаты и строки их контекста, включая прежние ответы агента.
 	f, err := os.Open(path)
 	if err != nil {
@@ -2344,7 +2830,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 	if err != nil {
 		return briefQuoteScanResult{path: path, err: err}
 	}
-	lines, err := readChronologicalBriefLines(path, f, info.Size(), filters.from, until, keep, collector.setRawDay, collector.takeParsed)
+	lines, err := readChronologicalBriefLines(path, f, info.Size(), filters.from, until, keep, collector.setRawDay, keepWithHints, collector.fastHintsForRecord, collector.takeParsed)
 	if err == nil && collector.timestampErr != nil {
 		err = collector.timestampErr
 	}
@@ -2435,6 +2921,10 @@ func briefAgentFromRaw(raw []byte) (*line, error) {
 }
 
 func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay []byte, isUserRecord func() bool) bool {
+	return keepBriefQuoteRecordWithHints(raw, filters, cachedDay, scanBriefRecordHints(raw))
+}
+
+func keepBriefQuoteRecordWithHints(raw []byte, filters briefQuoteFilters, cachedDay []byte, hints briefRecordHints) bool {
 	var dayBytes []byte
 	if len(cachedDay) >= len(time.DateOnly) {
 		dayBytes = cachedDay[:len(time.DateOnly)]
@@ -2453,8 +2943,8 @@ func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay []byt
 	if dayFilters == nil {
 		return false
 	}
-	ask := bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`))
-	if !ask && !isUserRecord() {
+	ask := hints.askCall
+	if !ask && !hints.user {
 		if !bytes.Contains(raw, []byte(`"type":"`)) && !bytes.Contains(raw, []byte(`"role":"`)) {
 			return true // Whitespace or another valid JSON layout needs full parsing.
 		}
@@ -2463,8 +2953,14 @@ func keepBriefQuoteRecord(raw []byte, filters briefQuoteFilters, cachedDay []byt
 	if ask {
 		return transcript.WithoutResults(raw)
 	}
-	if briefAskAnswer(raw) {
+	if hints.askAnswer {
 		return true
+	}
+	if hints.skipAttachment || hints.skipQuote {
+		return false
+	}
+	if bytes.HasPrefix(raw, []byte(`{"type":"user",`)) && hints.toolResult {
+		return false
 	}
 
 	for _, filter := range dayFilters {
@@ -2568,14 +3064,14 @@ func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *t
 	return out, recordDays, warnings, nil
 }
 
-func briefUserRecord(raw []byte) bool {
-	return bytes.Contains(raw, []byte(`"type":"user"`)) ||
-		bytes.Contains(raw, []byte(`"role":"user"`)) ||
-		bytes.Contains(raw, []byte(`"type":"attachment"`)) ||
-		bytes.Contains(raw, []byte(`"type":"event_msg","payload":{"type":"user_message"`))
+func briefToolResultRecord(raw []byte) bool {
+	return bytes.HasPrefix(raw, []byte(`{"type":"user",`)) && scanBriefRecordHints(raw).toolResult
 }
 
-func readChronologicalBriefLines(path string, f *os.File, size int64, from, until time.Time, keep func([]byte) bool, setDay func([]byte, []byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
+func briefUserRecord(raw []byte) bool {
+	return scanBriefRecordHints(raw).user
+}
+func readChronologicalBriefLines(path string, f *os.File, size int64, from, until time.Time, keep func([]byte) bool, setDay func([]byte, []byte, []byte), keepWithHints func([]byte, briefRecordHints) bool, fastHints func([]byte) (briefRecordHints, bool), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
 	var head [4 << 10]byte
 	n, err := f.ReadAt(head[:], 0)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -2595,7 +3091,7 @@ func readChronologicalBriefLines(path string, f *os.File, size int64, from, unti
 		if setDay != nil {
 			trackedKeep = func(raw []byte) bool {
 				if stamp, stampErr := transcriptTimestamp(raw); stampErr == nil && !stamp.IsZero() {
-					setDay([]byte(stamp.UTC().Format(time.DateOnly)), raw)
+					setDay([]byte(stamp.UTC().Format(time.DateOnly)), raw, nil)
 				}
 				return keep == nil || keep(raw)
 			}
@@ -2621,12 +3117,12 @@ func readChronologicalBriefLines(path string, f *os.File, size int64, from, unti
 	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek to transcript range: %w", err)
 	}
-	r := bufio.NewReaderSize(f, 1<<20)
+	r := bufio.NewReaderSize(f, 8<<20)
 	parser := transcript.NewParser()
 	// The line number of a malformed record counts from the file start; the
 	// lines before the seek point are counted only when a warning needs them.
-	scan := briefScan{path: path, linesBefore: func() (int, error) { return countLines(f, start) }}
-	return scan.lines(r, parser, until, keep, setDay, parsed...)
+	scan := briefScan{path: path, linesBefore: func() (int, error) { return countLines(f, start) }, fastHints: fastHints}
+	return scan.lines(r, parser, until, keep, setDay, keepWithHints, parsed...)
 }
 
 // countLines counts the line breaks in the first n bytes of f.
@@ -2655,19 +3151,20 @@ type briefScan struct {
 	bad         int
 	badLine     int
 	badErr      error
+	fastHints   func([]byte) (briefRecordHints, bool)
 }
 
-func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte) bool, setDay func([]byte, []byte), parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
+func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte) bool, setDay func([]byte, []byte, []byte), keepWithHints func([]byte, briefRecordHints) bool, parsed ...func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
 	var out []line
 	lineNo := 0
 	untilDate := []byte(until.UTC().Format(time.DateOnly))
 	for {
-		raw, consumed, readErr := readBriefRecord(r)
+		raw, hints, consumed, readErr := readBriefRecordWithHints(r, s.fastHints)
 		if consumed {
 			lineNo++
 		}
 		if len(raw) > 0 {
-			rawDay, past, err := briefRecordPast(raw, untilDate, until)
+			rawDay, past, err := briefRecordPastWithHints(raw, hints, untilDate, until)
 			if err != nil {
 				return nil, err
 			}
@@ -2675,9 +3172,15 @@ func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time
 				return s.finish(out)
 			}
 			if setDay != nil {
-				setDay(rawDay, raw)
+				setDay(rawDay, raw, hints.timestamp)
 			}
-			if keep == nil || keep(raw) {
+			keepRecord := keep == nil
+			if keepWithHints != nil {
+				keepRecord = keepWithHints(raw, hints)
+			} else if keep != nil {
+				keepRecord = keep(raw)
+			}
+			if keepRecord {
 				events, err := parseBriefRecord(raw, parser, parsed)
 				if err != nil {
 					s.noteBad(lineNo, err)
@@ -2707,6 +3210,21 @@ func parseBriefRecord(raw []byte, parser *transcript.Parser, parsed []func([]byt
 // briefRecordPast reports whether a record is later than until, by its day
 // when the day decides it and by its timestamp otherwise.
 func briefRecordPast(raw, untilDate []byte, until time.Time) ([]byte, bool, error) {
+	return briefRecordPastWithHints(raw, briefRecordHints{}, untilDate, until)
+}
+
+func briefRecordPastWithHints(raw []byte, hints briefRecordHints, untilDate []byte, until time.Time) ([]byte, bool, error) {
+	if len(hints.rawDay) == len(time.DateOnly) && len(hints.timestamp) > 0 {
+		if comparison := bytes.Compare(hints.rawDay, untilDate); comparison != 0 {
+			return hints.rawDay, comparison > 0, nil
+		}
+		if timestamp, ok := normalizeUTCTimestamp(hints.timestamp); ok {
+			cutoff := until.UTC().Format("2006-01-02T15:04:05.000000000Z")
+			return hints.rawDay, bytes.Compare(timestamp, []byte(cutoff)) > 0, nil
+		}
+		stamp, err := transcriptTimestamp(raw)
+		return hints.rawDay, !stamp.IsZero() && stamp.After(until), err
+	}
 	rawDay, after, known, err := briefRecordStatus(raw, untilDate, until)
 	if err != nil || known {
 		return rawDay, known && after, err
@@ -2803,10 +3321,20 @@ func validUTCTimestampDate(stamp []byte) bool {
 	return true
 }
 
+func briefMayContainToolResult(raw []byte) bool {
+	return !bytes.HasPrefix(raw, []byte(`{"type":"assistant",`)) &&
+		!bytes.HasPrefix(raw, []byte(`{"type":"agent_message",`)) &&
+		!bytes.HasPrefix(raw, []byte(`{"type":"event_msg","payload":{"type":"agent_message",`))
+}
+
 // readBriefRecord reads one transcript line. A tool result without answers is
 // skipped (nil record), but consumed still reports that a line was read, so the
 // caller's line count matches the file.
-func readBriefRecord(r *bufio.Reader) ([]byte, bool, error) {
+func readBriefRecord(r *bufio.Reader) ([]byte, briefRecordHints, bool, error) {
+	return readBriefRecordWithHints(r, nil)
+}
+
+func readBriefRecordWithHints(r *bufio.Reader, fastHints func([]byte) (briefRecordHints, bool)) ([]byte, briefRecordHints, bool, error) {
 	var raw []byte
 	skippingResult := false
 	consumed := false
@@ -2814,17 +3342,36 @@ func readBriefRecord(r *bufio.Reader) ([]byte, bool, error) {
 		chunk, err := r.ReadSlice('\n')
 		consumed = consumed || len(chunk) > 0
 		if !skippingResult {
-			raw = append(raw, chunk...)
-			if bytes.Contains(raw, []byte(`"type":"tool_result"`)) && !bytes.Contains(raw, []byte(`"answers":`)) {
+			if err == bufio.ErrBufferFull || raw != nil {
+				raw = append(raw, chunk...)
+			} else {
+				raw = chunk
+			}
+			if err == bufio.ErrBufferFull && briefMayContainToolResult(raw) &&
+				bytes.Contains(raw, []byte(`"type":"tool_result"`)) &&
+				!bytes.Contains(raw, []byte(`"answers":`)) {
 				raw = nil
 				skippingResult = true
 			}
 		}
 		if err != bufio.ErrBufferFull {
 			if skippingResult {
-				return nil, consumed, err
+				return nil, briefRecordHints{}, consumed, err
 			}
-			return bytes.TrimSuffix(raw, []byte{'\n'}), consumed, err
+			hints, known := briefRecordHints{}, false
+			if fastHints != nil {
+				hints, known = fastHints(raw)
+			}
+			if !known {
+				prefetched := hints
+				hints = scanBriefRecordHints(raw)
+				hints.rawDay = prefetched.rawDay
+				hints.timestamp = prefetched.timestamp
+			}
+			if hints.containsToolResult && !hints.containsAnswers {
+				return nil, hints, consumed, err
+			}
+			return bytes.TrimSuffix(raw, []byte{'\n'}), hints, consumed, err
 		}
 	}
 }
@@ -2876,7 +3423,7 @@ func transcriptChronological(f *os.File, size int64) (bool, []transcriptSample, 
 func transcriptTimestampAt(f *os.File, offset, size int64) (time.Time, int64, error) {
 	pos := offset
 	if pos > 0 {
-		var chunk [64 << 10]byte
+		var chunk [4 << 10]byte
 		for pos > 0 {
 			start := max(int64(0), pos-int64(len(chunk)))
 			n, err := f.ReadAt(chunk[:pos-start], start)
@@ -2995,40 +3542,47 @@ func transcriptOffset(f *os.File, size int64, target time.Time, samples []transc
 }
 
 func transcriptRecordAt(f *os.File, offset, size int64) (int64, time.Time, int64, error) {
-	pos := offset
-	if pos > 0 {
-		var chunk [64 << 10]byte
-		for pos > 0 {
-			start := max(int64(0), pos-int64(len(chunk)))
-			n, err := f.ReadAt(chunk[:pos-start], start)
-			if err != nil && !errors.Is(err, io.EOF) {
-				return 0, time.Time{}, 0, err
-			}
-			if i := bytes.LastIndexByte(chunk[:n], '\n'); i >= 0 {
-				pos = start + int64(i+1)
-				break
-			}
-			pos = start
-			if n == 0 {
-				return size, time.Time{}, size, nil
-			}
-		}
-	}
-	if pos >= size {
+	if offset >= size {
 		return size, time.Time{}, size, nil
 	}
-	var prefix [4096]byte
-	n, err := f.ReadAt(prefix[:], pos)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return 0, time.Time{}, 0, err
+	var chunk [68 << 10]byte
+	pos := offset
+	var lineData []byte
+	for {
+		start := max(int64(0), pos-(64<<10))
+		readSize := min(int64(len(chunk)), size-start)
+		n, err := f.ReadAt(chunk[:readSize], start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, time.Time{}, 0, err
+		}
+		boundary := min(int64(n), pos-start)
+		if i := bytes.LastIndexByte(chunk[:boundary], '\n'); i >= 0 {
+			lineData = chunk[i+1 : n]
+			pos = start + int64(i+1)
+			break
+		}
+		if start == 0 {
+			lineData = chunk[:n]
+			pos = 0
+			break
+		}
+		if n == 0 {
+			return size, time.Time{}, size, nil
+		}
+		pos = start
 	}
-	var stamp time.Time
-	stamp, err = transcriptTimestampPrefix(prefix[:n])
+	prefix := lineData
+	if len(prefix) > 4096 {
+		prefix = prefix[:4096]
+	}
+	stamp, err := transcriptTimestampPrefix(prefix)
 	if err != nil {
 		return 0, time.Time{}, 0, err
 	}
-	end := pos
-	var chunk [64 << 10]byte
+	if end := bytes.IndexByte(lineData, '\n'); end >= 0 {
+		return pos, stamp, pos + int64(end+1), nil
+	}
+	end := pos + int64(len(lineData))
 	for end < size {
 		count, readErr := f.ReadAt(chunk[:], end)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
