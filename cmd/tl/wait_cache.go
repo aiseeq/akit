@@ -24,9 +24,8 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 // afterWaitRead — точка между чтением транскрипта и сверкой его ключа; тест дописывает в ней файл.
 var afterWaitRead = func(string) {}
 
-// waitCacheVersion — формат записи: 3 добавляет данные для начала вызова по соседнему результату, 4 — последовательные
-// инструменты без команды и вывод только у ошибок, 5 — ключ по коду вместо отпечатка бинаря, 6 — текст активной сессии.
-const waitCacheVersion = 6
+// waitCacheVersion — формат записи кэша ожиданий.
+const waitCacheVersion = 9
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
@@ -198,7 +197,7 @@ func (c *waitCache) cleanup(now time.Time) {
 	}
 }
 
-func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
+func (c *waitCache) events(path string, codex bool) ([]cachedWaitEvent, error) {
 	if events, state, err := c.load(path, true); err == nil && state == waitCacheHit {
 		return events, nil
 	} else if err != nil && !errors.Is(err, errWaitCacheDecode) {
@@ -209,35 +208,7 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 		return nil, err
 	}
 	c.misses.Add(1)
-	events := make([]cachedWaitEvent, 0)
-	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
-		if ev.Role == transcript.Cmd {
-			command, bg := waitCommand(ev)
-			if _, poll := waitPollSession(cacheWaitCall(ev, command, bg, nil, false)); poll {
-				events = append(events, cacheWaitCall(ev, command, bg, nil, false))
-				return
-			}
-			if command == "" && ev.MessageID != "" && !ev.Sidechain && isSerialTool(ev.Who) {
-				// Последовательный инструмент без команды (Edit, Write) — предшественник для начала соседа.
-				events = append(events, cacheWaitCall(ev, "", false, nil, false))
-			}
-			if command != "" {
-				cachedCalls, invalid := parseWaitCalls(command)
-				events = append(events, cacheWaitCall(ev, command, bg, cachedCalls, invalid))
-			}
-		} else if ev.Role == transcript.Out {
-			// Текст вывода нужен только ошибке: по нему узнаётся отказ разрешения; весь вывод раздул бы кэш.
-			var raw []byte
-			if ev.Error {
-				raw = append([]byte(nil), ev.Raw...)
-			}
-			text := ""
-			if _, running := transcriptwaits.Running(ev.Text); running {
-				text = ev.Text
-			}
-			events = append(events, cachedWaitEvent{Role: ev.Role, CallID: ev.CallID, Text: text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw})
-		}
-	})
+	events, err := readWaitEvents(path, codex)
 	if err != nil {
 		return nil, err
 	}
@@ -247,6 +218,63 @@ func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 		c.saveRecord(key, events)
 	}
 	return events, nil
+}
+
+// readWaitEvents reads what a wait needs; a codex rollout gets its command
+// completions in the same pass, matched to the calls.
+func readWaitEvents(path string, codex bool) ([]cachedWaitEvent, error) {
+	events := make([]cachedWaitEvent, 0)
+	var commandResults []transcript.CodexCommandResult
+	var err error
+	addEvent := func(ev transcript.Event) {
+		events = append(events, cacheWaitEvents(ev)...)
+	}
+	if codex {
+		_, err = transcript.ReadWithCodexCommandsDiscardOutput(path, addEvent, func(result transcript.CodexCommandResult) {
+			commandResults = append(commandResults, result)
+		})
+	} else {
+		_, err = transcript.Read(path, nil, addEvent)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(commandResults) > 0 {
+		matcher := matchCodexWaitResults(codexCallsFromCache(events), commandResults)
+		for i := range events {
+			matcher.applyCached(&events[i])
+		}
+	}
+	return events, nil
+}
+
+func cacheWaitEvents(ev transcript.Event) []cachedWaitEvent {
+	if ev.Role == transcript.Cmd {
+		command, bg := waitCommand(ev)
+		if _, poll := waitPollSession(cacheWaitCall(ev, command, bg, nil, false)); poll {
+			return []cachedWaitEvent{cacheWaitCall(ev, command, bg, nil, false)}
+		}
+		if command == "" && ev.MessageID != "" && !ev.Sidechain && isSerialTool(ev.Who) {
+			// Последовательный инструмент без команды (Edit, Write) — предшественник для начала соседа.
+			return []cachedWaitEvent{cacheWaitCall(ev, "", false, nil, false)}
+		}
+		if command != "" {
+			cachedCalls, invalid := parseWaitCalls(command)
+			return []cachedWaitEvent{cacheWaitCall(ev, command, bg, cachedCalls, invalid)}
+		}
+	} else if ev.Role == transcript.Out {
+		// Текст вывода нужен только ошибке: по нему узнаётся отказ разрешения; весь вывод раздул бы кэш.
+		var raw []byte
+		if ev.Error {
+			raw = append([]byte(nil), ev.Raw...)
+		}
+		text := ""
+		if _, running := transcriptwaits.Running(ev.Text); running {
+			text = ev.Text
+		}
+		return []cachedWaitEvent{{Role: ev.Role, CallID: ev.CallID, Text: text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw}}
+	}
+	return nil
 }
 
 func cacheWaitCall(ev transcript.Event, command string, bg bool, calls []cachedShellCall, invalid bool) cachedWaitEvent {

@@ -203,6 +203,7 @@ func permissionRefusal(raw []byte) bool {
 		"doesn't want to proceed", "does not want to proceed", "rejected by user", "user rejected permission",
 		"permission denied by user", "request interrupted by user", "blocked by a hook", "blocked by hook",
 		"hook denied", "denied by permission hook", "denied by a permission hook",
+		"pretooluse:bash hook error",
 	} {
 		if strings.Contains(text, phrase) {
 			return true

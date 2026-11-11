@@ -1,12 +1,8 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"os"
 	"sort"
 	"strconv"
 	"time"
@@ -27,43 +23,13 @@ type commandResult struct {
 
 // codexCommandResults — завершения команд из файла codex по порядку строк; код известен (не меньше нуля).
 func codexCommandResults(path string) ([]commandResult, error) {
-	f, err := os.Open(path)
+	items, err := transcript.CodexCommandResults(path)
 	if err != nil {
-		return nil, fmt.Errorf("open transcript: %w", err)
+		return nil, err
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 256<<20)
-	marker := []byte(`"CommandExecution"`)
-	var res []commandResult
-	for n := 1; sc.Scan(); n++ {
-		if !bytes.Contains(sc.Bytes(), marker) {
-			continue
-		}
-		var rec struct {
-			Timestamp time.Time `json:"timestamp"`
-			Payload   struct {
-				Type string `json:"type"`
-				Item struct {
-					Type     string   `json:"type"`
-					Command  []string `json:"command"`
-					ExitCode *int     `json:"exit_code"`
-					Output   string   `json:"aggregated_output"`
-				} `json:"item"`
-			} `json:"payload"`
-		}
-		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
-			slog.Debug("decode command execution", "path", path, "line", n, "error", err)
-			continue
-		}
-		it := rec.Payload.Item
-		if rec.Payload.Type != "item_completed" || it.Type != "CommandExecution" || len(it.Command) == 0 || it.ExitCode == nil || *it.ExitCode < 0 {
-			continue
-		}
-		res = append(res, commandResult{line: n, at: rec.Timestamp, cmd: it.Command[len(it.Command)-1], code: *it.ExitCode, out: it.Output})
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("scan transcript: %w", err)
+	res := make([]commandResult, 0, len(items))
+	for _, item := range items {
+		res = append(res, commandResult{line: item.Line, at: item.Completed, cmd: item.Command, code: item.ExitCode, out: item.Output})
 	}
 	return res, nil
 }

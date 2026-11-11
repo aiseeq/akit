@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type payload struct {
@@ -28,11 +29,94 @@ type payload struct {
 	CreatorAccountID string `json:"creator_account_id"`
 	Model            string `json:"model"`
 	// event_msg: user_message, agent_message, token_count
-	Message     string            `json:"message"`
-	Images      []json.RawMessage `json:"images"`
-	LocalImages []json.RawMessage `json:"local_images"`
-	Info        *tokenInfo        `json:"info"`
-	RateLimits  *rateLimits       `json:"rate_limits"`
+	Message       string            `json:"message"`
+	Images        []json.RawMessage `json:"images"`
+	LocalImages   []json.RawMessage `json:"local_images"`
+	Info          *tokenInfo        `json:"info"`
+	RateLimits    *rateLimits       `json:"rate_limits"`
+	Item          *codexCommandItem `json:"item"`
+	StartedAtMS   int64             `json:"started_at_ms"`
+	CompletedAtMS int64             `json:"completed_at_ms"`
+}
+
+// CodexCommandResult — завершение одной команды оболочки из item_completed.
+type CodexCommandResult struct {
+	Line               int
+	Started, Completed time.Time
+	Command            string
+	ExitCode           int
+	Output             string
+}
+
+// CodexCommandResults читает завершённые вызовы оболочки из rollout codex.
+func CodexCommandResults(path string) ([]CodexCommandResult, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open transcript: %w", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 256<<20)
+	marker := []byte(`"CommandExecution"`)
+	var results []CodexCommandResult
+	for n := 1; sc.Scan(); n++ {
+		if !bytes.Contains(sc.Bytes(), marker) {
+			continue
+		}
+		if result, ok := parseCodexCommandResult(sc.Bytes(), n); ok {
+			results = append(results, result)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan transcript: %w", err)
+	}
+	return results, nil
+}
+
+type codexCommandItem struct {
+	Type     string   `json:"type"`
+	Command  []string `json:"command"`
+	ExitCode *int     `json:"exit_code"`
+}
+
+type codexCommandItemWithOutput struct {
+	codexCommandItem
+	Output string `json:"aggregated_output"`
+}
+
+type codexCommandRecordWithOutput struct {
+	Type    string `json:"type"`
+	Payload struct {
+		Type          string                      `json:"type"`
+		Item          *codexCommandItemWithOutput `json:"item"`
+		StartedAtMS   int64                       `json:"started_at_ms"`
+		CompletedAtMS int64                       `json:"completed_at_ms"`
+	} `json:"payload"`
+}
+
+func parseCodexCommandResult(raw []byte, line int) (CodexCommandResult, bool) {
+	var rec codexCommandRecordWithOutput
+	if json.Unmarshal(raw, &rec) != nil {
+		return CodexCommandResult{}, false
+	}
+	if rec.Type != "event_msg" || rec.Payload.Type != "item_completed" || rec.Payload.Item == nil {
+		return CodexCommandResult{}, false
+	}
+	return commandResult(line, rec.Payload.StartedAtMS, rec.Payload.CompletedAtMS, rec.Payload.Item.codexCommandItem, rec.Payload.Item.Output)
+}
+
+func codexCommandResultFromPayload(recType string, pl *payload, line int) (CodexCommandResult, bool) {
+	if recType != "event_msg" || pl == nil || pl.Type != "item_completed" || pl.Item == nil {
+		return CodexCommandResult{}, false
+	}
+	return commandResult(line, pl.StartedAtMS, pl.CompletedAtMS, *pl.Item, "")
+}
+
+func commandResult(line int, started, completed int64, it codexCommandItem, output string) (CodexCommandResult, bool) {
+	if it.Type != "CommandExecution" || len(it.Command) == 0 || it.ExitCode == nil || *it.ExitCode < 0 {
+		return CodexCommandResult{}, false
+	}
+	return CodexCommandResult{Line: line, Started: time.UnixMilli(started), Completed: time.UnixMilli(completed), Command: it.Command[len(it.Command)-1], ExitCode: *it.ExitCode, Output: output}, true
 }
 
 type tokenInfo struct {

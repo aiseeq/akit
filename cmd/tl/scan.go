@@ -632,15 +632,14 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 	if f.opts.waitProg != "" {
 		wt = newWaitTracker(f.opts)
 	}
-	if wt != nil && f.opts.waitCache != nil {
-		events, err := f.opts.waitCache.events(src.Path)
+	if wt != nil && (f.opts.waitCache != nil || isCodexRollout(src.Path)) {
+		events, err := f.waitEvents(src.Path)
 		if err != nil {
 			return nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
 		}
 		for i := range events {
 			event := &events[i]
-			if f.inWindow(transcript.Event{Role: event.Role, Text: event.Text, Time: event.Time, CallID: event.CallID, Line: event.Line,
-				MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw}) {
+			if f.cachedWaitEventInWindow(event) {
 				wt.cachedEvent(*event)
 			}
 		}
@@ -685,6 +684,21 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 		return out, waits, meta, fmt.Errorf("read %s: %w", src.Path, err)
 	}
 	return out, waits, meta, nil
+}
+
+// waitEvents: through the cache when there is one; a codex rollout without it is
+// read the same way, since its command completions need matching to the calls.
+func (f *filter) waitEvents(path string) ([]cachedWaitEvent, error) {
+	codex := isCodexRollout(path)
+	if f.opts.waitCache != nil {
+		return f.opts.waitCache.events(path, codex)
+	}
+	return readWaitEvents(path, codex)
+}
+
+func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent) bool {
+	return f.inWindow(transcript.Event{Role: event.Role, Text: event.Text, Time: event.Time, CallID: event.CallID, Line: event.Line,
+		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw})
 }
 
 // scan читает файлы параллельно; ошибка одного файла не мешает остальным и уходит в итог (result.errs).

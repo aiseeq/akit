@@ -162,7 +162,7 @@ func TestWaitExcludesBackgroundPermissionRefusalAndSidechainPredecessor(t *testi
 		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"m","content":[{"type":"tool_use","id":"hook","name":"Bash","input":{"command":"tk done hook"}}]}}`,
 		`{"type":"user","timestamp":"2026-10-25T10:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"started"}]}}`,
 		`{"type":"user","timestamp":"2026-10-25T10:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"denied","is_error":true,"content":"User doesn't want to proceed with this tool use"}]}}`,
-		`{"type":"user","timestamp":"2026-10-25T10:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"hook","is_error":true,"content":"PreToolUse hook denied this tool call"}]}}`,
+		`{"type":"user","timestamp":"2026-10-25T10:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"hook","is_error":true,"content":"PreToolUse:Bash hook error"}]}}`,
 		`{"type":"assistant","isSidechain":true,"timestamp":"2026-10-25T10:00:00Z","message":{"id":"shared","content":[{"type":"tool_use","id":"sub","name":"Bash","input":{"command":"tk done sidechain"}}]}}`,
 		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"shared","content":[{"type":"tool_use","id":"parent","name":"Bash","input":{"command":"tk done parent"}}]}}`,
 		`{"type":"user","timestamp":"2026-10-25T10:00:08Z","message":{"content":[{"type":"tool_result","tool_use_id":"sub","content":"ok"}]}}`,
@@ -171,6 +171,31 @@ func TestWaitExcludesBackgroundPermissionRefusalAndSidechainPredecessor(t *testi
 	waits := readWaits(t, e, "excluded.jsonl", rows)
 	if fmt.Sprint(waits) != fmt.Sprint([]time.Duration{8 * time.Second, 10 * time.Second}) {
 		t.Fatalf("waits = %v, want [8s 10s]", waits)
+	}
+}
+
+func TestWaitPreToolUseHookErrorIsRefusal(t *testing.T) {
+	start := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	denied := newWaitTracker(options{waitProg: "tk", waitSub: "done"})
+	denied.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "hook", Time: start, Command: "tk done hook", Who: "Bash"})
+	denied.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "hook", Time: start.Add(30 * time.Second), Error: true, Raw: []byte(`{"content":"PreToolUse:Bash hook error"}`)})
+	if len(denied.waits) != 0 {
+		t.Fatalf("PreToolUse refusal produced waits %v", denied.waits)
+	}
+	allowed := newWaitTracker(options{waitProg: "tk", waitSub: "done"})
+	allowed.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "ok", Time: start, Command: "tk done hook", Who: "Bash"})
+	allowed.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "ok", Time: start.Add(2 * time.Second), Raw: []byte(`{"content":"command ran"}`)})
+	if fmt.Sprint(allowed.waits) != fmt.Sprint([]time.Duration{2 * time.Second}) {
+		t.Fatalf("ordinary output waits = %v", allowed.waits)
+	}
+}
+
+func TestWaitPermissionHookDeniedPhrase(t *testing.T) {
+	if !permissionRefusal([]byte(`{"content":"hook denied this command"}`)) {
+		t.Fatal("hook denied output was not recognized as a refusal")
+	}
+	if permissionRefusal([]byte(`{"content":"command completed normally"}`)) {
+		t.Fatal("ordinary tool output was recognized as a refusal")
 	}
 }
 
@@ -442,6 +467,269 @@ func TestWaitCodexAndInsufficientData(t *testing.T) {
 		if code != tc.code || out != tc.out || !strings.Contains(errOut, tc.errOut) {
 			t.Errorf("events=%d q=%s: code=%d out=%q stderr=%q", tc.events, tc.q, code, out, errOut)
 		}
+	}
+}
+
+func TestWaitCodexUsesCompletedCommand(t *testing.T) {
+	e := fakeHome(t)
+	rows := []string{`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`}
+	for i := 1; i <= 3; i++ {
+		rows = append(rows,
+			fmt.Sprintf(`{"timestamp":"2026-10-25T10:00:%02dZ","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c%d","name":"exec","input":%q}}`, i, i, `exec_command({cmd:"sub -F - <<'EOF'\n"+spec+"\nEOF\nbash tests/run.sh"})`),
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1792922402000,"completed_at_ms":1792922405000,"item":{"type":"CommandExecution","command":["/bin/bash","-lc","sub -F - <<'EOF'\nvalue\nEOF\nbash tests/run.sh"],"exit_code":0,"aggregated_output":"ok"}}}`),
+			fmt.Sprintf(`{"timestamp":"2026-10-25T10:00:%02dZ","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c%d","output":"ok"}}`, i+5, i),
+		)
+	}
+	path := writeWaitTranscript(t, e, "rollout-completed.jsonl", strings.Join(rows, "\n")+"\n")
+	code, out, stderr := runTL(t, e, "--wait", "sub", "--q", "50", path)
+	if code != 3 || !strings.Contains(stderr, "0 wait event(s)") || out != "" {
+		t.Fatalf("concatenated command counted as clean sub: (%d, %q, %q)", code, out, stderr)
+	}
+	code, out, stderr = runTL(t, e, "--wait", "sub", "--q", "50", path)
+	if code != 3 || !strings.Contains(stderr, "0 wait event(s)") || out != "" {
+		t.Fatalf("cached concatenated command counted as clean sub: (%d, %q, %q)", code, out, stderr)
+	}
+}
+
+func TestWaitCodexUsesItemCompletionTime(t *testing.T) {
+	e := fakeHome(t)
+	base := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	rows := []string{`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`}
+	for i := 1; i <= 3; i++ {
+		call := base.Add(time.Duration(i) * time.Second)
+		started, completed := call.Add(time.Second).UnixMilli(), call.Add(5*time.Second).UnixMilli()
+		rows = append(rows,
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c%d","name":"exec","input":%q}}`, call.Format(time.RFC3339), i, `exec_command({cmd:"tk done item"})`),
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":%d,"item":{"type":"CommandExecution","command":["/bin/bash","-lc","tk done item"],"exit_code":0,"aggregated_output":"ok"}}}`, started, completed),
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c%d","output":"ok"}}`, call.Add(8*time.Second).Format(time.RFC3339), i),
+		)
+	}
+	path := writeWaitTranscript(t, e, "rollout-completion-time.jsonl", strings.Join(rows, "\n")+"\n")
+	code, out, stderr := runTL(t, e, "--wait", "tk done", "--q", "50", path)
+	if code != 0 || out != "5000\n" || !strings.Contains(stderr, "3 wait event(s)") {
+		t.Fatalf("completion-time wait = (%d, %q, %q), want 5000ms", code, out, stderr)
+	}
+	code, out, stderr = runTL(t, e, "--wait", "tk done", "--q", "50", path)
+	if code != 0 || out != "5000\n" || !strings.Contains(stderr, "3 wait event(s)") {
+		t.Fatalf("cached completion-time wait = (%d, %q, %q), want 5000ms", code, out, stderr)
+	}
+}
+
+func TestWaitCodexMatchesCommandResultsByText(t *testing.T) {
+	e := fakeHome(t)
+	base := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	rows := []string{`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`}
+	addCall := func(id, code string, at time.Time) {
+		rows = append(rows, fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call","call_id":%q,"name":"exec","input":%q}}`, at.Format(time.RFC3339), id, code))
+	}
+	addOutput := func(id string, at time.Time) {
+		rows = append(rows, fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":%q,"output":"ok"}}`, at.Format(time.RFC3339), id))
+	}
+	addDone := func(command string, started, completed time.Time) {
+		rows = append(rows, fmt.Sprintf(`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":%d,"item":{"type":"CommandExecution","command":["/bin/bash","-lc",%q],"exit_code":0,"aggregated_output":"ok"}}}`, started.UnixMilli(), completed.UnixMilli(), command))
+	}
+	addCall("many", `const a = await tools.exec_command({cmd:"tk done alpha"}); const b = await tools.exec_command({cmd:"tk done beta"});`, base)
+	addCall("patch", `await tools.apply_patch("patch body");`, base.Add(time.Second))
+	addOutput("many", base.Add(2*time.Second))
+	addCall("late", `await tools.exec_command({cmd:"tk done delayed"});`, base.Add(3*time.Second))
+	addOutput("late", base.Add(4*time.Second))
+	addCall("next", `await tools.exec_command({cmd:"tk done next"});`, base.Add(5*time.Second))
+	addOutput("next", base.Add(6*time.Second))
+	addDone("tk done delayed", base.Add(3*time.Second), base.Add(10*time.Second))
+	addDone("tk done next", base.Add(5*time.Second), base.Add(9*time.Second))
+	addDone("tk done alpha", base, base.Add(time.Second))
+	addDone("tk done beta", base, base.Add(2*time.Second))
+	path := writeWaitTranscript(t, e, "rollout-result-matching.jsonl", strings.Join(rows, "\n")+"\n")
+	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}}}).file(source{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{7 * time.Second, 4 * time.Second}
+	if fmt.Sprint(waits) != fmt.Sprint(want) {
+		t.Fatalf("waits = %v, want %v", waits, want)
+	}
+}
+
+func TestWaitCodexDoesNotMatchResultToLaterCall(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	event := codexWaitCall{line: 8, call: "later", text: "tk done same", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 7, Started: base, Command: "tk done same", Completed: base.Add(time.Second)}
+	matcher := matchCodexWaitResults([]codexWaitCall{event}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent) != 0 {
+		t.Fatalf("result at line %d matched later call at line %d", result.Line, event.line)
+	}
+}
+
+func TestWaitCodexRejectsStartAfterOutputAllowance(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 2, call: "failed-before-exec", text: "tl 0a1b2c3d:350", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 50, Started: base.Add(2500 * time.Millisecond), Completed: base.Add(time.Hour), Command: call.text}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent) != 0 {
+		t.Fatalf("completion started after the call window matched: %+v", matcher.byEvent)
+	}
+}
+
+func TestWaitCodexRejectsStartBeforeCallAllowance(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 2, call: "not-started-yet", text: "tl result", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 4, Started: base.Add(-2500 * time.Millisecond), Command: call.text}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent) != 0 {
+		t.Fatalf("completion started before the call allowance matched: %+v", matcher.byEvent)
+	}
+}
+
+func TestWaitCodexRejectsMissingCallStartTime(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 2, call: "missing-start", text: "tl result", out: base}
+	result := transcript.CodexCommandResult{Line: 4, Command: call.text}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent) != 0 {
+		t.Fatalf("result matched a call with no start time: %+v", matcher.byEvent)
+	}
+}
+
+func TestWaitCodexUsesFullCommandPrefixWithinOverlappingWindows(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	calls := []codexWaitCall{
+		{line: 2, call: "alpha", text: "tk done alpha", at: base, out: base.Add(10 * time.Second)},
+		{line: 4, call: "beta", text: "tk done beta", at: base.Add(time.Second), out: base.Add(11 * time.Second)},
+	}
+	results := []transcript.CodexCommandResult{
+		{Line: 6, Started: base.Add(2 * time.Second), Completed: base.Add(3 * time.Second), Command: "tk done alpha"},
+		{Line: 8, Started: base.Add(4 * time.Second), Completed: base.Add(5 * time.Second), Command: "tk done beta"},
+	}
+	matcher := matchCodexWaitResults(calls, results)
+	for _, call := range calls {
+		got := matcher.byEvent[codexWaitEventKey{line: call.line, call: call.call, text: call.text}]
+		if len(got) != 1 || got[0].command != call.text {
+			t.Fatalf("call %q got results %+v", call.call, got)
+		}
+	}
+}
+
+func TestWaitCodexSplitsCommandWordOnTab(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 2, call: "tab", text: "tk", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: "tk\tdone arg"}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent[codexWaitEventKey{line: call.line, call: call.call, text: call.text}]) != 1 {
+		t.Fatal("tab-separated command word did not match")
+	}
+}
+
+func TestWaitCodexTakeConsumesRepeatedResultsInOrder(t *testing.T) {
+	key := codexWaitEventKey{line: 2, call: "same", text: "tk run"}
+	matcher := codexWaitMatcher{next: map[codexWaitEventKey]int{}, byEvent: map[codexWaitEventKey][]codexWaitResult{
+		key: {{command: "first"}, {command: "second"}},
+	}}
+	for _, want := range []string{"first", "second"} {
+		got, ok := matcher.take(key)
+		if !ok || got.command != want {
+			t.Fatalf("take = (%+v, %t), want %q", got, ok, want)
+		}
+	}
+	if _, ok := matcher.take(key); ok {
+		t.Fatal("take returned a result after consuming the list")
+	}
+}
+
+func TestWaitCodexDoesNotReplaceOutputWithZeroCompletionTime(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 2, call: "zero-end", text: "tl result", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: call.text}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	out := cachedWaitEvent{Role: transcript.Out, CallID: call.call, Time: base.Add(2 * time.Second)}
+	matcher.applyCached(&out)
+	if !out.Time.Equal(base.Add(2 * time.Second)) {
+		t.Fatalf("output time = %v, was replaced with zero completion time", out.Time)
+	}
+}
+
+func TestWaitCodexRequiresCommandStartInsideCallWindow(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	old := codexWaitCall{line: 3, call: "old", text: "tl 0a1b2c3d:350 0a1b2c3d:706", at: base, out: base.Add(2 * time.Hour)}
+	newer := codexWaitCall{line: 8, call: "new", text: "tl 0a1b2c3d:350", at: base.Add(90 * time.Minute), out: base.Add(91 * time.Minute)}
+	result := transcript.CodexCommandResult{Line: 12, Started: base.Add(30 * time.Minute), Completed: base.Add(90*time.Minute + 800*time.Millisecond), Command: "tl 0a1b2c3d:350 0a1b2c3d:706"}
+	matcher := matchCodexWaitResults([]codexWaitCall{old, newer}, []transcript.CodexCommandResult{result})
+	if got := len(matcher.byEvent[codexWaitEventKey{line: newer.line, call: newer.call, text: newer.text}]); got != 0 {
+		t.Fatalf("late concatenated result was assigned to newer call: %d results", got)
+	}
+	if got := len(matcher.byEvent[codexWaitEventKey{line: old.line, call: old.call, text: old.text}]); got != 1 {
+		t.Fatalf("late result was not kept with its actual call: %d results", got)
+	}
+}
+
+func TestWaitCodexRejectsCompletionStartedBeforeCall(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 5, call: "retry", text: "tl 0a1b2c3d:350", at: base.Add(time.Hour), out: base.Add(time.Hour + time.Second)}
+	result := transcript.CodexCommandResult{Line: 10, Started: base, Completed: base.Add(time.Second), Command: call.text}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent) != 0 {
+		t.Fatalf("completion from before call matched: %v", matcher.byEvent)
+	}
+}
+
+func TestWaitCodexNormalizesQuotedCommandText(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	call := codexWaitCall{line: 2, call: "quoted", text: "  tl 'quoted arg'\\n--flag  ", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: "tl 'quoted arg'\n--flag"}
+	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent[codexWaitEventKey{line: call.line, call: call.call, text: call.text}]) != 1 {
+		t.Fatal("trimmed command with escaped newline was not matched")
+	}
+}
+
+func TestWaitCodexChoosesLatestEligibleCallAndRemovesIt(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	cmd := "tl"
+	calls := []codexWaitCall{
+		{line: 2, call: "first", text: cmd, at: base, out: base.Add(3 * time.Second)},
+		{line: 4, call: "second", text: cmd, at: base.Add(time.Second), out: base.Add(4 * time.Second)},
+	}
+	results := []transcript.CodexCommandResult{
+		{Line: 6, Started: base.Add(1500 * time.Millisecond), Completed: base.Add(2 * time.Second), Command: "tl alpha"},
+		{Line: 8, Started: base.Add(3500 * time.Millisecond), Completed: base.Add(4 * time.Second), Command: "tl beta"},
+	}
+	matcher := matchCodexWaitResults(calls, results)
+	first := matcher.byEvent[codexWaitEventKey{line: calls[0].line, call: calls[0].call, text: calls[0].text}]
+	second := matcher.byEvent[codexWaitEventKey{line: calls[1].line, call: calls[1].call, text: calls[1].text}]
+	if len(first) != 1 || !first[0].end.Equal(results[1].Completed) || len(second) != 1 || !second[0].end.Equal(results[0].Completed) {
+		t.Fatalf("latest eligible assignment: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestWaitCodexBreaksSameLineCandidateTieByOrder(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	first := codexWaitCall{line: 2, call: "first", text: "tl tie", at: base, out: base.Add(time.Second)}
+	last := codexWaitCall{line: 2, call: "last", text: "tl tie", at: base, out: base.Add(time.Second)}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: "tl tie"}
+	matcher := matchCodexWaitResults([]codexWaitCall{first, last}, []transcript.CodexCommandResult{result})
+	if len(matcher.byEvent[codexWaitEventKey{line: last.line, call: last.call, text: last.text}]) != 1 || len(matcher.byEvent[codexWaitEventKey{line: first.line, call: first.call, text: first.text}]) != 0 {
+		t.Fatalf("same-line result did not go to the last candidate: %+v", matcher.byEvent)
+	}
+}
+
+func TestWaitCodexDoesNotIndexAmbiguousOrEmptyCallIDs(t *testing.T) {
+	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
+	cmd := "tl same"
+	calls := []codexWaitCall{
+		{line: 2, call: "parallel", text: cmd, at: base, out: base.Add(time.Second)},
+		{line: 3, call: "parallel", text: cmd, at: base, out: base.Add(time.Second)},
+		{line: 4, call: "", text: cmd, at: base, out: base.Add(time.Second)},
+	}
+	results := []transcript.CodexCommandResult{
+		{Line: 5, Started: base, Completed: base.Add(time.Second), Command: cmd},
+		{Line: 6, Started: base, Completed: base.Add(time.Second), Command: cmd},
+		{Line: 7, Started: base, Completed: base.Add(time.Second), Command: cmd},
+	}
+	matcher := matchCodexWaitResults(calls, results)
+	if _, ok := matcher.byCall["parallel"]; ok {
+		t.Fatal("multiple completions for a call ID were indexed")
+	}
+	if _, ok := matcher.byCall[""]; ok {
+		t.Fatal("empty call ID was indexed")
 	}
 }
 
