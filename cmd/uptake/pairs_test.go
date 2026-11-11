@@ -1270,6 +1270,8 @@ func TestDetectorBusyAfterMeasurement(t *testing.T) {
 		{"if uptime; then go test ./...; fi", true},
 		{"uptime --since; go test ./...", false},
 		{"uptime -s; go test ./...", false},
+		{"uptime -p; go test ./...", false},
+		{"uptime -h; go test ./...", false},
 		{"uptime -r; go test ./...", true},
 		{"uptime -c; go test ./...", true},
 		{"uptime --raw; go test ./...", true},
@@ -1341,6 +1343,30 @@ func TestDetectorBusyAllowsIntermediateCommands(t *testing.T) {
 	}
 }
 
+func TestDetectorShadowParseError(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	e := transcript.Event{Role: transcript.Cmd, Text: "uptime; if", Time: time.Now()}
+	next := transcript.Event{Role: transcript.Cmd, Text: "go test ./...", Time: e.Time.Add(time.Second)}
+	u.recordPairOld("s", "agent", "", []transcript.Event{e, next}, nil, shellcmd.Call{Name: "uptime", Raw: "uptime", Offset: 0}, e.Text, 0, &e, "busy", "")
+	if len(u.pairCalls) != 0 {
+		t.Fatal("invalid shell command cannot establish an unshadowed probe")
+	}
+}
+
+func TestDetectorSearchGoalOptions(t *testing.T) {
+	for _, tc := range []struct{ cmd, want string }{
+		{"tl session --role=user --grep=яблоко", "яблоко"},
+		{"tl session --role user --grep яблоко", "яблоко"},
+		{"rg -e яблоко /synthetic/input", "яблоко"},
+		{"rg -e '-needle' /synthetic/input", "-needle"},
+	} {
+		calls, err := shellcmd.Calls(tc.cmd)
+		if err != nil || len(calls) == 0 || searchGoal(calls[0]) != tc.want {
+			t.Errorf("searchGoal(%q) = %q, err %v", tc.cmd, searchGoal(calls[0]), err)
+		}
+	}
+}
+
 func TestDetectorBoundaries(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
 	base := time.Now()
@@ -1356,6 +1382,10 @@ func TestDetectorBoundaries(t *testing.T) {
 	}
 	if u.waitPairGoal(shellcmd.Call{Name: "sleep", Args: []string{"1"}, Offset: -1}, "sleep 1; test -f /synthetic/ready") != "" {
 		t.Error("sleep without an offset was accepted")
+	}
+	quoted := "bash -c $'  while test -f /synthetic/ready; do sleep 1; done'"
+	if u.waitLoopGoal(quoted, strings.Index(quoted, "sleep")) == "" {
+		t.Error("quoted loop with leading whitespace was not detected")
 	}
 }
 
@@ -1378,17 +1408,30 @@ func TestDetectorPrecision(t *testing.T) {
 		{"grep 'red=blue green' ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep 'red<blue green' ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep 'red>blue green' ~/.claude/projects/s.jsonl", "user-word", false},
-		{"grep syntheticwordlong ~/.claude/projects/s.jsonl", "user-word", true},
+
+		{"rg -c wfor ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep -l graft ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'graft review job42' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'graft is useful' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"grep -c Bash ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep костыли ~/.claude/projects/s.jsonl", "user-word", true},
+		{"grep apple ~/.claude/projects/s.jsonl", "user-word", true},
 		{"rg -l 'яблоко|груша' ~/.claude/projects/s.jsonl", "user-word", true},
 		{"rg -m 5 -A 3 -B 2 -C 1 needle ~/.claude/projects/s.jsonl", "user-word", true},
 		{"rg -e 'яблоко' ~/.claude/projects/s.jsonl", "user-word", true},
 		{"f=~/.claude/projects/s.jsonl; rg яблоко \"$f\"", "user-word", true},
+		{"for f in ~/.claude/projects/*/*.jsonl; do rg яблоко \"$f\"; done", "user-word", true},
+		{"F=$(ls -t ~/.claude/projects/*/*.jsonl | head -1); grep яблоко \"$F\"", "user-word", true},
+		{"for f in /synthetic/*; do rg яблоко \"$f\"; done; echo ~/.claude/projects/a.jsonl", "user-word", false},
 		{"f=/synthetic/table.txt; echo ~/.claude/projects/s.jsonl; rg яблоко \"$f\"", "user-word", false},
 		{"rg '~/.claude/projects/s.jsonl' /synthetic/list.txt", "user-word", false},
 		{"rg -m 5 -A 3 -B 2 -C 1 'exit code' ~/.claude/projects/s.jsonl", "user-word", false},
 		{"tl --role user --grep яблоко", "user-word", true},
-		{"tl --role user,agent --grep яблоко", "user-word", false},
+		{"tl --role user,agent --grep яблоко", "user-word", true},
+		{"tl --role ask,user --grep яблоко", "user-word", true},
+		{"tl --role assistant --grep яблоко", "user-word", false},
 		{"tl --role=user --grep яблоко", "user-word", true},
+		{"tl --role=user,ask --grep=яблоко", "user-word", true},
 		{"grep package.TypeName ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep package.Component ~/.claude/projects/s.jsonl", "user-word", false},
 		{"jq '.message.type' ~/.claude/projects/s.jsonl", "user-word", false},
@@ -1406,11 +1449,15 @@ func TestDetectorPrecision(t *testing.T) {
 		{"curl -fsS https://example.test; sleep 1; test -s /synthetic/ready", "wfor", true},
 		{"if echo hi; then echo ok; fi; sleep 1; curl -fsS https://example.test", "wfor", true},
 		{"curl -fsS https://example.test; sleep 1; curl -fsS https://example.test", "wfor", false},
+		{"curl -fsS https://example.test/a; sleep 1; curl -fsS https://example.test/b", "wfor", false},
 		{"sleep 1; printf update; test -f /synthetic/ready", "wfor", true},
 		{"sleep 1; touch /synthetic/other", "wfor", false},
 		{"sleep 0; test -f /synthetic/ready", "wfor", false},
 		{"sleep 2; curl -fsS https://example.test", "wfor", true},
 		{"while :; do s=$(curl -fsS https://example.test); case \"$s\" in *done*) break;; esac; sleep 15; done", "wfor", true},
+		{"for x in a b c; do sleep 1; ls /synthetic/data; case $x in c) break;; esac; done", "wfor", false},
+		{"while true; do if grep -q DONE /synthetic/log; then exit 1; fi; sleep 5; done", "wfor", false},
+		{"while true; do if test -f /synthetic/ready; then return 1; fi; sleep 5; done", "wfor", false},
 		{"bash -c 'key='\"$key\"'; while :; do s=$(curl -fsS https://example.test); case \"$s\" in *done*) break;; esac; sleep 15; done'", "wfor", true},
 		{"while true; do if grep -q DONE /synthetic/log; then exit 0; fi; sleep 5; done", "wfor", true},
 		{"while true; do if test -f /synthetic/ready; then return 0; fi; sleep 5; done", "wfor", true},
@@ -1426,6 +1473,7 @@ func TestDetectorPrecision(t *testing.T) {
 		{"while true; do sleep 1; if test -f /synthetic/busy; then echo busy; else break; fi; done", "wfor", true},
 		{"while test -f /synthetic/busy; do sleep 1; done", "wfor", true},
 		{"timeout 4 bash -c 'until test -f /synthetic/ready; do sleep 1; done'", "wfor", true},
+		{"timeout 4 bash -c '  until test -f /synthetic/ready; do sleep 1; done'", "wfor", true},
 		{"timeout 4 bash -c 'while true; do sleep 1; ls /synthetic/data; done'", "wfor", false},
 		{"for i in 1 2; do curl -fsS https://example.test && break; sleep 1; done", "wfor", true},
 		{"cp ~/.claude/skills/demo/SKILL.md /synthetic/out", "claude-rules-export", true},
@@ -1435,6 +1483,8 @@ func TestDetectorPrecision(t *testing.T) {
 		{"rg choice ~/.claude/improve/state/notes.md", "prior", true},
 		{"sed -n '1,4p' /synthetic/main.go; rg status ~/.claude/improve/runs/check.md", "prior", false},
 		{"rg status ~/.claude/improve/runs/check.md; sed -n '1,4p' /synthetic/main.go", "prior", true},
+		{"cat /synthetic/main.go; cat ~/.claude/improve/runs/check.md", "prior", false},
+		{"cat ~/.claude/improve/runs/check.md; cat /synthetic/main.go", "prior", true},
 		{"rg '~/.claude/improve/state/notes.md' /synthetic/data.txt", "prior", false},
 		{"rg choice ~/.claude/improve/trials/record.md", "prior", true},
 		{"rg choice ~/.claude/improve/record.md", "prior", true},
@@ -1447,10 +1497,16 @@ func TestDetectorPrecision(t *testing.T) {
 		{"rg choice ~/.claude/improve/state/perf/measure.tsv", "prior", false},
 		{"rg choice ~/.claude/improve/new-section/registry.txt", "prior", true},
 		{"rg choice ~/.claude/improve/runs/raw/output.jsonl", "prior", false},
+		{"rg choice ~/.claude/improve/runs/raw/output.log", "prior", false},
 		{"rg choice ~/.claude/improve/runs/report.md", "prior", false},
+		{"rg choice ~/.claude/improve/runs/report-daily.md", "prior", false},
+		{"cat ~/.claude/improve/runs/report-daily.md", "prior", false},
 		{"rg 'experiment|trial' ~/.claude/improve/runs/report.md", "prior", true},
+		{"rg 'проблема' ~/.claude/improve/runs/report.md", "prior", false},
+		{"rg 'пробы' ~/.claude/improve/runs/report.md", "prior", true},
 		{"rg choice ~/.claude/improve/runs/raw/registry.txt", "prior", true},
 		{"grep --include='*.json' choice ~/.claude/improve/runs", "prior", false},
+		{"grep --include '*.json' choice ~/.claude/improve/runs", "prior", false},
 		{"grep --include='*.tsv' choice ~/.claude/improve/runs", "prior", true},
 		{"rg --glob='*.jsonl' choice ~/.claude/improve/runs", "prior", false},
 		{"rg -g'*.json' choice ~/.claude/improve/runs", "prior", false},
@@ -1462,6 +1518,8 @@ func TestDetectorPrecision(t *testing.T) {
 		{"cat ~/.claude/improve/runs/example.md", "prior", true},
 		{"sed -n '1,4p' ~/.claude/improve/runs/example.md", "prior", true},
 		{"sed -n '1,4p' ~/.claude/improve/runs/example.md | cut -c1-20 >/dev/null", "prior", false},
+		{"cat ~/.claude/improve/runs/example.md | cut -c1-20 | head -1 >/dev/null", "prior", false},
+		{"cat ~/.claude/improve/runs/example.md 2>/dev/null", "prior", true},
 		{"sed -i s/a/b/ ~/.claude/improve/runs/example.md", "prior", false},
 	} {
 		t.Run(tc.command, func(t *testing.T) {
