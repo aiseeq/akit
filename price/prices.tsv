@@ -5,7 +5,7 @@
 #   Вход сверх 272K токенов OpenAI считает вдвое, но лимит Codex этой надбавки не считает: здесь базовая цена.
 # DeepSeek — https://api-docs.deepseek.com/quick_start/pricing, пиковая цена (вне пика вдвое дешевле), бесплатный
 #   период считается платным. GLM и LongCat цены не публикуют — их в таблице нет, а не цена чужой модели.
-# Waibee (шлюз) — каталог /v1/models, поле pricing (prompt, input_cache_read, completion), проверено 2026-11-02;
+# Waibee (шлюз) — каталог /v1/models, поле pricing (prompt, input_cache_read, completion), проверено 2026-11-11;
 #   цены записи кэша каталог не даёт — записаны как вход.
 # tier: base — обычная; long — запрос с входом (вход + запись + чтение кэша) больше long_above токенов; fast — режим Fast.
 # model	tier	in	write5m	write1h	read	out	long_above
@@ -27,5 +27,5 @@ gpt-6.1-terra	base	1	1.25	1.25	0.05	5
 gpt-6-luna	base	0.10	0.125	0.125	0.01	0.50
 gpt-6-luna-fast	base	0.20	0.25	0.25	0.02	1
 deepseek-v4.1-flash-free	base	0.30	0.30	0.30	0.006	1.20
-deepseek-v4.1-flash-1017	base	0.30	0.30	0.30	0.006	1.20
+deepseek-v4.1-flash-1017	base	0.006	0.006	0.006	0.005	0.50
 qwen3.8-flash	base	0.15	0.15	0.15	0.016	0.47

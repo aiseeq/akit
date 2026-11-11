@@ -90,7 +90,7 @@ func TestTerra(t *testing.T) {
 
 func TestGatewayFlashModels(t *testing.T) {
 	u := Usage{Input: 1e6, Output: 1e6, CacheRead: 1e6, CacheWrite: 1e6}
-	if c, ok := Cost("deepseek-v4.1-flash-1017", u); !ok || !near(c, 1.806) {
+	if c, ok := Cost("deepseek-v4.1-flash-1017", u); !ok || !near(c, 0.517) {
 		t.Errorf("deepseek-v4.1-flash-1017: %v %v", c, ok)
 	}
 	if c, ok := Cost("qwen3.8-flash", u); !ok || !near(c, 0.786) {
