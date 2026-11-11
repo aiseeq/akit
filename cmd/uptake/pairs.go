@@ -1262,24 +1262,15 @@ func (u *run) waitPairGoal(c shellcmd.Call, cmd string) string {
 			if previous[i].Name != "curl" {
 				continue
 			}
-			endpoint := curlEndpoint(check)
-			if endpoint != "" && endpoint == curlEndpoint(previous[i]) && conditionalCall(after, check.Offset) {
+			// The nearest earlier request decides: the same address checked under
+			// if, && or || after the pause is a poll; anything else is pacing.
+			if u.waitGoal(previous[i].Raw) == goal && conditionalCall(after, check.Offset) {
 				break
 			}
 			return ""
 		}
 	}
 	return goal
-}
-
-// curlEndpoint returns a literal URL, avoiding option values when comparing requests.
-func curlEndpoint(c shellcmd.Call) string {
-	for _, arg := range c.Args {
-		if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
-			return arg
-		}
-	}
-	return ""
 }
 
 // conditionalCall reports whether a call controls an if or a boolean chain.
