@@ -241,6 +241,41 @@ func TestMaskBareCodeValueAfterShortAssignment(t *testing.T) {
 	}
 }
 
+func TestMaskRealTranscriptFalseMaskForms(t *testing.T) {
+	cases := []struct {
+		name, ordinary, secret string
+	}{
+		{"code type", `const auth: Record<map[string]*Thing> = {}`, `auth: sk-` + strings.Repeat("a1B", 10)},
+		{"function call", `auth: authority(x)`, `auth: Zq7xW9vK2m`},
+		{"json object", `"https://api.example.com/auth": {"plan": "pro"}`, `"https://api.example.com/auth": "8f3a9c2e7b1d4f60"`},
+		{"go map literal", `"https://api.example.com/auth": map[string]string{"plan": "pro"}`, `auth: sk-` + strings.Repeat("a1B", 10)},
+		{"pwd error", `pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory`, `pwd: Zq7xW9vK2m`},
+		{"short number", `financial=30, auth=60, general=300`, `auth=8f3a9c2e7b1d`},
+		{"go struct", `{Name:work Home:/tmp/x/001 Auth:/tmp/x/001/auth.json} <nil>`, `Auth:Zq7xW9vK2mPq`},
+		{"simple path", `credentials: /Users/me/MyApp/creds.json`, `credentials: /tmp/ApiKey2024`},
+		{"long temp path", `Auth:/tmp/test-runner-IntegrationSuite987654321/001/auth.json`, `Auth:/tmp/ApiKey2024`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, found := Mask(tc.ordinary); got != tc.ordinary || len(found) != 0 {
+				t.Errorf("ordinary form changed: %q, %v", got, found)
+			}
+			got, found := Mask(tc.secret)
+			if strings.Contains(got, "Zq7xW9vK2m") || strings.Contains(got, "8f3a9c2e7b1d4f60") || strings.Contains(got, strings.Repeat("a1B", 10)) || len(found) == 0 {
+				t.Errorf("secret value remained: %q, %v", got, found)
+			}
+		})
+	}
+}
+
+func TestMaskGoCompositeLiteralStillMasksNestedSecret(t *testing.T) {
+	text := `auth: map[string]string{"password": "sk-` + strings.Repeat("a1B", 10) + `"}`
+	got, found := Mask(text)
+	if !strings.Contains(got, `"password": "[скрыто:sk]"`) || len(found) == 0 {
+		t.Errorf("nested secret was not masked: %q %v", got, found)
+	}
+}
+
 func TestMaskPlainTextUnchanged(t *testing.T) {
 	text := "go test ./... — ok; AKIA short; sk-1; ghp_x\n"
 	got, found := Mask(text)

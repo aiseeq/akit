@@ -793,7 +793,7 @@ func nameMatches(text string) []contextMatch {
 		if valueIsStructure(text, value) {
 			continue
 		}
-		if plainValueFor(name, text[value.start:value.end]) {
+		if plainValueFor(name, text[value.start:value.end]) || nonSecretValueForm(text, value, name) {
 			continue
 		}
 		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
@@ -810,8 +810,63 @@ func nameMatches(text string) []contextMatch {
 	return matches
 }
 
-// contextSecretName is secretName for the name at text[start:end]. After a
-// written line break the letter of \n can be no part of the name.
+// nonSecretValueForm recognizes code and diagnostic syntax that cannot be a credential.
+func nonSecretValueForm(text string, value contextValue, name string) bool {
+	v := text[value.start:value.end]
+	if value.quoted {
+		return false
+	}
+	if strings.EqualFold(name, "pwd") && strings.EqualFold(v, "error") {
+		return true
+	}
+	return typeExpressionHead(v) || goCompositeLiteralHead(v) || shortNumberWithComma(v)
+}
+
+func typeExpressionHead(value string) bool {
+	angle := strings.IndexByte(value, '<')
+	if angle < 2 || value[0] < 'A' || value[0] > 'Z' {
+		return false
+	}
+	for i := 1; i < angle; i++ {
+		c := value[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// goCompositeLiteralHead recognizes a type immediately followed by the opening
+// brace of a Go composite literal, such as T{, []T{ or map[string]T{.
+func goCompositeLiteralHead(value string) bool {
+	if !strings.HasSuffix(value, "{") {
+		return false
+	}
+	typeName := value[:len(value)-1]
+	if typeName == "" {
+		return false
+	}
+	identifier := false
+	for i := 0; i < len(typeName); i++ {
+		c := typeName[i]
+		switch {
+		case c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.ContainsRune("_.*[]", rune(c)):
+			identifier = identifier || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+		default:
+			return false
+		}
+	}
+	return identifier
+}
+
+func shortNumberWithComma(value string) bool {
+	if !strings.HasSuffix(value, ",") {
+		return false
+	}
+	number := value[:len(value)-1]
+	return len(number) > 0 && len(number) <= 6 && onlyDigits(number)
+}
+
 func contextSecretName(text string, start, end int) (string, string, bool) {
 	name := text[start:end]
 	kind, ok := secretName(name)
@@ -1315,12 +1370,50 @@ func isPlainPath(value string) bool {
 	default:
 		return false
 	}
+	relaxed := false
 	for part := range strings.SplitSeq(rest, "/") {
-		if part != "" && !isPlainWord(part) {
+		if part == "" {
+			continue
+		}
+		if !isPlainPathComponent(part) {
 			return false
+		}
+		if !isPlainWord(part) {
+			relaxed = true
+		}
+	}
+	if relaxed {
+		for part := range strings.SplitSeq(rest, "/") {
+			if strings.ContainsAny(part, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") && strings.ContainsAny(part, "0123456789") && len(part) < 24 {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+// isPlainPathComponent accepts short alphabetic components and long generated
+// directory names; numeric mixed-case components remain token-shaped.
+func isPlainPathComponent(part string) bool {
+	if isPlainWord(part) {
+		return true
+	}
+	longNumeric := len(part) >= 24 && strings.ContainsAny(part, "0123456789")
+	shortAlphabetic := len(part) < 16 && !strings.ContainsAny(part, "0123456789")
+	return (longNumeric || shortAlphabetic) && pathComponentChars(part, longNumeric)
+}
+
+func pathComponentChars(part string, digits bool) bool {
+	for i := range len(part) {
+		c := part[i]
+		letter := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+		separator := c == '-' || c == '_' || c == '.'
+		number := digits && c >= '0' && c <= '9'
+		if !letter && !separator && !number {
+			return false
+		}
+	}
+	return part != ""
 }
 
 // isPlainWord: letters, digits, -, _ and . that do not look like a token. A
