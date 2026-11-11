@@ -169,6 +169,15 @@ func (g Gate) For(project string) (Scope, error) {
 	return scope, nil
 }
 
+// CritOnlyReason is "root: reason" when crit_only closes new work beyond CRIT
+// for the project, else "": readers show it so the reason lives in the gate.
+func (s Scope) CritOnlyReason() string {
+	if s.CritRoot == "" {
+		return ""
+	}
+	return s.CritRoot + ": " + s.CritOnly
+}
+
 // Passes says whether a ticket of this priority and difficulty clears the bar.
 // CRIT always does; under crit_only of the project's root nothing else does,
 // live list or not. Otherwise HIGH does too; under an untrusted gate nothing
