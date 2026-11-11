@@ -306,13 +306,18 @@ func TestReadCritOnly(t *testing.T) {
 		t.Fatalf("crit_only on a known root: %+v", g)
 	}
 	g = Read(writeGate(t, fmt.Sprintf(`{"at":%q,"open_by_root":{"/w":[]},"crit_only":{"/x":"day off","/w":"day off","/a":"x"}}`, at)), now)
-	if g.Valid || !strings.HasSuffix(g.Problem, `missing from open_by_root (or empty): "/a", "/x"`) {
+	if g.Valid || !strings.HasSuffix(g.Problem, `missing from open_by_root or not absolute: "/a", "/x"`) {
 		t.Fatalf("crit_only on unknown roots: Valid=%v Problem=%q", g.Valid, g.Problem)
 	}
 	// "" is what the root choice gives a project under no root, so it cannot name one.
 	g = Read(writeGate(t, fmt.Sprintf(`{"at":%q,"open_by_root":{"":[]},"crit_only":{"":"day off"}}`, at)), now)
-	if g.Valid || !strings.HasSuffix(g.Problem, `missing from open_by_root (or empty): ""`) {
+	if g.Valid || !strings.HasSuffix(g.Problem, `missing from open_by_root or not absolute: ""`) {
 		t.Fatalf("crit_only on an empty root: Valid=%v Problem=%q", g.Valid, g.Problem)
+	}
+	// The root choice skips relative roots, so such a key would close nothing.
+	g = Read(writeGate(t, fmt.Sprintf(`{"at":%q,"open_by_root":{"w":[]},"crit_only":{"w":"day off"}}`, at)), now)
+	if g.Valid || !strings.HasSuffix(g.Problem, `not absolute: "w"`) {
+		t.Fatalf("crit_only on a relative root: Valid=%v Problem=%q", g.Valid, g.Problem)
 	}
 }
 
@@ -362,6 +367,10 @@ func TestCritOnlyClosesAllButCrit(t *testing.T) {
 	s, err := closed.For(inWork)
 	if err != nil || s.CritRoot != work || s.CritOnly != "day off" {
 		t.Fatalf("For names the root and reason: %+v, %v", s, err)
+	}
+	noReason := Gate{Valid: true, OpenByRoot: roots, CritOnly: map[string]string{work: ""}}
+	if s, err := noReason.For(inWork); err != nil || s.Passes("HIGH", "DO") {
+		t.Fatalf("a root listed without a reason still closes: %+v, %v", s, err)
 	}
 	if s, err := closed.For(inOther); err != nil || s.CritRoot != "" || s.CritOnly != "" {
 		t.Fatalf("another root has no reason: %+v, %v", s, err)

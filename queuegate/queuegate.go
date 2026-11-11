@@ -71,13 +71,13 @@ func Read(path string, now time.Time) Gate {
 	return gate
 }
 
-// critOnlyProblem names crit_only roots missing from open_by_root: the root
-// choice could never select them, and guessing which projects they cover is
-// not safe.
+// critOnlyProblem names crit_only roots missing from open_by_root or not
+// absolute: the root choice could never select them, and guessing which
+// projects they cover is not safe.
 func critOnlyProblem(g Gate) string {
 	roots := make([]string, 0, len(g.CritOnly))
 	for root := range g.CritOnly {
-		if _, ok := g.OpenByRoot[root]; !ok || root == "" {
+		if _, ok := g.OpenByRoot[root]; !ok || !filepath.IsAbs(root) {
 			roots = append(roots, strconv.Quote(root))
 		}
 	}
@@ -85,7 +85,7 @@ func critOnlyProblem(g Gate) string {
 		return ""
 	}
 	slices.Sort(roots)
-	return "gate.json crit_only has roots missing from open_by_root (or empty): " + strings.Join(roots, ", ")
+	return "gate.json crit_only has roots missing from open_by_root or not absolute: " + strings.Join(roots, ", ")
 }
 
 // Pairs is the open list of the longest root holding the project, else the
