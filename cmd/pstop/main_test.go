@@ -26,8 +26,8 @@ func TestParseSignal(t *testing.T) {
 
 func TestKilledLine(t *testing.T) {
 	for killed, want := range map[int]string{
-		1: "stop: 7 killed 1 process after 2s grace",
-		3: "stop: 7 killed 3 processes after 2s grace",
+		1: "pstop: 7 killed 1 process after 2s grace",
+		3: "pstop: 7 killed 3 processes after 2s grace",
 	} {
 		if got := killedLine(7, killed, 2*time.Second); got != want {
 			t.Errorf("killed %d: %q, want %q", killed, got, want)

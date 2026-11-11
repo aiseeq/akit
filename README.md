@@ -10,21 +10,21 @@ Install: `graft install` — builds `cmd/...` into `bin/` and installs into `~/b
 
 `codexlimit` provides `Read` for weekly account limits, `Consume` for reset credits, and `ReadApproved` for reset approvals.
 
-## stop
+## pstop
 
-`stop [--grace D] [--signal S] PID` sends the request signal to the processes
+`pstop [--grace D] [--signal S] PID` sends the request signal to the processes
 of the tree observed before the request, then sends SIGKILL to tracked survivors,
 including processes found while waiting (such as a cleanup the target starts on
 the request), after the grace. Its answer says whether SIGKILL was needed and how
 many processes received it. A failure for one process does not stop the others:
-`stop` then exits 1 naming each failed PID. It accepts a descendant of itself or
+`pstop` then exits 1 naming each failed PID. It accepts a descendant of itself or
 of the consecutive shells directly above it (told by the program they run, so
 scripts count), allowing calls from a shell, a script, `$(...)`, and `bash -c`. A non-shell (a terminal, a multiplexer, an agent, any
 program) and a service manager are never owners, even as the direct parent: a
-shell running `stop` as its last command replaces itself with it. Stopping a job
+shell running `pstop` as its last command replaces itself with it. Stopping a job
 of another terminal tab or another agent call is not this tool's job; a program
 stopping its own child uses `proc.StopChild`. See
-`stop -h` for the PID identity and tree discovery limits. It requires Linux
+`pstop -h` for the PID identity and tree discovery limits. It requires Linux
 pidfds and refuses unsafe targets. The default grace is 2s.
 
 `proc.StopChild(pid, grace, request)` provides the same observed-tree stopping
