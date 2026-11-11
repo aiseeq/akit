@@ -141,6 +141,7 @@ var planTimeout = 8 * time.Minute
 
 type options struct {
 	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back, parent string
+	timeNow                                                                                                                                                    time.Time
 	all, due, json, required, take, journal, head, tailSet                                                                                                     bool
 	older, timeout                                                                                                                                             time.Duration
 	tail                                                                                                                                                       int
@@ -174,13 +175,13 @@ func runMain(args []string, now time.Time, out, errout io.Writer) int {
 		fmt.Fprintf(errout, "tk: %v\n(tk -h for usage)\n", e)
 		return exitUsage
 	}
-	// A time in the text is no usage mistake: the reason stays the last line, which a caller cutting
-	// the output to its tail still sees.
-	if e = validateApproxTime(o, now); e != nil {
-		fmt.Fprintf(errout, "tk: %v\n", e)
-		return exitUsage
+	o.timeNow = now
+	hint := timeHint(o, now)
+	code := run(o, out, errout)
+	if code == 0 && hint != "" {
+		fmt.Fprintln(errout, hint)
 	}
-	return run(o, out, errout)
+	return code
 }
 func parseArgs(a []string) (options, error) {
 	if len(a) == 0 {
@@ -213,27 +214,41 @@ func parseArgs(a []string) (options, error) {
 }
 
 // validateOneLine — текст, который ложится в строку журнала или заголовок, — одна строка: перевод строки
-// вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел. Текст журнала без
-// угаданного времени: у записи есть точная метка.
+// вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел.
 func validateOneLine(o options) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--back", o.back}, {"--until", o.until}, {"--add", o.add}, {"--repin", o.repin}} {
 		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
 	}
-	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until}} {
-		if m := guessedTime.FindString(f.value); m != "" {
-			return fmt.Errorf("%s: %q looks like a guessed time; the time of the entry is its journal stamp, write the exact time from date or drop it", f.flag, strings.TrimSpace(m))
-		}
-	}
 	return nil
 }
 
-// validateApproxTime — время в тексте журнала позже метки записи — угаданное будущее время: запись пишется сейчас,
-// и её метка уже точная. Проверяются «~03:00» в любом месте и время в начале текста («17:40 проверка …» —
-// самодельная метка события); время в середине текста бывает сроком или планом («ждёт до 18:00») и не проверяется.
-// Сравнение — по кругу суток: «~00:05» в 23:58 — тоже будущее, «~23:50» в 00:05 — прошлое; будущим считается сдвиг
-// больше минуты и меньше 12 часов.
+// timeHint возвращает подсказку о подозрительном времени; вызывающая сторона пишет её только после успеха.
+func timeHint(o options, now time.Time) string {
+	values := []string{o.note, o.check, o.why, o.until}
+	for _, value := range values {
+		if guessedTime.MatchString(value) || validateApproxTime(options{note: value}, now) != nil {
+			return "tk: замечено угаданное или будущее время; время записи — её метка, точное время — из date; проверьте запись"
+		}
+	}
+	return ""
+}
+
+func markedJournalText(o options, value string) string {
+	now := o.timeNow
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if guessedTime.MatchString(value) || validateApproxTime(options{note: value}, now) != nil {
+		return value + " [время требует проверки]"
+	}
+	return value
+}
+
+// validateApproxTime находит время позже метки записи: «~03:00» где угодно и время в начале («17:40 проверка»).
+// Время в середине может быть сроком или планом («ждёт до 18:00»). Время сравнивается по кругу суток;
+// будущим считается сдвиг больше минуты и меньше 12 часов.
 func validateApproxTime(o options, now time.Time) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}} {
 		found := approxTime.FindAllStringSubmatchIndex(f.value, -1)
@@ -2816,7 +2831,7 @@ func repinPlanItem(t task, o options, out, errout io.Writer) int {
 		return exitUsage
 	}
 
-	entry, err := repinJournalEntry(time.Now().Format("2006-01-02 15:04"), s, name, pin.cmd, command, o.why)
+	entry, err := repinJournalEntry(time.Now().Format("2006-01-02 15:04"), s, name, pin.cmd, command, markedJournalText(o, o.why))
 	if err != nil {
 		fmt.Fprintf(errout, "tk: %v\n", err)
 		return exitUsage
@@ -3009,7 +3024,7 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 		fmt.Fprintf(errout, "tk: plan name %q not found\n", o.item)
 		return exitNone
 	}
-	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, o.why)
+	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, markedJournalText(o, o.why))
 	body := journal(t.body, line)
 	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
@@ -3034,7 +3049,7 @@ func unskipPlanItem(t task, o options, out, errout io.Writer) int {
 			fmt.Fprintf(errout, "tk: plan item %q is not skipped; nothing to return\n", o.item)
 			return exitUsage
 		}
-		line := fmt.Sprintf("- %s план — %s: возвращён: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, o.why)
+		line := fmt.Sprintf("- %s план — %s: возвращён: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, markedJournalText(o, o.why))
 		if err := writeTask(t.path, journal(t.body, line)); err != nil {
 			return fail(errout, err)
 		}
@@ -3527,19 +3542,19 @@ func transitionJournal(o options, next string, glintFindings int) string {
 		if checkSession != "" && !strings.EqualFold(checkSession, o.by) {
 			line = fmt.Sprintf("- %s %s — %s (session %s)", time.Now().Format("2006-01-02 15:04"), next, o.by, checkSession)
 		}
-		line += ": " + o.check
+		line += ": " + markedJournalText(o, o.check)
 		if glintFindings > 0 && o.glintDebt != "" {
 			line += fmt.Sprintf("; glint: %d findings, debt %s", glintFindings, o.glintDebt)
 		}
 	}
 	if o.cmd == "reject" || o.cmd == "release" {
-		line += " — " + o.why
+		line += " — " + markedJournalText(o, o.why)
 	}
 	if o.cmd == "review" && o.note != "" {
-		line += " — " + o.note
+		line += " — " + markedJournalText(o, o.note)
 	}
 	if o.cmd == "wait" {
-		line += " — " + o.until
+		line += " — " + markedJournalText(o, o.until)
 	}
 	return line
 }
@@ -3814,7 +3829,7 @@ func renameJournal(actor, oldPath, newPath string) string {
 var renameTaskFile = os.Rename
 
 func addNote(t task, o options, out, errout io.Writer) int {
-	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, o.note)
+	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, markedJournalText(o, o.note))
 	body := journal(t.body, line)
 	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)

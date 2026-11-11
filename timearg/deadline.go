@@ -27,6 +27,7 @@ type DayMonth struct {
 
 // clockLike — слово-часы после даты (ЧЧ:ММ[:СС]), даже невозможные.
 var clockLike = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{1,2}(:[0-9]{1,2})?$`)
+var datedGuessedClock = regexp.MustCompile(`(?i)^\s*(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[,:;]\s*|\s+)[0-9]{1,2}:[0-9]{1,2}[xх](?:\s|$)`)
 
 // Deadline — срок ожидания: время в начале строки «Ждёт:» (дата, дата с часами, «ДД.ММ ЧЧ:ММ», ISO с T, RFC3339,
 // часы; UTC после часов — в UTC, иначе местное), дальше — текст. Без времени в начале — условие, срока нет.
@@ -39,6 +40,9 @@ func Deadline(wait string, now time.Time) (time.Time, bool) {
 	// «2026-10-31 17:30: текст», «2026-11-06, после…» — знак после срока к сроку не относится.
 	for i := range min(2, len(f)) {
 		f[i] = strings.TrimRight(f[i], ":,;")
+	}
+	if datedGuessedClock.MatchString(wait) {
+		return time.Time{}, false
 	}
 	if t, err := time.Parse(time.RFC3339, f[0]); err == nil {
 		return t, true

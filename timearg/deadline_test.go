@@ -9,7 +9,7 @@ func TestDeadlineQuirks(t *testing.T) {
 	loc := time.FixedZone("CET", 3600)
 	now := time.Date(2026, 11, 10, 15, 0, 0, 0, loc)
 	// A day with impossible hours is no deadline, not that day at midnight.
-	for _, wait := range []string{"12.11 25:00 x", "2026-11-12 25:00 x", "12.11 9:61: x"} {
+	for _, wait := range []string{"12.11 25:00 x", "2026-11-12 25:00 x", "12.11 9:61: x", "12.11 06:4x", "2026-11-12 06:4х"} {
 		if at, ok := Deadline(wait, now); ok {
 			t.Errorf("Deadline(%q) = %v, want no deadline", wait, at)
 		}
