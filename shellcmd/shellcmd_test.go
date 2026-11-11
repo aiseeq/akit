@@ -262,6 +262,117 @@ func TestCallDetails(t *testing.T) {
 	}
 }
 
+func TestKillGuardForms(t *testing.T) {
+	tests := []struct {
+		command, name string
+		args, via     []string
+	}{
+		{`taskset -c 0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
+		{`chrt -o 0 kill 1`, "kill", []string{"1"}, []string{"chrt"}},
+		{`strace -o /dev/null kill 1`, "kill", []string{"1"}, []string{"strace"}},
+		{`setpriv --reuid=u1 kill 1`, "kill", []string{"1"}, []string{"setpriv"}},
+		{`unshare -U kill 1`, "kill", []string{"1"}, []string{"unshare"}},
+		{`flock /tmp/x kill 1`, "kill", []string{"1"}, []string{"flock"}},
+		{`busybox kill 1`, "kill", []string{"1"}, []string{"busybox"}},
+		{`systemd-run --user --scope pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"systemd-run"}},
+		{`parallel kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
+		{`runuser -u u1 -- kill 1`, "kill", []string{"1"}, []string{"runuser"}},
+		{`doas -u u1 kill 1`, "kill", []string{"1"}, []string{"doas"}},
+		{`eval "kill $P"`, "kill", []string{"$P"}, []string{"eval"}},
+		{`watch -n1 'kill 1'`, "kill", []string{"1"}, []string{"watch"}},
+		{`trap 'kill 1' EXIT`, "kill", []string{"1"}, []string{"trap"}},
+		{`su u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"su"}},
+		{`runuser -u u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`flock /tmp/x -c 'kill 1'`, "kill", []string{"1"}, []string{"flock"}},
+		{`script -qc 'pkill -u u1' /dev/null`, "pkill", []string{"-u", "u1"}, []string{"script"}},
+		{`tmux new-session -d 'pkill -u u1'`, "pkill", []string{"-u", "u1"}, []string{"tmux"}},
+		{`env -S 'kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`env -iS 'kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`env --split-string='kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`find . -exec kill {} +`, "kill", []string{"{}"}, []string{"find", "-exec"}},
+		{`find . -execdir pkill -u u1 \;`, "pkill", []string{"-u", "u1"}, []string{"find", "-execdir"}},
+		{`find . -ok kill {} \;`, "kill", []string{"{}"}, []string{"find", "-ok"}},
+		{`find . -okdir pkill -u u1 +`, "pkill", []string{"-u", "u1"}, []string{"find", "-okdir"}},
+		{`bash <<< 'kill 1'`, "kill", []string{"1"}, []string{"bash"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found []Call
+			for _, call := range calls {
+				if call.Name == tt.name {
+					found = append(found, call)
+				}
+			}
+			if len(found) != 1 || !reflect.DeepEqual(found[0].Args, tt.args) || !reflect.DeepEqual(found[0].Via, tt.via) {
+				t.Fatalf("%s calls = %#v; want %s %q via %q", tt.name, found, tt.name, tt.args, tt.via)
+			}
+		})
+	}
+}
+
+func TestUnknownShellScriptInput(t *testing.T) {
+	for _, command := range []string{
+		`echo 'kill 1' | bash`,
+		`echo 'kill 1' | bash -s`,
+		`source <(echo 'kill 1')`,
+		`. <(echo 'kill 1')`,
+		`bash <(echo 'kill 1')`,
+	} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.ScriptInput && (IsShell(call.Name) || call.Name == "source" || call.Name == ".") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%q: no call marked ScriptInput: %#v", command, calls)
+		}
+	}
+	calls, err := Calls(`bash -n`)
+	if err != nil || len(calls) != 1 || calls[0].ScriptInput {
+		t.Errorf("bash -n = %#v, %v", calls, err)
+	}
+	calls, err = Calls(`bash -n <<< 'kill 1'`)
+	if err != nil || len(calls) != 1 || calls[0].ScriptInput {
+		t.Errorf("bash -n here-string = %#v, %v", calls, err)
+	}
+}
+
+func TestKillGuardExistingForms(t *testing.T) {
+	for _, command := range []string{
+		`sudo -iu u1 kill 1`,
+		`$'kill' 1`,
+		`K=kill; $K 1`,
+		`f() { kill 1; }; f`,
+		`coproc kill 1`,
+		`while test x; do kill 1; done`,
+		`\kill 1`,
+		"bash <<'EOF'\nkill 1\nEOF",
+	} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		var found []Call
+		for _, call := range calls {
+			if call.Name == "kill" {
+				found = append(found, call)
+			}
+		}
+		if len(found) != 1 || !reflect.DeepEqual(found[0].Args, []string{"1"}) {
+			t.Errorf("%q: kill calls = %#v", command, found)
+		}
+	}
+}
+
 func TestOffset(t *testing.T) {
 	tests := []struct {
 		name, command, program string
