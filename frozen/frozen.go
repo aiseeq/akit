@@ -15,10 +15,9 @@ const fields = 4
 
 // Result describes one project's entry in a frozen-project list.
 type Result struct {
-	Reason     string
-	Frozen     bool
-	Incomplete bool
-	Line       int
+	Reason         string
+	Frozen         bool
+	IncompleteLine int
 }
 
 // List is a frozen-project list and the home directory used to expand ~/ paths.
@@ -44,9 +43,9 @@ func Read(home string) (List, error) {
 	return List{content: string(content), home: home, path: path}, nil
 }
 
-// NewList creates a list from content already read by the caller.
-func NewList(content, home string) List {
-	return List{content: content, home: home, path: Path(home)}
+// NewList creates a list from content and its source path, already read by the caller.
+func NewList(content, home, path string) List {
+	return List{content: content, home: home, path: path}
 }
 
 // Path returns the path of the list held by l.
@@ -81,10 +80,10 @@ func (l List) Frozen(project string, onLineError func(number int, line string, e
 		if !matches {
 			continue
 		}
-		result := Result{Reason: LineReason(line), Frozen: true, Line: number + 1}
+		result := Result{Reason: LineReason(line), Frozen: true}
 		if result.Reason == "" {
 			result.Reason = "incomplete line in the frozen list"
-			result.Incomplete = true
+			result.IncompleteLine = number + 1
 		}
 		return result, nil
 	}
@@ -92,7 +91,8 @@ func (l List) Frozen(project string, onLineError func(number int, line string, e
 }
 
 // Frozen reads the default list and checks project. Invalid rows are returned as
-// errors with the list path and line number instead of being silently discarded.
+// errors with the list path and line number. A matching row still returns frozen
+// true alongside such an error, so callers must honor the frozen result.
 func Frozen(project string) (reason string, frozen bool, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -111,13 +111,7 @@ func Frozen(project string) (reason string, frozen bool, err error) {
 	if err != nil {
 		return "", false, err
 	}
-	if rowErr != nil {
-		return "", false, rowErr
-	}
-	if result.Incomplete {
-		return result.Reason, true, nil
-	}
-	return result.Reason, result.Frozen, nil
+	return result.Reason, result.Frozen, rowErr
 }
 
 // LineNames reports whether a frozen-list line names want.
