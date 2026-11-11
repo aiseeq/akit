@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 // user-word --brief: сценарии, где проверка брифа могла бы выдать не то слово пользователя, на синтетике.
@@ -765,6 +767,156 @@ func TestBriefLaterCountsQuestionAnswers(t *testing.T) {
 	mustHave(t, "ответ в окне вопроса", out, "1 found", "answer in a question dialog", "Северный", "--- 1 more user lines not shown")
 }
 
+func TestPrefilterAnyUsesLaterFailureStates(t *testing.T) {
+	filter := prefilterAny([]string{"abcdeX", "bcdeY"})
+	if !filter([]byte("abcdeY")) {
+		t.Fatal("trie missed a match reached through a failure link")
+	}
+}
+
+func TestTranscriptTimestampAtAdaptiveWindow(t *testing.T) {
+	short := human("2026-10-31T08:00:00Z", "short")
+	long := `{"type":"user","timestamp":"2026-10-31T08:01:00Z","text":"` + strings.Repeat("x", 12000) + `"}`
+	data := []byte(short + "\n" + long + "\n")
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, tc := range []struct {
+		offset int64
+		pos    int64
+		stamp  time.Time
+	}{
+		{int64(len(short) / 2), 0, time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC)},
+		{int64(len(short) + 1 + 9000), int64(len(short) + 1), time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC)},
+	} {
+		stamp, pos, err := transcriptTimestampAt(f, tc.offset, int64(len(data)))
+		if err != nil {
+			t.Fatalf("transcriptTimestampAt(%d): %v", tc.offset, err)
+		}
+		if pos != tc.pos || !stamp.Equal(tc.stamp) {
+			t.Errorf("transcriptTimestampAt(%d) = (%d, %s), want (%d, %s)", tc.offset, pos, stamp, tc.pos, tc.stamp)
+		}
+	}
+}
+
+func TestTranscriptRecordAt(t *testing.T) {
+	first := human("2026-10-31T08:00:00Z", "one")
+	long := `{"type":"user","timestamp":"2026-10-31T08:01:00Z","text":"` + strings.Repeat("x", 100000) + `"}`
+	last := human("2026-10-31T08:02:00Z", "three")
+	data := []byte(first + "\n" + long + "\n" + last + "\n")
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	firstEnd := int64(len(first) + 1)
+	longStart := firstEnd
+	longEnd := longStart + int64(len(long)) + 1
+	lastStart := longEnd
+	cases := []struct {
+		offset int64
+		pos    int64
+		stamp  time.Time
+		end    int64
+	}{
+		{0, 0, time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC), firstEnd},
+		{int64(len(first) / 2), 0, time.Date(2026, 10, 31, 8, 0, 0, 0, time.UTC), firstEnd},
+		{longStart, longStart, time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC), longEnd},
+		{longStart + 80000, longStart, time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC), longEnd},
+		{longStart + int64(len(long)), longStart, time.Date(2026, 10, 31, 8, 1, 0, 0, time.UTC), longEnd},
+		{lastStart, lastStart, time.Date(2026, 10, 31, 8, 2, 0, 0, time.UTC), int64(len(data))},
+	}
+	for _, tc := range cases {
+		pos, stamp, end, err := transcriptRecordAt(f, tc.offset, int64(len(data)))
+		if err != nil {
+			t.Fatalf("transcriptRecordAt(%d): %v", tc.offset, err)
+		}
+		if pos != tc.pos || !stamp.Equal(tc.stamp) || end != tc.end {
+			t.Errorf("transcriptRecordAt(%d) = (%d, %s, %d), want (%d, %s, %d)", tc.offset, pos, stamp, end, tc.pos, tc.stamp, tc.end)
+		}
+	}
+}
+
+func TestBriefFastHintsByDay(t *testing.T) {
+	c := briefQuoteCollector{
+		filters:     briefQuoteFilters{byRawDay: map[string][]func([]byte) bool{"2026-11-01": {func([]byte) bool { return false }}}},
+		lateRawFrom: "2026-11-03", lateRawUntil: "2026-11-04",
+		lateQuotes: []briefLateQuote{{}},
+	}
+	user := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":"old"}}`)
+	hints, ok := c.fastHintsForRecord(user)
+	if !ok || hints.user || hints.agent || string(hints.rawDay) != "2026-10-31" || string(hints.timestamp) != "2026-10-31T10:00:00Z" {
+		t.Fatalf("irrelevant user hints = (%+v, %v)", hints, ok)
+	}
+	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
+	wantDay, wantPast, wantKnown, wantErr := briefRecordStatus(user, []byte("2026-10-31"), until)
+	gotDay, gotPast, gotErr := briefRecordPast(user, hints, []byte("2026-10-31"), until)
+	if string(gotDay) != string(wantDay) || gotPast != (wantKnown && wantPast) || (gotErr == nil) != (wantErr == nil) {
+		t.Fatalf("cached record status = (%s, %v, %v), want (%s, %v, %v)", gotDay, gotPast, gotErr, wantDay, wantKnown && wantPast, wantErr)
+	}
+	agent := []byte(`{"type":"assistant","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"text","text":"context"}]}}`)
+	if hints, ok := c.fastHintsForRecord(agent); !ok || !hints.agent {
+		t.Fatalf("irrelevant agent hints = (%+v, %v)", hints, ok)
+	}
+	relevant := []byte(`{"type":"user","timestamp":"2026-11-01T10:00:00Z","message":{"content":"target"}}`)
+	if _, ok := c.fastHintsForRecord(relevant); ok {
+		t.Fatal("relevant day bypassed full hints")
+	}
+	late := []byte(`{"type":"user","timestamp":"2026-11-03T10:00:00Z","message":{"content":"late"}}`)
+	if _, ok := c.fastHintsForRecord(late); ok {
+		t.Fatal("late quote context bypassed full hints")
+	}
+	lastLate := []byte(`{"type":"user","timestamp":"2026-11-04T01:00:00Z","message":{"content":"late, west of UTC"}}`)
+	if _, ok := c.fastHintsForRecord(lastLate); ok {
+		t.Fatal("record on the last late day bypassed full hints")
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"timestamp":"2026-10-31T10:00:00Z","type":"assistant","message":{"content":[{"type":"text","text":"context"}]}}`),
+		[]byte(`{"timestamp":"2026-10-31T10:00:00Z","type":"agent_message","text":"context"}`),
+	} {
+		if _, ok := c.fastHintsForRecord(raw); ok {
+			t.Errorf("unusual agent prefix bypassed full hints: %s", raw)
+		}
+	}
+}
+
+func TestBriefRecordRoleUserMarker(t *testing.T) {
+	raw := []byte(`{"type":"assistant","role":"user","timestamp":"2026-10-31T10:00:00Z"}`)
+	if hints := scanBriefRecordHints(raw); !hints.user {
+		t.Fatalf("role:user marker was missed: %+v", hints)
+	}
+}
+
+func TestBriefAgentAskCallIsNotFastStored(t *testing.T) {
+	raw := []byte(`{"type":"assistant","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"text","text":"before question"},{"type":"tool_use","name":"AskUserQuestion","input":{}}]}}`)
+	collector := briefQuoteCollector{
+		filters:   briefQuoteFilters{byRawDay: map[string][]func([]byte) bool{"2026-10-31": {func([]byte) bool { return true }}}},
+		parser:    transcript.NewParser(),
+		agentRaw:  make(map[string][]byte),
+		lastAgent: []byte("previous agent context"),
+	}
+	hints := scanBriefRecordHints(raw)
+	if !hints.agent || !hints.askCall {
+		t.Fatalf("test record hints = %+v", hints)
+	}
+	if !collector.keepWithHints(raw, hints) {
+		t.Fatal("AskUserQuestion record was incorrectly consumed by the agent fast path")
+	}
+	if !bytes.Equal(collector.lastAgent, []byte("previous agent context")) {
+		t.Fatalf("AskUserQuestion replaced prior agent context: %q", collector.lastAgent)
+	}
+}
+
 func TestPrefilterRuneFastMappings(t *testing.T) {
 	for input, want := range map[rune]rune{
 		'А': 'а',
@@ -811,7 +963,9 @@ func TestReadBriefRecordHints(t *testing.T) {
 func TestPrefilterFoldsTranscriptCase(t *testing.T) {
 	for _, tc := range []struct{ quote, raw string }{
 		{"ЗАЛЕЙ НА", `{"text":"залей на GitHub"}`},
+		{"залей на", `{"text":"ЗАЛЕЙ НА GitHub"}`},
 		{"ЀЛ", `{"text":"ѐл"}`},
+		{"ѐл", `{"text":"ЀЛ"}`},
 	} {
 		if !prefilterAny([]string{tc.quote})([]byte(tc.raw)) {
 			t.Errorf("prefilter missed case-folded quote %q in %s", tc.quote, tc.raw)
