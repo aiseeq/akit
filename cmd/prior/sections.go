@@ -301,11 +301,11 @@ const maxReplies = 8
 var replyHeader = regexp.MustCompile(`^### (\S+Z) .* · claude ([0-9a-f]{8})[0-9a-f-]*$`)
 
 // replyHit — блок журнала реплик с совпадением: фраза агента «в ответ на», совпавшие строки пользователя (или первая
-// строка ответа, если совпала только фраза агента) и сколько слов темы нашлось у пользователя и у агента.
+// строка ответа, если совпала только фраза агента) и сколько разных слов темы нашлось во всём блоке.
 type replyHit struct {
-	head, ctx           string
-	lines               []string
-	userWords, ctxWords int
+	head, ctx string
+	lines     []string
+	words     int
 }
 
 // replyBlocks — блоки журнала, где совпало хоть что-то: один блок - одно место в выводе, даже если совпали и фраза
@@ -314,6 +314,7 @@ func replyBlocks(data string, q query) []replyHit {
 	var hits []replyHit
 	var cur replyHit
 	first, matched := "", false
+	seen := make([]bool, len(q.words))
 	flush := func() {
 		if matched {
 			if len(cur.lines) == 0 && first != "" {
@@ -322,6 +323,7 @@ func replyBlocks(data string, q query) []replyHit {
 			hits = append(hits, cur)
 		}
 		cur, first, matched = replyHit{}, "", false
+		clear(seen)
 	}
 	for l := range strings.Lines(data) {
 		l = strings.TrimSuffix(l, "\n")
@@ -340,18 +342,15 @@ func replyBlocks(data string, q query) []replyHit {
 			continue
 		}
 		matched = true
-		words := 0
-		for _, re := range q.words {
-			if re.MatchString(l) {
-				words++
+		for i, re := range q.words {
+			if !seen[i] && re.MatchString(l) {
+				seen[i] = true
+				cur.words++
 			}
 		}
-		if ctx {
-			cur.ctxWords = max(cur.ctxWords, words)
-			continue
+		if !ctx {
+			cur.lines = append(cur.lines, l)
 		}
-		cur.userWords = max(cur.userWords, words)
-		cur.lines = append(cur.lines, l)
 	}
 	flush()
 	return hits
@@ -374,7 +373,7 @@ func replies(w io.Writer, q query, s paths) {
 		return
 	}
 	if len(hits) > maxReplies {
-		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы у пользователя, затем у агента, при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
+		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы в блоке (вопрос агента и ответ), при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
 		hits = topReplies(hits)
 	}
 	for _, h := range hits {
@@ -392,21 +391,17 @@ func replies(w io.Writer, q query, s paths) {
 	}
 }
 
-// topReplies — maxReplies блоков: сначала по числу слов темы у пользователя, затем во фразе агента, при равенстве -
-// поздние; печатаются в порядке журнала. Иначе последние по времени вытесняли старый ответ, где слов темы больше, а
-// длинная фраза агента - короткий ответ пользователя.
+// topReplies — maxReplies блоков с наибольшим числом разных слов темы во фразе агента и ответе вместе, при равенстве -
+// поздние; печатаются в порядке журнала. Иначе последние по времени вытесняли старый ответ, где слов темы больше;
+// счёт по блоку целиком держит короткий ответ «да» на вопрос агента ровно по теме.
 func topReplies(hits []replyHit) []replyHit {
 	order := make([]int, len(hits))
 	for i := range order {
 		order[i] = i
 	}
 	sort.SliceStable(order, func(a, b int) bool {
-		x, y := hits[order[a]], hits[order[b]]
-		if x.userWords != y.userWords {
-			return x.userWords > y.userWords
-		}
-		if x.ctxWords != y.ctxWords {
-			return x.ctxWords > y.ctxWords
+		if hits[order[a]].words != hits[order[b]].words {
+			return hits[order[a]].words > hits[order[b]].words
 		}
 		return order[a] > order[b]
 	})

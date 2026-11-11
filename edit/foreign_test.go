@@ -75,3 +75,26 @@ func TestUnrecognizedSpecKeepsNoBlocksErrorAndExample(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+// A line END closing a NEW block is a terminator this form does not have: refused, not written into the file,
+// and the example drops it. END inside the text stays text.
+func TestFileOldNewTrailingEndRefused(t *testing.T) {
+	for _, spec := range []string{
+		"FILE x.go\nOLD\na\nNEW\nb\nEND\n",
+		"FILE x.go\nOLD\na\nNEW\nb\nEND\n\nOLD\nc\nNEW\nd\n",
+		"FILE x.go\nSEARCH\na\nREPLACE\nb\n  END  \n",
+	} {
+		_, err := ParseSpec(strings.NewReader(spec))
+		if err == nil || !strings.Contains(err.Error(), "ends with a line END") {
+			t.Errorf("ParseSpec(%q) error = %v", spec, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "b\nEND") || !strings.Contains(err.Error(), markReplace) {
+			t.Errorf("example keeps END or is missing:\n%v", err)
+		}
+	}
+	edits, err := ParseSpec(strings.NewReader("FILE q.sql\nOLD\nBEGIN\nNEW\nBEGIN\nEND\nSELECT 1;\n"))
+	if err != nil || len(edits) != 1 || edits[0].New != "BEGIN\nEND\nSELECT 1;" {
+		t.Fatalf("END inside the text: %v %+v", err, edits)
+	}
+}

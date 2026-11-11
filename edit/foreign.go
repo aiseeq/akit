@@ -85,6 +85,9 @@ func parseFileOldNew(lines []string, fixed string) ([]Edit, error) {
 		}
 		oldLines := trimBlankLines(lines[oldStart:newMark])
 		newLines := trimBlankLines(lines[newStart:next])
+		if endsWithEndMarker(newLines) {
+			return nil, fmt.Errorf("%s text ends with a line END: this form has no terminator, so it would go into the file; drop it, or use SEARCH/REPLACE blocks", newSeparator)
+		}
 		old := strings.Join(oldLines, "\n")
 		if old == "" {
 			return nil, fmt.Errorf("empty OLD text")
@@ -212,6 +215,12 @@ func checkForeignText(parts ...[]string) error {
 	return nil
 }
 
+// endsWithEndMarker — последняя строка текста NEW — «END»: в чужих формах так закрывают блок, а в форме FILE OLD/NEW
+// терминатора нет, и строка ушла бы в файл. Строка END в середине текста (SQL, Pascal) — обычный текст.
+func endsWithEndMarker(lines []string) bool {
+	return len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "END"
+}
+
 func isForeignSignal(line string) bool {
 	return line == "OLD" || line == "NEW" || line == "SEARCH" || line == "REPLACE" || line == "---" || line == "--- old" || line == "--- new" || line == "+++" || line == "===" || strings.HasPrefix(line, "=== ") || strings.HasPrefix(line, "FILE ")
 }
@@ -293,7 +302,11 @@ func fileSample(lines []string) (path, old, replacement string, ok bool) {
 		end++
 	}
 	old = strings.Join(trimBlankLines(lines[start+1:separator]), "\n")
-	replacement = strings.Join(trimBlankLines(lines[separator+1:end]), "\n")
+	newLines := trimBlankLines(lines[separator+1 : end])
+	if endsWithEndMarker(newLines) {
+		newLines = trimBlankLines(newLines[:len(newLines)-1])
+	}
+	replacement = strings.Join(newLines, "\n")
 	if old == "" {
 		old = "old text"
 	}

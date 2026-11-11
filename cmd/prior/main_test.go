@@ -355,43 +355,28 @@ func TestLineWithLongLines(t *testing.T) {
 	}
 }
 
-// Блок журнала — одно место в выводе, даже если совпали и фраза агента, и ответ; при отборе слова пользователя важнее
-// слов во фразе агента: длинная фраза агента не вытесняет короткий ответ.
-func TestRepliesBlockOnceUserWordsFirst(t *testing.T) {
+// Блок журнала — одно место в выводе, даже если совпали и фраза агента, и ответ; ранг — разные слова темы во всём
+// блоке: короткий ответ «да» на вопрос агента ровно по теме не вытесняется ответами с одним словом, а под совпавшей
+// фразой агента видна первая строка ответа.
+func TestRepliesBlockOnceRankedByBlockWords(t *testing.T) {
 	home := t.TempDir()
 	var b strings.Builder
-	b.WriteString("### 2026-10-01T10:00:00Z · ~/x\nв ответ на: alpha и beta у агента\nответ про alpha\n")
+	b.WriteString("### 2026-10-01T10:00:00Z · ~/x\nв ответ на: удалить alpha и beta?\nда\nвторая строка ответа\n")
+	b.WriteString("### 2026-10-02T10:00:00Z · ~/x\nв ответ на: про alpha\nответ alpha и beta\n")
+	b.WriteString("### 2026-10-03T10:00:00Z · ~/x\nв ответ на: снова beta\nи тут beta\n") // одно слово дважды — одно
 	for i := range 8 {
-		fmt.Fprintf(&b, "### 2026-10-%02dT10:00:00Z · ~/x\nв ответ на: агент про alpha и beta\nкороткий ответ %d\n", 10+i, i)
-	}
-	b.WriteString("### 2026-10-20T10:00:00Z · ~/x\nв ответ на: что-то\nнет, оставь beta\n")
-	write(t, filepath.Join(home, ".claude/user-replies.md"), b.String())
-	got := sectionOf(runPrior(t, home, "alpha", "beta"), "реплики")[1:]
-	text := strings.Join(got, "\n")
-	if strings.Count(text, "### 2026-10-01T10:00:00Z") != 1 || !strings.Contains(text, "  ответ про alpha") || !strings.Contains(text, "  нет, оставь beta") {
-		t.Fatalf("ответы пользователя вытеснены или блок повторён:\n%s", text)
-	}
-	if !strings.Contains(text, "  короткий ответ 7") || strings.Contains(text, "  короткий ответ 1\n") {
-		t.Errorf("блоки с одной фразой агента: нужны свежие, и ответ под фразой виден:\n%s", text)
-	}
-}
-
-// Совпала только фраза агента: под ней — первая строка ответа; при равных словах пользователя больше слов у агента —
-// выше свежести.
-func TestRepliesAgentWordsBreakTies(t *testing.T) {
-	home := t.TempDir()
-	var b strings.Builder
-	b.WriteString("### 2026-10-01T10:00:00Z · ~/x\nв ответ на: alpha и beta\nпервая строка ответа\nвторая строка ответа\n")
-	for i := range 8 {
-		fmt.Fprintf(&b, "### 2026-10-%02dT10:00:00Z · ~/x\nв ответ на: только beta\nответ %d\n", 10+i, i)
+		fmt.Fprintf(&b, "### 2026-10-%02dT10:00:00Z · ~/x\nв ответ на: что-то\nпро beta %d\n", 10+i, i)
 	}
 	write(t, filepath.Join(home, ".claude/user-replies.md"), b.String())
 	got := sectionOf(runPrior(t, home, "alpha", "beta"), "реплики")[1:]
 	text := strings.Join(got, "\n")
-	if !strings.Contains(text, "  первая строка ответа") || strings.Contains(text, "вторая строка ответа") {
+	if strings.Count(text, "### 2026-10-01T10:00:00Z") != 1 || strings.Count(text, "### 2026-10-02T10:00:00Z") != 1 {
+		t.Fatalf("блок с вопросом по теме вытеснен или повторён:\n%s", text)
+	}
+	if !strings.Contains(text, "  да") || strings.Contains(text, "вторая строка ответа") {
 		t.Errorf("под фразой агента не первая строка ответа:\n%s", text)
 	}
-	if strings.Contains(text, "  ответ 0") || !strings.Contains(text, "  ответ 7") {
-		t.Errorf("блок с двумя словами агента вытеснен свежими с одним:\n%s", text)
+	if strings.Contains(text, "и тут beta") || strings.Contains(text, "про beta 1") || !strings.Contains(text, "про beta 2") || !strings.Contains(text, "про beta 7") {
+		t.Errorf("при равенстве слов вошли не самые свежие:\n%s", text)
 	}
 }
