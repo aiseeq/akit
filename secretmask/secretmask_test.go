@@ -254,7 +254,7 @@ func TestMaskRealTranscriptFalseMaskForms(t *testing.T) {
 		{"function call", `auth: authority(x)`, `auth: Zq7xW9vK2m`},
 		{"json object", `"https://api.example.com/auth": {"plan": "pro"}`, `"https://api.example.com/auth": "8f3a9c2e7b1d4f60"`},
 		{"go map literal", `"https://api.example.com/auth": map[string]string{"plan": "pro"}`, `auth: Zq7xW9vK2mPq8Rt{`},
-		{"go named literal", `auth: MyType{}`, `auth: Zq7xW9vK2mPq8Rt{`},
+		{"go slice literal", `auth: []T{}`, `auth: kQzXwPvR{`},
 		{"pwd error", `pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory`, `pwd: Zq7xW9vK2m`},
 		{"pwd cannot error", `pwd: cannot access parent directories`, `pwd: Zq7xW9vK2m`},
 		{"short number list", `financial=30, auth=60, general=300`, `auth=8f3a9c2e7b1d`},
@@ -283,17 +283,17 @@ func TestTypeExpressionHeadAcceptsSingleCharacterTypeName(t *testing.T) {
 }
 
 func TestSyntaxExceptionHelpersRejectSecretLikeForms(t *testing.T) {
-	for _, value := range []string{"{", "map[Random123{", "Zq7xW9vK2mPq8Rt{", "T2{"} {
+	for _, value := range []string{"{", "map[Random123{", "Zq7xW9vK2mPq8Rt{", "T2{", "T{"} {
 		if goCompositeLiteralHead(value) {
 			t.Errorf("secret-like or incomplete composite accepted: %q", value)
 		}
 	}
-	for _, value := range []string{"map[string]string{", "[]T{", "T{"} {
+	for _, value := range []string{"map[string]string{", "map[LongName]Thing{", "[]T{"} {
 		if !goCompositeLiteralHead(value) {
 			t.Errorf("Go composite literal rejected: %q", value)
 		}
 	}
-	if simpleGoType("") || simpleGoType("T2") || !simpleGoType("Thing") {
+	if simpleGoType("") || simpleGoType("T2") || !simpleGoType("Thing") || !simpleGoType("LongName") || simpleGoType("LongerName") {
 		t.Fatal("simple Go type identifier boundary changed")
 	}
 	if shortNumericValue(",") || shortNumericValue("1234567,") || !shortNumericValue("123456,") || !shortNumericValue("300") {
@@ -353,6 +353,88 @@ func TestNonSecretValueFormsDoNotApplyToOtherSecretNames(t *testing.T) {
 		got, found := Mask(text)
 		if got == text || len(found) == 0 {
 			t.Errorf("secret name was exempted from masking: %q", text)
+		}
+	}
+}
+
+func TestGenericHeadAndTailRejectTokenLikeValues(t *testing.T) {
+	for _, text := range []string{
+		"auth=Zq7xW9vK2m<Pq8Rt>",
+		"credentials=Pa55w0rd<Xy>",
+		"auth: Kx7Qz9<pR,",
+		"auth: H3Un<E>_w$HBz8Sk",
+		"auth=Record<Kind>suffix",
+		"auth=Record<Kind>>",
+		"auth=Record<Kind>_w$HBz8Sk",
+		"auth=Record<,",
+		"auth=Record<Kind!>",
+		"auth=Record<2Kind,",
+		"auth=Record<Kind",
+		"auth=fooBar<Kind>",
+		"auth=Zq7xW9vK2m<Kind>",
+		"auth=map[string]Zq7xW9vK2m{",
+	} {
+		got, found := Mask(text)
+		if got == text || len(found) == 0 {
+			t.Errorf("token-like generic head or tail stayed visible: %q", text)
+		}
+	}
+	for _, text := range []string{
+		"auth=Record<string>",
+		"auth=HashMap<Kind>",
+		"auth=Record<Kind, string>",
+		"auth: Record<Kind, string> = {}",
+		"credentials=Map<Kind>",
+	} {
+		got, found := Mask(text)
+		if got != text || len(found) != 0 {
+			t.Errorf("ordinary type expression changed: %q -> %q %v", text, got, found)
+		}
+	}
+}
+
+func TestPwdDiagnosticIsNameAndLineScoped(t *testing.T) {
+	message := "error retrieving current directory: getcwd: cannot access parent directories"
+	value := contextValue{start: 0, end: len(message)}
+	if !nonSecretValueForm(message, value, "pwd") {
+		t.Fatal("pwd diagnostic form was not accepted")
+	}
+	for _, name := range []string{"auth", "password"} {
+		if nonSecretValueForm(message, value, name) {
+			t.Errorf("pwd diagnostic exception applied to %q", name)
+		}
+	}
+	message = "cannot access parent directories\n"
+	value = contextValue{start: 0, end: len("cannot access parent directories")}
+	if !pwdErrorDiagnostic(message, value) {
+		t.Fatal("newline-terminated shell diagnostic was rejected")
+	}
+}
+
+func TestNonSecretSyntaxExceptionsAreLimitedToAuthNames(t *testing.T) {
+	for _, text := range []string{
+		"password=Record<string, string>",
+		"secret=map[string]string{",
+		"token=map[string]string{",
+		"password=map[string]string{",
+		"a=1, b=2, password=3",
+	} {
+		got, found := Mask(text)
+		if got == text || len(found) == 0 {
+			t.Errorf("syntax exception escaped its allowed name: %q", text)
+		}
+	}
+}
+
+func TestShortNumericExceptionIsDelimitedAndLineLocal(t *testing.T) {
+	for _, text := range []string{
+		"auth=30, general=300",
+		"auth=30, general: 300, retry: 3",
+		"a=1, b=2\nfinancial=30, auth=60,",
+	} {
+		got, found := Mask(text)
+		if got == text || len(found) == 0 {
+			t.Errorf("short number was exempted without a same-line numeric assignment list: %q", text)
 		}
 	}
 }

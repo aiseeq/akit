@@ -844,7 +844,7 @@ func pwdErrorDiagnostic(text string, value contextValue) bool {
 func typeExpressionHead(text string, value contextValue) bool {
 	v := text[value.start:value.end]
 	angle := strings.IndexByte(v, '<')
-	if angle < 1 || !simpleTypeName(v[:angle]) {
+	if angle < 1 || !plainTypeName(v[:angle]) {
 		return false
 	}
 	i := angle + 1
@@ -854,25 +854,53 @@ func typeExpressionHead(text string, value contextValue) bool {
 	for i < len(v) && isIdentifierByte(v[i]) {
 		i++
 	}
-	for i < len(v) && (v[i] == ' ' || v[i] == '\t') {
-		i++
+	if i < len(v) && v[i] == '>' {
+		if i+1 != len(v) {
+			return false
+		}
+		return value.end == len(text) || value.end < len(text) && typeTailBoundary(text[value.end])
 	}
-	if i < len(v) && (v[i] == ',' || v[i] == '>') {
-		return true
+	if i < len(v) && v[i] == ',' {
+		return i+1 == len(v)
 	}
 	return i == len(v) && value.end < len(text) && text[value.end] == ','
 }
 
-func simpleTypeName(value string) bool {
+// plainTypeName accepts a plain identifier or a sequence of title-case words,
+// such as HashMap. Requiring letter-only title-case parts avoids token-like
+// names that mix digits with case changes.
+func plainTypeName(value string) bool {
 	if value == "" || !isIdentifierStart(value[0]) {
 		return false
 	}
-	for i := 1; i < len(value); i++ {
-		if !isIdentifierByte(value[i]) {
+	for i := 0; i < len(value); i++ {
+		if !(value[i] >= 'A' && value[i] <= 'Z' || value[i] >= 'a' && value[i] <= 'z') {
 			return false
 		}
 	}
-	return true
+	if isPlainWord(value) {
+		return true
+	}
+	parts := 0
+	for i := 0; i < len(value); {
+		if value[i] < 'A' || value[i] > 'Z' {
+			return false
+		}
+		i++
+		start := i
+		for i < len(value) && value[i] >= 'a' && value[i] <= 'z' {
+			i++
+		}
+		if i-start < 2 {
+			return false
+		}
+		parts++
+	}
+	return parts >= 2
+}
+
+func typeTailBoundary(c byte) bool {
+	return c == ';' || c == '=' || c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
 func isIdentifierStart(c byte) bool {
@@ -900,7 +928,7 @@ func goCompositeLiteralHead(value string) bool {
 	if strings.HasPrefix(typeName, "[]") {
 		return simpleGoType(typeName[2:])
 	}
-	return len(typeName) <= 8 && simpleGoType(typeName)
+	return false
 }
 
 func simpleGoType(value string) bool {
