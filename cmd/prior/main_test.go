@@ -86,7 +86,7 @@ func TestSources(t *testing.T) {
 	want := []string{
 
 		"### 2026-10-25T10:00 · ~/git/akit", "  в ответ на: Собрать?", "  собрать в akit",
-		"### 2026-10-25T11:00 · ~/git/akit", "  в ответ на: про akit?",
+		"### 2026-10-25T11:00 · ~/git/akit", "  в ответ на: про akit?", "  да",
 	}
 	if got := sectionOf(out, "реплики"); !strings.HasPrefix(got[0], "(daydigest не дописал журнал") || strings.Join(got[1:], "\n") != strings.Join(want, "\n") {
 		t.Errorf("реплики:\n%s", strings.Join(got, "\n"))
@@ -312,10 +312,10 @@ func TestRepliesRankedByTopicWords(t *testing.T) {
 func TestRepliesLinkTranscriptLine(t *testing.T) {
 	home := t.TempDir()
 	write(t, filepath.Join(home, ".claude/projects/-p/1234abcd-0000-0000-0000-000000000001.jsonl"),
-		`{"type":"user","timestamp":"2026-10-20T09:16:22.400Z","message":{"role":"user","content":"раньше"}}`+"\n"+
-			`{"type":"user","timestamp":"2026-10-20T09:16:22.440Z","message":{"role":"user","content":"ответ про ключслово"}}`+"\n")
+		`{"type":"user","timestamp":"2026-10-05T08:07:09.400Z","message":{"role":"user","content":"раньше"}}`+"\n"+
+			`{"type":"user","timestamp":"2026-10-05T08:07:09.440Z","message":{"role":"user","content":"ответ про ключслово"}}`+"\n")
 	write(t, filepath.Join(home, ".claude/user-replies.md"),
-		"### 2026-10-20T09:16:22.44Z (20.10 11:16 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001\n  ответ про ключслово\n"+
+		"### 2026-10-05T08:07:09.44Z (05.10 10:07 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001\n  ответ про ключслово\n"+
 			"### 2026-10-20T09:17:00Z (20.10 11:17 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001\n  ещё ключслово\n"+
 			"### 2026-10-21T09:00:00Z (21.10 11:00 CEST) · ~/x · claude 99999999-0000-0000-0000-000000000001\n  снова ключслово\n"+
 			"### 2026-10-22T09:00:00Z (22.10 11:00 CEST) · ~/x · codex 1234abcd-0000-0000-0000-000000000001\n  в codex ключслово\n"+
@@ -326,7 +326,7 @@ func TestRepliesLinkTranscriptLine(t *testing.T) {
 	}
 	got := sectionOf(runPrior(t, home, "ключслово"), "реплики")
 	want := []string{
-		"### 2026-10-20T09:16:22.44Z (20.10 11:16 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001 · tl 1234abcd:2",
+		"### 2026-10-05T08:07:09.44Z (05.10 10:07 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001 · tl 1234abcd:2",
 		"### 2026-10-20T09:17:00Z (20.10 11:17 CEST) · ~/x · claude 1234abcd-0000-0000-0000-000000000001 · tl: строки с 2026-10-20T09:17:00.000Z в транскрипте нет",
 		"### 2026-10-21T09:00:00Z (21.10 11:00 CEST) · ~/x · claude 99999999-0000-0000-0000-000000000001 · tl: транскриптов сессии 99999999 найдено 0",
 		"### 2026-10-22T09:00:00Z (22.10 11:00 CEST) · ~/x · codex 1234abcd-0000-0000-0000-000000000001",
@@ -352,5 +352,46 @@ func TestLineWithLongLines(t *testing.T) {
 	}
 	if n, err := lineWith(path, []byte("нет такого")); err != nil || n != 0 {
 		t.Errorf("нет такого: %d %v", n, err)
+	}
+}
+
+// Блок журнала — одно место в выводе, даже если совпали и фраза агента, и ответ; при отборе слова пользователя важнее
+// слов во фразе агента: длинная фраза агента не вытесняет короткий ответ.
+func TestRepliesBlockOnceUserWordsFirst(t *testing.T) {
+	home := t.TempDir()
+	var b strings.Builder
+	b.WriteString("### 2026-10-01T10:00:00Z · ~/x\nв ответ на: alpha и beta у агента\nответ про alpha\n")
+	for i := range 8 {
+		fmt.Fprintf(&b, "### 2026-10-%02dT10:00:00Z · ~/x\nв ответ на: агент про alpha и beta\nкороткий ответ %d\n", 10+i, i)
+	}
+	b.WriteString("### 2026-10-20T10:00:00Z · ~/x\nв ответ на: что-то\nнет, оставь beta\n")
+	write(t, filepath.Join(home, ".claude/user-replies.md"), b.String())
+	got := sectionOf(runPrior(t, home, "alpha", "beta"), "реплики")[1:]
+	text := strings.Join(got, "\n")
+	if strings.Count(text, "### 2026-10-01T10:00:00Z") != 1 || !strings.Contains(text, "  ответ про alpha") || !strings.Contains(text, "  нет, оставь beta") {
+		t.Fatalf("ответы пользователя вытеснены или блок повторён:\n%s", text)
+	}
+	if !strings.Contains(text, "  короткий ответ 7") || strings.Contains(text, "  короткий ответ 1\n") {
+		t.Errorf("блоки с одной фразой агента: нужны свежие, и ответ под фразой виден:\n%s", text)
+	}
+}
+
+// Совпала только фраза агента: под ней — первая строка ответа; при равных словах пользователя больше слов у агента —
+// выше свежести.
+func TestRepliesAgentWordsBreakTies(t *testing.T) {
+	home := t.TempDir()
+	var b strings.Builder
+	b.WriteString("### 2026-10-01T10:00:00Z · ~/x\nв ответ на: alpha и beta\nпервая строка ответа\nвторая строка ответа\n")
+	for i := range 8 {
+		fmt.Fprintf(&b, "### 2026-10-%02dT10:00:00Z · ~/x\nв ответ на: только beta\nответ %d\n", 10+i, i)
+	}
+	write(t, filepath.Join(home, ".claude/user-replies.md"), b.String())
+	got := sectionOf(runPrior(t, home, "alpha", "beta"), "реплики")[1:]
+	text := strings.Join(got, "\n")
+	if !strings.Contains(text, "  первая строка ответа") || strings.Contains(text, "вторая строка ответа") {
+		t.Errorf("под фразой агента не первая строка ответа:\n%s", text)
+	}
+	if strings.Contains(text, "  ответ 0") || !strings.Contains(text, "  ответ 7") {
+		t.Errorf("блок с двумя словами агента вытеснен свежими с одним:\n%s", text)
 	}
 }

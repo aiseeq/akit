@@ -300,10 +300,61 @@ const maxReplies = 8
 // replyHeader — заголовок блока журнала реплик: время UTC и сессия claude, по ним находится строка транскрипта.
 var replyHeader = regexp.MustCompile(`^### (\S+Z) .* · claude ([0-9a-f]{8})[0-9a-f-]*$`)
 
-// replyHit — совпавшая строка журнала реплик и сколько слов темы в ней нашлось.
+// replyHit — блок журнала реплик с совпадением: фраза агента «в ответ на», совпавшие строки пользователя (или первая
+// строка ответа, если совпала только фраза агента) и сколько слов темы нашлось у пользователя и у агента.
 type replyHit struct {
-	head, ctx, line string
-	words           int
+	head, ctx           string
+	lines               []string
+	userWords, ctxWords int
+}
+
+// replyBlocks — блоки журнала, где совпало хоть что-то: один блок - одно место в выводе, даже если совпали и фраза
+// агента, и ответ.
+func replyBlocks(data string, q query) []replyHit {
+	var hits []replyHit
+	var cur replyHit
+	first, matched := "", false
+	flush := func() {
+		if matched {
+			if len(cur.lines) == 0 && first != "" {
+				cur.lines = []string{first}
+			}
+			hits = append(hits, cur)
+		}
+		cur, first, matched = replyHit{}, "", false
+	}
+	for l := range strings.Lines(data) {
+		l = strings.TrimSuffix(l, "\n")
+		if strings.HasPrefix(l, "### ") {
+			flush()
+			cur.head = l
+			continue
+		}
+		ctx := strings.HasPrefix(l, "в ответ на: ")
+		if ctx {
+			cur.ctx = l
+		} else if first == "" && l != "" {
+			first = l
+		}
+		if !q.any.MatchString(l) {
+			continue
+		}
+		matched = true
+		words := 0
+		for _, re := range q.words {
+			if re.MatchString(l) {
+				words++
+			}
+		}
+		if ctx {
+			cur.ctxWords = max(cur.ctxWords, words)
+			continue
+		}
+		cur.userWords = max(cur.userWords, words)
+		cur.lines = append(cur.lines, l)
+	}
+	flush()
+	return hits
 }
 
 // replies — реплики пользователя из журнала, который дописывает программа разбора daydigest: заголовок блока, «в ответ на»
@@ -317,37 +368,13 @@ func replies(w io.Writer, q query, s paths) {
 		fmt.Fprintf(w, "(нет журнала: %v)\n", err)
 		return
 	}
-	var hits []replyHit
-	head, ctx := "", ""
-	for l := range strings.Lines(string(data)) {
-		l = strings.TrimSuffix(l, "\n")
-		if strings.HasPrefix(l, "### ") {
-			head, ctx = l, ""
-			continue
-		}
-		if strings.HasPrefix(l, "в ответ на: ") {
-			ctx = l
-		}
-		if !q.any.MatchString(l) {
-			continue
-		}
-		hit := replyHit{head: head, line: l}
-		if ctx != l {
-			hit.ctx = ctx
-		}
-		for _, re := range q.words {
-			if re.MatchString(l) {
-				hit.words++
-			}
-		}
-		hits = append(hits, hit)
-	}
+	hits := replyBlocks(string(data), q)
 	if len(hits) == 0 {
 		fmt.Fprintln(w, "(нет)")
 		return
 	}
 	if len(hits) > maxReplies {
-		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы, при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
+		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы у пользователя, затем у агента, при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
 		hits = topReplies(hits)
 	}
 	for _, h := range hits {
@@ -359,20 +386,27 @@ func replies(w io.Writer, q query, s paths) {
 		if h.ctx != "" {
 			fmt.Fprintln(w, "  "+cut(h.ctx))
 		}
-		fmt.Fprintln(w, "  "+cut(h.line))
+		for _, l := range h.lines {
+			fmt.Fprintln(w, "  "+cut(l))
+		}
 	}
 }
 
-// topReplies — maxReplies реплик с наибольшим числом слов темы (при равенстве - поздние), в порядке журнала: последние
-// по времени вытесняли старый ответ, где слов темы больше.
+// topReplies — maxReplies блоков: сначала по числу слов темы у пользователя, затем во фразе агента, при равенстве -
+// поздние; печатаются в порядке журнала. Иначе последние по времени вытесняли старый ответ, где слов темы больше, а
+// длинная фраза агента - короткий ответ пользователя.
 func topReplies(hits []replyHit) []replyHit {
 	order := make([]int, len(hits))
 	for i := range order {
 		order[i] = i
 	}
 	sort.SliceStable(order, func(a, b int) bool {
-		if hits[order[a]].words != hits[order[b]].words {
-			return hits[order[a]].words > hits[order[b]].words
+		x, y := hits[order[a]], hits[order[b]]
+		if x.userWords != y.userWords {
+			return x.userWords > y.userWords
+		}
+		if x.ctxWords != y.ctxWords {
+			return x.ctxWords > y.ctxWords
 		}
 		return order[a] > order[b]
 	})
