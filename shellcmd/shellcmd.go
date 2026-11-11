@@ -162,6 +162,9 @@ func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, 
 	if err := parseHeredocStmts(info.shellInputs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls); err != nil {
 		walker.nestedErrs = append(walker.nestedErrs, err)
 	}
+	if err := parsePipedHeredocs(info.pipedHeredocs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls); err != nil {
+		walker.nestedErrs = append(walker.nestedErrs, err)
+	}
 	return errors.Join(walker.nestedErrs...)
 }
 
@@ -173,16 +176,22 @@ type walkInfo struct {
 	shellInputs     []*syntax.Stmt
 	shellHdocs      map[*syntax.Redirect]bool
 	scriptInputs    map[*syntax.CallExpr]bool
+	pipedHeredocs   []pipedHeredoc
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walkInfo {
+	pipedHeredocs, knownPipes := collectPipedHeredocs(file, src, vars)
 	info := walkInfo{
 		timedCalls:      timedCallSet(file),
 		redirs:          make(map[*syntax.CallExpr][]Redir),
 		loopCalls:       loopCallSet(file),
 		backgroundCalls: backgroundCallSet(file),
 		shellHdocs:      make(map[*syntax.Redirect]bool),
-		scriptInputs:    scriptInputSet(file, src, vars),
+		scriptInputs:    scriptInputSet(file, src, vars, knownPipes),
+		pipedHeredocs:   pipedHeredocs,
+	}
+	for _, piped := range pipedHeredocs {
+		info.shellHdocs[piped.redir] = true
 	}
 	syntax.Walk(file, func(node syntax.Node) bool {
 		stmt, ok := node.(*syntax.Stmt)
@@ -200,12 +209,101 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walk
 	return info
 }
 
-func scriptInputSet(file *syntax.File, src string, vars map[string]string) map[*syntax.CallExpr]bool {
+type pipedHeredoc struct {
+	redir *syntax.Redirect
+	shell *syntax.Stmt
+	name  string
+	via   []string
+}
+
+func collectPipedHeredocs(file *syntax.File, src string, vars map[string]string) ([]pipedHeredoc, map[*syntax.BinaryCmd]bool) {
+	var piped []pipedHeredoc
+	known := make(map[*syntax.BinaryCmd]bool)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		binary, ok := node.(*syntax.BinaryCmd)
+		if !ok || !strings.Contains(binary.Op.String(), "|") {
+			return true
+		}
+		producer := binary.X
+		call, ok := producer.Cmd.(*syntax.CallExpr)
+		if !ok || !stdinEchoingCall(call, src, vars) {
+			return true
+		}
+		shell := binary.Y
+		name, via, ok := pipedShellName(shell, src, vars)
+		if !ok {
+			return true
+		}
+		for _, redir := range producer.Redirs {
+			if redir.Hdoc == nil {
+				continue
+			}
+			piped = append(piped, pipedHeredoc{redir: redir, shell: shell, name: name, via: via})
+			known[binary] = true
+		}
+		return true
+	})
+	return piped, known
+}
+
+func stdinEchoingCall(call *syntax.CallExpr, src string, vars map[string]string) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+	values, _ := words(call.Args, src, vars)
+	name := baseName(commandName(values[0]))
+	switch name {
+	case "tee":
+		return true
+	case "cat":
+		for _, arg := range values[1:] {
+			if arg == "-" {
+				return true
+			}
+			if arg == "--" || strings.HasPrefix(arg, "-") {
+				continue
+			}
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func pipedShellName(stmt *syntax.Stmt, src string, vars map[string]string) (string, []string, bool) {
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return "", nil, false
+	}
+	values, _ := words(call.Args, src, vars)
+	name, args := commandName(values[0]), values[1:]
+	var via []string
+	for {
+		if isShell(name) {
+			operand, command, stdin := shellArgs(args)
+			return name, via, !shellNoExec(args) && !command && (stdin || operand == len(args))
+		}
+		if target, ok := execTarget(args); ok {
+			via = append(via, name, "exec")
+			name, args = commandName(target[0]), target[1:]
+			continue
+		}
+		wrapped, wrapperVia, ok := unwrap(name, args)
+		if !ok {
+			return "", nil, false
+		}
+		via = append(via, wrapperVia...)
+		name, args = commandName(wrapped[0]), wrapped[1:]
+	}
+}
+
+func scriptInputSet(file *syntax.File, src string, vars map[string]string, knownPipes map[*syntax.BinaryCmd]bool) map[*syntax.CallExpr]bool {
 	inputs := make(map[*syntax.CallExpr]bool)
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch n := node.(type) {
 		case *syntax.BinaryCmd:
-			if strings.Contains(n.Op.String(), "|") {
+			if strings.Contains(n.Op.String(), "|") && !knownPipes[n] {
 				markPipeline(n.Y, src, vars, inputs)
 			}
 		case *syntax.CallExpr:
@@ -273,7 +371,14 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 	}
 	values, _ := words(call.Args, src, vars)
 	name, args := commandName(values[0]), values[1:]
+	argOffset := 0
 	for {
+		if name == "sudo" && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+			return true
+		}
+		if (name == "su" || name == "runuser") && suReadsShell(name, args) {
+			return true
+		}
 		if isShell(name) {
 			operand, command, stdin := shellArgs(args)
 			if shellNoExec(args) || command {
@@ -282,15 +387,19 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 			if stdin || operand == len(args) {
 				return true
 			}
-			if operand < len(args) && isShell(commandName(values[0])) && hasProcessSubstitution(call.Args[operand+1:operand+2]) {
-				return true
-			}
-			return false
+			index := 1 + argOffset + operand
+			return operand < len(args) && index < len(call.Args) && hasProcessSubstitution(call.Args[index:index+1])
+		}
+		if target, ok := execTarget(args); ok {
+			argOffset += len(args) - len(target) + 1
+			name, args = commandName(target[0]), target[1:]
+			continue
 		}
 		wrapped, _, ok := unwrap(name, args)
 		if !ok {
 			return false
 		}
+		argOffset += len(args) - len(wrapped) + 1
 		name, args = commandName(wrapped[0]), wrapped[1:]
 	}
 }
@@ -494,7 +603,7 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 			}
 			var body mapped
 			if redir.Hdoc != nil {
-				body.add(heredocText(redir, src), int(redir.Hdoc.Pos().Offset()))
+				body = heredocScript(redir, src)
 			} else if redir.Word != nil {
 				for _, part := range redir.Word.Parts {
 					body.addLiteral(part, src)
@@ -512,6 +621,63 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 		}
 	}
 	return errors.Join(nestedErrs...)
+}
+
+func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call) error {
+	var nestedErrs []error
+	for _, input := range piped {
+		redir := input.redir
+		body := heredocScript(redir, src)
+		via := append(slices.Clone(inherited), "pipe")
+		via = append(via, input.via...)
+		via = append(via, input.name)
+		call, _ := input.shell.Cmd.(*syntax.CallExpr)
+		first := len(*calls)
+		err := parseNested(body.String(), body.pos, lineBase, via, loopCalls[call], backgroundCalls[call], vars, calls)
+		for i := first; i < len(*calls); i++ {
+			offset := (*calls)[i].Offset
+			if validSpan(src, offset, offset) {
+				(*calls)[i].Line = lineBase + 1 + strings.Count(src[:offset], "\n")
+			}
+		}
+		if err != nil {
+			nestedErrs = append(nestedErrs, err)
+		}
+	}
+	return errors.Join(nestedErrs...)
+}
+
+func heredocScript(redir *syntax.Redirect, src string) mapped {
+	var body mapped
+	raw := heredocText(redir, src)
+	base := int(redir.Hdoc.Pos().Offset())
+	if redir.Op.String() != "<<-" {
+		body.add(raw, base)
+		return body
+	}
+	for start := 0; start < len(raw); {
+		end := strings.IndexByte(raw[start:], '\n')
+		if end < 0 {
+			end = len(raw)
+		} else {
+			end += start + 1
+		}
+		prefix := 0
+		for start+prefix < end {
+			if raw[start+prefix] == '\t' {
+				prefix++
+				continue
+			}
+			if strings.HasPrefix(raw[start+prefix:end], `\t`) {
+				prefix += 2
+				continue
+			}
+			break
+		}
+		body.add(raw[start+prefix:end], base+start+prefix)
+		start = end
+	}
+	return body
 }
 
 func heredocText(redir *syntax.Redirect, src string) string {
@@ -1070,19 +1236,56 @@ func (c cmd) via(more ...string) []string {
 
 // emit добавляет вызов и всё, что он запускает: программу под обёрткой, цель `X exec … --`, скрипт `bash -c`.
 func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
+	if len(c.call.Via) > maxNestedScripts {
+		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: nested execution depth exceeds %d", maxNestedScripts)}
+	}
 	*calls = append(*calls, c.call)
 	if err := expand(c, lineBase, vars, calls); err != nil {
 		return err
 	}
 	if nested, wrapperVia, ok := unwrap(c.call.Name, c.call.Args); ok {
-		if c.call.Name == "parallel" {
-			child := c.sub(wrapperStart("parallel", c.call.Args)+1, c.via(wrapperVia...))
-			child.call.Name, child.call.Args = nested[0], nested[1:]
-			return emit(child, lineBase, vars, calls)
+		if slices.Contains(wrapperVia, "parallel") {
+			child, ok := parallelChild(c, wrapperVia)
+			if ok {
+				return emit(child, lineBase, vars, calls)
+			}
 		}
 		return emit(c.sub(len(c.words)-len(nested), c.via(wrapperVia...)), lineBase, vars, calls)
 	}
 	return nil
+}
+
+func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
+	parallelOffset := 0
+	parallelArgs := c.call.Args
+	if c.call.Name != "parallel" {
+		index := slices.Index(c.call.Args, "parallel")
+		if index < 0 {
+			return cmd{}, false
+		}
+		parallelOffset = index + 1
+		parallelArgs = c.call.Args[parallelOffset:]
+	}
+	start := wrapperOptionEnd("parallel", parallelArgs, 0)
+	marker := slices.Index(parallelArgs[start:], ":::")
+	if marker < 0 {
+		marker = slices.Index(parallelArgs[start:], "::::")
+	}
+	if marker < 0 {
+		return cmd{}, false
+	}
+	marker += start
+	if marker == start {
+		return cmd{}, false
+	}
+	globalStart, globalMarker := parallelOffset+start, parallelOffset+marker
+	args := append(slices.Clone(parallelArgs[start:marker]), parallelArgs[marker+1:]...)
+	words := slices.Clone(c.words[globalStart+1 : globalMarker+1])
+	words = append(words, c.words[globalMarker+2:]...)
+	child := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: c.call.Raw, Line: c.call.Line,
+		Via: c.via(wrapperVia...), Offset: words[0].offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
+		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words}
+	return child, true
 }
 
 // expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).
@@ -1169,10 +1372,7 @@ func invocationScript(c cmd) (mapped, bool) {
 			return mappedScriptWords(c, []scriptArg{arg})
 		}
 	case "env":
-		arg, ok := envSplitArg(args)
-		if ok {
-			return mappedScriptWords(c, []scriptArg{arg})
-		}
+		return mappedScriptWords(c, envSplitScriptArgs(args))
 	case "tmux":
 		start := tmuxCommandStart(args)
 		if start < len(args) {
@@ -1199,10 +1399,7 @@ func watchScriptArgs(args []string) []scriptArg {
 	if start >= len(args) {
 		return nil
 	}
-	end := start + 1
-	if hasOption("watch", args, "-x", "--exec") {
-		end = len(args)
-	}
+	end := len(args)
 	words := make([]scriptArg, 0, end-start)
 	for i := start; i < end; i++ {
 		words = append(words, scriptArg{index: i})
@@ -1244,6 +1441,9 @@ func mappedScriptWords(c cmd, words []scriptArg) (mapped, bool) {
 }
 
 func commandStringArg(name string, args []string) (scriptArg, bool) {
+	if name == "script" {
+		return scriptCommandArg(args)
+	}
 	if name == "flock" {
 		lock := wrapperOptionEnd(name, args, 0)
 		if lock >= len(args) {
@@ -1251,11 +1451,15 @@ func commandStringArg(name string, args []string) (scriptArg, bool) {
 		}
 		return commandOptionAt(args, lock+1)
 	}
-	if name == "su" {
+	if name == "su" || name == "runuser" {
 		userSeen := false
 		for i := 0; i < len(args); {
 			if arg, ok := commandOptionAt(args, i); ok {
 				return arg, true
+			}
+			if args[i] == "-" {
+				i++
+				continue
 			}
 			if args[i] == "--" {
 				return scriptArg{}, false
@@ -1287,7 +1491,39 @@ func commandStringArg(name string, args []string) (scriptArg, bool) {
 		if !strings.HasPrefix(args[i], "-") {
 			return scriptArg{}, false
 		}
-		i = optionNext(name, args, i)
+		next := optionNext(name, args, i)
+		if next == i {
+			i++
+		} else {
+			i = next
+		}
+	}
+	return scriptArg{}, false
+}
+
+func scriptCommandArg(args []string) (scriptArg, bool) {
+	fileSeen := false
+	for i := 0; i < len(args); {
+		if arg, ok := commandOptionAt(args, i); ok {
+			return arg, true
+		}
+		if args[i] == "--" {
+			return scriptArg{}, false
+		}
+		if strings.HasPrefix(args[i], "-") {
+			next := optionNext("script", args, i)
+			if next == i {
+				i++
+			} else {
+				i = next
+			}
+			continue
+		}
+		if fileSeen {
+			return scriptArg{}, false
+		}
+		fileSeen = true
+		i++
 	}
 	return scriptArg{}, false
 }
@@ -1300,7 +1536,10 @@ func commandOptionAt(args []string, i int) (scriptArg, bool) {
 	if strings.HasPrefix(arg, "--command=") {
 		return scriptArg{index: i, offset: len("--command=")}, true
 	}
-	if arg == "-c" || arg == "--command" {
+	if strings.HasPrefix(arg, "--session-command=") {
+		return scriptArg{index: i, offset: len("--session-command=")}, true
+	}
+	if arg == "-c" || arg == "--command" || arg == "--session-command" {
 		if i+1 < len(args) {
 			return scriptArg{index: i + 1}, true
 		}
@@ -1318,6 +1557,18 @@ func commandOptionAt(args []string, i int) (scriptArg, bool) {
 		}
 	}
 	return scriptArg{}, false
+}
+
+func envSplitScriptArgs(args []string) []scriptArg {
+	arg, ok := envSplitArg(args)
+	if !ok {
+		return nil
+	}
+	words := []scriptArg{arg}
+	for i := arg.index + 1; i < len(args); i++ {
+		words = append(words, scriptArg{index: i})
+	}
+	return words
 }
 
 func envSplitArg(args []string) (scriptArg, bool) {
@@ -1508,12 +1759,48 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	return append([]string{name}, args...), via, len(via) > 0
 }
 
+func suReadsShell(name string, args []string) bool {
+	if _, ok := commandStringArg(name, args); ok {
+		return false
+	}
+	userSeen := false
+	for i := 0; i < len(args); {
+		if args[i] == "-" {
+			i++
+			continue
+		}
+		if args[i] == "--" {
+			return false
+		}
+		if strings.HasPrefix(args[i], "-") {
+			next := optionNext(name, args, i)
+			if next == i {
+				i++
+			} else {
+				i = next
+			}
+			continue
+		}
+		if userSeen {
+			return false
+		}
+		userSeen = true
+		i++
+	}
+	return true
+}
+
 func wrapperRunsScript(name string, args []string) bool {
 	switch name {
 	case "env":
 		_, ok := envSplitArg(args)
 		return ok
-	case "su", "runuser", "flock":
+	case "su", "runuser":
+		if _, ok := commandStringArg(name, args); ok {
+			return true
+		}
+		return suReadsShell(name, args)
+	case "flock":
 		_, ok := commandStringArg(name, args)
 		return ok
 	}
@@ -1543,7 +1830,7 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 	if name == "timeout" && i < len(args) && args[i] != "--" {
 		i++
 	}
-	for name == "env" && i < len(args) && (strings.Contains(args[i], "=") || args[i] == "-i") {
+	for name == "env" && i < len(args) && (strings.Contains(args[i], "=") || args[i] == "-i" || args[i] == "-" && i+1 < len(args)) {
 		i++
 	}
 	if i >= len(args) {
@@ -1569,14 +1856,21 @@ func wrapperStart(name string, args []string) int {
 
 func hasOption(name string, args []string, options ...string) bool {
 	for i := 0; i < len(args); {
-		if slices.Contains(options, args[i]) {
-			return true
+		arg := args[i]
+		for _, option := range options {
+			if arg == option || strings.HasPrefix(option, "--") && strings.HasPrefix(arg, option+"=") {
+				return true
+			}
+			if len(option) == 2 && option[0] == '-' && option[1] != '-' && strings.HasPrefix(arg, "-") && strings.Contains(arg[1:], option[1:]) {
+				return true
+			}
 		}
 		next := wrapperOptionEnd(name, args, i)
 		if next == i {
-			break
+			i++
+		} else {
+			i = next
 		}
-		i = next
 	}
 	return false
 }
@@ -1610,19 +1904,19 @@ var valueOptions = map[string]map[string]bool{
 	"xargs":       set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"),
 	"ssh":         set("-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"),
 	"taskset":     set("-c", "--cpu-list", "-p", "--pid"),
-	"chrt":        set("-p", "--pid", "--sched-period", "--sched-runtime", "--sched-deadline"),
-	"strace":      set("-o", "-e", "-p", "-u", "-s", "-O", "-I", "-E", "-P", "-a", "-S", "-X", "-b"),
-	"setpriv":     set("--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig"),
-	"unshare":     set("-S", "-G", "-R", "-w", "--setuid", "--setgid", "--root", "--wd", "--map-user", "--map-group", "--mount-proc", "--propagation"),
-	"flock":       set("-E", "-w"),
-	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--nice"),
+	"chrt":        set("-p", "--pid", "-P", "-T", "-D", "--sched-period", "--sched-runtime", "--sched-deadline"),
+	"strace":      set("-o", "--output", "-e", "-p", "-u", "-s", "-O", "-I", "-E", "-P", "-a", "-S", "-X", "-b", "-U", "--secontext"),
+	"setpriv":     set("--reuid", "--ruid", "--regid", "--rgid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig"),
+	"unshare":     set("-S", "-G", "-R", "-w", "--setuid", "--setgid", "--root", "--wd", "--map-user", "--map-group", "--propagation"),
+	"flock":       set("-E", "--conflict-exit-code", "-w", "--wait", "--timeout"),
+	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--nice"),
 	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "-s", "--shell", "-w", "--whitelist-environment"),
-	"su":          set("-c", "--command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
+	"su":          set("-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
 	"doas":        set("-u", "-C", "-s"),
 	"watch":       set("-n", "--interval"),
-	"script":      set("-c", "--command", "--echo"),
-	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin"),
-	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y"),
+	"script":      set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io"),
+	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "--halt", "--timeout", "--delay"),
+	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e"),
 }
 
 func set(items ...string) map[string]bool {

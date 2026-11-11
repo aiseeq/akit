@@ -195,6 +195,62 @@ func TestHeredocSubstitutionOffset(t *testing.T) {
 	}
 }
 
+func TestPipedHeredocScripts(t *testing.T) {
+	tests := []struct {
+		name, command string
+		via           []string
+		line          int
+		noScript      bool
+	}{
+		{name: "cat to bash", command: "cat <<'END' |\nkill 0\nEND\nbash", via: []string{"pipe", "bash"}, line: 2},
+		{name: "expanded body", command: "cat <<E | bash\nkill 1\nE", via: []string{"pipe", "bash"}, line: 2},
+		{name: "body substitutions", command: "cat <<E | bash\n$(kill 1)\nE", via: []string{"pipe", "bash"}, line: 2},
+		{name: "tabs to sh stdin", command: "cat - <<-E | sh -s\n\tkill 1\n\tE", via: []string{"pipe", "sh"}, line: 2},
+		{name: "escaped tab notation to sh stdin", command: "cat <<-E | sh -s\n\\tkill 1\n\\tE", via: []string{"pipe", "sh"}, line: 2},
+		{name: "sudo shell", command: "cat - <<E | sudo bash\nkill 1\nE", via: []string{"pipe", "sudo", "bash"}, line: 2},
+		{name: "tee to bash", command: "tee /tmp/x <<E | bash\nkill 1\nE", via: []string{"pipe", "bash"}, line: 2},
+		{name: "timeout shell", command: "cat <<E | timeout 5 bash\nkill 1\nE", via: []string{"pipe", "timeout", "bash"}, line: 2},
+		{name: "nested piped heredoc", command: "cat <<'A' | bash\ncat <<'B' | bash\nkill 1\nB\nA", via: []string{"pipe", "bash", "pipe", "bash"}, line: 3},
+		{name: "non-shell pipe", command: "cat <<E | grep x\nkill 0\nE", noScript: true},
+		{name: "no-exec shell", command: "cat <<E | bash -n\nkill 0\nE", noScript: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			var found bool
+			for _, call := range calls {
+				if call.Name == "kill" {
+					found = true
+					if tt.noScript || call.Line != tt.line || !reflect.DeepEqual(call.Via, tt.via) {
+						t.Errorf("kill call = %#v, want line %d via %q", call, tt.line, tt.via)
+					}
+				}
+				if (call.Name == "bash" || call.Name == "sh") && call.ScriptInput {
+					t.Errorf("known piped script marked ScriptInput: %#v", call)
+				}
+			}
+			if found != !tt.noScript {
+				t.Errorf("kill found = %t, want %t; calls = %#v", found, !tt.noScript, calls)
+			}
+		})
+	}
+}
+
+func TestPipedHeredocDepthLimit(t *testing.T) {
+	script := "kill 1"
+	for range maxNestedScripts {
+		script = "cat <<'E' | bash\n" + script + "\nE"
+	}
+	calls, err := Calls(script)
+	var nested *NestedError
+	if !errors.As(err, &nested) {
+		t.Fatalf("deep piped heredocs returned no depth error: calls=%d err=%v", len(calls), err)
+	}
+}
+
 func TestLoopCalls(t *testing.T) {
 	calls, err := Calls("while true; do sleep 5; done; bash -c 'for x in a; do sleep 2; done'")
 	if err != nil {
@@ -352,6 +408,40 @@ E`, "kill", []string{"1"}, []string{"bash"}},
 		{`find . -exec kill {} \; -exec pkill -u u1 +`, "pkill", []string{"-u", "u1"}, []string{"find", "-exec"}},
 		{`trap - SIG`, "kill", nil, nil},
 		{`parallel kill :::: /tmp/x`, "kill", []string{"/tmp/x"}, []string{"parallel"}},
+		{`env -S kill -1`, "kill", []string{"-1"}, []string{"env"}},
+		{`env -S pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"env"}},
+		{`env -S nice kill 1`, "kill", []string{"1"}, []string{"env", "nice"}},
+		{`nice env -S sudo pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"nice", "env", "sudo"}},
+		{`env --split-string=nice kill 1`, "kill", []string{"1"}, []string{"env", "nice"}},
+		{`env - kill 1`, "kill", []string{"1"}, []string{"env"}},
+		{`sudo env - pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"sudo", "env"}},
+		{`watch kill -1`, "kill", []string{"-1"}, []string{"watch"}},
+		{`watch sudo pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"watch", "sudo"}},
+		{`nice parallel bash -c 'kill 1' ::: x`, "kill", []string{"1"}, []string{"nice", "parallel", "bash", "-c"}},
+		{`sudo parallel kill -9 ::: 1`, "kill", []string{"-9", "1"}, []string{"sudo", "parallel"}},
+		{`timeout 5 parallel kill ::: 1`, "kill", []string{"1"}, []string{"timeout", "parallel"}},
+		{`parallel --halt now,fail=1 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
+		{`parallel --timeout 5 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
+		{`parallel --delay 1 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
+		{`runuser - a -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`runuser a -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`runuser -l a -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`taskset -c0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
+		{`taskset --cpu-list=0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
+		{`taskset -ac 0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
+		{`unshare --fork --pid --mount-proc kill 1`, "kill", []string{"1"}, []string{"unshare"}},
+		{`tmux new -d -e X=1 'kill 1'`, "kill", []string{"1"}, []string{"tmux"}},
+		{`script /dev/null -c 'kill 1'`, "kill", []string{"1"}, []string{"script"}},
+		{`flock --timeout 5 /tmp/x -c 'kill 1'`, "kill", []string{"1"}, []string{"flock"}},
+		{`flock --conflict-exit-code 3 /tmp/x kill 1`, "kill", []string{"1"}, []string{"flock"}},
+		{`strace --output /dev/null kill 1`, "kill", []string{"1"}, []string{"strace"}},
+		{`strace -U name kill 1`, "kill", []string{"1"}, []string{"strace"}},
+		{`systemd-run --on-active 5 kill 1`, "kill", []string{"1"}, []string{"systemd-run"}},
+		{`systemd-run --machine m kill 1`, "kill", []string{"1"}, []string{"systemd-run"}},
+		{`setpriv --ruid 1 kill 1`, "kill", []string{"1"}, []string{"setpriv"}},
+		{`chrt -T 1 -P 2 -D 3 -d 0 kill 1`, "kill", []string{"1"}, []string{"chrt"}},
+		{`script -E never -c 'kill 1'`, "kill", []string{"1"}, []string{"script"}},
+		{`su --session-command 'kill 1' u1`, "kill", []string{"1"}, []string{"su"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.command, func(t *testing.T) {
@@ -431,6 +521,12 @@ func TestUnknownShellScriptInput(t *testing.T) {
 		`echo k | sudo bash`,
 		`echo k | timeout 5 sh`,
 		`bash -c 'source <(echo k)'`,
+		`sudo bash <(echo k)`,
+		`timeout 5 bash <(echo k)`,
+		`echo k | sudo -s`,
+		`echo k | sudo -i`,
+		`echo k | sudo su`,
+		`echo k | su u1`,
 	} {
 		calls, err = Calls(command)
 		if err != nil {
@@ -457,7 +553,7 @@ func TestUnknownShellScriptInput(t *testing.T) {
 }
 
 func TestScriptOptionsDoNotPanic(t *testing.T) {
-	for _, command := range []string{`script -c`, `script -qc`, `script --force`, `x=1; script --force > /dev/null`} {
+	for _, command := range []string{`script -c`, `script -qc`, `script --force`, `script -`, `script - x`, `x=1; script --force > /dev/null`} {
 		calls, err := Calls(command)
 		if err != nil {
 			t.Errorf("%q: %v", command, err)
@@ -500,6 +596,15 @@ func TestNestedScriptDepthLimit(t *testing.T) {
 	var nested *NestedError
 	if !errors.As(err, &nested) {
 		t.Fatalf("deep eval did not return a depth error: calls=%d err=%v", len(calls), err)
+	}
+
+	script = "kill 1"
+	for range 64 {
+		script = "find . -exec " + script + ` \;`
+	}
+	calls, err = Calls(script)
+	if !errors.As(err, &nested) {
+		t.Fatalf("deep find -exec did not return a depth error: calls=%d err=%v", len(calls), err)
 	}
 }
 
