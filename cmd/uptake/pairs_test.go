@@ -1474,6 +1474,7 @@ func TestDetectorPrecision(t *testing.T) {
 		{"curl -s https://example.test/a; sleep 1; curl -sf https://example.test/b && echo done", "wfor", false},
 		{"curl -s \"$U/job\"; sleep 1; curl -sf \"$U/job\" && echo done", "wfor", true},
 		{"curl -s localhost:8080/job; sleep 1; curl -sf localhost:8080/job && echo done", "wfor", true},
+		{"curl -s https://example.test/a; sleep 1; test -f /synthetic/ready && curl -s https://example.test/b", "wfor", true},
 		{"curl -s http://example.test/a; sleep 1; curl -sf http://example.test/a && echo done", "wfor", true},
 		{"curl -s https://example.test/b; curl -s https://example.test/a; sleep 1; curl -sf https://example.test/a && echo done", "wfor", true},
 		{"curl -s https://example.test/a; curl -s https://example.test/b; sleep 1; curl -sf https://example.test/a && echo done", "wfor", false},
