@@ -851,8 +851,12 @@ func typeExpressionHead(text string, value contextValue) bool {
 	if i >= len(v) || !isIdentifierStart(v[i]) {
 		return false
 	}
+	argStart := i
 	for i < len(v) && isIdentifierByte(v[i]) {
 		i++
+	}
+	if !plainTypeName(v[argStart:i]) {
+		return false
 	}
 	if i < len(v) && v[i] == '>' {
 		if i+1 != len(v) {
@@ -878,8 +882,23 @@ func plainTypeName(value string) bool {
 			return false
 		}
 	}
+	allLower, allUpper := true, true
+	for i := 0; i < len(value); i++ {
+		allLower = allLower && value[i] >= 'a' && value[i] <= 'z'
+		allUpper = allUpper && value[i] >= 'A' && value[i] <= 'Z'
+	}
 	if isPlainWord(value) {
-		return true
+		if allLower || allUpper {
+			return true
+		}
+		if value[0] >= 'A' && value[0] <= 'Z' {
+			for i := 1; i < len(value); i++ {
+				if value[i] >= 'A' && value[i] <= 'Z' {
+					return false
+				}
+			}
+			return true
+		}
 	}
 	parts := 0
 	for i := 0; i < len(value); {

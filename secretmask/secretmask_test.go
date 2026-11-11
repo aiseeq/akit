@@ -249,7 +249,7 @@ func TestMaskRealTranscriptFalseMaskForms(t *testing.T) {
 		{"equals generic", `auth=Record<Kind, string>`, `auth=Summer<2024!`},
 		{"lowercase generic", `auth: record<T, string>`, `auth: Summer<2024!`},
 		{"single-letter generic", `auth: T<Kind, string>`, `auth: Summer<2024!`},
-		{"digit in generic type", `auth: Record<Kind2, string>`, `auth: Summer<2024!`},
+		{"digit in generic type", `auth: Record<Kind, string>`, `auth: Summer<2024!`},
 
 		{"function call", `auth: authority(x)`, `auth: Zq7xW9vK2m`},
 		{"json object", `"https://api.example.com/auth": {"plan": "pro"}`, `"https://api.example.com/auth": "8f3a9c2e7b1d4f60"`},
@@ -366,13 +366,23 @@ func TestGenericHeadAndTailRejectTokenLikeValues(t *testing.T) {
 		"auth=Record<Kind>suffix",
 		"auth=Record<Kind>>",
 		"auth=Record<Kind>_w$HBz8Sk",
+		"auth=Record<Kind>)",
+		"auth=Abc<def,ghi",
 		"auth=Record<,",
+		"auth: Record<Kind2, string>",
 		"auth=Record<Kind!>",
 		"auth=Record<2Kind,",
 		"auth=Record<Kind",
 		"auth=fooBar<Kind>",
 		"auth=Zq7xW9vK2m<Kind>",
 		"auth=map[string]Zq7xW9vK2m{",
+		"auth=pa55w0rd<x>",
+		"auth=KxQzWp<abc>",
+		"auth=Kxqzwprtmnbvcxzlk<abc>",
+		"auth=abcdefghijklmnopqr<abc>",
+		"credentials=PWSp<UAxVRVXI2n>",
+		"auth=PE<QFCa,",
+		"auth: NH<BA8GJ,CRgcjdLTh+a4McX",
 	} {
 		got, found := Mask(text)
 		if got == text || len(found) == 0 {
@@ -385,11 +395,29 @@ func TestGenericHeadAndTailRejectTokenLikeValues(t *testing.T) {
 		"auth=Record<Kind, string>",
 		"auth: Record<Kind, string> = {}",
 		"credentials=Map<Kind>",
+		"auth=Record<string, string>",
+		"auth=Promise<void>;",
+		"auth=HashMap<String, Vec>",
+		"auth=Map<string, number> = new Map()",
 	} {
 		got, found := Mask(text)
 		if got != text || len(found) != 0 {
 			t.Errorf("ordinary type expression changed: %q -> %q %v", text, got, found)
 		}
+	}
+}
+
+func TestTypeTailBoundaries(t *testing.T) {
+	base := "Record<Kind>"
+	value := contextValue{start: 0, end: len(base)}
+	for _, suffix := range []string{"=", " ", "\n", ";", ""} {
+		text := base + suffix
+		if !typeExpressionHead(text, value) {
+			t.Errorf("valid type tail boundary %q was rejected", suffix)
+		}
+	}
+	if typeExpressionHead(base+")", value) {
+		t.Fatal("closing parenthesis accepted after a generic type")
 	}
 }
 
