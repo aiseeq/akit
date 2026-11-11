@@ -3,7 +3,6 @@ package frozen
 import (
 	"os"
 	"path/filepath"
-
 	"testing"
 )
 
@@ -82,6 +81,19 @@ func TestFrozenIncompleteResultHasLine(t *testing.T) {
 	result, err := NewList("# comment\n"+project+"\n", home, Path(home)).Frozen(project)
 	if err != nil || !result.Frozen || result.IncompleteLine != 2 {
 		t.Fatalf("Frozen() = (%+v, %v), want incomplete line 2", result, err)
+	}
+}
+
+func TestFrozenFirstMatchingLineWins(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "work", "sample")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := project + "\n" + project + "\towner\tdate\tlater reason\n"
+	result, err := NewList(content, home, Path(home)).Frozen(project)
+	if err != nil || !result.Frozen || result.Line != 1 || result.IncompleteLine != 1 || result.Reason == "later reason" {
+		t.Fatalf("Frozen = %+v, %v; want the first, incomplete line", result, err)
 	}
 }
 
