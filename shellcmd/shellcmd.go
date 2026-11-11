@@ -1127,3 +1127,20 @@ func optionValue(wrapper, option string) bool {
 	}
 	return false
 }
+
+// ShadowedByFunction сообщает, объявлена ли в cmd до вызова функция оболочки с именем программы
+// вызова: тогда вызов идёт в функцию, а не в программу. Ошибка — cmd не разбирается.
+func (c Call) ShadowedByFunction(cmd string) (bool, error) {
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		return false, fmt.Errorf("parse shell functions: %w", err)
+	}
+	shadowed := false
+	syntax.Walk(file, func(n syntax.Node) bool {
+		if fn, ok := n.(*syntax.FuncDecl); ok && fn.Name.Value == c.Name && int(fn.Pos().Offset()) < c.Offset {
+			shadowed = true
+		}
+		return !shadowed
+	})
+	return shadowed, nil
+}

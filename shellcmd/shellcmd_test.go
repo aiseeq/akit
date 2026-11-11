@@ -684,3 +684,33 @@ func TestAppendedDelimiterNotArgument(t *testing.T) {
 		}
 	}
 }
+
+func TestShadowedByFunction(t *testing.T) {
+	for _, tc := range []struct {
+		cmd  string
+		want bool
+	}{
+		{"w() { echo running; }; w", true},
+		{"w; w() { echo running; }", false},
+		{"uptime() { :; }; w", false},
+		{"w", false},
+	} {
+		calls, err := Calls(tc.cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var probe Call
+		for _, c := range calls {
+			if c.Name == "w" {
+				probe = c
+			}
+		}
+		got, err := probe.ShadowedByFunction(tc.cmd)
+		if err != nil || got != tc.want {
+			t.Errorf("%q: got %v, %v; want %v", tc.cmd, got, err, tc.want)
+		}
+	}
+	if _, err := (Call{Name: "w"}).ShadowedByFunction("w() {"); err == nil {
+		t.Error("unparsable command: no error")
+	}
+}

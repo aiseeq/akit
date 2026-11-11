@@ -678,7 +678,7 @@ func TestPairUserWordOverlap(t *testing.T) {
 			t.Errorf("outcomes.tsv missing %q:\n%s", want, outcomes)
 		}
 	}
-	if got := read("pair-overlap.tsv"); !strings.Contains(got, "tl\tuser-word\t1") {
+	if got := read("pair-overlap.tsv"); !strings.Contains(got, "tl\tuser-word\t2") {
 		t.Errorf("transcript grep overlap missing:\n%s", got)
 	}
 	if got := read("pairs.tsv"); strings.Contains(got, "user-word\tclaude-main\tno\tno-date\told\t0\t1") {
@@ -693,7 +693,7 @@ func TestPairUserWordOverlap(t *testing.T) {
 		}
 	}
 	if priorOldCalls != 3 {
-		t.Errorf("prior old should count decisions, improve search and tl --grep, but not unrelated cat: %d", priorOldCalls)
+		t.Errorf("prior old should count decisions, improve and tl --grep, not unrelated cat: %d", priorOldCalls)
 	}
 	cand, verdict := read("candidates.tsv"), read("candidates-verdict.tsv")
 	if !strings.Contains(cand, "uptime") {
@@ -1265,15 +1265,23 @@ func TestDetectorBusyAfterMeasurement(t *testing.T) {
 		want    bool
 	}{
 		{"uptime; go test ./...", true},
+		{"w; go test ./...", true},
+		{"w() { echo running; }; w; go test ./...", false},
 		{"if uptime; then go test ./...; fi", true},
 		{"uptime --since; go test ./...", false},
 		{"uptime -s; go test ./...", false},
+		{"uptime -r; go test ./...", true},
+		{"uptime -c; go test ./...", true},
+		{"uptime --raw; go test ./...", true},
+		{"uptime --container; go test ./...", true},
 		{"uptime --pretty; go test ./...", false},
 		{"uptime; printf 'go test ./...'", false},
 		{"lscpu; uptime; go test ./...", false},
 		{"go test ./...; uptime", false},
 		{"go test ./...; uptime; echo done", false},
 		{"go test ./...; uptime; go build ./...", true},
+		{`uptime; "go" test ./...`, true},
+		{`"go" test ./...; uptime`, false},
 	} {
 		e := transcript.Event{Role: transcript.Cmd, Who: "Bash", Line: 1, CallID: tc.command, Time: base, Text: tc.command}
 		calls, err := shellcmd.Calls(tc.command)
@@ -1305,8 +1313,8 @@ func TestDetectorBusyAfterMeasurementAndLaterRun(t *testing.T) {
 	}
 	base := time.Now()
 	evs := []transcript.Event{{Role: transcript.Cmd, Time: base, Text: cmd}, {Role: transcript.Cmd, Time: base.Add(time.Minute), Text: "go build ./..."}}
-	if got := u.oldBusyGoal(evs, 0, cmd, calls[1]); got != "" {
-		t.Fatalf("probe after measurement paired with later run: %q", got)
+	if got := u.oldBusyGoal(evs, 0, cmd, calls[1]); got == "" {
+		t.Fatal("probe must pair with the later run")
 	}
 }
 
@@ -1333,6 +1341,24 @@ func TestDetectorBusyAllowsIntermediateCommands(t *testing.T) {
 	}
 }
 
+func TestDetectorBoundaries(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	base := time.Now()
+	probe := shellcmd.Call{Name: "uptime", Raw: "uptime", Offset: 0}
+	for _, tc := range []struct {
+		delay time.Duration
+		want  bool
+	}{{15 * time.Minute, true}, {15*time.Minute + time.Second, false}} {
+		events := []transcript.Event{{Role: transcript.Cmd, Time: base}, {Role: transcript.Cmd, Time: base.Add(tc.delay), Text: "go test ./..."}}
+		if got := u.oldBusyGoal(events, 0, "uptime", probe) != ""; got != tc.want {
+			t.Errorf("delay %s: got %v", tc.delay, got)
+		}
+	}
+	if u.waitPairGoal(shellcmd.Call{Name: "sleep", Args: []string{"1"}, Offset: -1}, "sleep 1; test -f /synthetic/ready") != "" {
+		t.Error("sleep without an offset was accepted")
+	}
+}
+
 func TestDetectorPrecision(t *testing.T) {
 	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
 	for _, tc := range []struct {
@@ -1342,7 +1368,27 @@ func TestDetectorPrecision(t *testing.T) {
 		{"grep 'hello friend' ~/.claude/projects/s.jsonl", "user-word", true},
 		{"rg 'любая фраза|другая.*мысль' ~/.claude/projects/s.jsonl", "user-word", true},
 		{"grep 'exit code 17' ~/.claude/projects/s.jsonl", "user-word", false},
-		{"grep syntheticwordlong ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'hi' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'hi|no' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'abc-123' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'abc|def' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"grep 'red/blue green' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'red_blue green' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'red$blue green' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'red=blue green' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'red<blue green' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep 'red>blue green' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep syntheticwordlong ~/.claude/projects/s.jsonl", "user-word", true},
+		{"rg -l 'яблоко|груша' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"rg -m 5 -A 3 -B 2 -C 1 needle ~/.claude/projects/s.jsonl", "user-word", true},
+		{"rg -e 'яблоко' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"f=~/.claude/projects/s.jsonl; rg яблоко \"$f\"", "user-word", true},
+		{"f=/synthetic/table.txt; echo ~/.claude/projects/s.jsonl; rg яблоко \"$f\"", "user-word", false},
+		{"rg '~/.claude/projects/s.jsonl' /synthetic/list.txt", "user-word", false},
+		{"rg -m 5 -A 3 -B 2 -C 1 'exit code' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"tl --role user --grep яблоко", "user-word", true},
+		{"tl --role user,agent --grep яблоко", "user-word", false},
+		{"tl --role=user --grep яблоко", "user-word", true},
 		{"grep package.TypeName ~/.claude/projects/s.jsonl", "user-word", false},
 		{"grep package.Component ~/.claude/projects/s.jsonl", "user-word", false},
 		{"jq '.message.type' ~/.claude/projects/s.jsonl", "user-word", false},
@@ -1358,11 +1404,18 @@ func TestDetectorPrecision(t *testing.T) {
 		{"sleep 1; if curl -fsS https://example.test; then echo ready; fi", "wfor", true},
 		{"sleep 1; curl -fsS https://example.test && echo ready", "wfor", true},
 		{"curl -fsS https://example.test; sleep 1; test -s /synthetic/ready", "wfor", true},
-		{"if echo hi; then echo ok; fi; sleep 1; curl -fsS https://example.test", "wfor", false},
+		{"if echo hi; then echo ok; fi; sleep 1; curl -fsS https://example.test", "wfor", true},
+		{"curl -fsS https://example.test; sleep 1; curl -fsS https://example.test", "wfor", false},
 		{"sleep 1; printf update; test -f /synthetic/ready", "wfor", true},
 		{"sleep 1; touch /synthetic/other", "wfor", false},
 		{"sleep 0; test -f /synthetic/ready", "wfor", false},
-		{"sleep 2; curl -fsS https://example.test", "wfor", false},
+		{"sleep 2; curl -fsS https://example.test", "wfor", true},
+		{"while :; do s=$(curl -fsS https://example.test); case \"$s\" in *done*) break;; esac; sleep 15; done", "wfor", true},
+		{"bash -c 'key='\"$key\"'; while :; do s=$(curl -fsS https://example.test); case \"$s\" in *done*) break;; esac; sleep 15; done'", "wfor", true},
+		{"while true; do if grep -q DONE /synthetic/log; then exit 0; fi; sleep 5; done", "wfor", true},
+		{"while true; do if test -f /synthetic/ready; then return 0; fi; sleep 5; done", "wfor", true},
+		{"while true; do while true; do if test -f /synthetic/ready; then break; fi; done; sleep 5; done", "wfor", false},
+		{"while true; do if test -f /synthetic/ready; then while true; do break; done; fi; sleep 5; done", "wfor", false},
 		{"for i in 1 2; do sleep 1; ls /synthetic/data; done", "wfor", false},
 		{"while true; do sleep 1; ls /synthetic/data; done", "wfor", false},
 		{"for x in a b; do sleep 1; ls /synthetic/data; done; if test -f /synthetic/done; then echo break; fi", "wfor", false},
@@ -1380,19 +1433,36 @@ func TestDetectorPrecision(t *testing.T) {
 		{"cp ~/.claude/skills/demo/reference.md /synthetic/out", "claude-rules-export", true},
 		{"cp -r ~/.claude/skills/demo/. /synthetic/out", "claude-rules-export", true},
 		{"rg choice ~/.claude/improve/state/notes.md", "prior", true},
+		{"sed -n '1,4p' /synthetic/main.go; rg status ~/.claude/improve/runs/check.md", "prior", false},
+		{"rg status ~/.claude/improve/runs/check.md; sed -n '1,4p' /synthetic/main.go", "prior", true},
+		{"rg '~/.claude/improve/state/notes.md' /synthetic/data.txt", "prior", false},
 		{"rg choice ~/.claude/improve/trials/record.md", "prior", true},
 		{"rg choice ~/.claude/improve/record.md", "prior", true},
 		{"rg choice ~/.claude/improve/templates/guide.md", "prior", false},
+		{"rg choice ~/.claude/improve/prompts", "prior", false},
 		{"cat ~/.claude/improve/runs/raw.json", "prior", false},
 		{"rg 'table.tsv' ~/.claude/improve/state/notes.md", "prior", true},
 		{"rg choice ~/.claude/improve/state/data.json", "prior", false},
-		{"rg choice ~/.claude/improve/state/measure.tsv", "prior", false},
+		{"rg choice ~/.claude/improve/state/measure.tsv", "prior", true},
+		{"rg choice ~/.claude/improve/state/perf/measure.tsv", "prior", false},
+		{"rg choice ~/.claude/improve/new-section/registry.txt", "prior", true},
+		{"rg choice ~/.claude/improve/runs/raw/output.jsonl", "prior", false},
+		{"rg choice ~/.claude/improve/runs/report.md", "prior", false},
+		{"rg 'experiment|trial' ~/.claude/improve/runs/report.md", "prior", true},
+		{"rg choice ~/.claude/improve/runs/raw/registry.txt", "prior", true},
+		{"grep --include='*.json' choice ~/.claude/improve/runs", "prior", false},
+		{"grep --include='*.tsv' choice ~/.claude/improve/runs", "prior", true},
+		{"rg --glob='*.jsonl' choice ~/.claude/improve/runs", "prior", false},
+		{"rg -g'*.json' choice ~/.claude/improve/runs", "prior", false},
 		{"rg --glob '*.json' choice ~/.claude/improve/runs", "prior", false},
 		{"rg -g '*.md' choice ~/.claude/improve/runs", "prior", true},
 		{"rg -g '*.json' -g '*.md' choice ~/.claude/improve/runs", "prior", true},
 		{"rg -g '!*.json' choice ~/.claude/improve/runs", "prior", true},
 		{"cat ~/.claude/improve/tasks/example.md", "prior", true},
 		{"cat ~/.claude/improve/runs/example.md", "prior", true},
+		{"sed -n '1,4p' ~/.claude/improve/runs/example.md", "prior", true},
+		{"sed -n '1,4p' ~/.claude/improve/runs/example.md | cut -c1-20 >/dev/null", "prior", false},
+		{"sed -i s/a/b/ ~/.claude/improve/runs/example.md", "prior", false},
 	} {
 		t.Run(tc.command, func(t *testing.T) {
 			calls, err := shellcmd.Calls(tc.command)
@@ -1407,7 +1477,7 @@ func TestDetectorPrecision(t *testing.T) {
 				}
 			}
 			if got != tc.want {
-				t.Errorf("%s: got %v, want %v", tc.pair, got, tc.want)
+				t.Errorf("%s: got %v, want %v; calls=%+v", tc.pair, got, tc.want, calls)
 			}
 		})
 	}
