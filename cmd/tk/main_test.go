@@ -2234,6 +2234,8 @@ func TestJournalTextAcceptsAndMarksGuessedTime(t *testing.T) {
 // «~ЧЧ:ММ» позже метки записи — угаданное будущее время; раньше или в пределах минуты — проходит.
 func TestJournalTextMarksApproxFutureTime(t *testing.T) {
 	now := time.Date(2026, 11, 2, 2, 54, 30, 0, time.Local)
+	_, dir := testRunMainRoot(t)
+	path := writeRunMainTask(t, dir, "20200101-1200-MED-approx.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
 	for _, c := range []struct {
 		text string
 		bad  bool
@@ -2274,6 +2276,20 @@ func TestJournalTextMarksApproxFutureTime(t *testing.T) {
 		if (err != nil) != c.bad || (err != nil && !strings.Contains(err.Error(), "time of the entry")) {
 			t.Errorf("%q: %v", c.text, err)
 		}
+		var out, errout bytes.Buffer
+		if code := runMain([]string{"note", "approx", c.text, "--by", "tester"}, now, &out, &errout); code != 0 {
+			t.Fatalf("runMain note %q: code=%d stderr=%q", c.text, code, errout.String())
+		}
+		updated, readErr := os.ReadFile(path)
+		marked := strings.Contains(string(updated), "note — tester: "+c.text+" [время требует проверки]")
+		if readErr != nil || marked != c.bad {
+			t.Errorf("%q: journal marked=%v want %v, err=%v", c.text, marked, c.bad, readErr)
+		}
+		if c.bad {
+			requireHintParts(t, errout.String(), "в note", "[время требует проверки]")
+		} else if got := lastStderrLine(errout.String()); got != "" {
+			t.Errorf("%q: unexpected hint %q", c.text, got)
+		}
 	}
 	zone, err := time.LoadLocation("Europe/Belgrade")
 	if err != nil {
@@ -2291,7 +2307,7 @@ func TestJournalTextMarksApproxFutureTime(t *testing.T) {
 
 func TestTimeHintIsLastOnlyAfterSuccessfulCommand(t *testing.T) {
 	now := time.Date(2026, 11, 2, 23, 0, 0, 0, time.Local)
-	if hint := timeHint(options{note: "06:4x found"}, now); hint == "" || !strings.Contains(hint, "точное время — из date") {
+	if hint := timeHint(options{note: "06:4x found"}, now); hint == "" || !strings.Contains(hint, "точное время можно взять из date") {
 		t.Fatalf("hint = %q", hint)
 	}
 	if _, err := parseArgs([]string{"note", "ticket", "one\ntwo"}); err == nil || !strings.Contains(err.Error(), "one line") {
@@ -2346,7 +2362,7 @@ func TestGuessedTimeNoteSucceedsWithMarkerAndHint(t *testing.T) {
 		if code != 0 || readErr != nil || !strings.Contains(string(updated), note+" [время требует проверки]") {
 			t.Fatalf("note %q: code=%d, body=%s, stderr=%q, err=%v", note, code, updated, errout.String(), readErr)
 		}
-		if len(lines) == 0 || lines[len(lines)-1] != timeHint(options{note: note}, now) || !strings.Contains(out.String(), "noted") {
+		if len(lines) == 0 || !strings.Contains(lines[len(lines)-1], "в note") || !strings.Contains(lines[len(lines)-1], "[время требует проверки]") || !strings.Contains(out.String(), "noted") {
 			t.Fatalf("hint/output for %q: stdout=%q stderr=%q", note, out.String(), errout.String())
 		}
 	}
@@ -2468,6 +2484,223 @@ func TestSkippedPlanReasonIsMarkedAndPlanStaysSkipped(t *testing.T) {
 	items := planItems(string(updated))
 	if len(items) != 1 || !items[0].Skipped {
 		t.Fatalf("plan item is not skipped: %#v", items)
+	}
+}
+
+func testRunMainRoot(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	return root, dir
+}
+
+func writeRunMainTask(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func lastStderrLine(stderr string) string {
+	stderr = strings.TrimRight(stderr, "\r\n")
+	if i := strings.LastIndexByte(stderr, '\n'); i >= 0 {
+		return stderr[i+1:]
+	}
+	return stderr
+}
+
+func requireHintParts(t *testing.T, stderr string, parts ...string) {
+	t.Helper()
+	line := lastStderrLine(stderr)
+	for _, part := range parts {
+		if !strings.Contains(line, part) {
+			t.Fatalf("last stderr line %q lacks %q; full stderr: %q", line, part, stderr)
+		}
+	}
+	if strings.Contains(line, "проверьте") || strings.Contains(line, "напишите") {
+		t.Fatalf("hint uses imperative phrasing: %q", line)
+	}
+}
+
+func TestRunMainTimeHintsForJournalCommands(t *testing.T) {
+	cases := []struct {
+		name, command, status, extra, journal, hintField string
+	}{
+		{"done check", "done", "на проверке", "Исполнитель: worker\n\n## Приёмка\n- check", "06:4x checked", "--check"},
+		{"skip why", "skip", "открыт", "## План\n- accept: true\n\n", "06:4x skipped", "--why"},
+		{"review note", "review", "открыт", "Исполнитель: worker\n\n## Приёмка\n- check", "06:4x reviewed", "--note"},
+		{"unskip why", "unskip", "открыт", "## План\n- accept: true\n\n", "06:4x returned", "--why"},
+		{"repin why", "repin", "открыт", "## План\n- accept: false\n\nИсполнитель: worker", "06:4x repinned", "--why"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, dir := testRunMainRoot(t)
+			journal := ""
+			if tc.command == "repin" {
+				journal = "- 2020-01-01 12:00 план — author: добавлен обязательный пункт accept: false\n"
+			}
+			if tc.command == "skip" {
+				journal = "- 2020-01-01 12:00 план — author: добавлен пункт accept: true\n"
+			}
+			if tc.command == "unskip" {
+				journal = "- 2020-01-01 12:00 план — author: добавлен пункт accept: true\n- 2020-01-01 12:01 план — author: пропущен: accept — skip\n"
+			}
+			body := fmt.Sprintf("# Task\n\nСтатус: %s\n%s\n\n## Приёмка\n- check\n\n## Журнал\n%s", tc.status, tc.extra, journal)
+			writeRunMainTask(t, dir, "20200101-1200-MED-task.md", body)
+			oldSession := session
+			if tc.command == "repin" {
+				session = func() string { return "new-agent" }
+				t.Cleanup(func() { session = oldSession })
+			}
+			args := []string{tc.command, "task"}
+			switch tc.command {
+			case "done":
+				args = append(args, "--check", tc.journal, "--by", "reviewer")
+			case "skip":
+				args = append(args, "accept", "--why", tc.journal, "--by", "tester")
+			case "review":
+				args = append(args, "--note", tc.journal, "--by", "reviewer")
+			case "unskip":
+				args = append(args, "accept", "--why", tc.journal, "--by", "tester")
+			case "repin":
+				args = []string{"plan", "task", "--repin", "accept: true", "--why", tc.journal, "--by", "reviewer"}
+			}
+			var out, errout bytes.Buffer
+			if code := runMain(args, time.Now(), &out, &errout); code != 0 {
+				t.Fatalf("runMain %v: code=%d stdout=%q stderr=%q", args, code, out.String(), errout.String())
+			}
+			updated, err := os.ReadFile(filepath.Join(dir, "20200101-1200-MED-task.md"))
+			if err != nil || !strings.Contains(string(updated), tc.journal+" [время требует проверки]") {
+				t.Fatalf("journal text lacks marker: %s, err=%v", updated, err)
+			}
+			requireHintParts(t, errout.String(), "06:4x", tc.hintField, "[время требует проверки]")
+			if tc.command == "skip" {
+				items := planItems(string(updated))
+				if len(items) != 1 || !items[0].Skipped {
+					t.Fatalf("skip did not remain active: %#v", items)
+				}
+			}
+		})
+	}
+}
+
+func TestRunMainHeaderReasonsStayUnmarked(t *testing.T) {
+	for _, operation := range []string{"new", "set", "start"} {
+		t.Run(operation, func(t *testing.T) {
+			_, dir := testRunMainRoot(t)
+			if operation != "new" {
+				status := "открыт"
+				body := "# Task\n\nСтатус: " + status + "\n\n## Приёмка\n- check\n\n## Журнал\n"
+				writeRunMainTask(t, dir, "20200101-1200-MED-"+operation+"-task.md", body)
+			}
+			args := []string{operation}
+			switch operation {
+			case "new":
+				args = append(args, "new-reason")
+			case "set":
+				args = append(args, "set-task")
+			case "start":
+				args = append(args, "start-task")
+			}
+			args = append(args, "--why", "06:4x причина", "--by", "tester")
+			var out, errout bytes.Buffer
+			if code := runMain(args, time.Now(), &out, &errout); code != 0 {
+				t.Fatalf("runMain %v: code=%d stdout=%q stderr=%q", args, code, out.String(), errout.String())
+			}
+			files, err := os.ReadDir(dir)
+			if err != nil || len(files) != 1 {
+				t.Fatalf("files=%v err=%v", files, err)
+			}
+			updated, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
+			if err != nil || !strings.Contains(string(updated), "Причина: 06:4x причина\n") || strings.Contains(string(updated), "Причина: 06:4x причина [") {
+				t.Fatalf("reason header marked: %s, err=%v", updated, err)
+			}
+			requireHintParts(t, errout.String(), "«06:4x»", "--why", "Причина:", "без пометки")
+		})
+	}
+}
+
+func TestRunMainFailureAfterParseDoesNotPrintTimeHint(t *testing.T) {
+	_, _ = testRunMainRoot(t)
+	var out, errout bytes.Buffer
+	code := runMain([]string{"note", "missing", "06:4x absent", "--by", "tester"}, time.Now(), &out, &errout)
+	if code == 0 || !strings.Contains(errout.String(), "not found") {
+		t.Fatalf("missing ticket result: code=%d stderr=%q", code, errout.String())
+	}
+	if strings.Contains(errout.String(), "точное время") || strings.Contains(errout.String(), "[время требует проверки]") {
+		t.Fatalf("failed command printed a time hint: %q", errout.String())
+	}
+}
+
+func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	path := writeRunMainTask(t, dir, "20200101-1200-MED-wait.md", "# Wait\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	forms := []string{
+		"12.11 06:4x: итог", "12.11 06:4x, итог", "12.11 06:4x; итог",
+		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
+	}
+	for _, until := range forms {
+		var out, errout bytes.Buffer
+		if code := runMain([]string{"wait", "wait", "--until", until, "--by", "tester"}, time.Now(), &out, &errout); code != 0 {
+			t.Fatalf("wait %q: code=%d stderr=%q", until, code, errout.String())
+		}
+		requireHintParts(t, errout.String(), "tk ls --due")
+		if !strings.Contains(errout.String(), "no deadline") {
+			t.Fatalf("wait %q lacks deadline explanation: %q", until, errout.String())
+		}
+		updated, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(updated), "Ждёт: "+until+"\n") || strings.Contains(string(updated), "Ждёт: "+until+" [") || !strings.Contains(string(updated), until+" [время требует проверки]") {
+			t.Fatalf("wait field %q changed: %s err=%v", until, updated, err)
+		}
+		waitTask, err := find(dir, "wait")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if obj := taskObject("", waitTask, "", false); obj.Due != "" {
+			t.Fatalf("guessed clock %q became due %q", until, obj.Due)
+		}
+		var dueOut, dueErr bytes.Buffer
+		if code := list("", options{cmd: "ls", root: filepath.Dir(filepath.Dir(dir)), due: true}, &dueOut, &dueErr); code != 0 || strings.Contains(dueOut.String(), "wait") {
+			t.Fatalf("ls --due %q: code=%d out=%q err=%q", until, code, dueOut.String(), dueErr.String())
+		}
+	}
+	todayClock := "23:30 итог бойца"
+	var todayOut, todayErr bytes.Buffer
+	if code := runMain([]string{"wait", "wait", "--until", todayClock, "--by", "tester"}, time.Date(2026, 11, 11, 23, 0, 0, 0, time.Local), &todayOut, &todayErr); code != 0 {
+		t.Fatalf("same-day exact future wait: %d %q", code, todayErr.String())
+	}
+	if strings.Contains(todayErr.String(), "время") || strings.Contains(todayErr.String(), "пометкой") {
+		t.Fatalf("same-day exact future wait got a hint: %q", todayErr.String())
+	}
+	todayBody, err := os.ReadFile(path)
+	todayStored := time.Now().Format("2006-01-02 ") + todayClock
+	if err != nil || !strings.Contains(string(todayBody), "Ждёт: "+todayStored) || strings.Contains(string(todayBody), todayStored+" [") {
+		t.Fatalf("same-day exact future wait marked: %s, %v", todayBody, err)
+	}
+	exact := time.Now().Add(2*time.Hour).Format("2006-01-02 15:04") + " итог бойца"
+	var out, errout bytes.Buffer
+	if code := runMain([]string{"wait", "wait", "--until", exact, "--by", "tester"}, time.Now(), &out, &errout); code != 0 {
+		t.Fatalf("exact future wait: %d %q", code, errout.String())
+	}
+	if lastStderrLine(errout.String()) != "" || strings.Contains(errout.String(), "время требует проверки") {
+		t.Fatalf("exact future wait got a hint or mark: %q", errout.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(updated), "Ждёт: "+exact) || strings.Contains(string(updated), exact+" [") {
+		t.Fatalf("exact future wait changed: %s, %v", updated, err)
 	}
 }
 

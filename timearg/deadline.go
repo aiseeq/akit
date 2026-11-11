@@ -27,7 +27,27 @@ type DayMonth struct {
 
 // clockLike — слово-часы после даты (ЧЧ:ММ[:СС]), даже невозможные.
 var clockLike = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{1,2}(:[0-9]{1,2})?$`)
-var datedGuessedClock = regexp.MustCompile(`(?i)^\s*(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[,:;]\s*|\s+)[0-9]{1,2}:[0-9]{1,2}[xх](?:\s|$)`)
+var guessedClockRE = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])((?:[01]\d|2[0-3]):[0-5][xх])(?:$|[^a-z0-9])`)
+var dateTokenRE = regexp.MustCompile(`^(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})$`)
+
+// GuessedTime возвращает угаданное время («06:4x»), если оно есть в тексте.
+func GuessedTime(value string) (string, bool) {
+	match := guessedClockRE.FindStringSubmatch(value)
+	if match == nil {
+		return "", false
+	}
+	return match[1], true
+}
+
+// HasDatedGuessedTime сообщает, что после начальной даты записано угаданное время.
+func HasDatedGuessedTime(value string) bool {
+	fields := strings.Fields(value)
+	if len(fields) < 2 || !dateTokenRE.MatchString(strings.TrimRight(fields[0], ":,;")) {
+		return false
+	}
+	_, ok := GuessedTime(strings.TrimRight(fields[1], ":,;"))
+	return ok
+}
 
 // Deadline — срок ожидания: время в начале строки «Ждёт:» (дата, дата с часами, «ДД.ММ ЧЧ:ММ», ISO с T, RFC3339,
 // часы; UTC после часов — в UTC, иначе местное), дальше — текст. Без времени в начале — условие, срока нет.
@@ -41,7 +61,7 @@ func Deadline(wait string, now time.Time) (time.Time, bool) {
 	for i := range min(2, len(f)) {
 		f[i] = strings.TrimRight(f[i], ":,;")
 	}
-	if datedGuessedClock.MatchString(wait) {
+	if HasDatedGuessedTime(wait) {
 		return time.Time{}, false
 	}
 	if t, err := time.Parse(time.RFC3339, f[0]); err == nil {

@@ -1,6 +1,7 @@
 package timearg
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -9,10 +10,23 @@ func TestDeadlineQuirks(t *testing.T) {
 	loc := time.FixedZone("CET", 3600)
 	now := time.Date(2026, 11, 10, 15, 0, 0, 0, loc)
 	// A day with impossible hours is no deadline, not that day at midnight.
-	for _, wait := range []string{"12.11 25:00 x", "2026-11-12 25:00 x", "12.11 9:61: x", "12.11 06:4x", "2026-11-12 06:4х"} {
+	for _, wait := range []string{
+		"12.11 25:00 x", "2026-11-12 25:00 x", "12.11 9:61: x",
+		"12.11 06:4x", "2026-11-12 06:4х",
+		"12.11 06:4x: итог", "12.11 06:4x, итог", "12.11 06:4x; итог",
+		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
+	} {
 		if at, ok := Deadline(wait, now); ok {
 			t.Errorf("Deadline(%q) = %v, want no deadline", wait, at)
 		}
+	}
+	for _, value := range []string{"06:4x", "06:4х", "06:4xМСК", "06:4x:", "06:4x,"} {
+		if got, ok := GuessedTime(value); !ok || !strings.HasPrefix(value, got) {
+			t.Errorf("GuessedTime(%q) = %q, %v", value, got, ok)
+		}
+	}
+	if _, ok := GuessedTime("06:41"); ok {
+		t.Error("exact clock detected as guessed")
 	}
 	// A one-digit day or month reads as the two-digit one.
 	for wait, want := range map[string]time.Time{

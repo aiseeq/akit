@@ -226,11 +226,36 @@ func validateOneLine(o options) error {
 
 // timeHint возвращает подсказку о подозрительном времени; вызывающая сторона пишет её только после успеха.
 func timeHint(o options, now time.Time) string {
-	values := []string{o.note, o.check, o.why, o.until}
-	for _, value := range values {
-		if guessedTime.MatchString(value) || validateApproxTime(options{note: value}, now) != nil {
-			return "tk: замечено угаданное или будущее время; время записи — её метка, точное время — из date; проверьте запись"
+	fields := []struct{ flag, value string }{
+		{"note", o.note}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until},
+	}
+	for _, field := range fields {
+		if field.value == "" {
+			continue
 		}
+		suspect, guessed := timearg.GuessedTime(field.value)
+		kind := "похоже на угаданное время"
+		if !guessed && field.flag != "--until" {
+			suspect = futureApproxTime(field.value, now)
+			if suspect != "" {
+				kind = "похоже на время позже метки записи"
+			}
+		}
+		if suspect == "" {
+			continue
+		}
+		label := field.flag
+		if label == "note" && o.cmd == "review" {
+			label = "--note"
+		}
+		if field.flag == "--until" {
+			return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок не распознан, tk ls --due его не покажет", suspect, label, kind)
+		}
+		header := field.flag == "--why" && (o.cmd == "new" || o.cmd == "set" || o.cmd == "start")
+		if header {
+			return fmt.Sprintf("tk: «%s» в %s %s; значение «Причина:» записано без пометки", suspect, label, kind)
+		}
+		return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]». Время записи — её метка, точное время можно взять из date", suspect, label, kind)
 	}
 	return ""
 }
@@ -240,10 +265,33 @@ func markedJournalText(o options, value string) string {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if guessedTime.MatchString(value) || validateApproxTime(options{note: value}, now) != nil {
+	if _, guessed := timearg.GuessedTime(value); guessed || futureApproxTime(value, now) != "" {
 		return value + " [время требует проверки]"
 	}
 	return value
+}
+
+func markedGuessedTime(value string) string {
+	if _, guessed := timearg.GuessedTime(value); guessed {
+		return value + " [время требует проверки]"
+	}
+	return value
+}
+
+func futureApproxTime(value string, now time.Time) string {
+	found := approxTime.FindAllStringSubmatchIndex(value, -1)
+	if ix := leadingTime.FindStringSubmatchIndex(value); ix != nil && !timeRange.MatchString(value[ix[1]:]) {
+		found = append(found, ix)
+	}
+	for _, ix := range found {
+		if end := ix[1]; end < len(value) && value[end] >= '0' && value[end] <= '9' {
+			continue
+		}
+		if futureTime("text", value, ix, now) != nil {
+			return strings.TrimSpace(value[ix[0]:ix[1]])
+		}
+	}
+	return ""
 }
 
 // validateApproxTime находит время позже метки записи: «~03:00» где угодно и время в начале («17:40 проверка»).
@@ -303,11 +351,6 @@ var leadingTime = regexp.MustCompile(`^[\s\p{Zs}]*(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d
 
 // timeRange — продолжение промежутка после времени: «-18:00», « – 18:00».
 var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*([01]?\d|2[0-3]):[0-5]\d(?:$|\D)`)
-
-// guessedTime — время суток с угаданной последней цифрой («06:4x», кириллическая «х» тоже). Границы — явные
-// классы: \b в regexp Go знает только ASCII-буквы. Справа не ASCII-буква и не цифра: «06:4xМСК» — время,
-// «06:4xyz» — нет.
-var guessedTime = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])(?:[01]\d|2[0-3]):[0-5][xх](?:$|[^a-z0-9])`)
 
 func parseMultiValueOption(args []string, i *int, v string, o *options) error {
 	if *i+1 == len(args) || strings.HasPrefix(args[*i+1], "--") || strings.TrimSpace(args[*i+1]) == "" {
@@ -3554,7 +3597,7 @@ func transitionJournal(o options, next string, glintFindings int) string {
 		line += " — " + markedJournalText(o, o.note)
 	}
 	if o.cmd == "wait" {
-		line += " — " + markedJournalText(o, o.until)
+		line += " — " + markedGuessedTime(o.until)
 	}
 	return line
 }
