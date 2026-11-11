@@ -164,6 +164,7 @@ func (w *rateWindow) window() *RateWindow {
 // response_item. named — session_meta уже дал сессию, а событий после него ещё не было.
 type codexParser struct {
 	tools                                    map[string]string
+	toolInputs                               map[string]string
 	session, cwd, originator, account, model string
 	// firstAccount — учётка первого session_meta для Meta.Account; account — последнего, для Tokens.Account.
 	firstAccount          string
@@ -171,7 +172,9 @@ type codexParser struct {
 	named                 bool
 }
 
-func newCodexParser() *codexParser { return &codexParser{tools: map[string]string{}} }
+func newCodexParser() *codexParser {
+	return &codexParser{tools: map[string]string{}, toolInputs: map[string]string{}}
+}
 
 // Обвязка codex подкладывает в начало беседы инструкции и окружение сообщениями пользователя — это не реплики;
 // <turn_aborted> — её же вставка после прерванного хода.
@@ -300,6 +303,7 @@ func (p *codexParser) responseItem(pl *payload, ev func(Role, string, string) []
 		}
 	case "custom_tool_call":
 		p.tools[pl.CallID] = pl.Name
+		p.toolInputs[pl.CallID] = str(pl.Input)
 		var out []Event
 		for _, c := range execCommands(str(pl.Input)) {
 			out = append(out, ev(Cmd, pl.Name, c)...)
@@ -311,8 +315,10 @@ func (p *codexParser) responseItem(pl *payload, ev func(Role, string, string) []
 		return call(ev(Cmd, pl.Name, argsCommand(args)), pl.CallID, argsJSON(args, pl.Arguments))
 	case "custom_tool_call_output", "function_call_output":
 		text, failed := outputText(pl.Output)
+		wrapperText, hasWrapperText := outputWrapperText(pl.Output, p.toolInputs[pl.CallID])
+		delete(p.toolInputs, pl.CallID)
 		// Вывод есть и пустой: exec с пустым выводом после шапки «Script completed» — тоже вывод вызова.
-		out := call([]Event{{Role: Out, Who: p.tools[pl.CallID], Text: text}}, pl.CallID, pl.Output)
+		out := call([]Event{{Role: Out, Who: p.tools[pl.CallID], Text: text, WrapperText: wrapperText, HasWrapperText: hasWrapperText}}, pl.CallID, pl.Output)
 		for i := range out {
 			out[i].Error = failed
 		}
@@ -467,4 +473,170 @@ func outputText(raw json.RawMessage) (text string, failed bool) {
 		return o.Output, false
 	}
 	return string(raw), false
+}
+
+var outputReference = regexp.MustCompile(`\b[\w$]+\s*(?:\?\.|\.)\s*output\b`)
+var processRunningOutput = regexp.MustCompile(`^Process running with session ID\s+\d+\b`)
+
+// outputWrapperText keeps text() values produced by JS calls other than values containing r.output.
+func outputWrapperText(raw json.RawMessage, source string) (string, bool) {
+	if strings.TrimSpace(source) == "" {
+		text, _ := outputText(raw)
+		if strings.Contains(text, `"session_id"`) || processRunningOutput.MatchString(text) {
+			return text, true
+		}
+		return "", true
+	}
+	var ps []part
+	if json.Unmarshal(raw, &ps) != nil || len(ps) == 0 {
+		return "", false
+	}
+	var texts []string
+	for i := range ps {
+		p := &ps[i]
+		if p.Type == "text" || p.Type == "input_text" || p.Type == "output_text" {
+			texts = append(texts, p.Text)
+		}
+	}
+	if len(texts) > 0 && execHeader.MatchString(texts[0]) {
+		texts = texts[1:]
+	}
+	calls := jsTextCallOutput(source)
+	var wrapper []string
+	for i, text := range texts {
+		if len(calls) > 0 && !calls[i%len(calls)] {
+			wrapper = append(wrapper, text)
+		}
+	}
+	return strings.Join(wrapper, "\n"), true
+}
+
+func jsTextCallOutput(source string) []bool {
+	var calls []bool
+	for pos := 0; pos < len(source); {
+		if next, skipped := jsSkipLiteral(source, pos); skipped {
+			pos = next
+			continue
+		}
+		if !jsIdentStart(source[pos]) {
+			pos++
+			continue
+		}
+		next, output, isCall := jsTextCall(source, pos)
+		if !isCall {
+			pos = next
+			continue
+		}
+		if next < 0 {
+			return calls
+		}
+		calls = append(calls, output)
+		pos = next
+	}
+	return calls
+}
+
+func jsSkipLiteral(source string, pos int) (int, bool) {
+	switch source[pos] {
+	case '"', '\'', '`':
+		return jsStringEnd(source, pos), true
+	case '/':
+		if pos+1 < len(source) && source[pos+1] == '/' {
+			if end := strings.IndexByte(source[pos+2:], '\n'); end >= 0 {
+				return pos + end + 3, true
+			}
+			return len(source), true
+		}
+		if pos+1 < len(source) && source[pos+1] == '*' {
+			if end := strings.Index(source[pos+2:], "*/"); end >= 0 {
+				return pos + end + 4, true
+			}
+			return len(source), true
+		}
+	}
+	return pos, false
+}
+
+func jsTextCall(source string, start int) (int, bool, bool) {
+	end := start + 1
+	for end < len(source) && jsIdentPart(source[end]) {
+		end++
+	}
+	if source[start:end] != "text" {
+		return end, false, false
+	}
+	open := end
+	for open < len(source) && isJSSpace(source[open]) {
+		open++
+	}
+	if open >= len(source) || source[open] != '(' {
+		return end, false, false
+	}
+	close := jsCallEnd(source, open)
+	if close < 0 {
+		return -1, false, true
+	}
+	return close + 1, outputReference.MatchString(source[open+1 : close]), true
+}
+
+func isJSSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+func jsCallEnd(source string, open int) int {
+	depth := 1
+	for pos := open + 1; pos < len(source); {
+		switch source[pos] {
+		case '"', '\'', '`':
+			pos = jsStringEnd(source, pos)
+		case '/':
+			if pos+1 < len(source) && source[pos+1] == '/' {
+				if end := strings.IndexByte(source[pos+2:], '\n'); end >= 0 {
+					pos += end + 3
+				} else {
+					return -1
+				}
+			} else if pos+1 < len(source) && source[pos+1] == '*' {
+				if end := strings.Index(source[pos+2:], "*/"); end >= 0 {
+					pos += end + 4
+				} else {
+					return -1
+				}
+			} else {
+				pos++
+			}
+		case '(':
+			depth++
+			pos++
+		case ')':
+			depth--
+			if depth == 0 {
+				return pos
+			}
+			pos++
+		default:
+			pos++
+		}
+	}
+	return -1
+}
+
+func jsStringEnd(source string, start int) int {
+	quote := source[start]
+	for pos := start + 1; pos < len(source); pos++ {
+		if source[pos] == '\\' {
+			pos++
+		} else if source[pos] == quote {
+			return pos + 1
+		}
+	}
+	return len(source)
+}
+
+func jsIdentStart(c byte) bool {
+	return c == '_' || c == '$' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func jsIdentPart(c byte) bool {
+	return jsIdentStart(c) || c >= '0' && c <= '9'
 }

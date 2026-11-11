@@ -7,7 +7,6 @@
 package waits
 
 import (
-	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
@@ -16,6 +15,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -331,132 +331,282 @@ func (r *Recognizer) count(p *pending, ev transcript.Event) {
 }
 
 var (
-	bgStarted = regexp.MustCompile(`running in background with ID: (\w+)`)
-	bgMoved   = regexp.MustCompile(`moved to the background \(ID: (\w+)\)`)
-	exit124   = regexp.MustCompile(`(?i)exit code:? 124\b`)
-	stopped   = regexp.MustCompile(`(?i)interrupted by user|doesn't want to proceed|rejected|\[Request interrupted`)
-	// Признаки живой сессии — только форматы, которые печатает обвязка exec.
+	bgStarted      = regexp.MustCompile(`running in background with ID: (\w+)`)
+	bgMoved        = regexp.MustCompile(`moved to the background \(ID: (\w+)\)`)
+	exit124        = regexp.MustCompile(`(?i)exit code:? 124\b`)
+	stopped        = regexp.MustCompile(`(?i)interrupted by user|doesn't want to proceed|rejected|\[Request interrupted`)
 	processSession = regexp.MustCompile(`^Process running with session ID\s+(\d+)\b`)
 	processExited  = regexp.MustCompile(`^Process exited with code\s+\d+\b`)
-	lineSession    = regexp.MustCompile(`(?m)^\s*session_id=(\d+)\s*$`)
+	sessionMark    = regexp.MustCompile(`(?im)(?:[a-z][a-z0-9_-]*_)?(?:exit_code=undefined\s+)?(?:идёт,\s*)?session(?:_id)?\s*(?:[:=]\s*|\s+)(\d+)(?:(?:\s+)(?:EXIT|exit_code|exit)\s*[:=]?\s*(?:undefined|running)?)?[ \t]*$`)
 )
 
-// Running returns the session for a command that is still active; ok is false for other output or an ended command.
+// RunningOutput checks only the separately recorded JS text() parts when the Codex reader preserved them.
+func RunningOutput(text, wrapperText string, hasWrapperText bool) (string, bool) {
+	if hasWrapperText {
+		return Running(wrapperText)
+	}
+	return Running(text)
+}
+
+// Running returns an active session marker in trusted wrapper text.
 func Running(text string) (session string, ok bool) {
-	if !strings.Contains(text, `"session_id"`) && !strings.Contains(text, "session_id=") &&
-		!strings.Contains(text, "Process running with session ID") && !strings.Contains(text, "Process exited with code") {
-		return "", false
-	}
-	if session, ok := jsonSessionID(text); ok {
-		return session, true
-	}
 	if processExited.MatchString(text) {
 		return "", false
 	}
-	if m := lineSession.FindStringSubmatch(text); m != nil {
-		return m[1], true
+	if strings.Contains(text, `"session_id"`) {
+		if session, ok := jsonSessionID(text); ok {
+			return session, true
+		}
+		// text() calls are joined with newlines; inspect plain marker parts after JSON candidates.
+		for line := range strings.SplitSeq(text, "\n") {
+			if strings.ContainsAny(line, `"{}[]`) {
+				continue
+			}
+			if m := processSession.FindStringSubmatch(line); m != nil {
+				return m[1], true
+			}
+			if m := sessionMark.FindStringSubmatch(line); m != nil {
+				return m[1], true
+			}
+		}
+		return "", false
 	}
-	if m := processSession.FindStringSubmatch(text); m != nil {
+	if strings.Contains(text, "Process running with session ID") {
+		if m := processSession.FindStringSubmatch(text); m != nil {
+			return m[1], true
+		}
+	}
+	if m := sessionMark.FindStringSubmatch(text); m != nil {
 		return m[1], true
 	}
 	return "", false
+}
+
+type sessionCandidate struct {
+	id  string
+	pos int
+	ok  bool
+}
+
+type wrapperJSONParser struct {
+	text string
 }
 
 func jsonSessionID(text string) (string, bool) {
-	for line := range strings.SplitSeq(text, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "--") {
-			if end := strings.Index(line[2:], "--"); end >= 0 {
-				line = strings.TrimSpace(line[end+4:])
-			}
+	if !strings.Contains(text, `"session_id"`) ||
+		(!strings.Contains(text, `"output"`) && !strings.Contains(text, `"chunk_id"`) && !strings.Contains(text, `"wall_time_seconds"`)) {
+		return "", false
+	}
+	for offset := 0; offset < len(text); {
+		start := strings.IndexAny(text[offset:], "{[")
+		if start < 0 {
+			return "", false
 		}
-		for strings.HasPrefix(line, "{") {
-			end := jsonObjectEnd(line, 0)
-			if end < 0 {
-				break
-			}
-			object := line[:end]
-			if bytes.Contains([]byte(object), []byte(`"session_id"`)) {
-				decoder := json.NewDecoder(strings.NewReader(object))
-				decoder.UseNumber()
-				var value any
-				if decoder.Decode(&value) == nil {
-					if session, ok := wrapperSession(value); ok {
-						return session, true
-					}
-				}
-			}
-			line = strings.TrimSpace(line[end:])
+		start += offset
+		end, candidate, ok := (wrapperJSONParser{text: text}).value(start)
+		if ok && candidate.ok {
+			return candidate.id, true
+		}
+		if !ok || end <= start {
+			offset = start + 1
+		} else {
+			offset = end
 		}
 	}
 	return "", false
 }
 
-// jsonObjectEnd returns the end of the next balanced JSON object, ignoring braces inside strings.
-func jsonObjectEnd(line string, start int) int {
-	depth := 0
-	quoted, escaped := false, false
-	for pos := start; pos < len(line); pos++ {
-		c := line[pos]
-		if quoted {
-			if escaped {
-				escaped = false
-			} else if c == '\\' {
-				escaped = true
-			} else if c == '"' {
-				quoted = false
-			}
+func (p wrapperJSONParser) value(pos int) (int, sessionCandidate, bool) {
+	pos = p.space(pos)
+	if pos >= len(p.text) {
+		return pos, sessionCandidate{}, false
+	}
+	switch p.text[pos] {
+	case '{':
+		return p.object(pos)
+	case '[':
+		return p.array(pos)
+	case '"':
+		end := p.stringEnd(pos)
+		return end, sessionCandidate{}, end > pos
+	default:
+		end := pos
+		for end < len(p.text) && p.text[end] != ' ' && p.text[end] != '\t' && p.text[end] != '\r' && p.text[end] != '\n' && p.text[end] != ',' && p.text[end] != ']' && p.text[end] != '}' {
+			end++
+		}
+		return end, sessionCandidate{}, end > pos
+	}
+}
+
+type wrapperJSONMember struct {
+	key                  string
+	keyStart             int
+	valueStart, valueEnd int
+	child                sessionCandidate
+}
+
+type wrapperObjectState struct {
+	direct, nested   sessionCandidate
+	hasExit, wrapper bool
+}
+
+func (p wrapperJSONParser) object(pos int) (int, sessionCandidate, bool) {
+	pos = p.space(pos + 1)
+	if pos < len(p.text) && p.text[pos] == '}' {
+		return pos + 1, sessionCandidate{}, true
+	}
+	var state wrapperObjectState
+	for pos < len(p.text) {
+		member, ok := p.objectMember(pos)
+		if !ok {
+			return pos, sessionCandidate{}, false
+		}
+		state.add(p, member)
+		next, closed, ok := p.objectNext(member.valueEnd)
+		if !ok {
+			return next, sessionCandidate{}, false
+		}
+		pos = next
+		if closed {
+			return pos, state.candidate(), true
+		}
+	}
+	return pos, sessionCandidate{}, false
+}
+
+func (p wrapperJSONParser) objectMember(pos int) (wrapperJSONMember, bool) {
+	if pos >= len(p.text) || p.text[pos] != '"' {
+		return wrapperJSONMember{}, false
+	}
+	keyEnd := p.stringEnd(pos)
+	if keyEnd <= pos {
+		return wrapperJSONMember{}, false
+	}
+	key := p.text[pos:keyEnd]
+	colon := p.space(keyEnd)
+	if colon >= len(p.text) || p.text[colon] != ':' {
+		return wrapperJSONMember{}, false
+	}
+	valueStart := p.space(colon + 1)
+	valueEnd, child, ok := p.value(valueStart)
+	if !ok || valueEnd <= valueStart {
+		return wrapperJSONMember{}, false
+	}
+	return wrapperJSONMember{key: key, keyStart: pos, valueStart: valueStart, valueEnd: valueEnd, child: child}, true
+}
+
+func (p wrapperJSONParser) objectNext(pos int) (int, bool, bool) {
+	pos = p.space(pos)
+	if pos >= len(p.text) {
+		return pos, false, false
+	}
+	switch p.text[pos] {
+	case ',':
+		return p.space(pos + 1), false, true
+	case '}':
+		return pos + 1, true, true
+	default:
+		return pos, false, false
+	}
+}
+
+func (s *wrapperObjectState) add(p wrapperJSONParser, member wrapperJSONMember) {
+	if member.child.ok && (!s.nested.ok || member.child.pos < s.nested.pos) {
+		s.nested = member.child
+	}
+	switch member.key {
+	case `"exit_code"`:
+		s.hasExit = true
+	case `"output"`, `"chunk_id"`, `"wall_time_seconds"`:
+		s.wrapper = s.wrapper || p.text[member.valueStart:member.valueEnd] != "null"
+	case `"session_id"`:
+		if id, ok := p.sessionValue(member.valueStart, member.valueEnd); ok {
+			s.direct = sessionCandidate{id: id, pos: member.keyStart, ok: true}
+		}
+	}
+}
+
+func (s wrapperObjectState) candidate() sessionCandidate {
+	if s.direct.ok && !s.hasExit && s.wrapper && (!s.nested.ok || s.direct.pos <= s.nested.pos) {
+		return s.direct
+	}
+	if s.nested.ok {
+		return s.nested
+	}
+	if s.direct.ok && !s.hasExit && s.wrapper {
+		return s.direct
+	}
+	return sessionCandidate{}
+}
+
+func (p wrapperJSONParser) array(pos int) (int, sessionCandidate, bool) {
+	pos = p.space(pos + 1)
+	var first sessionCandidate
+	if pos < len(p.text) && p.text[pos] == ']' {
+		return pos + 1, first, true
+	}
+	for pos < len(p.text) {
+		end, child, ok := p.value(pos)
+		if !ok || end <= pos {
+			return end, sessionCandidate{}, false
+		}
+		if child.ok && (!first.ok || child.pos < first.pos) {
+			first = child
+		}
+		pos = p.space(end)
+		if pos < len(p.text) && p.text[pos] == ',' {
+			pos = p.space(pos + 1)
 			continue
 		}
-		switch c {
-		case '"':
-			quoted = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return pos + 1
-			}
+		if pos < len(p.text) && p.text[pos] == ']' {
+			return pos + 1, first, true
+		}
+		return pos, sessionCandidate{}, false
+	}
+	return pos, sessionCandidate{}, false
+}
+
+func (p wrapperJSONParser) sessionValue(start, end int) (string, bool) {
+	if start >= end {
+		return "", false
+	}
+	if p.text[start] == '"' {
+		value, err := strconv.Unquote(p.text[start:end])
+		return value, err == nil && value != ""
+	}
+	value := p.text[start:end]
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return value, value != ""
+}
+
+func (p wrapperJSONParser) stringEnd(pos int) int {
+	escaped := false
+	for i := pos + 1; i < len(p.text); i++ {
+		if escaped {
+			escaped = false
+		} else if p.text[i] == '\\' {
+			escaped = true
+		} else if p.text[i] == '"' {
+			return i + 1
 		}
 	}
 	return -1
 }
 
-func wrapperSession(value any) (string, bool) {
-	switch value := value.(type) {
-	case map[string]any:
-		session, hasSession := value["session_id"]
-		_, hasExitCode := value["exit_code"]
-		if hasSession && !hasExitCode && (value["output"] != nil || value["chunk_id"] != nil || value["wall_time_seconds"] != nil) {
-			switch session := session.(type) {
-			case json.Number:
-				return session.String(), true
-			case string:
-				if session != "" {
-					return session, true
-				}
-			}
-		}
-		for _, child := range value {
-			if session, ok := wrapperSession(child); ok {
-				return session, true
-			}
-		}
-	case []any:
-		for _, child := range value {
-			if session, ok := wrapperSession(child); ok {
-				return session, true
-			}
-		}
+func (p wrapperJSONParser) space(pos int) int {
+	for pos < len(p.text) && (p.text[pos] == ' ' || p.text[pos] == '\t' || p.text[pos] == '\r' || p.text[pos] == '\n') {
+		pos++
 	}
-	return "", false
+	return pos
 }
-
 func (r *Recognizer) out(ev transcript.Event) []Wait {
 	if cmd, ok := r.shellText[ev.CallID]; ok {
 		delete(r.shellText, ev.CallID)
-		if sid, ok := Running(ev.Text); ok {
+		if sid, ok := RunningOutput(ev.Text, ev.WrapperText, ev.HasWrapperText); ok {
 			r.sessionCmd[sid] = cmd
 		}
 	}
@@ -467,7 +617,7 @@ func (r *Recognizer) out(ev transcript.Event) []Wait {
 	delete(r.byCall, ev.CallID)
 	if p.session != "" {
 		p.w.End = ev.Time
-		if _, ok := Running(ev.Text); ok {
+		if _, ok := RunningOutput(ev.Text, ev.WrapperText, ev.HasWrapperText); ok {
 			return nil // команда ещё идёт
 		}
 		p.w.Outcome = Done
@@ -478,7 +628,7 @@ func (r *Recognizer) out(ev transcript.Event) []Wait {
 		return []Wait{finish(p)}
 	}
 	// exec_command ждёт не дольше 30 с: wfor или цикл codex идёт дальше в своей сессии, её опросы - то же ожидание
-	if sid, ok := Running(ev.Text); ok && p.codex && r.cur == p {
+	if sid, ok := RunningOutput(ev.Text, ev.WrapperText, ev.HasWrapperText); ok && p.codex && r.cur == p {
 		p.session = sid
 		r.polls[sid] = p
 		r.cur = nil

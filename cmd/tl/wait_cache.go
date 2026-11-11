@@ -25,7 +25,7 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 var afterWaitRead = func(string) {}
 
 // waitCacheVersion — формат записи кэша ожиданий.
-const waitCacheVersion = 9
+const waitCacheVersion = 10
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
@@ -268,9 +268,12 @@ func cacheWaitEvents(ev transcript.Event) []cachedWaitEvent {
 		if ev.Error {
 			raw = append([]byte(nil), ev.Raw...)
 		}
-		text := ""
-		if _, running := transcriptwaits.Running(ev.Text); running {
-			text = ev.Text
+		text := ev.Text
+		if ev.HasWrapperText {
+			text = ev.WrapperText
+		}
+		if _, running := transcriptwaits.Running(text); !running {
+			text = ""
 		}
 		return []cachedWaitEvent{{Role: ev.Role, CallID: ev.CallID, Text: text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw}}
 	}

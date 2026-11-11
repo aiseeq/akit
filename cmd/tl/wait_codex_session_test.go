@@ -32,8 +32,8 @@ func codexExecOutput(t *testing.T, at, callID string, parts ...string) string {
 }
 
 const (
-	codexStart = `const r = await tools.exec_command({cmd:"tk done %s"}); text(r.output); if (r.session_id) text(` + "`session_id=${r.session_id}`" + `)`
-	codexPoll  = `const r = await tools.write_stdin({session_id:%d,yield_time_ms:270000}); text(r.output); if (r.session_id) text(` + "`session_id=${r.session_id}`" + `)`
+	codexStart = `const r = await tools.exec_command({cmd:"tk done %s"}); text(JSON.stringify(r))`
+	codexPoll  = `const r = await tools.write_stdin({session_id:%d,yield_time_ms:270000}); text(JSON.stringify(r))`
 )
 
 // A codex command still running after the exec yield (30 s by default) answers

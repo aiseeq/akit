@@ -109,25 +109,49 @@ func TestWfor(t *testing.T) {
 
 func TestRunningUsesOnlyWrapperSessionMarkers(t *testing.T) {
 	for _, tc := range []struct{ text, want string }{
-		{`{"chunk_id":"a","wall_time_seconds":30,"session_id":5,"output":"worker session 5 done"}`, "5"},
-		{`{"status":"fulfilled","value":{"chunk_id":"a","wall_time_seconds":1,"session_id":6,"output":""}}`, "6"},
+		{`идёт, session 77`, "77"},
+		{"SESSION_ID=81", "81"},
+		{"SESSION 82", "82"},
+		{"session_id 83", "83"},
+		{"session_id: 84", "84"},
+		{"session=85", "85"},
+		{"SESSION=86 EXIT=undefined", "86"},
+		{"exit_code=undefined session_id=87", "87"},
+		{"SCAN_SESSION=89", "89"},
+		{"12 SESSION 90", "90"},
+		{"session 91 exit undefined", "91"},
+		{"session_id: 92 exit_code: undefined", "92"},
+		{"session_id=93 exit_code=running", "93"},
+		{"session_id=94 exit_code=", "94"},
+		{"session:94 exit:undefined", "94"},
+		{strings.Repeat("x", 700) + "\nидёт, session 88", "88"},
+		{`label {"chunk_id":"a","session_id":91,"output":""}`, "91"},
+		{`["label",{"chunk_id":"a","session_id":92,"output":""}]`, "92"},
+		{`{"chunk_id":"a","session_id":93,"output":"}"}{"chunk_id":"b","session_id":94,"output":"{"}`, "93"},
+		{`{"chunk_id":"a","exit_code":0,"output":"done"}` + "\n" + `{"chunk_id":"b","session_id":100,"output":""}`, "100"},
+		{`{"chunk_id":"a","exit_code":1,"output":"done"}` + "\n" + `{"chunk_id":"b","session_id":101,"output":""}` + "\n" + `{"chunk_id":"c","exit_code":0,"output":"done"}`, "101"},
+		{`{"status":"fulfilled","value":{"chunk_id":"a","session_id":"95","output":"\"{\"}"}}`, "95"},
 		{`{"chunk_id":"a","wall_time_seconds":1,"session_id":5,"exit_code":0,"output":"done"}`, ""},
-		{"{\"chunk_id\":\"a\",\"session_id\":5,\"output\":\"\"}\n{\"chunk_id\":\"b\",\"exit_code\":0,\"output\":\"done\"}", "5"},
-		{"session_id=5", "5"},
-		{"SESSION_ID=5", ""},
-		{"Process running with session ID 5", "5"},
+		{`{"session_id":5}`, ""},
+		{`{"chunk_id":"a","session_id":98}`, "98"},
+		{`{"wall_time_seconds":1,"session_id":99}`, "99"},
+		{`{"session_id":1}` + "\n" + `идёт, session 97`, "97"},
+		{"Process running with session ID 96", "96"},
 		{"Process exited with code 0\nOutput:\ndone", ""},
-		{"Process exited with code 0\nsession_id=5", ""},
-		{"Process exited with code 0\nProcess running with session ID 5", ""},
+		{"Process exited with code 0\n{\"chunk_id\":\"a\",\"session_id\":5,\"output\":\"\"}", ""},
 		{"command output: Process running with session ID 5", ""},
 		{"worker session 5 done", ""},
-		{`{"session_id":5,"chunk":"done"}`, ""},
-		{`command output: {"chunk_id":"a","wall_time_seconds":1,"session_id":5,"output":""}`, ""},
 	} {
 		got, ok := Running(tc.text)
 		if tc.want == "" && ok || tc.want != "" && (!ok || got != tc.want) {
 			t.Errorf("Running(%q) = %q, %t; want %q", tc.text, got, ok, tc.want)
 		}
+	}
+	if sid, ok := RunningOutput("worker session 5 done", `идёт, session 77`, true); !ok || sid != "77" {
+		t.Fatalf("separate wrapper marker = %q, %t; want 77", sid, ok)
+	}
+	if sid, ok := RunningOutput("worker session 5 done", "", true); ok {
+		t.Fatalf("command output treated as wrapper session %q", sid)
 	}
 }
 
@@ -232,7 +256,7 @@ func TestCodexStdinPoll(t *testing.T) {
 	}
 	a := s.tool("exec", "tools/repo/gotest.sh -run TestX ./bot/...", "x", 0)
 	tokens(1000, 0)
-	s.out(a, "session_id=77", 10)
+	s.out(a, "идёт, session 77", 10)
 	poll := `const r = await tools.write_stdin({session_id:77,yield_time_ms:30000,max_output_tokens:3000}); text(r.output)`
 	for i, at := range []int{11, 42, 73} {
 		if i == 1 {
@@ -240,7 +264,7 @@ func TestCodexStdinPoll(t *testing.T) {
 		}
 		id := s.tool("exec", poll, "x", at)
 		tokens(500, at)
-		out := "session_id=77"
+		out := "идёт, session 77"
 		if i == 2 {
 			out = "ok  bot 41s"
 		}

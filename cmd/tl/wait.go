@@ -61,8 +61,12 @@ func (t *waitTracker) event(ev transcript.Event) {
 	if ev.Role == transcript.Cmd {
 		command, bg = waitCommand(ev)
 	}
+	text := ev.Text
+	if ev.HasWrapperText {
+		text = ev.WrapperText
+	}
 	t.eventCall(cachedWaitEvent{
-		Role: ev.Role, CallID: ev.CallID, Text: ev.Text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
+		Role: ev.Role, CallID: ev.CallID, Text: text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
 		Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: ev.Raw,
 		Command: command, BG: bg,
 	})

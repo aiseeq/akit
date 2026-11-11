@@ -50,6 +50,9 @@ type Event struct {
 	// Text — слова: напоминания обвязки (<system-reminder>) из реплик человека и писем вырезаны, картинки — не текст,
 	// их число в Images.
 	Text string
+	// WrapperText — отдельные текстовые части JS-обвязки после вывода r.output.
+	WrapperText    string
+	HasWrapperText bool
 	// Answer — только ответы человека в AskUserQuestion, без текста вопросов.
 	Answer string
 	Images int

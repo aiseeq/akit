@@ -463,6 +463,41 @@ func TestCodexPayloadParsingEdges(t *testing.T) {
 	}
 }
 
+func TestCodexOutputKeepsWrapperTextSeparate(t *testing.T) {
+	codex := newCodexParser()
+	call := `{"timestamp":"2026-10-25T10:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"synthetic","name":"exec","input":"const r = await tools.exec_command({cmd:\"echo\"}); text(r.output); if (r.session_id) text(\"идёт, session \" + r.session_id); const s = await tools.exec_command({cmd:\"status\"}); text(JSON.stringify(s)); text(s.output)"}}`
+	if _, err := parseLine([]byte(call), nil, codex); err != nil {
+		t.Fatal(err)
+	}
+	output := `{"timestamp":"2026-10-25T10:00:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"synthetic","output":[{"type":"input_text","text":"Script completed\nWall time 1.0s\nOutput:\n"},{"type":"input_text","text":"worker session 5 done"},{"type":"input_text","text":"идёт, session 5"},{"type":"input_text","text":"{\"chunk_id\":\"b\",\"session_id\":6,\"output\":\"\"}"},{"type":"input_text","text":"worker session 6 done"}]}}`
+	events, err := parseLine([]byte(output), nil, codex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantText := "worker session 5 done\nидёт, session 5\n{\"chunk_id\":\"b\",\"session_id\":6,\"output\":\"\"}\nworker session 6 done"
+	wantWrapper := "идёт, session 5\n{\"chunk_id\":\"b\",\"session_id\":6,\"output\":\"\"}"
+	if len(events) != 1 || events[0].Text != wantText || !events[0].HasWrapperText || events[0].WrapperText != wantWrapper {
+		t.Fatalf("command and wrapper parts were not separated: %+v", events)
+	}
+}
+
+func TestCodexOutputMapsRepeatedTextCalls(t *testing.T) {
+	source := `for (const r of results) { text(r.output); if (r.session_id) text("идёт, session " + r.session_id) }`
+	raw := json.RawMessage(`[{"type":"input_text","text":"Script completed\nWall time 1.0s\nOutput:\n"},{"type":"input_text","text":"worker session 5 done"},{"type":"input_text","text":"идёт, session 5"},{"type":"input_text","text":"worker session 6 done"},{"type":"input_text","text":"идёт, session 6"}]`)
+	got, ok := outputWrapperText(raw, source)
+	if !ok || got != "идёт, session 5\nидёт, session 6" {
+		t.Fatalf("repeated wrapper markers = %q, %t", got, ok)
+	}
+}
+
+func TestCodexOutputKeepsDirectJSONWrapper(t *testing.T) {
+	raw := json.RawMessage(`[ {"type":"input_text","text":"{\"chunk_id\":\"a\",\"session_id\":77,\"output\":\"\"}"} ]`)
+	got, ok := outputWrapperText(raw, "")
+	if !ok || got != `{"chunk_id":"a","session_id":77,"output":""}` {
+		t.Fatalf("direct JSON wrapper = %q, %t", got, ok)
+	}
+}
+
 func TestReadCodexEmptyCmd(t *testing.T) {
 	evs, _ := events(t,
 		`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"s1"}}`,

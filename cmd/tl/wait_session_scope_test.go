@@ -31,7 +31,7 @@ func TestWaitCodexReusedSessionIDDoesNotEndAbandonedCommand(t *testing.T) {
 		`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`,
 		codexExecRow("10:00:00", "a1", fmt.Sprintf(codexStart, "abandoned")),
 		codexExecOutput(t, "10:00:30", "a1", `{"wall_time_seconds":30.0,"session_id":5150,"output":""}`),
-		codexExecRow("10:01:00", "s1", `const r = await tools.exec_command({cmd:"sleep 300"}); text(r.output); if (r.session_id) text(`+"`session_id=${r.session_id}`"+`)`),
+		codexExecRow("10:01:00", "s1", `const r = await tools.exec_command({cmd:"sleep 300"}); text(JSON.stringify(r))`),
 		codexExecOutput(t, "10:01:30", "s1", `{"wall_time_seconds":30.0,"session_id":5150,"output":""}`),
 		codexExecRow("10:06:00", "s2", fmt.Sprintf(codexPoll, 5150)),
 		codexExecOutput(t, "10:06:40", "s2", "done\n"),
