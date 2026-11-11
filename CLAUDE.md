@@ -1,3 +1,4 @@
+<!-- lex: собран из /home/aisee/.claude/codex/manifest/git-akit-CLAUDE.md.yaml. Правь фрагменты в /home/aisee/.claude/codex/frag и запусти `lex build --codex /home/aisee/.claude/codex`; правку прямо в этом файле перенеси во фрагменты: `lex absorb --codex /home/aisee/.claude/codex <этот файл>` -->
 # akit — консольные утилиты для агентов
 
 Прочитать перед работой: `~/.claude/tools/akit/design.md` (приватный, вне репо) — замысел, грань «утилита в akit или отдельный проект», список утилит, принятые решения. Решения оттуда не пересматривать молча — только обсудив с пользователем; новые решения с источником писать туда, не в репо.
