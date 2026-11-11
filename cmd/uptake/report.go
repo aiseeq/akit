@@ -61,7 +61,7 @@ func (u *run) writePairReport(b *strings.Builder) {
 	}
 	fmt.Fprintf(b, "\nВне пар busy: без последующего решения — %d; `busy --quiet` — %d.\n", u.busyNoDecision, u.busyQuiet)
 	fmt.Fprintf(b, "Поиск решений (по правилу): %d вызовов.\n", u.decisionRuleSearches)
-	fmt.Fprintf(b, "Prior old по источнику: .claude/improve/ — %d вызовов; tl --role user --grep — %d вызовов.\n", u.priorImproveCalls, u.priorTLCalls)
+	fmt.Fprintf(b, "Prior old по источнику: файлы решений и improve — %d вызовов; tl --role user --grep — %d вызовов.\n", u.priorImproveCalls, u.priorTLCalls)
 	t := u.tkRefusalTotals()
 	fmt.Fprintf(b, "Отказы tk: %d; исправлены потом %d (той же подкомандой %d, другой %d), обход ручной правкой %d, сессия кончилась раньше 10 мин %d, брошены %d — [tk-refusals.tsv](tk-refusals.tsv).\n", t.refusals, t.same+t.other, t.same, t.other, t.bypass, t.incomplete, t.dropped)
 	b.WriteString("\n## Ограничения замера\n\nЦель определяется по ключу, а не по смыслу; instructed означает упоминание утилиты, а не обязательность её применения. Полнота детекторов оценивается только внутри широкого надмножества кандидатов. Взвешивания по составу проектов нет; версии утилит не учитываются. Повтор не означает ошибку. Польза tk измерена прокси.\n")

@@ -15,10 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // New tools go last: candidates are sampled with one generator in this order, so a tool put in the
@@ -42,10 +44,10 @@ func newPairPatterns() pairPatterns {
 		heavyCommand: regexp.MustCompile(`\b(graft\s+(gate|test|commit|install|release)|graft\s+exec\s+--heavy|go\s+(test|build)|make|docker\s+build|podman\s+build|worker\s+run|(npm|pnpm|yarn)\s+(run\s+)?(test|build))\b`),
 		spaces:       regexp.MustCompile(`\s+`),
 		waitGoals: []*regexp.Regexp{
-			regexp.MustCompile(`(?:test\s+-[ef]\s+|\[\[?\s+-[ef]\s+)([^]\s;]+)`),
-			regexp.MustCompile(`curl\s+-\S+\s+([^\s;]+)`), regexp.MustCompile(`kill\s+-0\s+(\d+)`),
-			regexp.MustCompile(`pgrep\s+(?:-\S+\s+)*([^\s;]+)`), regexp.MustCompile(`grep\s+-q\s+.*?\s+([^\s;]+)`),
-			regexp.MustCompile(`ls\s+([^\s;]+)`),
+			regexp.MustCompile(`(?:test\s+-[efsd]\s+|\[\[?\s+-[efsd]\s+)([^]\s;]+)`),
+			regexp.MustCompile(`curl\s+-\S+\s+([^\s;]+)`), regexp.MustCompile(`kill\s+-0\s+([^\s;]+)`),
+			regexp.MustCompile(`pgrep\s+(?:-\S+\s+)*([^\s;]+)`), regexp.MustCompile(`(?:grep|rg)\s+-[^\s]*q[^\s]*\s+.*?\s+([^\s;]+)`),
+			regexp.MustCompile(`ps\s+-p\s+([^\s;]+)`), regexp.MustCompile(`ls\s+([^\s;]+)`),
 		},
 		tkKindClean: regexp.MustCompile(`[0-9]+|[^\p{L}\w -]`),
 		tkPath:      regexp.MustCompile(`(?:^|\s)(?:/\S+|\S*\.md)(?:\s|$)`),
@@ -56,7 +58,20 @@ func newPairPatterns() pairPatterns {
 
 func (u *run) isPairBusyProbe(c shellcmd.Call) bool {
 	l := strings.ToLower(c.Raw + " " + strings.Join(c.Args, " "))
-	return c.Name == "uptime" || c.Name == "w" || c.Name == "top" && strings.Contains(l, "-b") && (strings.Contains(l, "-n1") || strings.Contains(l, "-n 1")) && !strings.Contains(l, "-p") && !strings.Contains(l, "-h") || c.Name == "vmstat" || c.Name == "mpstat" || c.Name == "cat" && (strings.Contains(l, "/proc/loadavg") || strings.Contains(l, "/proc/pressure/"))
+	return c.Name == "uptime" && !uptimeOnly(c.Args) || c.Name == "w" || c.Name == "top" && strings.Contains(l, "-b") && (strings.Contains(l, "-n1") || strings.Contains(l, "-n 1")) && !strings.Contains(l, "-p") && !strings.Contains(l, "-h") || c.Name == "vmstat" || c.Name == "mpstat" || c.Name == "cat" && (strings.Contains(l, "/proc/loadavg") || strings.Contains(l, "/proc/pressure/"))
+}
+
+// uptimeOnly identifies options that report uptime rather than system load.
+func uptimeOnly(args []string) bool {
+	for _, arg := range args {
+		if slices.Contains([]string{"--since", "--pretty", "--raw", "--container", "--help", "--version"}, arg) {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && strings.ContainsAny(strings.TrimPrefix(arg, "-"), "sprchV") {
+			return true
+		}
+	}
+	return false
 }
 
 func pairTools() []string { return strings.Fields(pairToolNames) }
@@ -93,6 +108,12 @@ func (u *run) loadInputs() error {
 		return err
 	}
 	u.releases = releases
+	if u.rescorePath != "" {
+		u.labelsPath = u.rescorePath
+		err := u.readPairLabels()
+		u.labelsPath = ""
+		return err
+	}
 	return u.readPairLabels()
 }
 
@@ -339,7 +360,10 @@ func (u *run) collectPairOld(path, agent, firstUser string, evs []transcript.Eve
 		return
 	}
 	if way == "busy" {
-		goal = u.busyGoal(evs, i, cmd, sc)
+		if hardwareInventory(cmd) {
+			return
+		}
+		goal = u.oldBusyGoal(evs, i, cmd, sc)
 		if goal == "" {
 			u.busyNoDecision++
 			return
@@ -681,6 +705,65 @@ func (u *run) pairUtilityCode(tool string, calls []shellcmd.Call, at, code int, 
 	return code
 }
 
+func hardwareInventory(cmd string) bool {
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil { //nolint:fallback-return,silent-error-handling // Calls before a parsing error are still useful.
+		slog.Debug("parse hardware inventory", "error", err)
+	}
+	return slices.ContainsFunc(calls, func(c shellcmd.Call) bool {
+		return c.Name == "lscpu" || c.Name == "lshw" || c.Name == "dmidecode"
+	})
+}
+
+func (u *run) oldBusyGoal(evs []transcript.Event, at int, cmd string, probe shellcmd.Call) string {
+	before, after := u.executedHeavyGoals(cmd, probe.Offset)
+	if after != "" {
+		return after
+	}
+	if before != "" {
+		return ""
+	}
+	for i := at + 1; i < len(evs); i++ {
+		if evs[i].Role != transcript.Cmd {
+			continue
+		}
+		if evs[i].Time.Sub(evs[at].Time) > 15*time.Minute {
+			return ""
+		}
+		_, goal := u.executedHeavyGoals(evs[i].Text, -1)
+		if goal != "" {
+			return goal
+		}
+	}
+	return ""
+}
+
+// executedHeavyGoals identifies executed commands on either side of the probe.
+func (u *run) executedHeavyGoals(cmd string, probeOffset int) (string, string) {
+	if u.heavyCommandGoal(cmd) == "" {
+		return "", ""
+	}
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil { //nolint:fallback-return,silent-error-handling // Calls parsed before a nested error still identify executed programs.
+		slog.Debug("parse heavy command", "error", err)
+	}
+	before, after := "", ""
+	for _, c := range calls {
+		if c.Offset < 0 || !slices.Contains([]string{"graft", "go", "make", "docker", "podman", "worker", "npm", "pnpm", "yarn"}, c.Name) {
+			continue
+		}
+		goal := u.heavyCommandGoal(c.Name + " " + strings.Join(c.Args, " "))
+		if c.Offset <= probeOffset {
+			if goal != "" {
+				before = goal
+			}
+		} else if goal != "" {
+			after = goal
+		}
+	}
+	return before, after
+}
+
 func (u *run) busyGoal(evs []transcript.Event, at int, cmd string, probe shellcmd.Call) string {
 	start := min(max(probe.Offset+len(probe.Raw), 0), len(cmd))
 	if g := u.heavyCommandGoal(cmd[start:]); g != "" {
@@ -716,6 +799,9 @@ func (u *run) oldPair(c shellcmd.Call, cmd string) (string, string) {
 	}
 	if u.isPairBusyProbe(c) {
 		return "busy", ""
+	}
+	if priorRead(c) {
+		return "prior", callPairGoal(c)
 	}
 	if tool, goal := u.oldSearchPair(c, cmd); tool != "" {
 		return tool, goal
@@ -816,7 +902,7 @@ func oldDateTimingPair(c shellcmd.Call, cmd string) (string, string) {
 func (u *run) oldSearchPair(c shellcmd.Call, cmd string) (string, string) {
 	line := strings.ToLower(c.Raw + " " + strings.Join(c.Args, " "))
 	name := strings.ToLower(c.Name)
-	if priorSearch(name, line) {
+	if priorSearch(c, line) {
 		return "prior", searchGoal(c)
 	}
 	if transcriptSearch(u, c, cmd, name, line) {
@@ -828,15 +914,143 @@ func (u *run) oldSearchPair(c shellcmd.Call, cmd string) (string, string) {
 	return "", ""
 }
 
-func priorSearch(name, line string) bool {
-	return (name == "grep" || name == "rg") && strings.Contains(line, "/.claude/improve/") ||
-		name == "tl" && strings.Contains(line, "--role user") && strings.Contains(line, "--grep")
+func priorSearch(c shellcmd.Call, line string) bool {
+	if c.Name == "tl" {
+		return strings.Contains(line, "--role user") && strings.Contains(line, "--grep")
+	}
+	if c.Name != "grep" && c.Name != "rg" {
+		return false
+	}
+	if c.Name == "rg" && dataOnlyGlobs(c.Args) {
+		return false
+	}
+	for _, arg := range c.Args {
+		p := strings.ToLower(filepath.ToSlash(arg))
+		if !isPriorSource(p) {
+			continue
+		}
+		ext := filepath.Ext(p)
+		if ext == "" || ext == ".md" || strings.Contains(p, ".md,") || strings.Contains(p, ".md}") {
+			return true
+		}
+	}
+	return false
+}
+
+// dataOnlyGlobs reports an explicit restriction to structured data files.
+func dataOnlyGlobs(args []string) bool {
+	included := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		var pattern string
+		switch {
+		case arg == "-g" || arg == "--glob":
+			if i+1 >= len(args) {
+				return false
+			}
+			i++
+			pattern = args[i]
+		case strings.HasPrefix(arg, "--glob="):
+			pattern = strings.TrimPrefix(arg, "--glob=")
+		case strings.HasPrefix(arg, "-g") && len(arg) > 2:
+			pattern = arg[2:]
+		default:
+			continue
+		}
+		if strings.HasPrefix(pattern, "!") {
+			continue
+		}
+		included = true
+		ext := strings.ToLower(filepath.Ext(pattern))
+		if ext != ".tsv" && ext != ".json" && ext != ".jsonl" {
+			return false
+		}
+	}
+	return included
+}
+
+// isPriorSource distinguishes historical material from executable and instructional material.
+func isPriorSource(p string) bool {
+	if strings.HasSuffix(p, "/decisions.md") {
+		return true
+	}
+	_, rest, ok := strings.Cut(p, "/.claude/improve/")
+	if !ok {
+		return false
+	}
+	section, _, nested := strings.Cut(rest, "/")
+	if !nested && filepath.Ext(section) == ".md" {
+		return true
+	}
+	switch section {
+	case "", "state", "runs", "tasks", "cases", "mechanisms", "decisions", "experiments", "trials":
+		return true
+	}
+	return false
+}
+
+// priorRead recognises direct reading of recorded tasks and trials.
+func priorRead(c shellcmd.Call) bool {
+	if c.Name != "cat" && c.Name != "less" && c.Name != "head" && c.Name != "tail" {
+		return false
+	}
+	for _, arg := range c.Args {
+		p := strings.ToLower(filepath.ToSlash(arg))
+		if isPriorSource(p) && (strings.Contains(p, "/tasks/") || strings.Contains(p, "/runs/")) && (filepath.Ext(p) == "" || filepath.Ext(p) == ".md") {
+			return true
+		}
+	}
+	return false
 }
 
 func transcriptSearch(u *run, c shellcmd.Call, cmd, name, line string) bool {
 	search := name == "grep" || name == "rg" || name == "jq" || name == "sed"
-	return u.transcriptArgs(strings.ToLower(strings.Join(c.Args, " ")), strings.ToLower(cmd)) && search ||
-		name == "tl" && strings.Contains(line, "--grep")
+	if name == "tl" {
+		return strings.Contains(line, "--grep") && strings.Contains(line, "--role user")
+	}
+	if !search || !u.transcriptArgs(strings.ToLower(strings.Join(c.Args, " ")), strings.ToLower(cmd)) {
+		return false
+	}
+	if invokesUserWord(cmd) {
+		return false
+	}
+	return naturalLanguagePhrase(searchGoal(c))
+}
+
+func invokesUserWord(cmd string) bool {
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil { //nolint:fallback-return,silent-error-handling // Parsed calls remain useful after a nested error.
+		slog.Debug("parse user-word call", "error", err)
+	}
+	return slices.ContainsFunc(calls, func(c shellcmd.Call) bool { return c.Name == "user-word" })
+}
+
+var diagnosticPhrase = regexp.MustCompile(`(?i)\b(?:error|exception|failed|exit\s+(?:code|status))\b`)
+
+// naturalLanguagePhrase accepts words inside search patterns, including regular-expression
+// alternatives and character classes, while excluding paths and structured field expressions.
+func naturalLanguagePhrase(s string) bool {
+	if diagnosticPhrase.MatchString(s) || len(strings.Fields(s)) < 2 {
+		return false
+	}
+	if strings.ContainsAny(s, "/_$=<>") {
+		return false
+	}
+	words, run := 0, 0
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			run++
+			continue
+		}
+		if run >= 3 {
+			words++
+		}
+		run = 0
+	}
+	if run >= 3 {
+		words++
+	}
+	return words >= 2
 }
 
 func searchPhrase(sample string) bool {
@@ -845,10 +1059,199 @@ func searchPhrase(sample string) bool {
 }
 
 func (u *run) waitPairGoal(c shellcmd.Call, cmd string) string {
-	if c.Name != "sleep" && !(strings.Contains(strings.ToLower(cmd), "while ") && strings.Contains(strings.ToLower(cmd), "sleep")) {
+	if c.Name != "sleep" || len(c.Args) == 0 {
 		return ""
 	}
-	return u.waitGoal(cmd)
+	duration := strings.TrimRight(c.Args[0], "smhd")
+	if n, err := strconv.ParseFloat(duration, 64); err == nil && n <= 0 {
+		return ""
+	}
+	goal := u.waitGoal(cmd)
+	if goal == "" || c.Offset < 0 {
+		return ""
+	}
+	if c.Loop {
+		return u.waitLoopGoal(cmd, c.Offset)
+	}
+	after := strings.TrimLeft(cmd[min(c.Offset+len(c.Raw), len(cmd)):], " \t\r\n;|&")
+	goal = u.waitGoal(after)
+	if goal == "" {
+		return ""
+	}
+	calls, err := shellcmd.Calls(after)
+	if err != nil { //nolint:fallback-return,silent-error-handling // Calls before a nested error still identify the check.
+		slog.Debug("parse wait check", "error", err)
+	}
+	for _, check := range calls {
+		if check.Name == "curl" && u.waitGoal(check.Raw) == goal && !conditionalCall(after, check.Offset) {
+			return ""
+		}
+	}
+	return goal
+}
+
+// conditionalCall reports whether a command's exit status controls an if or boolean chain.
+func conditionalCall(cmd string, offset int) bool {
+	if offset < 0 {
+		return false
+	}
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		slog.Debug("parse conditional check", "error", err)
+		return false
+	}
+	found := false
+	contains := func(n syntax.Node) bool {
+		return n != nil && int(n.Pos().Offset()) <= offset && offset < int(n.End().Offset())
+	}
+	syntax.Walk(file, func(n syntax.Node) bool {
+		if n == nil || found {
+			return false
+		}
+		switch c := n.(type) {
+		case *syntax.IfClause:
+			for _, condition := range c.Cond {
+				found = found || contains(condition)
+			}
+		case *syntax.BinaryCmd:
+			if c.Op == syntax.AndStmt || c.Op == syntax.OrStmt {
+				found = found || contains(c.X)
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// waitLoopGoal examines the loop containing the sleep, not unrelated loops in the command.
+func (u *run) waitLoopGoal(cmd string, offset int) string {
+	return u.waitLoopGoalDepth(cmd, offset, 0)
+}
+
+func (u *run) waitLoopGoalDepth(cmd string, offset, depth int) string {
+	if depth > 4 || offset < 0 || offset >= len(cmd) {
+		return ""
+	}
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		slog.Debug("parse wait loop", "error", err)
+		return ""
+	}
+	loop, quoted := enclosingWaitNodes(file, offset)
+	if loop == nil {
+		start, end, ok := quotedWaitBounds(cmd, quoted, offset)
+		if !ok {
+			return ""
+		}
+		return u.waitLoopGoalDepth(cmd[start:end], offset-start, depth+1)
+	}
+	start, end := int(loop.Pos().Offset()), min(int(loop.End().Offset()), len(cmd))
+	text := cmd[start:end]
+	goal := u.waitGoal(text)
+	if goal == "" {
+		return ""
+	}
+	if w, ok := loop.(*syntax.WhileClause); ok {
+		do := int(w.DoPos.Offset()) - start
+		if do >= 0 && do <= len(text) && u.waitGoal(text[:do]) != "" {
+			return goal
+		}
+	}
+	return u.conditionalLoopExit(loop, cmd)
+}
+
+func enclosingWaitNodes(file *syntax.File, offset int) (syntax.Node, syntax.Node) {
+	var loop, quoted syntax.Node
+	syntax.Walk(file, func(n syntax.Node) bool {
+		if n == nil {
+			return true
+		}
+		start, end := int(n.Pos().Offset()), int(n.End().Offset())
+		switch n.(type) {
+		case *syntax.WhileClause, *syntax.ForClause:
+			if start <= offset && offset < end && (loop == nil || end-start < int(loop.End().Offset()-loop.Pos().Offset())) {
+				loop = n
+			}
+		case *syntax.SglQuoted, *syntax.DblQuoted:
+			if start < offset && offset < end && (quoted == nil || end-start < int(quoted.End().Offset()-quoted.Pos().Offset())) {
+				quoted = n
+			}
+		}
+		return true
+	})
+	return loop, quoted
+}
+
+func quotedWaitBounds(cmd string, quoted syntax.Node, offset int) (int, int, bool) {
+	if quoted == nil {
+		return 0, 0, false
+	}
+	start, end := int(quoted.Pos().Offset()), min(int(quoted.End().Offset())-1, len(cmd))
+	for start < end && cmd[start] != '\'' && cmd[start] != '"' {
+		start++
+	}
+	start++
+	return start, end, start < end && offset >= start && offset < end
+}
+
+// conditionalLoopExit requires a tested condition to govern the break itself.
+func (u *run) conditionalLoopExit(loop syntax.Node, cmd string) string {
+	goal := ""
+	syntax.Walk(loop, func(n syntax.Node) bool {
+		if n == nil || goal != "" {
+			return false
+		}
+		if n != loop {
+			switch n.(type) {
+			case *syntax.WhileClause, *syntax.ForClause:
+				return false
+			}
+		}
+		switch c := n.(type) {
+		case *syntax.IfClause:
+			if len(c.Cond) == 0 || len(c.Then) == 0 {
+				break
+			}
+			condition := cmd[c.Cond[0].Pos().Offset():c.Cond[len(c.Cond)-1].End().Offset()]
+			branches := c.Then
+			if c.Else != nil {
+				branches = append(slices.Clone(branches), c.Else.Then...)
+			}
+			for _, statement := range branches {
+				if containsShellBreak(statement) {
+					goal = u.waitGoal(condition)
+					break
+				}
+			}
+		case *syntax.BinaryCmd:
+			if (c.Op == syntax.AndStmt || c.Op == syntax.OrStmt) && containsShellBreak(c.Y) {
+				goal = u.waitGoal(cmd[c.X.Pos().Offset():c.X.End().Offset()])
+			}
+		}
+		return true
+	})
+	return goal
+}
+
+func containsShellBreak(node syntax.Node) bool {
+	found := false
+	syntax.Walk(node, func(n syntax.Node) bool {
+		if n == nil || found {
+			return false
+		}
+		switch c := n.(type) {
+		case *syntax.WhileClause, *syntax.ForClause:
+			return false
+		case *syntax.CallExpr:
+			if len(c.Args) > 0 && len(c.Args[0].Parts) == 1 {
+				if lit, ok := c.Args[0].Parts[0].(*syntax.Lit); ok && lit.Value == "break" {
+					found = true
+				}
+			}
+		}
+		return true
+	})
+	return found
 }
 
 func (u *run) pageShotGoal(c shellcmd.Call) string {
@@ -912,10 +1315,17 @@ func copyTargetDirectory(args []string) string {
 
 // isClaudeRulesSource reports a path inside the Claude Code rules, skills or global instructions.
 func isClaudeRulesSource(path string) bool {
-	p := filepath.ToSlash(path)
+	p := filepath.ToSlash(filepath.Clean(path))
 	for _, part := range []string{".claude/rules", ".claude/skills", ".claude/CLAUDE.md"} {
-		if strings.HasSuffix(p, part) || strings.Contains(p, part+"/") {
+		if strings.HasSuffix(p, part) {
 			return true
+		}
+		if strings.Contains(p, part+"/") {
+			base := filepath.Base(p)
+			if !strings.Contains(base, ".") {
+				return true
+			}
+			return strings.HasSuffix(strings.ToLower(base), ".md")
 		}
 	}
 	return false
@@ -967,12 +1377,39 @@ func lastArg(a []string) string {
 func (u *run) collectCandidate(path string, evs []transcript.Event, i int, cmd, agent string) {
 	l := strings.ToLower(cmd)
 	candidates := u.candidateClasses(l, cmd)
+	u.collectRescoreCandidate(callRef(path, &evs[i]))
 	for pair := range candidates {
 		eventID := callRef(path, &evs[i])
 		_, yes := u.pairOldIDs[eventID][pair]
 		id := pair + ":" + eventID
 		context := u.candidateContext(evs, i)
-		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: id, pair: pair, command: truncateRunes(maskSecrets(cmd), 300), context: context, yes: yes, agent: agent})
+		u.pairCandidates = append(u.pairCandidates, pairCandidate{id: id, pair: pair, command: maskSecrets(cmd), context: context, yes: yes, agent: agent})
+	}
+}
+
+func (u *run) collectRescoreCandidate(eventID string) {
+	if u.rescorePath == "" {
+		return
+	}
+	originalID := eventID
+	if prefix, suffix, ok := strings.Cut(eventID, "#"); ok {
+		if _, err := strconv.Atoi(suffix); err == nil {
+			originalID = prefix
+		}
+	}
+	for _, pair := range pairTools() {
+		for _, ref := range []string{eventID, originalID} {
+			id := pair + ":" + ref
+			if _, ok := u.labelRows[id]; !ok {
+				continue
+			}
+			if u.rescoreCandidates == nil {
+				u.rescoreCandidates = make(map[string]pairCandidate)
+			}
+			_, yes := u.pairOldIDs[eventID][pair]
+			yes = yes || u.rescoreCandidates[id].yes
+			u.rescoreCandidates[id] = pairCandidate{id: id, pair: pair, yes: yes}
+		}
 	}
 }
 
@@ -1166,6 +1603,9 @@ func (u *run) writePairTables() error {
 		return err
 	}
 	if err := u.writeCandidates(); err != nil {
+		return err
+	}
+	if err := u.writeRescore(); err != nil {
 		return err
 	}
 	if err := u.checkPairLabels(); err != nil {
@@ -1647,6 +2087,37 @@ func tkActionMatchesRefusal(action *taskWrite, refusal *tkRefusal, source string
 
 func sortedTKKinds(stats map[string]*tkRefusalStat) []string {
 	return slices.Sorted(maps.Keys(stats))
+}
+
+func (u *run) writeRescore() error {
+	if u.rescorePath == "" {
+		return nil
+	}
+	candidates := make(map[string]pairCandidate, len(u.pairCandidates))
+	for _, c := range u.pairCandidates {
+		candidates[c.id] = c
+	}
+	maps.Copy(candidates, u.rescoreCandidates)
+	ids := slices.SortedFunc(maps.Keys(u.labelRows), func(a, b string) int { return u.labelRows[a].line - u.labelRows[b].line })
+	var missing []string
+	var b strings.Builder
+	b.WriteString("id\tpair\tlabel\tverdict\n")
+	for _, id := range ids {
+		c, ok := candidates[id]
+		if !ok {
+			missing = append(missing, id)
+			continue
+		}
+		verdict := "no"
+		if c.yes {
+			verdict = "yes"
+		}
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\n", id, c.pair, u.labelRows[id].label, verdict)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s: IDs not found in window: %s", u.rescorePath, strings.Join(missing, ", "))
+	}
+	return u.save("rescore.tsv", b.String())
 }
 
 func (u *run) writeCandidates() error {

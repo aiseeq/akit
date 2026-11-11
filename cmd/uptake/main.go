@@ -72,7 +72,7 @@ type run struct {
 	hookMissing                                             []string
 	hookBadLines                                            int
 	firstHookBad                                            string
-	releasesPath, labelsPath                                string
+	releasesPath, labelsPath, rescorePath                   string
 	releases                                                map[string]releaseDate
 	labelRows                                               map[string]labelRow
 	labels                                                  map[string]string
@@ -80,6 +80,7 @@ type run struct {
 	pairOldIDs                                              map[string]map[string]struct{}
 	pairCandidates                                          []pairCandidate
 	pairCandidateSample                                     []pairCandidate
+	rescoreCandidates                                       map[string]pairCandidate
 	tkRefusals                                              []tkRefusal
 	tkActions                                               []taskWrite
 	pairOverlap                                             []pairOverlap
@@ -1495,7 +1496,7 @@ func (e *uptakeInputError) Error() string { return e.message }
 const usage = `uptake — weekly uptake of akit tools from agent transcripts.
 
 Usage:
-  uptake [--since T] [--until T] [--out DIR] [--seed N] [--releases FILE] [--labels FILE]
+  uptake [--since T] [--until T] [--out DIR] [--seed N] [--releases FILE] [--labels FILE] [--rescore FILE]
 
   --since T         window start (default: 7 days before now): 12:05, 25.10, "25.10 12:05", RFC3339,
                     or an age such as 3d (three days ago)
@@ -1508,6 +1509,7 @@ Usage:
                     is reported only when precision and recall pass their lower bounds
                     (both files are checked before the transcripts are read: a missing, unreadable
                     or malformed file is a usage error)
+  --rescore FILE    rescore labeled IDs from the window into rescore.tsv
   -h, --help        this help
 
 Writes report.md and TSV tables (counts, examples, errors, pairs, outcomes, candidates, ...) to DIR.
@@ -1530,7 +1532,7 @@ func main() {
 		os.Exit(1)
 	}
 	u := newRun(args.since, args.until, args.seed, args.out, home)
-	u.releasesPath, u.labelsPath = args.releases, args.labels
+	u.releasesPath, u.labelsPath, u.rescorePath = args.releases, args.labels, args.rescore
 	if err := u.runUptake(args.since, args.until); err != nil {
 		code, message := uptakeErrorResult(err)
 		fmt.Fprintln(os.Stderr, message)
@@ -1548,15 +1550,18 @@ func uptakeErrorResult(err error) (int, string) {
 
 // uptakeArgs — разобранные аргументы командной строки.
 type uptakeArgs struct {
-	since, until          time.Time
-	seed                  int
-	out, releases, labels string
+	since, until                   time.Time
+	seed                           int
+	out, releases, labels, rescore string
 }
 
 func parseUptakeArgs(args []string, now time.Time) (uptakeArgs, error) {
 	a, err := parseUptakeFlags(args, now)
 	if err != nil {
 		return uptakeArgs{}, err
+	}
+	if a.labels != "" && a.rescore != "" {
+		return uptakeArgs{}, fmt.Errorf("--labels and --rescore cannot be combined")
 	}
 	if !a.since.Before(a.until) {
 		return uptakeArgs{}, fmt.Errorf("--since must be before --until")
@@ -1565,7 +1570,7 @@ func parseUptakeArgs(args []string, now time.Time) (uptakeArgs, error) {
 }
 
 func uptakeFlagNames() []string {
-	return []string{"--since", "--until", "--seed", "--out", "--releases", "--labels"}
+	return []string{"--since", "--until", "--seed", "--out", "--releases", "--labels", "--rescore"}
 }
 
 func parseUptakeFlags(args []string, now time.Time) (uptakeArgs, error) {
@@ -1617,14 +1622,16 @@ func (a *uptakeArgs) setFlag(name, value string, now time.Time) error {
 		a.seed = n
 	case "--out":
 		a.out = value
-	case "--releases", "--labels":
+	case "--releases", "--labels", "--rescore":
 		if value == "" {
 			return fmt.Errorf("%s needs a non-empty value", name)
 		}
 		if name == "--releases" {
 			a.releases = value
-		} else {
+		} else if name == "--labels" {
 			a.labels = value
+		} else {
+			a.rescore = value
 		}
 	}
 	return nil

@@ -692,8 +692,8 @@ func TestPairUserWordOverlap(t *testing.T) {
 			priorOldCalls, _ = strconv.Atoi(fields[9])
 		}
 	}
-	if priorOldCalls != 2 {
-		t.Errorf("prior old should count improve search and tl --grep, but not cat: %d", priorOldCalls)
+	if priorOldCalls != 3 {
+		t.Errorf("prior old should count decisions, improve search and tl --grep, but not unrelated cat: %d", priorOldCalls)
 	}
 	cand, verdict := read("candidates.tsv"), read("candidates-verdict.tsv")
 	if !strings.Contains(cand, "uptime") {
@@ -721,7 +721,7 @@ func TestPairUserWordOverlap(t *testing.T) {
 	if !strings.Contains(report, "Поиск решений (по правилу): 1 вызовов.") {
 		t.Errorf("decision rule search count missing: %s", report)
 	}
-	if !strings.Contains(report, "Prior old по источнику: .claude/improve/ — 1 вызовов; tl --role user --grep — 1 вызовов.") {
+	if !strings.Contains(report, "Prior old по источнику: файлы решений и improve — 2 вызовов; tl --role user --grep — 1 вызовов.") {
 		t.Errorf("prior old source counts missing: %s", report)
 	}
 }
@@ -1202,6 +1202,214 @@ func TestGateNoYesReason(t *testing.T) {
 	u.writePairReport(&b)
 	if !strings.Contains(b.String(), "| prior | agent | no | no-date | — | — | нет кандидатов «да» — точность не определена |") {
 		t.Fatalf("report does not name the missing yes sample:\n%s", b.String())
+	}
+}
+
+func TestRescoreRows(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	u.rescorePath = "labels.tsv"
+	u.labelRows = map[string]labelRow{"prior:a": {label: "no", line: 2}, "busy:b": {label: "yes", line: 3}}
+	u.pairCandidates = []pairCandidate{{id: "prior:a", pair: "prior", yes: true}, {id: "busy:b", pair: "busy"}}
+	if err := u.writeRescore(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(u.outputDir, "rescore.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "id\tpair\tlabel\tverdict\nprior:a\tprior\tno\tyes\nbusy:b\tbusy\tyes\tno\n"
+	if string(data) != want {
+		t.Fatalf("got %q, want %q", data, want)
+	}
+	u.rescorePath = "labels.tsv"
+	u.labelRows["prior:session:1:call"] = labelRow{label: "no", line: 4}
+	e := transcript.Event{Role: transcript.Cmd, Who: "Bash", Line: 1, CallID: "call", Text: "echo hello"}
+	u.collectPairEvents("session", true, nil, []transcript.Event{e}, nil, nil)
+	if len(u.pairCandidates) != 2 {
+		t.Fatalf("rescore changed candidate selection: %v", u.pairCandidates)
+	}
+	if err := u.writeRescore(); err != nil {
+		t.Fatalf("command outside candidate classes: %v", err)
+	}
+	delete(u.labelRows, "prior:session:1:call")
+	u.labelRows["prior:session:2:script"] = labelRow{label: "yes", line: 4}
+	u.pairOldIDs = map[string]map[string]struct{}{"session:2:script#0": {"prior": {}}}
+	for _, callID := range []string{"script#0", "script#1"} {
+		events := []transcript.Event{{Role: transcript.Cmd, Line: 2, CallID: callID}}
+		u.collectCandidate("session", events, 0, "echo hello", "agent")
+	}
+	if c := u.rescoreCandidates["prior:session:2:script"]; !c.yes {
+		t.Fatal("original script ID must retain any positive command")
+	}
+	delete(u.labelRows, "prior:session:2:script")
+	u.labelRows["absent:c"] = labelRow{label: "no", line: 4}
+	u.labelRows["absent:d"] = labelRow{label: "no", line: 5}
+	err = u.writeRescore()
+	if err == nil || !strings.Contains(err.Error(), "absent:c") || !strings.Contains(err.Error(), "absent:d") {
+		t.Fatalf("missing IDs: %v", err)
+	}
+	code, _ := uptakeErrorResult(err)
+	if code != 1 {
+		t.Fatalf("missing IDs exit %d", code)
+	}
+	if _, err := parseUptakeArgs([]string{"--labels", "a", "--rescore", "b"}, time.Now()); err == nil {
+		t.Fatal("combined flags accepted")
+	}
+}
+
+func TestDetectorBusyAfterMeasurement(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	base := time.Now()
+	for _, tc := range []struct {
+		command string
+		want    bool
+	}{
+		{"uptime; go test ./...", true},
+		{"if uptime; then go test ./...; fi", true},
+		{"uptime --since; go test ./...", false},
+		{"uptime -s; go test ./...", false},
+		{"uptime --pretty; go test ./...", false},
+		{"uptime; printf 'go test ./...'", false},
+		{"lscpu; uptime; go test ./...", false},
+		{"go test ./...; uptime", false},
+		{"go test ./...; uptime; echo done", false},
+		{"go test ./...; uptime; go build ./...", true},
+	} {
+		e := transcript.Event{Role: transcript.Cmd, Who: "Bash", Line: 1, CallID: tc.command, Time: base, Text: tc.command}
+		calls, err := shellcmd.Calls(tc.command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.pairCalls = nil
+		for _, c := range calls {
+			u.collectPairOld("session", "agent", "", []transcript.Event{e}, nil, c, tc.command, 0, &e)
+		}
+		got := false
+		for _, call := range u.pairCalls {
+			if call.tool == "busy" {
+				got = true
+			}
+		}
+		if got != tc.want {
+			t.Errorf("%q: got %v want %v", tc.command, got, tc.want)
+		}
+	}
+}
+
+func TestDetectorBusyAfterMeasurementAndLaterRun(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	cmd := "go test ./...; uptime"
+	calls, err := shellcmd.Calls(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	evs := []transcript.Event{{Role: transcript.Cmd, Time: base, Text: cmd}, {Role: transcript.Cmd, Time: base.Add(time.Minute), Text: "go build ./..."}}
+	if got := u.oldBusyGoal(evs, 0, cmd, calls[1]); got != "" {
+		t.Fatalf("probe after measurement paired with later run: %q", got)
+	}
+}
+
+func TestDetectorBusyAllowsIntermediateCommands(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	base := time.Now()
+	probe := shellcmd.Call{Name: "uptime", Raw: "uptime"}
+	for _, tc := range []struct {
+		next string
+		want bool
+	}{
+		{"go test ./...", true},
+		{"echo checking readiness", true},
+	} {
+		events := []transcript.Event{
+			{Role: transcript.Cmd, Time: base, Text: "uptime"},
+			{Role: transcript.Cmd, Time: base.Add(time.Second), Text: tc.next},
+			{Role: transcript.Cmd, Time: base.Add(2 * time.Second), Text: "go build ./..."},
+		}
+		got := u.busyGoal(events, 0, "uptime", probe) != ""
+		if got != tc.want {
+			t.Errorf("next command %q: got %v, want %v", tc.next, got, tc.want)
+		}
+	}
+}
+
+func TestDetectorPrecision(t *testing.T) {
+	u := newRun(time.Time{}, time.Time{}, 1, t.TempDir(), t.TempDir())
+	for _, tc := range []struct {
+		command, pair string
+		want          bool
+	}{
+		{"grep 'hello friend' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"rg 'любая фраза|другая.*мысль' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"grep 'exit code 17' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep syntheticwordlong ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep package.TypeName ~/.claude/projects/s.jsonl", "user-word", false},
+		{"grep package.Component ~/.claude/projects/s.jsonl", "user-word", false},
+		{"jq '.message.type' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"user-word hello; grep 'hello friend' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"echo user-word; grep 'hello friend' ~/.claude/projects/s.jsonl", "user-word", true},
+		{"bash -c 'user-word hello'; grep 'hello friend' ~/.claude/projects/s.jsonl", "user-word", false},
+		{"sleep 1; test -f /synthetic/ready", "wfor", true},
+		{"sleep 1; test -s /synthetic/ready", "wfor", true},
+		{"until kill -0 $pid; do sleep 1; done", "wfor", true},
+		{"until ps -p $pid; do sleep 1; done", "wfor", true},
+		{"until rg -qF ready /synthetic/log; do sleep 1; done", "wfor", true},
+		{"test -f /synthetic/ready; sleep 1", "wfor", false},
+		{"sleep 1; if curl -fsS https://example.test; then echo ready; fi", "wfor", true},
+		{"sleep 1; curl -fsS https://example.test && echo ready", "wfor", true},
+		{"curl -fsS https://example.test; sleep 1; test -s /synthetic/ready", "wfor", true},
+		{"if echo hi; then echo ok; fi; sleep 1; curl -fsS https://example.test", "wfor", false},
+		{"sleep 1; printf update; test -f /synthetic/ready", "wfor", true},
+		{"sleep 1; touch /synthetic/other", "wfor", false},
+		{"sleep 0; test -f /synthetic/ready", "wfor", false},
+		{"sleep 2; curl -fsS https://example.test", "wfor", false},
+		{"for i in 1 2; do sleep 1; ls /synthetic/data; done", "wfor", false},
+		{"while true; do sleep 1; ls /synthetic/data; done", "wfor", false},
+		{"for x in a b; do sleep 1; ls /synthetic/data; done; if test -f /synthetic/done; then echo break; fi", "wfor", false},
+		{"for x in a b; do sleep 1; if test -f /synthetic/data; then echo break; fi; done", "wfor", false},
+		{"for x in a b; do sleep 1; ls /synthetic/data; echo a && echo b; break; done", "wfor", false},
+		{"for x in a b; do sleep 1; ls /synthetic/data && echo measured; break; done", "wfor", false},
+		{"while true; do sleep 1; if test -f /synthetic/ready; then break; fi; done", "wfor", true},
+		{"while true; do sleep 1; if test -f /synthetic/busy; then echo busy; else break; fi; done", "wfor", true},
+		{"while test -f /synthetic/busy; do sleep 1; done", "wfor", true},
+		{"timeout 4 bash -c 'until test -f /synthetic/ready; do sleep 1; done'", "wfor", true},
+		{"timeout 4 bash -c 'while true; do sleep 1; ls /synthetic/data; done'", "wfor", false},
+		{"for i in 1 2; do curl -fsS https://example.test && break; sleep 1; done", "wfor", true},
+		{"cp ~/.claude/skills/demo/SKILL.md /synthetic/out", "claude-rules-export", true},
+		{"cp ~/.claude/skills/demo/code.js /synthetic/out", "claude-rules-export", false},
+		{"cp ~/.claude/skills/demo/reference.md /synthetic/out", "claude-rules-export", true},
+		{"cp -r ~/.claude/skills/demo/. /synthetic/out", "claude-rules-export", true},
+		{"rg choice ~/.claude/improve/state/notes.md", "prior", true},
+		{"rg choice ~/.claude/improve/trials/record.md", "prior", true},
+		{"rg choice ~/.claude/improve/record.md", "prior", true},
+		{"rg choice ~/.claude/improve/templates/guide.md", "prior", false},
+		{"cat ~/.claude/improve/runs/raw.json", "prior", false},
+		{"rg 'table.tsv' ~/.claude/improve/state/notes.md", "prior", true},
+		{"rg choice ~/.claude/improve/state/data.json", "prior", false},
+		{"rg choice ~/.claude/improve/state/measure.tsv", "prior", false},
+		{"rg --glob '*.json' choice ~/.claude/improve/runs", "prior", false},
+		{"rg -g '*.md' choice ~/.claude/improve/runs", "prior", true},
+		{"rg -g '*.json' -g '*.md' choice ~/.claude/improve/runs", "prior", true},
+		{"rg -g '!*.json' choice ~/.claude/improve/runs", "prior", true},
+		{"cat ~/.claude/improve/tasks/example.md", "prior", true},
+		{"cat ~/.claude/improve/runs/example.md", "prior", true},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			calls, err := shellcmd.Calls(tc.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := false
+			for _, c := range calls {
+				way, _ := u.oldPair(c, tc.command)
+				if way == tc.pair {
+					got = true
+				}
+			}
+			if got != tc.want {
+				t.Errorf("%s: got %v, want %v", tc.pair, got, tc.want)
+			}
+		})
 	}
 }
 
