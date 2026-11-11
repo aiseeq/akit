@@ -29,6 +29,7 @@ func TestCalls(t *testing.T) {
 		{"time format option", `/usr/bin/time -f "took %es" rg x`, []string{"time", "rg"}},
 		{"nice and ionice values", `nice -n 5 ionice -c 3 rg x`, []string{"nice", "rg"}},
 		{"wrapper options", `timeout 5 env -u X sudo -n rg x`, []string{"timeout", "rg"}},
+		{"env lone dash", `env -`, []string{"env", "-"}},
 		{"xargs option value", `xargs -I{} jq .`, []string{"xargs", "jq"}},
 		{"bash command string", `bash -euo pipefail -c 'rg x; echo ok'`, []string{"bash", "rg", "echo"}},
 		{"bash command string with variables", `bash -c 'while grep -q "$x"; do sleep 5; done'`, []string{"bash", "grep", "sleep"}},
@@ -294,6 +295,63 @@ func TestKillGuardForms(t *testing.T) {
 		{`find . -ok kill {} \;`, "kill", []string{"{}"}, []string{"find", "-ok"}},
 		{`find . -okdir pkill -u u1 +`, "pkill", []string{"-u", "u1"}, []string{"find", "-okdir"}},
 		{`bash <<< 'kill 1'`, "kill", []string{"1"}, []string{"bash"}},
+		{`bash -s -- -n <<'E'
+kill 1
+E`, "kill", []string{"1"}, []string{"bash"}},
+		{`echo k | bash -s -- -n`, "kill", nil, nil},
+		{`parallel bash -c 'kill 1' ::: x`, "kill", []string{"1"}, []string{"parallel", "bash", "-c"}},
+		{`parallel -j1 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
+		{`parallel kill -9 ::: 1`, "kill", []string{"-9", "1"}, []string{"parallel"}},
+		{`parallel -j 1 kill -9 ::: 1`, "kill", []string{"-9", "1"}, []string{"parallel"}},
+		{`parallel kill ::: 1 2`, "kill", []string{"1", "2"}, []string{"parallel"}},
+		{`sudo su -c 'pkill -u u1'`, "pkill", []string{"-u", "u1"}, []string{"sudo", "su"}},
+		{`nice -n 5 env -S 'kill 1'`, "kill", []string{"1"}, []string{"nice", "env"}},
+		{`timeout 5 flock /tmp/x -c 'kill 1'`, "kill", []string{"1"}, []string{"timeout", "flock"}},
+		{`sudo runuser -u u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"sudo", "runuser"}},
+		{`sudo su - u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"sudo", "su"}},
+		{`flock /tmp/x bash -c 'kill 1'`, "kill", []string{"1"}, []string{"flock", "bash", "-c"}},
+		{`flock /tmp/x pkill -c -u u1`, "pkill", []string{"-c", "-u", "u1"}, []string{"flock"}},
+		{`runuser -u u1 -- pkill -c -u u1`, "pkill", []string{"-c", "-u", "u1"}, []string{"runuser"}},
+		{`flock /tmp/x pkill -u u1 -c`, "pkill", []string{"-u", "u1", "-c"}, []string{"flock"}},
+		{`sudo flock /tmp/x pkill -c -u u1`, "pkill", []string{"-c", "-u", "u1"}, []string{"sudo", "flock"}},
+		{`su -c 'kill 1' u1`, "kill", []string{"1"}, []string{"su"}},
+		{`su --command='kill 1' u1`, "kill", []string{"1"}, []string{"su"}},
+		{`su -lc 'kill 1' u1`, "kill", []string{"1"}, []string{"su"}},
+		{`su -c'kill 1' u1`, "kill", []string{"1"}, []string{"su"}},
+		{`runuser -c'kill 1' u1`, "kill", []string{"1"}, []string{"runuser"}},
+		{`runuser --command='kill 1' u1`, "kill", []string{"1"}, []string{"runuser"}},
+		{`flock /tmp/x -c'kill 1'`, "kill", []string{"1"}, []string{"flock"}},
+		{`flock /tmp/x --command='kill 1'`, "kill", []string{"1"}, []string{"flock"}},
+		{`taskset 0x1 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
+		{`taskset 1 pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"taskset"}},
+		{`chrt 5 kill 1`, "kill", []string{"1"}, []string{"chrt"}},
+		{`chrt -b 0 kill 1`, "kill", []string{"1"}, []string{"chrt"}},
+		{`chrt --other 0 kill 1`, "kill", []string{"1"}, []string{"chrt"}},
+		{`watch -t 'kill 1'`, "kill", []string{"1"}, []string{"watch"}},
+		{`watch -d 'kill 1'`, "kill", []string{"1"}, []string{"watch"}},
+		{`watch -g 'kill 1'`, "kill", []string{"1"}, []string{"watch"}},
+		{`watch -x kill 1`, "kill", []string{"1"}, []string{"watch"}},
+		{`watch -n 1 'kill 1'`, "kill", []string{"1"}, []string{"watch"}},
+		{`strace -T -D kill 1`, "kill", []string{"1"}, []string{"strace"}},
+		{`strace -E X=1 kill 1`, "kill", []string{"1"}, []string{"strace"}},
+		{`flock -o /tmp/x kill 1`, "kill", []string{"1"}, []string{"flock"}},
+		{`systemd-run --same-dir kill 1`, "kill", []string{"1"}, []string{"systemd-run"}},
+		{`systemd-run -E X=1 kill 1`, "kill", []string{"1"}, []string{"systemd-run"}},
+		{`systemd-run -u x kill 1`, "kill", []string{"1"}, []string{"systemd-run"}},
+		{`unshare -S 0 kill 1`, "kill", []string{"1"}, []string{"unshare"}},
+		{`script --echo always -c 'kill 1'`, "kill", []string{"1"}, []string{"script"}},
+		{`tmux new -d 'kill 1'`, "kill", []string{"1"}, []string{"tmux"}},
+		{`trap -- 'kill 1' EXIT`, "kill", []string{"1"}, []string{"trap"}},
+		{`eval -- 'kill 1'`, "kill", []string{"1"}, []string{"eval"}},
+		{`env -i -S 'kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`env -u X -S 'kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`env --ignore-environment --split-string='kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`env -S'kill 1'`, "kill", []string{"1"}, []string{"env"}},
+		{`eval kill 1`, "kill", []string{"1"}, []string{"eval"}},
+		{`find . -exec kill {} \; -exec pkill -u u1 +`, "kill", []string{"{}"}, []string{"find", "-exec"}},
+		{`find . -exec kill {} \; -exec pkill -u u1 +`, "pkill", []string{"-u", "u1"}, []string{"find", "-exec"}},
+		{`trap - SIG`, "kill", nil, nil},
+		{`parallel kill :::: /tmp/x`, "kill", []string{"/tmp/x"}, []string{"parallel"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.command, func(t *testing.T) {
@@ -307,8 +365,14 @@ func TestKillGuardForms(t *testing.T) {
 					found = append(found, call)
 				}
 			}
+			if tt.args == nil {
+				if len(found) != 0 {
+					t.Fatalf("%s calls = %#v; want no %s call", tt.command, found, tt.name)
+				}
+				return
+			}
 			if len(found) != 1 || !reflect.DeepEqual(found[0].Args, tt.args) || !reflect.DeepEqual(found[0].Via, tt.via) {
-				t.Fatalf("%s calls = %#v; want %s %q via %q", tt.name, found, tt.name, tt.args, tt.via)
+				t.Fatalf("%s calls = %#v (all %#v); want %s %q via %q", tt.name, found, calls, tt.name, tt.args, tt.via)
 			}
 		})
 	}
@@ -343,6 +407,99 @@ func TestUnknownShellScriptInput(t *testing.T) {
 	calls, err = Calls(`bash -n <<< 'kill 1'`)
 	if err != nil || len(calls) != 1 || calls[0].ScriptInput {
 		t.Errorf("bash -n here-string = %#v, %v", calls, err)
+	}
+	for _, command := range []string{`echo k | bash -n`, `bash -n <(echo k)`} {
+		calls, err = Calls(command)
+		if err != nil {
+			t.Errorf("%q: %v", command, err)
+			continue
+		}
+		for _, call := range calls {
+			if call.ScriptInput {
+				t.Errorf("%q: no-exec shell marked ScriptInput: %#v", command, call)
+			}
+		}
+	}
+	for _, command := range []string{
+		`echo k | bash -s arg`,
+		`if true; then echo k | bash; fi`,
+		`( echo k | bash )`,
+		`for i in 1; do echo k | bash; done`,
+		`f() { echo k | bash; }`,
+		`x=$(echo k | bash)`,
+		`bash < <(echo k)`,
+		`echo k | sudo bash`,
+		`echo k | timeout 5 sh`,
+		`bash -c 'source <(echo k)'`,
+	} {
+		calls, err = Calls(command)
+		if err != nil {
+			t.Errorf("%q: %v", command, err)
+			continue
+		}
+		found := false
+		for _, call := range calls {
+			found = found || call.ScriptInput
+		}
+		if !found {
+			t.Errorf("%q: no nested ScriptInput: %#v", command, calls)
+		}
+	}
+	calls, err = Calls("echo done\nbash <<< 'kill 1'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "kill" && call.Line != 2 {
+			t.Errorf("here-string Line = %d, want 2", call.Line)
+		}
+	}
+}
+
+func TestScriptOptionsDoNotPanic(t *testing.T) {
+	for _, command := range []string{`script -c`, `script -qc`, `script --force`, `x=1; script --force > /dev/null`} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Errorf("%q: %v", command, err)
+		}
+		for _, call := range calls {
+			if call.Name == "kill" || call.Name == "pkill" {
+				t.Errorf("%q: unexpected signal call %#v", command, call)
+			}
+		}
+	}
+}
+
+func TestWrapperCallsAreRetained(t *testing.T) {
+	for _, tt := range []struct {
+		command, name string
+		via           []string
+	}{
+		{`sudo su -c 'pkill -u u1'`, "su", []string{"sudo"}},
+		{`flock /tmp/x bash -c 'kill 1'`, "bash", []string{"flock"}},
+	} {
+		calls, err := Calls(tt.command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == tt.name && reflect.DeepEqual(call.Via, tt.via) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%q: no %s via %q: %#v", tt.command, tt.name, tt.via, calls)
+		}
+	}
+}
+
+func TestNestedScriptDepthLimit(t *testing.T) {
+	script := strings.Repeat("eval ", 2000) + "kill 1"
+	calls, err := Calls(script)
+	var nested *NestedError
+	if !errors.As(err, &nested) {
+		t.Fatalf("deep eval did not return a depth error: calls=%d err=%v", len(calls), err)
 	}
 }
 

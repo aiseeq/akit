@@ -182,7 +182,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walk
 		loopCalls:       loopCallSet(file),
 		backgroundCalls: backgroundCallSet(file),
 		shellHdocs:      make(map[*syntax.Redirect]bool),
-		scriptInputs:    scriptInputSet(file),
+		scriptInputs:    scriptInputSet(file, src, vars),
 	}
 	syntax.Walk(file, func(node syntax.Node) bool {
 		stmt, ok := node.(*syntax.Stmt)
@@ -197,87 +197,102 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walk
 		}
 		return true
 	})
+	return info
+}
+
+func scriptInputSet(file *syntax.File, src string, vars map[string]string) map[*syntax.CallExpr]bool {
+	inputs := make(map[*syntax.CallExpr]bool)
 	syntax.Walk(file, func(node syntax.Node) bool {
-		call, ok := node.(*syntax.CallExpr)
-		if !ok || len(call.Args) == 0 {
-			return true
-		}
-		name, _ := wordValue(call.Args[0])
-		name = baseName(name)
-		if name == "source" || name == "." {
-			for _, arg := range call.Args[1:] {
-				syntax.Walk(arg, func(n syntax.Node) bool {
-					if _, ok := n.(*syntax.ProcSubst); ok {
-						info.scriptInputs[call] = true
-					}
-					return true
-				})
+		switch n := node.(type) {
+		case *syntax.BinaryCmd:
+			if strings.Contains(n.Op.String(), "|") {
+				markPipeline(n.Y, src, vars, inputs)
+			}
+		case *syntax.CallExpr:
+			if len(n.Args) == 0 {
+				return true
+			}
+			name, _ := wordValue(n.Args[0])
+			name = baseName(name)
+			if name == "source" || name == "." {
+				if hasProcessSubstitution(n.Args[1:]) {
+					inputs[n] = true
+				}
+			} else if hasProcessSubstitution(n.Args) && shellInputTarget(n, src, vars) {
+				inputs[n] = true
+			}
+		case *syntax.Stmt:
+			call, ok := n.Cmd.(*syntax.CallExpr)
+			if !ok || !shellInputTarget(call, src, vars) {
+				return true
+			}
+			for _, redir := range n.Redirs {
+				if redir.Op.String() == "<" && hasProcessSubstitution([]*syntax.Word{redir.Word}) {
+					inputs[call] = true
+				}
 			}
 		}
 		return true
 	})
-	return info
-}
-
-func scriptInputSet(file *syntax.File) map[*syntax.CallExpr]bool {
-	inputs := make(map[*syntax.CallExpr]bool)
-	var mark func(*syntax.Stmt)
-	mark = func(stmt *syntax.Stmt) {
-		if stmt == nil {
-			return
-		}
-		switch cmd := stmt.Cmd.(type) {
-		case *syntax.BinaryCmd:
-			if strings.Contains(cmd.Op.String(), "|") {
-				markPipeline(cmd.Y, inputs)
-			}
-			mark(cmd.X)
-			mark(cmd.Y)
-		case *syntax.CallExpr:
-			name := ""
-			if len(cmd.Args) > 0 {
-				name, _ = wordValue(cmd.Args[0])
-				name = baseName(name)
-			}
-			for _, arg := range cmd.Args {
-				syntax.Walk(arg, func(node syntax.Node) bool {
-					if _, ok := node.(*syntax.ProcSubst); ok && (isShell(name) || name == "source" || name == ".") {
-						inputs[cmd] = true
-					}
-					return true
-				})
-			}
-		}
-	}
-	for _, stmt := range file.Stmts {
-		mark(stmt)
-	}
 	return inputs
 }
 
-func markPipeline(stmt *syntax.Stmt, inputs map[*syntax.CallExpr]bool) {
+func markPipeline(stmt *syntax.Stmt, src string, vars map[string]string, inputs map[*syntax.CallExpr]bool) {
 	if stmt == nil {
 		return
 	}
 	syntax.Walk(stmt, func(node syntax.Node) bool {
 		call, ok := node.(*syntax.CallExpr)
-		if !ok || len(call.Args) == 0 {
-			return true
-		}
-		name, _ := wordValue(call.Args[0])
-		if !isShell(baseName(name)) {
-			return true
-		}
-		args := make([]string, len(call.Args)-1)
-		for i, arg := range call.Args[1:] {
-			args[i], _ = wordValue(arg)
-		}
-		operand, command, stdin := shellArgs(args)
-		if !command && (stdin || operand == len(args)) && !slices.Contains(args, "-n") {
+		if ok && shellInputTarget(call, src, vars) {
 			inputs[call] = true
 		}
 		return true
 	})
+}
+
+func hasProcessSubstitution(words []*syntax.Word) bool {
+	for _, word := range words {
+		found := false
+		syntax.Walk(word, func(node syntax.Node) bool {
+			if _, ok := node.(*syntax.ProcSubst); ok {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+	values, _ := words(call.Args, src, vars)
+	name, args := commandName(values[0]), values[1:]
+	for {
+		if isShell(name) {
+			operand, command, stdin := shellArgs(args)
+			if shellNoExec(args) || command {
+				return false
+			}
+			if stdin || operand == len(args) {
+				return true
+			}
+			if operand < len(args) && isShell(commandName(values[0])) && hasProcessSubstitution(call.Args[operand+1:operand+2]) {
+				return true
+			}
+			return false
+		}
+		wrapped, _, ok := unwrap(name, args)
+		if !ok {
+			return false
+		}
+		name, args = commandName(wrapped[0]), wrapped[1:]
+	}
 }
 
 type callWalker struct {
@@ -551,11 +566,30 @@ func isShell(name string) bool {
 
 // shellReadsHeredoc — оболочка читает heredoc как скрипт, если её stdin не заменён -c или файлом.
 func shellReadsHeredoc(args []string) bool {
-	if slices.Contains(args, "-n") {
+	if shellNoExec(args) {
 		return false
 	}
 	operand, command, stdin := shellArgs(args)
 	return !command && (stdin || operand == len(args))
+}
+
+func shellNoExec(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--" || args[i] == "-" {
+			return false
+		}
+		option, takesValue, _, _ := shellArgumentOption(args[i])
+		if !option {
+			return false
+		}
+		if args[i] == "--noexec" || args[i] == "--no-exec" || strings.HasPrefix(args[i], "-") && !strings.HasPrefix(args[i], "--") && strings.Contains(args[i][1:], "n") {
+			return true
+		}
+		if takesValue {
+			i++
+		}
+	}
+	return false
 }
 
 // shellArgs разбирает `bash [опции] [-c СКРИПТ | -s | ФАЙЛ] [аргументы]`: operand — индекс первого
@@ -582,7 +616,7 @@ func shellArgumentOption(arg string) (option, takesValue, stdin, command bool) {
 		return true, true, false, false
 	}
 	if strings.HasPrefix(arg, "--") {
-		return true, false, false, false
+		return true, false, false, arg == "--command"
 	}
 	if len(arg) < 2 || (arg[0] != '-' && arg[0] != '+') {
 		return false, false, false, false
@@ -613,9 +647,14 @@ type NestedError struct {
 func (e *NestedError) Error() string { return e.Err.Error() }
 func (e *NestedError) Unwrap() error { return e.Err }
 
+const maxNestedScripts = 32
+
 // parseNested добавляет вызовы скрипта src, который выполнит вложенная оболочка; pos[i] — смещение байта i
 // скрипта во внешнем тексте (-1 — такого байта нет).
 func parseNested(src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call) error {
+	if len(via) > maxNestedScripts {
+		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script depth exceeds %d", maxNestedScripts)}
+	}
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
@@ -1022,7 +1061,7 @@ func wordValue(w *syntax.Word) (string, bool) {
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background}, words: c.words[i:]}
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:]}
 }
 
 func (c cmd) via(more ...string) []string {
@@ -1037,7 +1076,7 @@ func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 	}
 	if nested, wrapperVia, ok := unwrap(c.call.Name, c.call.Args); ok {
 		if c.call.Name == "parallel" {
-			child := c.sub(1, c.via(wrapperVia...))
+			child := c.sub(wrapperStart("parallel", c.call.Args)+1, c.via(wrapperVia...))
 			child.call.Name, child.call.Args = nested[0], nested[1:]
 			return emit(child, lineBase, vars, calls)
 		}
@@ -1055,7 +1094,7 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 	switch {
 	case isShell(name):
 		operand, command, _ := shellArgs(args)
-		if command && operand < len(args) && c.words[operand+1].script != "" {
+		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
 			script := c.words[operand+1]
 			return parseNested(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
 		}
@@ -1097,124 +1136,276 @@ func scriptInvocation(name string, args []string) bool {
 	case "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux":
 		return true
 	}
-	return name == "env" && len(args) > 0 && (args[0] == "-S" || strings.HasPrefix(args[0], "-S") || strings.HasPrefix(args[0], "--split-string") || len(args[0]) > 2 && args[0][0] == '-' && args[0][1] != '-' && strings.Contains(args[0][1:], "S"))
+	_, ok := envSplitArg(args)
+	return name == "env" && ok
 }
 
 func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error {
-	name, args := c.call.Name, c.call.Args
-	if name == "env" {
-		return parseNested(envSplitString(args), nil, c.call.Line-1, c.via("env"), c.call.Loop, c.call.Background, vars, calls)
-	}
-	start, end, ok := scriptRange(name, args)
-	if !ok || start < 0 || start >= end {
-		return nil
-	}
-	script, ok := invocationWords(c, start, end)
+	script, ok := invocationScript(c)
 	if !ok {
 		return nil
 	}
-	return parseNested(script.String(), script.pos, c.call.Line-1, c.via(name), c.call.Loop, c.call.Background, vars, calls)
+	viaName := c.call.Name
+	return parseNested(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls)
 }
 
-func scriptRange(name string, args []string) (int, int, bool) {
-	end := len(args)
+type scriptArg struct {
+	index  int
+	offset int
+}
+
+func invocationScript(c cmd) (mapped, bool) {
+	name, args := c.call.Name, c.call.Args
 	switch name {
 	case "eval":
-		return 0, end, true
+		return mappedScriptWords(c, evalScriptArgs(args))
 	case "watch":
-		return watchScriptIndex(args), end, true
+		return mappedScriptWords(c, watchScriptArgs(args))
 	case "trap":
-		if len(args) == 0 || args[0] == "-p" || args[0] == "-" {
-			return -1, 0, false
+		return mappedScriptWords(c, trapScriptArgs(args))
+	case "su", "runuser", "flock", "script":
+		arg, ok := commandStringArg(name, args)
+		if ok {
+			return mappedScriptWords(c, []scriptArg{arg})
 		}
-		return 0, 1, true
-	case "su", "runuser", "flock":
-		return commandStringIndex(args), end, true
-	case "script":
-		start := scriptCommandIndex(args)
-		return start, start + 1, start >= 0
+	case "env":
+		arg, ok := envSplitArg(args)
+		if ok {
+			return mappedScriptWords(c, []scriptArg{arg})
+		}
 	case "tmux":
-		return tmuxScriptIndex(args), end, true
+		start := tmuxCommandStart(args)
+		if start < len(args) {
+			return mappedScriptWords(c, []scriptArg{{index: start}})
+		}
 	}
-	return -1, 0, false
+	return mapped{}, false
 }
 
-func watchScriptIndex(args []string) int {
-	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "-") {
-		if optionValue("watch", args[i]) && i+1 < len(args) {
-			i += 2
-		} else {
-			i++
+func evalScriptArgs(args []string) []scriptArg {
+	start := 0
+	if len(args) > 0 && args[0] == "--" {
+		start++
+	}
+	words := make([]scriptArg, 0, len(args)-start)
+	for i := start; i < len(args); i++ {
+		words = append(words, scriptArg{index: i})
+	}
+	return words
+}
+
+func watchScriptArgs(args []string) []scriptArg {
+	start := wrapperStart("watch", args)
+	if start >= len(args) {
+		return nil
+	}
+	end := start + 1
+	if hasOption("watch", args, "-x", "--exec") {
+		end = len(args)
+	}
+	words := make([]scriptArg, 0, end-start)
+	for i := start; i < end; i++ {
+		words = append(words, scriptArg{index: i})
+	}
+	return words
+}
+
+func trapScriptArgs(args []string) []scriptArg {
+	start := 0
+	if len(args) > 0 && args[0] == "--" {
+		start++
+	}
+	if start >= len(args) || args[start] == "-p" || args[start] == "-" {
+		return nil
+	}
+	return []scriptArg{{index: start}}
+}
+
+func mappedScriptWords(c cmd, words []scriptArg) (mapped, bool) {
+	if len(words) == 0 {
+		return mapped{}, false
+	}
+	var script mapped
+	for i, arg := range words {
+		if arg.index < 0 || arg.index+1 >= len(c.words) {
+			return mapped{}, false
 		}
+		w := c.words[arg.index+1]
+		if w.script == "" || arg.offset > len(w.script) {
+			return mapped{}, false
+		}
+		if i > 0 {
+			script.add(" ", -1)
+		}
+		script.text = append(script.text, w.script[arg.offset:]...)
+		script.pos = append(script.pos, w.pos[arg.offset:]...)
+	}
+	return script, true
+}
+
+func commandStringArg(name string, args []string) (scriptArg, bool) {
+	if name == "flock" {
+		lock := wrapperOptionEnd(name, args, 0)
+		if lock >= len(args) {
+			return scriptArg{}, false
+		}
+		return commandOptionAt(args, lock+1)
+	}
+	if name == "su" {
+		userSeen := false
+		for i := 0; i < len(args); {
+			if arg, ok := commandOptionAt(args, i); ok {
+				return arg, true
+			}
+			if args[i] == "--" {
+				return scriptArg{}, false
+			}
+			if strings.HasPrefix(args[i], "-") {
+				next := optionNext(name, args, i)
+				if next == i {
+					i++
+				} else {
+					i = next
+				}
+				continue
+			}
+			if userSeen {
+				return scriptArg{}, false
+			}
+			userSeen = true
+			i++ // su допускает имя пользователя перед ключами оболочки.
+		}
+		return scriptArg{}, false
+	}
+	for i := 0; i < len(args); {
+		if arg, ok := commandOptionAt(args, i); ok {
+			return arg, true
+		}
+		if args[i] == "--" {
+			return scriptArg{}, false
+		}
+		if !strings.HasPrefix(args[i], "-") {
+			return scriptArg{}, false
+		}
+		i = optionNext(name, args, i)
+	}
+	return scriptArg{}, false
+}
+
+func commandOptionAt(args []string, i int) (scriptArg, bool) {
+	if i >= len(args) {
+		return scriptArg{}, false
+	}
+	arg := args[i]
+	if strings.HasPrefix(arg, "--command=") {
+		return scriptArg{index: i, offset: len("--command=")}, true
+	}
+	if arg == "-c" || arg == "--command" {
+		if i+1 < len(args) {
+			return scriptArg{index: i + 1}, true
+		}
+		return scriptArg{}, false
+	}
+	if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") {
+		if j := strings.IndexByte(arg[1:], 'c'); j >= 0 {
+			pos := j + 1
+			if pos+1 < len(arg) {
+				return scriptArg{index: i, offset: pos + 1}, true
+			}
+			if i+1 < len(args) {
+				return scriptArg{index: i + 1}, true
+			}
+		}
+	}
+	return scriptArg{}, false
+}
+
+func envSplitArg(args []string) (scriptArg, bool) {
+	for i := 0; i < len(args); {
+		arg := args[i]
+		if after, ok := strings.CutPrefix(arg, "--split-string="); ok {
+			return scriptArg{index: i, offset: len(arg) - len(after)}, true
+		}
+		if arg == "-S" || arg == "--split-string" {
+			if i+1 < len(args) {
+				return scriptArg{index: i + 1}, true
+			}
+			return scriptArg{}, false
+		}
+		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") {
+			if j := strings.IndexByte(arg[1:], 'S'); j >= 0 {
+				pos := j + 1
+				if pos+1 < len(arg) {
+					return scriptArg{index: i, offset: pos + 1}, true
+				}
+				if i+1 < len(args) {
+					return scriptArg{index: i + 1}, true
+				}
+			}
+		}
+		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
+			return scriptArg{}, false
+		}
+		i = optionNext("env", args, i)
+	}
+	return scriptArg{}, false
+}
+
+func tmuxCommandStart(args []string) int {
+	for i := 0; i < len(args); {
+		arg := args[i]
+		if arg == "new-session" || arg == "new" {
+			return wrapperOptionEnd("tmux", args, i+1)
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			next := wrapperOptionEnd("tmux", args, i)
+			if next == i {
+				i++
+			} else {
+				i = next
+			}
+			continue
+		}
+		i++
+	}
+	return len(args)
+}
+
+func wrapperOptionEnd(name string, args []string, start int) int {
+	i := start
+	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" {
+		i = optionNext(name, args, i)
 	}
 	return i
 }
 
-func commandStringIndex(args []string) int {
-	for i, arg := range args {
-		if arg == "-c" || arg == "--command" {
+func optionNext(name string, args []string, i int) int {
+	if i >= len(args) {
+		return i
+	}
+	arg := args[i]
+	if arg == "--" {
+		return i + 1
+	}
+	if !strings.HasPrefix(arg, "-") || arg == "-" {
+		return i
+	}
+	if strings.HasPrefix(arg, "--") {
+		key, _, hasValue := strings.Cut(arg, "=")
+		if !hasValue && valueOptions[name][key] && i+1 < len(args) {
+			return i + 2
+		}
+		return i + 1
+	}
+	for j := 1; j < len(arg); j++ {
+		if valueOptions[name]["-"+arg[j:j+1]] {
+			if j == len(arg)-1 && i+1 < len(args) {
+				return i + 2
+			}
 			return i + 1
 		}
-		if strings.HasPrefix(arg, "-c") && arg != "-c" {
-			return i
-		}
 	}
-	return -1
-}
-
-func scriptCommandIndex(args []string) int {
-	for i, arg := range args {
-		if strings.HasPrefix(arg, "-") && strings.Contains(arg, "c") {
-			return i + 1
-		}
-	}
-	return -1
-}
-
-func tmuxScriptIndex(args []string) int {
-	start := -1
-	for i, arg := range args {
-		if arg == "new-session" || arg == "new" {
-			start = i + 1
-			break
-		}
-	}
-	for start >= 0 && start < len(args) && strings.HasPrefix(args[start], "-") {
-		if slices.Contains([]string{"-c", "-s", "-t", "-n", "-x", "-y"}, args[start]) {
-			start++
-		}
-		start++
-	}
-	return start
-}
-
-func envSplitString(args []string) string {
-	if after, ok := strings.CutPrefix(args[0], "--split-string="); ok {
-		return after
-	}
-	if args[0] == "-S" || len(args[0]) > 2 && args[0][0] == '-' && args[0][1] != '-' && strings.Contains(args[0][1:], "S") {
-		if len(args) > 1 {
-			return args[1]
-		}
-		return ""
-	}
-	return strings.TrimPrefix(args[0], "-S")
-}
-
-func invocationWords(c cmd, start, end int) (mapped, bool) {
-	var script mapped
-	for i := start; i < end; i++ {
-		if c.words[i+1].script == "" {
-			return mapped{}, false
-		}
-		if i > start {
-			script.add(" ", -1)
-		}
-		script.text = append(script.text, c.words[i+1].script...)
-		script.pos = append(script.pos, c.words[i+1].pos...)
-	}
-	return script, true
+	return i + 1
 }
 
 func expandFind(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
@@ -1299,6 +1490,9 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 	var via []string
 	for wrappers[name] {
 		if wrapperRunsScript(name, args) {
+			if len(via) > 0 {
+				return append([]string{name}, args...), via, true
+			}
 			return nil, via, false
 		}
 		via = append(via, name)
@@ -1315,22 +1509,32 @@ func unwrap(name string, args []string) ([]string, []string, bool) {
 }
 
 func wrapperRunsScript(name string, args []string) bool {
-	if name == "env" && len(args) > 0 && scriptInvocation(name, args) {
-		return true
+	switch name {
+	case "env":
+		_, ok := envSplitArg(args)
+		return ok
+	case "su", "runuser", "flock":
+		_, ok := commandStringArg(name, args)
+		return ok
 	}
-	return (name == "su" || name == "runuser" || name == "flock") && slices.Contains(args, "-c")
+	return false
 }
 
 func unwrapOnce(name string, args []string) ([]string, bool) {
 	if name == "parallel" {
-		marker := slices.Index(args, ":::")
+		start := wrapperOptionEnd(name, args, 0)
+		marker := slices.Index(args[start:], ":::")
 		if marker < 0 {
-			marker = slices.Index(args, "::::")
+			marker = slices.Index(args[start:], "::::")
 		}
-		if marker < 0 || marker == 0 {
+		if marker < 0 {
 			return nil, false
 		}
-		return append([]string{args[0]}, append(slices.Clone(args[marker+1:]), args[1:marker]...)...), true
+		marker += start
+		if marker == start {
+			return nil, false
+		}
+		return append(slices.Clone(args[start:marker]), args[marker+1:]...), true
 	}
 	if name == "command" && commandIsLookup(args) {
 		return nil, false
@@ -1349,34 +1553,32 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 }
 
 func wrapperStart(name string, args []string) int {
-	i := 0
-	if name == "flock" {
-		for i < len(args) && strings.HasPrefix(args[i], "-") {
-			if optionValue(name, args[i]) && i+1 < len(args) {
-				i += 2
-			} else {
-				i++
-			}
-		}
-		if i < len(args) && args[i] != "--" {
+	i := wrapperOptionEnd(name, args, 0)
+	switch name {
+	case "taskset":
+		if !hasOption(name, args, "-c", "--cpu-list") && i < len(args) {
 			i++
 		}
-		return i
-	}
-	if name == "busybox" {
-		return i
-	}
-	for i < len(args) && strings.HasPrefix(args[i], "-") {
-		if args[i] == "--" {
-			return i + 1
-		}
-		if optionValue(name, args[i]) && i+1 < len(args) {
-			i += 2
-		} else {
+	case "chrt", "flock":
+		if i < len(args) && args[i] != "--" {
 			i++
 		}
 	}
 	return i
+}
+
+func hasOption(name string, args []string, options ...string) bool {
+	for i := 0; i < len(args); {
+		if slices.Contains(options, args[i]) {
+			return true
+		}
+		next := wrapperOptionEnd(name, args, i)
+		if next == i {
+			break
+		}
+		i = next
+	}
+	return false
 }
 
 // commandIsLookup — `command -v X`/`-V X`: ключи до имени программы ищут её, а не запускают.
@@ -1398,7 +1600,7 @@ var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf"
 // valueOptions — опции обёрток и ssh, следующее слово после которых — их значение, а не программа.
 var valueOptions = map[string]map[string]bool{
 	"timeout":     set("-s", "--signal", "-k", "--kill-after"),
-	"env":         set("-u", "--unset", "-C", "--chdir"),
+	"env":         set("-u", "--unset", "-C", "--chdir", "-S", "--split-string"),
 	"sudo":        set("-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user"),
 	"nice":        set("-n", "--adjustment"),
 	"ionice":      set("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"),
@@ -1407,17 +1609,20 @@ var valueOptions = map[string]map[string]bool{
 	"exec":        set("-a"),
 	"xargs":       set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"),
 	"ssh":         set("-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"),
-	"taskset":     set("-c", "--cpu-list", "-p"),
-	"chrt":        set("-o", "-f", "-r", "-d", "-i", "-p", "--pid", "--max", "--sched-period", "--sched-runtime", "--sched-deadline"),
-	"strace":      set("-o", "-e", "-p", "-u", "-s", "-T", "-D", "-O", "-I"),
+	"taskset":     set("-c", "--cpu-list", "-p", "--pid"),
+	"chrt":        set("-p", "--pid", "--sched-period", "--sched-runtime", "--sched-deadline"),
+	"strace":      set("-o", "-e", "-p", "-u", "-s", "-O", "-I", "-E", "-P", "-a", "-S", "-X", "-b"),
 	"setpriv":     set("--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig"),
-	"unshare":     set("--map-user", "--map-group", "--propagation"),
-	"flock":       set("-E", "-o", "-c", "-F", "-w"),
-	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--same-dir", "--service-type"),
+	"unshare":     set("-S", "-G", "-R", "-w", "--setuid", "--setgid", "--root", "--wd", "--map-user", "--map-group", "--mount-proc", "--propagation"),
+	"flock":       set("-E", "-w"),
+	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--nice"),
 	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "-s", "--shell", "-w", "--whitelist-environment"),
 	"su":          set("-c", "--command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
 	"doas":        set("-u", "-C", "-s"),
-	"watch":       set("-n", "--interval", "-d", "--differences", "-t", "-p", "-g", "--chgexit", "-x", "--exec"),
+	"watch":       set("-n", "--interval"),
+	"script":      set("-c", "--command", "--echo"),
+	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin"),
+	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y"),
 }
 
 func set(items ...string) map[string]bool {
