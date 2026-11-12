@@ -57,12 +57,11 @@ func TestFindNestedDepthGrowth(t *testing.T) {
 		var calls []Call
 		budget := newNestedParseBudget(len(src))
 		budget.trackWork = true
-		budget.wanted = map[string]bool{"kill": true}
 		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
 			t.Fatal(err)
 		}
-		if len(calls) != 1 || calls[0].Name != "kill" {
-			t.Fatalf("Find returned %#v", calls)
+		if kills := callsNamed(calls, "kill"); kills != 1 {
+			t.Fatalf("Calls returned %d kill calls: %#v", kills, calls)
 		}
 		return budget.parsedBytes
 	}
@@ -79,12 +78,11 @@ func TestFindNestedSubstitutionParseBytesGrowLinearly(t *testing.T) {
 		var calls []Call
 		budget := newNestedParseBudget(len(src))
 		budget.trackWork = true
-		budget.wanted = map[string]bool{"kill": true}
 		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
 			t.Fatal(err)
 		}
-		if len(calls) != 20 {
-			t.Fatalf("got %d kill calls, want 20", len(calls))
+		if kills := callsNamed(calls, "kill"); kills != 20 {
+			t.Fatalf("got %d kill calls, want 20", kills)
 		}
 		return budget.parsedBytes
 	}
@@ -105,12 +103,11 @@ func TestFindWalkInfoNodeWorkGrowsLinearly(t *testing.T) {
 		var calls []Call
 		budget := newNestedParseBudget(len(src))
 		budget.trackWork = true
-		budget.wanted = map[string]bool{"kill": true}
 		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
 			t.Fatal(err)
 		}
-		if len(calls) != 20 {
-			t.Fatalf("got %d kill calls, want 20", len(calls))
+		if kills := callsNamed(calls, "kill"); kills != 20 {
+			t.Fatalf("got %d kill calls, want 20", kills)
 		}
 		return nodeCounts{walker: budget.visitedNodes, info: budget.walkInfoNodes}
 	}
@@ -2091,5 +2088,40 @@ func TestShadowedByFunction(t *testing.T) {
 	}
 	if _, err := (Call{Name: "w"}).ShadowedByFunction("w() {"); err == nil {
 		t.Error("unparsable command: no error")
+	}
+}
+
+func callsNamed(calls []Call, name string) int {
+	n := 0
+	for _, call := range calls {
+		if call.Name == name {
+			n++
+		}
+	}
+	return n
+}
+
+func TestCallSetKeepsSameCallWithDifferentVia(t *testing.T) {
+	seen := newCallSet()
+	base := Call{Name: "kill", Args: []string{"-9", "1234"}, Offset: 7}
+	direct, viaSudo, viaNice := base, base, base
+	viaSudo.Via = []string{"sudo"}
+	viaNice.Via = []string{"nice"}
+	for _, call := range []Call{direct, viaSudo, viaNice} {
+		if seen.hasExact(call) {
+			t.Fatalf("%v reported seen before add", call.Via)
+		}
+		seen.add(call)
+		if !seen.hasExact(call) {
+			t.Fatalf("%v not seen after add", call.Via)
+		}
+	}
+	seen.add(viaNice)
+	key, _ := callBaseIdentity(base)
+	if got := len(seen.more[key]); got != 2 {
+		t.Fatalf("calls with the same identity kept beyond the first: %d, want 2 (sudo and nice once each)", got)
+	}
+	if !seen.hasBase(Call{Name: "kill", Args: []string{"-9", "1234"}, Offset: 7, Via: []string{"timeout"}}) {
+		t.Fatal("same name, args and offset with another Via not found by base identity")
 	}
 }

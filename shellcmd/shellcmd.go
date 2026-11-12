@@ -101,7 +101,6 @@ func Find(cmd string, names ...string) ([]Call, error) {
 type nestedParseBudget struct {
 	used          int
 	limit         int
-	wanted        map[string]bool
 	parsedBytes   int
 	visitedNodes  int
 	walkInfoNodes int
@@ -614,9 +613,6 @@ func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
 }
 
 func (w *callWalker) addTime(clause *syntax.TimeClause) {
-	if w.budget != nil && w.budget.wanted != nil && !w.budget.wanted["time"] {
-		return
-	}
 	start, end := int(clause.Pos().Offset()), int(clause.End().Offset())
 	if !validSpan(w.src, start, end) {
 		w.parseErr = fmt.Errorf("shellcmd: invalid source span for time clause")
@@ -1481,11 +1477,7 @@ func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *call
 	if len(c.call.Via) > maxNestedScripts {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: nested execution depth exceeds %d", maxNestedScripts)}
 	}
-	if c.budget.wanted == nil || c.budget.wanted[c.call.Name] {
-		appendCall(seen, calls, c.call)
-	} else if !seen.hasExact(c.call) {
-		markCall(seen, c.call)
-	}
+	appendCall(seen, calls, c.call)
 
 	if err := emitExpanded(c, lineBase, vars, calls, seen); err != nil {
 		return err
