@@ -36,8 +36,9 @@ type Call struct {
 
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
 type cmd struct {
-	call  Call
-	words []word
+	call   Call
+	words  []word
+	budget *nestedParseBudget
 }
 
 // word — место слова в исходной команде и его текст как скрипта.
@@ -96,13 +97,27 @@ func Find(cmd string, names ...string) ([]Call, error) {
 	return filtered, err
 }
 
+type nestedParseBudget struct {
+	used  int
+	limit int
+}
+
+func newNestedParseBudget(inputSize int) *nestedParseBudget {
+	limit := max(inputSize*3, 4096)
+	return &nestedParseBudget{limit: limit}
+}
+
 func parse(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
+	return parseWithBudget(src, lineBase, inherited, vars, calls, newNestedParseBudget(len(src)))
+}
+
+func parseWithBudget(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	file, full, err := parseShell(src)
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
 	first := len(*calls)
-	err = walkCalls(file, full, lineBase, inherited, vars, calls)
+	err = walkCalls(file, full, lineBase, inherited, vars, calls, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -155,26 +170,40 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 	return nil, full, err
 }
 
-func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
+func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars)
-	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, info: info}
+	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: make(map[string]bool), budget: budget, info: info}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
 	}
-	if len(walker.nestedErrs) > 0 {
-		return errors.Join(walker.nestedErrs...)
+	nestedErrs := walker.nestedErrs
+	if err := parseHeredocStmts(info.shellInputs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls, budget); err != nil {
+		nestedErrs = append(nestedErrs, err)
 	}
-	if err := parseHeredocStmts(info.shellInputs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls); err != nil {
-		walker.nestedErrs = append(walker.nestedErrs, err)
+	if err := parsePipedHeredocs(info.pipedHeredocs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls, budget); err != nil {
+		nestedErrs = append(nestedErrs, err)
 	}
-	if len(walker.nestedErrs) > 0 {
-		return errors.Join(walker.nestedErrs...)
+	*calls = append((*calls)[:baseCalls], dedupeCalls((*calls)[baseCalls:], walker.seen)...)
+	return errors.Join(nestedErrs...)
+}
+
+func dedupeCalls(calls []Call, seen map[string]bool) []Call {
+	clear(seen)
+	write := 0
+	for _, call := range calls {
+		key, ok := callKeyOf(call)
+		if ok && seen[key] {
+			continue
+		}
+		if ok {
+			seen[key] = true
+		}
+		calls[write] = call
+		write++
 	}
-	if err := parsePipedHeredocs(info.pipedHeredocs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls); err != nil {
-		walker.nestedErrs = append(walker.nestedErrs, err)
-	}
-	return errors.Join(walker.nestedErrs...)
+	return calls[:write]
 }
 
 type walkInfo struct {
@@ -312,6 +341,16 @@ func pipedShellName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 			name, args = commandName(target[0]), target[1:]
 			continue
 		}
+		if name == "sudo" && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+			return "bash", append(via, "sudo"), true
+		}
+		if wrappers[name] {
+			if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
+				via = append(via, name)
+				name, args = commandName(wrapped[0]), wrapped[1:]
+				continue
+			}
+		}
 		wrapped, wrapperVia, ok := unwrap(name, args)
 		if !ok {
 			return "", nil, false
@@ -418,6 +457,13 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 			name, args = commandName(target[0]), target[1:]
 			continue
 		}
+		if wrappers[name] {
+			if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
+				argOffset += len(args) - len(wrapped) + 1
+				name, args = commandName(wrapped[0]), wrapped[1:]
+				continue
+			}
+		}
 		wrapped, _, ok := unwrap(name, args)
 		if !ok {
 			return false
@@ -434,6 +480,8 @@ type callWalker struct {
 	vars       map[string]string
 	calls      *[]Call
 	info       walkInfo
+	seen       map[string]bool
+	budget     *nestedParseBudget
 	parseErr   error
 	nestedErrs []error
 }
@@ -503,12 +551,8 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		via = append(via, "time")
 	}
 	ws := splitWords(cmdWords(call.Args, w.src), split)
-	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws}
-	if len(w.nestedErrs) > 0 {
-		*w.calls = append(*w.calls, c.call)
-		return
-	}
-	if err := emit(c, w.lineBase, w.vars, w.calls); err != nil {
+	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget}
+	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
 		if errors.As(err, &nested) {
 			w.nestedErrs = append(w.nestedErrs, err)
@@ -617,7 +661,7 @@ func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
 }
 
-func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call) error {
+func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
 	var nestedErrs []error
 	for _, stmt := range stmts {
 		name, shellVia, ok := shellInputName(stmt, src, vars)
@@ -642,7 +686,7 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 			if redir.Hdoc != nil {
 				line = int(redir.Hdoc.Pos().Line()) + lineBase - 1
 			}
-			if err := parseNested(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls); err != nil {
+			if err := parseNestedWithBudget(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
 				nestedErrs = append(nestedErrs, err)
 			}
 		}
@@ -650,7 +694,7 @@ func parseHeredocStmts(stmts []*syntax.Stmt, src string, lineBase int, inherited
 	return errors.Join(nestedErrs...)
 }
 
-func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call) error {
+func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
 	var nestedErrs []error
 	for _, input := range piped {
 		redir := input.redir
@@ -660,7 +704,7 @@ func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherite
 		via = append(via, input.name)
 		call, _ := input.shell.Cmd.(*syntax.CallExpr)
 		first := len(*calls)
-		err := parseNested(body.String(), body.pos, lineBase, via, loopCalls[call], backgroundCalls[call], vars, calls)
+		err := parseNestedWithBudget(body.String(), body.pos, lineBase, via, loopCalls[call], backgroundCalls[call], vars, calls, budget)
 		for i := first; i < len(*calls); i++ {
 			offset := (*calls)[i].Offset
 			if validSpan(src, offset, offset) {
@@ -766,6 +810,16 @@ func shellInputForShell(name string, args []string, redirs []*syntax.Redirect, v
 func nextShellInputTarget(name string, args []string, via []string) (string, []string, []string, bool) {
 	if target, ok := execTarget(args); ok {
 		return commandName(target[0]), target[1:], append(via, name, "exec"), true
+	}
+	if wrappers[name] {
+		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
+			if !isShell(commandName(wrapped[0])) {
+				if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(target[1:]) {
+					return baseName(target[0]), target[1:], append(append(via, fallbackVia...), name), true
+				}
+			}
+			return commandName(wrapped[0]), wrapped[1:], append(via, name), true
+		}
 	}
 	wrapped, wrapperVia, ok := unwrap(name, args)
 	if ok {
@@ -873,20 +927,32 @@ func (e *NestedError) Error() string { return e.Err.Error() }
 func (e *NestedError) Unwrap() error { return e.Err }
 
 const maxNestedScripts = 32
+const maxNestedScriptBytes = 1 << 20
 
 // parseNested добавляет вызовы скрипта src, который выполнит вложенная оболочка; pos[i] — смещение байта i
 // скрипта во внешнем тексте (-1 — такого байта нет).
 func parseNested(src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call) error {
+	return parseNestedWithBudget(src, pos, lineBase, via, inLoop, inBackground, vars, calls, newNestedParseBudget(len(src)))
+}
+
+func parseNestedWithBudget(src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	if len(via) > maxNestedScripts {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script depth exceeds %d", maxNestedScripts)}
 	}
-	if len(via) > 0 && len(src) > 0 && len(via)*len(src) > 512*1024 {
-		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script parse budget exceeded")}
+	if len(src) > maxNestedScriptBytes {
+		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script exceeds %d bytes", maxNestedScriptBytes)}
 	}
+	if budget == nil {
+		budget = newNestedParseBudget(len(src))
+	}
+	if len(src) > budget.limit-budget.used {
+		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested parse budget exceeds %d bytes", budget.limit)}
+	}
+	budget.used += len(src)
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
-	err := parse(src, lineBase, via, nestedVars, &nestedCalls)
+	err := parseWithBudget(src, lineBase, via, nestedVars, &nestedCalls, budget)
 	if err != nil {
 		var nestedErr *NestedError
 		if !errors.As(err, &nestedErr) {
@@ -1289,125 +1355,254 @@ func wordValue(w *syntax.Word) (string, bool) {
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:]}
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget}
 }
 
 func (c cmd) via(more ...string) []string {
 	return append(slices.Clone(c.call.Via), more...)
 }
 
-// emit adds calls from precise expansion and the permissive baseline walk.
-func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
+// emit записывает вызовы точного разбора и совместимого с прежней версией обхода.
+func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
 	if len(c.call.Via) > maxNestedScripts {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: nested execution depth exceeds %d", maxNestedScripts)}
 	}
-	*calls = append(*calls, c.call)
-	var expanded []Call
-	if err := expand(c, lineBase, vars, &expanded); err != nil {
-		*calls = append(*calls, expanded...)
+	appendCall(seen, calls, c.call)
+	if err := emitExpanded(c, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
-	*calls = append(*calls, expanded...)
-	seen := callKeys(*calls)
+	return emitCompatibleRoutes(c, lineBase, vars, calls, seen)
+}
+
+func emitExpanded(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
+	start := len(*calls)
+	err := expand(c, lineBase, vars, calls, seen)
+	markCalls(seen, (*calls)[start:])
+	return err
+}
+
+func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
 	name, args := c.call.Name, c.call.Args
+	if err := emitShellInputTarget(c, lineBase, vars, calls, seen); err != nil {
+		return err
+	}
+	emitUnknownWrapperCandidates(c, name, args, calls, seen)
 	exact, exactVia, exactOK := unwrap(name, args)
 	exactStart := -1
 	if exactOK {
 		exactStart = wrapperTargetStart(c, exact, exactVia)
 	}
 	main, mainVia, mainOK := unwrapMain(name, args)
-	if name == "taskset" && hasOption(name, args, "-p", "--pid") {
+	if mainOK && exactOK && len(c.words)-len(main) == exactStart {
 		mainOK = false
 	}
-	mainStart := -1
-	if mainOK {
-		mainStart = len(c.words) - len(main)
-	}
-
-	if route, err := genericShellRoute(c, name, args, lineBase, vars); err != nil {
-		addCallRoute(calls, route, seen)
+	if err := emitGenericShellTarget(c, name, args, exactStart, lineBase, vars, calls, seen); err != nil {
 		return err
-	} else {
-		addCallRoute(calls, route, seen)
 	}
-	if exactOK {
-		route, err := exactWrapperRoute(c, exactStart, exactVia, lineBase, vars)
-		addCallRoute(calls, route, seen)
-		if err != nil {
-			return err
-		}
+	if err := emitExactWrapperTarget(c, exactOK, exactStart, exactVia, lineBase, vars, calls, seen); err != nil {
+		return err
 	}
-	if mainOK && (!exactOK || mainStart != exactStart) {
-		route, err := emitRoute(c.sub(mainStart, c.via(mainVia...)), lineBase, vars)
-		addCallRoute(calls, route, seen)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return emitMainTarget(c, main, mainVia, mainOK, lineBase, vars, calls, seen)
 }
 
-func addCallRoute(calls *[]Call, route []Call, seen map[string]bool) {
-	base := maps.Clone(seen)
-	for _, call := range route {
-		key, ok := callKeyOf(call)
-		if !ok || !base[key] {
-			*calls = append(*calls, call)
-		}
+func emitShellInputTarget(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
+	if !c.call.ScriptInput {
+		return nil
 	}
-	for _, call := range route {
-		if key, ok := callKeyOf(call); ok {
-			seen[key] = true
-		}
+	target, ok := sudoShellTarget(c)
+	if !ok {
+		return nil
+	}
+	return emit(target, lineBase, vars, calls, seen)
+}
+
+func emitUnknownWrapperCandidates(c cmd, name string, args []string, calls *[]Call, seen map[string]bool) {
+	index, ok := unknownWrapperOption(name, args)
+	if !ok {
+		return
+	}
+	for i := index + 1; i < len(args); i++ {
+		appendCall(seen, calls, c.sub(i+1, c.via(name)).call)
 	}
 }
 
-func emitRoute(c cmd, lineBase int, vars map[string]string) ([]Call, error) {
-	var route []Call
-	err := emit(c, lineBase, vars, &route)
-	return route, err
+func emitGenericShellTarget(c cmd, name string, args []string, exactStart, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
+	route, ok := genericShellTarget(c, name, args, exactStart)
+	if !ok {
+		return nil
+	}
+	return emit(route, lineBase, vars, calls, seen)
 }
 
-func genericShellRoute(c cmd, name string, args []string, lineBase int, vars map[string]string) ([]Call, error) {
+func emitExactWrapperTarget(c cmd, exactOK bool, start int, via []string, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
+	if !exactOK {
+		return nil
+	}
+	child, ok := exactWrapperTarget(c, start, via)
+	if !ok {
+		return nil
+	}
+	return emit(child, lineBase, vars, calls, seen)
+}
+
+func emitMainTarget(c cmd, main []string, via []string, ok bool, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
+	if !ok {
+		return nil
+	}
+	start := len(c.words) - len(main)
+	candidate := c.sub(start, c.via(via...))
+	if key, exists := callKeyBase(candidate.call); exists && seen[key] {
+		return nil
+	}
+	return emit(candidate, lineBase, vars, calls, seen)
+}
+
+func appendCall(seen map[string]bool, calls *[]Call, call Call) {
+	if key, ok := callKeyOf(call); ok {
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+	}
+	if key, ok := callKeyBase(call); ok {
+		seen[key] = true
+	}
+	*calls = append(*calls, call)
+}
+
+func markCall(seen map[string]bool, call Call) {
+	if key, ok := callKeyOf(call); ok {
+		seen[key] = true
+	}
+	if key, ok := callKeyBase(call); ok {
+		seen[key] = true
+	}
+}
+
+func markCalls(seen map[string]bool, calls []Call) {
+	for _, call := range calls {
+		markCall(seen, call)
+	}
+}
+
+func genericShellTarget(c cmd, name string, args []string, exactStart int) (cmd, bool) {
 	if isShell(name) || name == "ssh" || dataArgs[name] || baselineWrapper(name) {
-		return nil, nil
+		return cmd{}, false
 	}
 	if _, ok := execTarget(args); ok {
-		return nil, nil
+		return cmd{}, false
 	}
 	index := mainShellArgIndex(args)
 	if index < 0 {
-		return nil, nil
+		return cmd{}, false
 	}
-	return emitRoute(c.sub(index+1, c.via(name)), lineBase, vars)
+	if exactStart >= 0 && index+1 == exactStart {
+		return cmd{}, false
+	}
+	return c.sub(index+1, c.via(name)), true
 }
 
-func exactWrapperRoute(c cmd, start int, via []string, lineBase int, vars map[string]string) ([]Call, error) {
+func exactWrapperTarget(c cmd, start int, via []string) (cmd, bool) {
 	if slices.Contains(via, "parallel") {
-		child, ok := parallelChild(c, via)
-		if !ok {
-			return nil, nil
-		}
-		return emitRoute(child, lineBase, vars)
+		return parallelChild(c, via)
 	}
-	return emitRoute(c.sub(start, c.via(via...)), lineBase, vars)
+	return c.sub(start, c.via(via...)), true
 }
 
-func callKeyOf(call Call) (string, bool) {
+func sudoShellTarget(c cmd) (cmd, bool) {
+	name, args := c.call.Name, c.call.Args
+	argStart := 0
+	peeled := false
+	via := slices.Clone(c.call.Via)
+	for {
+		if name == "sudo" && peeled && hasOption(name, args, "-s", "--shell", "-i", "--login") {
+			return c.sub(argStart+1, append(via, "sudo")), true
+		}
+		if !wrappers[name] {
+			return cmd{}, false
+		}
+		wrapped, ok := unwrapOnce(name, args)
+		if !ok || len(wrapped) == 0 {
+			return cmd{}, false
+		}
+		argStart += len(args) - len(wrapped)
+		peeled = true
+		via = append(via, name)
+		name, args = commandName(wrapped[0]), wrapped[1:]
+	}
+}
+
+func unknownWrapperOption(name string, args []string) (int, bool) {
+	if name == "command" && commandIsLookup(args) {
+		return 0, false
+	}
+	if !wrappers[name] && name != "watch" && name != "tmux" && name != "script" {
+		return 0, false
+	}
+	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-"; {
+		next, unknown := wrapperOptionStep(name, args, i)
+		if unknown {
+			return i, true
+		}
+		if next <= i {
+			i++
+		} else {
+			i = next
+		}
+	}
+	return 0, false
+}
+
+func wrapperOptionStep(name string, args []string, i int) (int, bool) {
+	arg := args[i]
+	if arg == "--" {
+		return len(args), false
+	}
+	if strings.HasPrefix(arg, "--") {
+		return longWrapperOptionStep(name, args, i)
+	}
+	return shortWrapperOptionStep(name, args, i)
+}
+
+func longWrapperOptionStep(name string, args []string, i int) (int, bool) {
+	key, _, attached := strings.Cut(args[i], "=")
+	if !valueOptions[name][key] && !flagOptions[name][key] {
+		return i, true
+	}
+	if valueOptions[name][key] && !attached && i+1 < len(args) {
+		return i + 2, false
+	}
+	return i + 1, false
+}
+
+func shortWrapperOptionStep(name string, args []string, i int) (int, bool) {
+	for j := 1; j < len(args[i]); j++ {
+		key, takesValue := shortOptionAt(name, args[i], j)
+		if !valueOptions[name][key] && !flagOptions[name][key] {
+			return i, true
+		}
+		if takesValue {
+			if j == len(args[i])-1 && i+1 < len(args) {
+				return i + 2, false
+			}
+			return i + 1, false
+		}
+	}
+	return i + 1, false
+}
+
+func callKeyBase(call Call) (string, bool) {
 	if call.Offset < 0 {
 		return "", false
 	}
 	return call.Name + "\x00" + strconv.Itoa(call.Offset) + "\x00" + strings.Join(call.Args, "\x00"), true
 }
 
-func callKeys(calls []Call) map[string]bool {
-	keys := make(map[string]bool, len(calls))
-	for _, call := range calls {
-		if key, ok := callKeyOf(call); ok {
-			keys[key] = true
-		}
+func callKeyOf(call Call) (string, bool) {
+	if call.Offset < 0 {
+		return "", false
 	}
-	return keys
+	return call.Name + "\x00" + strconv.Itoa(call.Offset) + "\x00" + strings.Join(call.Args, "\x00") + "\x00" + strings.Join(call.Via, "\x00"), true
 }
 
 func wrapperTargetStart(c cmd, target, via []string) int {
@@ -1541,7 +1736,7 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 	}
 	child := cmd{call: Call{Name: commandName(parallelArgs[start]), Args: args, Raw: c.call.Raw, Line: c.call.Line,
 		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
-		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words}
+		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget}
 	return child, true
 }
 
@@ -1556,17 +1751,17 @@ func parallelCommandStart(args []string) (int, bool) {
 }
 
 // expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).
-func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
+func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
 	name, args := c.call.Name, c.call.Args
 	if target, ok := execTarget(args); ok {
-		return emit(c.sub(len(c.words)-len(target), c.via(name, "exec")), lineBase, vars, calls)
+		return emit(c.sub(len(c.words)-len(target), c.via(name, "exec")), lineBase, vars, calls, seen)
 	}
 	switch {
 	case isShell(name):
 		operand, command, _ := shellArgs(args)
 		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
 			script := c.words[operand+1]
-			return parseNested(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls)
+			return parseNestedWithBudget(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
 		}
 		return nil
 	case name == "ssh":
@@ -1585,9 +1780,9 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
 			remote.text = append(remote.text, w.script...)
 			remote.pos = append(remote.pos, w.pos...)
 		}
-		return parseNested(remote.String(), remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls)
+		return parseNestedWithBudget(remote.String(), remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, c.budget)
 	case name == "find":
-		return expandFind(c, lineBase, vars, calls)
+		return expandFind(c, lineBase, vars, calls, seen)
 	case scriptInvocation(name, args):
 		return expandScriptInvocation(c, vars, calls)
 
@@ -1610,7 +1805,7 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 		return nil
 	}
 	viaName := c.call.Name
-	return parseNested(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls)
+	return parseNestedWithBudget(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
 }
 
 type scriptArg struct {
@@ -1734,8 +1929,8 @@ func mappedShellCommandWords(c cmd, words []scriptArg) (mapped, bool) {
 				pos = w.pos[j]
 			}
 			if w.script[j] == '\'' {
-				script.add(`'\\''`, -1)
-				script.add("'", pos)
+				script.add("'", -1)
+				script.add(`\'`, pos)
 				script.add("'", -1)
 			} else {
 				script.add(w.script[j:j+1], pos)
@@ -2006,7 +2201,7 @@ func shortOptionAt(name, arg string, offset int) (string, bool) {
 	return option, valueOptions[name][option]
 }
 
-func expandFind(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
+func expandFind(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
 	args := c.call.Args
 	var errs []error
 	for i := 0; i < len(args); i++ {
@@ -2024,7 +2219,7 @@ func expandFind(c cmd, lineBase int, vars map[string]string, calls *[]Call) erro
 		cmd := c.sub(start+1, c.via("find", args[i]))
 		cmd.call.Args = slices.Clone(args[start+1 : end])
 		cmd.words = cmd.words[:len(cmd.call.Args)+1]
-		if err := emit(cmd, lineBase, vars, calls); err != nil {
+		if err := emit(cmd, lineBase, vars, calls, seen); err != nil {
 			errs = append(errs, err)
 		}
 		i = end
@@ -2275,14 +2470,27 @@ var valueOptions = map[string]map[string]bool{
 	"setpriv":     set("--reuid", "--ruid", "--euid", "--regid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig", "--ptracer", "--landlock-access", "--landlock-rule", "--landlock-restrict", "--seccomp-filter"),
 	"unshare":     set("-S", "-G", "-R", "-w", "-l", "--setuid", "--setgid", "--root", "--wd", "--map-user", "--map-group", "--map-users", "--map-groups", "--setgroups", "--monotonic", "--boottime", "--propagation"),
 	"flock":       set("-E", "--conflict-exit-code", "-w", "--wait", "--timeout"),
-	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--nice", "--root-directory", "--json", "--job-mode", "--path-property", "--socket-property"),
+	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--nice", "--root-directory", "--json", "--job-mode", "--path-property", "--socket-property", "--expand-environment"),
 	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "-s", "--shell", "-w", "--whitelist-environment"),
 	"su":          set("-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
 	"doas":        set("-u", "-C", "-s"),
 	"watch":       set("-n", "--interval", "-q", "--equexit"),
 	"script":      set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io", "-m", "--logging-format", "-o", "--output-limit"),
 	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "-a", "--arg-file", "--sshloginfile", "--joblog", "--results", "--workdir", "--env", "--block", "--recstart", "--recend", "--regexp", "--tagstring", "--halt", "--timeout", "--delay", "--memfree", "--load", "--nice", "--filter", "--return", "--transferfile", "--cleanup", "--trc", "--basefile", "--record-env", "-C", "--colsep", "-I", "-E", "--retries", "--tmpdir", "--header", "--termseq", "--sshdelay", "--group-by", "--compress-program", "--limit", "--memsuspend"),
-	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e", "-F", "-B", "-l", "-m", "-R", "-T"),
+	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e", "-F", "-B", "-l", "-m", "-R", "-T", "-p"),
+}
+
+var flagOptions = map[string]map[string]bool{
+	"env":         set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug"),
+	"sudo":        set("-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login"),
+	"timeout":     set("--foreground", "--preserve-status", "-v", "--verbose"),
+	"taskset":     set("-a", "--all-tasks"),
+	"chrt":        set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks"),
+	"flock":       set("-n", "--no-fork", "-o", "--close", "-F", "--no-fork"),
+	"systemd-run": set("--scope", "--user", "--system", "--wait", "--pipe", "--pty", "--quiet", "--collect", "--same-dir", "--send-sighup", "--remain-after-exit", "--background", "--expand-environment", "--on-clock-change", "--on-timezone-change"),
+	"xargs":       set("-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty"),
+	"command":     set("-p"),
+	"tmux":        set("-2", "-8", "-C", "-D", "-N", "-V", "-v", "-q", "-u"),
 }
 
 func set(items ...string) map[string]bool {
