@@ -48,7 +48,9 @@ func sessionLeaderAlive(fd int) (bool, error) {
 // first batch, no signals are sent. If it becomes unavailable later, the scan
 // stops and ErrPidfdUnavailable is returned with StopResult.Signaled counting
 // processes already sent the requested signal. Any other pidfd_open error
-// leaves only that process unsignaled and is returned with the result.
+// skips that process in the current batch; a later batch may open and signal
+// it. Such errors are returned with the result, except a process that exited
+// or changed identity, which is not an error.
 func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
@@ -82,7 +84,9 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 // in the first batch, no signals are sent. If it becomes unavailable later,
 // the scan stops and ErrPidfdUnavailable is returned with StopResult.Signaled
 // counting processes already sent the requested signal. Any other pidfd_open
-// error leaves only that process unsignaled and is returned with the result.
+// error skips that process in the current batch; a later batch may open and
+// signal it. Such errors are returned with the result, except a process that
+// exited or changed identity, which is not an error.
 func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
