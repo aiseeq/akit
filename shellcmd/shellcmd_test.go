@@ -1671,7 +1671,7 @@ func TestOffset(t *testing.T) {
 		{"call after a line continuation in double quotes", "bash -c \"echo a \\\n; pgrep x\"", "pgrep", []int{20}},
 		{"program after a line continuation in double quotes", "bash -c \"echo a; \\\npgrep x\"", "pgrep", []int{19}},
 		{"line continuation in a bare script", "bash -c echo\\ a\\\n\\;pgrep", "pgrep", []int{19}},
-		{"ansi-c quoted script", "bash -c $'pgrep x'", "pgrep", []int{-1}},
+		{"ansi-c quoted script", "bash -c $'pgrep x'", "pgrep", []int{10}},
 		{"shell heredoc", "bash <<'EOF'\npgrep x\nEOF", "pgrep", []int{13}},
 		{"variable argv0", "P=/usr/bin/pgrep; $P x", "pgrep", []int{-1}},
 		{"substitution", "echo $(pgrep x)", "pgrep", []int{7}},
@@ -1992,9 +1992,13 @@ func TestNestedHeredocBounds(t *testing.T) {
 			}
 		})
 	}
-	calls, err := Find("bash -c $'cat > f <<EOF\\nab\\nEOF'", "cat")
-	if err != nil || len(calls) != 1 || len(calls[0].Redirs) != 2 || calls[0].Redirs[1].BodyStart != -1 || calls[0].Redirs[1].BodyEnd != -1 {
-		t.Errorf("ansi-c quoted script = %#v, %v", calls, err)
+	ansi := "bash -c $'cat > f <<EOF\\nab\\nEOF'"
+	calls, err := Find(ansi, "cat")
+	if err != nil || len(calls) != 1 || len(calls[0].Redirs) != 2 ||
+		calls[0].Redirs[1].BodyStart != strings.Index(ansi, "ab") ||
+		calls[0].Redirs[1].BodyEnd != strings.Index(ansi, "ab")+3 ||
+		ansi[calls[0].Redirs[1].BodyStart:calls[0].Redirs[1].BodyEnd] != "ab\\" {
+		t.Errorf("ansi-c quoted script bounds = %#v, %v", calls, err)
 	}
 }
 
@@ -2125,14 +2129,16 @@ func TestANSIQuotedMultilineCallKeepsPhysicalLine(t *testing.T) {
 	}
 }
 
-func TestSSHMalformedRemotePrefixDoesNotReportNestedError(t *testing.T) {
-	src := "ssh host '; sh script.sh' <<'EOF'\necho start\nkill 1\nEOF"
-	calls, err := Find(src, "kill")
-	if err != nil {
-		t.Fatalf("Find(%q) error = %v", src, err)
-	}
-	if len(calls) != 0 {
-		t.Fatalf("Find(%q) = %#v; heredoc is not a remote script", src, calls)
+func TestSSHMalformedRemotePrefixPreservesNestedError(t *testing.T) {
+	for _, src := range []string{
+		"ssh host '; sh script.sh' <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh host '; sh script.sh' <<<x",
+	} {
+		_, err := Find(src, "kill")
+		var nested *NestedError
+		if !errors.As(err, &nested) {
+			t.Fatalf("Find(%q) error = %v; want NestedError", src, err)
+		}
 	}
 }
 
@@ -2224,5 +2230,103 @@ func TestCallSetKeepsSameCallWithDifferentVia(t *testing.T) {
 	}
 	if !seen.hasBase(Call{Name: "kill", Args: []string{"-9", "1234"}, Offset: 7, Via: []string{"timeout"}}) {
 		t.Fatal("same name, args and offset with another Via not found by base identity")
+	}
+}
+
+func TestSSHRemoteHeredocRoundThree(t *testing.T) {
+	body := "echo start\nkill 1\nEOF"
+	for _, tt := range []struct {
+		name    string
+		src     string
+		wantVia [][]string
+	}{
+		{"ansi remote shell word", "ssh host $'bash\\x20-s' <<'EOF'\n" + body, [][]string{{"ssh", "bash"}}},
+		{"second remote command reads stdin", "ssh host 'true; bash -s' <<'EOF'\n" + body, [][]string{{"ssh", "bash"}}},
+		{"stdin shell heredoc substitutions local and remote", "ssh host <<EOF\necho $(kill 1)\nEOF", [][]string{nil, {"ssh", "bash"}}},
+		{"quoted heredoc substitution is remote only", "ssh host <<'EOF'\necho $(kill 1)\nEOF", [][]string{{"ssh", "bash"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil {
+				t.Fatalf("Find error: %v", err)
+			}
+			if len(calls) != len(tt.wantVia) {
+				t.Fatalf("Find = %#v; want %d calls", calls, len(tt.wantVia))
+			}
+			for _, via := range tt.wantVia {
+				found := false
+				for _, call := range calls {
+					if reflect.DeepEqual(call.Via, via) {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("Find = %#v; missing Via %v", calls, via)
+				}
+			}
+		})
+	}
+}
+
+func TestSSHHeredocDataAndDisabledRemoteExecution(t *testing.T) {
+	for _, src := range []string{
+		"ssh -N host <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh -W target:22 host <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh -O check host <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh -s host sftp <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh host 'bash -s </dev/null' <<'EOF'\necho start\nkill 1\nEOF",
+		"ssh -n host <<'EOF'\necho start\nkill 1\nEOF",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want no kill", src, calls, err)
+		}
+	}
+}
+
+func TestSSHWithForkOptionStillReadsStdin(t *testing.T) {
+	calls, err := Find("ssh -f host <<'EOF'\necho start\nkill 1\nEOF", "kill")
+	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, []string{"ssh", "bash"}) {
+		t.Fatalf("Find = %#v, %v; want kill via ssh bash", calls, err)
+	}
+}
+
+func TestSSHRemoteSyntaxErrorsArePreserved(t *testing.T) {
+	for _, src := range []string{
+		"ssh host '; bad' <<'EOF'\nx\nEOF",
+		"ssh host '; bad' <<<x",
+	} {
+		_, err := Find(src, "kill")
+		var nested *NestedError
+		if !errors.As(err, &nested) {
+			t.Errorf("Find(%q) error = %v; want NestedError", src, err)
+		}
+	}
+}
+
+func TestANSILiteralNewlineMapsPhysicalLines(t *testing.T) {
+	for _, tt := range []struct {
+		name, src string
+		lines     []int
+	}{
+		{"bash", "true\nbash -c $'echo x\nkill 1'", []int{3}},
+		{"eval", "eval $'echo x\nkill 1'", []int{2}},
+		{"ssh", "ssh host $'echo x\nkill 1'", []int{2}},
+		{"mixed literal and escaped newline", "bash -c $'echo x\nkill 1\\nkill 1'", []int{2, 2}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil || len(calls) != len(tt.lines) {
+				t.Fatalf("Find = %#v, %v; want lines %v", calls, err, tt.lines)
+			}
+			got := make([]int, len(calls))
+			for i, call := range calls {
+				got[i] = call.Line
+			}
+			if !reflect.DeepEqual(got, tt.lines) {
+				t.Errorf("Find lines = %v, want %v", got, tt.lines)
+			}
+		})
 	}
 }
