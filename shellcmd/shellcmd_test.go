@@ -338,6 +338,14 @@ func TestCalls(t *testing.T) {
 		{"ssh remote command", `ssh -o StrictHostKeyChecking=no -p 22 host 'timeout 35m bash -c "while true; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "true", "sleep"}},
 		{"ssh heredoc without remote command", "ssh host <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "echo", "kill"}},
 		{"ssh heredoc with bash command", "ssh -T host bash <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "bash", "echo", "kill"}},
+		{"ssh heredoc remote bash -s in one argument", "ssh host 'bash -s' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "bash", "echo", "kill"}},
+		{"ssh heredoc remote sh -s in one argument", "ssh host 'sh -s' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "sh", "echo", "kill"}},
+		{"ssh heredoc remote quoted bash", "ssh host \"bash\" <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "bash", "echo", "kill"}},
+		{"ssh heredoc remote sudo bash", "ssh host 'sudo bash' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "sudo", "bash", "echo", "kill"}},
+		{"ssh heredoc remote bash command string is data", "ssh host 'bash -c \"cat\"' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "bash", "cat"}},
+		{"ssh heredoc remote cat command is data", "ssh host 'cat > f' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "cat"}},
+		{"ssh heredoc remote sh -c command is data", "ssh host 'sh -c cat' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "sh", "cat"}},
+		{"ssh heredoc malformed remote prefix is data", "ssh host '; sh script.sh' <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh"}},
 		{"ssh heredoc with unquoted delimiter", "ssh -o BatchMode=yes host <<EOF\necho start\nkill 1\nEOF", []string{"ssh", "echo", "kill"}},
 		{"ssh heredoc to data command", "ssh host cat <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "cat"}},
 		{"bash ANSI-C multiline command", "bash -c $'echo start\\nkill 1'", []string{"bash", "echo", "kill"}},
@@ -2114,6 +2122,83 @@ func TestANSIQuotedMultilineCallKeepsPhysicalLine(t *testing.T) {
 	}
 	if len(calls) != 1 || calls[0].Line != 3 {
 		t.Fatalf("ANSI-C call = %#v, want one call on physical line 3", calls)
+	}
+}
+
+func TestSSHMalformedRemotePrefixDoesNotReportNestedError(t *testing.T) {
+	src := "ssh host '; sh script.sh' <<'EOF'\necho start\nkill 1\nEOF"
+	calls, err := Find(src, "kill")
+	if err != nil {
+		t.Fatalf("Find(%q) error = %v", src, err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("Find(%q) = %#v; heredoc is not a remote script", src, calls)
+	}
+}
+
+func TestANSIEscapesBecomeShellSyntax(t *testing.T) {
+	for _, tt := range []struct {
+		name, escaped string
+	}{
+		{"newline", `\n`},
+		{"hex newline", `\x0a`},
+		{"octal newline", `\012`},
+		{"unicode newline", `\u000a`},
+		{"long unicode newline", `\U0000000a`},
+		{"control newline", `\cJ`},
+		{"hex semicolon", `\x3b`},
+		{"octal semicolon", `\073`},
+		{"unicode semicolon", `\u003b`},
+		{"long unicode semicolon", `\U0000003b`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			src := "bash -c $'echo x" + tt.escaped + "kill 1'"
+			calls, err := Find(src, "kill")
+			if err != nil || len(calls) != 1 {
+				t.Fatalf("Find(%q) = %#v, %v; want kill call", src, calls, err)
+			}
+		})
+	}
+}
+
+func TestANSILiteralBackslashNDoesNotSplitScript(t *testing.T) {
+	calls, err := Find(`bash -c $'echo x\\nkill 1'`, "kill")
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("literal \\n split script: %#v, %v", calls, err)
+	}
+}
+
+func TestANSIDecodingAcrossScriptEntryPoints(t *testing.T) {
+	for _, src := range []string{
+		`sh -c $'echo x\x0akill 1'`,
+		`eval $'echo x\x0akill 1'`,
+		`ssh host $'echo x\x0akill 1'`,
+	} {
+		t.Run(src[:strings.IndexByte(src, ' ')], func(t *testing.T) {
+			calls, err := Find(src, "kill")
+			if err != nil || len(calls) != 1 {
+				t.Fatalf("Find(%q) = %#v, %v; want kill call", src, calls, err)
+			}
+		})
+	}
+}
+
+func TestNestedCallLinesFollowSourceOffsets(t *testing.T) {
+	for _, tt := range []struct {
+		name, src string
+		line      int
+	}{
+		{"literal multiline bash", "bash -c 'echo start\nkill 1'", 2},
+		{"ANSI multiline bash", "true\ntrue\nbash -c $'echo start\\nkill 1'", 3},
+		{"ANSI multiline eval", `eval $'echo start\nkill 1'`, 1},
+		{"ANSI multiline ssh", `ssh host $'echo start\nkill 1'`, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil || len(calls) != 1 || calls[0].Line != tt.line {
+				t.Fatalf("Find(%q) = %#v, %v; want line %d", tt.src, calls, err, tt.line)
+			}
+		})
 	}
 }
 
