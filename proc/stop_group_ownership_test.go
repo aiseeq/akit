@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -449,13 +448,8 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 			os.Exit(53)
 		}
 		for _, pid := range adopted {
-			stat, err := ReadStat("/proc", pid)
-			if err != nil || stat.State != "Z" || stat.Ppid != os.Getpid() {
+			if _, err := ReadStat("/proc", pid); err == nil {
 				os.Exit(54)
-			}
-			var status syscall.WaitStatus
-			if waited, waitErr := syscall.Wait4(pid, &status, syscall.WNOHANG, nil); waited != pid || waitErr != nil {
-				os.Exit(55)
 			}
 		}
 		os.Exit(0)
@@ -474,8 +468,7 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 			}
 			t.Fatalf("subreaper helper: %v", err)
 		}
-		// The helper verified that these were already direct children before
-		// StopChildGroup; their exit status remains for the owning Wait4.
+		// The helper verified these adopted zombies were reaped from cmd's group.
 	})
 	t.Run("without subreaper", func(t *testing.T) {
 		pidPath := filepath.Join(t.TempDir(), "members")
@@ -496,44 +489,95 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 	})
 }
 
-func TestStopChildGroupDoesNotReapExistingDirectChild(t *testing.T) {
-	if pgidText := os.Getenv("PROC_DIRECT_GROUP_MEMBER_PGID"); pgidText != "" {
-		pgid, err := strconv.Atoi(pgidText)
-		if err != nil || pgid <= 1 {
-			os.Exit(80)
-		}
-		if err := syscall.Setpgid(0, pgid); err != nil {
-			os.Exit(81)
-		}
-		signal.Ignore(syscall.SIGTERM)
-		time.Sleep(time.Hour)
-		os.Exit(0)
-	}
+func TestStopChildGroupDoesNotReapZombieOutsideCommandGroup(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	outsider := exec.Command(os.Args[0], "-test.run=^TestStopChildGroupDoesNotReapExistingDirectChild$")
-	outsider.Env = append(os.Environ(), "PROC_DIRECT_GROUP_MEMBER_PGID="+strconv.Itoa(cmd.Process.Pid))
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	outsider := exec.Command("sh", "-c", "exit 7")
 	if err := outsider.Start(); err != nil {
 		_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
 		_ = cmd.Wait()
 		t.Fatal(err)
 	}
-	if _, err := StopChildGroup(cmd, 40*time.Millisecond, syscall.SIGTERM); err != nil {
+	t.Cleanup(func() {
+		if outsider.ProcessState == nil {
+			_ = outsider.Wait()
+		}
+	})
+	waitForZombie(t, outsider.Process.Pid)
+	stat, err := ReadStat("/proc", outsider.Process.Pid)
+	if err != nil || stat.Ppid != os.Getpid() {
+		t.Fatalf("test child is not an adopted zombie: stat=%+v err=%v", stat, err)
+	}
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 		t.Errorf("stop test group: %v", err)
 	}
 	if err := cmd.Wait(); err == nil {
 		t.Error("leader unexpectedly exited successfully")
 	}
 	if err := outsider.Wait(); err == nil {
-		t.Fatal("group member unexpectedly exited successfully")
+		t.Fatal("outside-group zombie unexpectedly exited successfully")
 	} else {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
-			t.Fatalf("Cmd.Wait lost its direct child status: %v", err)
+			t.Fatalf("Cmd.Wait lost the outside-group child's status: %v", err)
 		}
+		if exitErr.ExitCode() != 7 {
+			t.Fatalf("outside-group child exit code = %d, want 7", exitErr.ExitCode())
+		}
+	}
+}
+
+func TestStopChildGroupDoesNotReapCommandLeader(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 7")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	waitForZombie(t, cmd.Process.Pid)
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("Cmd.Wait after StopChildGroup = %v, want exit status 7", err)
+	}
+}
+
+func TestCommandGroupZombieEligibility(t *testing.T) {
+	const self, leader = 100, 200
+	for _, tc := range []struct {
+		name string
+		pid  int
+		stat Stat
+		want bool
+	}{
+		{name: "our zombie in command group", pid: 201, stat: Stat{Ppid: self, Pgid: leader, State: "Z"}, want: true},
+		{name: "leader is owned by Cmd.Wait", pid: leader, stat: Stat{Ppid: self, Pgid: leader, State: "Z"}},
+		{name: "direct child outside command group", pid: 201, stat: Stat{Ppid: self, Pgid: 99, State: "Z"}},
+		{name: "not our direct child", pid: 201, stat: Stat{Ppid: 101, Pgid: leader, State: "Z"}},
+		{name: "live child", pid: 201, stat: Stat{Ppid: self, Pgid: leader, State: "S"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandGroupZombie(tc.pid, leader, self, tc.stat); got != tc.want {
+				t.Fatalf("commandGroupZombie(%d, %+v) = %v, want %v", tc.pid, tc.stat, got, tc.want)
+			}
+		})
 	}
 }
 

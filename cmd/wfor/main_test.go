@@ -206,7 +206,7 @@ func TestOk(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "last exit 0") {
 		t.Errorf("code %d: %s", code, out)
 	}
-	code, out, _ = wfor(t, "ok", "echo not yet; exit 3", "--every", "10ms", "--timeout", "100ms")
+	code, out, _ = wfor(t, "ok", "echo not yet; exit 3", "--every", "10ms", "--timeout", "1s")
 	if code != exitTimeout || !strings.Contains(out, "last exit 3, output: not yet") {
 		t.Errorf("code %d: %s", code, out)
 	}
@@ -253,6 +253,54 @@ func TestOkKillsLeftoverProcesses(t *testing.T) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRepeatedOkChecksReapOrphans(t *testing.T) {
+	if os.Getenv("WFOR_ORPHAN_REAPER_HELPER") == "1" {
+		groups := make(map[int]bool)
+		for range 12 {
+			cond := &okCond{cmd: "sleep 0.05 & exit 1", now: time.Now}
+			if ok, err := cond.check(context.Background()); ok || err != nil {
+				os.Exit(70)
+			}
+			groups[cond.lastCommand.Process.Pid] = true
+		}
+		entries, err := os.ReadDir("/proc")
+		if err != nil {
+			os.Exit(71)
+		}
+		var zombies []string
+		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid <= 1 {
+				continue
+			}
+			stat, err := proc.ReadStat("/proc", pid)
+			if err == nil && stat.Ppid == os.Getpid() && stat.State == "Z" && groups[stat.Pgid] {
+				zombies = append(zombies, strconv.Itoa(pid))
+			}
+		}
+		if len(zombies) > 0 {
+			_ = os.WriteFile(os.Getenv("WFOR_ORPHAN_REAPER_ZOMBIES"), []byte(strings.Join(zombies, "\n")), 0o600)
+			os.Exit(72)
+		}
+		os.Exit(0)
+	}
+	zombies := filepath.Join(t.TempDir(), "zombies")
+	helper := exec.Command(os.Args[0], "-test.run=^TestRepeatedOkChecksReapOrphans$")
+	helper.Env = append(os.Environ(), "WFOR_ORPHAN_REAPER_HELPER=1", "WFOR_ORPHAN_REAPER_ZOMBIES="+zombies)
+	if output, err := helper.CombinedOutput(); err != nil {
+		if data, readErr := os.ReadFile(zombies); readErr == nil {
+			for field := range strings.FieldsSeq(string(data)) {
+				pid, parseErr := strconv.Atoi(field)
+				if parseErr == nil {
+					var status syscall.WaitStatus
+					_, _ = syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+				}
+			}
+		}
+		t.Fatalf("repeated orphan checks left a zombie or failed: %v; output=%s", err, output)
 	}
 }
 

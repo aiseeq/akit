@@ -16,12 +16,15 @@ import (
 
 var errStopTargetChanged = errors.New("stop target changed during validation")
 
-// StopChild stops a direct child and its observed descendants. request is called
-// once after the initial tree is captured; it may signal, close stdin or cancel
-// a context. The caller remains responsible for Cmd.Wait and WaitDelay.
-// Descendants that leave the tree before they can be observed cannot be found.
-// A failure for a single process does not stop the rest: the result comes with
-// an error naming each failed PID.
+// StopChild stops the direct child and descendants observed during tree walks,
+// including descendants later reparented to this process or another subreaper.
+// It also captures new descendants of tracked processes during grace. Each
+// captured pidfd refers to that specific process; signaling it after it exits
+// returns ESRCH. request is called once after the initial tree is captured; it
+// may signal, close stdin or cancel a context. The caller remains responsible
+// for Cmd.Wait and WaitDelay. Descendants that leave the tree before they can
+// be observed cannot be found. A failure for one process does not stop the
+// rest; the result includes an error naming each failed PID.
 func StopChild(pid int, grace time.Duration, request func() error) (StopResult, error) {
 	return stopTree("/proc", os.Getpid(), pid, grace, request, 0)
 }
@@ -31,10 +34,13 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 // assembled around an existing Process is unsupported. Each recipient is
 // checked through its parent chain, pinned by pidfd, then checked again before
 // each signal. Without BecomeChildSubreaper, descendants reparented to init
-// cease to be verifiably ours and are left alone. Adopted zombies that became
-// direct children before this call are left for their owning Cmd.Wait or process
-// exit; only descendants observed below the caller and adopted during this
-// call are reaped here.
+// cease to be verifiably ours and are left alone. After signaling, zombies
+// among this process's direct children in cmd's process group are reaped, except
+// cmd.Process, whose status belongs to cmd.Wait. A separate Cmd whose process
+// was placed in this group is outside this contract and may lose its Wait
+// status. Adopted zombies in other groups, including descendants that changed
+// groups with setsid or setpgid, remain until their owner or process exit reaps
+// them.
 func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	pid, err := validateChildGroupCommand(cmd, grace, sig)
 	if err != nil {
@@ -42,34 +48,29 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 	}
 	self := os.Getpid()
 	beforeStopChildGroupTree(pid)
-	initialDetails, err := discoverCommandTargetStats("/proc", self, pid)
+	initial, err := discoverCommandTargets("/proc", self, pid)
 	if err != nil {
 		return StopResult{}, err
 	}
-	for tries := 0; len(initialDetails) == 0 && tries < 5; tries++ {
+	for tries := 0; len(initial) == 0 && tries < 5; tries++ {
 		stat, statErr := ReadStat("/proc", pid)
 		if statErr != nil || stat.State == "Z" || stat.State == "X" {
 			break
 		}
 		timer := time.NewTimer(5 * time.Millisecond)
 		<-timer.C
-		initialDetails, err = discoverCommandTargetStats("/proc", self, pid)
+		initial, err = discoverCommandTargets("/proc", self, pid)
 		if err != nil {
 			return StopResult{}, err
 		}
 	}
-	if len(initialDetails) == 0 {
+	if len(initial) == 0 {
+		if err := reapCommandGroupZombies(pid); err != nil {
+			return StopResult{}, err
+		}
 		return StopResult{AlreadyExited: true}, nil
 	}
-	reapTargets := make(map[int]bool, len(initialDetails))
-	signaledTargets := make(map[int]bool, len(initialDetails))
-	initial := make([]int, 0, len(initialDetails))
-	for _, target := range initialDetails {
-		if target.pid != pid && target.ppid != self {
-			reapTargets[target.pid] = true
-		}
-		initial = append(initial, target.pid)
-	}
+	signaledTargets := make(map[int]bool, len(initial))
 	var failures stopFailures
 	requestOwnedTargets("/proc", self, pid, initial, unix.Signal(sig), signaledTargets, &failures)
 	var result StopResult
@@ -78,24 +79,19 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 			timer := time.NewTimer(grace)
 			<-timer.C
 		}
-		survivorsDetails, scanErr := discoverCommandTargetStats("/proc", self, pid)
+		survivors, scanErr := discoverCommandTargets("/proc", self, pid)
 		if scanErr != nil {
 			failures.add(0, scanErr)
 		} else {
-			survivors := make([]int, 0, len(survivorsDetails))
-			for _, target := range survivorsDetails {
-				if target.pid != pid && target.ppid != self {
-					reapTargets[target.pid] = true
-				}
-				survivors = append(survivors, target.pid)
-			}
 			result.Killed = requestOwnedTargets("/proc", self, pid, survivors, unix.SIGKILL, signaledTargets, &failures)
-			result.Killed += drainCommandTargets("/proc", self, pid, reapTargets, signaledTargets, &failures)
+			result.Killed += drainCommandTargets("/proc", self, pid, signaledTargets, &failures)
 		}
 	} else if sig == syscall.SIGKILL {
-		result.Killed = drainCommandTargets("/proc", self, pid, reapTargets, signaledTargets, &failures)
+		result.Killed = drainCommandTargets("/proc", self, pid, signaledTargets, &failures)
 	}
-	reapAdoptedTargets(pid, reapTargets, signaledTargets)
+	if err := reapCommandGroupZombies(pid); err != nil {
+		failures.add(0, err)
+	}
 	return result, failures.err()
 }
 

@@ -31,23 +31,6 @@ type processIdentity struct {
 }
 
 func discoverCommandTargets(root string, self, leader int) ([]int, error) {
-	targets, err := discoverCommandTargetStats(root, self, leader)
-	if err != nil {
-		return nil, err
-	}
-	pids := make([]int, 0, len(targets))
-	for _, target := range targets {
-		pids = append(pids, target.pid)
-	}
-	return pids, nil
-}
-
-type commandTarget struct {
-	pid  int
-	ppid int
-}
-
-func discoverCommandTargetStats(root string, self, leader int) ([]commandTarget, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("read process list %s: %w", root, err)
@@ -67,7 +50,7 @@ func discoverCommandTargetStats(root string, self, leader int) ([]commandTarget,
 		}
 		stats[pid] = stat
 	}
-	var targets []commandTarget
+	var targets []int
 	for pid, stat := range stats {
 		if pid == self || stat.State == "Z" || stat.State == "X" || serviceManager(pid, stat) {
 			continue
@@ -84,10 +67,10 @@ func discoverCommandTargetStats(root string, self, leader int) ([]commandTarget,
 			}
 		}
 		if inTree || stat.Pgid == leader {
-			targets = append(targets, commandTarget{pid: pid, ppid: stat.Ppid})
+			targets = append(targets, pid)
 		}
 	}
-	slices.SortFunc(targets, func(a, b commandTarget) int { return a.pid - b.pid })
+	slices.Sort(targets)
 	return targets, nil
 }
 
@@ -183,7 +166,7 @@ func commandMembership(chain []processIdentity, pid, leader, pgid int) bool {
 	return false
 }
 
-func drainCommandTargets(root string, self, leader int, reaperTargets, signaledTargets map[int]bool, failures *stopFailures) int {
+func drainCommandTargets(root string, self, leader int, signaledTargets map[int]bool, failures *stopFailures) int {
 	killed, emptyScans := 0, 0
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for signaledTargets[leader] && time.Now().Before(deadline) {
@@ -198,7 +181,7 @@ func drainCommandTargets(root string, self, leader int, reaperTargets, signaledT
 		time.Sleep(2 * time.Millisecond)
 	}
 	for time.Now().Before(deadline) && emptyScans < 3 {
-		targets, err := discoverCommandTargetStats(root, self, leader)
+		targets, err := discoverCommandTargets(root, self, leader)
 		if err != nil {
 			failures.add(0, err)
 			return killed
@@ -209,19 +192,12 @@ func drainCommandTargets(root string, self, leader int, reaperTargets, signaledT
 			continue
 		}
 		emptyScans = 0
-		pids := make([]int, 0, len(targets))
-		for _, target := range targets {
-			if target.pid != leader && target.ppid != self {
-				reaperTargets[target.pid] = true
-			}
-			pids = append(pids, target.pid)
-		}
 		priorSignals := len(signaledTargets)
-		killed += requestOwnedTargets(root, self, leader, pids, unix.SIGKILL, signaledTargets, failures)
+		killed += requestOwnedTargets(root, self, leader, targets, unix.SIGKILL, signaledTargets, failures)
 		if len(signaledTargets) == priorSignals {
 			allSignaled := true
-			for _, target := range targets {
-				allSignaled = allSignaled && signaledTargets[target.pid]
+			for _, pid := range targets {
+				allSignaled = allSignaled && signaledTargets[pid]
 			}
 			if !allSignaled {
 				return killed
@@ -258,36 +234,62 @@ func requestOwnedTargets(root string, self, leader int, targets []int, sig unix.
 	return sent
 }
 
-func reapAdoptedTargets(leader int, targets, signaledTargets map[int]bool) {
-	for pid := range targets {
-		if pid == leader {
-			continue
+func reapCommandGroupZombies(leader int) error {
+	self := os.Getpid()
+	deadline := time.Now().Add(time.Second)
+	var failures stopFailures
+	for {
+		entries, err := os.ReadDir("/proc")
+		if err != nil {
+			return fmt.Errorf("read process list while reaping command group %d: %w", leader, err)
 		}
-		deadline := time.Now().Add(time.Second)
-		for {
-			stat, err := ReadStat("/proc", pid)
-			if err != nil || stat.Ppid != os.Getpid() {
-				break
-			}
-			if stat.State != "Z" {
-				if !signaledTargets[pid] {
-					break
-				}
-				if time.Now().After(deadline) {
-					break
-				}
-				time.Sleep(5 * time.Millisecond)
+		active := false
+		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid <= 1 {
 				continue
 			}
-			var status syscall.WaitStatus
-			waited, waitErr := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
-			if waited == pid || errors.Is(waitErr, syscall.ECHILD) {
-				break
+			stat, err := ReadStat("/proc", pid)
+			if Gone(err) || errors.Is(err, os.ErrPermission) {
+				continue
 			}
-			if waitErr != nil || time.Now().After(deadline) {
-				break
+			if err != nil {
+				failures.add(pid, fmt.Errorf("read process stat while reaping command group: %w", err))
+				continue
 			}
-			time.Sleep(5 * time.Millisecond)
+			if !directCommandGroupChild(pid, leader, self, stat) {
+				continue
+			}
+			if commandGroupZombie(pid, leader, self, stat) {
+				var status syscall.WaitStatus
+				waited, waitErr := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+				if errors.Is(waitErr, syscall.ECHILD) {
+					continue
+				}
+				if waitErr != nil {
+					failures.add(pid, fmt.Errorf("wait for adopted command-group child: %w", waitErr))
+					continue
+				}
+				if waited != 0 && waited != pid {
+					failures.add(pid, fmt.Errorf("wait returned unexpected PID %d", waited))
+				}
+				continue
+			}
+			if stat.State != "Z" {
+				active = true
+			}
 		}
+		if !active || time.Now().After(deadline) {
+			return failures.err()
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func directCommandGroupChild(pid, leader, self int, stat Stat) bool {
+	return pid != leader && stat.Ppid == self && stat.Pgid == leader
+}
+
+func commandGroupZombie(pid, leader, self int, stat Stat) bool {
+	return directCommandGroupChild(pid, leader, self, stat) && stat.State == "Z"
 }

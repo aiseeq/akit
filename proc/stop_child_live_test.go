@@ -64,7 +64,7 @@ func TestStopChildLive(t *testing.T) {
 
 func TestStopChildKillsReparentedGroupMember(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "background.pid")
-	cmd := exec.Command("sh", "-c", "sleep 30 & echo $! > \"$1\"; exit 0", "sh", pidFile)
+	cmd := exec.Command("sh", "-c", `sleep 30 & printf '%s\n' "$!" > "$1.tmp"; mv "$1.tmp" "$1"; exit 0`, "sh", pidFile)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -741,8 +741,11 @@ func waitReady(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := os.Stat(path); err == nil {
-			return
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			text := string(data)
+			if _, parseErr := strconv.Atoi(strings.TrimSpace(text)); parseErr != nil || strings.HasSuffix(text, "\n") {
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("child did not get ready: %s", path)
