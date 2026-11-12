@@ -23,6 +23,7 @@ func BecomeChildSubreaper() error {
 
 var afterCommandTargetPidfdOpen = func(int) {}
 var readCommandTargetStat = ReadStat
+var readCommandAncestryStat = ReadStat
 
 type processIdentity struct {
 	pid   int
@@ -30,6 +31,23 @@ type processIdentity struct {
 }
 
 func discoverCommandTargets(root string, self, leader int) ([]int, error) {
+	targets, err := discoverCommandTargetStats(root, self, leader)
+	if err != nil {
+		return nil, err
+	}
+	pids := make([]int, 0, len(targets))
+	for _, target := range targets {
+		pids = append(pids, target.pid)
+	}
+	return pids, nil
+}
+
+type commandTarget struct {
+	pid  int
+	ppid int
+}
+
+func discoverCommandTargetStats(root string, self, leader int) ([]commandTarget, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("read process list %s: %w", root, err)
@@ -49,7 +67,7 @@ func discoverCommandTargets(root string, self, leader int) ([]int, error) {
 		}
 		stats[pid] = stat
 	}
-	var targets []int
+	var targets []commandTarget
 	for pid, stat := range stats {
 		if pid == self || stat.State == "Z" || stat.State == "X" || serviceManager(pid, stat) {
 			continue
@@ -66,10 +84,10 @@ func discoverCommandTargets(root string, self, leader int) ([]int, error) {
 			}
 		}
 		if inTree || stat.Pgid == leader {
-			targets = append(targets, pid)
+			targets = append(targets, commandTarget{pid: pid, ppid: stat.Ppid})
 		}
 	}
-	slices.Sort(targets)
+	slices.SortFunc(targets, func(a, b commandTarget) int { return a.pid - b.pid })
 	return targets, nil
 }
 
@@ -104,7 +122,7 @@ func processAncestry(root string, target, self int) ([]processIdentity, error) {
 			return nil, errors.New("cyclic process ancestry")
 		}
 		seen[pid] = true
-		stat, err := ReadStat(root, pid)
+		stat, err := readCommandAncestryStat(root, pid)
 		if err != nil || stat.State == "Z" || stat.State == "X" {
 			if err == nil {
 				err = os.ErrProcessDone
@@ -129,14 +147,7 @@ func verifiedCommandTarget(root string, self, leader, pid int) (*trackedProcess,
 	if err != nil {
 		return nil, err
 	}
-	inTree := pid == leader
-	for _, item := range before[1:] {
-		if item.pid == leader {
-			inTree = true
-			break
-		}
-	}
-	if !inTree && stat.Pgid != leader {
+	if !commandMembership(before, pid, leader, stat.Pgid) {
 		return nil, fmt.Errorf("PID %d left command tree and group", pid)
 	}
 	fd, err := unix.PidfdOpen(pid, 0)
@@ -150,11 +161,26 @@ func verifiedCommandTarget(root string, self, leader, pid int) (*trackedProcess,
 		return nil, fmt.Errorf("PID %d changed during ownership validation: %w", pid, errors.Join(errStopTargetChanged, err))
 	}
 	checked, err := readCommandTargetStat(root, pid)
-	if err != nil || checked.Start != stat.Start || (!inTree && checked.Pgid != leader) {
+	if err != nil || checked.Start != stat.Start || !commandMembership(after, pid, leader, checked.Pgid) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("PID %d changed during target validation: %w", pid, errors.Join(errStopTargetChanged, err))
 	}
 	return &trackedProcess{fd: fd, start: stat.Start}, nil
+}
+
+func commandMembership(chain []processIdentity, pid, leader, pgid int) bool {
+	if pgid == leader {
+		return true
+	}
+	if pid == leader {
+		return true
+	}
+	for _, item := range chain[1:] {
+		if item.pid == leader {
+			return true
+		}
+	}
+	return false
 }
 
 func drainCommandTargets(root string, self, leader int, reaperTargets, signaledTargets map[int]bool, failures *stopFailures) int {
@@ -172,7 +198,7 @@ func drainCommandTargets(root string, self, leader int, reaperTargets, signaledT
 		time.Sleep(2 * time.Millisecond)
 	}
 	for time.Now().Before(deadline) && emptyScans < 3 {
-		targets, err := discoverCommandTargets(root, self, leader)
+		targets, err := discoverCommandTargetStats(root, self, leader)
 		if err != nil {
 			failures.add(0, err)
 			return killed
@@ -183,15 +209,19 @@ func drainCommandTargets(root string, self, leader int, reaperTargets, signaledT
 			continue
 		}
 		emptyScans = 0
-		for _, pid := range targets {
-			reaperTargets[pid] = true
+		pids := make([]int, 0, len(targets))
+		for _, target := range targets {
+			if target.pid != leader && target.ppid != self {
+				reaperTargets[target.pid] = true
+			}
+			pids = append(pids, target.pid)
 		}
 		priorSignals := len(signaledTargets)
-		killed += requestOwnedTargets(root, self, leader, targets, unix.SIGKILL, signaledTargets, failures)
+		killed += requestOwnedTargets(root, self, leader, pids, unix.SIGKILL, signaledTargets, failures)
 		if len(signaledTargets) == priorSignals {
 			allSignaled := true
-			for _, pid := range targets {
-				allSignaled = allSignaled && signaledTargets[pid]
+			for _, target := range targets {
+				allSignaled = allSignaled && signaledTargets[target.pid]
 			}
 			if !allSignaled {
 				return killed
@@ -239,8 +269,15 @@ func reapAdoptedTargets(leader int, targets, signaledTargets map[int]bool) {
 			if err != nil || stat.Ppid != os.Getpid() {
 				break
 			}
-			if stat.State != "Z" && !signaledTargets[pid] {
-				break
+			if stat.State != "Z" {
+				if !signaledTargets[pid] {
+					break
+				}
+				if time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+				continue
 			}
 			var status syscall.WaitStatus
 			waited, waitErr := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)

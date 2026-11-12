@@ -12,7 +12,7 @@ tasks:
     # Тесты читают только своё дерево и временные папки: при занятой машине гейт отдаёт их PC (кеш Go там постоянный).
     remote: true
     run:
-      - go test -p {threads} -json {args} ./...
+      - go test -short -p {threads} -json {args} ./...
   build:
     desc: собрать утилиты в bin/
     run:

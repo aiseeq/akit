@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -183,6 +184,138 @@ func TestStopChildGroupRechecksMembershipAfterPidfdOpen(t *testing.T) {
 	}
 }
 
+func TestStopChildGroupDropsStaleTreeMembershipAfterPidfdOpen(t *testing.T) {
+	if os.Getenv("PROC_STALE_OWNER_ROLE") == "target" {
+		if err := waitFile(os.Getenv("PROC_STALE_OWNER_MOVE"), 5*time.Second); err != nil {
+			os.Exit(70)
+		}
+		if err := syscall.Setpgid(0, 0); err != nil {
+			os.Exit(71)
+		}
+		if err := os.WriteFile(os.Getenv("PROC_STALE_OWNER_DONE"), []byte("done"), 0o600); err != nil {
+			os.Exit(72)
+		}
+		time.Sleep(time.Hour)
+		os.Exit(0)
+	}
+	dir := t.TempDir()
+	movePath, donePath := filepath.Join(dir, "move"), filepath.Join(dir, "done")
+	cmd := exec.Command("sh", "-c", `"$1" -test.run=^TestStopChildGroupDropsStaleTreeMembershipAfterPidfdOpen$; wait`, "sh", os.Args[0])
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "PROC_STALE_OWNER_ROLE=target", "PROC_STALE_OWNER_MOVE="+movePath, "PROC_STALE_OWNER_DONE="+donePath)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	// The command shell is the lower PID and is always visited before its helper.
+	deadline := time.Now().Add(5 * time.Second)
+	var target int
+	for time.Now().Before(deadline) {
+		entries, _ := os.ReadDir("/proc")
+		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid <= cmd.Process.Pid {
+				continue
+			}
+			stat, err := ReadStat("/proc", pid)
+			if err == nil && stat.Ppid == cmd.Process.Pid && stat.Pgid == cmd.Process.Pid {
+				target = pid
+				break
+			}
+		}
+		if target != 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if target == 0 {
+		t.Fatal("did not find test helper under command shell")
+	}
+	var moved, signaled bool
+	realHook, realSignal := afterCommandTargetPidfdOpen, signalProcess
+	afterCommandTargetPidfdOpen = func(pid int) {
+		if pid != target || moved {
+			return
+		}
+		moved = true
+		if err := cmd.Process.Kill(); err != nil {
+			t.Errorf("exit test command leader: %v", err)
+		}
+		if err := cmd.Wait(); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Errorf("wait for test command leader: %v", err)
+			}
+		}
+		if err := os.WriteFile(movePath, []byte("move"), 0o600); err != nil {
+			t.Errorf("request helper group change: %v", err)
+		}
+		if err := waitFile(donePath, time.Second); err != nil {
+			t.Errorf("wait for helper group change: %v", err)
+		}
+	}
+	signalProcess = func(pid int, tracked *trackedProcess, sig unix.Signal) error {
+		if pid == target {
+			signaled = true
+		}
+		return realSignal(pid, tracked, sig)
+	}
+	t.Cleanup(func() { afterCommandTargetPidfdOpen, signalProcess = realHook, realSignal })
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if !moved || signaled {
+		t.Fatalf("stale tree membership: moved=%v signaled=%v", moved, signaled)
+	}
+	if stat, err := ReadStat("/proc", target); err != nil || stat.State == "Z" || stat.State == "X" {
+		t.Fatalf("target did not survive after leaving tree and group: stat=%+v err=%v", stat, err)
+	}
+	if err := SignalChild(target, syscall.SIGKILL); err != nil {
+		t.Fatalf("stop test-owned adopted helper: %v", err)
+	}
+	var status syscall.WaitStatus
+	if _, err := syscall.Wait4(target, &status, 0, nil); err != nil {
+		t.Fatalf("reap test-owned helper: %v", err)
+	}
+}
+
+func TestVerifiedCommandTargetRejectsChangedAncestryStartTime(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	realRead, realHook := readCommandAncestryStat, afterCommandTargetPidfdOpen
+	opened := false
+	readCommandAncestryStat = func(root string, pid int) (Stat, error) {
+		stat, err := realRead(root, pid)
+		if pid == cmd.Process.Pid && opened && err == nil {
+			stat.Start += "-reused"
+		}
+		return stat, err
+	}
+	afterCommandTargetPidfdOpen = func(pid int) {
+		if pid == cmd.Process.Pid {
+			opened = true
+		}
+	}
+	t.Cleanup(func() { readCommandAncestryStat, afterCommandTargetPidfdOpen = realRead, realHook })
+	if _, err := verifiedCommandTarget("/proc", os.Getpid(), cmd.Process.Pid, cmd.Process.Pid); !errors.Is(err, errStopTargetChanged) {
+		t.Fatalf("verifiedCommandTarget error = %v, want changed ancestry identity", err)
+	}
+}
+
 func TestVerifiedCommandTargetPinsAndRechecksStartTime(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -295,12 +428,34 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 		if err := cmd.Wait(); err != nil {
 			os.Exit(52)
 		}
+		adopted := readPIDs(t, pidPath)
+		for _, pid := range adopted {
+			if err := SignalChild(pid, syscall.SIGKILL); err != nil {
+				os.Exit(56)
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				stat, err := ReadStat("/proc", pid)
+				if err == nil && stat.State == "Z" && stat.Ppid == os.Getpid() {
+					break
+				}
+				if time.Now().After(deadline) {
+					os.Exit(57)
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
 		if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 			os.Exit(53)
 		}
-		for _, pid := range readPIDs(t, pidPath) {
-			if _, err := ReadStat("/proc", pid); err == nil {
+		for _, pid := range adopted {
+			stat, err := ReadStat("/proc", pid)
+			if err != nil || stat.State != "Z" || stat.Ppid != os.Getpid() {
 				os.Exit(54)
+			}
+			var status syscall.WaitStatus
+			if waited, waitErr := syscall.Wait4(pid, &status, syscall.WNOHANG, nil); waited != pid || waitErr != nil {
+				os.Exit(55)
 			}
 		}
 		os.Exit(0)
@@ -319,11 +474,8 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 			}
 			t.Fatalf("subreaper helper: %v", err)
 		}
-		for _, pid := range readPIDs(t, pidPath) {
-			if stat, err := ReadStat("/proc", pid); err == nil {
-				t.Fatalf("adopted PID %d was not reaped: %+v", pid, stat)
-			}
-		}
+		// The helper verified that these were already direct children before
+		// StopChildGroup; their exit status remains for the owning Wait4.
 	})
 	t.Run("without subreaper", func(t *testing.T) {
 		pidPath := filepath.Join(t.TempDir(), "members")
@@ -342,6 +494,47 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 			_, _ = syscall.Wait4(pid, &status, 0, nil)
 		}
 	})
+}
+
+func TestStopChildGroupDoesNotReapExistingDirectChild(t *testing.T) {
+	if pgidText := os.Getenv("PROC_DIRECT_GROUP_MEMBER_PGID"); pgidText != "" {
+		pgid, err := strconv.Atoi(pgidText)
+		if err != nil || pgid <= 1 {
+			os.Exit(80)
+		}
+		if err := syscall.Setpgid(0, pgid); err != nil {
+			os.Exit(81)
+		}
+		signal.Ignore(syscall.SIGTERM)
+		time.Sleep(time.Hour)
+		os.Exit(0)
+	}
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	outsider := exec.Command(os.Args[0], "-test.run=^TestStopChildGroupDoesNotReapExistingDirectChild$")
+	outsider.Env = append(os.Environ(), "PROC_DIRECT_GROUP_MEMBER_PGID="+strconv.Itoa(cmd.Process.Pid))
+	if err := outsider.Start(); err != nil {
+		_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+		_ = cmd.Wait()
+		t.Fatal(err)
+	}
+	if _, err := StopChildGroup(cmd, 40*time.Millisecond, syscall.SIGTERM); err != nil {
+		t.Errorf("stop test group: %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Error("leader unexpectedly exited successfully")
+	}
+	if err := outsider.Wait(); err == nil {
+		t.Fatal("group member unexpectedly exited successfully")
+	} else {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("Cmd.Wait lost its direct child status: %v", err)
+		}
+	}
 }
 
 func TestStopChildGroupDoesNotAdoptUnownedMembers(t *testing.T) {

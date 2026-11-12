@@ -31,7 +31,10 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 // assembled around an existing Process is unsupported. Each recipient is
 // checked through its parent chain, pinned by pidfd, then checked again before
 // each signal. Without BecomeChildSubreaper, descendants reparented to init
-// cease to be verifiably ours and are left alone.
+// cease to be verifiably ours and are left alone. Adopted zombies that became
+// direct children before this call are left for their owning Cmd.Wait or process
+// exit; only descendants observed below the caller and adopted during this
+// call are reaped here.
 func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	pid, err := validateChildGroupCommand(cmd, grace, sig)
 	if err != nil {
@@ -39,29 +42,33 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 	}
 	self := os.Getpid()
 	beforeStopChildGroupTree(pid)
-	initial, err := discoverCommandTargets("/proc", self, pid)
+	initialDetails, err := discoverCommandTargetStats("/proc", self, pid)
 	if err != nil {
 		return StopResult{}, err
 	}
-	for tries := 0; len(initial) == 0 && tries < 5; tries++ {
+	for tries := 0; len(initialDetails) == 0 && tries < 5; tries++ {
 		stat, statErr := ReadStat("/proc", pid)
 		if statErr != nil || stat.State == "Z" || stat.State == "X" {
 			break
 		}
 		timer := time.NewTimer(5 * time.Millisecond)
 		<-timer.C
-		initial, err = discoverCommandTargets("/proc", self, pid)
+		initialDetails, err = discoverCommandTargetStats("/proc", self, pid)
 		if err != nil {
 			return StopResult{}, err
 		}
 	}
-	if len(initial) == 0 {
+	if len(initialDetails) == 0 {
 		return StopResult{AlreadyExited: true}, nil
 	}
-	reapTargets := make(map[int]bool, len(initial))
-	signaledTargets := make(map[int]bool, len(initial))
-	for _, target := range initial {
-		reapTargets[target] = true
+	reapTargets := make(map[int]bool, len(initialDetails))
+	signaledTargets := make(map[int]bool, len(initialDetails))
+	initial := make([]int, 0, len(initialDetails))
+	for _, target := range initialDetails {
+		if target.pid != pid && target.ppid != self {
+			reapTargets[target.pid] = true
+		}
+		initial = append(initial, target.pid)
 	}
 	var failures stopFailures
 	requestOwnedTargets("/proc", self, pid, initial, unix.Signal(sig), signaledTargets, &failures)
@@ -71,12 +78,16 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 			timer := time.NewTimer(grace)
 			<-timer.C
 		}
-		survivors, scanErr := discoverCommandTargets("/proc", self, pid)
+		survivorsDetails, scanErr := discoverCommandTargetStats("/proc", self, pid)
 		if scanErr != nil {
 			failures.add(0, scanErr)
 		} else {
-			for _, target := range survivors {
-				reapTargets[target] = true
+			survivors := make([]int, 0, len(survivorsDetails))
+			for _, target := range survivorsDetails {
+				if target.pid != pid && target.ppid != self {
+					reapTargets[target.pid] = true
+				}
+				survivors = append(survivors, target.pid)
 			}
 			result.Killed = requestOwnedTargets("/proc", self, pid, survivors, unix.SIGKILL, signaledTargets, &failures)
 			result.Killed += drainCommandTargets("/proc", self, pid, reapTargets, signaledTargets, &failures)

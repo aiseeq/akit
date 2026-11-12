@@ -241,7 +241,7 @@ func TestStopChildGroupRequestsTERMThenKillsReparentedGroupMember(t *testing.T) 
 		t.Run(leader, func(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "member.pid")
 			ready := filepath.Join(t.TempDir(), "ready")
-			script := `sh -c 'trap "" TERM; sleep 30 >/dev/null 2>&1 & echo $! > "$1"; exit 0' sh "$1" & while [ ! -s "$1" ]; do sleep .005; done; echo ready > "$2"; if [ "$3" = "live" ]; then exec sleep 30; fi; exit 0`
+			script := `sh -c 'trap "" TERM; sleep 30 >/dev/null 2>&1 & echo $! > "$1"; wait' sh "$1" & while [ ! -s "$1" ]; do sleep .005; done; echo ready > "$2"; if [ "$3" = "live" ]; then exec sleep 30; fi; exit 0`
 			cmd := exec.Command("sh", "-c", script, "sh", pidFile, ready, leader)
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			if err := cmd.Start(); err != nil {
@@ -302,11 +302,11 @@ func TestStopChildGroupRequestsTERMThenKillsReparentedGroupMember(t *testing.T) 
 			deadline := time.Now().Add(time.Second)
 			for {
 				stat, err := ReadStat("/proc", member)
-				if Gone(err) || err == nil && (stat.State == "Z" || stat.State == "X") {
+				if Gone(err) {
 					break
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("reparented member %d survived TERM and SIGKILL: %+v, %v", member, stat, err)
+					t.Fatalf("reparented member %d was not killed and reaped after TERM and SIGKILL: %+v, %v", member, stat, err)
 				}
 				time.Sleep(5 * time.Millisecond)
 			}

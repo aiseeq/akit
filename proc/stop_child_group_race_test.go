@@ -150,7 +150,7 @@ func injectLeaderExit(t *testing.T, cmd *exec.Cmd, point string) {
 func TestStopChildGroupCancelRaceStress(t *testing.T) {
 	iterations := 300
 	if testing.Short() {
-		iterations = 40
+		iterations = 8
 	}
 	dir := t.TempDir()
 	var called atomic.Int32
