@@ -275,9 +275,18 @@ func collectPipelineWalkInfo(binary *syntax.BinaryCmd, src string, vars map[stri
 	markPipeline(binary.Y, src, vars, info.scriptInputs)
 }
 
+func hasHeredocRedir(redirs []*syntax.Redirect) bool {
+	for _, redir := range redirs {
+		if redir.Hdoc != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func collectPipedHeredocWalkInfo(binary *syntax.BinaryCmd, src string, vars map[string]string, info *walkInfo) bool {
 	producerStmt := binary.X
-	if producerStmt == nil {
+	if producerStmt == nil || !hasHeredocRedir(producerStmt.Redirs) {
 		return false
 	}
 	producer, ok := producerStmt.Cmd.(*syntax.CallExpr)
@@ -628,7 +637,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		return
 	}
 
-	args, split := words(call.Args, w.src, w.vars)
+	args, split, literals := wordValues(call.Args, w.src, w.vars, true)
 
 	start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
 	if !validSpan(w.src, start, end) {
@@ -646,7 +655,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	if !needsScripts {
 		needsScripts = mainShellArgIndex(args[1:]) >= 0
 	}
-	ws := splitWords(cmdWords(call.Args, w.src, needsScripts), split)
+	ws := splitWords(cmdWords(call.Args, w.src, needsScripts, literals), split)
 	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget}
 	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
@@ -1123,14 +1132,14 @@ func heredocBodyLen(text, delim string) int {
 }
 
 // cmdWords — место и текст скрипта каждого слова команды.
-func cmdWords(args []*syntax.Word, src string, scripts bool) []word {
+func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) []word {
 	ws := make([]word, len(args))
 	for i, arg := range args {
 		ws[i].offset = -1
 		if scripts {
-			ws[i].script, ws[i].pos = wordScript(arg, src)
+			ws[i].script, ws[i].pos = wordScript(arg, src, literals[i])
 		}
-		if _, literal := wordValue(arg); literal {
+		if literals[i] {
 			ws[i].offset = int(arg.Pos().Offset())
 		}
 	}
@@ -1142,9 +1151,9 @@ func cmdWords(args []*syntax.Word, src string, scripts bool) []word {
 // ($x, $(…)) остаются текстом, а строй скрипта (циклы, вызовы) виден. Слово только из подстановки
 // ("$cmd", $cmd) — "": что выполнится, видно только при запуске.
 // Возвращает и карту байтов текста в исходную команду.
-func wordScript(w *syntax.Word, src string) (string, []int) {
+func wordScript(w *syntax.Word, src string, literal bool) (string, []int) {
 	var text mapped
-	if _, literal := wordValue(w); literal {
+	if literal {
 		for _, part := range w.Parts {
 			text.addLiteral(part, src)
 		}
@@ -1277,10 +1286,22 @@ func unescapeBare(s string) string {
 // строк, как делит оболочка; другой argv0 с подстановками — текст без кавычек ("$HOME/bin/x" → $HOME/bin/x).
 // Второй результат — сколько слов добавило деление argv0.
 func words(ws []*syntax.Word, src string, vars map[string]string) ([]string, int) {
+	result, split, _ := wordValues(ws, src, vars, false)
+	return result, split
+}
+
+func wordValues(ws []*syntax.Word, src string, vars map[string]string, needLiterals bool) ([]string, int, []bool) {
 	result := make([]string, len(ws))
+	var literals []bool
+	if needLiterals {
+		literals = make([]bool, len(ws))
+	}
 	for i, w := range ws {
 		if value, ok := wordValue(w); ok {
 			result[i] = value
+			if needLiterals {
+				literals[i] = true
+			}
 			continue
 		}
 		result[i] = nodeText(w, src)
@@ -1294,21 +1315,21 @@ func words(ws []*syntax.Word, src string, vars map[string]string) ([]string, int
 			fields := splitFields(value)
 			if len(fields) == 0 {
 				if len(ws) > 1 {
-					return result[1:], -1
+					return result[1:], -1, literals
 				}
 				result[0] = value
 				break
 			}
-			return append(fields, result[1:]...), len(fields) - 1
+			return append(fields, result[1:]...), len(fields) - 1, literals
 		case ok && value != "":
 			result[0] = value
 		default:
-			if _, literal := wordValue(ws[0]); !literal {
+			if !needLiterals || !literals[0] {
 				result[0] = unquotedText(ws[0], src)
 			}
 		}
 	}
-	return result, 0
+	return result, 0, literals
 }
 
 // splitFields делит значение переменной на слова по пробелам, табам и переводам строк вне подстановок
@@ -1674,20 +1695,24 @@ func shortWrapperOptionStep(name string, args []string, i int) (int, bool) {
 	return i + 1, false
 }
 
+type callIdentity struct {
+	name   string
+	offset int
+	hash   uint64
+}
+
 type callSet struct {
-	base, exact         map[string]Call
-	baseMore, exactMore map[string][]Call
+	calls map[callIdentity]Call
+	more  map[callIdentity][]Call
 }
 
 func newCallSet() *callSet {
-	return &callSet{base: make(map[string]Call), exact: make(map[string]Call), baseMore: make(map[string][]Call), exactMore: make(map[string][]Call)}
+	return &callSet{calls: make(map[callIdentity]Call), more: make(map[callIdentity][]Call)}
 }
 
 func (s *callSet) clear() {
-	clear(s.base)
-	clear(s.exact)
-	clear(s.baseMore)
-	clear(s.exactMore)
+	clear(s.calls)
+	clear(s.more)
 }
 
 const (
@@ -1695,30 +1720,29 @@ const (
 	callHashPrime       uint64 = 1099511628211
 )
 
-func callBaseIdentity(call Call) (string, bool) {
-	if call.Offset < 0 {
-		return "", false
-	}
-	hash := callHashOffsetBasis
-	for _, arg := range call.Args {
-		for i := 0; i < len(arg); i++ {
-			hash = (hash ^ uint64(arg[i])) * callHashPrime
+func hashCallParts(hash uint64, parts []string) uint64 {
+	for _, part := range parts {
+		for i := 0; i < len(part); i++ {
+			hash = (hash ^ uint64(part[i])) * callHashPrime
 		}
 		hash = (hash ^ 0xff) * callHashPrime
 	}
-	return call.Name + "\x00" + strconv.Itoa(call.Offset) + "\x00" + strconv.FormatUint(hash, 16), true
+	return hash
 }
 
-func callExactIdentity(call Call) (string, bool) {
-	key, ok := callBaseIdentity(call)
-	if !ok {
-		return "", false
+func callBaseIdentity(call Call) (callIdentity, bool) {
+	if call.Offset < 0 {
+		return callIdentity{}, false
 	}
-	return key + "\x00" + strings.Join(call.Via, "\x00"), true
+	return callIdentity{name: call.Name, offset: call.Offset, hash: hashCallParts(callHashOffsetBasis, call.Args)}, true
 }
 
 func sameCallArgs(a, b Call) bool {
 	return slices.Equal(a.Args, b.Args)
+}
+
+func sameCall(a, b Call) bool {
+	return sameCallArgs(a, b) && slices.Equal(a.Via, b.Via)
 }
 
 func (s *callSet) hasBase(call Call) bool {
@@ -1726,10 +1750,10 @@ func (s *callSet) hasBase(call Call) bool {
 	if !ok {
 		return false
 	}
-	if first, exists := s.base[key]; exists && sameCallArgs(first, call) {
+	if first, exists := s.calls[key]; exists && sameCallArgs(first, call) {
 		return true
 	}
-	for _, previous := range s.baseMore[key] {
+	for _, previous := range s.more[key] {
 		if sameCallArgs(previous, call) {
 			return true
 		}
@@ -1738,45 +1762,40 @@ func (s *callSet) hasBase(call Call) bool {
 }
 
 func (s *callSet) hasExact(call Call) bool {
-	key, ok := callExactIdentity(call)
+	key, ok := callBaseIdentity(call)
 	if !ok {
 		return false
 	}
-	if first, exists := s.exact[key]; exists && sameCallArgs(first, call) {
+	if first, exists := s.calls[key]; exists && sameCall(first, call) {
 		return true
 	}
-	for _, previous := range s.exactMore[key] {
-		if sameCallArgs(previous, call) {
+	for _, previous := range s.more[key] {
+		if sameCall(previous, call) {
 			return true
 		}
 	}
 	return false
 }
 
-func addCallToSet(first map[string]Call, more map[string][]Call, key string, call Call) {
-	previous, exists := first[key]
+func (s *callSet) add(call Call) {
+	key, ok := callBaseIdentity(call)
+	if !ok {
+		return
+	}
+	previous, exists := s.calls[key]
 	if !exists {
-		first[key] = call
+		s.calls[key] = call
 		return
 	}
-	if sameCallArgs(previous, call) && slices.Equal(previous.Via, call.Via) {
+	if sameCall(previous, call) {
 		return
 	}
-	for _, previous := range more[key] {
-		if sameCallArgs(previous, call) && slices.Equal(previous.Via, call.Via) {
+	for _, previous := range s.more[key] {
+		if sameCall(previous, call) {
 			return
 		}
 	}
-	more[key] = append(more[key], call)
-}
-
-func (s *callSet) add(call Call) {
-	if key, ok := callBaseIdentity(call); ok {
-		addCallToSet(s.base, s.baseMore, key, call)
-	}
-	if key, ok := callExactIdentity(call); ok {
-		addCallToSet(s.exact, s.exactMore, key, call)
-	}
+	s.more[key] = append(s.more[key], call)
 }
 
 func callKeyBase(call Call) (string, bool) {

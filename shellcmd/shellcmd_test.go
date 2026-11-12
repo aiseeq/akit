@@ -172,6 +172,18 @@ func BenchmarkFindNestedSubstitutions(b *testing.B) {
 	}
 }
 
+func BenchmarkFindNestedScript(b *testing.B) {
+	src := nestedSubstitutionScript(20000)
+	b.SetBytes(int64(len(src)))
+	b.ResetTimer()
+	for range b.N {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 20 {
+			b.Fatalf("calls=%d err=%v", len(calls), err)
+		}
+	}
+}
+
 func TestFindMatchesCallsOnRiskForms(t *testing.T) {
 	scripts := []string{
 		`echo exec -- kill target`, `printf exec -- rm -rf /x`, `echo exec -- curl http://x`,
