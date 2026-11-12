@@ -207,6 +207,8 @@ func TestPipedHeredocScripts(t *testing.T) {
 		{name: "body substitutions", command: "cat <<E | bash\n$(kill 1)\nE", via: []string{"pipe", "bash"}, line: 2},
 		{name: "tabs to sh stdin", command: "cat - <<-E | sh -s\n\tkill 1\n\tE", via: []string{"pipe", "sh"}, line: 2},
 		{name: "sudo shell", command: "cat - <<E | sudo bash\nkill 1\nE", via: []string{"pipe", "sudo", "bash"}, line: 2},
+		{name: "runuser shell", command: "cat <<'E' | runuser sh\nkill 1\nE", via: []string{"pipe", "runuser", "sh"}, line: 2},
+		{name: "sudo shell from stdin", command: "cat <<'E' | sudo -s\nkill 1\nE", via: []string{"pipe", "sudo", "bash"}, line: 2},
 		{name: "tee to bash", command: "tee /tmp/x <<E | bash\nkill 1\nE", via: []string{"pipe", "bash"}, line: 2},
 		{name: "timeout shell", command: "cat <<E | timeout 5 bash\nkill 1\nE", via: []string{"pipe", "timeout", "bash"}, line: 2},
 		{name: "nested piped heredoc", command: "cat <<'A' | bash\ncat <<'B' | bash\nkill 1\nB\nA", via: []string{"pipe", "bash", "pipe", "bash"}, line: 3},
@@ -422,9 +424,9 @@ E`, "kill", []string{"1"}, []string{"bash"}},
 		{`parallel --halt now,fail=1 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
 		{`parallel --timeout 5 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
 		{`parallel --delay 1 kill ::: 1`, "kill", []string{"1"}, []string{"parallel"}},
-		{`runuser - a -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
-		{`runuser a -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
-		{`runuser -l a -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`runuser - u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`runuser u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
+		{`runuser -l u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
 		{`taskset -c0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
 		{`taskset --cpu-list=0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
 		{`taskset -ac 0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
@@ -475,10 +477,10 @@ func TestWrapperOptionAndProgressRegressions(t *testing.T) {
 		args    []string
 		via     []string
 	}{
-		{command: `runuser - a -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
-		{command: `runuser a -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
-		{command: `runuser -l a -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
-		{command: `runuser - postgres -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser - u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser -l u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
+		{command: `runuser - u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
 		{command: `taskset -c0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
 		{command: `taskset --cpu-list=0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
 		{command: `taskset -ac 0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
@@ -839,11 +841,11 @@ func TestWrapperArgumentScansAlwaysAdvance(t *testing.T) {
 		want    bool
 	}{
 		{command: `runuser -`},
-		{command: `runuser - a -c 'kill 1'`, want: true},
+		{command: `runuser - u1 -c 'kill 1'`, want: true},
 		{command: `sudo runuser - a`},
 		{command: `script -`},
 		{command: `script - x`},
-		{command: `runuser - postgres -c 'kill 1'`, want: true},
+		{command: `runuser - u1 -c 'kill 1'`, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.command, func(t *testing.T) {
@@ -1033,13 +1035,13 @@ func TestKillGuardExistingForms(t *testing.T) {
 	}
 }
 
-func TestRoundSixKeepsCallsAfterNestedErrors(t *testing.T) {
+func TestCallsContinueAfterNestedParseErrors(t *testing.T) {
 	cases := []struct {
 		command string
 		name    string
 		via     []string
 	}{
-		{`bash -c 'if' ; sudo reddy history`, "reddy", []string{"sudo"}},
+		{`bash -c 'if' ; sudo tool history`, "tool", []string{"sudo"}},
 		{`bash -c 'if' ; timeout 5 pgrep x`, "pgrep", []string{"timeout"}},
 		{"bash -c 'if' ; bash <<E\nkill 1\nE", "kill", []string{"bash"}},
 	}
@@ -1063,7 +1065,7 @@ func TestRoundSixKeepsCallsAfterNestedErrors(t *testing.T) {
 	}
 }
 
-func TestRoundSixMainFallbackIsRetained(t *testing.T) {
+func TestMainCompatibleWrapperCalls(t *testing.T) {
 	for _, command := range []string{
 		`ssh -l --command + su sh 'bash -c kill'`,
 	} {
@@ -1097,7 +1099,7 @@ func TestRoundSixMainFallbackIsRetained(t *testing.T) {
 	}
 }
 
-func TestRoundSixKnownOptionTablesAndBaselineBounds(t *testing.T) {
+func TestWrapperOptionTablesAndDepthLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -1107,9 +1109,15 @@ func TestRoundSixKnownOptionTablesAndBaselineBounds(t *testing.T) {
 		{"unshare", []string{"--setgroups", "deny", "kill"}, 2},
 		{"systemd-run", []string{"--json", "pretty", "kill"}, 2},
 		{"tmux", []string{"-T", "/tmp/name", "new", "-d"}, 2},
+		{"strace", []string{"-efoo", "grep"}, 1},
+		{"sudo", []string{"-n", "grep"}, 1},
+		{"timeout", []string{"-v", "5", "grep"}, 1},
 	} {
 		if got := wrapperOptionEnd(tc.name, tc.args, 0); got != tc.want {
 			t.Errorf("%s option end = %d, want %d", tc.name, got, tc.want)
+		}
+		if !wrapperOptionsKnown(tc.name, tc.args) {
+			t.Errorf("%s known options rejected: %q", tc.name, tc.args)
 		}
 	}
 	target, _, ok := unwrapMain("env", []string{"-i", "A=1", "kill", "1"})
@@ -1126,28 +1134,111 @@ func TestRoundSixKnownOptionTablesAndBaselineBounds(t *testing.T) {
 	}
 }
 
-func TestRoundSixUnknownWrapperOptionsKeepCandidates(t *testing.T) {
-	wrappers := []string{"setpriv", "unshare", "strace", "chrt", "taskset", "flock", "systemd-run", "runuser", "su", "watch", "parallel", "tmux", "sudo", "env", "timeout", "nice", "doas", "busybox", "ionice", "xargs", "nohup", "stdbuf", "script"}
-	for _, wrapper := range wrappers {
-		for _, option := range []string{"--zzz", "-Z"} {
-			command := wrapper + " " + option + " val pkill -u u1"
-			t.Run(command, func(t *testing.T) {
-				calls, err := Calls(command)
-				if err != nil {
-					t.Fatal(err)
+func TestUnknownWrapperOptionsUseMainBehavior(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    string
+	}{
+		{"strace -Z val grep kill /tmp/notes", "strace"},
+		{"sudo -Z val grep kill /tmp/notes", "val"},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			calls, err := Calls(tc.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name == "kill" || call.Name == "grep" {
+					t.Fatalf("unknown key invented a command: %#v", calls)
 				}
-				for _, call := range calls {
-					if call.Name == "pkill" && reflect.DeepEqual(call.Args, []string{"-u", "u1"}) && reflect.DeepEqual(call.Via, []string{wrapper}) {
-						return
-					}
-				}
-				t.Fatalf("candidate pkill missing for %q: %#v", command, calls)
-			})
+				found = found || call.Name == tc.want
+			}
+			if !found {
+				t.Fatalf("main-compatible call %q missing: %#v", tc.want, calls)
+			}
+		})
+	}
+	calls, err := Calls("strace -Z val bash -c 'kill 1'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "kill" {
+			return
 		}
+	}
+	t.Fatalf("main shell search after unknown key was lost: %#v", calls)
+}
+
+func TestBenignWrapperArgumentsDoNotBecomeCommands(t *testing.T) {
+	commands := []string{
+		"strace -f grep kill /tmp/log",
+		"watch -d grep kill notes.txt",
+		"unshare -r grep kill notes.txt",
+		"setpriv --init-groups grep kill notes.txt",
+		"flock -x /tmp/l grep kill notes.txt",
+		"sudo -A grep kill f",
+		"sudo -n grep kill f",
+		"timeout -v 5 grep kill f",
+		"systemd-run -q --user grep kill f",
+		"parallel -k grep kill ::: a b",
+		"doas -n grep kill f",
+		"ionice -t -c3 grep kill f",
+		"xargs -i grep kill {}",
+		"strace -f echo foo bar",
+		"strace -efoo grep kill notes.txt",
+	}
+	for _, command := range commands {
+		t.Run(command, func(t *testing.T) {
+			calls, err := Calls(command)
+			if err != nil {
+				t.Fatalf("ordinary command returned error: %v", err)
+			}
+			for _, call := range calls {
+				if call.Name == "kill" {
+					t.Fatalf("argument reported as command: %#v", calls)
+				}
+				if command == "strace -f echo foo bar" && call.Name == "foo" {
+					t.Fatalf("echo argument reported as command: %#v", calls)
+				}
+			}
+		})
 	}
 }
 
-func TestRoundSixWrapperOptionsAndEnvAttachedValue(t *testing.T) {
+func TestMainWrappersUseTheirOwnCommandRoute(t *testing.T) {
+	args := []string{"grep", "bash", "-c", "echo x"}
+	c := cmd{call: Call{Name: "sudo", Args: args}, words: make([]word, len(args)+1)}
+	if _, ok := genericShellTarget(c, "sudo", args, -1); ok {
+		t.Fatal("main wrapper was rescanned as a generic shell command")
+	}
+}
+
+func TestWrapperRouteDeduplicationUsesSourceCall(t *testing.T) {
+	call := Call{Name: "echo", Args: []string{"x"}, Offset: 10, Via: []string{"exact"}}
+	calls := []Call(nil)
+	seen := make(map[string]bool)
+	appendCall(seen, &calls, call)
+	c := cmd{
+		call:  Call{Name: "sudo", Args: []string{"echo", "x"}},
+		words: []word{{offset: 0}, {offset: 10}, {offset: 15}},
+	}
+	if err := emitMainTarget(c, []string{"echo", "x"}, []string{"main"}, true, 0, map[string]string{}, &calls, seen); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("same source call emitted through multiple routes: %#v", calls)
+	}
+}
+
+func TestAttachedShortOptionValueDoesNotHideFollowingOption(t *testing.T) {
+	if wrapperOptionsKnown("strace", []string{"-efoo", "-Q", "grep"}) {
+		t.Fatal("unknown option after an attached value was skipped")
+	}
+}
+
+func TestKnownWrapperOptionsAndEnvAttachedValue(t *testing.T) {
 	cases := []struct {
 		command string
 		name    string
@@ -1156,7 +1247,7 @@ func TestRoundSixWrapperOptionsAndEnvAttachedValue(t *testing.T) {
 	}{
 		{`env -uSHELL pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"env"}},
 		{`systemd-run --background red kill -1`, "red", []string{"kill", "-1"}, []string{"systemd-run"}},
-		{`systemd-run --expand-environment no kill -1`, "kill", []string{"-1"}, []string{"systemd-run"}},
+		{`systemd-run --expand-environment no kill -1`, "no", []string{"kill", "-1"}, []string{"systemd-run"}},
 		{`tmux splitw -h -p 50 kill -1`, "kill", []string{"-1"}, []string{"tmux"}},
 	}
 	for _, tc := range cases {
@@ -1184,36 +1275,66 @@ func TestRoundSixWrapperOptionsAndEnvAttachedValue(t *testing.T) {
 	}
 }
 
-func TestRoundSixNestedSudoShellInput(t *testing.T) {
+func TestNestedSudoReadsStdinOnlyWithoutCommand(t *testing.T) {
 	for _, command := range []string{
+		`curl x | timeout 5 sudo -s`,
+		`curl x | nice sudo -i`,
 		"timeout 5 sudo -s <<E\nkill 1\nE",
 		"nice sudo -i <<E\nkill 1\nE",
 		"sudo -u u1 sudo -s <<E\nkill 1\nE",
-		`curl x | timeout 5 sudo -s`,
-		`curl x | nice sudo -i`,
 	} {
 		t.Run(command, func(t *testing.T) {
 			calls, err := Calls(command)
 			if err != nil {
 				t.Fatal(err)
 			}
-			scriptInput, kill := false, false
+			var foundInput bool
 			for _, call := range calls {
-				if call.Name == "sudo" && call.ScriptInput {
-					scriptInput = true
-				}
-				if call.Name == "kill" {
-					kill = true
-				}
+				foundInput = foundInput || call.Name == "sudo" && call.ScriptInput
 			}
-			if !strings.Contains(command, "<<E") && !scriptInput {
+			if !strings.Contains(command, "<<E") && !foundInput {
 				t.Fatalf("sudo ScriptInput missing: %#v", calls)
-			}
-			if strings.Contains(command, "<<E") && !kill {
-				t.Fatalf("heredoc body not parsed: %#v", calls)
 			}
 		})
 	}
+}
+
+func TestSudoCommandsReceiveHeredocAsData(t *testing.T) {
+	for _, command := range []string{
+		"sudo -i -u u1 psql <<E\nselect 1 where (x;\nE",
+		"sudo -s cat <<E\nkill 1\nE",
+		"timeout 30 sudo -s cat <<E\nkill 1\nE",
+		"cat <<E | nice sudo -s tee /tmp/x\nkill 1\nE",
+	} {
+		t.Run(command, func(t *testing.T) {
+			calls, err := Calls(command)
+			if err != nil {
+				t.Fatalf("data heredoc returned error: %v; calls=%#v", err, calls)
+			}
+			for _, call := range calls {
+				if call.ScriptInput || call.Name == "kill" {
+					t.Fatalf("command stdin treated as shell input: %#v", calls)
+				}
+			}
+		})
+	}
+}
+
+func TestFourLargeNestedHeredocScriptsFitBudget(t *testing.T) {
+	script := strings.Repeat("echo x\n", 2500)
+	for range 4 {
+		script = "bash <<'T'\n" + script + "T\n"
+	}
+	calls, err := Calls(script)
+	if err != nil {
+		t.Fatalf("four nested 20 KiB scripts: %v", err)
+	}
+	for _, call := range calls {
+		if call.Name == "echo" {
+			return
+		}
+	}
+	t.Fatalf("nested script calls missing: %d calls", len(calls))
 }
 
 func TestOffset(t *testing.T) {

@@ -103,7 +103,7 @@ type nestedParseBudget struct {
 }
 
 func newNestedParseBudget(inputSize int) *nestedParseBudget {
-	limit := max(inputSize*3, 4096)
+	limit := max(inputSize*4, 4096)
 	return &nestedParseBudget{limit: limit}
 }
 
@@ -341,10 +341,13 @@ func pipedShellName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 			name, args = commandName(target[0]), target[1:]
 			continue
 		}
-		if name == "sudo" && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+		if name == "sudo" && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), true
 		}
 		if wrappers[name] {
+			if !wrapperOptionsKnown(name, args) {
+				return "", nil, false
+			}
 			if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
 				via = append(via, name)
 				name, args = commandName(wrapped[0]), wrapped[1:]
@@ -435,42 +438,55 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 	name, args := commandName(values[0]), values[1:]
 	argOffset := 0
 	for {
-		if name == "sudo" && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+		if name == "sudo" && sudoReadsStdin(args) {
 			return true
 		}
 		if (name == "su" || name == "runuser") && suReadsShell(name, args) {
 			return true
 		}
 		if isShell(name) {
-			operand, command, stdin := shellArgs(args)
-			if shellNoExec(args) || command {
-				return false
-			}
-			if stdin || operand == len(args) {
-				return true
-			}
-			index := 1 + argOffset + operand
-			return operand < len(args) && index < len(call.Args) && hasProcessSubstitution(call.Args[index:index+1])
+			return shellInputForShellCall(call, args, argOffset)
 		}
-		if target, ok := execTarget(args); ok {
-			argOffset += len(args) - len(target) + 1
-			name, args = commandName(target[0]), target[1:]
-			continue
-		}
-		if wrappers[name] {
-			if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
-				argOffset += len(args) - len(wrapped) + 1
-				name, args = commandName(wrapped[0]), wrapped[1:]
-				continue
-			}
-		}
-		wrapped, _, ok := unwrap(name, args)
+		var ok bool
+		name, args, argOffset, ok = shellInputNextTarget(name, args, argOffset)
 		if !ok {
 			return false
 		}
-		argOffset += len(args) - len(wrapped) + 1
-		name, args = commandName(wrapped[0]), wrapped[1:]
 	}
+}
+
+func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int) bool {
+	operand, command, stdin := shellArgs(args)
+	if shellNoExec(args) || command {
+		return false
+	}
+	if stdin || operand == len(args) {
+		return true
+	}
+	index := 1 + argOffset + operand
+	return operand < len(args) && index < len(call.Args) && hasProcessSubstitution(call.Args[index:index+1])
+}
+
+func shellInputNextTarget(name string, args []string, argOffset int) (string, []string, int, bool) {
+	if target, ok := execTarget(args); ok {
+		argOffset += len(args) - len(target) + 1
+		return commandName(target[0]), target[1:], argOffset, true
+	}
+	if wrappers[name] {
+		if !wrapperOptionsKnown(name, args) {
+			return "", nil, argOffset, false
+		}
+		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
+			argOffset += len(args) - len(wrapped) + 1
+			return commandName(wrapped[0]), wrapped[1:], argOffset, true
+		}
+	}
+	wrapped, _, ok := unwrap(name, args)
+	if !ok {
+		return "", nil, argOffset, false
+	}
+	argOffset += len(args) - len(wrapped) + 1
+	return commandName(wrapped[0]), wrapped[1:], argOffset, true
 }
 
 type callWalker struct {
@@ -780,7 +796,7 @@ func hasScriptInputRedir(redirs []*syntax.Redirect) bool {
 func resolveShellInput(name string, args []string, redirs []*syntax.Redirect, hasHeredoc bool) (string, []string, bool) {
 	var via []string
 	for {
-		if name == "sudo" && hasHeredoc && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+		if name == "sudo" && hasHeredoc && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), true
 		}
 		if (name == "su" || name == "runuser") && hasHeredoc && suReadsShell(name, args) {
@@ -942,9 +958,7 @@ func parseNestedWithBudget(src string, pos []int, lineBase int, via []string, in
 	if len(src) > maxNestedScriptBytes {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script exceeds %d bytes", maxNestedScriptBytes)}
 	}
-	if budget == nil {
-		budget = newNestedParseBudget(len(src))
-	}
+
 	if len(src) > budget.limit-budget.used {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested parse budget exceeds %d bytes", budget.limit)}
 	}
@@ -1386,7 +1400,7 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 	if err := emitShellInputTarget(c, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
-	emitUnknownWrapperCandidates(c, name, args, calls, seen)
+
 	exact, exactVia, exactOK := unwrap(name, args)
 	exactStart := -1
 	if exactOK {
@@ -1414,16 +1428,6 @@ func emitShellInputTarget(c cmd, lineBase int, vars map[string]string, calls *[]
 		return nil
 	}
 	return emit(target, lineBase, vars, calls, seen)
-}
-
-func emitUnknownWrapperCandidates(c cmd, name string, args []string, calls *[]Call, seen map[string]bool) {
-	index, ok := unknownWrapperOption(name, args)
-	if !ok {
-		return
-	}
-	for i := index + 1; i < len(args); i++ {
-		appendCall(seen, calls, c.sub(i+1, c.via(name)).call)
-	}
 }
 
 func emitGenericShellTarget(c cmd, name string, args []string, exactStart, lineBase int, vars map[string]string, calls *[]Call, seen map[string]bool) error {
@@ -1509,16 +1513,24 @@ func exactWrapperTarget(c cmd, start int, via []string) (cmd, bool) {
 	return c.sub(start, c.via(via...)), true
 }
 
+func sudoReadsStdin(args []string) bool {
+	if !hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+		return false
+	}
+	_, hasCommand := unwrapOnce("sudo", args)
+	return !hasCommand
+}
+
 func sudoShellTarget(c cmd) (cmd, bool) {
 	name, args := c.call.Name, c.call.Args
 	argStart := 0
 	peeled := false
 	via := slices.Clone(c.call.Via)
 	for {
-		if name == "sudo" && peeled && hasOption(name, args, "-s", "--shell", "-i", "--login") {
+		if name == "sudo" && peeled && sudoReadsStdin(args) {
 			return c.sub(argStart+1, append(via, "sudo")), true
 		}
-		if !wrappers[name] {
+		if !wrappers[name] || !wrapperOptionsKnown(name, args) {
 			return cmd{}, false
 		}
 		wrapped, ok := unwrapOnce(name, args)
@@ -1532,17 +1544,14 @@ func sudoShellTarget(c cmd) (cmd, bool) {
 	}
 }
 
-func unknownWrapperOption(name string, args []string) (int, bool) {
+func wrapperOptionsKnown(name string, args []string) bool {
 	if name == "command" && commandIsLookup(args) {
-		return 0, false
-	}
-	if !wrappers[name] && name != "watch" && name != "tmux" && name != "script" {
-		return 0, false
+		return true
 	}
 	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-"; {
 		next, unknown := wrapperOptionStep(name, args, i)
 		if unknown {
-			return i, true
+			return false
 		}
 		if next <= i {
 			i++
@@ -1550,7 +1559,7 @@ func unknownWrapperOption(name string, args []string) (int, bool) {
 			i = next
 		}
 	}
-	return 0, false
+	return true
 }
 
 func wrapperOptionStep(name string, args []string, i int) (int, bool) {
@@ -1632,7 +1641,7 @@ func mainShellArgIndex(args []string) int {
 	return -1
 }
 
-// baselineWrapper and baselineOptionValue preserve the permissive main wrapper walk.
+// baselineWrapper и baselineOptionValue сохраняют совместимый с прежней версией разбор обёрток.
 func baselineWrapper(name string) bool {
 	switch name {
 	case "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs":
@@ -2282,6 +2291,9 @@ func baseName(path string) string {
 func unwrap(name string, args []string) ([]string, []string, bool) {
 	var via []string
 	for wrappers[name] {
+		if !wrapperOptionsKnown(name, args) {
+			return nil, via, false
+		}
 		if wrapperRunsScript(name, args) {
 			if len(via) > 0 {
 				return append([]string{name}, args...), via, true
@@ -2470,10 +2482,10 @@ var valueOptions = map[string]map[string]bool{
 	"setpriv":     set("--reuid", "--ruid", "--euid", "--regid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig", "--ptracer", "--landlock-access", "--landlock-rule", "--landlock-restrict", "--seccomp-filter"),
 	"unshare":     set("-S", "-G", "-R", "-w", "-l", "--setuid", "--setgid", "--root", "--wd", "--map-user", "--map-group", "--map-users", "--map-groups", "--setgroups", "--monotonic", "--boottime", "--propagation"),
 	"flock":       set("-E", "--conflict-exit-code", "-w", "--wait", "--timeout"),
-	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--nice", "--root-directory", "--json", "--job-mode", "--path-property", "--socket-property", "--expand-environment"),
-	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "-s", "--shell", "-w", "--whitelist-environment"),
+	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--nice", "--root-directory", "--json", "--job-mode", "--path-property", "--socket-property"),
+	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "-s", "--shell", "-w", "--whitelist-environment", "--groups"),
 	"su":          set("-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
-	"doas":        set("-u", "-C", "-s"),
+	"doas":        set("-u", "--user", "-a", "--auth-type", "-C", "--config"),
 	"watch":       set("-n", "--interval", "-q", "--equexit"),
 	"script":      set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io", "-m", "--logging-format", "-o", "--output-limit"),
 	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "-a", "--arg-file", "--sshloginfile", "--joblog", "--results", "--workdir", "--env", "--block", "--recstart", "--recend", "--regexp", "--tagstring", "--halt", "--timeout", "--delay", "--memfree", "--load", "--nice", "--filter", "--return", "--transferfile", "--cleanup", "--trc", "--basefile", "--record-env", "-C", "--colsep", "-I", "-E", "--retries", "--tmpdir", "--header", "--termseq", "--sshdelay", "--group-by", "--compress-program", "--limit", "--memsuspend"),
@@ -2482,15 +2494,25 @@ var valueOptions = map[string]map[string]bool{
 
 var flagOptions = map[string]map[string]bool{
 	"env":         set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug"),
-	"sudo":        set("-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login"),
+	"sudo":        set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet"),
 	"timeout":     set("--foreground", "--preserve-status", "-v", "--verbose"),
 	"taskset":     set("-a", "--all-tasks"),
 	"chrt":        set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks"),
-	"flock":       set("-n", "--no-fork", "-o", "--close", "-F", "--no-fork"),
-	"systemd-run": set("--scope", "--user", "--system", "--wait", "--pipe", "--pty", "--quiet", "--collect", "--same-dir", "--send-sighup", "--remain-after-exit", "--background", "--expand-environment", "--on-clock-change", "--on-timezone-change"),
-	"xargs":       set("-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty"),
+	"strace":      set("-f", "-ff", "-c", "-q", "-qq", "-T", "-tt", "-y", "-yy", "-D", "-d", "-k", "-r", "-t", "-v", "-x", "-xx", "-z", "-Z", "--follow-forks", "--daemonize", "--summary-only", "--quiet", "--absolute-timestamps", "--decode-fds", "--secontext", "--kill-on-exit", "--output-separately", "--seccomp-bpf"),
+	"unshare":     set("-r", "--map-root-user", "-U", "--user", "-f", "--fork", "-m", "--mount", "-p", "--pid", "-n", "--net", "-i", "--ipc", "-u", "--uts", "-C", "--cgroup", "--mount-proc", "--kill-child", "--time", "--cgroup-namespace"),
+	"setpriv":     set("--init-groups", "--clear-groups", "--no-new-privs", "--keep-caps", "--dump", "--list-caps"),
+	"watch":       set("-d", "--differences", "-t", "--no-title", "-c", "--color", "-g", "--chgexit", "-e", "--errexit", "-b", "--beep", "-p", "--precise", "-x", "--exec"),
+	"parallel":    set("-k", "--keep-order", "--tag", "-q", "--quote", "--ungroup", "--group", "--line-buffer", "--tagstring"),
+	"flock":       set("-x", "--exclusive", "-s", "--shared", "-u", "--unlock", "-n", "--nonblock", "-o", "--close", "-F", "--no-fork"),
+	"systemd-run": set("-q", "--quiet", "-t", "--pty", "-P", "--pipe", "-G", "--collect", "-d", "--remain-after-exit", "--user", "--scope", "--wait", "--system", "--same-dir", "--send-sighup", "--background", "--expand-environment", "--on-clock-change", "--on-timezone-change"),
+	"doas":        set("-n", "--non-interactive", "-s", "-L", "--"),
+	"ionice":      set("-t", "--ignore"),
+	"xargs":       set("-i", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty"),
+	"script":      set("-q", "--quiet", "-f", "--flush", "-V", "--version"),
 	"command":     set("-p"),
 	"tmux":        set("-2", "-8", "-C", "-D", "-N", "-V", "-v", "-q", "-u"),
+	"su":          set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast"),
+	"runuser":     set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "--pty", "--close-session", "--reset-environment"),
 }
 
 func set(items ...string) map[string]bool {
