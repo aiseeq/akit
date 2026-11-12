@@ -178,6 +178,37 @@ func TestStopSessionLeaderExitAfterMemberPreflightDoesNotSignalBatch(t *testing.
 	}
 }
 
+func TestStopSessionLeaderExitAfterScanDoesNotSignalBatch(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	rec := sessionRecordFor(t, cmd.Process.Pid)
+	oldPoll, oldSignal := pollSessionLeader, signalProcess
+	checks, signals := 0, 0
+	pollSessionLeader = func(fds []unix.PollFd, _ int) (int, error) {
+		checks++
+		if checks > 1 {
+			fds[0].Revents = unix.POLLIN
+			return 1, nil
+		}
+		return 0, nil
+	}
+	signalProcess = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() { pollSessionLeader, signalProcess = oldPoll, oldSignal })
+	_, err := StopSession(rec, 0, syscall.SIGTERM)
+	if !errors.Is(err, ErrSessionLeaderGone) || checks != 2 || signals != 0 {
+		t.Fatalf("StopSession = error %v, leader checks %d, signals %d; want leader exit after scan and no batch signals", err, checks, signals)
+	}
+}
+
 func TestStopSessionLeaderExitBeforeNextScanDoesNotSelectMembers(t *testing.T) {
 	var scans, signals int
 	oldSignal := signalProcess

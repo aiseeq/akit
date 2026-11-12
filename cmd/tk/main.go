@@ -3157,9 +3157,9 @@ var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS",
 	"RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR"}
 
 var cancelByStopWithObserver = proc.CancelByStopWithObserver
-var writeDegradedStopWarning = func() {
-	fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
-}
+
+// degradedStopWarning — предупреждение, когда отмена остановила только прямого потомка.
+const degradedStopWarning = "остановлен только прямой потомок: pidfd недоступен"
 
 func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -3192,7 +3192,7 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	cmd.Stderr = stderr
 	err = cmd.Run()
 	if cancelDegraded {
-		writeDegradedStopWarning()
+		fmt.Fprintln(os.Stderr, degradedStopWarning)
 	}
 	if cmd.Process != nil {
 		// ESRCH — группа уже пуста: остатков нет.

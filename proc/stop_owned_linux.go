@@ -24,10 +24,12 @@ var afterDescendantPidfdOpen = func(int) {}
 var readSessionStat = ReadStat
 var openSessionPidfd = func(pid, flags int) (int, error) { return openProcessPidfd(pid, flags) }
 var afterSessionPidfdOpen = func(int) {}
-var sessionLeaderAlive = func(fd int) (bool, error) {
+var pollSessionLeader = unix.Poll
+
+func sessionLeaderAlive(fd int) (bool, error) {
 	for {
 		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		_, err := unix.Poll(fds, 0)
+		_, err := pollSessionLeader(fds, 0)
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
@@ -42,7 +44,9 @@ var sessionLeaderAlive = func(fd int) (bool, error) {
 // SIGKILLs survivors after grace. It never reaps direct children; their Cmd
 // owners retain responsibility for Wait. Callers must be child subreapers to
 // find descendants reparented after an intermediate process exits.
-// If pidfd_open is unavailable, it returns ErrPidfdUnavailable without signaling.
+// A pidfd failure in the first batch sends no signals. A later failure stops
+// the scan and returns ErrPidfdUnavailable with StopResult.Signaled counting
+// processes already sent the requested signal.
 func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
@@ -61,16 +65,19 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 
 // StopSession signals verified members of rec's detached session and then
 // SIGKILLs survivors after grace. It requires the original live session leader
-// and holds its pidfd throughout the stop. Each batch is signaled only when the
-// leader is live both before scanning and after all member pidfds are opened
-// and checked; this proves the SID was occupied throughout selection. If the
-// leader exits during a batch, that batch is not signaled and ErrSessionLeaderGone
-// is returned with work already completed. Orphans of an exited leader cannot
-// be identified safely; use StopDescendants as a subreaper or a dedicated
-// systemd scope for those processes. If pidfd_open becomes unavailable on a
-// later batch, ErrPidfdUnavailable is returned with the count already sent;
-// zero signals is guaranteed only for the first batch.
-// If pidfd_open is unavailable, it returns ErrPidfdUnavailable without signaling.
+// and holds its pidfd throughout the stop. For each batch, the leader is checked
+// through that pidfd before scanning and after every member pidfd is opened and
+// checked. If the leader is live at both checks, selected members were verified
+// as members of the recorded session while its original leader was live. A
+// member may leave the session, or the leader may exit, after the second check;
+// pidfds still pin the exact processes verified in the session, and signaling
+// those processes remains authorized. If the leader exits before the second
+// check, that batch is not signaled and ErrSessionLeaderGone is returned with
+// work already completed. Orphans of an exited leader cannot be identified
+// safely; use StopDescendants as a subreaper or a dedicated systemd scope. A
+// pidfd failure in the first batch sends no signals. A later failure stops the
+// scan and returns ErrPidfdUnavailable with StopResult.Signaled counting
+// processes already sent the requested signal.
 func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err

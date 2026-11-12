@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,22 +19,31 @@ import (
 )
 
 func TestOKCondWarnsWhenCancelStopDegrades(t *testing.T) {
-	oldCancel, oldWarning := cancelByStopWithObserver, writeDegradedStopWarning
-	warning := ""
+	oldCancel, oldStderr := cancelByStopWithObserver, os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
 	cancelByStopWithObserver = func(cmd *exec.Cmd, _ time.Duration, _ syscall.Signal, observer func(bool, error)) error {
 		observer(true, nil)
 		return nil
 	}
-	writeDegradedStopWarning = func() {
-		warning += "остановлен только прямой потомок: pidfd недоступен\n"
-	}
 	t.Cleanup(func() {
-		cancelByStopWithObserver, writeDegradedStopWarning = oldCancel, oldWarning
+		cancelByStopWithObserver, os.Stderr = oldCancel, oldStderr
+		_ = r.Close()
+		_ = w.Close()
 	})
 	cond := &okCond{cmd: "true", every: time.Second, now: time.Now}
 	ok, checkErr := cond.check(context.Background())
-	if !ok || checkErr != nil || !strings.Contains(warning, "остановлен только прямой потомок: pidfd недоступен") {
-		t.Fatalf("check=(%v,%v), warning=%q", ok, checkErr, warning)
+	_ = w.Close()
+	os.Stderr = oldStderr
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || checkErr != nil || !strings.Contains(string(got), "остановлен только прямой потомок: pidfd недоступен") {
+		t.Fatalf("check=(%v,%v), stderr=%q", ok, checkErr, got)
 	}
 }
 

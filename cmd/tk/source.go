@@ -109,7 +109,7 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if cancelDegraded {
-		writeDegradedStopWarning()
+		fmt.Fprintln(os.Stderr, degradedStopWarning)
 	}
 	if stdout.overflow || stderr.overflow {
 		return nil, stderr.Bytes(), errors.New("output over 1 MiB")

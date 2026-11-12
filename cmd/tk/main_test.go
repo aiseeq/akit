@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/aiseeq/akit/queuegate"
 	"github.com/aiseeq/akit/timearg"
+	"io"
 	"maps"
 	"os"
 	"os/exec"
@@ -1313,21 +1314,31 @@ func TestPlanItemStopsLeftoverChild(t *testing.T) {
 }
 
 func TestPlanItemWarnsWhenCancelStopDegrades(t *testing.T) {
-	oldCancel, oldWarning := cancelByStopWithObserver, writeDegradedStopWarning
-	var warning bytes.Buffer
+	oldCancel, oldStderr := cancelByStopWithObserver, os.Stderr
+	stderr, err := os.CreateTemp(t.TempDir(), "stderr-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = stderr
 	cancelByStopWithObserver = func(cmd *exec.Cmd, _ time.Duration, _ syscall.Signal, observer func(bool, error)) error {
 		observer(true, nil)
 		return nil
 	}
-	writeDegradedStopWarning = func() {
-		fmt.Fprintln(&warning, "остановлен только прямой потомок: pidfd недоступен")
-	}
 	t.Cleanup(func() {
-		cancelByStopWithObserver, writeDegradedStopWarning = oldCancel, oldWarning
+		cancelByStopWithObserver, os.Stderr = oldCancel, oldStderr
+		_ = stderr.Close()
 	})
 	result := runPlanItem(t.TempDir(), planJSON{Name: "degraded", Cmd: "exit 0"}, time.Second)
-	if result.exit != 0 || !strings.Contains(warning.String(), "остановлен только прямой потомок: pidfd недоступен") {
-		t.Fatalf("result=%+v warning=%q", result, warning.String())
+	os.Stderr = oldStderr
+	if _, err := stderr.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.exit != 0 || !strings.Contains(string(got), "остановлен только прямой потомок: pidfd недоступен") {
+		t.Fatalf("result=%+v stderr=%q", result, got)
 	}
 }
 

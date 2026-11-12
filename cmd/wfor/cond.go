@@ -378,9 +378,6 @@ func (c *timeCond) state() string {
 }
 
 var cancelByStopWithObserver = proc.CancelByStopWithObserver
-var writeDegradedStopWarning = func() {
-	fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
-}
 
 // okCond — команда bash вышла с кодом 0. Запускается не чаще раза в every.
 type okCond struct {
@@ -409,7 +406,7 @@ func (c *okCond) check(ctx context.Context) (bool, error) {
 	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()
 	if cancelDegraded {
-		writeDegradedStopWarning()
+		fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
 	}
 	if cmd.Process != nil {
 		// Bash may have exited while commands it started are still running.
