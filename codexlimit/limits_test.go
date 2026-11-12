@@ -360,7 +360,7 @@ func TestReadContextDeadlineGrandchildHoldsStderr(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	t.Cleanup(func() {
-		if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+		if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 			t.Errorf("stop app-server test group: %v", err)
 		}
 	})

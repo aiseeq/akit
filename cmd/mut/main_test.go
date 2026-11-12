@@ -289,9 +289,7 @@ func TestAdd(t *testing.T){os.WriteFile("started",[]byte("yes"),0600);for i:=0;i
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	_, _ = proc.StopChild(cmd.Process.Pid, 10*time.Second, func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
-	})
+	_, _ = proc.StopChildGroup(cmd, 10*time.Second, syscall.SIGINT)
 	err := cmd.Wait()
 	ee, ok := err.(*exec.ExitError)
 	if !ok || ee.ExitCode() != 130 {

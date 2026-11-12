@@ -105,7 +105,7 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 		if cmd.Process == nil {
 			return nil
 		}
-		_, err := proc.StopChildGroup(cmd, 0, nil)
+		_, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
 		return err
 	}
 	var stdout, stderr cappedBuffer

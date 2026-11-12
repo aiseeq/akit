@@ -398,14 +398,14 @@ func (c *okCond) check(ctx context.Context) (bool, error) {
 	c.lastCommand = cmd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		_, err := proc.StopChildGroup(cmd, 0, nil)
+		_, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
 		return err
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()
 	if cmd.Process != nil {
 		// Bash may have exited while commands it started are still running.
-		if _, stopErr := proc.StopChildGroup(cmd, 0, nil); stopErr != nil {
+		if _, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); stopErr != nil {
 			return false, fmt.Errorf("%s: stop leftover processes: %w", c, stopErr)
 		}
 	}

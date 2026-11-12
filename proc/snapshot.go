@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -113,7 +112,7 @@ func ReadSnapshot(procRoot string, uid int, now time.Time) (*Snapshot, error) {
 
 // Gone — ошибка значит, что процесс уже завершился.
 func Gone(err error) bool {
-	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+	return errors.Is(err, fs.ErrNotExist) || noSuchProcess(err)
 }
 
 // isPid — имя папки /proc из одних цифр.
@@ -168,8 +167,8 @@ func Read(procRoot string, pid, uid int, boot time.Time) (*Proc, error) {
 		Pid: pid, Ppid: st.Ppid, UID: -1, Comm: st.Comm, StartRaw: st.Start, Start: start,
 		StartAt: boot.Add(time.Duration(start) * time.Second / clockTicks),
 	}
-	if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
-		p.UID = int(sys.Uid)
+	if fileUIDValue, ok := fileUID(fi); ok {
+		p.UID = fileUIDValue
 	}
 	if p.UID != uid {
 		return p, nil // чужое окружение не прочитать

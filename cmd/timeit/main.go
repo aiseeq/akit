@@ -106,7 +106,7 @@ func watchSignals(signals <-chan os.Signal) {
 
 func stopForSignal(sig os.Signal) {
 	if cmd := activeCommand.Load(); cmd != nil {
-		if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+		if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 			fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
 		}
 	}
@@ -444,7 +444,7 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 	select {
 	case sig := <-signals:
 		if signalNumber, ok := sig.(syscall.Signal); ok {
-			_, stopErr := proc.StopChildGroup(cmd, 0, nil)
+			_, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
 			if stopErr != nil {
 				fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", stopErr)
 			}
@@ -453,7 +453,7 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 			cleanup()
 			return result{interrupted: int(signalNumber)}, time.Since(started), nil
 		}
-		_, stopErr := proc.StopChildGroup(cmd, 0, nil)
+		_, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
 		if stopErr != nil {
 			fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", stopErr)
 		}
@@ -462,7 +462,7 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		cleanup()
 		return result{interrupted: int(syscall.SIGTERM)}, time.Since(started), nil
 	case err := <-wait:
-		if _, stopErr := proc.StopChildGroup(cmd, 0, nil); stopErr != nil {
+		if _, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); stopErr != nil {
 			fmt.Fprintf(os.Stderr, "timeit: stop command group: %v\n", stopErr)
 		}
 		activeCommand.CompareAndSwap(cmd, nil)
@@ -486,7 +486,7 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 }
 
 func stopCommand(cmd *exec.Cmd) {
-	if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+	if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 		fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
 	}
 	if err := cmd.Wait(); err != nil {

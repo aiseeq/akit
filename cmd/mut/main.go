@@ -523,7 +523,11 @@ func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 		var signalErr error
 		if sig != os.Interrupt {
 			_, signalErr = proc.StopChild(cmd.Process.Pid, 24*time.Hour, func() error {
-				return cmd.Process.Signal(sig)
+				forwarded, ok := sig.(syscall.Signal)
+				if !ok {
+					return fmt.Errorf("unsupported signal %v", sig)
+				}
+				return proc.SignalChild(cmd.Process.Pid, forwarded)
 			})
 		}
 		err = <-done

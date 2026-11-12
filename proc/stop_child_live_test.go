@@ -1,6 +1,10 @@
+//go:build linux
+
 package proc
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +37,7 @@ func TestStopChildLive(t *testing.T) {
 			waitReady(t, ready)
 			started := time.Now()
 			result, err := StopChild(cmd.Process.Pid, 300*time.Millisecond, func() error {
-				return cmd.Process.Signal(syscall.SIGTERM)
+				return SignalChild(cmd.Process.Pid, syscall.SIGTERM)
 			})
 			_ = cmd.Wait()
 			if err != nil {
@@ -57,7 +61,7 @@ func TestStopChildKillsReparentedGroupMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := StopChildGroup(cmd, 0, nil); err != nil {
+		if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 			t.Errorf("stop child group: %v", err)
 		}
 		if cmd.ProcessState == nil {
@@ -87,7 +91,7 @@ func TestStopChildKillsReparentedGroupMember(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StopChildGroup(cmd, 0, nil); err != nil {
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
 	deadline = time.Now().Add(time.Second)
@@ -111,7 +115,7 @@ func TestStopChildGroupKillsLiveGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := StopChildGroup(cmd, 0, nil); err != nil {
+		if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 			t.Errorf("stop live child group: %v", err)
 		}
 		if cmd.ProcessState == nil {
@@ -119,16 +123,196 @@ func TestStopChildGroupKillsLiveGroup(t *testing.T) {
 		}
 	})
 	waitReady(t, ready)
-	result, err := StopChildGroup(cmd, 0, nil)
+	_, err := StopChildGroup(cmd, 0, syscall.SIGKILL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Wait(); err == nil {
 		t.Fatal("group leader exited successfully after SIGKILL")
 	}
-	if result.Killed == 0 {
-		t.Errorf("StopChildGroup did not report a killed tree member: %+v", result)
+}
+
+func TestStopChildGroupHonorsGraceAfterGroupRequest(t *testing.T) {
+	ready := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command("sh", "-c", "trap '' TERM; echo ready > \"$1\"; exec sleep 30", "sh", ready)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
+	waitReady(t, ready)
+	started := time.Now()
+	result, err := StopChildGroup(cmd, 200*time.Millisecond, syscall.SIGTERM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("process survived SIGKILL after grace")
+	}
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond {
+		t.Errorf("group stopped before grace elapsed: %v", elapsed)
+	}
+	if result.Killed == 0 {
+		t.Errorf("SIGKILL did not reach the tracked child: %+v", result)
+	}
+}
+
+func TestStopChildGroupAcceptsSetsid(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("session leader survived SIGKILL")
+	}
+}
+
+func TestSignalChildOnlySignalsDirectChild(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			if _, err := StopChild(cmd.Process.Pid, 0, nil); err != nil {
+				t.Errorf("stop direct child: %v", err)
+			}
+			_ = cmd.Wait()
+		}
+	})
+	if err := SignalChild(cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("child survived SIGTERM")
+	}
+	real := signalProcess
+	t.Cleanup(func() { signalProcess = real })
+	calls := 0
+	signalProcess = func(_ int, _ *trackedProcess, _ unix.Signal) error {
+		calls++
+		return nil
+	}
+	for name, pid := range map[string]int{"self": os.Getpid(), "parent": os.Getppid()} {
+		t.Run(name, func(t *testing.T) {
+			if err := SignalChild(pid, syscall.SIGKILL); err == nil {
+				t.Fatalf("SignalChild accepted %s PID %d", name, pid)
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("signal function called for protected PID: %d times", calls)
+	}
+}
+
+func TestSignalChildRejectsDescendant(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "grandchild.pid")
+	a := exec.Command("sh", "-c", "sleep 30 & echo $! > \"$1\"; wait", "sh", pidPath)
+	a.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := a.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := StopChildGroup(a, 0, syscall.SIGKILL); err != nil {
+			t.Errorf("stop test child group: %v", err)
+		}
+		if a.ProcessState == nil {
+			_ = a.Wait()
+		}
+	})
+	grandchild := readPID(t, pidPath)
+	real := signalProcess
+	t.Cleanup(func() { signalProcess = real })
+	calls := 0
+	signalProcess = func(_ int, _ *trackedProcess, _ unix.Signal) error {
+		calls++
+		return nil
+	}
+	if err := SignalChild(grandchild, syscall.SIGKILL); err == nil {
+		t.Fatalf("SignalChild accepted grandchild %d", grandchild)
+	}
+	if calls != 0 {
+		t.Fatalf("signal function called for grandchild: %d times", calls)
+	}
+	if stat, err := ReadStat("/proc", grandchild); err != nil || stat.State == "Z" || stat.State == "X" {
+		t.Fatalf("rejected signal nevertheless stopped grandchild: stat=%+v err=%v", stat, err)
+	}
+}
+
+func TestSignalChildChecksStartTimeAndParentAgain(t *testing.T) {
+	self := os.Getpid()
+	before := Stat{Ppid: self, Start: "first"}
+	if !sameDirectChild(self, before, Stat{Ppid: self, Start: "first"}) {
+		t.Fatal("accepted child identity rejected")
+	}
+	for name, after := range map[string]Stat{
+		"changed start":  {Ppid: self, Start: "second"},
+		"changed parent": {Ppid: os.Getppid(), Start: "first"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if sameDirectChild(self, before, after) {
+				t.Fatal("accepted changed child identity")
+			}
+		})
+	}
+	if sameDirectChild(self, Stat{Ppid: os.Getppid(), Start: "first"}, Stat{Ppid: self, Start: "first"}) {
+		t.Fatal("accepted a process that was not our child at the first read")
+	}
+}
+
+func TestStopAPIsReturnCancelErrorsThroughExec(t *testing.T) {
+	sentinel := errors.New("synthetic stop request failure")
+	t.Run("StopChild", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sleep", "30")
+		cancelResult := make(chan error, 1)
+		cmd.Cancel = func() error {
+			_, err := StopChild(cmd.Process.Pid, 0, func() error {
+				if err := SignalChild(cmd.Process.Pid, syscall.SIGTERM); err != nil {
+					return err
+				}
+				return sentinel
+			})
+			cancelResult <- err
+			return err
+		}
+		_ = cmd.Run()
+		if err := <-cancelResult; !errors.Is(err, sentinel) {
+			t.Fatalf("Cmd.Cancel error %v does not wrap request error", err)
+		}
+	})
+	t.Run("StopChildGroup", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sleep", "30")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		cancelResult := make(chan error, 1)
+		real := signalProcessGroup
+		t.Cleanup(func() { signalProcessGroup = real })
+		signalProcessGroup = func(pgid int, sig unix.Signal) error {
+			err := real(pgid, sig)
+			if sig == unix.Signal(syscall.SIGTERM) {
+				return errors.Join(err, sentinel)
+			}
+			return err
+		}
+		cmd.Cancel = func() error {
+			_, err := StopChildGroup(cmd, 0, syscall.SIGTERM)
+			cancelResult <- err
+			return err
+		}
+		_ = cmd.Wait()
+		if err := <-cancelResult; !errors.Is(err, sentinel) {
+			t.Fatalf("Cmd.Cancel error %v does not wrap group request error", err)
+		}
+	})
 }
 
 func TestStopChildRejectsForeignExitedPIDAndLeavesItsProcessAlive(t *testing.T) {
@@ -141,7 +325,7 @@ func TestStopChildRejectsForeignExitedPIDAndLeavesItsProcessAlive(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := StopChildGroup(a, 0, nil); err != nil {
+		if _, err := StopChildGroup(a, 0, syscall.SIGKILL); err != nil {
 			t.Errorf("stop probe parent group: %v", err)
 		}
 		if a.ProcessState == nil {
@@ -190,12 +374,50 @@ func TestStopChildGroupRequiresOwnProcessGroup(t *testing.T) {
 		"no attributes":         {Process: &os.Process{Pid: os.Getpid()}},
 		"not setpgid":           {Process: &os.Process{Pid: os.Getpid()}, SysProcAttr: &syscall.SysProcAttr{}},
 		"explicit foreign pgid": {Process: &os.Process{Pid: os.Getpid()}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Pgid: 1}},
+		"reserved pid":          {Process: &os.Process{Pid: 1}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := StopChildGroup(cmd, 0, nil); err == nil {
+			if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err == nil {
 				t.Fatal("StopChildGroup accepted command without its own group")
 			}
 		})
+	}
+	if _, err := StopChildGroup(&exec.Cmd{Process: &os.Process{Pid: os.Getpid()}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}, 0, 0); err == nil {
+		t.Fatal("StopChildGroup accepted signal zero")
+	}
+	if _, err := StopChildGroup(&exec.Cmd{Process: &os.Process{Pid: os.Getpid()}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}, -1, syscall.SIGKILL); err == nil {
+		t.Fatal("StopChildGroup accepted negative grace")
+	}
+}
+
+func TestOwnGroupConfigChecksSetpgidAndSetsid(t *testing.T) {
+	for name, tc := range map[string]struct {
+		attr *syscall.SysProcAttr
+		want bool
+	}{
+		"nil":                   {attr: nil},
+		"neither":               {attr: &syscall.SysProcAttr{}},
+		"setpgid default group": {attr: &syscall.SysProcAttr{Setpgid: true}, want: true},
+		"setpgid nonzero group": {attr: &syscall.SysProcAttr{Setpgid: true, Pgid: 2}},
+		"setsid":                {attr: &syscall.SysProcAttr{Setsid: true}, want: true},
+		"conflicting modes":     {attr: &syscall.SysProcAttr{Setpgid: true, Setsid: true}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ownGroupConfig(tc.attr); got != tc.want {
+				t.Fatalf("ownGroupConfig = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateSignalTargetRejectsReservedIDsAndSignals(t *testing.T) {
+	for _, tc := range []struct {
+		pid int
+		sig syscall.Signal
+	}{{0, syscall.SIGTERM}, {1, syscall.SIGTERM}, {42, 0}, {42, 65}} {
+		if err := validateSignalTarget(tc.pid, tc.sig); err == nil {
+			t.Errorf("accepted pid=%d signal=%d", tc.pid, tc.sig)
+		}
 	}
 }
 
@@ -243,7 +465,7 @@ func TestStopChildGroupIgnoresForeignProcessUsingGroupNumber(t *testing.T) {
 		return nil
 	}
 	cmd := &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	if _, err := StopChildGroup(cmd, 0, nil); err != nil {
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
 	if called {
@@ -278,7 +500,7 @@ func TestStopChildGroupIgnoresESRCH(t *testing.T) {
 	t.Cleanup(func() { signalProcessGroup = real })
 	signalProcessGroup = func(_ int, _ unix.Signal) error { return unix.ESRCH }
 	cmd := &exec.Cmd{Process: &os.Process{Pid: 2_000_000_000}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	if _, err := StopChildGroup(cmd, 0, nil); err != nil {
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 		t.Fatalf("ESRCH should mean the group is already gone: %v", err)
 	}
 }

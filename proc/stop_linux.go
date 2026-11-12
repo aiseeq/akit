@@ -9,16 +9,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
-
-// StopResult reports an already exited target and the number sent SIGKILL.
-type StopResult struct {
-	AlreadyExited bool
-	Killed        int
-}
 
 // StopChild stops a direct child and its observed descendants. request is called
 // once after the initial tree is captured; it may signal, close stdin or cancel
@@ -30,13 +25,13 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 	return stopTree("/proc", os.Getpid(), pid, grace, request, 0)
 }
 
-// StopChildGroup stops the process group started by cmd with Setpgid: true.
+// StopChildGroup stops the process group started by cmd with Setpgid or Setsid.
 // It accepts a waited command whose leader has exited while group members remain.
 // Reuse of the now-free numeric group ID between Wait and this call has the
 // same narrow risk as the former Kill(-pid): a new unrelated group could take
 // that ID before cleanup.
-func StopChildGroup(cmd *exec.Cmd, grace time.Duration, request func() error) (StopResult, error) {
-	pid, err := validateChildGroupCommand(cmd, grace)
+func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
+	pid, err := validateChildGroupCommand(cmd, grace, sig)
 	if err != nil {
 		return StopResult{}, err
 	}
@@ -61,12 +56,25 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, request func() error) (S
 
 	var result StopResult
 	if leaderPresent {
-		result, err = stopTree("/proc", self, pid, grace, request, 0)
+		started := time.Now()
+		result, err = stopTree("/proc", self, pid, grace, func() error {
+			return sendProcessGroupSignal(pid, sig)
+		}, 0)
 		if err != nil {
 			return result, err
 		}
+		if result.AlreadyExited {
+			if err := requestProcessGroup(pid, sig); err != nil {
+				return result, err
+			}
+		}
+		waitProcessGroup(pid, max(time.Until(started.Add(grace)), 0))
 	} else {
 		result.AlreadyExited = true
+		if err := requestProcessGroup(pid, sig); err != nil {
+			return result, err
+		}
+		waitProcessGroup(pid, grace)
 	}
 	if err := signalProcessGroup(pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
 		return result, fmt.Errorf("kill child process group %d: %w", pid, err)
@@ -74,21 +82,103 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, request func() error) (S
 	return result, nil
 }
 
-func validateChildGroupCommand(cmd *exec.Cmd, grace time.Duration) (int, error) {
+func validateChildGroupCommand(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (int, error) {
 	if grace < 0 || grace > 24*time.Hour {
 		return 0, errors.New("grace must be between 0 and 24h")
 	}
 	if cmd == nil || cmd.Process == nil {
 		return 0, errors.New("missing started command")
 	}
-	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid || cmd.SysProcAttr.Pgid != 0 {
-		return 0, errors.New("command was not started as its own process-group leader")
+	if !ownGroupConfig(cmd.SysProcAttr) {
+		return 0, errors.New("command was not started as its own process-group or session leader")
 	}
 	pid := cmd.Process.Pid
-	if pid <= 1 {
-		return 0, fmt.Errorf("refusing process-group ID %d", pid)
+	if err := validateSignalTarget(pid, sig); err != nil {
+		return 0, err
 	}
 	return pid, nil
+}
+
+func ownGroupConfig(attr *syscall.SysProcAttr) bool {
+	return attr != nil && (attr.Setpgid && attr.Pgid == 0 && !attr.Setsid || attr.Setsid && !attr.Setpgid)
+}
+
+func requestProcessGroup(pgid int, sig syscall.Signal) error {
+	err := sendProcessGroupSignal(pgid, sig)
+	if err != nil {
+		return fmt.Errorf("stop request: %w", err)
+	}
+	return nil
+}
+
+func sendProcessGroupSignal(pgid int, sig syscall.Signal) error {
+	err := signalProcessGroup(pgid, unix.Signal(sig))
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+func waitProcessGroup(pgid int, grace time.Duration) {
+	deadline := time.Now().Add(grace)
+	for {
+		err := signalProcessGroup(pgid, 0)
+		if errors.Is(err, unix.ESRCH) {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		if remaining > 20*time.Millisecond {
+			remaining = 20 * time.Millisecond
+		}
+		time.Sleep(remaining)
+	}
+}
+
+// SignalChild signals only a direct child after checking its parent and start
+// time both before and after opening a pidfd. The pidfd pins identity at send.
+func SignalChild(pid int, sig syscall.Signal) error {
+	if err := validateSignalTarget(pid, sig); err != nil {
+		return err
+	}
+	self := os.Getpid()
+	target, err := ReadStat("/proc", pid)
+	if err != nil {
+		return fmt.Errorf("read child process %d: %w", pid, err)
+	}
+	if target.Ppid != self {
+		return fmt.Errorf("PID %d is not a direct child", pid)
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return fmt.Errorf("pidfd_open %d: %w", pid, err)
+	}
+	defer unix.Close(fd)
+	checked, err := ReadStat("/proc", pid)
+	if err != nil || !sameDirectChild(self, target, checked) {
+		return fmt.Errorf("PID %d changed during validation", pid)
+	}
+	err = signalProcess(pid, &trackedProcess{fd: fd, start: target.Start}, unix.Signal(sig))
+	if err != nil {
+		return fmt.Errorf("signal child PID %d: %w", pid, err)
+	}
+	return nil
+}
+
+func validateSignalTarget(pid int, sig syscall.Signal) error {
+	if pid <= 1 {
+		return fmt.Errorf("refusing PID %d", pid)
+	}
+	if sig <= 0 || sig > 64 {
+		return fmt.Errorf("invalid signal %d", sig)
+	}
+	return nil
+}
+
+func sameDirectChild(self int, before, after Stat) bool {
+	return before.Ppid == self && after.Ppid == self && after.Start == before.Start
 }
 
 func inspectChildGroupLeader(cmd *exec.Cmd, self, pid int) (present, owned bool, err error) {

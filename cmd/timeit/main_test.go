@@ -228,7 +228,7 @@ func TestForwardSignalToCommandGroup(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() {
-				if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+				if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 					t.Errorf("stop signal helper group: %v", err)
 				}
 			})
@@ -242,7 +242,7 @@ func TestForwardSignalToCommandGroup(t *testing.T) {
 				}
 				time.Sleep(5 * time.Millisecond)
 			}
-			if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return cmd.Process.Signal(forwarded) }); err != nil {
+			if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return proc.SignalChild(cmd.Process.Pid, forwarded) }); err != nil {
 				t.Fatal(err)
 			}
 			err := cmd.Wait()
@@ -291,12 +291,12 @@ func TestSignalDuringStderrWrite(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			_, _ = proc.StopChildGroup(cmd, 0, nil)
+			_, _ = proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
 			t.Fatal("helper did not block writing stderr")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return cmd.Process.Signal(syscall.SIGTERM) }); err != nil {
+	if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return proc.SignalChild(cmd.Process.Pid, syscall.SIGTERM) }); err != nil {
 		t.Fatal(err)
 	}
 	err := cmd.Wait()

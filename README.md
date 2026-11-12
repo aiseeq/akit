@@ -30,11 +30,12 @@ pidfds and refuses unsafe targets. The default grace is 2s.
 `proc.StopChild(pid, grace, request)` provides the same observed-tree stopping
 for a direct child; the caller supplies the request (signal, stdin close or
 context cancellation) and remains responsible for `exec.Cmd.Wait` and
-`WaitDelay`. `proc.StopChildGroup(cmd, grace, request)` also stops the child's
-own process group when `cmd` was started with `Setpgid: true`; it can clean up
-group members after `cmd.Wait`. `proc.StopFromShell(pid, grace, signal)` implements the CLI's
-ancestry rule. Both return `proc.StopResult`, including the number sent SIGKILL,
-and an error.
+`WaitDelay`. `proc.StopChildGroup(cmd, grace, signal)` also stops the child's
+own process group when `cmd` was started with `Setpgid` or `Setsid`; it can clean
+up group members after `cmd.Wait`. `proc.SignalChild(pid, signal)` signals only
+a direct child after checking its process identity. `proc.StopFromShell(pid,
+grace, signal)` implements the CLI's ancestry rule. Stop operations return
+`proc.StopResult`, including the number sent SIGKILL, and an error.
 ## shellcmd
 
 Finds program calls in shell scripts, including nested substitutions, wrapper commands, and scripts

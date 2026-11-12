@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -221,7 +222,7 @@ func TestOkKillsLeftoverProcesses(t *testing.T) {
 		t.Errorf("successful command returned after %s, ok=%v err=%v", elapsed, ok, err)
 	}
 	t.Cleanup(func() {
-		if _, err := proc.StopChildGroup(cond.lastCommand, 0, nil); err != nil {
+		if _, err := proc.StopChildGroup(cond.lastCommand, 0, syscall.SIGKILL); err != nil {
 			t.Errorf("stop test command group: %v", err)
 		}
 	})
