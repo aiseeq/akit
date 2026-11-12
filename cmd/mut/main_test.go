@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 var mutBinary string
@@ -282,12 +284,14 @@ func TestAdd(t *testing.T){os.WriteFile("started",[]byte("yes"),0600);for i:=0;i
 			break
 		}
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
+			_, _ = proc.StopChild(cmd.Process.Pid, 0, nil)
 			t.Fatal("test did not start")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
+	_, _ = proc.StopChild(cmd.Process.Pid, 10*time.Second, func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
+	})
 	err := cmd.Wait()
 	ee, ok := err.(*exec.ExitError)
 	if !ok || ee.ExitCode() != 130 {

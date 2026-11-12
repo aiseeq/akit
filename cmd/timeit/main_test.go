@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -228,12 +230,12 @@ func TestForwardSignalToCommandGroup(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
+			_, _ = proc.StopChild(cmd.Process.Pid, 0, nil)
 			t.Fatal("signal helper did not become ready")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return cmd.Process.Signal(syscall.SIGTERM) }); err != nil {
 		t.Fatal(err)
 	}
 	err := cmd.Wait()
@@ -279,12 +281,12 @@ func TestSignalDuringStderrWrite(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
+			_, _ = proc.StopChild(cmd.Process.Pid, 0, nil)
 			t.Fatal("helper did not block writing stderr")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return cmd.Process.Signal(syscall.SIGTERM) }); err != nil {
 		t.Fatal(err)
 	}
 	err := cmd.Wait()

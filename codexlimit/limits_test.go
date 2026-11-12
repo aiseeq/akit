@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 const fullAnswer = `{"id":2,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"primary":{"usedPercent":95,"windowDurationMins":10080,"resetsAt":1794148763},"planType":"synthetic-plan"},"accountId":"synthetic-account","rateLimitResetCredits":{"availableCount":1,"credits":[{"status":"available","title":"synthetic credit"},{"n":2}]}}}`
@@ -360,7 +362,7 @@ func TestReadContextDeadlineGrandchildHoldsStderr(t *testing.T) {
 		if data, err := os.ReadFile(pidFile); err == nil {
 			var pid int
 			if _, err := fmt.Sscan(string(data), &pid); err == nil {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+				_, _ = proc.StopChild(pid, 0, nil)
 			}
 		}
 	})

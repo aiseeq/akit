@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aiseeq/akit/proc"
+
 	"github.com/aiseeq/akit/edit"
 )
 
@@ -520,7 +522,9 @@ func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 	case sig := <-sigc:
 		var signalErr error
 		if sig != os.Interrupt {
-			signalErr = cmd.Process.Signal(sig)
+			_, signalErr = proc.StopChild(cmd.Process.Pid, time.Second, func() error {
+				return cmd.Process.Signal(sig)
+			})
 		}
 		err = <-done
 		text := fmt.Sprintf("error: interrupted (%v)", sig)

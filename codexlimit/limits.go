@@ -8,10 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 // WeekMins is the length of a weekly rate limit window in minutes.
@@ -200,8 +201,8 @@ func stop(cmd *exec.Cmd, stdin io.Closer) error {
 	if err := stdin.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("codexlimit: close stdin: %w", err))
 	}
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		errs = append(errs, fmt.Errorf("codexlimit: kill app-server: %w", err))
+	if _, err := proc.StopChild(cmd.Process.Pid, 0, nil); err != nil {
+		errs = append(errs, fmt.Errorf("codexlimit: stop app-server: %w", err))
 	}
 	var exit *exec.ExitError
 	// ErrWaitDelay only says an output copy held by another process was cut; the server is gone.

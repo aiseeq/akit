@@ -16,6 +16,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/queuegate"
 	"github.com/aiseeq/akit/secretmask"
 )
@@ -104,7 +105,8 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 		if cmd.Process == nil {
 			return nil
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_, err := proc.StopChild(cmd.Process.Pid, 0, nil)
+		return err
 	}
 	var stdout, stderr cappedBuffer
 	cmd.Stdout = &stdout

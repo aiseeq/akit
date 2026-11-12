@@ -10,9 +10,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 func wfor(t *testing.T, args ...string) (int, string, string) {
@@ -226,7 +227,7 @@ func TestOkKillsLeftoverProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	t.Cleanup(func() { _, _ = proc.StopChild(pid, 0, nil) })
 	deadline := time.Now().Add(time.Second)
 	for {
 		stat, readErr := os.ReadFile(filepath.Join("/proc", itoa(pid), "stat"))

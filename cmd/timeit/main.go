@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 const (
@@ -96,8 +98,8 @@ func watchSignals(signals <-chan os.Signal) {
 			pid = activeGroup.Load()
 		}
 		if pid > 0 {
-			if err := syscall.Kill(-int(pid), syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-				fmt.Fprintf(os.Stderr, "timeit: kill command group: %v\n", err)
+			if _, err := proc.StopChild(int(pid), 0, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
 			}
 		}
 		os.Exit(128 + int(s))
@@ -433,16 +435,18 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 	select {
 	case sig := <-signals:
 		if signalNumber, ok := sig.(syscall.Signal); ok {
-			if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-				fmt.Fprintf(os.Stderr, "timeit: kill command group: %v\n", killErr)
+			_, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil)
+			if stopErr != nil {
+				fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", stopErr)
 			}
 			<-wait
 			activeGroup.CompareAndSwap(int64(cmd.Process.Pid), 0)
 			cleanup()
 			return result{interrupted: int(signalNumber)}, time.Since(started), nil
 		}
-		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-			fmt.Fprintf(os.Stderr, "timeit: kill command group: %v\n", killErr)
+		_, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil)
+		if stopErr != nil {
+			fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", stopErr)
 		}
 		<-wait
 		activeGroup.CompareAndSwap(int64(cmd.Process.Pid), 0)
@@ -470,8 +474,8 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 }
 
 func stopCommand(cmd *exec.Cmd) {
-	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		fmt.Fprintf(os.Stderr, "timeit: kill command group: %v\n", err)
+	if _, err := proc.StopChild(cmd.Process.Pid, 0, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
 	}
 	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError

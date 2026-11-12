@@ -3168,7 +3168,10 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.Cancel = func() error {
+		_, err := proc.StopChild(cmd.Process.Pid, 0, nil)
+		return err
+	}
 	// stderr — в файл, не в трубу: оставленный пунктом фоновый процесс держал бы трубу открытой, и Wait
 	// ждал бы его мимо таймаута. Остаток группы после выхода bash убивается: проверка не оставляет процессов.
 	stderr, err := os.CreateTemp("", "tk-plan-*")
@@ -3181,8 +3184,8 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	err = cmd.Run()
 	if cmd.Process != nil {
 		// ESRCH — группа уже пуста: остатков нет.
-		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-			return planResult{item: item, exit: 1, stderr: "kill leftover processes: " + killErr.Error()}
+		if _, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil); stopErr != nil {
+			return planResult{item: item, exit: 1, stderr: "stop leftover processes: " + stopErr.Error()}
 		}
 	}
 	result := planResult{item: item, stderr: firstLine(readHead(stderr.Name()))}
