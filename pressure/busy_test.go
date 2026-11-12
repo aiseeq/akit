@@ -90,7 +90,8 @@ func TestRule(t *testing.T) {
 }
 
 func TestHalfRule(t *testing.T) {
-	until := time.Date(2026, 11, 12, 21, 30, 0, 0, time.Local)
+	// Срок — от текущего времени: Why показывает день у срока не сегодня, а тест не должен зависеть от даты прогона.
+	until := time.Now().Add(time.Hour).Truncate(time.Minute)
 	cases := []struct {
 		name   string
 		load   Load
@@ -112,7 +113,7 @@ func TestHalfRule(t *testing.T) {
 		}
 	}
 	v := Rule(cases[0].load, DefaultLimits, nil)
-	if got := v.Why(); !strings.Contains(got, "half until 21:30 (lead: игра)") {
+	if got, want := v.Why(), "half until "+quietClock(until, time.Now())+" (lead: игра)"; !strings.Contains(got, want) {
 		t.Errorf("half reason = %q", got)
 	}
 	// Load average использует тот же порог half.
