@@ -187,13 +187,28 @@ func TestStderrCaptureUnlinkedWhileCommandRuns(t *testing.T) {
 }
 
 func TestBackgroundChildDoesNotHoldOutputPipes(t *testing.T) {
-	opts := options{command: []string{"sh", "-c", "sleep 5 &"}, runs: 1, okExit: map[int]bool{0: true}}
+	pidPath := filepath.Join(t.TempDir(), "background.pid")
+	opts := options{command: []string{"sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"", "sh", pidPath}, runs: 1, okExit: map[int]bool{0: true}}
 	started := time.Now()
 	res, duration, err := runCommand(opts, nil)
 	elapsed := time.Since(started)
-	cleanupResult(res)
 	if err != nil || duration > time.Second || elapsed > time.Second {
 		t.Fatalf("background child delayed completion: duration %v elapsed %v err %v", duration, elapsed, err)
+	}
+	defer cleanupResult(res)
+	pidBytes, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat, err := proc.ReadStat("/proc", pid); err != nil || stat.State == "Z" || stat.State == "X" {
+		t.Fatalf("ordinary completion stopped background child: stat=%+v err=%v", stat, err)
+	}
+	if _, err := proc.StopChildGroup(res.processGroup, 0, syscall.SIGKILL); err != nil {
+		t.Fatalf("clean test command group: %v", err)
 	}
 }
 

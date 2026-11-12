@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -300,6 +303,78 @@ func TestAdd(t *testing.T){os.WriteFile("started",[]byte("yes"),0600);for i:=0;i
 	}
 	f.unchanged(t)
 }
+
+func TestSignalWaitsForGraftButNotItsDetachedChild(t *testing.T) {
+	if os.Getenv("MUT_SIGNAL_HELPER") == "1" {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		defer signal.Stop(signals)
+		verdict := runTests([]string{os.Getenv("MUT_FAKE_GRAFT")}, []string{"./..."}, signals)
+		os.Exit(verdict.code)
+	}
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	pidFile := filepath.Join(dir, "sleep.pid")
+	fakeGraft := filepath.Join(dir, "graft")
+	script := "#!/bin/sh\n" +
+		"sleep 30 </dev/null >/dev/null 2>&1 &\n" +
+		"echo $! > \"$MUT_SLEEP_PID\"\n" +
+		"echo ready > \"$MUT_READY\"\n" +
+		"trap 'exit 143' TERM\n" +
+		"while :; do wait; done\n"
+	if err := os.WriteFile(fakeGraft, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSignalWaitsForGraftButNotItsDetachedChild$")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "MUT_SIGNAL_HELPER=1", "MUT_FAKE_GRAFT="+fakeGraft, "MUT_READY="+ready, "MUT_SLEEP_PID="+pidFile)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+			t.Errorf("clean helper process group: %v", err)
+		}
+	})
+	waitForMarker(t, ready)
+	start := time.Now()
+	if err := proc.SignalChild(cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 143 {
+		t.Fatalf("mut exit: %v, want 143", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("mut waited for the detached child: %v", elapsed)
+	}
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, err := proc.ReadStat("/proc", pid)
+	if err != nil || stat.State == "Z" || stat.State == "X" {
+		t.Fatalf("detached child was not left for group cleanup: stat=%+v err=%v", stat, err)
+	}
+}
+
+func waitForMarker(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("marker did not appear: %s", path)
+}
+
 func TestSpecMultiple(t *testing.T) {
 	f := newFixture(t, goodTest)
 	spec := filepath.Join(f.dir, "spec")

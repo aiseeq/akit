@@ -522,15 +522,23 @@ func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 	case sig := <-sigc:
 		var signalErr error
 		if sig != os.Interrupt {
-			_, signalErr = proc.StopChild(cmd.Process.Pid, 24*time.Hour, func() error {
-				forwarded, ok := sig.(syscall.Signal)
-				if !ok {
-					return fmt.Errorf("unsupported signal %v", sig)
-				}
-				return proc.SignalChild(cmd.Process.Pid, forwarded)
-			})
+			forwarded, ok := sig.(syscall.Signal)
+			if !ok {
+				signalErr = fmt.Errorf("unsupported signal %v", sig)
+			} else {
+				signalErr = proc.SignalChild(cmd.Process.Pid, forwarded)
+			}
 		}
-		err = <-done
+		timer := time.NewTimer(24 * time.Hour)
+		select {
+		case err = <-done:
+			timer.Stop()
+		case <-timer.C:
+			if _, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil); stopErr != nil {
+				signalErr = errors.Join(signalErr, fmt.Errorf("kill graft tree after timeout: %w", stopErr))
+			}
+			err = <-done
+		}
 		text := fmt.Sprintf("error: interrupted (%v)", sig)
 		if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
 			text += ": child signal: " + signalErr.Error()

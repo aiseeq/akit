@@ -194,11 +194,12 @@ func parseExitCodes(s string) (map[int]bool, error) {
 const maxStderrBytes = 64 * 1024
 
 type result struct {
-	code        int
-	stderrFile  *os.File
-	stderrData  []byte
-	interrupted int
-	signalName  string
+	code         int
+	stderrFile   *os.File
+	stderrData   []byte
+	interrupted  int
+	signalName   string
+	processGroup *exec.Cmd
 }
 type commandRunner func(options) (result, time.Duration, error)
 
@@ -462,12 +463,9 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		cleanup()
 		return result{interrupted: int(syscall.SIGTERM)}, time.Since(started), nil
 	case err := <-wait:
-		if _, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); stopErr != nil {
-			fmt.Fprintf(os.Stderr, "timeit: stop command group: %v\n", stopErr)
-		}
 		activeCommand.CompareAndSwap(cmd, nil)
 		duration := time.Since(started)
-		res := result{stderrFile: stderrFile}
+		res := result{stderrFile: stderrFile, processGroup: cmd}
 		if err == nil {
 			return res, duration, nil
 		}

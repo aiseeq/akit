@@ -26,7 +26,9 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 }
 
 // StopChildGroup stops the process group started by cmd with Setpgid or Setsid.
-// It accepts a waited command whose leader has exited while group members remain.
+// cmd must have been started by the caller with Start or Run; constructing a
+// Cmd around an existing Process is not supported. It accepts a waited command
+// whose leader has exited while group members remain.
 // Reuse of the now-free numeric group ID between Wait and this call has the
 // same narrow risk as the former Kill(-pid): a new unrelated group could take
 // that ID before cleanup.
@@ -36,21 +38,21 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 		return StopResult{}, err
 	}
 	self := os.Getpid()
-	leaderPresent, owned, err := inspectChildGroupLeader(cmd, self, pid)
+	leaderPresent, directChild, groupLeader, err := inspectChildGroupLeader(cmd, self, pid)
 	if err != nil {
 		return StopResult{}, err
 	}
-	if !owned {
-		return StopResult{AlreadyExited: true}, nil
+	if leaderPresent && directChild && !groupLeader {
+		return StopChild(pid, grace, func() error { return SignalChild(pid, sig) })
 	}
 	safe, err := safeToSignalChildGroup(pid, self)
 	if err != nil {
 		return StopResult{}, err
 	}
 	if !safe {
-		if leaderPresent {
-			return StopResult{}, fmt.Errorf("refusing unsafe process group ID %d", pid)
-		}
+		return StopResult{}, fmt.Errorf("refusing unsafe process group ID %d", pid)
+	}
+	if leaderPresent && !directChild {
 		return StopResult{AlreadyExited: true}, nil
 	}
 
@@ -181,18 +183,19 @@ func sameDirectChild(self int, before, after Stat) bool {
 	return before.Ppid == self && after.Ppid == self && after.Start == before.Start
 }
 
-func inspectChildGroupLeader(cmd *exec.Cmd, self, pid int) (present, owned bool, err error) {
+func inspectChildGroupLeader(cmd *exec.Cmd, self, pid int) (present, directChild, groupLeader bool, err error) {
 	target, err := ReadStat("/proc", pid)
 	if Gone(err) {
-		return false, true, nil
+		return false, false, false, nil
 	}
 	if err != nil {
-		return false, false, fmt.Errorf("read command process %d: %w", pid, err)
+		return false, false, false, fmt.Errorf("read command process %d: %w", pid, err)
 	}
-	if !commandOwnsGroupLeader(cmd, self, target) {
-		return false, false, nil
+	directChild = target.Ppid == self
+	if !directChild {
+		return true, false, false, nil
 	}
-	return true, true, nil
+	return true, true, commandOwnsGroupLeader(cmd, self, target), nil
 }
 
 func safeToSignalChildGroup(pgid, self int) (bool, error) {
@@ -212,12 +215,11 @@ func safeToSignalChildGroup(pgid, self int) (bool, error) {
 }
 
 func commandOwnsGroupLeader(cmd *exec.Cmd, self int, target Stat) bool {
-	return cmd != nil && cmd.Process != nil && cmd.ProcessState == nil &&
-		target.Ppid == self && target.Pgid == cmd.Process.Pid
+	return cmd != nil && cmd.Process != nil && target.Ppid == self && target.Pgid == cmd.Process.Pid
 }
 
 func safeChildGroup(pgid, ownPGID, parentPGID, sessionID int) bool {
-	return pgid > 1 && pgid != ownPGID && pgid != parentPGID && pgid != sessionID
+	return pgid != ownPGID && pgid != parentPGID && pgid != sessionID
 }
 
 // StopFromShell sends sig to the target and the descendants observed before the
