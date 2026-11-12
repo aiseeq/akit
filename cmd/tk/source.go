@@ -101,12 +101,8 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 500 * time.Millisecond
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		_, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
-		return err
+	if err := proc.CancelByStop(cmd, 0, syscall.SIGKILL); err != nil {
+		return nil, nil, err
 	}
 	var stdout, stderr cappedBuffer
 	cmd.Stdout = &stdout

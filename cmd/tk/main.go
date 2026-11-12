@@ -3172,9 +3172,8 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		_, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
-		return err
+	if err := proc.CancelByStop(cmd, 0, syscall.SIGKILL); err != nil {
+		return planResult{item: item, exit: 1, stderr: err.Error()}
 	}
 	// stderr — в файл, не в трубу: оставленный пунктом фоновый процесс держал бы трубу открытой, и Wait
 	// ждал бы его мимо таймаута. Остаток группы после выхода bash убивается: проверка не оставляет процессов.

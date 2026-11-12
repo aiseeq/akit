@@ -128,8 +128,7 @@ var readSignalChildStat = ReadStat
 var beforeSignalChildPidfdOpen = func(int) {}
 var openSignalChildPidfd = unix.PidfdOpen
 
-// SignalChild signals only a direct child after checking its parent and start
-// time both before and after opening a pidfd. The pidfd pins identity at send.
+// SignalChild signals only the verified direct child; its descendants are untouched and the child decides when to exit.
 func SignalChild(pid int, sig syscall.Signal) error {
 	if err := validateSignalTarget(pid, sig); err != nil {
 		return err

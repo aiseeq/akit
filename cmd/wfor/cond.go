@@ -397,9 +397,8 @@ func (c *okCond) check(ctx context.Context) (bool, error) {
 	cmd := exec.CommandContext(ctx, "bash", "-c", c.cmd)
 	c.lastCommand = cmd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		_, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL)
-		return err
+	if err := proc.CancelByStop(cmd, 0, syscall.SIGKILL); err != nil {
+		return false, err
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()

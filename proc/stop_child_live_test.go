@@ -369,6 +369,64 @@ func TestSignalChildOnlySignalsDirectChild(t *testing.T) {
 	}
 }
 
+func TestSignalChildLeavesGrandchildAlive(t *testing.T) {
+	dir := t.TempDir()
+	marker, grandchild := filepath.Join(dir, "term"), filepath.Join(dir, "grandchild")
+	cmd := exec.Command("sh", "-c", `trap 'echo term > "$1"' TERM; sleep 30 & echo $! > "$2"; wait`, "sh", marker, grandchild)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	childPID := cmd.Process.Pid
+	deadline := time.Now().Add(2 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(grandchild); err == nil {
+			ready = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatal("grandchild did not start")
+	}
+	if err := SignalChild(childPID, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("child trap did not write marker: %v", err)
+	}
+	pidBytes, err := os.ReadFile(grandchild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grandchildPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(grandchildPID, 0); err != nil {
+		t.Fatalf("grandchild was not left alive: %v", err)
+	}
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+		t.Fatalf("clean up test process group: %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("child survived test cleanup")
+	}
+}
+
 func TestSignalChildRejectsDescendant(t *testing.T) {
 	pidPath := filepath.Join(t.TempDir(), "grandchild.pid")
 	a := exec.Command("sh", "-c", "sleep 30 & echo $! > \"$1\"; wait", "sh", pidPath)
