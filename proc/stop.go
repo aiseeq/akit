@@ -2,14 +2,18 @@ package proc
 
 import "errors"
 
-// StopResult reports an already exited target, the number sent SIGKILL, and
-// whether StopCmd had to fall back to signaling only the direct child.
+// StopResult reports an already exited target, the number of distinct
+// processes sent the requested signal by StopDescendants or StopSession, the
+// number sent SIGKILL, and whether StopCmd had to fall back to signaling only
+// the direct child.
 // Killed is informational: a process is identified by PID and start time,
 // which has clock-tick resolution, so a PID reused within the same tick is
 // counted once even if both processes were sent SIGKILL.
 type StopResult struct {
 	AlreadyExited bool
-	Killed        int
+	// Signaled counts distinct processes that received the requested signal.
+	Signaled int
+	Killed   int
 	// Degraded reports that StopCmd used direct-child os.Process signaling
 	// because pidfd_open was unavailable. Descendants were not inspected.
 	Degraded bool

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1288,7 +1289,6 @@ func TestPlanItemStopsLeftoverChild(t *testing.T) {
 	dir := t.TempDir()
 	start := time.Now()
 	result := runPlanItem(dir, planJSON{Name: "bg", Cmd: "sleep 3 & echo $! >pid; echo first >&2"}, 5*time.Second)
-	// Two seconds still tells «stopped the leftover» from «waited for sleep 3», and leaves room for a loaded machine.
 	if elapsed := time.Since(start); elapsed > 2*time.Second || result.exit != 0 || result.timedOut || result.stderr != "first" {
 		t.Fatalf("leftover child: %v %#v", elapsed, result)
 	}
@@ -1300,14 +1300,34 @@ func TestPlanItemStopsLeftoverChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+	for attempt := range 2 {
 		stat, err := proc.ReadStat("/proc", pid)
 		if err != nil || stat.State == "Z" || stat.State == "X" {
-			break
+			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("leftover child %d still alive", pid)
+		if attempt == 0 {
+			time.Sleep(50 * time.Millisecond)
 		}
+	}
+	t.Fatalf("leftover child %d still alive immediately after runPlanItem", pid)
+}
+
+func TestPlanItemWarnsWhenCancelStopDegrades(t *testing.T) {
+	oldCancel, oldWarning := cancelByStopWithObserver, writeDegradedStopWarning
+	var warning bytes.Buffer
+	cancelByStopWithObserver = func(cmd *exec.Cmd, _ time.Duration, _ syscall.Signal, observer func(bool, error)) error {
+		observer(true, nil)
+		return nil
+	}
+	writeDegradedStopWarning = func() {
+		fmt.Fprintln(&warning, "остановлен только прямой потомок: pidfd недоступен")
+	}
+	t.Cleanup(func() {
+		cancelByStopWithObserver, writeDegradedStopWarning = oldCancel, oldWarning
+	})
+	result := runPlanItem(t.TempDir(), planJSON{Name: "degraded", Cmd: "exit 0"}, time.Second)
+	if result.exit != 0 || !strings.Contains(warning.String(), "остановлен только прямой потомок: pidfd недоступен") {
+		t.Fatalf("result=%+v warning=%q", result, warning.String())
 	}
 }
 

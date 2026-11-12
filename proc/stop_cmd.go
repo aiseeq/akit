@@ -42,6 +42,27 @@ func validateCmdPID(pid int) error {
 	return nil
 }
 
+func killValidatedCmd(cmd *exec.Cmd, sig syscall.Signal) (StopResult, error) {
+	process, err := validateCmdSignalState(cmd, sig, true)
+	if err != nil {
+		return StopResult{}, err
+	}
+	if err := directProcessKill(process); err != nil {
+		if errors.Is(err, os.ErrProcessDone) {
+			return StopResult{AlreadyExited: true}, nil
+		}
+		return StopResult{}, err
+	}
+	return StopResult{Killed: 1}, nil
+}
+
+func stopChildGroupDirect(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
+	if grace < 0 || grace > 24*time.Hour {
+		return StopResult{}, errors.New("grace must be between 0 and 24h")
+	}
+	return killValidatedCmd(cmd, sig)
+}
+
 func validateCmdStopState(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, checkProcessState bool) (*os.Process, error) {
 	if grace < 0 || grace > 24*time.Hour {
 		return nil, errors.New("grace must be between 0 and 24h")

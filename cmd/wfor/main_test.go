@@ -17,6 +17,26 @@ import (
 	"github.com/aiseeq/akit/proc"
 )
 
+func TestOKCondWarnsWhenCancelStopDegrades(t *testing.T) {
+	oldCancel, oldWarning := cancelByStopWithObserver, writeDegradedStopWarning
+	warning := ""
+	cancelByStopWithObserver = func(cmd *exec.Cmd, _ time.Duration, _ syscall.Signal, observer func(bool, error)) error {
+		observer(true, nil)
+		return nil
+	}
+	writeDegradedStopWarning = func() {
+		warning += "остановлен только прямой потомок: pidfd недоступен\n"
+	}
+	t.Cleanup(func() {
+		cancelByStopWithObserver, writeDegradedStopWarning = oldCancel, oldWarning
+	})
+	cond := &okCond{cmd: "true", every: time.Second, now: time.Now}
+	ok, checkErr := cond.check(context.Background())
+	if !ok || checkErr != nil || !strings.Contains(warning, "остановлен только прямой потомок: pidfd недоступен") {
+		t.Fatalf("check=(%v,%v), warning=%q", ok, checkErr, warning)
+	}
+}
+
 func TestMain(m *testing.M) {
 	if err := proc.BecomeChildSubreaper(); err != nil {
 		panic(err)

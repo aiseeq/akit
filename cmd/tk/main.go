@@ -3156,6 +3156,11 @@ var shellEnvDropped = []string{"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS",
 	"GCONV_PATH", "GETCONF_DIR", "GLIBC_TUNABLES", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH", "NIS_PATH", "NLSPATH",
 	"RESOLV_HOST_CONF", "RES_OPTIONS", "TZDIR"}
 
+var cancelByStopWithObserver = proc.CancelByStopWithObserver
+var writeDegradedStopWarning = func() {
+	fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
+}
+
 func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -3172,7 +3177,8 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	})
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := proc.CancelByStop(cmd, 0, syscall.SIGKILL); err != nil {
+	var cancelDegraded bool
+	if err := cancelByStopWithObserver(cmd, 0, syscall.SIGKILL, func(degraded bool, _ error) { cancelDegraded = degraded }); err != nil {
 		return planResult{item: item, exit: 1, stderr: err.Error()}
 	}
 	// stderr — в файл, не в трубу: оставленный пунктом фоновый процесс держал бы трубу открытой, и Wait
@@ -3185,6 +3191,9 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	defer stderr.Close()
 	cmd.Stderr = stderr
 	err = cmd.Run()
+	if cancelDegraded {
+		writeDegradedStopWarning()
+	}
 	if cmd.Process != nil {
 		// ESRCH — группа уже пуста: остатков нет.
 		if _, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); stopErr != nil {

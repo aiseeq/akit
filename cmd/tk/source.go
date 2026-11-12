@@ -16,7 +16,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/queuegate"
 	"github.com/aiseeq/akit/secretmask"
 )
@@ -102,7 +101,7 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 500 * time.Millisecond
 	var cancelDegraded bool
-	if err := proc.CancelByStopWithObserver(cmd, 0, syscall.SIGKILL, func(degraded bool, _ error) { cancelDegraded = degraded }); err != nil {
+	if err := cancelByStopWithObserver(cmd, 0, syscall.SIGKILL, func(degraded bool, _ error) { cancelDegraded = degraded }); err != nil {
 		return nil, nil, err
 	}
 	var stdout, stderr cappedBuffer
@@ -110,7 +109,7 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if cancelDegraded {
-		fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
+		writeDegradedStopWarning()
 	}
 	if stdout.overflow || stderr.overflow {
 		return nil, stderr.Bytes(), errors.New("output over 1 MiB")

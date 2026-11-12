@@ -118,6 +118,85 @@ func TestStopOwnedProcessesPreflightsPidfdsBeforeAnySignal(t *testing.T) {
 	}
 }
 
+func TestStopOwnedProcessesLaterPidfdFailureReportsEarlierSignals(t *testing.T) {
+	oldSignal := signalProcess
+	signals := 0
+	signalProcess = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() { signalProcess = oldSignal })
+	opened := make(map[int]bool)
+	ops := ownedStopOps{
+		scan: func() ([]int, error) {
+			if opened[40] {
+				return []int{41}, nil
+			}
+			return []int{40}, nil
+		},
+		open: func(pid int) (*trackedOwnedProcess, error) {
+			if pid == 41 {
+				return nil, fmt.Errorf("later target: %w", ErrPidfdUnavailable)
+			}
+			fd, err := unix.Open("/dev/null", unix.O_RDONLY, 0)
+			if err != nil {
+				return nil, err
+			}
+			opened[pid] = true
+			return &trackedOwnedProcess{identity: processIdentity{pid: pid, start: "1"}, tracked: &trackedProcess{fd: fd, start: "1"}}, nil
+		},
+	}
+	result, err := stopOwnedProcesses(20*time.Millisecond, syscall.SIGTERM, ops)
+	if !errors.Is(err, ErrPidfdUnavailable) || signals != 1 || result.Signaled != 1 || result.AlreadyExited {
+		t.Fatalf("later pidfd failure = (%+v, %v), signals=%d; want one earlier signal and ErrPidfdUnavailable", result, err, signals)
+	}
+}
+
+func TestStopSessionLeaderExitAfterMemberPreflightDoesNotSignalBatch(t *testing.T) {
+	fd, err := unix.Open("/dev/null", unix.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signals int
+	oldSignal := signalProcess
+	signalProcess = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() { signalProcess = oldSignal })
+	checks := 0
+	ops := ownedStopOps{
+		guard: func() error {
+			checks++
+			if checks == 1 {
+				return nil
+			}
+			return fmt.Errorf("%w: synthetic leader 50 exited", ErrSessionLeaderGone)
+		},
+		scan: func() ([]int, error) { return []int{51}, nil },
+		open: func(pid int) (*trackedOwnedProcess, error) {
+			return &trackedOwnedProcess{identity: processIdentity{pid: pid, start: "200"}, tracked: &trackedProcess{fd: fd, start: "200"}}, nil
+		},
+	}
+	_, err = stopOwnedProcesses(0, syscall.SIGTERM, ops)
+	if !errors.Is(err, ErrSessionLeaderGone) || signals != 0 {
+		t.Fatalf("leader exit after preflight = err %v, signals %d; want ErrSessionLeaderGone and no signal to replacement member 51", err, signals)
+	}
+}
+
+func TestStopSessionLeaderExitBeforeNextScanDoesNotSelectMembers(t *testing.T) {
+	var scans, signals int
+	oldSignal := signalProcess
+	signalProcess = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() { signalProcess = oldSignal })
+	ops := ownedStopOps{
+		guard: func() error { return fmt.Errorf("%w: synthetic leader exited", ErrSessionLeaderGone) },
+		scan: func() ([]int, error) {
+			scans++
+			return []int{51}, nil
+		},
+		open: func(int) (*trackedOwnedProcess, error) { return nil, errors.New("unexpected candidate open") },
+	}
+	_, err := stopOwnedProcesses(0, syscall.SIGTERM, ops)
+	if !errors.Is(err, ErrSessionLeaderGone) || scans != 0 || signals != 0 {
+		t.Fatalf("leader exit before scan: err=%v scans=%d signals=%d; want refusal before scanning or signaling", err, scans, signals)
+	}
+}
+
 func TestSignalDescendantSignalsGrandchild(t *testing.T) {
 	dir := t.TempDir()
 	marker, ready, pidPath := filepath.Join(dir, "term"), filepath.Join(dir, "ready"), filepath.Join(dir, "pid")
@@ -245,7 +324,7 @@ func TestSignalDescendantRejectsStartChangeAfterPidfdOpen(t *testing.T) {
 func TestStopSessionStopsLiveSessionAndLeavesOtherSession(t *testing.T) {
 	dir := t.TempDir()
 	marker, ready, memberFile := filepath.Join(dir, "term"), filepath.Join(dir, "ready"), filepath.Join(dir, "member.pid")
-	cmd := exec.Command("sh", "-c", `trap 'echo term > "$1"; exit 0' TERM; echo ready > "$3"; sleep 30 & echo $! > "$2"; wait`, "sh", marker, memberFile, ready)
+	cmd := exec.Command("sh", "-c", `trap 'echo term > "$1"; while :; do :; done' TERM; echo ready > "$3"; sleep 30 & echo $! > "$2"; wait`, "sh", marker, memberFile, ready)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -269,8 +348,8 @@ func TestStopSessionStopsLiveSessionAndLeavesOtherSession(t *testing.T) {
 	if _, err := StopSession(rec, 100*time.Millisecond, syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("session leader trap exit: %v", err)
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("session leader survived SIGKILL after grace")
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("session leader TERM trap was not observed: %v", err)

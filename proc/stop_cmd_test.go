@@ -170,6 +170,22 @@ func TestSignalCmdRefusesInvalidTargetWithoutSignaling(t *testing.T) {
 	}
 }
 
+func TestDirectStopChildGroupRejectsUnsafePIDBeforeKill(t *testing.T) {
+	oldKill := directProcessKill
+	calls := 0
+	directProcessKill = func(*os.Process) error { calls++; return nil }
+	t.Cleanup(func() { directProcessKill = oldKill })
+	for _, pid := range []int{-1, 0, -2, os.Getpid(), os.Getppid()} {
+		cmd := &exec.Cmd{Process: &os.Process{Pid: pid}}
+		if _, err := stopChildGroupDirect(cmd, 0, syscall.SIGTERM); err == nil {
+			t.Errorf("stopChildGroupDirect accepted PID %d", pid)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("direct kill calls = %d, want 0", calls)
+	}
+}
+
 func TestSignalCmdAndStopCmdRejectUnsafeAndForeignPIDs(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
