@@ -70,7 +70,7 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 		}
 		return StopResult{AlreadyExited: true}, nil
 	}
-	signaledTargets := make(map[int]unix.Signal, len(initial))
+	signaledTargets := make(map[int]signalMark, len(initial))
 	var failures stopFailures
 	sent := requestOwnedTargets("/proc", self, pid, initial, unix.Signal(sig), signaledTargets, &failures)
 	var result StopResult

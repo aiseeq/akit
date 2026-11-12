@@ -166,10 +166,10 @@ func commandMembership(chain []processIdentity, pid, leader, pgid int) bool {
 	return false
 }
 
-func drainCommandTargets(root string, self, leader int, signaledTargets map[int]unix.Signal, failures *stopFailures) int {
+func drainCommandTargets(root string, self, leader int, signaledTargets map[int]signalMark, failures *stopFailures) int {
 	killed, emptyScans := 0, 0
 	deadline := time.Now().Add(500 * time.Millisecond)
-	for signaledTargets[leader] != 0 && time.Now().Before(deadline) {
+	for signaledTargets[leader].sig != 0 && time.Now().Before(deadline) {
 		stat, err := ReadStat(root, leader)
 		if Gone(err) || err == nil && (stat.State == "Z" || stat.State == "X") {
 			break
@@ -197,7 +197,7 @@ func drainCommandTargets(root string, self, leader int, signaledTargets map[int]
 		if len(signaledTargets) == priorSignals {
 			allSignaled := true
 			for _, pid := range targets {
-				allSignaled = allSignaled && signaledTargets[pid] != 0
+				allSignaled = allSignaled && signaledTargets[pid].sig != 0
 			}
 			if !allSignaled {
 				return killed
@@ -207,7 +207,7 @@ func drainCommandTargets(root string, self, leader int, signaledTargets map[int]
 	return killed
 }
 
-func requestOwnedTargets(root string, self, leader int, targets []int, sig unix.Signal, signaledTargets map[int]unix.Signal, failures *stopFailures) int {
+func requestOwnedTargets(root string, self, leader int, targets []int, sig unix.Signal, signaledTargets map[int]signalMark, failures *stopFailures) int {
 	sent := 0
 	for _, pid := range targets {
 		tracked, err := verifiedCommandTarget(root, self, leader, pid)
@@ -226,11 +226,12 @@ func requestOwnedTargets(root string, self, leader int, targets []int, sig unix.
 			failures.add(pid, fmt.Errorf("signal %s: %w", unix.SignalName(sig), err))
 			continue
 		}
-		if signaledTargets[pid] != unix.SIGKILL { // Killed counts each process once
+		// Killed counts each process once; a reused PID is a new process.
+		if mark := signaledTargets[pid]; mark.start != tracked.start || mark.sig != unix.SIGKILL {
 			if sig == unix.SIGKILL {
 				sent++
 			}
-			signaledTargets[pid] = sig
+			signaledTargets[pid] = signalMark{sig: sig, start: tracked.start}
 		}
 	}
 	return sent
@@ -294,4 +295,10 @@ func directCommandGroupChild(pid, leader, self int, stat Stat) bool {
 
 func commandGroupZombie(pid, leader, self int, stat Stat) bool {
 	return directCommandGroupChild(pid, leader, self, stat) && stat.State == "Z"
+}
+
+// signalMark records the strongest signal sent to one process identity.
+type signalMark struct {
+	sig   unix.Signal
+	start string
 }

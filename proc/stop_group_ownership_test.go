@@ -598,3 +598,21 @@ func waitFile(path string, timeout time.Duration) error {
 	}
 	return os.ErrDeadlineExceeded
 }
+
+func TestRequestOwnedTargetsCountsReusedPIDAsNewProcess(t *testing.T) {
+	cmd := startGroupLeader(t, "sleep", "30")
+	pid := cmd.Process.Pid
+	marks := map[int]signalMark{pid: {sig: unix.SIGKILL, start: "earlier-process"}}
+	var failures stopFailures
+	sent := requestOwnedTargets("/proc", os.Getpid(), pid, []int{pid}, unix.SIGKILL, marks, &failures)
+	if err := failures.err(); err != nil {
+		t.Fatal(err)
+	}
+	if sent != 1 {
+		t.Fatalf("sent = %d, want the process behind a reused PID counted", sent)
+	}
+	if again := requestOwnedTargets("/proc", os.Getpid(), pid, []int{pid}, unix.SIGKILL, marks, &failures); again != 0 {
+		t.Fatalf("second SIGKILL to the same process counted again: %d", again)
+	}
+	_ = cmd.Wait()
+}
