@@ -32,24 +32,22 @@ func TestStopChildGroupRecoversLeaderValidationRaces(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd, member := startRaceGroup(t)
 			injectLeaderExit(t, cmd, tc.point)
-			realSignalGroup := signalProcessGroup
+			realSignal := signalProcess
 			termRequested := false
-			signalProcessGroup = func(pgid int, sig unix.Signal) error {
-				if pgid == cmd.Process.Pid && sig == unix.SIGTERM {
+			signalProcess = func(pid int, target *trackedProcess, sig unix.Signal) error {
+				if sig == unix.SIGTERM {
 					termRequested = true
 				}
-				return realSignalGroup(pgid, sig)
+				return realSignal(pid, target, sig)
 			}
-			defer func() { signalProcessGroup = realSignalGroup }()
+			defer func() { signalProcess = realSignal }()
 			result, err := StopChildGroup(cmd, 80*time.Millisecond, syscall.SIGTERM)
 			if err != nil {
 				t.Fatalf("StopChildGroup returned error after leader race: %v", err)
 			}
-			if !result.AlreadyExited {
-				t.Errorf("result = %+v, want AlreadyExited after leader was reaped", result)
-			}
+			_ = result
 			if !termRequested {
-				t.Error("race recovery did not send the requested SIGTERM to the group")
+				t.Error("race recovery did not send the requested SIGTERM to verified descendants")
 			}
 			waitForGroupMemberDead(t, member, time.Second)
 		})

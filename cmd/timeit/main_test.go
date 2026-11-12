@@ -18,6 +18,13 @@ import (
 	"github.com/aiseeq/akit/proc"
 )
 
+func TestMain(m *testing.M) {
+	if err := proc.BecomeChildSubreaper(); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
+
 func TestParseArgs(t *testing.T) {
 	opts, err := parseArgs([]string{"--runs", "3", "--budget", "12s", "--limit", "20s", "--ok-exit", "0,3", "--fail-on-stderr", "bad", "--stdin", "in", "--", "echo", "-n"})
 	if err != nil {

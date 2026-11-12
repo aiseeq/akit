@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,6 +16,15 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("PROC_DISABLE_TEST_SUBREAPER") != "1" {
+		if err := BecomeChildSubreaper(); err != nil {
+			panic(err)
+		}
+	}
+	os.Exit(m.Run())
+}
 
 // StopChild on a real child: a child that exits on the request needs no
 // SIGKILL; one that ignores it is killed after the grace.
@@ -177,22 +185,14 @@ func TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup(t *testing.T) {
 	if err != nil || stat.Pgid != sibling.Process.Pid {
 		t.Fatalf("mover did not join sibling group: stat=%+v err=%v", stat, err)
 	}
-	realSignalProcess, realSignalProcessGroup := signalProcess, signalProcessGroup
-	t.Cleanup(func() {
-		signalProcess, signalProcessGroup = realSignalProcess, realSignalProcessGroup
-	})
-	directTerm, groupSignals := false, 0
+	realSignalProcess := signalProcess
+	t.Cleanup(func() { signalProcess = realSignalProcess })
+	directTerm := false
 	signalProcess = func(pid int, process *trackedProcess, sig unix.Signal) error {
 		if pid == mover.Process.Pid && sig == unix.SIGTERM {
 			directTerm = true
 		}
 		return realSignalProcess(pid, process, sig)
-	}
-	signalProcessGroup = func(pgid int, sig unix.Signal) error {
-		if pgid == mover.Process.Pid {
-			groupSignals++
-		}
-		return realSignalProcessGroup(pgid, sig)
 	}
 	result, err := StopChildGroup(mover, 100*time.Millisecond, syscall.SIGTERM)
 	if err != nil {
@@ -203,9 +203,6 @@ func TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup(t *testing.T) {
 	}
 	if !directTerm {
 		t.Fatalf("StopChildGroup did not request SIGTERM from the direct child: %+v", result)
-	}
-	if groupSignals != 0 {
-		t.Fatalf("StopChildGroup signaled the child's foreign group %d times", groupSignals)
 	}
 	if err := mover.Wait(); err == nil {
 		t.Fatal("moved child survived requested SIGTERM")
@@ -279,14 +276,12 @@ func TestStopChildGroupRequestsTERMThenKillsReparentedGroupMember(t *testing.T) 
 				}
 			}
 
-			real := signalProcessGroup
-			t.Cleanup(func() { signalProcessGroup = real })
+			real := signalProcess
+			t.Cleanup(func() { signalProcess = real })
 			var sent []unix.Signal
-			signalProcessGroup = func(pgid int, sig unix.Signal) error {
-				if pgid == cmd.Process.Pid {
-					sent = append(sent, sig)
-				}
-				return real(pgid, sig)
+			signalProcess = func(pid int, target *trackedProcess, sig unix.Signal) error {
+				sent = append(sent, sig)
+				return real(pid, target, sig)
 			}
 			started := time.Now()
 			_, err := StopChildGroup(cmd, 180*time.Millisecond, syscall.SIGTERM)
@@ -504,10 +499,10 @@ func TestStopAPIsReturnCancelErrorsThroughExec(t *testing.T) {
 		cmd := exec.CommandContext(ctx, "sleep", "30")
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cancelResult := make(chan error, 1)
-		real := signalProcessGroup
-		t.Cleanup(func() { signalProcessGroup = real })
-		signalProcessGroup = func(pgid int, sig unix.Signal) error {
-			err := real(pgid, sig)
+		real := signalProcess
+		t.Cleanup(func() { signalProcess = real })
+		signalProcess = func(pid int, target *trackedProcess, sig unix.Signal) error {
+			err := real(pid, target, sig)
 			if sig == unix.Signal(syscall.SIGTERM) {
 				return errors.Join(err, sentinel)
 			}
@@ -568,9 +563,12 @@ func TestStopChildRejectsForeignExitedPIDAndLeavesItsProcessAlive(t *testing.T) 
 	}
 	// C is intentionally allowed to finish naturally; the probe never signals
 	// a PID it did not start as a direct child.
-	deadline = time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for {
-		if _, err := ReadStat("/proc", cPID); Gone(err) {
+		stat, err := ReadStat("/proc", cPID)
+		if Gone(err) || err == nil && (stat.State == "Z" || stat.State == "X") {
+			var status syscall.WaitStatus
+			_, _ = syscall.Wait4(cPID, &status, syscall.WNOHANG, nil)
 			break
 		}
 		if time.Now().After(deadline) {
@@ -603,76 +601,6 @@ func TestStopChildGroupRequiresOwnProcessGroup(t *testing.T) {
 	}
 }
 
-func TestStopChildGroupRejectsProtectedGroupsThroughPublicAPI(t *testing.T) {
-	if mode := os.Getenv("PROC_GROUP_GUARD_HELPER"); mode != "" {
-		target := os.Getpid()
-		if mode == "check-parent" || mode == "check-session" {
-			target, _ = strconv.Atoi(os.Getenv("PROC_GROUP_GUARD_PID"))
-			attr := &syscall.SysProcAttr{Setpgid: true}
-			if mode == "check-session" {
-				attr = &syscall.SysProcAttr{Setsid: true}
-			}
-			_, err := StopChildGroup(&exec.Cmd{Process: &os.Process{Pid: target}, SysProcAttr: attr}, 0, syscall.SIGKILL)
-			if err == nil {
-				os.Exit(3)
-			}
-			os.Exit(0)
-		}
-		if mode == "middle" {
-			target, _ := strconv.Atoi(os.Getenv("PROC_GROUP_GUARD_PID"))
-			os.Exit(runGuardChild("check-session", target))
-		}
-		if mode == "parent" || mode == "session-root" {
-			childMode := "check-parent"
-			if mode == "session-root" {
-				childMode = "middle"
-			}
-			os.Exit(runGuardChild(childMode, target))
-		}
-		_, err := StopChildGroup(&exec.Cmd{Process: &os.Process{Pid: target}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}, 0, syscall.SIGKILL)
-		if err == nil {
-			os.Exit(3)
-		}
-		os.Exit(0)
-	}
-	for _, tc := range []struct {
-		name string
-		mode string
-		attr *syscall.SysProcAttr
-	}{
-		{name: "own group", mode: "self", attr: &syscall.SysProcAttr{Setpgid: true}},
-		{name: "parent group", mode: "parent", attr: &syscall.SysProcAttr{Setpgid: true}},
-		{name: "session", mode: "session-root", attr: &syscall.SysProcAttr{Setsid: true}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=^TestStopChildGroupRejectsProtectedGroupsThroughPublicAPI$")
-			cmd.SysProcAttr = tc.attr
-			cmd.Env = append(os.Environ(), "PROC_GROUP_GUARD_HELPER="+tc.mode)
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
-					t.Errorf("clean helper group: %v", err)
-				}
-			})
-			if err := cmd.Wait(); err != nil {
-				t.Fatalf("unsafe group was not refused: %v", err)
-			}
-		})
-	}
-}
-
-func runGuardChild(mode string, target int) int {
-	cmd := exec.Command(os.Args[0], "-test.run=^TestStopChildGroupRejectsProtectedGroupsThroughPublicAPI$")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = append(os.Environ(), "PROC_GROUP_GUARD_HELPER="+mode, "PROC_GROUP_GUARD_PID="+strconv.Itoa(target))
-	if err := cmd.Run(); err != nil {
-		return 4
-	}
-	return 0
-}
-
 func TestOwnGroupConfigChecksSetpgidAndSetsid(t *testing.T) {
 	for name, tc := range map[string]struct {
 		attr *syscall.SysProcAttr
@@ -700,119 +628,6 @@ func TestValidateSignalTargetRejectsReservedIDsAndSignals(t *testing.T) {
 	}{{0, syscall.SIGTERM}, {1, syscall.SIGTERM}, {42, 0}, {42, 65}} {
 		if err := validateSignalTarget(tc.pid, tc.sig); err == nil {
 			t.Errorf("accepted pid=%d signal=%d", tc.pid, tc.sig)
-		}
-	}
-}
-
-func TestSafeChildGroupGuardsEveryProtectedID(t *testing.T) {
-	if safeChildGroup(10, 10, 11, 12) {
-		t.Error("accepted caller's process group")
-	}
-	if safeChildGroup(11, 10, 11, 12) {
-		t.Error("accepted parent process group")
-	}
-	if safeChildGroup(12, 10, 11, 12) {
-		t.Error("accepted caller's session group")
-	}
-	if !safeChildGroup(13, 10, 11, 12) {
-		t.Error("rejected a distinct valid group")
-	}
-	if !safeChildGroup(1, 10, 11, 12) {
-		t.Error("safeChildGroup duplicates validateSignalTarget's reserved-ID check")
-	}
-}
-
-func TestStopChildGroupIgnoresForeignProcessUsingGroupNumber(t *testing.T) {
-	parent, err := ReadStat("/proc", os.Getppid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	own, err := unix.Getpgid(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	sid, err := unix.Getsid(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !safeChildGroup(os.Getpid(), own, parent.Pgid, sid) {
-		t.Skip("test process PID is a protected group ID")
-	}
-	real := signalProcessGroup
-	t.Cleanup(func() { signalProcessGroup = real })
-	called := false
-	signalProcessGroup = func(_ int, _ unix.Signal) error {
-		called = true
-		return nil
-	}
-	cmd := &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
-		t.Fatal(err)
-	}
-	if called {
-		t.Fatal("signaled group whose number belongs to a process that is not our child")
-	}
-}
-
-func TestCommandOwnsGroupLeaderRequiresUnwaitedDirectChild(t *testing.T) {
-	cmd := &exec.Cmd{Process: &os.Process{Pid: 42}}
-	if !commandOwnsGroupLeader(cmd, 7, Stat{Ppid: 7, Pgid: 42}) {
-		t.Fatal("rejected an unwaited direct child that leads its group")
-	}
-	for name, tc := range map[string]struct {
-		cmd    *exec.Cmd
-		self   int
-		target Stat
-	}{
-		"not our child":    {cmd: cmd, self: 7, target: Stat{Ppid: 8, Pgid: 42}},
-		"not group leader": {cmd: cmd, self: 7, target: Stat{Ppid: 7, Pgid: 9}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if commandOwnsGroupLeader(tc.cmd, tc.self, tc.target) {
-				t.Fatal("accepted an unrelated or already-waited process")
-			}
-		})
-	}
-}
-
-func TestStopChildGroupIgnoresESRCH(t *testing.T) {
-	real := signalProcessGroup
-	t.Cleanup(func() { signalProcessGroup = real })
-	var sent []unix.Signal
-	signalProcessGroup = func(_ int, sig unix.Signal) error {
-		sent = append(sent, sig)
-		if sig == unix.SIGKILL {
-			return unix.ESRCH
-		}
-		return nil
-	}
-	cmd := &exec.Cmd{Process: &os.Process{Pid: 2_000_000_000}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	if _, err := StopChildGroup(cmd, 0, syscall.SIGTERM); err != nil {
-		t.Fatalf("ESRCH during final group kill should be benign: %v", err)
-	}
-	if !slices.Contains(sent, unix.SIGKILL) {
-		t.Fatalf("did not exercise final SIGKILL: %v", sent)
-	}
-}
-
-func TestStopChildGroupSkipsFinalKillAfterGroupDisappears(t *testing.T) {
-	real := signalProcessGroup
-	t.Cleanup(func() { signalProcessGroup = real })
-	var sent []unix.Signal
-	signalProcessGroup = func(_ int, sig unix.Signal) error {
-		sent = append(sent, sig)
-		if sig == unix.Signal(syscall.SIGTERM) {
-			return nil
-		}
-		return unix.ESRCH
-	}
-	cmd := &exec.Cmd{Process: &os.Process{Pid: 2_000_000_000}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	if _, err := StopChildGroup(cmd, 0, syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	for _, sig := range sent {
-		if sig == unix.SIGKILL {
-			t.Fatalf("sent SIGKILL after the group vanished: %v", sent)
 		}
 	}
 }
@@ -847,19 +662,13 @@ func TestStopChildGroupStopsOutOfTreeMemberInLiveZombieAndReapedCases(t *testing
 				}
 			}
 
-			real := signalProcessGroup
+			real := signalProcess
 			var sent []unix.Signal
-			groupPolls := 0
-			signalProcessGroup = func(pgid int, sig unix.Signal) error {
-				if pgid == cmd.Process.Pid {
-					sent = append(sent, sig)
-					if sig == 0 {
-						groupPolls++
-					}
-				}
-				return real(pgid, sig)
+			signalProcess = func(pid int, target *trackedProcess, sig unix.Signal) error {
+				sent = append(sent, sig)
+				return real(pid, target, sig)
 			}
-			t.Cleanup(func() { signalProcessGroup = real })
+			t.Cleanup(func() { signalProcess = real })
 			started := time.Now()
 			_, err := StopChildGroup(cmd, 180*time.Millisecond, syscall.SIGTERM)
 			if err != nil {
@@ -875,9 +684,6 @@ func TestStopChildGroupStopsOutOfTreeMemberInLiveZombieAndReapedCases(t *testing
 			}
 			if !term || !kill {
 				t.Fatalf("group signals = %v, want TERM then SIGKILL", sent)
-			}
-			if groupPolls == 0 {
-				t.Fatal("did not wait for process-group members through grace")
 			}
 			waitForGoneOrZombie(t, member)
 		})

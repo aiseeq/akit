@@ -18,7 +18,7 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 }
 
 // StopChildGroup kills only cmd's process on systems without Linux process
-// group inspection. It requires the caller's own started Cmd and does not stop
+// inspection. It requires the caller's own started Cmd and does not stop
 // descendants.
 func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if grace < 0 || grace > 24*time.Hour {
@@ -35,6 +35,9 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 	}
 	return StopResult{Killed: 1}, nil
 }
+
+// BecomeChildSubreaper is unsupported outside Linux.
+func BecomeChildSubreaper() error { return errors.ErrUnsupported }
 
 // SignalChild is unsupported outside Linux because a bare PID cannot be
 // verified as this process's direct child. It returns errors.ErrUnsupported

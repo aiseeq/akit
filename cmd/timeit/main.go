@@ -66,6 +66,10 @@ type options struct {
 var errHelp = errors.New("help")
 
 func main() {
+	if err := proc.BecomeChildSubreaper(); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+		fmt.Fprintf(os.Stderr, "timeit: enable child subreaper: %v\n", err)
+		os.Exit(exitError)
+	}
 	opts, err := parseArgs(os.Args[1:])
 	if errors.Is(err, errHelp) {
 		fmt.Print(usage)

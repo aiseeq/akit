@@ -163,6 +163,10 @@ type task struct {
 }
 
 func main() {
+	if err := proc.BecomeChildSubreaper(); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+		fmt.Fprintf(os.Stderr, "tk: enable child subreaper: %v\n", err)
+		os.Exit(exitUsage)
+	}
 	os.Exit(runMain(os.Args[1:], time.Now(), os.Stdout, os.Stderr))
 }
 

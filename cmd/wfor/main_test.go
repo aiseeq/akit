@@ -17,6 +17,13 @@ import (
 	"github.com/aiseeq/akit/proc"
 )
 
+func TestMain(m *testing.M) {
+	if err := proc.BecomeChildSubreaper(); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
+
 func wfor(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
 	opts, err := parseArgs(args, time.Now)

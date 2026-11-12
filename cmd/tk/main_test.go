@@ -14,10 +14,18 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
+
+func TestMain(m *testing.M) {
+	if err := proc.BecomeChildSubreaper(); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
 
 // Without a session and without --by the actor is unknown: tk refuses rather than guessing a name.
 func TestPrepareActorWithoutSessionNeedsBy(t *testing.T) {
@@ -1276,7 +1284,7 @@ func TestPlanTimeoutFlag(t *testing.T) {
 	}
 }
 
-func TestPlanItemDoesNotWaitForLeftoverChild(t *testing.T) {
+func TestPlanItemStopsLeftoverChild(t *testing.T) {
 	dir := t.TempDir()
 	start := time.Now()
 	result := runPlanItem(dir, planJSON{Name: "bg", Cmd: "sleep 3 & echo $! >pid; echo first >&2"}, 5*time.Second)
@@ -1291,7 +1299,11 @@ func TestPlanItemDoesNotWaitForLeftoverChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for deadline := time.Now().Add(2 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, err := proc.ReadStat("/proc", pid)
+		if err != nil || stat.State == "Z" || stat.State == "X" {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("leftover child %d still alive", pid)
 		}

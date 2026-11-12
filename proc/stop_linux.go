@@ -3,7 +3,6 @@ package proc
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"slices"
@@ -27,82 +26,66 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 	return stopTree("/proc", os.Getpid(), pid, grace, request, 0)
 }
 
-// StopChildGroup stops the process group started by cmd with Setpgid or Setsid.
-// cmd must have been started by the caller with Start or Run; constructing a
-// Cmd around an existing Process is not supported. It accepts a waited command
-// whose leader has exited while group members remain.
-// Reuse of the now-free numeric group ID between Wait and this call has the
-// same narrow risk as the former Kill(-pid): a new unrelated group could take
-// that ID before cleanup.
+// StopChildGroup stops verified descendants in cmd's process tree or process
+// group. cmd must have been started by the caller with Start or Run; a Cmd
+// assembled around an existing Process is unsupported. Each recipient is
+// checked through its parent chain, pinned by pidfd, then checked again before
+// each signal. Without BecomeChildSubreaper, descendants reparented to init
+// cease to be verifiably ours and are left alone.
 func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	pid, err := validateChildGroupCommand(cmd, grace, sig)
 	if err != nil {
 		return StopResult{}, err
 	}
 	self := os.Getpid()
-	leaderPresent, directChild, groupLeader, err := inspectChildGroupLeader(cmd, self, pid)
+	beforeStopChildGroupTree(pid)
+	initial, err := discoverCommandTargets("/proc", self, pid)
 	if err != nil {
 		return StopResult{}, err
 	}
-	if leaderPresent && directChild && !groupLeader {
-		return StopChild(pid, grace, func() error { return SignalChild(pid, sig) })
+	for tries := 0; len(initial) == 0 && tries < 5; tries++ {
+		stat, statErr := ReadStat("/proc", pid)
+		if statErr != nil || stat.State == "Z" || stat.State == "X" {
+			break
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		<-timer.C
+		initial, err = discoverCommandTargets("/proc", self, pid)
+		if err != nil {
+			return StopResult{}, err
+		}
 	}
-	safe, err := safeToSignalChildGroup(pid, self)
-	if err != nil {
-		return StopResult{}, err
-	}
-	if !safe {
-		return StopResult{}, fmt.Errorf("refusing unsafe process group ID %d", pid)
-	}
-	if leaderPresent && !directChild {
+	if len(initial) == 0 {
 		return StopResult{AlreadyExited: true}, nil
 	}
-	beforeStopChildGroupTree(pid)
-
+	reapTargets := make(map[int]bool, len(initial))
+	signaledTargets := make(map[int]bool, len(initial))
+	for _, target := range initial {
+		reapTargets[target] = true
+	}
+	var failures stopFailures
+	requestOwnedTargets("/proc", self, pid, initial, unix.Signal(sig), signaledTargets, &failures)
 	var result StopResult
-	if leaderPresent {
-		started := time.Now()
-		result, err = stopTree("/proc", self, pid, grace, func() error {
-			return sendProcessGroupSignal(pid, sig)
-		}, 0)
-		if err != nil {
-			if !stopTargetRace(err) {
-				return result, err
-			}
-			result = StopResult{AlreadyExited: true}
-			if err := requestProcessGroup(pid, sig); err != nil {
-				return result, err
-			}
-			return finishChildGroupStop(result, pid, grace)
+	if sig != syscall.SIGKILL {
+		if grace > 0 {
+			timer := time.NewTimer(grace)
+			<-timer.C
+		}
+		survivors, scanErr := discoverCommandTargets("/proc", self, pid)
+		if scanErr != nil {
+			failures.add(0, scanErr)
 		} else {
-			if result.AlreadyExited {
-				if err := requestProcessGroup(pid, sig); err != nil {
-					return result, err
-				}
+			for _, target := range survivors {
+				reapTargets[target] = true
 			}
-			return finishChildGroupStop(result, pid, max(time.Until(started.Add(grace)), 0))
+			result.Killed = requestOwnedTargets("/proc", self, pid, survivors, unix.SIGKILL, signaledTargets, &failures)
+			result.Killed += drainCommandTargets("/proc", self, pid, reapTargets, signaledTargets, &failures)
 		}
-	} else {
-		result.AlreadyExited = true
-		if err := requestProcessGroup(pid, sig); err != nil {
-			return result, err
-		}
-		return finishChildGroupStop(result, pid, grace)
+	} else if sig == syscall.SIGKILL {
+		result.Killed = drainCommandTargets("/proc", self, pid, reapTargets, signaledTargets, &failures)
 	}
-}
-
-func finishChildGroupStop(result StopResult, pgid int, grace time.Duration) (StopResult, error) {
-	alive, err := waitProcessGroup(pgid, grace)
-	if err != nil {
-		return result, err
-	}
-	if !alive {
-		return result, nil
-	}
-	if err := signalProcessGroup(pgid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
-		return result, fmt.Errorf("kill child process group %d: %w", pgid, err)
-	}
-	return result, nil
+	reapAdoptedTargets(pid, reapTargets, signaledTargets)
+	return result, failures.err()
 }
 
 func validateChildGroupCommand(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (int, error) {
@@ -124,43 +107,6 @@ func validateChildGroupCommand(cmd *exec.Cmd, grace time.Duration, sig syscall.S
 
 func ownGroupConfig(attr *syscall.SysProcAttr) bool {
 	return attr != nil && (attr.Setpgid && attr.Pgid == 0 && !attr.Setsid || attr.Setsid && !attr.Setpgid)
-}
-
-func requestProcessGroup(pgid int, sig syscall.Signal) error {
-	err := sendProcessGroupSignal(pgid, sig)
-	if err != nil {
-		return fmt.Errorf("stop request: %w", err)
-	}
-	return nil
-}
-
-func sendProcessGroupSignal(pgid int, sig syscall.Signal) error {
-	err := signalProcessGroup(pgid, unix.Signal(sig))
-	if errors.Is(err, unix.ESRCH) {
-		return nil
-	}
-	return err
-}
-
-func waitProcessGroup(pgid int, grace time.Duration) (bool, error) {
-	deadline := time.Now().Add(grace)
-	for {
-		err := signalProcessGroup(pgid, 0)
-		if errors.Is(err, unix.ESRCH) {
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("check child process group %d: %w", pgid, err)
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return true, nil
-		}
-		if remaining > 20*time.Millisecond {
-			remaining = 20 * time.Millisecond
-		}
-		time.Sleep(remaining)
-	}
 }
 
 func stopTargetRace(err error) bool {
@@ -236,45 +182,6 @@ func validateSignalTarget(pid int, sig syscall.Signal) error {
 
 func sameDirectChild(self int, before, after Stat) bool {
 	return after.Ppid == self && after.Start == before.Start
-}
-
-func inspectChildGroupLeader(cmd *exec.Cmd, self, pid int) (present, directChild, groupLeader bool, err error) {
-	target, err := ReadStat("/proc", pid)
-	if Gone(err) {
-		return false, false, false, nil
-	}
-	if err != nil {
-		return false, false, false, fmt.Errorf("read command process %d: %w", pid, err)
-	}
-	directChild = target.Ppid == self
-	if !directChild {
-		return true, false, false, nil
-	}
-	return true, true, commandOwnsGroupLeader(cmd, self, target), nil
-}
-
-func safeToSignalChildGroup(pgid, self int) (bool, error) {
-	ownPGID, err := unix.Getpgid(self)
-	if err != nil {
-		return false, fmt.Errorf("get caller process group: %w", err)
-	}
-	sessionID, err := unix.Getsid(self)
-	if err != nil {
-		return false, fmt.Errorf("get caller session: %w", err)
-	}
-	parent, err := ReadStat("/proc", os.Getppid())
-	if err != nil {
-		return false, fmt.Errorf("read parent process group: %w", err)
-	}
-	return safeChildGroup(pgid, ownPGID, parent.Pgid, sessionID), nil
-}
-
-func commandOwnsGroupLeader(cmd *exec.Cmd, self int, target Stat) bool {
-	return cmd != nil && cmd.Process != nil && target.Ppid == self && target.Pgid == cmd.Process.Pid
-}
-
-func safeChildGroup(pgid, ownPGID, parentPGID, sessionID int) bool {
-	return pgid != ownPGID && pgid != parentPGID && pgid != sessionID
 }
 
 // StopFromShell sends sig to the target and the descendants observed before the
@@ -410,6 +317,7 @@ func (tree processTree) close() {
 type stopFailures struct {
 	byPID   map[int][]string
 	general []string
+	causes  []error
 }
 
 func (f *stopFailures) add(pid int, err error) {
@@ -417,6 +325,7 @@ func (f *stopFailures) add(pid int, err error) {
 	if pid <= 0 {
 		if !slices.Contains(f.general, msg) {
 			f.general = append(f.general, msg)
+			f.causes = append(f.causes, err)
 		}
 		return
 	}
@@ -425,6 +334,7 @@ func (f *stopFailures) add(pid int, err error) {
 	}
 	if !slices.Contains(f.byPID[pid], msg) {
 		f.byPID[pid] = append(f.byPID[pid], msg)
+		f.causes = append(f.causes, fmt.Errorf("PID %d: %w", pid, err))
 	}
 }
 
@@ -432,11 +342,7 @@ func (f *stopFailures) err() error {
 	if len(f.byPID) == 0 && len(f.general) == 0 {
 		return nil
 	}
-	parts := slices.Clone(f.general)
-	for _, pid := range slices.Sorted(maps.Keys(f.byPID)) {
-		parts = append(parts, fmt.Sprintf("PID %d: %s", pid, strings.Join(f.byPID[pid], ", ")))
-	}
-	return errors.New(strings.Join(parts, "; "))
+	return errors.Join(f.causes...)
 }
 
 // signalProcess sends sig through the process's pidfd. Tests replace it to
@@ -509,10 +415,6 @@ func stopTree(root string, self, pid int, grace time.Duration, request func() er
 		result = killTree(tree, &failures)
 	}
 	return result, failures.err()
-}
-
-var signalProcessGroup = func(pgid int, sig unix.Signal) error {
-	return unix.Kill(-pgid, sig)
 }
 
 func requestTree(tree processTree, leader int, sig unix.Signal, failures *stopFailures) {
