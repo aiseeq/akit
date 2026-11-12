@@ -336,6 +336,11 @@ func TestCalls(t *testing.T) {
 		{"bash command string with variables", `bash -c 'while grep -q "$x"; do sleep 5; done'`, []string{"bash", "grep", "sleep"}},
 		{"bash double-quoted command string", `timeout 15 bash -c "while kill -0 $cp 2>/dev/null; do sleep 1; done"`, []string{"timeout", "bash", "kill", "sleep"}},
 		{"ssh remote command", `ssh -o StrictHostKeyChecking=no -p 22 host 'timeout 35m bash -c "while true; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "true", "sleep"}},
+		{"ssh heredoc without remote command", "ssh host <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "echo", "kill"}},
+		{"ssh heredoc with bash command", "ssh -T host bash <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "bash", "echo", "kill"}},
+		{"ssh heredoc with unquoted delimiter", "ssh -o BatchMode=yes host <<EOF\necho start\nkill 1\nEOF", []string{"ssh", "echo", "kill"}},
+		{"ssh heredoc to data command", "ssh host cat <<'EOF'\necho start\nkill 1\nEOF", []string{"ssh", "cat"}},
+		{"bash ANSI-C multiline command", "bash -c $'echo start\\nkill 1'", []string{"bash", "echo", "kill"}},
 		{"ssh remote command with parameter", `ssh host 'timeout 35m bash -c "while kill -0 $child 2>/dev/null; do sleep 20; done"'`, []string{"ssh", "timeout", "bash", "kill", "sleep"}},
 		{"ssh without command", `ssh -p 22 host`, []string{"ssh"}},
 		{"ssh options after host", `ssh h -- 'pgrep x'; ssh h -p 22 -o A=b pgrep y; ssh -vp 22 h wc z`, []string{"ssh", "pgrep", "ssh", "pgrep", "ssh", "wc"}},
@@ -2099,6 +2104,17 @@ func callsNamed(calls []Call, name string) int {
 		}
 	}
 	return n
+}
+
+func TestANSIQuotedMultilineCallKeepsPhysicalLine(t *testing.T) {
+	src := "true\ntrue\nbash -c $'echo start\\nkill 1'"
+	calls, err := Find(src, "kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0].Line != 3 {
+		t.Fatalf("ANSI-C call = %#v, want one call on physical line 3", calls)
+	}
 }
 
 func TestCallSetKeepsSameCallWithDifferentVia(t *testing.T) {

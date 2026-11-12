@@ -837,9 +837,10 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false
 	}
+	hasHeredoc := hasScriptInputRedir(stmt.Redirs)
 	if first, literal := wordValue(call.Args[0]); literal {
 		name := commandName(first)
-		if !isShell(name) && !wrappers[name] {
+		if !isShell(name) && !wrappers[name] && !(name == "ssh" && hasHeredoc) {
 			execTarget := false
 			execSeen := false
 			for _, arg := range call.Args[1:] {
@@ -862,7 +863,6 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 		}
 	}
 	args, _ := words(call.Args, src, vars)
-	hasHeredoc := hasScriptInputRedir(stmt.Redirs)
 	return resolveShellInput(commandName(args[0]), args[1:], stmt.Redirs, hasHeredoc)
 }
 
@@ -878,6 +878,20 @@ func hasScriptInputRedir(redirs []*syntax.Redirect) bool {
 func resolveShellInput(name string, args []string, redirs []*syntax.Redirect, hasHeredoc bool) (string, []string, bool) {
 	var via []string
 	for {
+		if name == "ssh" {
+			if !hasHeredoc {
+				return "", nil, false
+			}
+			index, hasCommand := sshCommand(args)
+			if !hasCommand {
+				return "bash", append(via, "ssh"), true
+			}
+			remoteName := commandName(args[index])
+			if isShell(remoteName) && shellReadsHeredoc(args[index+1:]) {
+				return remoteName, append(via, "ssh"), true
+			}
+			return "", nil, false
+		}
 		if name == "sudo" && hasHeredoc && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), true
 		}
@@ -1215,10 +1229,16 @@ func (m *mapped) addLiteral(part syntax.WordPart, src string) {
 		m.unescape(raw, base, false)
 	case *syntax.SglQuoted:
 		base := -1
-		if !p.Dollar {
+		if p.Dollar {
+			base = -1
+		} else {
 			base = sourceBase(p, p.Value, 1, src)
 		}
-		m.add(p.Value, base)
+		if p.Dollar {
+			m.unescapeANSI(p.Value, base)
+		} else {
+			m.add(p.Value, base)
+		}
 	case *syntax.DblQuoted:
 		for _, inner := range p.Parts {
 			if lit, ok := inner.(*syntax.Lit); ok {
@@ -1260,7 +1280,40 @@ func (m *mapped) unescape(raw string, base int, double bool) {
 	}
 }
 
-// unescapeDouble снимает экранирование в двойных кавычках.
+// unescapeANSI декодирует экранирование в ANSI-C-слове Bash.
+func (m *mapped) unescapeANSI(raw string, base int) {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' || i+1 == len(raw) {
+			m.push(raw[i], base, i)
+			continue
+		}
+		i++
+		decoded := byte(raw[i])
+		switch raw[i] {
+		case 'a':
+			decoded = '\a'
+		case 'b':
+			decoded = '\b'
+		case 'e', 'E':
+			decoded = 0x1b
+		case 'f':
+			decoded = '\f'
+		case 'n':
+			decoded = '\n'
+		case 'r':
+			decoded = '\r'
+		case 't':
+			decoded = '\t'
+		case 'v':
+			decoded = '\v'
+		case '\\', '\'', '"', '?':
+		default:
+			m.push('\\', base, i-1)
+		}
+		m.push(decoded, base, i)
+	}
+}
+
 func unescapeDouble(s string) string {
 	var m mapped
 	m.unescape(s, -1, true)
@@ -1953,7 +2006,10 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 		operand, command, _ := shellArgs(args)
 		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
 			script := c.words[operand+1]
-			return parseNestedWithBudget(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+			first := len(*calls)
+			err := parseNestedWithBudget(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+			relocateNestedLines(c, first, calls, hasANSIQuotedPart(c.call.Raw))
+			return err
 		}
 		return nil
 	case name == "ssh":
@@ -1972,7 +2028,10 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 			remote.text = append(remote.text, w.script...)
 			remote.pos = append(remote.pos, w.pos...)
 		}
-		return parseNestedWithBudget(remote.String(), remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+		first := len(*calls)
+		err := parseNestedWithBudget(remote.String(), remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+		relocateNestedLines(c, first, calls, false)
+		return err
 	case name == "find":
 		return expandFind(c, lineBase, vars, calls, seen)
 	case scriptInvocation(name, args):
@@ -1980,6 +2039,32 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 
 	}
 	return nil
+}
+
+// hasANSIQuotedPart проверяет, содержит ли команда ANSI-C-кавычки.
+func hasANSIQuotedPart(raw string) bool {
+	return strings.Contains(raw, "$'")
+}
+
+func relocateNestedLines(parent cmd, first int, calls *[]Call, ansiC bool) {
+	if ansiC {
+		for i := first; i < len(*calls); i++ {
+			(*calls)[i].Line = parent.call.Line
+		}
+		return
+	}
+	base := parent.call.Offset
+	if base < 0 {
+		return
+	}
+	for i := first; i < len(*calls); i++ {
+		offset := (*calls)[i].Offset
+		start := offset - base
+		if start < 0 || start >= len(parent.call.Raw) {
+			continue
+		}
+		(*calls)[i].Line = parent.call.Line + strings.Count(parent.call.Raw[:start], "\n")
+	}
 }
 
 func scriptInvocation(name string, args []string) bool {
