@@ -2215,8 +2215,8 @@ func TestJournalTextAcceptsAndMarksGuessedTime(t *testing.T) {
 		if value == "" {
 			value = o.until
 		}
-		if markedJournalText(o, value) == value || timeHint(o, o.timeNow) == "" {
-			t.Errorf("%q: missing marker or hint", args)
+		if markedJournalText(o, value) == value {
+			t.Errorf("%q: missing marker", args)
 		}
 	}
 	_, dir := testRunMainRoot(t)
@@ -2312,7 +2312,7 @@ func TestJournalTextMarksApproxFutureTime(t *testing.T) {
 
 func TestTimeHintIsLastOnlyAfterSuccessfulCommand(t *testing.T) {
 	now := time.Date(2026, 11, 2, 23, 0, 0, 0, time.Local)
-	if hint := timeHint(options{note: "06:4x found"}, now); hint == "" || !strings.Contains(hint, "точное время можно взять из date") {
+	if hint := formatTimeHint(timeHintFacts{field: "note", suspect: "06:4x", kind: "похоже на угаданное время", marked: true}); hint == "" || !strings.Contains(hint, "точное время можно взять из date") {
 		t.Fatalf("hint = %q", hint)
 	}
 	if _, err := parseArgs([]string{"note", "ticket", "one\ntwo"}); err == nil || !strings.Contains(err.Error(), "one line") {
@@ -2372,7 +2372,7 @@ func TestGuessedTimeNoteSucceedsWithMarkerAndHint(t *testing.T) {
 		}
 	}
 	for _, note := range []string{now.Add(-10*time.Minute).Format("15:04") + " exact", "waiting until 23:59", "17:40-18:00 window"} {
-		if got := markedJournalText(options{timeNow: now}, note); got != note || timeHint(options{note: note}, now) != "" {
+		if got := markedJournalText(options{timeNow: now}, note); got != note || futureApproxTime(note, now) != "" {
 			t.Errorf("non-warning text %q got marked/hinted as %q", note, got)
 		}
 	}
@@ -2442,7 +2442,7 @@ func TestMarkedJournalFieldsAndUnmarkedHeaders(t *testing.T) {
 	until := "2000-01-01 06:4x"
 	code := runMain([]string{"wait", "header-reason", "--until", until, "--by", "tester"}, now, &waitOut, &waitErr)
 	lines := strings.Split(strings.TrimSpace(waitErr.String()), "\n")
-	if code != 0 || len(lines) != 1 || lines[len(lines)-1] != timeHint(options{until: until}, now) {
+	if code != 0 || len(lines) != 1 || !strings.Contains(lines[len(lines)-1], "срок не распознан") {
 		t.Fatalf("wait result: code=%d, stdout=%q stderr=%q", code, waitOut.String(), waitErr.String())
 	}
 	updated, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
@@ -2656,7 +2656,7 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 	forms := []string{
 		"12.11 06:4x: итог", "12.11 06:4x, итог", "12.11 06:4x; итог",
 		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
-		"12.11 в 06:4x", "12.11 6:4x: итог",
+		"12.11 в 06:4x", "12.11 6:4x: итог", "13.11 6:4x итог",
 		"13.11 до 06:4x", "13.11 к 06:4x", "13.11 около 06:4x", "13.11 В 06:4x",
 	}
 	for _, until := range forms {
@@ -2672,7 +2672,9 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 			t.Fatalf("wait %q lacks deadline explanation: %q", until, errout.String())
 		}
 		updated, err := os.ReadFile(path)
-		if err != nil || !strings.Contains(string(updated), "Ждёт: ") || strings.Contains(string(updated), "Ждёт: "+until+" [") || !strings.Contains(string(updated), "[время требует проверки]") {
+		journalLines := strings.Split(strings.TrimSpace(string(updated)), "\n")
+		lastJournalLine := journalLines[len(journalLines)-1]
+		if err != nil || !strings.Contains(string(updated), "Ждёт: ") || strings.Contains(string(updated), "Ждёт: "+until+" [") || !strings.Contains(lastJournalLine, "[время требует проверки]") {
 			t.Fatalf("wait field %q changed: %s err=%v", until, updated, err)
 		}
 		waitTask, err := find(dir, "wait")
@@ -2721,6 +2723,7 @@ func TestRunMainUntilHintReflectsDeadlineParsing(t *testing.T) {
 	}{
 		{"past-date", "10.11 18:00 итог 06:4x", "срок распознан:"},
 		{"tomorrow", "12.11 18:00 итог, прошлый был 06:4x", "срок распознан:"},
+		{"deadline-before-guessed", "13.11 18:00 06:4x", "срок распознан:"},
 		{"no-deadline", "12.11 в 06:4x", "срок не распознан"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2754,6 +2757,42 @@ func TestRunMainUntilHintReflectsDeadlineParsing(t *testing.T) {
 				t.Fatalf("guessed time became due %q", got)
 			}
 		})
+	}
+}
+
+func TestRunMainNoteMarksLaterGuessedClock(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	path := writeRunMainTask(t, dir, "20200101-1200-MED-later-clock.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.Local)
+	note := "шаг 1:4x, упало в 06:4x"
+	var out, errout bytes.Buffer
+	if code := runMain([]string{"note", "later-clock", note, "--by", "tester"}, now, &out, &errout); code != 0 {
+		t.Fatalf("note: code=%d stderr=%q", code, errout.String())
+	}
+	updated, err := os.ReadFile(path)
+	hint := lastStderrLine(errout.String())
+	if err != nil || !strings.Contains(string(updated), note+" [время требует проверки]") || !strings.Contains(hint, "«06:4x»") || strings.Contains(hint, "«1:4x»") || !strings.Contains(hint, "строка журнала дополнена пометкой") {
+		t.Fatalf("note mark/hint mismatch: body=%s hint=%q err=%v", updated, hint, err)
+	}
+}
+
+func TestRunMainUntilOneDigitWithoutDateHintsWithoutMarker(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	path := writeRunMainTask(t, dir, "20200101-1200-MED-one-digit.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	var out, errout bytes.Buffer
+	if code := runMain([]string{"wait", "one-digit", "--until", "6:4x итог", "--by", "tester"}, time.Now(), &out, &errout); code != 0 {
+		t.Fatalf("wait: code=%d stderr=%q", code, errout.String())
+	}
+	hint := lastStderrLine(errout.String())
+	if !strings.Contains(hint, "«6:4x»") || !strings.Contains(hint, "строка журнала записана без пометки") || !strings.Contains(hint, "срок не распознан") || strings.Contains(hint, "дополнена пометкой") {
+		t.Fatalf("unexpected hint: %q", hint)
+	}
+	if strings.Count(strings.TrimSpace(errout.String()), "\n") != 0 {
+		t.Fatalf("multiple deadline messages: %q", errout.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(updated), "Ждёт: 6:4x итог\n") || strings.Contains(string(updated), "6:4x итог [время требует проверки]") {
+		t.Fatalf("one-digit deadline was marked: %s err=%v", updated, err)
 	}
 }
 

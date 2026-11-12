@@ -38,10 +38,20 @@ func guessedTime(value string) string {
 	return match[1]
 }
 
-// GuessedTime возвращает угаданное время с двузначным часом, если оно есть в тексте записи.
-func GuessedTime(value string) (string, bool) {
+// GuessedClock возвращает первое угаданное время независимо от длины часа.
+func GuessedClock(value string) (string, bool) {
 	clock := guessedTime(value)
-	return clock, clock != "" && strings.IndexByte(clock, ':') == 2
+	return clock, clock != ""
+}
+
+// GuessedTime возвращает первое угаданное время с двузначным часом в тексте записи.
+func GuessedTime(value string) (string, bool) {
+	for _, match := range guessedClockRE.FindAllStringSubmatch(value, -1) {
+		if strings.IndexByte(match[1], ':') == 2 {
+			return match[1], true
+		}
+	}
+	return "", false
 }
 
 // DatedGuessedTime возвращает угаданное время после даты, с одним словом между ними или без него.

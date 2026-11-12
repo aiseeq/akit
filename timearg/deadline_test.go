@@ -28,8 +28,11 @@ func TestDeadlineQuirks(t *testing.T) {
 			t.Errorf("GuessedTime(%q) = %q, %v", value, got, ok)
 		}
 	}
-	if _, ok := GuessedTime("6:4x"); ok {
-		t.Error("GuessedTime accepted a one-digit hour in text")
+	if got, ok := GuessedTime("6:4x"); ok || got != "" {
+		t.Errorf("GuessedTime one-digit hour = %q, %v, want empty and false", got, ok)
+	}
+	if got, ok := GuessedTime("шаг 1:4x, упало в 06:4x"); !ok || got != "06:4x" {
+		t.Errorf("GuessedTime did not find later double-digit clock: %q, %v", got, ok)
 	}
 	for _, value := range []string{"13.11 до 06:4x", "13.11 к 06:4x", "13.11 около 06:4x", "13.11 В 06:4x"} {
 		if got, ok := DatedGuessedTime(value); !ok || !strings.Contains(value, got) {
@@ -41,6 +44,9 @@ func TestDeadlineQuirks(t *testing.T) {
 	}
 	if _, ok := GuessedTime("06:41"); ok {
 		t.Error("exact clock detected as guessed")
+	}
+	if at, ok := Deadline("13.11 18:00 06:4x", now); !ok || !at.Equal(time.Date(2026, 11, 13, 18, 0, 0, 0, loc)) {
+		t.Errorf("exact deadline before later guessed clock = %v, %v", at, ok)
 	}
 	// Exact time after an intervening word keeps the existing date-only deadline behavior.
 	if at, ok := Deadline("13.11 до 18:00", now); !ok || !at.Equal(time.Date(2026, 11, 13, 0, 0, 0, 0, loc)) {

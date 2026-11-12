@@ -146,6 +146,7 @@ type options struct {
 	older, timeout                                                                                                                                             time.Duration
 	tail                                                                                                                                                       int
 	sections, blocks, unblocks                                                                                                                                 []string
+	hintFacts                                                                                                                                                  *timeHintFacts
 }
 
 // planLimit — предел пункта плана: --timeout или умолчание.
@@ -176,10 +177,12 @@ func runMain(args []string, now time.Time, out, errout io.Writer) int {
 		return exitUsage
 	}
 	o.timeNow = now
-	hint := timeHint(o, now)
+	o.hintFacts = &timeHintFacts{}
 	code := run(o, out, errout)
-	if code == 0 && hint != "" {
-		fmt.Fprintln(errout, hint)
+	if code == 0 {
+		if hint := formatTimeHint(*o.hintFacts); hint != "" {
+			fmt.Fprintln(errout, hint)
+		}
 	}
 	return code
 }
@@ -224,71 +227,108 @@ func validateOneLine(o options) error {
 	return nil
 }
 
-// timeHint возвращает подсказку о подозрительном времени; вызывающая сторона пишет её только после успеха.
-func timeHint(o options, now time.Time) string {
-	fields := []struct{ flag, value string }{
-		{"note", o.note}, {"--check", o.check}, {"--why", o.why}, {"--until", o.until},
+type timeHintFacts struct {
+	field, value, suspect, kind string
+	marked, header              bool
+	deadline                    time.Time
+	hasDeadline                 bool
+}
+
+func formatTimeHint(facts timeHintFacts) string {
+	if facts.suspect == "" {
+		return ""
 	}
-	for _, field := range fields {
-		if field.value == "" {
-			continue
+	if facts.field == "--until" {
+		mark := "строка журнала записана без пометки"
+		if facts.marked {
+			mark = "строка журнала дополнена пометкой «[время требует проверки]»"
 		}
-		suspect, guessed := timearg.GuessedTime(field.value)
-		if field.flag == "--until" {
-			suspect, guessed = timearg.DatedGuessedTime(field.value)
-			if !guessed {
-				suspect, guessed = timearg.GuessedTime(field.value)
-			}
+		deadline := "срок не распознан, tk ls --due его не покажет"
+		if facts.hasDeadline {
+			deadline = "срок распознан: " + facts.deadline.Format(time.RFC3339)
 		}
-		kind := "похоже на угаданное время"
-		if !guessed && field.flag != "--until" {
-			suspect = futureApproxTime(field.value, now)
-			if suspect != "" {
-				kind = "похоже на время позже метки записи"
-			}
-		}
-		if suspect == "" {
-			continue
-		}
-		label := field.flag
-		if label == "note" && o.cmd == "review" {
-			label = "--note"
-		}
-		if field.flag == "--until" {
-			normalized := datedWait(field.value, now)
-			if deadline, ok := timearg.Deadline(normalized, now); ok {
-				return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок распознан: %s", suspect, label, kind, deadline.Format(time.RFC3339))
-			}
-			return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок не распознан, tk ls --due его не покажет", suspect, label, kind)
-		}
-		header := field.flag == "--why" && (o.cmd == "new" || o.cmd == "set" || o.cmd == "start")
-		if header {
-			return fmt.Sprintf("tk: «%s» в %s %s; значение «Причина:» записано без пометки", suspect, label, kind)
-		}
-		return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]». Время записи — её метка, точное время можно взять из date", suspect, label, kind)
+		return fmt.Sprintf("tk: «%s» в %s %s; %s, %s", facts.suspect, facts.field, facts.kind, mark, deadline)
+	}
+	if facts.header {
+		return fmt.Sprintf("tk: «%s» в %s %s; значение «Причина:» записано без пометки", facts.suspect, facts.field, facts.kind)
+	}
+	if facts.marked {
+		return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]». Время записи — её метка, точное время можно взять из date", facts.suspect, facts.field, facts.kind)
 	}
 	return ""
 }
 
-func markedJournalText(o options, value string) string {
-	now := o.timeNow
-	if now.IsZero() {
-		now = time.Now()
+func journalTimeCandidate(o options, value string) (string, string) {
+	if suspect, ok := timearg.GuessedTime(value); ok {
+		return suspect, "похоже на угаданное время"
 	}
-	if _, guessed := timearg.GuessedTime(value); guessed || futureApproxTime(value, now) != "" {
-		return value + " [время требует проверки]"
+	if suspect := futureApproxTime(value, o.timeNow); suspect != "" {
+		return suspect, "похоже на время позже метки записи"
 	}
-	return value
+	return "", ""
 }
 
-func markedGuessedTime(value string) string {
-	if _, guessed := timearg.GuessedTime(value); guessed {
-		return value + " [время требует проверки]"
+func recordTimeHint(o options, fact timeHintFacts) {
+	if o.hintFacts != nil {
+		*o.hintFacts = timeHintFacts{
+			field: fact.field, value: fact.value, suspect: fact.suspect, kind: fact.kind, marked: fact.marked, header: fact.header,
+			deadline: o.hintFacts.deadline, hasDeadline: o.hintFacts.hasDeadline,
+		}
 	}
-	if _, guessed := timearg.DatedGuessedTime(value); guessed {
-		return value + " [время требует проверки]"
+}
+
+func markedJournalText(o options, value string) string {
+	return markedJournalTextFor(o, "note", value)
+}
+
+func markJournalText(o options, field, value string) (string, timeHintFacts) {
+	suspect, kind := journalTimeCandidate(o, value)
+	if suspect == "" {
+		return value, timeHintFacts{}
 	}
-	return value
+	fact := timeHintFacts{field: field, value: value, suspect: suspect, kind: kind, marked: true}
+	return value + " [время требует проверки]", fact
+}
+
+func markedJournalTextFor(o options, field, value string) string {
+	marked, fact := markJournalText(o, field, value)
+	if fact.suspect != "" {
+		recordTimeHint(o, fact)
+	}
+	return marked
+}
+
+func recordUnmarkedHeader(o options, value string) {
+	suspect, kind := journalTimeCandidate(o, value)
+	if suspect != "" {
+		recordTimeHint(o, timeHintFacts{field: "--why", value: value, suspect: suspect, kind: kind, header: true})
+	}
+}
+
+func markUntilText(value string) (string, timeHintFacts) {
+	suspect, marked := timearg.GuessedTime(value)
+	if !marked {
+		suspect, marked = timearg.DatedGuessedTime(value)
+	}
+	if suspect == "" {
+		suspect, _ = timearg.GuessedClock(value)
+	}
+	if suspect == "" {
+		return value, timeHintFacts{}
+	}
+	fact := timeHintFacts{field: "--until", value: value, suspect: suspect, kind: "похоже на угаданное время", marked: marked}
+	if marked {
+		return value + " [время требует проверки]", fact
+	}
+	return value, fact
+}
+
+func markedGuessedTime(o options, value string) string {
+	marked, fact := markUntilText(value)
+	if fact.suspect != "" {
+		recordTimeHint(o, fact)
+	}
+	return marked
 }
 
 func futureApproxTime(value string, now time.Time) string {
@@ -1724,6 +1764,7 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	if e = writeTask(p, body); e != nil {
 		return fail(errout, e)
 	}
+	recordUnmarkedHeader(o, o.why)
 	createdPath := relative(root, p)
 	if o.to != "" {
 		createdPath, e = filepath.Abs(p)
@@ -2866,7 +2907,7 @@ func repinPlanItem(t task, o options, out, errout io.Writer) int {
 		return exitUsage
 	}
 
-	entry, err := repinJournalEntry(time.Now().Format("2006-01-02 15:04"), s, name, pin.cmd, command, markedJournalText(o, o.why))
+	entry, err := repinJournalEntry(time.Now().Format("2006-01-02 15:04"), s, name, pin.cmd, command, markedJournalTextFor(o, "--why", o.why))
 	if err != nil {
 		fmt.Fprintf(errout, "tk: %v\n", err)
 		return exitUsage
@@ -3059,7 +3100,7 @@ func skipPlanItem(t task, o options, out, errout io.Writer) int {
 		fmt.Fprintf(errout, "tk: plan name %q not found\n", o.item)
 		return exitNone
 	}
-	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, markedJournalText(o, o.why))
+	line := fmt.Sprintf("- %s план — %s: пропущен: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, markedJournalTextFor(o, "--why", o.why))
 	body := journal(t.body, line)
 	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
@@ -3084,7 +3125,7 @@ func unskipPlanItem(t task, o options, out, errout io.Writer) int {
 			fmt.Fprintf(errout, "tk: plan item %q is not skipped; nothing to return\n", o.item)
 			return exitUsage
 		}
-		line := fmt.Sprintf("- %s план — %s: возвращён: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, markedJournalText(o, o.why))
+		line := fmt.Sprintf("- %s план — %s: возвращён: %s — %s", time.Now().Format("2006-01-02 15:04"), o.by, o.item, markedJournalTextFor(o, "--why", o.why))
 		if err := writeTask(t.path, journal(t.body, line)); err != nil {
 			return fail(errout, err)
 		}
@@ -3554,7 +3595,12 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 			now = time.Now()
 		}
 		o.until = datedWait(o.until, now)
-		if _, ok := timearg.Deadline(o.until, now); !ok && !timearg.HasDatedGuessedTime(o.until) {
+		deadline, hasDeadline := timearg.Deadline(o.until, now)
+		if o.hintFacts != nil {
+			o.hintFacts.deadline, o.hintFacts.hasDeadline = deadline, hasDeadline
+		}
+		_, hasGuessed := timearg.GuessedClock(o.until)
+		if !hasDeadline && !hasGuessed {
 			if datedBadClock.MatchString(o.until) {
 				fmt.Fprintln(errout, "tk: --until starts with a date and time that do not exist: no deadline, tk ls --due will not show it")
 			} else {
@@ -3581,19 +3627,19 @@ func transitionJournal(o options, next string, glintFindings int) string {
 		if checkSession != "" && !strings.EqualFold(checkSession, o.by) {
 			line = fmt.Sprintf("- %s %s — %s (session %s)", time.Now().Format("2006-01-02 15:04"), next, o.by, checkSession)
 		}
-		line += ": " + markedJournalText(o, o.check)
+		line += ": " + markedJournalTextFor(o, "--check", o.check)
 		if glintFindings > 0 && o.glintDebt != "" {
 			line += fmt.Sprintf("; glint: %d findings, debt %s", glintFindings, o.glintDebt)
 		}
 	}
 	if o.cmd == "reject" || o.cmd == "release" {
-		line += " — " + markedJournalText(o, o.why)
+		line += " — " + markedJournalTextFor(o, "--why", o.why)
 	}
 	if o.cmd == "review" && o.note != "" {
-		line += " — " + markedJournalText(o, o.note)
+		line += " — " + markedJournalTextFor(o, "--note", o.note)
 	}
 	if o.cmd == "wait" {
-		line += " — " + markedGuessedTime(o.until)
+		line += " — " + markedGuessedTime(o, o.until)
 	}
 	return line
 }
@@ -3655,7 +3701,11 @@ func applyMetadata(body string, o options) (string, error) {
 	if o.why == "" {
 		return body, nil
 	}
-	return setHeaderValue(body, "Причина: ", o.why)
+	updated, err := setHeaderValue(body, "Причина: ", o.why)
+	if err == nil {
+		recordUnmarkedHeader(o, o.why)
+	}
+	return updated, err
 }
 
 func setJournalKind(body string) (string, error) {
@@ -3868,7 +3918,7 @@ func renameJournal(actor, oldPath, newPath string) string {
 var renameTaskFile = os.Rename
 
 func addNote(t task, o options, out, errout io.Writer) int {
-	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, markedJournalText(o, o.note))
+	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, markedJournalTextFor(o, "note", o.note))
 	body := journal(t.body, line)
 	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
