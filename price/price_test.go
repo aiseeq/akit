@@ -8,7 +8,7 @@ import (
 func near(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 
 func TestTable(t *testing.T) {
-	if Checked != "2026-10-17" {
+	if Checked != "2026-11-12" {
 		t.Errorf("Checked %q", Checked)
 	}
 	m, ok := Of("claude-haiku-4-5-20251001")
@@ -47,6 +47,13 @@ func TestCost(t *testing.T) {
 	fast.Fast = true
 	if c, ok := Cost("claude-opus-5-5", fast); !ok || !near(c, 74.4) {
 		t.Errorf("fast: %v %v", c, ok)
+	}
+	// fable 5.2: 8 + 40 + 0.20 + 10 + 16; fast — вдвое
+	if c, ok := Cost("claude-fable-5-2", u); !ok || !near(c, 74.2) {
+		t.Errorf("fable 5.2: %v %v", c, ok)
+	}
+	if c, ok := Cost("claude-fable-5-2", fast); !ok || !near(c, 148.4) {
+		t.Errorf("fable 5.2 fast: %v %v", c, ok)
 	}
 	if _, ok := Cost("claude-sonnet-5-5", fast); ok {
 		t.Error("fast у модели без цены fast")
