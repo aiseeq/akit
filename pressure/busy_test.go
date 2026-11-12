@@ -99,6 +99,7 @@ func TestHalfRule(t *testing.T) {
 	}{
 		{"above half is busy", Load{Runnable: 5, Threads: 8, HalfUntil: until, HalfBy: "lead", HalfWhy: "игра"}, DefaultLimits, CPU},
 		{"below half is free", Load{Runnable: 3, Threads: 8, HalfUntil: until}, Limits{MaxIOFull: 100}, ""},
+		{"odd threads keep the fractional half", Load{Runnable: 3, Threads: 7, HalfUntil: until}, Limits{MaxIOFull: 100}, ""},
 		{"half is at least one", Load{Runnable: 1, Threads: 1, HalfUntil: until}, Limits{MaxIOFull: 100}, CPU},
 		{"zero tasks remains below minimum half threshold", Load{Runnable: 0, Threads: 1, HalfUntil: until}, Limits{MaxIOFull: 100}, ""},
 		{"lower configured threshold wins", Load{Runnable: 2, Threads: 8, HalfUntil: until}, Limits{Runnable: 2, MaxIOFull: 100}, CPU},

@@ -118,16 +118,7 @@ func parseArgs(args []string, now time.Time) (options, error) {
 		if a == "-h" || a == "--help" {
 			return opts, errHelp
 		}
-		if a == "--quiet-off" {
-			opts.quietOff = true
-			continue
-		}
-		if a == "--half-off" {
-			opts.halfOff = true
-			continue
-		}
-		if a == "--ignore-quiet" {
-			opts.ignoreQuiet = true
+		if opts.setSwitch(a) {
 			continue
 		}
 		if !strings.HasPrefix(a, "--") {
@@ -148,28 +139,52 @@ func parseArgs(args []string, now time.Time) (options, error) {
 			return opts, err
 		}
 	}
-	if opts.quietOff && !opts.quiet.IsZero() {
-		return opts, errors.New("--quiet-off together with a quiet time")
-	}
-	if opts.halfOff && !opts.half.IsZero() {
-		return opts, errors.New("--half-off together with a half time")
-	}
-	if opts.quietOff && (opts.halfOff || !opts.half.IsZero()) ||
-		opts.halfOff && !opts.quiet.IsZero() ||
-		!opts.quiet.IsZero() && !opts.half.IsZero() {
-		return opts, errors.New("choose one mode per invocation")
-	}
-	if opts.why != "" && opts.quiet.IsZero() && opts.half.IsZero() {
-		return opts, errors.New("--why needs --quiet, --quiet-until, --half, or --half-until")
-	}
-	if opts.ignoreQuiet && (opts.quietOff || !opts.quiet.IsZero() || opts.halfOff || !opts.half.IsZero()) {
-		return opts, errors.New("--ignore-quiet is for a check, not for setting quiet mode")
+	if err := opts.checkModes(); err != nil {
+		return opts, err
 	}
 	if opts.quietOff || !opts.quiet.IsZero() || opts.halfOff || !opts.half.IsZero() {
 		return opts, nil
 	}
 	err := opts.loadLimits()
 	return opts, err
+}
+
+// setSwitch ставит ключ без значения; false — a не такой ключ.
+func (o *options) setSwitch(a string) bool {
+	switch a {
+	case "--quiet-off":
+		o.quietOff = true
+	case "--half-off":
+		o.halfOff = true
+	case "--ignore-quiet":
+		o.ignoreQuiet = true
+	default:
+		return false
+	}
+	return true
+}
+
+// checkModes отклоняет несовместимые ключи режимов: за вызов — один режим и одно действие с ним.
+func (o *options) checkModes() error {
+	opts := *o
+	if opts.quietOff && !opts.quiet.IsZero() {
+		return errors.New("--quiet-off together with a quiet time")
+	}
+	if opts.halfOff && !opts.half.IsZero() {
+		return errors.New("--half-off together with a half time")
+	}
+	if opts.quietOff && (opts.halfOff || !opts.half.IsZero()) ||
+		opts.halfOff && !opts.quiet.IsZero() ||
+		!opts.quiet.IsZero() && !opts.half.IsZero() {
+		return errors.New("choose one mode per invocation")
+	}
+	if opts.why != "" && opts.quiet.IsZero() && opts.half.IsZero() {
+		return errors.New("--why needs --quiet, --quiet-until, --half, or --half-until")
+	}
+	if opts.ignoreQuiet && (opts.quietOff || !opts.quiet.IsZero() || opts.halfOff || !opts.half.IsZero()) {
+		return errors.New("--ignore-quiet is for a check, not for setting quiet mode")
+	}
+	return nil
 }
 
 // loadLimits — пороги файла пользователя и поверх них флаги. Файл нужен только замеру: справку и тихий режим
@@ -307,8 +322,12 @@ func setMode(until time.Time, why string, off bool, name string, pathFn func() (
 		fmt.Fprintf(stdout, "%s mode off (%s removed)\n", name, path)
 		return 0
 	}
-	fmt.Fprintf(stdout, "%s mode until %s (%s): busy reflects this mode until then\n",
-		name, until.Local().Format("2006-01-02 15:04 MST"), path)
+	effect := "busy answers busy until then"
+	if name == "half" {
+		effect = "busy counts half the machine threads until then"
+	}
+	fmt.Fprintf(stdout, "%s mode until %s (%s): %s; busy --%s-off ends it\n",
+		name, until.Local().Format("2006-01-02 15:04 MST"), path, effect, name)
 	return 0
 }
 

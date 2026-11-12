@@ -27,7 +27,7 @@ func StatePath(name string) (string, error) {
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("quiet mode file: %w", err)
+			return "", fmt.Errorf("mode state file %s: %w", name, err)
 		}
 		dir = filepath.Join(home, ".local", "state")
 	}
@@ -41,11 +41,11 @@ func ReadQuiet(path string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	if err != nil {
-		return time.Time{}, fmt.Errorf("quiet mode: %w", err)
+		return time.Time{}, fmt.Errorf("mode state file: %w", err)
 	}
 	until, err := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
 	if err != nil {
-		return time.Time{}, fmt.Errorf("quiet mode file %s: %w", path, err)
+		return time.Time{}, fmt.Errorf("mode state file %s: %w", path, err)
 	}
 	return until, nil
 }
