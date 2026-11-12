@@ -36,6 +36,16 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 	return StopResult{Killed: 1}, nil
 }
 
+// StopDescendants is unsupported outside Linux and sends no signal.
+func StopDescendants(time.Duration, syscall.Signal) (StopResult, error) {
+	return StopResult{}, errors.ErrUnsupported
+}
+
+// StopSession is unsupported outside Linux and sends no signal.
+func StopSession(SessionRecord, time.Duration, syscall.Signal) (StopResult, error) {
+	return StopResult{}, errors.ErrUnsupported
+}
+
 // BecomeChildSubreaper is unsupported outside Linux.
 func BecomeChildSubreaper() error { return errors.ErrUnsupported }
 

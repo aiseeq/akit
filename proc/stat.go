@@ -17,6 +17,7 @@ type Stat struct {
 	State string // поле 3: R, S, D, Z (завершился, родитель ещё не прибрал) …
 	Ppid  int
 	Pgid  int
+	Sid   int
 	Start string // поле 22, время старта в тиках с загрузки
 }
 
@@ -50,6 +51,10 @@ func ParseStat(s string) (Stat, error) {
 	if err != nil {
 		return st, fmt.Errorf("stat: pgid: %w", err)
 	}
-	st.State, st.Ppid, st.Pgid, st.Start = f[0], ppid, pgid, f[19]
+	sid, err := strconv.Atoi(f[3])
+	if err != nil {
+		return st, fmt.Errorf("stat: sid: %w", err)
+	}
+	st.State, st.Ppid, st.Pgid, st.Sid, st.Start = f[0], ppid, pgid, sid, f[19]
 	return st, nil
 }

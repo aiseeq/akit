@@ -24,6 +24,7 @@ func BecomeChildSubreaper() error {
 var afterCommandTargetPidfdOpen = func(int) {}
 var readCommandTargetStat = ReadStat
 var readCommandAncestryStat = ReadStat
+var errNotDescendant = errors.New("process is not our descendant")
 
 type processIdentity struct {
 	pid   int
@@ -102,7 +103,7 @@ func processAncestry(root string, target, self int) ([]processIdentity, error) {
 	chain := make([]processIdentity, 0, 8)
 	for pid := target; pid > 1; {
 		if seen[pid] {
-			return nil, errors.New("cyclic process ancestry")
+			return nil, fmt.Errorf("%w: cyclic ancestry", errNotDescendant)
 		}
 		seen[pid] = true
 		stat, err := readCommandAncestryStat(root, pid)
@@ -118,7 +119,7 @@ func processAncestry(root string, target, self int) ([]processIdentity, error) {
 		}
 		pid = stat.Ppid
 	}
-	return nil, fmt.Errorf("PID %d is not our descendant", target)
+	return nil, fmt.Errorf("%w: PID %d", errNotDescendant, target)
 }
 
 func verifiedCommandTarget(root string, self, leader, pid int) (*trackedProcess, error) {
