@@ -132,9 +132,12 @@ func TestStopChildGroupKillsLiveGroup(t *testing.T) {
 		}
 	})
 	waitReady(t, ready)
-	_, err := StopChildGroup(cmd, 0, syscall.SIGKILL)
+	result, err := StopChildGroup(cmd, 0, syscall.SIGKILL)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if result.AlreadyExited || result.Killed < 2 {
+		t.Fatalf("result = %+v, want SIGKILL counted for the shell and its sleep", result)
 	}
 	if err := cmd.Wait(); err == nil {
 		t.Fatal("group leader exited successfully after SIGKILL")

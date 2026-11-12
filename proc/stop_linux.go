@@ -72,9 +72,11 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 	}
 	signaledTargets := make(map[int]bool, len(initial))
 	var failures stopFailures
-	requestOwnedTargets("/proc", self, pid, initial, unix.Signal(sig), signaledTargets, &failures)
+	sent := requestOwnedTargets("/proc", self, pid, initial, unix.Signal(sig), signaledTargets, &failures)
 	var result StopResult
-	if sig != syscall.SIGKILL {
+	if sig == syscall.SIGKILL {
+		result.Killed = sent + drainCommandTargets("/proc", self, pid, signaledTargets, &failures)
+	} else {
 		if grace > 0 {
 			timer := time.NewTimer(grace)
 			<-timer.C
@@ -86,8 +88,6 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 			result.Killed = requestOwnedTargets("/proc", self, pid, survivors, unix.SIGKILL, signaledTargets, &failures)
 			result.Killed += drainCommandTargets("/proc", self, pid, signaledTargets, &failures)
 		}
-	} else if sig == syscall.SIGKILL {
-		result.Killed = drainCommandTargets("/proc", self, pid, signaledTargets, &failures)
 	}
 	if err := reapCommandGroupZombies(pid); err != nil {
 		failures.add(0, err)
