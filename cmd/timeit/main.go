@@ -76,34 +76,45 @@ func main() {
 	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go watchSignals(signals)
-	code := run(opts, os.Stdout, os.Stderr, time.Now, func(opts options) (result, time.Duration, error) {
-		return runCommand(opts, nil)
-	})
-	signal.Stop(signals)
-	os.Exit(code)
+	done := make(chan int, 1)
+	go func() {
+		done <- run(opts, os.Stdout, os.Stderr, time.Now, func(opts options) (result, time.Duration, error) {
+			return runCommand(opts, nil)
+		})
+	}()
+	select {
+	case code := <-done:
+		select {
+		case sig := <-signals:
+			stopForSignal(sig)
+		default:
+		}
+		signal.Stop(signals)
+		os.Exit(code)
+	case sig := <-signals:
+		stopForSignal(sig)
+	}
 }
 
-var activeGroup atomic.Int64
+var activeCommand atomic.Pointer[exec.Cmd]
 
 func watchSignals(signals <-chan os.Signal) {
-	for sig := range signals {
-		s, ok := sig.(syscall.Signal)
-		if !ok {
-			continue
-		}
-		pid := activeGroup.Load()
-		for pid == -1 {
-			time.Sleep(time.Millisecond)
-			pid = activeGroup.Load()
-		}
-		if pid > 0 {
-			if _, err := proc.StopChild(int(pid), 0, nil); err != nil {
-				fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
-			}
-		}
-		os.Exit(128 + int(s))
+	if sig := <-signals; sig != nil {
+		stopForSignal(sig)
 	}
+}
+
+func stopForSignal(sig os.Signal) {
+	if cmd := activeCommand.Load(); cmd != nil {
+		if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
+		}
+	}
+	s, ok := sig.(syscall.Signal)
+	if !ok {
+		s = syscall.SIGTERM
+	}
+	os.Exit(128 + int(s))
 }
 
 func parseArgs(args []string) (options, error) {
@@ -417,14 +428,12 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		cmd.Stdin = f
 	}
 	started := time.Now()
-	activeGroup.Store(-1)
 	if err := cmd.Start(); err != nil {
-		activeGroup.Store(0)
 		cleanup()
 		closeErr := stdoutFile.Close()
 		return result{}, 0, errors.Join(fmt.Errorf("%s: %w", opts.command[0], err), closeErr)
 	}
-	activeGroup.Store(int64(cmd.Process.Pid))
+	activeCommand.Store(cmd)
 	if err := stdoutFile.Close(); err != nil {
 		stopCommand(cmd)
 		cleanup()
@@ -435,25 +444,28 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 	select {
 	case sig := <-signals:
 		if signalNumber, ok := sig.(syscall.Signal); ok {
-			_, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil)
+			_, stopErr := proc.StopChildGroup(cmd, 0, nil)
 			if stopErr != nil {
 				fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", stopErr)
 			}
 			<-wait
-			activeGroup.CompareAndSwap(int64(cmd.Process.Pid), 0)
+			activeCommand.CompareAndSwap(cmd, nil)
 			cleanup()
 			return result{interrupted: int(signalNumber)}, time.Since(started), nil
 		}
-		_, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil)
+		_, stopErr := proc.StopChildGroup(cmd, 0, nil)
 		if stopErr != nil {
 			fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", stopErr)
 		}
 		<-wait
-		activeGroup.CompareAndSwap(int64(cmd.Process.Pid), 0)
+		activeCommand.CompareAndSwap(cmd, nil)
 		cleanup()
 		return result{interrupted: int(syscall.SIGTERM)}, time.Since(started), nil
 	case err := <-wait:
-		activeGroup.CompareAndSwap(int64(cmd.Process.Pid), 0)
+		if _, stopErr := proc.StopChildGroup(cmd, 0, nil); stopErr != nil {
+			fmt.Fprintf(os.Stderr, "timeit: stop command group: %v\n", stopErr)
+		}
+		activeCommand.CompareAndSwap(cmd, nil)
 		duration := time.Since(started)
 		res := result{stderrFile: stderrFile}
 		if err == nil {
@@ -474,7 +486,7 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 }
 
 func stopCommand(cmd *exec.Cmd) {
-	if _, err := proc.StopChild(cmd.Process.Pid, 0, nil); err != nil {
+	if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
 	}
 	if err := cmd.Wait(); err != nil {
@@ -483,6 +495,7 @@ func stopCommand(cmd *exec.Cmd) {
 			fmt.Fprintf(os.Stderr, "timeit: wait for command: %v\n", err)
 		}
 	}
+	activeCommand.CompareAndSwap(cmd, nil)
 }
 
 func signalLabel(sig syscall.Signal) string {

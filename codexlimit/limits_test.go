@@ -25,6 +25,7 @@ const fullAnswer = `{"id":2,"result":{"ordinaryUsageAllowed":true,"rateLimits":{
 func helperCommand(t *testing.T, scenario string, response string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestAppServerHelper$")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = os.Stderr
 	env := append(os.Environ(), "CODEXLIMIT_HELPER="+scenario, "CODEXLIMIT_RESPONSE="+response)
 	cmd.Env = env
@@ -359,11 +360,8 @@ func TestReadContextDeadlineGrandchildHoldsStderr(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	t.Cleanup(func() {
-		if data, err := os.ReadFile(pidFile); err == nil {
-			var pid int
-			if _, err := fmt.Sscan(string(data), &pid); err == nil {
-				_, _ = proc.StopChild(pid, 0, nil)
-			}
+		if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+			t.Errorf("stop app-server test group: %v", err)
 		}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)

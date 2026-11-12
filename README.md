@@ -30,7 +30,9 @@ pidfds and refuses unsafe targets. The default grace is 2s.
 `proc.StopChild(pid, grace, request)` provides the same observed-tree stopping
 for a direct child; the caller supplies the request (signal, stdin close or
 context cancellation) and remains responsible for `exec.Cmd.Wait` and
-`WaitDelay`. `proc.StopFromShell(pid, grace, signal)` implements the CLI's
+`WaitDelay`. `proc.StopChildGroup(cmd, grace, request)` also stops the child's
+own process group when `cmd` was started with `Setpgid: true`; it can clean up
+group members after `cmd.Wait`. `proc.StopFromShell(pid, grace, signal)` implements the CLI's
 ancestry rule. Both return `proc.StopResult`, including the number sent SIGKILL,
 and an error.
 ## shellcmd

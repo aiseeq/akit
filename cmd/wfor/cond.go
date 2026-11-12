@@ -379,13 +379,14 @@ func (c *timeCond) state() string {
 
 // okCond — команда bash вышла с кодом 0. Запускается не чаще раза в every.
 type okCond struct {
-	cmd   string
-	every time.Duration
-	next  time.Time
-	now   func() time.Time
-	runs  int
-	code  int
-	out   string
+	cmd         string
+	every       time.Duration
+	next        time.Time
+	now         func() time.Time
+	runs        int
+	code        int
+	out         string
+	lastCommand *exec.Cmd
 }
 
 func (c *okCond) check(ctx context.Context) (bool, error) {
@@ -394,16 +395,17 @@ func (c *okCond) check(ctx context.Context) (bool, error) {
 	}
 	c.next = c.now().Add(c.every)
 	cmd := exec.CommandContext(ctx, "bash", "-c", c.cmd)
+	c.lastCommand = cmd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		_, err := proc.StopChild(cmd.Process.Pid, 0, nil)
+		_, err := proc.StopChildGroup(cmd, 0, nil)
 		return err
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()
 	if cmd.Process != nil {
 		// Bash may have exited while commands it started are still running.
-		if _, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil); stopErr != nil {
+		if _, stopErr := proc.StopChildGroup(cmd, 0, nil); stopErr != nil {
 			return false, fmt.Errorf("%s: stop leftover processes: %w", c, stopErr)
 		}
 	}

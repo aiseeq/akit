@@ -90,12 +90,12 @@ func TestStopTreeLibraryLimits(t *testing.T) {
 	fakeStat(t, root, 20, 10, "child", "S")
 	fakeStat(t, root, 30, 20, "grandchild", "S")
 	never := func() error { t.Fatal("request called"); return nil }
-	if _, err := stopTree(root, 10, 30, 0, never, 0, false); err == nil || !strings.Contains(err.Error(), "direct child") {
+	if _, err := stopTree(root, 10, 30, 0, never, 0); err == nil || !strings.Contains(err.Error(), "direct child") {
 		t.Errorf("library accepted a grandchild: %v", err)
 	}
 	for _, g := range []time.Duration{-time.Nanosecond, 24*time.Hour + time.Nanosecond} {
 		t.Run(strconv.FormatInt(int64(g), 10), func(t *testing.T) {
-			if _, err := stopTree(root, 10, 20, g, never, 0, false); err == nil || !strings.Contains(err.Error(), "grace") {
+			if _, err := stopTree(root, 10, 20, g, never, 0); err == nil || !strings.Contains(err.Error(), "grace") {
 				t.Errorf("accepted grace %v: %v", g, err)
 			}
 		})

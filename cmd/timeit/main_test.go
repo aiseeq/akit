@@ -218,30 +218,39 @@ func TestForwardSignalToCommandGroup(t *testing.T) {
 		signal.Stop(signals)
 		os.Exit(code)
 	}
-	ready := filepath.Join(t.TempDir(), "ready")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestForwardSignalToCommandGroup$")
-	cmd.Env = append(os.Environ(), "TIMEIT_SIGNAL_HELPER=1", "TIMEIT_SIGNAL_READY="+ready)
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if _, err := os.Stat(ready); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			_, _ = proc.StopChild(cmd.Process.Pid, 0, nil)
-			t.Fatal("signal helper did not become ready")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return cmd.Process.Signal(syscall.SIGTERM) }); err != nil {
-		t.Fatal(err)
-	}
-	err := cmd.Wait()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 128+int(syscall.SIGTERM) {
-		t.Fatalf("helper exit: %v", err)
+	for _, forwarded := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
+		t.Run(forwarded.String(), func(t *testing.T) {
+			ready := filepath.Join(t.TempDir(), "ready")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestForwardSignalToCommandGroup$")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Env = append(os.Environ(), "TIMEIT_SIGNAL_HELPER=1", "TIMEIT_SIGNAL_READY="+ready)
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if _, err := proc.StopChildGroup(cmd, 0, nil); err != nil {
+					t.Errorf("stop signal helper group: %v", err)
+				}
+			})
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				if _, err := os.Stat(ready); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("signal helper did not become ready")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if _, err := proc.StopChild(cmd.Process.Pid, time.Second, func() error { return cmd.Process.Signal(forwarded) }); err != nil {
+				t.Fatal(err)
+			}
+			err := cmd.Wait()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 128+int(forwarded) {
+				t.Fatalf("helper exit: %v", err)
+			}
+		})
 	}
 }
 
@@ -271,6 +280,7 @@ func TestSignalDuringStderrWrite(t *testing.T) {
 	ready := filepath.Join(dir, "ready")
 	marker := filepath.Join(dir, "blocked")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSignalDuringStderrWrite$")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), "TIMEIT_BLOCKING_HELPER=1", "TIMEIT_SIGNAL_READY="+ready, "TIMEIT_BLOCKING_MARKER="+marker)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -281,7 +291,7 @@ func TestSignalDuringStderrWrite(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			_, _ = proc.StopChild(cmd.Process.Pid, 0, nil)
+			_, _ = proc.StopChildGroup(cmd, 0, nil)
 			t.Fatal("helper did not block writing stderr")
 		}
 		time.Sleep(time.Millisecond)

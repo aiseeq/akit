@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,7 +27,107 @@ type StopResult struct {
 // A failure for a single process does not stop the rest: the result comes with
 // an error naming each failed PID.
 func StopChild(pid int, grace time.Duration, request func() error) (StopResult, error) {
-	return stopTree("/proc", os.Getpid(), pid, grace, request, 0, true)
+	return stopTree("/proc", os.Getpid(), pid, grace, request, 0)
+}
+
+// StopChildGroup stops the process group started by cmd with Setpgid: true.
+// It accepts a waited command whose leader has exited while group members remain.
+// Reuse of the now-free numeric group ID between Wait and this call has the
+// same narrow risk as the former Kill(-pid): a new unrelated group could take
+// that ID before cleanup.
+func StopChildGroup(cmd *exec.Cmd, grace time.Duration, request func() error) (StopResult, error) {
+	pid, err := validateChildGroupCommand(cmd, grace)
+	if err != nil {
+		return StopResult{}, err
+	}
+	self := os.Getpid()
+	leaderPresent, owned, err := inspectChildGroupLeader(cmd, self, pid)
+	if err != nil {
+		return StopResult{}, err
+	}
+	if !owned {
+		return StopResult{AlreadyExited: true}, nil
+	}
+	safe, err := safeToSignalChildGroup(pid, self)
+	if err != nil {
+		return StopResult{}, err
+	}
+	if !safe {
+		if leaderPresent {
+			return StopResult{}, fmt.Errorf("refusing unsafe process group ID %d", pid)
+		}
+		return StopResult{AlreadyExited: true}, nil
+	}
+
+	var result StopResult
+	if leaderPresent {
+		result, err = stopTree("/proc", self, pid, grace, request, 0)
+		if err != nil {
+			return result, err
+		}
+	} else {
+		result.AlreadyExited = true
+	}
+	if err := signalProcessGroup(pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		return result, fmt.Errorf("kill child process group %d: %w", pid, err)
+	}
+	return result, nil
+}
+
+func validateChildGroupCommand(cmd *exec.Cmd, grace time.Duration) (int, error) {
+	if grace < 0 || grace > 24*time.Hour {
+		return 0, errors.New("grace must be between 0 and 24h")
+	}
+	if cmd == nil || cmd.Process == nil {
+		return 0, errors.New("missing started command")
+	}
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid || cmd.SysProcAttr.Pgid != 0 {
+		return 0, errors.New("command was not started as its own process-group leader")
+	}
+	pid := cmd.Process.Pid
+	if pid <= 1 {
+		return 0, fmt.Errorf("refusing process-group ID %d", pid)
+	}
+	return pid, nil
+}
+
+func inspectChildGroupLeader(cmd *exec.Cmd, self, pid int) (present, owned bool, err error) {
+	target, err := ReadStat("/proc", pid)
+	if Gone(err) {
+		return false, true, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("read command process %d: %w", pid, err)
+	}
+	if !commandOwnsGroupLeader(cmd, self, target) {
+		return false, false, nil
+	}
+	return true, true, nil
+}
+
+func safeToSignalChildGroup(pgid, self int) (bool, error) {
+	ownPGID, err := unix.Getpgid(self)
+	if err != nil {
+		return false, fmt.Errorf("get caller process group: %w", err)
+	}
+	sessionID, err := unix.Getsid(self)
+	if err != nil {
+		return false, fmt.Errorf("get caller session: %w", err)
+	}
+	parent, err := ReadStat("/proc", os.Getppid())
+	if err != nil {
+		return false, fmt.Errorf("read parent process group: %w", err)
+	}
+	return safeChildGroup(pgid, ownPGID, parent.Pgid, sessionID), nil
+}
+
+func commandOwnsGroupLeader(cmd *exec.Cmd, self int, target Stat) bool {
+	return cmd != nil && cmd.Process != nil && cmd.ProcessState == nil &&
+		target.Ppid == self && target.Pgid == cmd.Process.Pid
+}
+
+func safeChildGroup(pgid, ownPGID, parentPGID, sessionID int) bool {
+	return pgid > 1 && pgid != ownPGID && pgid != parentPGID && pgid != sessionID
 }
 
 // StopFromShell sends sig to the target and the descendants observed before the
@@ -40,7 +141,7 @@ func StopFromShell(pid int, grace time.Duration, sig unix.Signal) (StopResult, e
 	if sig <= 0 || sig > 64 {
 		return StopResult{}, fmt.Errorf("invalid signal %d", sig)
 	}
-	return stopTree("/proc", os.Getpid(), pid, grace, nil, sig, false)
+	return stopTree("/proc", os.Getpid(), pid, grace, nil, sig)
 }
 
 func serviceManager(pid int, s Stat) bool {
@@ -147,7 +248,6 @@ func validateStop(root string, self, pid int, shells bool) (Stat, error) {
 type trackedProcess struct {
 	fd    int
 	start string
-	pgid  int
 }
 
 type processTree map[int]*trackedProcess
@@ -218,7 +318,7 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 		_ = unix.Close(fd)
 		return nil, false, fmt.Errorf("PID %d changed during validation", pid)
 	}
-	return processTree{pid: {fd: fd, start: target.Start, pgid: target.Pgid}}, false, nil
+	return processTree{pid: {fd: fd, start: target.Start}}, false, nil
 }
 
 // stopTree validates and opens the target, captures its tree and sends the
@@ -226,31 +326,15 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 // cleanup the target runs on the request, are tracked and get only SIGKILL if
 // they outlive the grace. Failures before the request abort; later failures of
 // single processes are collected and returned with the result.
-func stopTree(root string, self, pid int, grace time.Duration, request func() error, sig unix.Signal, stopGroup bool) (StopResult, error) {
+func stopTree(root string, self, pid int, grace time.Duration, request func() error, sig unix.Signal) (StopResult, error) {
 	if grace < 0 || grace > 24*time.Hour {
 		return StopResult{}, errors.New("grace must be between 0 and 24h")
 	}
 	tree, exited, err := openStopTarget(root, self, pid, sig)
 	if err != nil {
-		if stopGroup {
-			if _, statErr := ReadStat(root, pid); Gone(statErr) {
-				groupErr := killExitedChildGroup(root, self, pid)
-				if groupErr == nil {
-					return StopResult{AlreadyExited: true}, nil
-				}
-				return StopResult{}, groupErr
-			}
-		}
 		return StopResult{}, err
 	}
 	if exited {
-		if stopGroup {
-			if stat, statErr := ReadStat(root, pid); statErr == nil && stat.Pgid == pid {
-				if err := killExitedChildGroup(root, self, pid); err != nil {
-					return StopResult{}, err
-				}
-			}
-		}
 		return StopResult{AlreadyExited: true}, nil
 	}
 	defer tree.close()
@@ -269,88 +353,11 @@ func stopTree(root string, self, pid int, grace time.Duration, request func() er
 	if waitTree(root, tree, grace, &failures) {
 		result = killTree(tree, &failures)
 	}
-	if stopGroup {
-		if err := killChildGroup(root, self, tree[pid].pgid, pid); err != nil {
-			failures.add(0, err)
-		}
-	}
 	return result, failures.err()
-}
-
-func killExitedChildGroup(root string, self, pgid int) error {
-	if pgid <= 1 {
-		return nil
-	}
-	own, err := unix.Getpgid(self)
-	if err != nil {
-		return fmt.Errorf("get caller process group: %w", err)
-	}
-	parent, err := ReadStat(root, os.Getppid())
-	if err != nil {
-		return fmt.Errorf("read parent process group: %w", err)
-	}
-	if pgid == own || pgid == parent.Pgid {
-		return nil
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return fmt.Errorf("read process list %s: %w", root, err)
-	}
-	found := false
-	for _, entry := range entries {
-		pid, parseErr := strconv.Atoi(entry.Name())
-		if parseErr != nil || pid <= 1 {
-			continue
-		}
-		stat, statErr := ReadStat(root, pid)
-		if statErr == nil && stat.Pgid == pgid {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil
-	}
-	err = signalProcessGroup(pgid, unix.SIGKILL)
-	if errors.Is(err, unix.ESRCH) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("kill child process group %d: %w", pgid, err)
-	}
-	return nil
 }
 
 var signalProcessGroup = func(pgid int, sig unix.Signal) error {
 	return unix.Kill(-pgid, sig)
-}
-
-// killChildGroup also catches group members reparented after their shell exits.
-// The group is eligible only when the direct child leads its own group; never
-// signal the caller's or caller parent's group.
-func killChildGroup(root string, self, pgid, childPID int) error {
-	if pgid != childPID || pgid <= 1 {
-		return nil
-	}
-	own, err := unix.Getpgid(self)
-	if err != nil {
-		return fmt.Errorf("get caller process group: %w", err)
-	}
-	parent, err := ReadStat(root, os.Getppid())
-	if err != nil {
-		return fmt.Errorf("read parent process group: %w", err)
-	}
-	if pgid == own || pgid == parent.Pgid {
-		return nil
-	}
-	err = signalProcessGroup(pgid, unix.SIGKILL)
-	if errors.Is(err, unix.ESRCH) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("kill child process group %d: %w", pgid, err)
-	}
-	return nil
 }
 
 func requestTree(tree processTree, leader int, sig unix.Signal, failures *stopFailures) {

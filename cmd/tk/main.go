@@ -3169,7 +3169,7 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	cmd.Dir = root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		_, err := proc.StopChild(cmd.Process.Pid, 0, nil)
+		_, err := proc.StopChildGroup(cmd, 0, nil)
 		return err
 	}
 	// stderr — в файл, не в трубу: оставленный пунктом фоновый процесс держал бы трубу открытой, и Wait
@@ -3184,7 +3184,7 @@ func runPlanItem(root string, item planJSON, timeout time.Duration) planResult {
 	err = cmd.Run()
 	if cmd.Process != nil {
 		// ESRCH — группа уже пуста: остатков нет.
-		if _, stopErr := proc.StopChild(cmd.Process.Pid, 0, nil); stopErr != nil {
+		if _, stopErr := proc.StopChildGroup(cmd, 0, nil); stopErr != nil {
 			return planResult{item: item, exit: 1, stderr: "stop leftover processes: " + stopErr.Error()}
 		}
 	}

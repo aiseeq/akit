@@ -101,7 +101,7 @@ func TestZombieReturnsImmediately(t *testing.T) {
 	fakeStat(t, root, 1, 0, "init", "S")
 	fakeStat(t, root, 10, 1, "parent", "S")
 	fakeStat(t, root, 20, 10, "child", "Z")
-	result, err := stopTree(root, 10, 20, 0, func() error { t.Fatal("request called"); return nil }, 0, false)
+	result, err := stopTree(root, 10, 20, 0, func() error { t.Fatal("request called"); return nil }, 0)
 	if err != nil || !result.AlreadyExited {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
@@ -151,7 +151,7 @@ while :; do sleep 0.05; done`
 				}
 				return real(pid, p, sig)
 			}
-			result, err := stopTree("/proc", os.Getpid(), child, 300*time.Millisecond, nil, unix.SIGTERM, false)
+			result, err := stopTree("/proc", os.Getpid(), child, 300*time.Millisecond, nil, unix.SIGTERM)
 			want := fmt.Sprintf("PID %d: %s", child, tc.failure)
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("error %v, want it to name %q", err, want)

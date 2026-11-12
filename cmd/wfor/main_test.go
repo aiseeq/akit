@@ -215,10 +215,16 @@ func TestOkTimeoutKillsProcessGroup(t *testing.T) {
 func TestOkKillsLeftoverProcesses(t *testing.T) {
 	pidPath := filepath.Join(t.TempDir(), "pid")
 	start := time.Now()
-	code, out, _ := wfor(t, "ok", "sleep 2 & echo $! >"+pidPath+"; exit 0", "--timeout", "5s")
-	if elapsed := time.Since(start); elapsed > time.Second || code != 0 {
-		t.Errorf("successful command returned after %s with code %d: %s", elapsed, code, out)
+	cond := &okCond{cmd: "sleep 2 & echo $! >" + pidPath + "; exit 0", every: time.Second, now: time.Now}
+	ok, err := cond.check(context.Background())
+	if elapsed := time.Since(start); elapsed > time.Second || !ok || err != nil {
+		t.Errorf("successful command returned after %s, ok=%v err=%v", elapsed, ok, err)
 	}
+	t.Cleanup(func() {
+		if _, err := proc.StopChildGroup(cond.lastCommand, 0, nil); err != nil {
+			t.Errorf("stop test command group: %v", err)
+		}
+	})
 	data, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +233,6 @@ func TestOkKillsLeftoverProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = proc.StopChild(pid, 0, nil) })
 	deadline := time.Now().Add(time.Second)
 	for {
 		stat, readErr := os.ReadFile(filepath.Join("/proc", itoa(pid), "stat"))

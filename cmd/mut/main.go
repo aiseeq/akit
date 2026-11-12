@@ -522,7 +522,7 @@ func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 	case sig := <-sigc:
 		var signalErr error
 		if sig != os.Interrupt {
-			_, signalErr = proc.StopChild(cmd.Process.Pid, time.Second, func() error {
+			_, signalErr = proc.StopChild(cmd.Process.Pid, 24*time.Hour, func() error {
 				return cmd.Process.Signal(sig)
 			})
 		}
