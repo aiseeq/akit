@@ -756,3 +756,60 @@ func waitReady(t *testing.T, path string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestStopChildGroupCountsEachKilledProcessOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		sig   syscall.Signal
+		grace time.Duration
+	}{{"kill", syscall.SIGKILL, 0}, {"term", syscall.SIGTERM, 50 * time.Millisecond}} {
+		ready := filepath.Join(t.TempDir(), "ready")
+		cmd := startGroupLeader(t, "sh", "-c", "trap '' TERM; sleep 30 & echo ready > \"$1\"; wait", "sh", ready)
+		waitReady(t, ready)
+		realSignal := signalProcess
+		faked := 0
+		repeated := false
+		signalProcess = func(pid int, process *trackedProcess, sig unix.Signal) error {
+			if sig == unix.SIGKILL && pid != cmd.Process.Pid {
+				faked++
+				if faked == 1 {
+					return nil // reported as sent while the process stays visible to the next pass
+				}
+				repeated = true
+			}
+			return realSignal(pid, process, sig)
+		}
+		result, err := StopChildGroup(cmd, tc.grace, tc.sig)
+		signalProcess = realSignal
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if !repeated {
+			t.Fatalf("%s: SIGKILL to the background process was not repeated, the test does not reach the second pass", tc.name)
+		}
+		if result.Killed != 2 {
+			t.Fatalf("%s: result = %+v, want the shell and its sleep counted once each", tc.name, result)
+		}
+		if err := cmd.Wait(); err == nil {
+			t.Fatalf("%s: shell exited successfully after SIGKILL", tc.name)
+		}
+	}
+}
+
+// startGroupLeader starts name as its own process-group leader and stops the
+// group at cleanup if the test did not wait for it.
+func startGroupLeader(t *testing.T, name string, args ...string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	return cmd
+}

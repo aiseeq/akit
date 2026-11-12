@@ -120,17 +120,7 @@ func TestStopChildGroupRechecksMembershipAfterPidfdOpen(t *testing.T) {
 		time.Sleep(time.Hour)
 		os.Exit(0)
 	}
-	cmd := exec.Command("sleep", "30")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if cmd.ProcessState == nil {
-			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
-			_ = cmd.Wait()
-		}
-	})
+	cmd := startGroupLeader(t, "sleep", "30")
 	dir := t.TempDir()
 	readyPath, movePath, donePath := filepath.Join(dir, "ready"), filepath.Join(dir, "move"), filepath.Join(dir, "done")
 	outsider := exec.Command(os.Args[0], "-test.run=^TestStopChildGroupRechecksMembershipAfterPidfdOpen$")
@@ -284,17 +274,7 @@ func TestStopChildGroupDropsStaleTreeMembershipAfterPidfdOpen(t *testing.T) {
 }
 
 func TestVerifiedCommandTargetRejectsChangedAncestryStartTime(t *testing.T) {
-	cmd := exec.Command("sleep", "30")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if cmd.ProcessState == nil {
-			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
-			_ = cmd.Wait()
-		}
-	})
+	cmd := startGroupLeader(t, "sleep", "30")
 	realRead, realHook := readCommandAncestryStat, afterCommandTargetPidfdOpen
 	opened := false
 	readCommandAncestryStat = func(root string, pid int) (Stat, error) {
@@ -490,17 +470,7 @@ func TestStopChildGroupStopsAdoptedMembersOnlyAsSubreaper(t *testing.T) {
 }
 
 func TestStopChildGroupDoesNotReapZombieOutsideCommandGroup(t *testing.T) {
-	cmd := exec.Command("sleep", "30")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if cmd.ProcessState == nil {
-			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
-			_ = cmd.Wait()
-		}
-	})
+	cmd := startGroupLeader(t, "sleep", "30")
 	outsider := exec.Command("sh", "-c", "exit 7")
 	if err := outsider.Start(); err != nil {
 		_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
@@ -537,17 +507,7 @@ func TestStopChildGroupDoesNotReapZombieOutsideCommandGroup(t *testing.T) {
 }
 
 func TestStopChildGroupDoesNotReapCommandLeader(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "exit 7")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if cmd.ProcessState == nil {
-			_, _ = StopChildGroup(cmd, 0, syscall.SIGKILL)
-			_ = cmd.Wait()
-		}
-	})
+	cmd := startGroupLeader(t, "sh", "-c", "exit 7")
 	waitForZombie(t, cmd.Process.Pid)
 	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
