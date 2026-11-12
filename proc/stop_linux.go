@@ -173,6 +173,7 @@ var afterStopTargetPidfdOpen = func(int) {}
 
 var readSignalChildStat = ReadStat
 var beforeSignalChildPidfdOpen = func(int) {}
+var openSignalChildPidfd = unix.PidfdOpen
 
 // SignalChild signals only a direct child after checking its parent and start
 // time both before and after opening a pidfd. The pidfd pins identity at send.
@@ -195,7 +196,7 @@ func SignalChild(pid int, sig syscall.Signal) error {
 		return fmt.Errorf("child process %d: %w", pid, os.ErrProcessDone)
 	}
 	beforeSignalChildPidfdOpen(pid)
-	fd, err := unix.PidfdOpen(pid, 0)
+	fd, err := openSignalChildPidfd(pid, 0)
 	if err != nil {
 		if errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("pidfd_open child %d: %w", pid, errors.Join(errStopTargetChanged, os.ErrProcessDone))

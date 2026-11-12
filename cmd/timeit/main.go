@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -98,6 +99,46 @@ func main() {
 
 var activeCommand atomic.Pointer[exec.Cmd]
 
+var commandStartState struct {
+	sync.Mutex
+	starting bool
+	done     chan struct{}
+}
+
+var afterCommandStartBeforePublish = func(*exec.Cmd) {}
+var beforeCommandSignalLookup = func() {}
+
+func beginCommandStart() {
+	commandStartState.Lock()
+	activeCommand.Store(nil)
+	commandStartState.starting = true
+	commandStartState.done = make(chan struct{})
+	commandStartState.Unlock()
+}
+
+func finishCommandStart(cmd *exec.Cmd) {
+	commandStartState.Lock()
+	activeCommand.Store(cmd)
+	commandStartState.starting = false
+	close(commandStartState.done)
+	commandStartState.done = nil
+	commandStartState.Unlock()
+}
+
+func commandForSignal() *exec.Cmd {
+	beforeCommandSignalLookup()
+	commandStartState.Lock()
+	for commandStartState.starting {
+		done := commandStartState.done
+		commandStartState.Unlock()
+		<-done
+		commandStartState.Lock()
+	}
+	cmd := activeCommand.Load()
+	commandStartState.Unlock()
+	return cmd
+}
+
 func watchSignals(signals <-chan os.Signal) {
 	if sig := <-signals; sig != nil {
 		stopForSignal(sig)
@@ -105,7 +146,11 @@ func watchSignals(signals <-chan os.Signal) {
 }
 
 func stopForSignal(sig os.Signal) {
-	if cmd := activeCommand.Load(); cmd != nil {
+	os.Exit(signalExitCode(sig))
+}
+
+func signalExitCode(sig os.Signal) int {
+	if cmd := commandForSignal(); cmd != nil {
 		if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
 			fmt.Fprintf(os.Stderr, "timeit: stop command: %v\n", err)
 		}
@@ -114,7 +159,7 @@ func stopForSignal(sig os.Signal) {
 	if !ok {
 		s = syscall.SIGTERM
 	}
-	os.Exit(128 + int(s))
+	return 128 + int(s)
 }
 
 func parseArgs(args []string) (options, error) {
@@ -429,12 +474,15 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		cmd.Stdin = f
 	}
 	started := time.Now()
+	beginCommandStart()
 	if err := cmd.Start(); err != nil {
+		finishCommandStart(nil)
 		cleanup()
 		closeErr := stdoutFile.Close()
 		return result{}, 0, errors.Join(fmt.Errorf("%s: %w", opts.command[0], err), closeErr)
 	}
-	activeCommand.Store(cmd)
+	afterCommandStartBeforePublish(cmd)
+	finishCommandStart(cmd)
 	if err := stdoutFile.Close(); err != nil {
 		stopCommand(cmd)
 		cleanup()

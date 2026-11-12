@@ -221,6 +221,137 @@ func TestChildSignalExit(t *testing.T) {
 	}
 }
 
+func TestSignalDuringCommandPublication(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "member.pid")
+	started := make(chan *exec.Cmd, 1)
+	release := make(chan struct{})
+	var testCmd *exec.Cmd
+	oldAfterStart := afterCommandStartBeforePublish
+	afterCommandStartBeforePublish = func(cmd *exec.Cmd) {
+		started <- cmd
+		<-release
+	}
+	signalEntered := make(chan struct{})
+	oldSignalLookup := beforeCommandSignalLookup
+	beforeCommandSignalLookup = func() { close(signalEntered) }
+	t.Cleanup(func() {
+		afterCommandStartBeforePublish = oldAfterStart
+		beforeCommandSignalLookup = oldSignalLookup
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		if testCmd == nil {
+			select {
+			case testCmd = <-started:
+			default:
+			}
+		}
+		if testCmd != nil {
+			if _, err := proc.StopChildGroup(testCmd, 0, syscall.SIGKILL); err != nil {
+				t.Errorf("cleanup test command group: %v", err)
+			}
+		}
+	})
+
+	opts := options{command: []string{"sh", "-c", `sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$1"; exec sleep 30`, "sh", pidFile}, runs: 1, okExit: map[int]bool{0: true}}
+	type commandResult struct {
+		result  result
+		elapsed time.Duration
+		err     error
+	}
+	done := make(chan commandResult, 1)
+	go func() {
+		res, elapsed, err := runCommand(opts, nil)
+		done <- commandResult{result: res, elapsed: elapsed, err: err}
+	}()
+	cmd := <-started
+	testCmd = cmd
+	waitTimeitFile(t, pidFile)
+
+	handled := make(chan int, 1)
+	go func() { handled <- signalExitCode(syscall.SIGTERM) }()
+	select {
+	case <-signalEntered:
+	case <-time.After(time.Second):
+		t.Fatal("signal handler did not enter command lookup")
+	}
+	early := false
+	select {
+	case code := <-handled:
+		early = true
+		t.Errorf("signal handler returned %d before command publication", code)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	code := <-handled
+	if early {
+		if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+			t.Errorf("clean command group after failed window check: %v", err)
+		}
+	}
+	got := <-done
+	if code != 128+int(syscall.SIGTERM) {
+		t.Errorf("signal handler code = %d, want 143", code)
+	}
+	if got.err != nil {
+		t.Fatalf("runCommand: %v", got.err)
+	}
+	cleanupResult(got.result)
+	if got.result.code != 128+int(syscall.SIGKILL) {
+		t.Errorf("command exit code = %d, want 137 after group stop", got.result.code)
+	}
+	if cmd.ProcessState == nil {
+		t.Error("test command was not reaped by runCommand")
+	}
+	member := readTimeitPID(t, pidFile)
+	if !timeitProcessGone(member, time.Second) {
+		t.Errorf("command group member %d survived signal", member)
+		if _, err := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+			t.Errorf("clean surviving test group: %v", err)
+		}
+	}
+}
+
+func readTimeitPID(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 1 {
+		t.Fatalf("invalid PID in %s: %q (%v)", path, b, err)
+	}
+	return pid
+}
+
+func waitTimeitFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("file %s was not created", path)
+}
+
+func timeitProcessGone(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		stat, err := proc.ReadStat("/proc", pid)
+		if err != nil || stat.State == "Z" || stat.State == "X" {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
 func TestForwardSignalToCommandGroup(t *testing.T) {
 	if os.Getenv("TIMEIT_SIGNAL_HELPER") == "1" {
 		signals := make(chan os.Signal, 1)

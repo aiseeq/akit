@@ -89,6 +89,9 @@ func TestOpenStopTargetMarksLeaderValidationRaces(t *testing.T) {
 }
 
 func TestStopTargetRaceRecognizesGoneAndESRCH(t *testing.T) {
+	// The explicit ESRCH predicate is redundant on Linux because Gone already
+	// recognizes ESRCH through noSuchProcess; keep this case as the one accepted
+	// equivalent mutation in the reviewer spec.
 	for name, err := range map[string]error{
 		"validation marker": errStopTargetChanged,
 		"gone":              fs.ErrNotExist,
@@ -153,6 +156,7 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 	}
 	dir := t.TempDir()
 	var called atomic.Int32
+	var checked atomic.Int32
 	jobs := make(chan int)
 	workers := min(40, iterations)
 	var wg sync.WaitGroup
@@ -191,8 +195,15 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 					if stopErr != nil {
 						t.Errorf("iteration %d: Cancel returned %v", i, stopErr)
 					}
-					if raw, err := os.ReadFile(pidFile); err == nil {
-						if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 1 {
+					raw, err := os.ReadFile(pidFile)
+					if err != nil {
+						t.Errorf("iteration %d: read member PID: %v", i, err)
+					} else {
+						pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+						if parseErr != nil || pid <= 1 {
+							t.Errorf("iteration %d: invalid member PID %q: %v", i, raw, parseErr)
+						} else {
+							checked.Add(1)
 							if !groupMemberGone(pid, time.Second) {
 								t.Errorf("iteration %d: group member %d survived Cancel", i, pid)
 							}
@@ -215,7 +226,10 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 	if int(called.Load()) < iterations*2/3 {
 		t.Fatalf("Cancel ran in only %d of %d iterations", called.Load(), iterations)
 	}
-	t.Logf("Cancel invoked in %d/%d iterations; errors=0; checked leftovers dead", called.Load(), iterations)
+	if checked.Load() != called.Load() {
+		t.Fatalf("Cancel calls=%d, participants checked=%d", called.Load(), checked.Load())
+	}
+	t.Logf("Cancel calls=%d, participants checked=%d", called.Load(), checked.Load())
 }
 
 func startRaceGroup(t *testing.T) (*exec.Cmd, int) {
