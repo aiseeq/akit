@@ -76,6 +76,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -83,6 +84,7 @@ var (
 	awsRE         = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE      = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
 	contextNameRE = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
+	russianNameRE = regexp.MustCompile(`(?i)([\p{Cyrillic}]+(?:[ \t]+[\p{L}0-9_.-]+)?)(?:\\*["'])?([ \t]*)(—|–|:=|=>|=|:)`)
 
 	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
@@ -233,6 +235,12 @@ func contextAnchorGroups(text string) anchorGroup {
 			if groups&anchor.group == 0 && anchorEdgeAt(text, i+1-len(anchor.word), i+1, anchor.edge) {
 				groups |= anchor.group
 			}
+		}
+	}
+	if groups&anchorName == 0 && strings.ContainsAny(text, "абвгдежзийклмнопрстуфхцчшщъыьэюяАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ") {
+		lower := strings.ToLower(text)
+		if strings.Contains(lower, "парол") || strings.Contains(lower, "токен") || strings.Contains(lower, "ключ") {
+			groups |= anchorName
 		}
 	}
 	return groups
@@ -767,7 +775,10 @@ func headerMatches(text string) []contextMatch {
 
 func nameMatches(text string) []contextMatch {
 	var matches []contextMatch
-	for _, ix := range contextNameRE.FindAllStringSubmatchIndex(text, -1) {
+	indices := contextNameRE.FindAllStringSubmatchIndex(text, -1)
+	indices = append(indices, russianNameRE.FindAllStringSubmatchIndex(text, -1)...)
+	sort.Slice(indices, func(i, j int) bool { return indices[i][0] < indices[j][0] })
+	for _, ix := range indices {
 		if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
 			continue
 		}
@@ -780,6 +791,9 @@ func nameMatches(text string) []contextMatch {
 		}
 		leftSpace := text[ix[4]:ix[5]]
 		delimiter := text[ix[6]:ix[7]]
+		if (delimiter == "—" || delimiter == "–") && !isRussianSecretLabel(text[ix[2]:ix[3]]) {
+			continue
+		}
 		at := ix[1]
 		if delimiter == "=" && leftSpace == "" && hasHorizontalSpaceAt(text, at) {
 			continue
@@ -1502,7 +1516,26 @@ func plainValueFor(name, value string) bool {
 		return isPlainPath(value)
 	}
 	n := strings.TrimRight(strings.ToLower(name), "0123456789")
+	if _, ok := russianSecretName(n); ok {
+		if isRussianKeyLabel(n) {
+			return !isRussianKeyValue(value)
+		}
+		value = strings.TrimRight(value, "»”’›")
+		return value == "…" || isPlaceholder(value) || isPlainWord(value) || isShortLetterWord(value)
+	}
 	return authName(n) && (isPlainPath(value) || isPlainWord(value))
+}
+
+// isShortLetterWord accepts a short word made only of Unicode letters.
+func isShortLetterWord(value string) bool {
+	count := 0
+	for _, r := range value {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+		count++
+	}
+	return count > 0 && count < 16
 }
 
 // isPlainPath: /a/b, ~/a or ./a, every part a plain word: /Bx4Tq9Wz is no path.
@@ -1591,9 +1624,12 @@ func isHex(s string) bool {
 }
 
 func secretName(name string) (string, bool) {
-	n := strings.ToLower(name)
+	n := strings.ToLower(strings.TrimSpace(name))
 	for len(n) > 0 && n[len(n)-1] >= '0' && n[len(n)-1] <= '9' {
 		n = n[:len(n)-1]
+	}
+	if kind, ok := russianSecretName(n); ok {
+		return kind, true
 	}
 	for _, suffix := range [...]string{"password", "passwd", "passphrase"} {
 		if strings.HasSuffix(n, suffix) {
@@ -1618,6 +1654,61 @@ func secretName(name string) (string, bool) {
 		return "token", true
 	}
 	return "", false
+}
+
+func russianSecretName(name string) (string, bool) {
+	words := strings.Fields(strings.ToLower(strings.TrimSpace(name)))
+	if len(words) == 0 || len(words) > 2 {
+		return "", false
+	}
+	switch {
+	case strings.Contains(words[0], "парол"):
+		return "password", true
+	case strings.Contains(words[0], "токен"):
+		return "token", true
+	case len(words) == 1 && isRussianKeyName(words[0]):
+		return "token", true
+	default:
+		return "", false
+	}
+}
+
+func isRussianSecretLabel(name string) bool {
+	_, ok := russianSecretName(name)
+	return ok
+}
+
+func isRussianKeyLabel(name string) bool {
+	words := strings.Fields(strings.ToLower(strings.TrimSpace(name)))
+	return len(words) == 1 && isRussianKeyName(words[0])
+}
+
+func isRussianKeyValue(value string) bool {
+	if len(value) < 12 {
+		return false
+	}
+	hasLetter, hasDigit := false, false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z':
+			hasLetter = true
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c != '-' && c != '_' && c != '.':
+			return false
+		}
+	}
+	return hasLetter && hasDigit && !isPlainWord(value)
+}
+
+func isRussianKeyName(name string) bool {
+	switch name {
+	case "ключ", "ключа", "ключу", "ключом", "ключе", "ключи", "ключей", "ключам", "ключами", "ключах":
+		return true
+	default:
+		return false
+	}
 }
 
 func authName(name string) bool {

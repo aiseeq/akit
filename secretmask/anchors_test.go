@@ -62,6 +62,40 @@ func TestMaskToolAndJSONNeighboursStay(t *testing.T) {
 	}
 }
 
+// Russian password and token labels use the same value-shape rules as English labels.
+func TestMaskRussianSecretLabels(t *testing.T) {
+	for _, input := range []string{
+		"пароль: Zq7xW9vK2mPq8Rt",
+		"Пароль учётки: Zq7xW9vK2mPq8Rt",
+		"пароль=Zq7xW9vK2mPq8Rt",
+		"пароля — Zq7xW9vK2mPq8Rt",
+		"паролем: Zq7xW9vK2mPq8Rt",
+		"токен: Zq7xW9vK2mPq8Rt",
+		"токена: Zq7xW9vK2mPq8Rt",
+		"ключ: aB4cD9eF0gH2",
+	} {
+		got, _ := Mask(input)
+		secret := "Zq7xW9vK2mPq8Rt"
+		if strings.HasPrefix(input, "ключ:") {
+			secret = "aB4cD9eF0gH2"
+		}
+		if strings.Contains(got, secret) {
+			t.Errorf("secret value left visible for input %q: %q", input, got)
+		}
+	}
+	for _, input := range []string{
+		"пароль не подошёл",
+		"пароль: нет",
+		"токенов: 1200",
+		"ключ: XY-1234",
+		"ключ: incident-reference",
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("ordinary value changed for %q: %q, %v", input, got, found)
+		}
+	}
+}
+
 // The filter takes a secret name only where it is used as one, and a command
 // word only at a command edge.
 func TestContextAnchorGroups(t *testing.T) {
