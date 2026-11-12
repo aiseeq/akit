@@ -88,8 +88,11 @@ type Load struct {
 	DirtyLimitMB float64
 	// QuietUntil — срок тихого режима, пока он не прошёл; нулевое — режима нет или срок прошёл.
 	QuietUntil time.Time
-	QuietBy    string // кто поставил тихий режим, из его пометки
-	QuietWhy   string // зачем
+	QuietBy    string    // кто поставил тихий режим, из его пометки
+	QuietWhy   string    // зачем
+	HalfUntil  time.Time // срок режима половины машины, пока не прошёл
+	HalfBy     string    // кто поставил режим половины машины
+	HalfWhy    string    // зачем
 }
 
 // Verdict — ответ правила: Measure пусто — свободна; иначе мера, её значение и порог.
@@ -109,9 +112,9 @@ func (v Verdict) Why() string {
 	switch v.Measure {
 	case CPU:
 		if float64(v.Load.Runnable) < v.Limit {
-			return fmt.Sprintf("load average 1m %.2f is at or above %v", v.Value, v.Limit)
+			return withHalfWhy(v, fmt.Sprintf("load average 1m %.2f is at or above %v", v.Value, v.Limit))
 		}
-		return fmt.Sprintf("runnable %.0f is at or above %v", v.Value, v.Limit)
+		return withHalfWhy(v, fmt.Sprintf("runnable %.0f is at or above %v", v.Value, v.Limit))
 	case IO:
 		if v.Load.Disk != nil && v.Load.Disk.Open && !v.Load.Disk.OpenCapped {
 			return fmt.Sprintf("disk freeze in progress for %d ms", v.Load.Disk.OpenMs)
@@ -125,6 +128,13 @@ func (v Verdict) Why() string {
 		return "quiet mode until " + quietClock(v.Load.QuietUntil, time.Now()) + quietNoteText(v.Load.QuietBy, v.Load.QuietWhy)
 	}
 	return ""
+}
+
+func withHalfWhy(v Verdict, why string) string {
+	if v.Load.HalfUntil.IsZero() {
+		return why
+	}
+	return why + " (half until " + quietClock(v.Load.HalfUntil, time.Now()) + quietNoteText(v.Load.HalfBy, v.Load.HalfWhy) + ")"
 }
 
 // quietNoteText — пометка тихого режима в скобках: «(planner: созвон)», «(planner)», «(созвон)».
@@ -208,10 +218,23 @@ func effectiveLimits(m Load, l Limits) (maxIOFull, runnable, memSome float64) {
 	if maxIOFull <= 0 {
 		maxIOFull = DefaultLimits.MaxIOFull
 	}
+	runnable = l.RunnableLimit(m)
+	return maxIOFull, runnable, l.MemSomeLimit()
+}
+
+// RunnableLimit — порог CPU после умолчаний и активного режима половины машины.
+func (l Limits) RunnableLimit(m Load) float64 {
+	runnable := l.Runnable
 	if runnable <= 0 {
 		runnable = float64(m.Threads)
 	}
-	return maxIOFull, runnable, l.MemSomeLimit()
+	if !m.HalfUntil.IsZero() {
+		half := math.Max(1, float64(m.Threads)/2)
+		if runnable > half {
+			runnable = half
+		}
+	}
+	return runnable
 }
 
 // MemSomeLimit — порог давления памяти: MaxMemSome, а 0 — DefaultMemSome.
@@ -244,6 +267,7 @@ func skippedAny(skipped []error, target error) bool {
 type Meter struct {
 	procRoot string
 	quiet    string // файл срока тихого режима; пусто — QuietPath
+	half     string // файл срока режима половины машины; пусто — HalfPath
 	pages    int64
 	at       time.Time
 	ioTotal  int64
@@ -281,6 +305,18 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 		return Verdict{}, err
 	}
 	load.QuietUntil, load.QuietBy, load.QuietWhy = note.Until, note.By, note.Why
+	halfPath := m.half
+	if halfPath == "" {
+		halfPath, err = HalfPath()
+		if err != nil {
+			return Verdict{}, err
+		}
+	}
+	halfNote, err := activeQuiet(halfPath, m.now())
+	if err != nil {
+		return Verdict{}, err
+	}
+	load.HalfUntil, load.HalfBy, load.HalfWhy = halfNote.Until, halfNote.By, halfNote.Why
 	// measure кладёт замер или, когда меры нет в системе, её сентинел в skipped.
 	measure := func(none error, read func() error) error {
 		err := read()

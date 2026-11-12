@@ -181,6 +181,32 @@ func TestParseArgs(t *testing.T) {
 	}
 }
 
+func TestHalf(t *testing.T) {
+	root := proc(t, "3")
+	call := func(args ...string) (int, string) {
+		t.Helper()
+		opts, err := parseArgs(append([]string{"--proc", root, "--window=1ms"}, args...), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		code := run(context.Background(), opts, &out, &out)
+		return code, out.String()
+	}
+	if code, out := call("--half", "1h", "--why", "игра"); code != 0 || !strings.HasPrefix(out, "half mode until ") {
+		t.Fatalf("set half: code %d, %q", code, out)
+	}
+	if code, out := call(); code != exitBusy || !strings.Contains(out, "half until ") || !strings.Contains(out, "игра") {
+		t.Errorf("half busy result: code %d, %q", code, out)
+	}
+	if code, out := call("--half-off"); code != 0 || !strings.HasPrefix(out, "half mode off") {
+		t.Errorf("half off: code %d, %q", code, out)
+	}
+	if code, out := call(); code != exitBusy || !strings.Contains(out, "runnable 2 is at or above 2") {
+		t.Errorf("ordinary mode restored: code %d, %q", code, out)
+	}
+}
+
 func TestQuiet(t *testing.T) {
 	root := proc(t, "1")
 	call := func(args ...string) (int, string) {
@@ -267,9 +293,14 @@ func TestParseQuiet(t *testing.T) {
 	if opts, err = parseArgs([]string{"--quiet=2h", "--why", " call "}, now); err != nil || opts.why != "call" {
 		t.Errorf("--why = %q, %v", opts.why, err)
 	}
+	if opts, err = parseArgs([]string{"--half-until", "14:45"}, now); err != nil || !opts.half.Equal(now.Add(2*time.Hour+45*time.Minute)) {
+		t.Errorf("--half-until 14:45 = %v, %v", opts.half, err)
+	}
 	for _, bad := range [][]string{
 		{"--quiet-until", "11:00"}, {"--quiet-until", "2h"}, {"--quiet", "0s"}, {"--quiet", "1h", "--quiet-off"},
+		{"--half-until", "11:00"}, {"--half-until", "2h"}, {"--half", "0s"}, {"--half", "1h", "--half-off"},
 		{"--why", "call"}, {"--quiet", "1h", "--why", " "}, {"--quiet", "1h", "--ignore-quiet"}, {"--quiet-off", "--ignore-quiet"},
+		{"--half-off", "--quiet", "1h"}, {"--quiet-off", "--half", "1h"},
 	} {
 		if _, err := parseArgs(bad, now); err == nil {
 			t.Errorf("%v — ждали ошибку", bad)

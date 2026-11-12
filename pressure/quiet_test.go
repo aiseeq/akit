@@ -13,6 +13,9 @@ func TestQuietPath(t *testing.T) {
 	if p, err := QuietPath(); err != nil || p != "/state/akit/quiet-until" {
 		t.Errorf("QuietPath = %q, %v", p, err)
 	}
+	if p, err := HalfPath(); err != nil || p != "/state/akit/half-until" {
+		t.Errorf("HalfPath = %q, %v", p, err)
+	}
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("HOME", "/home/u")
 	if p, err := QuietPath(); err != nil || p != "/home/u/.local/state/akit/quiet-until" {
@@ -145,6 +148,32 @@ func TestCheckQuiet(t *testing.T) {
 	}
 	if _, err := m.Check(context.Background(), DefaultLimits, "", true); err == nil {
 		t.Error("битый файл тихого режима — ждали ошибку замера")
+	}
+}
+
+func TestCheckHalf(t *testing.T) {
+	m, now := fakeProc(t, map[string]string{"stat": "cpu0 1\ncpu1 1\nprocs_running 1\n"})
+	until := now.Add(time.Hour)
+	if err := SetQuiet(m.half, QuietNote{Until: until, By: "lead", Why: "игра"}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := m.Check(context.Background(), DefaultLimits, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Busy() || v.Measure != "" || !v.Load.HalfUntil.Equal(until) || v.Load.HalfBy != "lead" || v.Load.HalfWhy != "игра" {
+		t.Errorf("режим half при свободной машине = %+v", v)
+	}
+
+	*now = until
+	if v, err = m.Check(context.Background(), DefaultLimits, "", true); err != nil || v.Busy() || !v.Load.HalfUntil.IsZero() {
+		t.Errorf("истёкший half = %+v, %v; ждали обычное правило", v, err)
+	}
+	if err := os.WriteFile(m.half, []byte("soon\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Check(context.Background(), DefaultLimits, "", true); err == nil {
+		t.Error("битый файл half — ждали ошибку замера")
 	}
 }
 

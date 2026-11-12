@@ -16,7 +16,13 @@ import (
 
 // QuietPath — файл срока тихого режима: $XDG_STATE_HOME/akit/quiet-until, без XDG_STATE_HOME —
 // ~/.local/state/akit/quiet-until.
-func QuietPath() (string, error) {
+func QuietPath() (string, error) { return StatePath("quiet-until") }
+
+// HalfPath — файл срока режима половины машины, рядом с quiet-until.
+func HalfPath() (string, error) { return StatePath("half-until") }
+
+// StatePath — файл состояния режима в $XDG_STATE_HOME/akit, либо ~/.local/state/akit.
+func StatePath(name string) (string, error) {
 	dir := os.Getenv("XDG_STATE_HOME")
 	if dir == "" {
 		home, err := os.UserHomeDir()
@@ -25,7 +31,7 @@ func QuietPath() (string, error) {
 		}
 		dir = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(dir, "akit", "quiet-until"), nil
+	return filepath.Join(dir, "akit", name), nil
 }
 
 // ReadQuiet — срок тихого режима из path; файла нет — нулевое время. Срок может быть и прошедшим.

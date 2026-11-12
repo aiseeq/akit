@@ -24,6 +24,7 @@ const usage = `busy — is the machine busy by the shared rule (akit/pressure), 
 
 Usage:
   busy [--runnable N] [--mem-some P] [--io-full P] [--dirty-mb M] [--kind K] [--window D] [--proc DIR] [--ignore-quiet]
+  busy (--half-until TIME | --half D) [--why TEXT] | --half-off
   busy (--quiet-until TIME | --quiet D) [--why TEXT] | --quiet-off
 
 Busy when quiet mode is on, the tasks ready to run now (procs_running, one reading, without busy
@@ -40,6 +41,12 @@ defaults; the user's own are flat "key: value" lines in $XDG_CONFIG_HOME/akit/pr
 max_dirty_mb),
 which graft reads too; flags override both for one check.
 
+Half mode lowers the CPU threshold to half the machine's threads, with a minimum of one; a lower
+configured runnable limit takes precedence. Disk, writeback and memory checks keep their usual limits.
+Half mode lasts until its deadline. The time is stored as one RFC3339 line in
+$XDG_STATE_HOME/akit/half-until (~/.local/state/akit/half-until). The adjacent half-until.note records
+who set it and why, and the busy line and graft wait explain CPU busy verdicts as "half until 14:45 (planner: call)".
+
 Quiet mode keeps the machine busy until a time, whatever it measures: heavy work waits while
 someone needs a responsive machine. The time is one RFC3339 line in $XDG_STATE_HOME/akit/quiet-until
 (~/.local/state/akit/quiet-until); a past time does nothing and needs no cleanup. Who set it (the
@@ -54,15 +61,21 @@ Flags:
   --kind K        disk state profile kind to request
   --window D      swapping measured over D (default 1s)
   --proc DIR      read DIR instead of /proc
+  --half-until T half mode until T: 14:45 today, "30.10 09:00", or RFC3339
+  --half D       half mode for D from now: 2h, 90m
+  --half-off     end half mode
   --quiet-until T quiet mode until T: 14:45 today, "30.10 09:00", or RFC3339
   --quiet D       quiet mode for D from now: 2h, 90m
-  --why TEXT      why quiet mode is set, shown to everyone it holds back; over ssh the
+  --why TEXT      why the selected mode is set, shown to everyone it holds back; over ssh the
                   remote shell splits it again: ssh HOST "busy --quiet 2h --why 'a long reason'"
   --quiet-off     end quiet mode
   --ignore-quiet  judge by the measurements alone, as if quiet mode were off (for a measurement
                   that runs inside quiet mode); the line still names the quiet mode
 
-Exit: 0 free, 1 busy, 2 usage error or a failed reading. Setting quiet mode exits 0.
+The three CPU policies are ordinary (the machine's thread count), half, and quiet. Half changes the CPU
+threshold only; quiet makes the machine busy regardless of its measurements.
+
+Exit: 0 free, 1 busy, 2 usage error or a failed reading. Setting either mode exits 0.
 `
 
 const (
@@ -76,8 +89,10 @@ type options struct {
 	procRoot    string
 	kind        string
 	quiet       time.Time // срок тихого режима, который поставить
-	why         string    // зачем тихий режим
+	half        time.Time // срок режима половины машины, который поставить
+	why         string    // зачем активный режим
 	quietOff    bool      // снять тихий режим
+	halfOff     bool      // снять режим половины машины
 	ignoreQuiet bool      // судить по замерам без тихого режима
 }
 
@@ -107,6 +122,10 @@ func parseArgs(args []string, now time.Time) (options, error) {
 			opts.quietOff = true
 			continue
 		}
+		if a == "--half-off" {
+			opts.halfOff = true
+			continue
+		}
 		if a == "--ignore-quiet" {
 			opts.ignoreQuiet = true
 			continue
@@ -132,13 +151,21 @@ func parseArgs(args []string, now time.Time) (options, error) {
 	if opts.quietOff && !opts.quiet.IsZero() {
 		return opts, errors.New("--quiet-off together with a quiet time")
 	}
-	if opts.why != "" && opts.quiet.IsZero() {
-		return opts, errors.New("--why needs --quiet or --quiet-until")
+	if opts.halfOff && !opts.half.IsZero() {
+		return opts, errors.New("--half-off together with a half time")
 	}
-	if opts.ignoreQuiet && (opts.quietOff || !opts.quiet.IsZero()) {
+	if opts.quietOff && (opts.halfOff || !opts.half.IsZero()) ||
+		opts.halfOff && !opts.quiet.IsZero() ||
+		!opts.quiet.IsZero() && !opts.half.IsZero() {
+		return opts, errors.New("choose one mode per invocation")
+	}
+	if opts.why != "" && opts.quiet.IsZero() && opts.half.IsZero() {
+		return opts, errors.New("--why needs --quiet, --quiet-until, --half, or --half-until")
+	}
+	if opts.ignoreQuiet && (opts.quietOff || !opts.quiet.IsZero() || opts.halfOff || !opts.half.IsZero()) {
 		return opts, errors.New("--ignore-quiet is for a check, not for setting quiet mode")
 	}
-	if opts.quietOff || !opts.quiet.IsZero() {
+	if opts.quietOff || !opts.quiet.IsZero() || opts.halfOff || !opts.half.IsZero() {
 		return opts, nil
 	}
 	err := opts.loadLimits()
@@ -180,6 +207,8 @@ func (opts *options) set(name, value string, now time.Time) error {
 		opts.procRoot = value
 	case "--quiet-until", "--quiet", "--why":
 		err = opts.setQuiet(name, value, now)
+	case "--half-until", "--half":
+		opts.half, err = parseModeUntil(name, value, now)
 	default:
 		return fmt.Errorf("unknown flag %s", name)
 	}
@@ -189,26 +218,40 @@ func (opts *options) set(name, value string, now time.Time) error {
 	return nil
 }
 
-// setQuiet разбирает флаги тихого режима: срок и зачем.
+// parseModeUntil разбирает срок режима: длительность или время окончания.
+func parseModeUntil(name, value string, now time.Time) (time.Time, error) {
+	if name == "--half-until" || name == "--quiet-until" {
+		until, err := timearg.Parse(value, now)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if !until.After(now) {
+			return time.Time{}, errors.New("is not in the future")
+		}
+		return until, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("duration: %w", err)
+	}
+	if d <= 0 {
+		if name == "--quiet" {
+			return time.Time{}, errors.New("must be positive; --quiet-off ends quiet mode")
+		}
+		return time.Time{}, errors.New("must be positive; --half-off ends half mode")
+	}
+	return now.Add(d), nil
+}
+
+// setQuiet разбирает срок тихого режима и общий флаг --why.
 func (opts *options) setQuiet(name, value string, now time.Time) error {
 	switch name {
-	case "--quiet-until":
+	case "--quiet-until", "--quiet":
 		var err error
-		if opts.quiet, err = timearg.Parse(value, now); err != nil {
+		opts.quiet, err = parseModeUntil(name, value, now)
+		if err != nil {
 			return err
 		}
-		if !opts.quiet.After(now) {
-			return errors.New("is not in the future")
-		}
-	case "--quiet":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("duration: %w", err)
-		}
-		if d <= 0 {
-			return errors.New("must be positive; --quiet-off ends quiet mode")
-		}
-		opts.quiet = now.Add(d)
 	default:
 		opts.why = strings.TrimSpace(value)
 		if opts.why == "" {
@@ -220,7 +263,10 @@ func (opts *options) setQuiet(name, value string, now time.Time) error {
 
 func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	if opts.quietOff || !opts.quiet.IsZero() {
-		return setQuiet(opts, stdout, stderr)
+		return setMode(opts.quiet, opts.why, opts.quietOff, "quiet", pressure.QuietPath, stdout, stderr)
+	}
+	if opts.halfOff || !opts.half.IsZero() {
+		return setMode(opts.half, opts.why, opts.halfOff, "half", pressure.HalfPath, stdout, stderr)
 	}
 	v, err := pressure.Check(ctx, opts.procRoot, opts.limits, opts.kind)
 	if err != nil {
@@ -240,16 +286,16 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// setQuiet ставит или снимает тихий режим и говорит, где его срок.
-func setQuiet(opts options, stdout, stderr io.Writer) int {
-	path, err := pressure.QuietPath()
+// setMode ставит или снимает режим с общей записью срока и пометки.
+func setMode(until time.Time, why string, off bool, name string, pathFn func() (string, error), stdout, stderr io.Writer) int {
+	path, err := pathFn()
 	if err == nil {
-		if opts.quietOff {
+		if off {
 			err = pressure.ClearQuiet(path)
 		} else {
 			var by string
 			if by, err = sessionName(); err == nil {
-				err = pressure.SetQuiet(path, pressure.QuietNote{Until: opts.quiet, By: by, Why: opts.why})
+				err = pressure.SetQuiet(path, pressure.QuietNote{Until: until, By: by, Why: why})
 			}
 		}
 	}
@@ -257,12 +303,12 @@ func setQuiet(opts options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "busy: %v\n", err)
 		return exitUsage
 	}
-	if opts.quietOff {
-		fmt.Fprintf(stdout, "quiet mode off (%s removed)\n", path)
+	if off {
+		fmt.Fprintf(stdout, "%s mode off (%s removed)\n", name, path)
 		return 0
 	}
-	fmt.Fprintf(stdout, "quiet mode until %s (%s): busy answers busy until then; busy --quiet-off ends it\n",
-		opts.quiet.Local().Format("2006-01-02 15:04 MST"), path)
+	fmt.Fprintf(stdout, "%s mode until %s (%s): busy reflects this mode until then\n",
+		name, until.Local().Format("2006-01-02 15:04 MST"), path)
 	return 0
 }
 
@@ -319,10 +365,7 @@ func line(v pressure.Verdict, l pressure.Limits) string {
 	var parts []string
 	skipped := func(none error) bool { return errors.Is(errors.Join(v.Skipped...), none) }
 	if !skipped(pressure.ErrNoRunnable) {
-		limit := l.Runnable
-		if limit <= 0 {
-			limit = float64(m.Threads)
-		}
+		limit := l.RunnableLimit(m)
 		parts = append(parts, fmt.Sprintf("runnable %d (busy at %v, threads %d)", m.Runnable, limit, m.Threads))
 		if !skipped(pressure.ErrNoLoadAvg) {
 			parts = append(parts, fmt.Sprintf("load average 1m %.2f (busy at %v)", m.Avg1, limit))

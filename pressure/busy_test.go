@@ -89,6 +89,45 @@ func TestRule(t *testing.T) {
 	}
 }
 
+func TestHalfRule(t *testing.T) {
+	until := time.Date(2026, 11, 12, 21, 30, 0, 0, time.Local)
+	cases := []struct {
+		name   string
+		load   Load
+		limits Limits
+		want   string
+	}{
+		{"above half is busy", Load{Runnable: 5, Threads: 8, HalfUntil: until, HalfBy: "lead", HalfWhy: "игра"}, DefaultLimits, CPU},
+		{"below half is free", Load{Runnable: 3, Threads: 8, HalfUntil: until}, Limits{MaxIOFull: 100}, ""},
+		{"half is at least one", Load{Runnable: 1, Threads: 1, HalfUntil: until}, Limits{MaxIOFull: 100}, CPU},
+		{"zero tasks remains below minimum half threshold", Load{Runnable: 0, Threads: 1, HalfUntil: until}, Limits{MaxIOFull: 100}, ""},
+		{"lower configured threshold wins", Load{Runnable: 2, Threads: 8, HalfUntil: until}, Limits{Runnable: 2, MaxIOFull: 100}, CPU},
+		{"higher configured threshold is capped", Load{Runnable: 5, Threads: 8, HalfUntil: until}, Limits{Runnable: 6, MaxIOFull: 100}, CPU},
+	}
+	for _, c := range cases {
+		v := Rule(c.load, c.limits, nil)
+		if v.Measure != c.want {
+			t.Errorf("%s: measure %q, want %q", c.name, v.Measure, c.want)
+		}
+	}
+	v := Rule(cases[0].load, DefaultLimits, nil)
+	if got := v.Why(); !strings.Contains(got, "half until 21:30 (lead: игра)") {
+		t.Errorf("half reason = %q", got)
+	}
+	// Load average использует тот же порог half.
+	if v := Rule(Load{Runnable: 1, Threads: 8, Avg1: 4, HalfUntil: until}, Limits{MaxIOFull: 100}, nil); v.Measure != CPU || !strings.Contains(v.Why(), "half until") {
+		t.Errorf("half load average = %+v, %q", v, v.Why())
+	}
+	// Дробный load average проверяет минимум в один поток на однопоточной машине.
+	if v := Rule(Load{Threads: 1, Avg1: 0.75, HalfUntil: until}, Limits{MaxIOFull: 100}, nil); v.Busy() {
+		t.Errorf("load average below minimum threshold = %+v", v)
+	}
+	// При обоих активных сроках тихий режим главнее.
+	if v := Rule(Load{Runnable: 5, Threads: 8, QuietUntil: until, HalfUntil: until}, DefaultLimits, nil); v.Measure != Quiet {
+		t.Errorf("both modes = %q; want quiet", v.Measure)
+	}
+}
+
 func TestParseDirty(t *testing.T) {
 	if mb, err := ParseDirty("MemTotal:  100 kB\nDirty:     65536 kB\nWriteback:  1024 kB\nWritebackTmp: 9999 kB\n"); err != nil || mb != 65 {
 		t.Errorf("ParseDirty = %v, %v; ждали 65 MiB (WritebackTmp не в счёт)", mb, err)
@@ -120,6 +159,7 @@ func fakeProc(t *testing.T, files map[string]string) (*Meter, *time.Time) {
 	now := time.Unix(1000, 0)
 	m := NewMeter(root)
 	m.quiet = filepath.Join(root, "quiet-until")
+	m.half = filepath.Join(root, "half-until")
 	m.now = func() time.Time { return now }
 	m.sleep = func(_ context.Context, d time.Duration) error {
 		now = now.Add(d)
