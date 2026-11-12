@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -238,6 +239,86 @@ func TestStopChildGroupHonorsGraceAfterGroupRequest(t *testing.T) {
 	}
 }
 
+func TestStopChildGroupRequestsTERMThenKillsReparentedGroupMember(t *testing.T) {
+	for _, leader := range []string{"live", "zombie", "reaped"} {
+		t.Run(leader, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "member.pid")
+			ready := filepath.Join(t.TempDir(), "ready")
+			script := `sh -c 'trap "" TERM; sleep 30 >/dev/null 2>&1 & echo $! > "$1"; exit 0' sh "$1" & while [ ! -s "$1" ]; do sleep .005; done; echo ready > "$2"; if [ "$3" = "live" ]; then exec sleep 30; fi; exit 0`
+			cmd := exec.Command("sh", "-c", script, "sh", pidFile, ready, leader)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+					t.Errorf("clean process group: %v", err)
+				}
+				if cmd.ProcessState == nil {
+					_ = cmd.Wait()
+				}
+			})
+			waitReady(t, ready)
+			member := readPID(t, pidFile)
+			if leader != "live" {
+				deadline := time.Now().Add(time.Second)
+				for {
+					stat, err := ReadStat("/proc", cmd.Process.Pid)
+					if err == nil && stat.State == "Z" {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("leader did not exit: %+v, %v", stat, err)
+					}
+					time.Sleep(time.Millisecond)
+				}
+				if leader == "reaped" {
+					if err := cmd.Wait(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			real := signalProcessGroup
+			t.Cleanup(func() { signalProcessGroup = real })
+			var sent []unix.Signal
+			signalProcessGroup = func(pgid int, sig unix.Signal) error {
+				if pgid == cmd.Process.Pid {
+					sent = append(sent, sig)
+				}
+				return real(pgid, sig)
+			}
+			started := time.Now()
+			_, err := StopChildGroup(cmd, 180*time.Millisecond, syscall.SIGTERM)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if elapsed := time.Since(started); elapsed < 150*time.Millisecond {
+				t.Fatalf("process group was killed before grace: %v", elapsed)
+			}
+			term, kill := false, false
+			for _, sig := range sent {
+				term = term || sig == unix.SIGTERM
+				kill = kill || sig == unix.SIGKILL
+			}
+			if !term || !kill {
+				t.Fatalf("group signals = %v, want TERM then KILL", sent)
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				stat, err := ReadStat("/proc", member)
+				if Gone(err) || err == nil && (stat.State == "Z" || stat.State == "X") {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("reparented member %d survived TERM and SIGKILL: %+v, %v", member, stat, err)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
+}
+
 func TestStopChildGroupAcceptsSetsid(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -324,24 +405,74 @@ func TestSignalChildRejectsDescendant(t *testing.T) {
 	}
 }
 
-func TestSignalChildChecksStartTimeAndParentAgain(t *testing.T) {
-	self := os.Getpid()
-	before := Stat{Ppid: self, Start: "first"}
-	if !sameDirectChild(self, before, Stat{Ppid: self, Start: "first"}) {
-		t.Fatal("accepted child identity rejected")
+func TestSignalChildRevalidatesSubstitutedChildAfterPidfdOpen(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
-	for name, after := range map[string]Stat{
-		"changed start":  {Ppid: self, Start: "second"},
-		"changed parent": {Ppid: os.Getppid(), Start: "first"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if sameDirectChild(self, before, after) {
-				t.Fatal("accepted changed child identity")
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			if _, err := StopChild(cmd.Process.Pid, 0, nil); err != nil {
+				t.Errorf("stop test child: %v", err)
 			}
-		})
+			_ = cmd.Wait()
+		}
+	})
+	realRead, realBefore, realSignal := readSignalChildStat, beforeSignalChildPidfdOpen, signalProcess
+	t.Cleanup(func() {
+		readSignalChildStat, beforeSignalChildPidfdOpen, signalProcess = realRead, realBefore, realSignal
+	})
+	replacement := ""
+	inPidfdWindow := false
+	reads, signals := 0, 0
+	readSignalChildStat = func(root string, pid int) (Stat, error) {
+		stat, err := realRead(root, pid)
+		reads++
+		if inPidfdWindow && replacement != "" && pid == cmd.Process.Pid && err == nil && reads == 2 {
+			switch replacement {
+			case "start":
+				stat.Start += "-reused"
+			case "parent":
+				stat.Ppid = os.Getppid()
+			}
+		}
+		return stat, err
 	}
-	if sameDirectChild(self, Stat{Ppid: os.Getppid(), Start: "first"}, Stat{Ppid: self, Start: "first"}) {
-		t.Fatal("accepted a process that was not our child at the first read")
+	beforeSignalChildPidfdOpen = func(pid int) {
+		if pid == cmd.Process.Pid {
+			// Simulate the PID resolving to a different process after the first
+			// /proc read but before pidfd_open.
+			inPidfdWindow = true
+		}
+	}
+	signalProcess = func(_ int, _ *trackedProcess, _ unix.Signal) error {
+		signals++
+		return nil
+	}
+	for _, replacementCase := range []string{"start", "parent"} {
+		replacement = replacementCase
+		inPidfdWindow = false
+		reads = 0
+		err := SignalChild(cmd.Process.Pid, syscall.SIGTERM)
+		if err == nil {
+			t.Fatalf("SignalChild accepted substituted %s identity", replacementCase)
+		}
+		if reads != 2 {
+			t.Fatalf("read /proc %d times, want pre-open and post-open checks", reads)
+		}
+	}
+	if signals != 0 {
+		t.Fatalf("signaled substituted child %d times", signals)
+	}
+}
+
+func TestSignalChildReapedReturnsProcessDone(t *testing.T) {
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := SignalChild(cmd.Process.Pid, syscall.SIGTERM); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("SignalChild error = %v, want os.ErrProcessDone", err)
 	}
 }
 
@@ -647,11 +778,137 @@ func TestCommandOwnsGroupLeaderRequiresUnwaitedDirectChild(t *testing.T) {
 func TestStopChildGroupIgnoresESRCH(t *testing.T) {
 	real := signalProcessGroup
 	t.Cleanup(func() { signalProcessGroup = real })
-	signalProcessGroup = func(_ int, _ unix.Signal) error { return unix.ESRCH }
-	cmd := &exec.Cmd{Process: &os.Process{Pid: 2_000_000_000}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
-		t.Fatalf("ESRCH should mean the group is already gone: %v", err)
+	var sent []unix.Signal
+	signalProcessGroup = func(_ int, sig unix.Signal) error {
+		sent = append(sent, sig)
+		if sig == unix.SIGKILL {
+			return unix.ESRCH
+		}
+		return nil
 	}
+	cmd := &exec.Cmd{Process: &os.Process{Pid: 2_000_000_000}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGTERM); err != nil {
+		t.Fatalf("ESRCH during final group kill should be benign: %v", err)
+	}
+	if !slices.Contains(sent, unix.SIGKILL) {
+		t.Fatalf("did not exercise final SIGKILL: %v", sent)
+	}
+}
+
+func TestStopChildGroupSkipsFinalKillAfterGroupDisappears(t *testing.T) {
+	real := signalProcessGroup
+	t.Cleanup(func() { signalProcessGroup = real })
+	var sent []unix.Signal
+	signalProcessGroup = func(_ int, sig unix.Signal) error {
+		sent = append(sent, sig)
+		if sig == unix.Signal(syscall.SIGTERM) {
+			return nil
+		}
+		return unix.ESRCH
+	}
+	cmd := &exec.Cmd{Process: &os.Process{Pid: 2_000_000_000}, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+	if _, err := StopChildGroup(cmd, 0, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	for _, sig := range sent {
+		if sig == unix.SIGKILL {
+			t.Fatalf("sent SIGKILL after the group vanished: %v", sent)
+		}
+	}
+}
+
+func TestStopChildGroupStopsOutOfTreeMemberInLiveZombieAndReapedCases(t *testing.T) {
+	for _, leaderState := range []string{"live", "zombie", "reaped"} {
+		t.Run(leaderState, func(t *testing.T) {
+			dir := t.TempDir()
+			pidFile, ready := filepath.Join(dir, "member.pid"), filepath.Join(dir, "ready")
+			script := `sh -c 'trap "" TERM; sleep 30 >/dev/null 2>&1 & echo $! > "$1"; exit 0' sh "$1" & while [ ! -s "$1" ]; do sleep .005; done; echo ready > "$2"; if [ "$3" = "live" ]; then exec sleep 30; fi; exit 0`
+			cmd := exec.Command("sh", "-c", script, "sh", pidFile, ready, leaderState)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
+					t.Errorf("clean process group: %v", err)
+				}
+				if cmd.ProcessState == nil {
+					_ = cmd.Wait()
+				}
+			})
+			waitReady(t, ready)
+			member := readPID(t, pidFile)
+			if leaderState != "live" {
+				waitForZombie(t, cmd.Process.Pid)
+				if leaderState == "reaped" {
+					if err := cmd.Wait(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			real := signalProcessGroup
+			var sent []unix.Signal
+			groupPolls := 0
+			signalProcessGroup = func(pgid int, sig unix.Signal) error {
+				if pgid == cmd.Process.Pid {
+					sent = append(sent, sig)
+					if sig == 0 {
+						groupPolls++
+					}
+				}
+				return real(pgid, sig)
+			}
+			t.Cleanup(func() { signalProcessGroup = real })
+			started := time.Now()
+			_, err := StopChildGroup(cmd, 180*time.Millisecond, syscall.SIGTERM)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if elapsed := time.Since(started); elapsed < 150*time.Millisecond {
+				t.Fatalf("group cleanup ended before grace: %v", elapsed)
+			}
+			term, kill := false, false
+			for _, sig := range sent {
+				term = term || sig == unix.SIGTERM
+				kill = kill || sig == unix.SIGKILL
+			}
+			if !term || !kill {
+				t.Fatalf("group signals = %v, want TERM then SIGKILL", sent)
+			}
+			if groupPolls == 0 {
+				t.Fatal("did not wait for process-group members through grace")
+			}
+			waitForGoneOrZombie(t, member)
+		})
+	}
+}
+
+func waitForZombie(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		stat, err := ReadStat("/proc", pid)
+		if err == nil && stat.State == "Z" {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("leader %d did not become a zombie", pid)
+}
+
+func waitForGoneOrZombie(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		stat, err := ReadStat("/proc", pid)
+		if Gone(err) || err == nil && (stat.State == "Z" || stat.State == "X") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stat, err := ReadStat("/proc", pid)
+	t.Fatalf("member %d remained alive: %+v, %v", pid, stat, err)
 }
 
 func readPID(t *testing.T, path string) int {

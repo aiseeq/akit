@@ -15,6 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var errStopTargetChanged = errors.New("stop target changed during validation")
+
 // StopChild stops a direct child and its observed descendants. request is called
 // once after the initial tree is captured; it may signal, close stdin or cancel
 // a context. The caller remains responsible for Cmd.Wait and WaitDelay.
@@ -63,23 +65,41 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 			return sendProcessGroupSignal(pid, sig)
 		}, 0)
 		if err != nil {
-			return result, err
-		}
-		if result.AlreadyExited {
+			if !stopTargetRace(err) {
+				return result, err
+			}
+			result = StopResult{AlreadyExited: true}
 			if err := requestProcessGroup(pid, sig); err != nil {
 				return result, err
 			}
+			return finishChildGroupStop(result, pid, grace)
+		} else {
+			if result.AlreadyExited {
+				if err := requestProcessGroup(pid, sig); err != nil {
+					return result, err
+				}
+			}
+			return finishChildGroupStop(result, pid, max(time.Until(started.Add(grace)), 0))
 		}
-		waitProcessGroup(pid, max(time.Until(started.Add(grace)), 0))
 	} else {
 		result.AlreadyExited = true
 		if err := requestProcessGroup(pid, sig); err != nil {
 			return result, err
 		}
-		waitProcessGroup(pid, grace)
+		return finishChildGroupStop(result, pid, grace)
 	}
-	if err := signalProcessGroup(pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
-		return result, fmt.Errorf("kill child process group %d: %w", pid, err)
+}
+
+func finishChildGroupStop(result StopResult, pgid int, grace time.Duration) (StopResult, error) {
+	alive, err := waitProcessGroup(pgid, grace)
+	if err != nil {
+		return result, err
+	}
+	if !alive {
+		return result, nil
+	}
+	if err := signalProcessGroup(pgid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		return result, fmt.Errorf("kill child process group %d: %w", pgid, err)
 	}
 	return result, nil
 }
@@ -121,16 +141,19 @@ func sendProcessGroupSignal(pgid int, sig syscall.Signal) error {
 	return err
 }
 
-func waitProcessGroup(pgid int, grace time.Duration) {
+func waitProcessGroup(pgid int, grace time.Duration) (bool, error) {
 	deadline := time.Now().Add(grace)
 	for {
 		err := signalProcessGroup(pgid, 0)
 		if errors.Is(err, unix.ESRCH) {
-			return
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("check child process group %d: %w", pgid, err)
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return
+			return true, nil
 		}
 		if remaining > 20*time.Millisecond {
 			remaining = 20 * time.Millisecond
@@ -139,6 +162,13 @@ func waitProcessGroup(pgid int, grace time.Duration) {
 	}
 }
 
+func stopTargetRace(err error) bool {
+	return errors.Is(err, errStopTargetChanged) || Gone(err) || errors.Is(err, unix.ESRCH)
+}
+
+var readSignalChildStat = ReadStat
+var beforeSignalChildPidfdOpen = func(int) {}
+
 // SignalChild signals only a direct child after checking its parent and start
 // time both before and after opening a pidfd. The pidfd pins identity at send.
 func SignalChild(pid int, sig syscall.Signal) error {
@@ -146,24 +176,43 @@ func SignalChild(pid int, sig syscall.Signal) error {
 		return err
 	}
 	self := os.Getpid()
-	target, err := ReadStat("/proc", pid)
+	target, err := readSignalChildStat("/proc", pid)
 	if err != nil {
+		if Gone(err) {
+			return fmt.Errorf("read child process %d: %w", pid, os.ErrProcessDone)
+		}
 		return fmt.Errorf("read child process %d: %w", pid, err)
 	}
 	if target.Ppid != self {
 		return fmt.Errorf("PID %d is not a direct child", pid)
 	}
+	if target.State == "Z" || target.State == "X" {
+		return fmt.Errorf("child process %d: %w", pid, os.ErrProcessDone)
+	}
+	beforeSignalChildPidfdOpen(pid)
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("pidfd_open child %d: %w", pid, errors.Join(errStopTargetChanged, os.ErrProcessDone))
+		}
 		return fmt.Errorf("pidfd_open %d: %w", pid, err)
 	}
 	defer unix.Close(fd)
-	checked, err := ReadStat("/proc", pid)
+	checked, err := readSignalChildStat("/proc", pid)
+	if Gone(err) {
+		return fmt.Errorf("PID %d changed during validation: %w", pid, errors.Join(errStopTargetChanged, os.ErrProcessDone))
+	}
 	if err != nil || !sameDirectChild(self, target, checked) {
-		return fmt.Errorf("PID %d changed during validation", pid)
+		return fmt.Errorf("PID %d changed during validation: %w", pid, errors.Join(errStopTargetChanged, os.ErrProcessDone))
+	}
+	if checked.State == "Z" || checked.State == "X" {
+		return fmt.Errorf("child process %d: %w", pid, os.ErrProcessDone)
 	}
 	err = signalProcess(pid, &trackedProcess{fd: fd, start: target.Start}, unix.Signal(sig))
 	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("signal child PID %d: %w", pid, errors.Join(errStopTargetChanged, os.ErrProcessDone))
+		}
 		return fmt.Errorf("signal child PID %d: %w", pid, err)
 	}
 	return nil
@@ -180,7 +229,7 @@ func validateSignalTarget(pid int, sig syscall.Signal) error {
 }
 
 func sameDirectChild(self int, before, after Stat) bool {
-	return before.Ppid == self && after.Ppid == self && after.Start == before.Start
+	return after.Ppid == self && after.Start == before.Start
 }
 
 func inspectChildGroupLeader(cmd *exec.Cmd, self, pid int) (present, directChild, groupLeader bool, err error) {
@@ -393,6 +442,9 @@ var signalProcess = func(_ int, p *trackedProcess, sig unix.Signal) error {
 func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, bool, error) {
 	target, err := validateStop(root, self, pid, sig != 0)
 	if err != nil {
+		if Gone(err) {
+			return nil, false, fmt.Errorf("stat child process %d: %w", pid, errors.Join(errStopTargetChanged, err))
+		}
 		return nil, false, err
 	}
 	if sig == 0 && target.Ppid != self {
@@ -403,12 +455,15 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 	}
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return nil, false, fmt.Errorf("pidfd_open %d: %w", pid, errors.Join(errStopTargetChanged, err))
+		}
 		return nil, false, fmt.Errorf("pidfd_open %d: %w", pid, err)
 	}
 	checked, err := validateStop(root, self, pid, sig != 0)
 	if err != nil || checked.Start != target.Start {
 		_ = unix.Close(fd)
-		return nil, false, fmt.Errorf("PID %d changed during validation", pid)
+		return nil, false, fmt.Errorf("PID %d changed during validation: %w", pid, errStopTargetChanged)
 	}
 	return processTree{pid: {fd: fd, start: target.Start}}, false, nil
 }
