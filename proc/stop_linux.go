@@ -57,6 +57,7 @@ func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (Sto
 	if leaderPresent && !directChild {
 		return StopResult{AlreadyExited: true}, nil
 	}
+	beforeStopChildGroupTree(pid)
 
 	var result StopResult
 	if leaderPresent {
@@ -165,6 +166,10 @@ func waitProcessGroup(pgid int, grace time.Duration) (bool, error) {
 func stopTargetRace(err error) bool {
 	return errors.Is(err, errStopTargetChanged) || Gone(err) || errors.Is(err, unix.ESRCH)
 }
+
+var beforeStopChildGroupTree = func(int) {}
+var beforeStopTargetPidfdOpen = func(int) {}
+var afterStopTargetPidfdOpen = func(int) {}
 
 var readSignalChildStat = ReadStat
 var beforeSignalChildPidfdOpen = func(int) {}
@@ -453,6 +458,7 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 	if target.State == "Z" || target.State == "X" {
 		return nil, true, nil
 	}
+	beforeStopTargetPidfdOpen(pid)
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
 		if errors.Is(err, unix.ESRCH) {
@@ -460,6 +466,7 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 		}
 		return nil, false, fmt.Errorf("pidfd_open %d: %w", pid, err)
 	}
+	afterStopTargetPidfdOpen(pid)
 	checked, err := validateStop(root, self, pid, sig != 0)
 	if err != nil || checked.Start != target.Start {
 		_ = unix.Close(fd)
