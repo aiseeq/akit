@@ -56,6 +56,7 @@ func TestFindNestedDepthGrowth(t *testing.T) {
 	work := func(src string) int {
 		var calls []Call
 		budget := newNestedParseBudget(len(src))
+		budget.trackWork = true
 		budget.wanted = map[string]bool{"kill": true}
 		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
 			t.Fatal(err)
@@ -63,11 +64,64 @@ func TestFindNestedDepthGrowth(t *testing.T) {
 		if len(calls) != 1 || calls[0].Name != "kill" {
 			t.Fatalf("Find returned %#v", calls)
 		}
-		return budget.visitedNodes
+		return budget.parsedBytes
 	}
 	small, large := work(nestedDepthScript(800)), work(nestedDepthScript(1600))
+	t.Logf("nested parse bytes: depth 800=%d depth 1600=%d", small, large)
 	if small == 0 || large > small*21/10 {
-		t.Fatalf("doubling nested input visited %d nodes after %d; want linear growth", large, small)
+		t.Fatalf("doubling nested input reparsed %d source bytes after %d; want linear growth", large, small)
+	}
+}
+
+func TestFindNestedSubstitutionParseBytesGrowLinearly(t *testing.T) {
+	parseBytes := func(lines int) int {
+		src := nestedSubstitutionScript(lines)
+		var calls []Call
+		budget := newNestedParseBudget(len(src))
+		budget.trackWork = true
+		budget.wanted = map[string]bool{"kill": true}
+		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 20 {
+			t.Fatalf("got %d kill calls, want 20", len(calls))
+		}
+		return budget.parsedBytes
+	}
+	small, large := parseBytes(500), parseBytes(1000)
+	t.Logf("nested-substitution parse bytes: lines 500=%d lines 1000=%d", small, large)
+	if small == 0 || large > small*21/10 {
+		t.Fatalf("doubling nested-substitution lines reparsed %d source bytes after %d; want linear growth", large, small)
+	}
+}
+
+func TestFindWalkInfoNodeWorkGrowsLinearly(t *testing.T) {
+	type nodeCounts struct {
+		walker int
+		info   int
+	}
+	nodeWork := func(lines int) nodeCounts {
+		src := nestedSubstitutionScript(lines)
+		var calls []Call
+		budget := newNestedParseBudget(len(src))
+		budget.trackWork = true
+		budget.wanted = map[string]bool{"kill": true}
+		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 20 {
+			t.Fatalf("got %d kill calls, want 20", len(calls))
+		}
+		return nodeCounts{walker: budget.visitedNodes, info: budget.walkInfoNodes}
+	}
+	small, large := nodeWork(500), nodeWork(1000)
+	smallTotal, largeTotal := small.walker+small.info, large.walker+large.info
+	t.Logf("syntax nodes at 500 lines: walker=%d info=%d; at 1000: walker=%d info=%d", small.walker, small.info, large.walker, large.info)
+	if smallTotal == 0 || largeTotal > smallTotal*21/10 {
+		t.Fatalf("doubling nested-substitution lines visited %d nodes after %d; want linear growth", largeTotal, smallTotal)
+	}
+	if small.info > small.walker || large.info > large.walker {
+		t.Fatalf("walk-info pass exceeds the main call walk: small=%+v large=%+v", small, large)
 	}
 }
 
@@ -104,6 +158,71 @@ E
 				t.Fatalf("Find = %#v; filtered Calls = %#v", got, expected)
 			}
 		})
+	}
+}
+
+func BenchmarkFindNestedSubstitutions(b *testing.B) {
+	src := nestedSubstitutionScript(20000)
+	b.SetBytes(int64(len(src)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := Find(src, "kill"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestFindMatchesCallsOnRiskForms(t *testing.T) {
+	scripts := []string{
+		`echo exec -- kill target`, `printf exec -- rm -rf /x`, `echo exec -- curl http://x`,
+		`echo exec -- bash -c 'if'`, `echo x | b'a's'h'`, `echo x | b\a\s\h`,
+		`find . -exec kill -1 {} \;`,
+		`exec env -S -n sh -sc bash script tee -k ionice ssh -c busybox`,
+		`watch env -lc -cS -9 'bash -c kill' --cpu-list=0 runuser`,
+		`b'a's'h' >(echo x)`, `b'a's'h' <(echo x)`, `select x in a; do kill -1; done`,
+		`B=bash; bash -c '$B < <(echo x)'`, `kill -1 &`,
+	}
+	for _, src := range scripts {
+		t.Run(src, func(t *testing.T) {
+			all, callsErr := Calls(src)
+			got, findErr := Find(src, "kill", "rm", "curl", "bash")
+			if (callsErr == nil) != (findErr == nil) || (callsErr != nil && callsErr.Error() != findErr.Error()) {
+				t.Fatalf("Calls error %v differs from Find error %v", callsErr, findErr)
+			}
+			want := make([]Call, 0, len(all))
+			for _, call := range all {
+				if call.Name == "kill" || call.Name == "rm" || call.Name == "curl" || call.Name == "bash" {
+					want = append(want, call)
+				}
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Find = %#v; filtered Calls = %#v", got, want)
+			}
+			for _, call := range all {
+				switch {
+				case strings.Contains(src, "select x") && call.Name == "kill" && !call.Loop:
+					t.Fatalf("select body not marked as loop: %#v", call)
+				case strings.Contains(src, "b'a's'h'") && strings.Contains(src, "| b'a's'h'") && call.Name == "bash" && !call.ScriptInput:
+					t.Fatalf("quoted pipeline shell lacks ScriptInput: %#v", call)
+				case strings.Contains(src, `b\a\s\h`) && call.Name == "bash" && !call.ScriptInput:
+					t.Fatalf("escaped pipeline shell lacks ScriptInput: %#v", call)
+				case strings.Contains(src, `b'a's'h' >(echo`) && call.Name == "bash" && !call.ScriptInput:
+					t.Fatalf("process-substitution shell lacks ScriptInput: %#v", call)
+				case strings.Contains(src, "B=bash") && call.Raw == "$B" && !call.ScriptInput:
+					t.Fatalf("inherited-variable command should be script input: %#v", call)
+				case strings.Contains(src, "kill -1 &") && call.Name == "kill" && !call.Background:
+					t.Fatalf("background command lacks Background: %#v", call)
+				}
+			}
+		})
+	}
+}
+
+func TestFindKeepsNestedErrorWithoutRequestedNames(t *testing.T) {
+	_, err := Find("echo exec -- bash -c 'if'")
+	var nested *NestedError
+	if !errors.As(err, &nested) {
+		t.Fatalf("Find error = %v, want NestedError", err)
 	}
 }
 
@@ -159,10 +278,17 @@ func TestInheritedVariableShellProcessSubstitution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	found := false
 	for _, call := range calls {
-		if call.Name == "bash" && call.Raw == "$B" && !call.ScriptInput {
-			t.Fatalf("inherited shell input not marked: %#v", call)
+		if call.Name == "bash" && call.Raw == "$B" {
+			found = true
+			if !call.ScriptInput {
+				t.Fatalf("inherited variable should classify the command as shell input: %#v", call)
+			}
 		}
+	}
+	if !found {
+		t.Fatalf("inherited command call not found: %#v", calls)
 	}
 }
 

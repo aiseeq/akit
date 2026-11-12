@@ -84,10 +84,13 @@ func Find(cmd string, names ...string) ([]Call, error) {
 	for _, name := range names {
 		wanted[name] = true
 	}
-	calls := make([]Call, 0)
-	budget := newNestedParseBudget(len(cmd))
-	budget.wanted = wanted
-	err := parseWithBudget(cmd, 0, nil, make(map[string]string), &calls, budget)
+	all, err := Calls(cmd)
+	calls := make([]Call, 0, len(all))
+	for _, call := range all {
+		if wanted[call.Name] {
+			calls = append(calls, call)
+		}
+	}
 	var nested *NestedError
 	if err != nil && !errors.As(err, &nested) {
 		return nil, err
@@ -96,10 +99,13 @@ func Find(cmd string, names ...string) ([]Call, error) {
 }
 
 type nestedParseBudget struct {
-	used         int
-	limit        int
-	wanted       map[string]bool
-	visitedNodes int
+	used          int
+	limit         int
+	wanted        map[string]bool
+	parsedBytes   int
+	visitedNodes  int
+	walkInfoNodes int
+	trackWork     bool
 }
 
 func newNestedParseBudget(inputSize int) *nestedParseBudget {
@@ -112,6 +118,9 @@ func parse(src string, lineBase int, inherited []string, vars map[string]string,
 }
 
 func parseWithBudget(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+	if budget.trackWork {
+		budget.parsedBytes += len(src)
+	}
 	file, full, err := parseShell(src)
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
@@ -172,7 +181,7 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
-	info := collectWalkInfo(file, src, vars)
+	info := collectWalkInfo(file, src, vars, budget)
 	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
@@ -212,13 +221,16 @@ type walkInfo struct {
 	shellHdocs      map[*syntax.Redirect]bool
 	scriptInputs    map[*syntax.CallExpr]bool
 	pipedHeredocs   []pipedHeredoc
+	workNodes       int
+	trackWork       bool
 }
 
-func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walkInfo {
+func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
 	if !needsWalkInfo(src) {
 		return walkInfo{redirs: make(map[*syntax.CallExpr][]Redir)}
 	}
 	info := walkInfo{
+		trackWork:       budget.trackWork,
 		timedCalls:      make(map[*syntax.CallExpr]bool),
 		redirs:          make(map[*syntax.CallExpr][]Redir),
 		loopCalls:       make(map[*syntax.CallExpr]bool),
@@ -228,10 +240,16 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string) walk
 	}
 	knownPipes := make(map[*syntax.BinaryCmd]bool)
 	syntax.Walk(file, func(node syntax.Node) bool {
+		if info.trackWork {
+			info.workNodes++
+		}
 		collectWalkNode(node, src, vars, &info, knownPipes)
 		collectCallContextNode(node, &info)
 		return true
 	})
+	if budget.trackWork {
+		budget.walkInfoNodes += info.workNodes
+	}
 	return info
 }
 
@@ -324,15 +342,8 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, src string, vars map[string]string, 
 }
 
 func needsWalkInfo(src string) bool {
-	if strings.ContainsAny(src, "<>&") {
+	if strings.ContainsAny(src, "<>&|") {
 		return true
-	}
-	if strings.Contains(src, "|") {
-		for _, name := range []string{"bash", "zsh", "sh", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "doas", "taskset", "chrt", "strace", "setpriv", "busybox", "systemd-run", "parallel"} {
-			if strings.Contains(src, name) {
-				return true
-			}
-		}
 	}
 	for _, name := range []string{"bash", "zsh", "sh", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "for", "while", "until", "select"} {
 		if strings.Contains(src, name) {
@@ -434,19 +445,22 @@ func markPipeline(stmt *syntax.Stmt, src string, vars map[string]string, inputs 
 	}
 	syntax.Walk(stmt, func(node syntax.Node) bool {
 		call, ok := node.(*syntax.CallExpr)
-		if ok && possibleShellInput(call, src, vars) && shellInputTarget(call, src, vars) {
+		if ok && possibleShellInput(call) && shellInputTarget(call, src, vars) {
 			inputs[call] = true
 		}
 		return true
 	})
 }
 
-func possibleShellInput(call *syntax.CallExpr, src string, vars map[string]string) bool {
+func possibleShellInput(call *syntax.CallExpr) bool {
 	if len(call.Args) == 0 {
 		return false
 	}
-	first, _ := words(call.Args[:1], src, vars)
-	name := commandName(first[0])
+	first, literal := wordValue(call.Args[0])
+	if !literal {
+		return false
+	}
+	name := commandName(first)
 	return isShell(name) || wrappers[name]
 }
 
@@ -475,12 +489,14 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 	if len(call.Args) == 0 {
 		return false
 	}
-	firstWords, _ := words(call.Args, src, vars)
-	name := commandName(firstWords[0])
+	values, _ := words(call.Args, src, vars)
+	if len(values) == 0 {
+		return false
+	}
+	name := commandName(values[0])
 	if !isShell(name) && !wrappers[name] {
 		return false
 	}
-	values, _ := words(call.Args, src, vars)
 	args := values[1:]
 	argOffset := 0
 	for {
@@ -549,7 +565,10 @@ type callWalker struct {
 }
 
 func (w *callWalker) visit(node syntax.Node) bool {
-	w.budget.visitedNodes++
+	if w.budget.trackWork {
+		w.budget.visitedNodes++
+	}
+
 	if w.parseErr != nil {
 		return false
 	}
@@ -608,10 +627,9 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		collectAssignments(call, w.src, w.vars)
 		return
 	}
-	if w.budget.wanted != nil && skipFilteredCall(call, w.budget.wanted) {
-		return
-	}
+
 	args, split := words(call.Args, w.src, w.vars)
+
 	start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
 	if !validSpan(w.src, start, end) {
 		w.parseErr = fmt.Errorf("shellcmd: invalid source span for command")
@@ -641,42 +659,12 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	}
 }
 
-func skipFilteredCall(call *syntax.CallExpr, wanted map[string]bool) bool {
-	name, literal := wordValue(call.Args[0])
-	if !literal {
-		return false
-	}
-	name = commandName(name)
-	if wanted[name] || wrappers[name] || isShell(name) || name == "ssh" || name == "find" || scriptInvocation(name, nil) {
-		return false
-	}
-	if dataArgs[name] {
-		return true
-	}
-	execSeen := false
-	for i, arg := range call.Args[1:] {
-		value, ok := wordValue(arg)
-		if !ok {
-			return false
-		}
-		if value == "exec" {
-			execSeen = true
-		}
-		if value == "--" && execSeen {
-			return false
-		}
-		if isShell(baseName(value)) && i+2 < len(call.Args) {
-			if option, ok := wordValue(call.Args[i+2]); ok && shellCommandOption(option) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 func collectCallContextNode(node syntax.Node, info *walkInfo) {
 	mark := func(node syntax.Node, target map[*syntax.CallExpr]bool) {
 		syntax.Walk(node, func(child syntax.Node) bool {
+			if info.trackWork {
+				info.workNodes++
+			}
 			if call, ok := child.(*syntax.CallExpr); ok {
 				target[call] = true
 			}
@@ -1474,13 +1462,10 @@ func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *call
 	}
 	if c.budget.wanted == nil || c.budget.wanted[c.call.Name] {
 		appendCall(seen, calls, c.call)
+	} else if !seen.hasExact(c.call) {
+		markCall(seen, c.call)
 	}
-	if !wrappers[c.call.Name] && !isShell(c.call.Name) && c.call.Name != "ssh" && c.call.Name != "find" && !scriptInvocation(c.call.Name, c.call.Args) {
-		_, exec := execTarget(c.call.Args)
-		if !exec && mainShellArgIndex(c.call.Args) < 0 {
-			return nil
-		}
-	}
+
 	if err := emitExpanded(c, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
