@@ -53,21 +53,116 @@ func BenchmarkFindNestedDepth(b *testing.B) {
 }
 
 func TestFindNestedDepthGrowth(t *testing.T) {
-	measure := func(src string) float64 {
-		result := testing.Benchmark(func(b *testing.B) {
-			for range b.N {
-				calls, err := Find(src, "kill")
-				if err != nil || len(calls) != 1 {
-					t.Fatalf("Find returned %d calls, err=%v", len(calls), err)
+	work := func(src string) int {
+		var calls []Call
+		budget := newNestedParseBudget(len(src))
+		budget.wanted = map[string]bool{"kill": true}
+		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 1 || calls[0].Name != "kill" {
+			t.Fatalf("Find returned %#v", calls)
+		}
+		return budget.visitedNodes
+	}
+	small, large := work(nestedDepthScript(800)), work(nestedDepthScript(1600))
+	if small == 0 || large > small*21/10 {
+		t.Fatalf("doubling nested input visited %d nodes after %d; want linear growth", large, small)
+	}
+}
+
+func TestFindMatchesFilteredCallsAcrossNestedShellForms(t *testing.T) {
+	scripts := []string{
+		`echo "$(k'il'l -1)"`, `X=$(k'il'l -1)`, "echo `k'il'l -1`", `cat <(k'il'l -1)`,
+		`echo $((1 + $(k'il'l -1)))`, `taskset -c 0 kill -1`, `doas kill -1`, `chrt -p 1 kill -1`,
+		`strace kill -1`, `setpriv -- kill -1`, `busybox kill -1`, `systemd-run kill -1`, `parallel kill ::: -1`,
+		`find . -exec kill -1 \;`,
+		`/bin/k'il'l -1`, `bash -c 'kill -1'`, `eval 'kill -1'`, `cat <<'E' | bash
+kill -1
+E
+`,
+		`echo "$(r'm' -rf x)"`, `X=$(cu\rl https://x)`,
+	}
+	for _, src := range scripts {
+		t.Run(src, func(t *testing.T) {
+			all, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wanted := map[string]bool{"kill": true, "rm": true, "curl": true}
+			expected := make([]Call, 0)
+			for _, call := range all {
+				if wanted[call.Name] {
+					expected = append(expected, call)
 				}
 			}
+			got, err := Find(src, "kill", "rm", "curl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, expected) {
+				t.Fatalf("Find = %#v; filtered Calls = %#v", got, expected)
+			}
 		})
-		return float64(result.NsPerOp())
 	}
-	small, large := nestedDepthScript(800), nestedDepthScript(1600)
-	ratio := measure(large) / measure(small)
-	if ratio > 3.1 {
-		t.Fatalf("doubling nested input took %.2fx as long; want growth below 3.1x", ratio)
+}
+
+func TestFindKeepsNonliteralCommandName(t *testing.T) {
+	src := "CMD=kill; $CMD " + "-" + "1"
+	calls, err := Calls(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Find(src, "kill")
+	if err != nil || !reflect.DeepEqual(got, calls) {
+		t.Fatalf("Find = %#v, Calls = %#v, err=%v", got, calls, err)
+	}
+}
+
+func TestFindReturnsOnlyRequestedTimeCalls(t *testing.T) {
+	got, err := Find("time kill -1", "kill")
+	if err != nil || len(got) != 1 || got[0].Name != "kill" {
+		t.Fatalf("Find = %#v, %v", got, err)
+	}
+}
+
+func TestUntilMarksLoop(t *testing.T) {
+	calls, err := Calls("until test -e x; do kill -1; done")
+	if err != nil || len(calls) != 2 || !calls[1].Loop {
+		t.Fatalf("Calls = %#v, %v", calls, err)
+	}
+}
+
+func TestWalkInfoForRedirection(t *testing.T) {
+	calls, err := Calls("echo x > f")
+	if err != nil || len(calls) != 1 || len(calls[0].Redirs) != 1 {
+		t.Fatalf("Calls = %#v, %v", calls, err)
+	}
+}
+
+func TestWalkInfoForBackground(t *testing.T) {
+	calls, err := Calls("sleep 1 &")
+	if err != nil || len(calls) != 1 || !calls[0].Background {
+		t.Fatalf("Calls = %#v, %v", calls, err)
+	}
+}
+
+func TestSelectMarksLoop(t *testing.T) {
+	calls, err := Calls("select x in a; do kill -1; done")
+	if err != nil || len(calls) != 1 || !calls[0].Loop {
+		t.Fatalf("Calls = %#v, %v", calls, err)
+	}
+}
+
+func TestInheritedVariableShellProcessSubstitution(t *testing.T) {
+	calls, err := Calls(`B=bash; bash -c '$B < <(echo x)'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "bash" && call.Raw == "$B" && !call.ScriptInput {
+			t.Fatalf("inherited shell input not marked: %#v", call)
+		}
 	}
 }
 
