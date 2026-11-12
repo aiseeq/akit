@@ -249,6 +249,9 @@ func timeHint(o options, now time.Time) string {
 			label = "--note"
 		}
 		if field.flag == "--until" {
+			if deadline, ok := timearg.Deadline(field.value, now); ok {
+				return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок распознан: %s", suspect, label, kind, deadline.Format(time.RFC3339))
+			}
 			return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок не распознан, tk ls --due его не покажет", suspect, label, kind)
 		}
 		header := field.flag == "--why" && (o.cmd == "new" || o.cmd == "set" || o.cmd == "start")
@@ -292,27 +295,6 @@ func futureApproxTime(value string, now time.Time) string {
 		}
 	}
 	return ""
-}
-
-// validateApproxTime находит время позже метки записи: «~03:00» где угодно и время в начале («17:40 проверка»).
-// Время в середине может быть сроком или планом («ждёт до 18:00»). Время сравнивается по кругу суток;
-// будущим считается сдвиг больше минуты и меньше 12 часов.
-func validateApproxTime(o options, now time.Time) error {
-	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--check", o.check}, {"--why", o.why}} {
-		found := approxTime.FindAllStringSubmatchIndex(f.value, -1)
-		if ix := leadingTime.FindStringSubmatchIndex(f.value); ix != nil && !timeRange.MatchString(f.value[ix[1]:]) {
-			found = append(found, ix) // промежуток в начале («17:40-18:00 окно») — план, не метка
-		}
-		for _, ix := range found {
-			if end := ix[1]; end < len(f.value) && f.value[end] >= '0' && f.value[end] <= '9' {
-				continue // не время: «~03:001»
-			}
-			if err := futureTime(f.flag, f.value, ix, now); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // futureTime проверяет одно найденное время: группы ix — дата, час, минута.

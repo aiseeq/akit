@@ -27,7 +27,7 @@ type DayMonth struct {
 
 // clockLike — слово-часы после даты (ЧЧ:ММ[:СС]), даже невозможные.
 var clockLike = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{1,2}(:[0-9]{1,2})?$`)
-var guessedClockRE = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])((?:[01]\d|2[0-3]):[0-5][xх])(?:$|[^a-z0-9])`)
+var guessedClockRE = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])((?:[01]?\d|2[0-3]):[0-5][xх])(?:$|[^a-z0-9])`)
 var dateTokenRE = regexp.MustCompile(`^(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})$`)
 
 // GuessedTime возвращает угаданное время («06:4x»), если оно есть в тексте.
@@ -45,7 +45,11 @@ func HasDatedGuessedTime(value string) bool {
 	if len(fields) < 2 || !dateTokenRE.MatchString(strings.TrimRight(fields[0], ":,;")) {
 		return false
 	}
-	_, ok := GuessedTime(strings.TrimRight(fields[1], ":,;"))
+	clockField := 1
+	if strings.TrimRight(fields[clockField], ":,;") == "в" && len(fields) > clockField+1 {
+		clockField++
+	}
+	_, ok := GuessedTime(strings.TrimRight(fields[clockField], ":,;"))
 	return ok
 }
 

@@ -15,12 +15,14 @@ func TestDeadlineQuirks(t *testing.T) {
 		"12.11 06:4x", "2026-11-12 06:4х",
 		"12.11 06:4x: итог", "12.11 06:4x, итог", "12.11 06:4x; итог",
 		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
+		"12.11 в 06:4x", "12.11 6:4x: итог",
+		"12.11: 06:4x итог", "12.11, 06:4x итог",
 	} {
 		if at, ok := Deadline(wait, now); ok {
 			t.Errorf("Deadline(%q) = %v, want no deadline", wait, at)
 		}
 	}
-	for _, value := range []string{"06:4x", "06:4х", "06:4xМСК", "06:4x:", "06:4x,"} {
+	for _, value := range []string{"06:4x", "06:4х", "06:4xМСК", "06:4x:", "06:4x,", "6:4x"} {
 		if got, ok := GuessedTime(value); !ok || !strings.HasPrefix(value, got) {
 			t.Errorf("GuessedTime(%q) = %q, %v", value, got, ok)
 		}
