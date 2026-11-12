@@ -1313,32 +1313,50 @@ func TestPlanItemStopsLeftoverChild(t *testing.T) {
 	t.Fatalf("leftover child %d still alive immediately after runPlanItem", pid)
 }
 
-func TestPlanItemWarnsWhenCancelStopDegrades(t *testing.T) {
-	oldCancel, oldStderr := cancelByStopWithObserver, os.Stderr
-	stderr, err := os.CreateTemp(t.TempDir(), "stderr-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stderr = stderr
-	cancelByStopWithObserver = func(cmd *exec.Cmd, _ time.Duration, _ syscall.Signal, observer func(bool, error)) error {
-		observer(true, nil)
-		return nil
-	}
-	t.Cleanup(func() {
-		cancelByStopWithObserver, os.Stderr = oldCancel, oldStderr
-		_ = stderr.Close()
-	})
-	result := runPlanItem(t.TempDir(), planJSON{Name: "degraded", Cmd: "exit 0"}, time.Second)
-	os.Stderr = oldStderr
-	if _, err := stderr.Seek(0, 0); err != nil {
-		t.Fatal(err)
-	}
-	got, err := io.ReadAll(stderr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.exit != 0 || !strings.Contains(string(got), "остановлен только прямой потомок: pidfd недоступен") {
-		t.Fatalf("result=%+v stderr=%q", result, got)
+func TestCancelStopDegradedWarnsOnStderr(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"plan item", func(t *testing.T) {
+			if result := runPlanItem(t.TempDir(), planJSON{Name: "degraded", Cmd: "exit 0"}, time.Second); result.exit != 0 {
+				t.Fatalf("result=%+v", result)
+			}
+		}},
+		{"bounded command", func(t *testing.T) {
+			if _, _, err := runBoundedCommand("/bin/true", nil, nil, time.Second); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldCancel, oldStderr := cancelByStopWithObserver, os.Stderr
+			stderr, err := os.CreateTemp(t.TempDir(), "stderr-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			os.Stderr = stderr
+			cancelByStopWithObserver = func(cmd *exec.Cmd, _ time.Duration, _ syscall.Signal, observer func(bool, error)) error {
+				observer(true, nil)
+				return nil
+			}
+			t.Cleanup(func() {
+				cancelByStopWithObserver, os.Stderr = oldCancel, oldStderr
+				_ = stderr.Close()
+			})
+			tc.run(t)
+			os.Stderr = oldStderr
+			if _, err := stderr.Seek(0, 0); err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(stderr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(got), "остановлен только прямой потомок: pidfd недоступен") {
+				t.Fatalf("stderr=%q", got)
+			}
+		})
 	}
 }
 

@@ -44,9 +44,11 @@ func sessionLeaderAlive(fd int) (bool, error) {
 // SIGKILLs survivors after grace. It never reaps direct children; their Cmd
 // owners retain responsibility for Wait. Callers must be child subreapers to
 // find descendants reparented after an intermediate process exits.
-// A pidfd failure in the first batch sends no signals. A later failure stops
-// the scan and returns ErrPidfdUnavailable with StopResult.Signaled counting
-// processes already sent the requested signal.
+// If pidfd_open is unavailable (ErrPidfdUnavailable: ENOSYS or EPERM) in the
+// first batch, no signals are sent. If it becomes unavailable later, the scan
+// stops and ErrPidfdUnavailable is returned with StopResult.Signaled counting
+// processes already sent the requested signal. Any other pidfd_open error
+// leaves only that process unsignaled and is returned with the result.
 func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
@@ -71,13 +73,16 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 // as members of the recorded session while its original leader was live. A
 // member may leave the session, or the leader may exit, after the second check;
 // pidfds still pin the exact processes verified in the session, and signaling
-// those processes remains authorized. If the leader exits before the second
-// check, that batch is not signaled and ErrSessionLeaderGone is returned with
-// work already completed. Orphans of an exited leader cannot be identified
-// safely; use StopDescendants as a subreaper or a dedicated systemd scope. A
-// pidfd failure in the first batch sends no signals. A later failure stops the
-// scan and returns ErrPidfdUnavailable with StopResult.Signaled counting
-// processes already sent the requested signal.
+// those processes remains authorized. If either check finds the leader gone,
+// that batch is not signaled and ErrSessionLeaderGone is returned with work
+// already completed; any other failure of a check also stops before the batch
+// is signaled and is returned. Orphans of an exited leader cannot be
+// identified safely; use StopDescendants as a subreaper or a dedicated systemd
+// scope. If pidfd_open is unavailable (ErrPidfdUnavailable: ENOSYS or EPERM)
+// in the first batch, no signals are sent. If it becomes unavailable later,
+// the scan stops and ErrPidfdUnavailable is returned with StopResult.Signaled
+// counting processes already sent the requested signal. Any other pidfd_open
+// error leaves only that process unsignaled and is returned with the result.
 func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
