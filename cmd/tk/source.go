@@ -101,13 +101,17 @@ func runBoundedCommand(path string, args []string, stdin []byte, timeout time.Du
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 500 * time.Millisecond
-	if err := proc.CancelByStop(cmd, 0, syscall.SIGKILL); err != nil {
+	var cancelDegraded bool
+	if err := proc.CancelByStopWithObserver(cmd, 0, syscall.SIGKILL, func(degraded bool, _ error) { cancelDegraded = degraded }); err != nil {
 		return nil, nil, err
 	}
 	var stdout, stderr cappedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if cancelDegraded {
+		fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
+	}
 	if stdout.overflow || stderr.overflow {
 		return nil, stderr.Bytes(), errors.New("output over 1 MiB")
 	}

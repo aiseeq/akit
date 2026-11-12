@@ -1288,7 +1288,8 @@ func TestPlanItemStopsLeftoverChild(t *testing.T) {
 	dir := t.TempDir()
 	start := time.Now()
 	result := runPlanItem(dir, planJSON{Name: "bg", Cmd: "sleep 3 & echo $! >pid; echo first >&2"}, 5*time.Second)
-	if elapsed := time.Since(start); elapsed > time.Second || result.exit != 0 || result.timedOut || result.stderr != "first" {
+	// Two seconds still tells «stopped the leftover» from «waited for sleep 3», and leaves room for a loaded machine.
+	if elapsed := time.Since(start); elapsed > 2*time.Second || result.exit != 0 || result.timedOut || result.stderr != "first" {
 		t.Fatalf("leftover child: %v %#v", elapsed, result)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "pid"))

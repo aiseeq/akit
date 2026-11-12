@@ -397,11 +397,15 @@ func (c *okCond) check(ctx context.Context) (bool, error) {
 	cmd := exec.CommandContext(ctx, "bash", "-c", c.cmd)
 	c.lastCommand = cmd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := proc.CancelByStop(cmd, 0, syscall.SIGKILL); err != nil {
+	var cancelDegraded bool
+	if err := proc.CancelByStopWithObserver(cmd, 0, syscall.SIGKILL, func(degraded bool, _ error) { cancelDegraded = degraded }); err != nil {
 		return false, err
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()
+	if cancelDegraded {
+		fmt.Fprintln(os.Stderr, "остановлен только прямой потомок: pidfd недоступен")
+	}
 	if cmd.Process != nil {
 		// Bash may have exited while commands it started are still running.
 		if _, stopErr := proc.StopChildGroup(cmd, 0, syscall.SIGKILL); stopErr != nil {

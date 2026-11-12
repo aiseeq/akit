@@ -29,7 +29,17 @@ func validateCmdSignalState(cmd *exec.Cmd, sig syscall.Signal, checkProcessState
 	if sig <= 0 || sig > 64 {
 		return nil, fmt.Errorf("invalid signal %d", sig)
 	}
+	if err := validateCmdPID(cmd.Process.Pid); err != nil {
+		return nil, err
+	}
 	return cmd.Process, nil
+}
+
+func validateCmdPID(pid int) error {
+	if pid <= 0 || pid == os.Getpid() || pid == os.Getppid() {
+		return fmt.Errorf("refusing unsafe command PID %d", pid)
+	}
+	return nil
 }
 
 func validateCmdStopState(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, checkProcessState bool) (*os.Process, error) {
@@ -40,6 +50,10 @@ func validateCmdStopState(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal
 }
 
 func installCancelByStop(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, stop func(*exec.Cmd, time.Duration, syscall.Signal) (StopResult, error)) error {
+	return installCancelByStopWithObserver(cmd, grace, sig, stop, nil)
+}
+
+func installCancelByStopWithObserver(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, stop func(*exec.Cmd, time.Duration, syscall.Signal) (StopResult, error), observer func(bool, error)) error {
 	if cmd == nil || cmd.Process != nil {
 		return errors.New("CancelByStop requires a command before Start")
 	}
@@ -50,7 +64,13 @@ func installCancelByStop(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal,
 		return errors.New("invalid signal")
 	}
 	cmd.Cancel = func() error {
-		_, err := stop(cmd, grace, sig)
+		result, err := stop(cmd, grace, sig)
+		if result.Degraded {
+			err = errors.Join(ErrPidfdUnavailable, err)
+		}
+		if observer != nil {
+			observer(result.Degraded, err)
+		}
 		return err
 	}
 	return nil

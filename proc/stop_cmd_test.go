@@ -170,6 +170,123 @@ func TestSignalCmdRefusesInvalidTargetWithoutSignaling(t *testing.T) {
 	}
 }
 
+func TestSignalCmdAndStopCmdRejectUnsafeAndForeignPIDs(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	original := cmd.Process
+	t.Cleanup(func() {
+		cmd.Process = original
+		_ = SignalChild(original.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+	oldSignal, oldKill := directProcessSignal, directProcessKill
+	signals, kills := 0, 0
+	directProcessSignal = func(*os.Process, syscall.Signal) error { signals++; return nil }
+	directProcessKill = func(*os.Process) error { kills++; return nil }
+	t.Cleanup(func() { directProcessSignal, directProcessKill = oldSignal, oldKill })
+	for _, pid := range []int{-1, 0, -2, os.Getpid(), os.Getppid(), 1} {
+		cmd.Process = &os.Process{Pid: pid}
+		if err := SignalCmd(cmd, syscall.SIGTERM); err == nil {
+			t.Errorf("SignalCmd accepted PID %d", pid)
+		}
+		if _, err := StopCmd(cmd, 0, syscall.SIGTERM); err == nil {
+			t.Errorf("StopCmd accepted PID %d", pid)
+		}
+	}
+	cmd.Process = original
+	if signals != 0 || kills != 0 {
+		t.Fatalf("signal calls=%d kill calls=%d, want 0", signals, kills)
+	}
+}
+
+func TestValidateLinuxCmdChildRequiresCurrentProcessAsParent(t *testing.T) {
+	root := t.TempDir()
+	fakeStat(t, root, 1, 0, "init", "S")
+	fakeStat(t, root, 20, os.Getpid(), "owned-child", "S")
+	fakeStat(t, root, 21, 19, "foreign-process", "S")
+	oldRoot := cmdProcRoot
+	cmdProcRoot = root
+	t.Cleanup(func() { cmdProcRoot = oldRoot })
+	if err := validateLinuxCmdChild(20); err != nil {
+		t.Fatalf("direct child validation = %v", err)
+	}
+	if err := validateLinuxCmdChild(21); err == nil {
+		t.Fatal("accepted positive PID whose PPID is not this process")
+	}
+}
+
+func TestValidateCmdPIDRejectsUnsafeNumbers(t *testing.T) {
+	for _, pid := range []int{-1, 0, -2, os.Getpid(), os.Getppid()} {
+		if err := validateCmdPID(pid); err == nil {
+			t.Errorf("validateCmdPID(%d) accepted unsafe PID", pid)
+		}
+	}
+}
+
+func TestCancelByStopReturnsDegradedErrorThroughWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := t.TempDir() + "/ready"
+	cmd := exec.CommandContext(ctx, "sh", "-c", `trap 'exit 0' TERM; echo ready > "$1"; while :; do :; done`, "sh", ready)
+	var observedDegraded bool
+	var observedCancelErr error
+	if err := installCancelByStopWithObserver(cmd, 0, syscall.SIGTERM, func(cmd *exec.Cmd, _ time.Duration, sig syscall.Signal) (StopResult, error) {
+		_ = cmd.Process.Signal(sig)
+		return StopResult{Degraded: true}, nil
+	}, func(degraded bool, err error) { observedDegraded, observedCancelErr = degraded, err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitReady(t, ready)
+	cancel()
+	err := cmd.Wait()
+	if !errors.Is(err, ErrPidfdUnavailable) {
+		t.Fatalf("Wait error = %v, want ErrPidfdUnavailable", err)
+	}
+	if !errors.Is(observedCancelErr, ErrPidfdUnavailable) {
+		t.Fatalf("observer error = %v, want ErrPidfdUnavailable", observedCancelErr)
+	}
+	if !observedDegraded {
+		t.Fatal("observer degradation flag = false, want true")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("context cancellation was not recorded")
+	}
+}
+
+func TestCancelByStopKilledErrorMatchesDefaultCancel(t *testing.T) {
+	run := func(custom bool) (error, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", `trap '' TERM; while :; do :; done`)
+		if custom {
+			if err := CancelByStop(cmd, 30*time.Millisecond, syscall.SIGTERM); err != nil {
+				return nil, err
+			}
+		}
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return cmd.Wait(), ctx.Err()
+	}
+	defaultErr, defaultContextErr := run(false)
+	customErr, customContextErr := run(true)
+	if defaultContextErr == nil || customContextErr == nil {
+		t.Fatalf("context errors: default=%v custom=%v", defaultContextErr, customContextErr)
+	}
+	var defaultExit, customExit *exec.ExitError
+	if !errors.As(defaultErr, &defaultExit) || !errors.As(customErr, &customExit) {
+		t.Fatalf("Wait errors: default=%T %v custom=%T %v; want ExitError in both", defaultErr, defaultErr, customErr, customErr)
+	}
+	if defaultErr.Error() != customErr.Error() {
+		t.Fatalf("Wait error differs from default Cancel: default=%q custom=%q", defaultErr, customErr)
+	}
+}
+
 func TestStopCmdDirectWaitsGraceAndKills(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {

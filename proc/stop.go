@@ -27,6 +27,11 @@ var ErrPidfdUnavailable = errors.New("pidfd_open unavailable")
 // ErrNoStartRecord marks a session record without a usable /proc start time.
 var ErrNoStartRecord = errors.New("session record has no start time")
 
+// ErrSessionLeaderGone reports that a recorded session leader cannot be
+// verified as the original live leader, so its remaining members are unsafe
+// to identify by session ID alone.
+var ErrSessionLeaderGone = errors.New("recorded session leader is gone or changed")
+
 // SessionRecord identifies a detached session by its leader PID and /proc start time.
 type SessionRecord struct {
 	Pid   int

@@ -60,17 +60,36 @@ func signalOwnUnit(ctx context.Context, procRoot, cgRoot string, self, ppid int,
 	if err != nil {
 		return 0, fmt.Errorf("read service cgroup.procs: %w", err)
 	}
-	count := 0
+	var targets []*ownUnitTarget
 	var failures []error
 	for line := range strings.FieldsSeq(string(procs)) {
 		pid, e := strconv.Atoi(line)
 		if e != nil || pid <= 1 || pid == self || pid == ppid {
 			continue
 		}
-		sent, e := signalOwnUnitProcess(procRoot, cg, pid, sig)
+		target, e := prepareOwnUnitProcess(procRoot, cg, pid)
 		if e != nil {
+			if errors.Is(e, ErrPidfdUnavailable) {
+				for _, opened := range targets {
+					_ = unix.Close(opened.fd)
+				}
+				return 0, errors.Join(ErrPidfdUnavailable, e)
+			}
 			failures = append(failures, e)
-		} else if sent {
+		} else if target != nil {
+			targets = append(targets, target)
+		}
+	}
+	defer func() {
+		for _, target := range targets {
+			_ = unix.Close(target.fd)
+		}
+	}()
+	count := 0
+	for _, target := range targets {
+		if e := ownUnitSignal(target.pid, &trackedProcess{fd: target.fd, start: target.start}, unix.Signal(sig)); e != nil {
+			failures = append(failures, fmt.Errorf("signal PID %d: %w", target.pid, e))
+		} else {
 			count++
 		}
 	}
@@ -142,57 +161,65 @@ func querySystemdMainPID(parent context.Context, userManager bool, unit string) 
 	return pid, nil
 }
 
-func signalOwnUnitProcess(procRoot, cg string, pid int, sig syscall.Signal) (bool, error) {
+type ownUnitTarget struct {
+	pid   int
+	fd    int
+	start string
+}
+
+func prepareOwnUnitProcess(procRoot, cg string, pid int) (*ownUnitTarget, error) {
 	st, err := ReadStat(procRoot, pid)
 	if Gone(err) || err == nil && (st.State == "Z" || st.State == "X") {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read PID %d stat: %w", pid, err)
+		return nil, fmt.Errorf("read PID %d stat: %w", pid, err)
 	}
 	member, err := readProcessCgroup(procRoot, pid)
 	if Gone(err) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read PID %d cgroup: %w", pid, err)
+		return nil, fmt.Errorf("read PID %d cgroup: %w", pid, err)
 	}
 	if member != cg {
-		return false, nil
+		return nil, nil
 	}
 	fd, err := ownUnitPidfdOpen(pid, 0)
 	if errors.Is(err, unix.ESRCH) {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, pidfdOpenError(fmt.Errorf("pidfd_open PID %d: %w", pid, err))
+		return nil, pidfdOpenError(fmt.Errorf("pidfd_open PID %d: %w", pid, err))
 	}
-	defer unix.Close(fd)
 	ownUnitAfterPidfdOpen(pid)
 	checked, err := ReadStat(procRoot, pid)
 	if Gone(err) {
-		return false, nil
+		_ = unix.Close(fd)
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("recheck PID %d stat: %w", pid, err)
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("recheck PID %d stat: %w", pid, err)
 	}
 	if checked.Start != st.Start || checked.State == "Z" || checked.State == "X" {
-		return false, nil
+		_ = unix.Close(fd)
+		return nil, nil
 	}
 	member, err = readProcessCgroup(procRoot, pid)
 	if Gone(err) {
-		return false, nil
+		_ = unix.Close(fd)
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("recheck PID %d cgroup: %w", pid, err)
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("recheck PID %d cgroup: %w", pid, err)
 	}
 	if member != cg {
-		return false, nil
+		_ = unix.Close(fd)
+		return nil, nil
 	}
-	if err := ownUnitSignal(pid, &trackedProcess{fd: fd, start: st.Start}, unix.Signal(sig)); err != nil {
-		return false, fmt.Errorf("signal PID %d: %w", pid, err)
-	}
-	return true, nil
+	return &ownUnitTarget{pid: pid, fd: fd, start: st.Start}, nil
 }
 
 func readProcessCgroup(procRoot string, pid int) (string, error) {

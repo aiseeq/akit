@@ -47,8 +47,10 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 }
 
 // StopSession signals verified members of rec's detached session and then
-// SIGKILLs survivors after grace. The session ID cannot be reused by a new
-// session leader while any process from the recorded session remains.
+// SIGKILLs survivors after grace. It requires the original live session leader
+// and pins it with pidfd before selecting members. Orphans of an exited leader
+// cannot be distinguished from a reused session ID; use StopDescendants as a
+// subreaper or a dedicated systemd scope for those processes.
 // If pidfd_open is unavailable, it returns ErrPidfdUnavailable without signaling.
 func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
@@ -65,9 +67,11 @@ func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (St
 	if err := ensurePidfdAvailable(self); err != nil {
 		return StopResult{}, err
 	}
-	if err := validateSessionTarget("/proc", self, rec, start); err != nil {
+	leaderFD, err := openVerifiedSessionLeader("/proc", self, rec, start)
+	if err != nil {
 		return StopResult{}, err
 	}
+	defer unix.Close(leaderFD)
 	ops := ownedStopOps{
 		scan: func() ([]int, error) { return sessionPIDs("/proc", self, rec.Pid, start) },
 		open: func(pid int) (*trackedOwnedProcess, error) { return ownedSessionTarget("/proc", rec.Pid, start, pid) },
@@ -115,41 +119,66 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 	var failures stopFailures
 	result := StopResult{}
 	deadline := time.Now().Add(grace)
+	pidfdUnavailable := false
 	for {
 		pids, err := ops.scan()
 		if err != nil {
 			failures.add(0, err)
+			pidfdUnavailable = errors.Is(err, ErrPidfdUnavailable)
 			break
 		}
-		requestOwnedCandidates(pids, sig, ops, tracked, &failures, &result)
+		batch, err := prepareOwnedCandidates(pids, ops, tracked, &failures, false)
+		if err != nil {
+			failures.add(0, err)
+			pidfdUnavailable = errors.Is(err, ErrPidfdUnavailable)
+			break
+		}
+		requestOwnedCandidates(batch, sig, &failures, &result)
 		if sig == syscall.SIGKILL || !time.Now().Before(deadline) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if sig != syscall.SIGKILL {
+	if sig != syscall.SIGKILL && !pidfdUnavailable {
 		pids, err := ops.scan()
 		if err != nil {
 			failures.add(0, err)
 		} else {
-			result.Killed += killOwnedCandidates(pids, sig, ops, tracked, &failures)
+			batch, prepareErr := prepareOwnedCandidates(pids, ops, tracked, &failures, true)
+			if prepareErr != nil {
+				failures.add(0, prepareErr)
+				pidfdUnavailable = errors.Is(prepareErr, ErrPidfdUnavailable)
+			} else {
+				result.Killed += killOwnedCandidates(batch, sig, ops, &failures)
+			}
 		}
 	}
 	result.AlreadyExited = len(tracked) == 0
 	return result, failures.err()
 }
 
-func requestOwnedCandidates(pids []int, sig syscall.Signal, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures, result *StopResult) {
+func prepareOwnedCandidates(pids []int, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures, includeRequested bool) ([]*trackedOwnedProcess, error) {
+	var batch []*trackedOwnedProcess
 	for _, pid := range pids {
 		candidate, err := ops.open(pid)
 		if err != nil {
+			if errors.Is(err, ErrPidfdUnavailable) {
+				return nil, err
+			}
 			recordOwnedFailure(failures, pid, err)
 			continue
 		}
 		entry := rememberOwnedProcess(tracked, candidate)
-		if entry.requested {
-			continue
+		if includeRequested || !entry.requested {
+			batch = append(batch, entry)
 		}
+	}
+	return batch, nil
+}
+
+func requestOwnedCandidates(batch []*trackedOwnedProcess, sig syscall.Signal, failures *stopFailures, result *StopResult) {
+	for _, entry := range batch {
+		pid := entry.identity.pid
 		if err := signalProcess(pid, entry.tracked, unix.Signal(sig)); err != nil {
 			recordOwnedFailure(failures, pid, err)
 			continue
@@ -162,15 +191,10 @@ func requestOwnedCandidates(pids []int, sig syscall.Signal, ops ownedStopOps, tr
 	}
 }
 
-func killOwnedCandidates(pids []int, sig syscall.Signal, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures) int {
+func killOwnedCandidates(batch []*trackedOwnedProcess, sig syscall.Signal, ops ownedStopOps, failures *stopFailures) int {
 	killed := 0
-	for _, pid := range pids {
-		candidate, err := ops.open(pid)
-		if err != nil {
-			recordOwnedFailure(failures, pid, err)
-			continue
-		}
-		entry := rememberOwnedProcess(tracked, candidate)
+	for _, entry := range batch {
+		pid := entry.identity.pid
 		if !entry.requested && requestOwnedProcess(pid, sig, entry, failures) != nil {
 			continue
 		}
@@ -212,7 +236,7 @@ func validateSessionTarget(root string, self int, rec SessionRecord, recordedSta
 	leader, err := readSessionStat(root, rec.Pid)
 	if err != nil {
 		if Gone(err) {
-			return nil
+			return fmt.Errorf("%w: PID %d", ErrSessionLeaderGone, rec.Pid)
 		}
 		return fmt.Errorf("read session leader %d: %w", rec.Pid, err)
 	}
@@ -220,16 +244,38 @@ func validateSessionTarget(root string, self int, rec SessionRecord, recordedSta
 		return fmt.Errorf("refusing system manager session leader PID %d", rec.Pid)
 	}
 	if leader.State == "Z" || leader.State == "X" {
-		return nil
+		return fmt.Errorf("%w: PID %d is not live", ErrSessionLeaderGone, rec.Pid)
 	}
 	leaderStart, err := numericStart(leader.Start)
 	if err != nil || leaderStart != recordedStart {
-		return fmt.Errorf("session leader PID %d start does not match record", rec.Pid)
+		return fmt.Errorf("%w: PID %d start does not match record", ErrSessionLeaderGone, rec.Pid)
 	}
 	if leader.Sid != rec.Pid {
-		return fmt.Errorf("PID %d is not its session leader", rec.Pid)
+		return fmt.Errorf("%w: PID %d is not its session leader", ErrSessionLeaderGone, rec.Pid)
 	}
 	return nil
+}
+
+func openVerifiedSessionLeader(root string, self int, rec SessionRecord, recordedStart uint64) (int, error) {
+	if err := validateSessionDoesNotContainCaller(root, self, rec.Pid); err != nil {
+		return -1, err
+	}
+	if err := validateSessionTarget(root, self, rec, recordedStart); err != nil {
+		return -1, err
+	}
+	fd, err := openSessionPidfd(rec.Pid, 0)
+	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return -1, fmt.Errorf("%w: PID %d", ErrSessionLeaderGone, rec.Pid)
+		}
+		return -1, fmt.Errorf("pidfd_open session leader PID %d: %w", rec.Pid, pidfdOpenError(err))
+	}
+	afterSessionPidfdOpen(rec.Pid)
+	if err := validateSessionTarget(root, self, rec, recordedStart); err != nil {
+		_ = unix.Close(fd)
+		return -1, errors.Join(errStopTargetChanged, err)
+	}
+	return fd, nil
 }
 
 func validateSessionPID(pid int) error {

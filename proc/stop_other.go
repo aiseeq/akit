@@ -10,8 +10,9 @@ import (
 	"time"
 )
 
-// SignalCmd signals only cmd's direct child. The caller owns Wait; after Wait
-// this returns os.ErrProcessDone without signaling.
+// SignalCmd signals only cmd's direct process. cmd.Process must come from
+// cmd.Start; the caller owns Wait, and after Wait this returns os.ErrProcessDone
+// without signaling.
 func SignalCmd(cmd *exec.Cmd, sig syscall.Signal) error {
 	process, err := validateCmdSignal(cmd, sig)
 	if err != nil {
@@ -26,7 +27,7 @@ func SignalCmdWithResult(cmd *exec.Cmd, sig syscall.Signal) (SignalResult, error
 	return SignalResult{}, SignalCmd(cmd, sig)
 }
 
-// StopCmd stops only cmd's direct process. It waits the full grace period
+// StopCmd stops only cmd's direct process from cmd.Start. It waits the full grace period
 // before Kill because it cannot inspect descendants or safely poll by PID.
 func StopCmd(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	return stopCmdDirect(cmd, grace, sig, false)

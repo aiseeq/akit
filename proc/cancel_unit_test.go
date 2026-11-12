@@ -353,6 +353,48 @@ func TestSignalOwnUnitDoesNotSignalParent(t *testing.T) {
 	}
 }
 
+func TestSignalOwnUnitPreflightsEveryPidfdBeforeSignaling(t *testing.T) {
+	procRoot, cgRoot := t.TempDir(), t.TempDir()
+	cg := "/system.slice/worker.service"
+	fakeStat(t, procRoot, 10, 1, "systemd", "S")
+	fakeStat(t, procRoot, 20, 10, "worker", "S")
+	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::"+cg+"\n")
+	for _, pid := range []int{30, 31} {
+		fakeStat(t, procRoot, pid, 20, "worker-child", "S")
+		writeTestFile(t, filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"), "0::"+cg+"\n")
+	}
+	writeTestFile(t, filepath.Join(cgRoot, cg, "cgroup.procs"), "30\n31\n")
+	oldEnv, oldMainPID, oldOpen, oldSignal := ownUnitEnv, ownUnitMainPID, ownUnitPidfdOpen, ownUnitSignal
+	ownUnitEnv = func(string) string { return "invocation" }
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
+	firstFD := -1
+	ownUnitPidfdOpen = func(pid, _ int) (int, error) {
+		if pid == 31 {
+			return -1, unix.EPERM
+		}
+		fd, err := unix.Open("/dev/null", unix.O_RDONLY, 0)
+		firstFD = fd
+		return fd, err
+	}
+	signals := 0
+	ownUnitSignal = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() {
+		ownUnitEnv, ownUnitMainPID, ownUnitPidfdOpen, ownUnitSignal = oldEnv, oldMainPID, oldOpen, oldSignal
+	})
+	count, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM)
+	if !errors.Is(err, ErrPidfdUnavailable) {
+		t.Fatalf("signalOwnUnit error = %v, want ErrPidfdUnavailable", err)
+	}
+	if count != 0 || signals != 0 {
+		t.Fatalf("signalOwnUnit count=%d signal calls=%d, want 0", count, signals)
+	}
+	if firstFD >= 0 {
+		if _, err := unix.FcntlInt(uintptr(firstFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+			t.Fatalf("preflight pidfd remains open after отказ: %v", err)
+		}
+	}
+}
+
 func TestSignalOwnUnitDetectsStartReplacementAfterPidfdOpen(t *testing.T) {
 	procRoot, cgRoot := t.TempDir(), t.TempDir()
 	cg := "/system.slice/worker.service"
@@ -491,7 +533,7 @@ func TestSignalOwnUnitLiveService(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	marker := filepath.Join(t.TempDir(), "helper-ran")
-	unit := exec.CommandContext(ctx, systemdRun, "--user", "--unit", base+".service", "--wait", "--collect", "--setenv=AKIT_LIVE_SYSTEMD_HELPER=1", "--setenv=AKIT_LIVE_SYSTEMD_MARKER="+marker, "--", os.Args[0], "-test.run=^TestSignalOwnUnitLiveService$")
+	unit := exec.CommandContext(ctx, systemdRun, "--user", "--unit", base+".service", "--wait", "--pipe", "--collect", "--setenv=AKIT_LIVE_SYSTEMD_HELPER=1", "--setenv=AKIT_LIVE_SYSTEMD_MARKER="+marker, "--", os.Args[0], "-test.run=^TestSignalOwnUnitLiveService$")
 	if output, err := unit.CombinedOutput(); err != nil {
 		t.Fatalf("temporary systemd service failed: %v: %s", err, strings.TrimSpace(string(output)))
 	}

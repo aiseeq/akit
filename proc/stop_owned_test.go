@@ -82,6 +82,42 @@ func TestStopDescendantsStopsAdoptedGrandchildAndNotSibling(t *testing.T) {
 	}
 }
 
+func TestStopOwnedProcessesPreflightsPidfdsBeforeAnySignal(t *testing.T) {
+	oldSignal := signalProcess
+	signals := 0
+	signalProcess = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() { signalProcess = oldSignal })
+	openedFD := -1
+	openCount := 0
+	ops := ownedStopOps{
+		scan: func() ([]int, error) { return []int{40, 41}, nil },
+		open: func(pid int) (*trackedOwnedProcess, error) {
+			openCount++
+			if pid == 41 {
+				return nil, fmt.Errorf("second target: %w", ErrPidfdUnavailable)
+			}
+			fd, err := unix.Open("/dev/null", unix.O_RDONLY, 0)
+			if err != nil {
+				return nil, err
+			}
+			openedFD = fd
+			return &trackedOwnedProcess{identity: processIdentity{pid: pid, start: "1"}, tracked: &trackedProcess{fd: fd, start: "1"}}, nil
+		},
+	}
+	_, err := stopOwnedProcesses(0, syscall.SIGTERM, ops)
+	if !errors.Is(err, ErrPidfdUnavailable) {
+		t.Fatalf("stopOwnedProcesses error = %v, want ErrPidfdUnavailable", err)
+	}
+	if signals != 0 {
+		t.Fatalf("signals = %d, want 0", signals)
+	}
+	if openedFD >= 0 {
+		if _, err := unix.FcntlInt(uintptr(openedFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+			t.Fatalf("preflight fd remains open after отказ: %v", err)
+		}
+	}
+}
+
 func TestSignalDescendantSignalsGrandchild(t *testing.T) {
 	dir := t.TempDir()
 	marker, ready, pidPath := filepath.Join(dir, "term"), filepath.Join(dir, "ready"), filepath.Join(dir, "pid")
@@ -246,7 +282,7 @@ func TestStopSessionStopsLiveSessionAndLeavesOtherSession(t *testing.T) {
 	}
 }
 
-func TestStopSessionStopsMembersAfterLeaderExits(t *testing.T) {
+func TestStopSessionRefusesMembersAfterLeaderExits(t *testing.T) {
 	dir := t.TempDir()
 	marker, ready, memberFile := filepath.Join(dir, "term"), filepath.Join(dir, "ready"), filepath.Join(dir, "member.pid")
 	script := `sh -c 'trap "echo term > $1" TERM; echo ready > $2; while :; do :; done' sh "$1" "$2" & child=$!; while [ ! -f "$2" ]; do sleep 0.01; done; echo $child > "$3"; exit 0`
@@ -258,16 +294,32 @@ func TestStopSessionStopsMembersAfterLeaderExits(t *testing.T) {
 	rec := sessionRecordFor(t, cmd.Process.Pid)
 	waitReady(t, ready)
 	member := readPID(t, memberFile)
+	memberFD, err := unix.PidfdOpen(member, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(memberFD) })
 	if err := cmd.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StopSession(rec, 100*time.Millisecond, syscall.SIGTERM); err != nil {
-		t.Fatal(err)
+	if _, err := StopSession(rec, 100*time.Millisecond, syscall.SIGTERM); !errors.Is(err, ErrSessionLeaderGone) {
+		t.Fatalf("StopSession error = %v, want ErrSessionLeaderGone", err)
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("adopted session member did not run TERM trap: %v", err)
+	if err := unix.PidfdSendSignal(memberFD, unix.SIGKILL, nil, 0); err != nil {
+		t.Fatalf("stop test-owned member after refusal: %v", err)
 	}
 	waitForGoneOrZombie(t, member)
+}
+
+func TestStopSessionRefusesReusedSIDWhenLeaderIsGone(t *testing.T) {
+	root := t.TempDir()
+	writeFakeSessionStat(t, root, 1, "init", "S", 0, 1, 1, "1")
+	writeFakeSessionStat(t, root, 20, "caller", "S", 1, 20, 20, "20")
+	writeFakeSessionStat(t, root, 51, "replacement member", "S", 1, 50, 50, "200")
+	err := validateSessionTarget(root, 20, SessionRecord{Pid: 50, Start: "42"}, 42)
+	if !errors.Is(err, ErrSessionLeaderGone) {
+		t.Fatalf("validateSessionTarget error = %v, want ErrSessionLeaderGone", err)
+	}
 }
 
 func TestStopSessionRefusesUnsafeRecords(t *testing.T) {
@@ -298,7 +350,7 @@ func TestStopSessionRefusesUnsafeRecords(t *testing.T) {
 		{name: "start mismatch", selfSID: 55, parentSID: 55, leader: "worker", leaderSID: 50, start: "43", wantErr: true},
 		{name: "not session leader", selfSID: 55, parentSID: 55, leader: "worker", leaderSID: 51, start: "42", wantErr: true},
 		{name: "safe target", selfSID: 55, parentSID: 55, leader: "worker", leaderSID: 50, start: "42"},
-		{name: "dead leader", selfSID: 55, parentSID: 55, leader: "worker", leaderSID: 50, start: "42", wantErr: false},
+		{name: "dead leader", selfSID: 55, parentSID: 55, leader: "worker", leaderSID: 50, start: "42", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -423,6 +475,44 @@ func TestOwnedSessionTargetRechecksStartAndSIDAfterPidfdOpen(t *testing.T) {
 				t.Fatalf("ownedSessionTarget error = %v, want changed identity (actual start %s)", err, stat.Start)
 			}
 		})
+	}
+}
+
+func TestStopSessionRechecksLeaderAfterPidfdOpenBeforeMembers(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	rec := sessionRecordFor(t, cmd.Process.Pid)
+	oldRead, oldAfter, oldSignal := readSessionStat, afterSessionPidfdOpen, signalProcess
+	changed := false
+	readSessionStat = func(root string, pid int) (Stat, error) {
+		st, err := ReadStat(root, pid)
+		if changed && pid == rec.Pid && err == nil {
+			st.Start = "1"
+		}
+		return st, err
+	}
+	afterSessionPidfdOpen = func(pid int) {
+		if pid == rec.Pid {
+			changed = true
+		}
+	}
+	signals := 0
+	signalProcess = func(int, *trackedProcess, unix.Signal) error { signals++; return nil }
+	t.Cleanup(func() { readSessionStat, afterSessionPidfdOpen, signalProcess = oldRead, oldAfter, oldSignal })
+	if _, err := StopSession(rec, 0, syscall.SIGTERM); !errors.Is(err, errStopTargetChanged) {
+		t.Fatalf("StopSession error = %v, want changed leader identity", err)
+	}
+	if signals != 0 {
+		t.Fatalf("signals = %d, want 0 before validating all session members", signals)
 	}
 }
 

@@ -4,6 +4,7 @@ package proc
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -12,9 +13,11 @@ import (
 
 var stopCmdGroup = StopChildGroup
 var stopCmdSingle = StopChild
+var cmdProcRoot = "/proc"
 
-// SignalCmd signals cmd's direct child. Wait remains the caller's responsibility;
-// before Wait the child PID cannot be reused, and after Wait this returns
+// SignalCmd signals cmd's direct child. cmd.Process must be a direct child
+// created by cmd.Start. Wait remains the caller's responsibility; before Wait
+// the child PID cannot be reused, and after Wait this returns
 // os.ErrProcessDone without signaling. If pidfd_open is unavailable, it uses
 // os.Process.Signal and SignalCmdWithResult reports the degraded path.
 func SignalCmd(cmd *exec.Cmd, sig syscall.Signal) error {
@@ -31,6 +34,9 @@ func SignalCmdWithResult(cmd *exec.Cmd, sig syscall.Signal) (SignalResult, error
 func signalCmdWithResultState(cmd *exec.Cmd, sig syscall.Signal, checkProcessState bool) (SignalResult, error) {
 	process, err := validateCmdSignalState(cmd, sig, checkProcessState)
 	if err != nil {
+		return SignalResult{}, err
+	}
+	if err := validateLinuxCmdChild(process.Pid); err != nil {
 		return SignalResult{}, err
 	}
 	err = SignalChild(process.Pid, sig)
@@ -63,6 +69,9 @@ func stopCmdLinux(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, checkP
 	if err != nil {
 		return StopResult{}, err
 	}
+	if err := validateLinuxCmdChild(process.Pid); err != nil {
+		return StopResult{}, err
+	}
 	probe := ensureSignalChildPidfd
 	if ownGroupConfig(cmd.SysProcAttr) {
 		probe = ensurePidfdAvailable
@@ -88,4 +97,18 @@ func stopCmdLinux(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, checkP
 	}
 	result.Degraded = degraded
 	return result, err
+}
+
+func validateLinuxCmdChild(pid int) error {
+	if err := validateCmdPID(pid); err != nil {
+		return err
+	}
+	stat, err := ReadStat(cmdProcRoot, pid)
+	if err != nil {
+		return fmt.Errorf("verify command child PID %d: %w", pid, err)
+	}
+	if stat.Ppid != os.Getpid() {
+		return fmt.Errorf("command PID %d is not a direct child", pid)
+	}
+	return nil
 }
