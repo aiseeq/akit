@@ -9,12 +9,83 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"mvdan.cc/sh/v3/syntax"
 )
+
+func nestedSubstitutionScript(lines int) string {
+	const line = `x="$(printf "%%s" "it's $(echo "a)b" | tr a b)")"; y=` + "`date \"+%%s\"`" + `; z=$(( (i+1) * 2 )) # c` + "\n"
+	return "#!/bin/bash\n" + strings.Repeat(line, lines) + strings.Repeat("kill -0 \"$pid\"\n", 20)
+}
+
+func nestedDepthScript(depth int) string {
+	var src strings.Builder
+	src.WriteString(`echo "`)
+	for range depth {
+		src.WriteString(`$(echo `)
+	}
+	src.WriteString(`$(kill)`)
+	for range depth {
+		src.WriteByte(')')
+	}
+	src.WriteByte('"')
+	return src.String()
+}
+
+func BenchmarkFindNestedDepth(b *testing.B) {
+	for _, depth := range []int{400, 800, 1600} {
+		b.Run(strconv.Itoa(depth), func(b *testing.B) {
+			src := nestedDepthScript(depth)
+			b.SetBytes(int64(len(src)))
+			b.ResetTimer()
+			for range b.N {
+				calls, err := Find(src, "kill")
+				if err != nil || len(calls) != 1 {
+					b.Fatalf("Find returned %d calls, err=%v", len(calls), err)
+				}
+			}
+		})
+	}
+}
+
+func TestFindNestedDepthGrowth(t *testing.T) {
+	measure := func(src string) float64 {
+		result := testing.Benchmark(func(b *testing.B) {
+			for range b.N {
+				calls, err := Find(src, "kill")
+				if err != nil || len(calls) != 1 {
+					t.Fatalf("Find returned %d calls, err=%v", len(calls), err)
+				}
+			}
+		})
+		return float64(result.NsPerOp())
+	}
+	small, large := nestedDepthScript(800), nestedDepthScript(1600)
+	ratio := measure(large) / measure(small)
+	if ratio > 3.1 {
+		t.Fatalf("doubling nested input took %.2fx as long; want growth below 3.1x", ratio)
+	}
+}
+
+func BenchmarkFindNestedSubstitution(b *testing.B) {
+	for _, lines := range []int{1000, 5000, 20000} {
+		b.Run(strconv.Itoa(lines), func(b *testing.B) {
+			src := nestedSubstitutionScript(lines)
+			b.SetBytes(int64(len(src)))
+			b.ResetTimer()
+			for range b.N {
+				calls, err := Find(src, "kill")
+				if err != nil || len(calls) != 20 {
+					b.Fatalf("Find returned %d calls, err=%v", len(calls), err)
+				}
+			}
+		})
+	}
+}
 
 func TestCalls(t *testing.T) {
 	tests := []struct {
@@ -1218,7 +1289,7 @@ func TestMainWrappersUseTheirOwnCommandRoute(t *testing.T) {
 func TestWrapperRouteDeduplicationUsesSourceCall(t *testing.T) {
 	call := Call{Name: "echo", Args: []string{"x"}, Offset: 10, Via: []string{"exact"}}
 	calls := []Call(nil)
-	seen := make(map[string]bool)
+	seen := newCallSet()
 	appendCall(seen, &calls, call)
 	c := cmd{
 		call:  Call{Name: "sudo", Args: []string{"echo", "x"}},
