@@ -89,10 +89,132 @@ func TestMaskRussianSecretLabels(t *testing.T) {
 		"токенов: 1200",
 		"ключ: XY-1234",
 		"ключ: incident-reference",
+		"ключ: Abcdefghijklmnop",
 	} {
 		if got, found := Mask(input); got != input || len(found) != 0 {
 			t.Errorf("ordinary value changed for %q: %q, %v", input, got, found)
 		}
+	}
+}
+
+// Markdown around a secret label stays visible while its value is masked.
+func TestMaskMarkdownSecretLabels(t *testing.T) {
+	for _, tc := range []struct {
+		input  string
+		label  string
+		secret string
+	}{
+		{"**Пароль:** Zq7xW9vK2mPq8Rt", "**Пароль:**", "Zq7xW9vK2mPq8Rt"},
+		{"__Пароль__: Zq7xW9vK2mPq8Rt", "__Пароль__:", "Zq7xW9vK2mPq8Rt"},
+		{"`Пароль`: Zq7xW9vK2mPq8Rt", "`Пароль`:", "Zq7xW9vK2mPq8Rt"},
+		{"**Password:** Zq7xW9vK2mPq8Rt", "**Password:**", "Zq7xW9vK2mPq8Rt"},
+		{"__Password__: Zq7xW9vK2mPq8Rt", "__Password__:", "Zq7xW9vK2mPq8Rt"},
+		{"`Password`: Zq7xW9vK2mPq8Rt", "`Password`:", "Zq7xW9vK2mPq8Rt"},
+		{"Password: Zq7xW9vK2mPq8Rt", "Password:", "Zq7xW9vK2mPq8Rt"},
+	} {
+		got, _ := Mask(tc.input)
+		if strings.Contains(got, tc.secret) || !strings.Contains(got, tc.label) {
+			t.Errorf("label/value handling for %q: %q", tc.input, got)
+		}
+	}
+	for _, input := range []string{"**Пароль:**, описание", "__Password__:, prose"} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("closing markup without a value changed %q to %q", input, got)
+		}
+	}
+}
+
+// Secret labels can have up to four words before the value delimiter.
+func TestMaskSecretLabelsWithInterveningWords(t *testing.T) {
+	for _, input := range []string{
+		"пароль для учётной записи: Zq7xW9vK2mPq8Rt",
+		"пароль для этой учётной записи: Zq7xW9vK2mPq8Rt",
+		"password for the account: Zq7xW9vK2mPq8Rt",
+		"password for the current user: Zq7xW9vK2mPq8Rt",
+	} {
+		got, _ := Mask(input)
+		if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
+			t.Errorf("secret value left visible for %q: %q", input, got)
+		}
+	}
+	for _, input := range []string{
+		"пароль для учётной записи\nZq7xW9vK2mPq8Rt",
+		"пароль для=учётной записи: Zq7xW9vK2mPq8Rt",
+		"password for the\naccount: Zq7xW9vK2mPq8Rt",
+		"password for = the account: Zq7xW9vK2mPq8Rt",
+		"password - the account: Zq7xW9vK2mPq8Rt",
+		"password for the current user account: Zq7xW9vK2mPq8Rt",
+	} {
+		got, _ := Mask(input)
+		if !strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
+			t.Errorf("label crossed a line or delimiter in %q: %q", input, got)
+		}
+	}
+}
+
+// Russian and English labels classify the same value form identically.
+func TestMaskRussianAndEnglishValueShape(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		value string
+		mask  bool
+	}{
+		{"пароль: Abcdefghijklmno", "Abcdefghijklmno", true},
+		{"пароль: \"Abcdefghijklmno\"", "Abcdefghijklmno", true},
+		{"password: Abcdefghijklmno", "Abcdefghijklmno", true},
+		{"password: \"Abcdefghijklmno\"", "Abcdefghijklmno", true},
+		{"пароль: нет", "нет", false},
+		{"password: нет", "нет", true},
+	} {
+		got, _ := Mask(tc.input)
+		if strings.Contains(got, tc.value) == tc.mask {
+			t.Errorf("value shape for %q: %q", tc.input, got)
+		}
+	}
+}
+
+// A spaced hyphen separates a label from its value; an unspaced hyphen does not.
+func TestMaskSecretLabelsWithSpacedHyphen(t *testing.T) {
+	for _, input := range []string{
+		"пароль - Zq7xW9vK2mPq8Rt",
+	} {
+		got, _ := Mask(input)
+		if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
+			t.Errorf("secret value left visible for %q: %q", input, got)
+		}
+	}
+	for _, input := range []string{
+		"пароль-Zq7xW9vK2mPq8Rt",
+		"пароль -Zq7xW9vK2mPq8Rt",
+		"пароль- Zq7xW9vK2mPq8Rt",
+	} {
+		got, _ := Mask(input)
+		if !strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
+			t.Errorf("unspaced hyphen was treated as a delimiter for %q: %q", input, got)
+		}
+	}
+}
+
+func TestMaskMarkdownValueMayStartWithEmphasis(t *testing.T) {
+	input := `password=**Zq7xW9vK2mPq8Rt**`
+	got, _ := Mask(input)
+	if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
+		t.Fatalf("secret value left visible: %q", got)
+	}
+}
+
+func TestMaskNameAnchorDoesNotStartInsideName(t *testing.T) {
+	input := `__PWD=Zq7xW9vK2mPq8Rt`
+	got, _ := Mask(input)
+	if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
+		t.Fatalf("secret value left visible: %q", got)
+	}
+}
+
+func TestMaskQuotedLabelDashBeforeExplanation(t *testing.T) {
+	input := `"pass": - ключ.`
+	if got, found := Mask(input); got != input || len(found) != 0 {
+		t.Fatalf("explanation separator changed %q to %q, %v", input, got, found)
 	}
 }
 

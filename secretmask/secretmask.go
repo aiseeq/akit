@@ -83,8 +83,8 @@ var (
 	privateKeyRE  = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
 	awsRE         = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE      = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
-	contextNameRE = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
-	russianNameRE = regexp.MustCompile(`(?i)([\p{Cyrillic}]+(?:[ \t]+[\p{L}0-9_.-]+)?)(?:\\*["'])?([ \t]*)(—|–|:=|=>|=|:)`)
+	contextNameRE = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([a-z0-9_.-]+?)(?:\\*["']|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}0-9]+){0,4}([ \t]*)(:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	russianNameRE = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([\p{Cyrillic}]+)(?:\\*["']|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}0-9]+){0,4}([ \t]*)( - |—|–|:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
 
 	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
@@ -251,13 +251,39 @@ func isNameByte(c byte) bool {
 }
 
 func nameUsedAt(text string, start, end int) bool {
+	switch {
+	case strings.HasPrefix(text[end:], "**"), strings.HasPrefix(text[end:], "__"):
+		end += 2
+	case strings.HasPrefix(text[end:], "`"):
+		end++
+	}
 	for end < len(text) && text[end] >= '0' && text[end] <= '9' {
 		end++
 	}
 	if end < len(text) && isNameByte(text[end]) {
 		return false
 	}
-	return nameIsOption(text, start) || nameBeforeDelimiter(text, end)
+	return nameIsOption(text, start) || nameBeforeDelimiter(text, end) || nameBeforeDelimiterAfterWords(text, end)
+}
+
+func nameBeforeDelimiterAfterWords(text string, at int) bool {
+	for range 4 {
+		start := at
+		for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+			at++
+		}
+		if at == start {
+			return false
+		}
+		for at < len(text) && isNameByte(text[at]) {
+			at++
+		}
+		if at == start || !nameBeforeDelimiter(text, at) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // nameIsOption: the name run holding the anchor starts with a dash. A very long
@@ -279,8 +305,12 @@ func nameBeforeDelimiter(text string, at int) bool {
 	if at < len(text) && (text[at] == '"' || text[at] == '\'') {
 		at++
 	}
+	spaces := at
 	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
 		at++
+	}
+	if at < len(text) && text[at] == '-' && at > spaces && at+1 < len(text) && (text[at+1] == ' ' || text[at+1] == '\t') {
+		return true
 	}
 	return at < len(text) && (text[at] == ':' || text[at] == '=' || text[at] == ',')
 }
@@ -774,54 +804,126 @@ func headerMatches(text string) []contextMatch {
 }
 
 func nameMatches(text string) []contextMatch {
-	var matches []contextMatch
-	indices := contextNameRE.FindAllStringSubmatchIndex(text, -1)
-	indices = append(indices, russianNameRE.FindAllStringSubmatchIndex(text, -1)...)
+	indices := namePatternIndices(text, contextNameRE)
+	indices = append(indices, namePatternIndices(text, russianNameRE)...)
 	sort.Slice(indices, func(i, j int) bool { return indices[i][0] < indices[j][0] })
+	var matches []contextMatch
 	for _, ix := range indices {
-		if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
-			continue
-		}
-		// A name inside the value before it still counts: its own value can lie
-		// past that value's end (auth=::X-API-KEY: value). Overlaps are dropped
-		// in maskContext.
-		name, kind, ok := contextSecretName(text, ix[2], ix[3])
-		if !ok {
-			continue
-		}
-		leftSpace := text[ix[4]:ix[5]]
-		delimiter := text[ix[6]:ix[7]]
-		if (delimiter == "—" || delimiter == "–") && !isRussianSecretLabel(text[ix[2]:ix[3]]) {
-			continue
-		}
-		at := ix[1]
-		if delimiter == "=" && leftSpace == "" && hasHorizontalSpaceAt(text, at) {
-			continue
-		}
-		value, ok := scanValue(text, at, delimiter == ":" || delimiter == ":=")
-		if !ok {
-			continue
-		}
-		// A structure or the next name is no value: the names inside it get
-		// their own match.
-		if valueIsStructure(text, value) {
-			continue
-		}
-		if plainValueFor(name, text[value.start:value.end]) || nonSecretValueForm(text, value, name) {
-			continue
-		}
-		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
-			continue
-		}
-		// After := and => a bare value is an expression in code; a literal has quotes.
-		if !value.quoted && (delimiter == ":=" || delimiter == "=>") {
-			continue
-		}
-		if valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=") {
-			matches = append(matches, contextMatch{value.start, value.end, kind})
+		if match, ok := nameMatchAt(text, ix); ok {
+			matches = append(matches, match)
 		}
 	}
 	return matches
+}
+
+func namePatternIndices(text string, pattern *regexp.Regexp) [][]int {
+	indices := pattern.FindAllStringSubmatchIndex(text, -1)
+	var nested [][]int
+	for _, ix := range indices {
+		if _, _, ok := contextSecretName(text, ix[2], ix[3]); ok {
+			continue
+		}
+		for start := ix[2] + 1; start < ix[1]; {
+			candidate := pattern.FindStringSubmatchIndex(text[start:ix[1]])
+			if candidate == nil {
+				break
+			}
+			for i := range candidate {
+				if candidate[i] >= 0 {
+					candidate[i] += start
+				}
+			}
+			boundary := candidate[2] == 0 || !isNameByte(text[candidate[2]-1])
+			if boundary {
+				if _, _, ok := contextSecretName(text, candidate[2], candidate[3]); ok {
+					nested = append(nested, candidate)
+				}
+			}
+			next := candidate[2] + 1
+			if next <= start {
+				break
+			}
+			start = next
+		}
+	}
+	return append(indices, nested...)
+}
+
+func nameMatchAt(text string, ix []int) (contextMatch, bool) {
+	if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
+		return contextMatch{}, false
+	}
+	name, kind, ok := contextSecretName(text, ix[2], ix[3])
+	if !ok && ix[0] < ix[2] && !markdownLabelClosed(text, ix) {
+		name, kind, ok = contextSecretName(text, ix[0], ix[3])
+	}
+	if !ok {
+		return contextMatch{}, false
+	}
+	leftSpace := text[ix[4]:ix[5]]
+	delimiter := text[ix[6]:ix[7]]
+	if markdownCloseHasNoValue(text, ix[1]) {
+		return contextMatch{}, false
+	}
+	if (delimiter == "—" || delimiter == "–") && !isRussianSecretLabel(text[ix[2]:ix[3]]) {
+		return contextMatch{}, false
+	}
+	at := ix[1]
+	if delimiter == "=" && leftSpace == "" && hasHorizontalSpaceAt(text, at) {
+		return contextMatch{}, false
+	}
+	value, ok := scanValue(text, at, delimiter == ":" || delimiter == ":=")
+	if !ok || !nameValueAllowed(text, ix, value, name, delimiter) {
+		return contextMatch{}, false
+	}
+	if !valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=") {
+		return contextMatch{}, false
+	}
+	return contextMatch{value.start, value.end, kind}, true
+}
+
+func markdownLabelClosed(text string, ix []int) bool {
+	marker := text[ix[0]:ix[2]]
+	return (marker == "**" || marker == "__" || marker == "`") && strings.Contains(text[ix[3]:ix[6]], marker)
+}
+
+func markdownCloseHasNoValue(text string, at int) bool {
+	for _, marker := range []string{"**", "__", "\x60"} {
+		if strings.HasPrefix(text[at:], marker) {
+			next := at + len(marker)
+			return next >= len(text) || strings.ContainsRune(",.;!?)]}", rune(text[next]))
+		}
+	}
+	return false
+}
+
+func nameValueAllowed(text string, ix []int, value contextValue, name, delimiter string) bool {
+	if valueIsStructure(text, value) {
+		return false
+	}
+	raw := text[value.start:value.end]
+	if raw == "-" && dashBeforeExplanation(text[value.end:]) {
+		return false
+	}
+	if plainValueFor(name, raw) || nonSecretValueForm(text, value, name) {
+		return false
+	}
+	if !value.quoted && notSecretHere(text, ix[2], name, delimiter, raw) {
+		return false
+	}
+	// After := and => a bare value is an expression in code; a literal has quotes.
+	return value.quoted || delimiter != ":=" && delimiter != "=>"
+}
+
+func dashBeforeExplanation(rest string) bool {
+	rest = strings.TrimLeft(rest, " \t")
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		return unicode.IsLetter(r)
+	}
+	return false
 }
 
 // nonSecretValueForm recognizes code and diagnostic syntax that cannot be a credential.
@@ -1520,17 +1622,35 @@ func plainValueFor(name, value string) bool {
 		if isRussianKeyLabel(n) {
 			return !isRussianKeyValue(value)
 		}
-		value = strings.TrimRight(value, "»”’›")
-		return value == "…" || isPlaceholder(value) || isPlainWord(value) || isShortLetterWord(value)
+		value = strings.Trim(value, "«»")
+		value = strings.TrimRight(value, "”’›")
+		return value == "…" || isPlaceholder(value) || isShortCyrillicWord(value) || isShortPlainWord(value) || isPlainPhrase(value)
 	}
 	return authName(n) && (isPlainPath(value) || isPlainWord(value))
 }
 
-// isShortLetterWord accepts a short word made only of Unicode letters.
-func isShortLetterWord(value string) bool {
+func isShortPlainWord(value string) bool {
+	return len(value) < 8 && isPlainWord(value)
+}
+
+func isPlainPhrase(value string) bool {
+	words := strings.Fields(value)
+	if len(words) < 2 {
+		return false
+	}
+	for _, word := range words {
+		if !isPlainWord(word) && !isShortCyrillicWord(word) {
+			return false
+		}
+	}
+	return true
+}
+
+// isShortCyrillicWord accepts a short ordinary word in Russian.
+func isShortCyrillicWord(value string) bool {
 	count := 0
 	for _, r := range value {
-		if !unicode.IsLetter(r) {
+		if !unicode.IsLetter(r) || !unicode.Is(unicode.Cyrillic, r) {
 			return false
 		}
 		count++
