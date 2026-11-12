@@ -3,13 +3,16 @@
 package proc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -17,21 +20,39 @@ import (
 var ownUnitProcRoot = "/proc"
 var ownUnitCgroupRoot = "/sys/fs/cgroup"
 var ownUnitEnv = os.Getenv
-var ownUnitPidfdOpen = unix.PidfdOpen
+var ownUnitPidfdOpen = func(pid, flags int) (int, error) { return openProcessPidfd(pid, flags) }
 var ownUnitSignal = signalProcess
 var ownUnitAfterPidfdOpen = func(int) {}
+var ownUnitMainPID = querySystemdMainPID
+var ownUnitDefaultContext = context.Background()
 
-// SignalOwnUnit signals every verified process in this systemd service cgroup except itself.
-// It requires a main service process with INVOCATION_ID and systemd as its parent.
+// SignalOwnUnit signals verified members of this systemd service cgroup except
+// itself and its parent. It verifies INVOCATION_ID, systemd as parent, and that
+// systemd reports this process as MainPID. A process can move cgroups between
+// the final membership check and pidfd signal; only the manager or the owner of
+// a delegated subtree can do that. If pidfd_open is unavailable, it refuses
+// with ErrPidfdUnavailable and sends no signals.
 func SignalOwnUnit(sig syscall.Signal) (int, error) {
-	return signalOwnUnit(ownUnitProcRoot, ownUnitCgroupRoot, os.Getpid(), os.Getppid(), sig)
+	return SignalOwnUnitContext(ownUnitDefaultContext, sig)
 }
 
-func signalOwnUnit(procRoot, cgRoot string, self, ppid int, sig syscall.Signal) (int, error) {
+// SignalOwnUnitContext is SignalOwnUnit with a context for the systemd MainPID query.
+func SignalOwnUnitContext(ctx context.Context, sig syscall.Signal) (int, error) {
+	self := os.Getpid()
 	if err := validateSignalTarget(self, sig); err != nil {
 		return 0, err
 	}
-	cg, err := ownServiceCgroup(procRoot, self, ppid)
+	if err := ensurePidfdAvailable(self); err != nil {
+		return 0, err
+	}
+	return signalOwnUnit(ctx, ownUnitProcRoot, ownUnitCgroupRoot, self, os.Getppid(), sig)
+}
+
+func signalOwnUnit(ctx context.Context, procRoot, cgRoot string, self, ppid int, sig syscall.Signal) (int, error) {
+	if err := validateSignalTarget(self, sig); err != nil {
+		return 0, err
+	}
+	cg, err := ownServiceCgroup(ctx, procRoot, self, ppid)
 	if err != nil {
 		return 0, err
 	}
@@ -43,7 +64,7 @@ func signalOwnUnit(procRoot, cgRoot string, self, ppid int, sig syscall.Signal) 
 	var failures []error
 	for line := range strings.FieldsSeq(string(procs)) {
 		pid, e := strconv.Atoi(line)
-		if e != nil || pid <= 1 || pid == self {
+		if e != nil || pid <= 1 || pid == self || pid == ppid {
 			continue
 		}
 		sent, e := signalOwnUnitProcess(procRoot, cg, pid, sig)
@@ -56,17 +77,17 @@ func signalOwnUnit(procRoot, cgRoot string, self, ppid int, sig syscall.Signal) 
 	return count, errors.Join(failures...)
 }
 
-func ownServiceCgroup(procRoot string, self, ppid int) (string, error) {
+func ownServiceCgroup(ctx context.Context, procRoot string, self, ppid int) (string, error) {
 	if ownUnitEnv("INVOCATION_ID") == "" {
-		return "", errors.New("process has no systemd INVOCATION_ID")
+		return "", ErrNoInvocationID
 	}
 	selfStat, err := ReadStat(procRoot, self)
 	if err != nil || selfStat.Ppid != ppid {
-		return "", errors.New("process is not the service main process")
+		return "", ErrNotServiceMainProcess
 	}
 	parent, err := ReadStat(procRoot, ppid)
 	if err != nil || !serviceManager(ppid, parent) {
-		return "", errors.New("process parent is not systemd")
+		return "", ErrNotSystemdParent
 	}
 	cgroupBytes, err := os.ReadFile(filepath.Join(procRoot, "self", "cgroup"))
 	if err != nil {
@@ -75,13 +96,50 @@ func ownServiceCgroup(procRoot string, self, ppid int) (string, error) {
 	cg := ParseCgroup(string(cgroupBytes))
 	parts := strings.Split(strings.Trim(cg, "/"), "/")
 	if cg == "" || len(parts) == 0 {
-		return "", errors.New("invalid own cgroup")
+		return "", fmt.Errorf("%w: invalid own cgroup", ErrUnsafeUnitCgroup)
 	}
 	unit := parts[len(parts)-1]
 	if !strings.HasSuffix(unit, ".service") || strings.HasPrefix(unit, "user@") {
-		return "", fmt.Errorf("own cgroup leaf %q is not a service", unit)
+		return "", fmt.Errorf("%w: leaf %q is not a service", ErrUnsafeUnitCgroup, unit)
+	}
+	userManager := false
+	for _, part := range parts[:len(parts)-1] {
+		if strings.HasPrefix(part, "user@") && strings.HasSuffix(part, ".service") {
+			userManager = true
+			break
+		}
+	}
+	mainPID, err := ownUnitMainPID(ctx, userManager, unit)
+	if err != nil || mainPID != self {
+		return "", errors.Join(ErrNotUnitMainPID, err)
 	}
 	return cg, nil
+}
+
+func querySystemdMainPID(parent context.Context, userManager bool, unit string) (int, error) {
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return 0, fmt.Errorf("find systemctl: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	args := []string{"show", "-p", "MainPID", "--value", unit}
+	if userManager {
+		args = append([]string{"--user"}, args...)
+	}
+	output, err := exec.CommandContext(ctx, systemctl, args...).Output()
+	if err != nil {
+		return 0, fmt.Errorf("query systemd MainPID: %w", err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 1 {
+		return 0, errors.New("systemctl MainPID output is not one number")
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 1 {
+		return 0, errors.New("systemctl MainPID is not a valid process ID")
+	}
+	return pid, nil
 }
 
 func signalOwnUnitProcess(procRoot, cg string, pid int, sig syscall.Signal) (bool, error) {
@@ -107,7 +165,7 @@ func signalOwnUnitProcess(procRoot, cg string, pid int, sig syscall.Signal) (boo
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("pidfd_open PID %d: %w", pid, err)
+		return false, pidfdOpenError(fmt.Errorf("pidfd_open PID %d: %w", pid, err))
 	}
 	defer unix.Close(fd)
 	ownUnitAfterPidfdOpen(pid)

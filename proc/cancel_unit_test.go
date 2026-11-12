@@ -126,6 +126,67 @@ func TestCancelByStopGroupIncludesGroupPeer(t *testing.T) {
 	}
 }
 
+func TestCancelByStopTreatsNonzeroPgidAsDirectChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leader := exec.Command("sleep", "30")
+	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := leader.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if leader.ProcessState == nil {
+			_ = SignalChild(leader.Process.Pid, syscall.SIGKILL)
+			_ = leader.Wait()
+		}
+	})
+	cmd := exec.CommandContext(ctx, "sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: leader.Process.Pid}
+	if err := CancelByStop(cmd, 0, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	peer := exec.Command("sleep", "30")
+	peer.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: leader.Process.Pid}
+	if err := peer.Start(); err != nil {
+		_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		t.Fatal(err)
+	}
+	oldGroup, oldSingle := stopCmdGroup, stopCmdSingle
+	groupCalls, singleCalls := 0, 0
+	stopCmdGroup = func(cmd *exec.Cmd, _ time.Duration, sig syscall.Signal) (StopResult, error) {
+		groupCalls++
+		return StopResult{}, SignalCmd(cmd, sig)
+	}
+	stopCmdSingle = func(_ int, _ time.Duration, request func() error) (StopResult, error) {
+		singleCalls++
+		return StopResult{}, request()
+	}
+	defer func() { stopCmdGroup, stopCmdSingle = oldGroup, oldSingle }()
+	t.Cleanup(func() {
+		if peer.ProcessState == nil {
+			_ = SignalChild(peer.Process.Pid, syscall.SIGKILL)
+			_ = peer.Wait()
+		}
+	})
+	cancel()
+	if err := cmd.Wait(); !errors.Is(err, context.Canceled) {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("Wait error = %v", err)
+		}
+	}
+	if groupCalls != 0 || singleCalls != 1 {
+		t.Fatalf("StopCmd route = group:%d single:%d; want direct child only", groupCalls, singleCalls)
+	}
+	if st, err := ReadStat("/proc", peer.Process.Pid); err != nil || st.State == "Z" || st.State == "X" {
+		t.Fatalf("nonzero-Pgid peer was stopped: stat=%+v err=%v", st, err)
+	}
+}
+
 func TestSignalOwnUnitRejectsUnsafeCgroups(t *testing.T) {
 	for _, cg := range []string{"/user.slice/session-1.scope", "/user.slice/user@1000.service", "/init.scope", "/system.slice/foo.slice"} {
 		t.Run(strings.ReplaceAll(cg, "/", "_"), func(t *testing.T) {
@@ -134,19 +195,21 @@ func TestSignalOwnUnitRejectsUnsafeCgroups(t *testing.T) {
 			fakeStat(t, procRoot, 20, 10, "worker", "S")
 			writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::"+cg+"\n")
 			oldEnv := ownUnitEnv
+			oldMainPID := ownUnitMainPID
 			ownUnitEnv = func(key string) string {
 				if key == "INVOCATION_ID" {
 					return "id"
 				}
 				return ""
 			}
-			t.Cleanup(func() { ownUnitEnv = oldEnv })
+			ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
+			t.Cleanup(func() { ownUnitEnv, ownUnitMainPID = oldEnv, oldMainPID })
 			calls := 0
 			oldSignal := ownUnitSignal
 			ownUnitSignal = func(int, *trackedProcess, unix.Signal) error { calls++; return nil }
 			t.Cleanup(func() { ownUnitSignal = oldSignal })
-			if _, err := signalOwnUnit(procRoot, cgRoot, 20, 10, syscall.SIGTERM); err == nil || !strings.Contains(err.Error(), "not a service") {
-				t.Fatal("unsafe cgroup accepted")
+			if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); !errors.Is(err, ErrUnsafeUnitCgroup) {
+				t.Fatalf("unsafe cgroup error = %v, want ErrUnsafeUnitCgroup", err)
 			}
 			if calls != 0 {
 				t.Fatalf("sent signals on rejection: %d", calls)
@@ -173,10 +236,169 @@ func TestSignalOwnUnitRejectsNonMainProcess(t *testing.T) {
 	fakeStat(t, procRoot, 20, 99, "worker", "S")
 	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::/system.slice/worker.service\n")
 	oldEnv := ownUnitEnv
+	oldMainPID := ownUnitMainPID
 	ownUnitEnv = func(string) string { return "id" }
-	t.Cleanup(func() { ownUnitEnv = oldEnv })
-	if _, err := signalOwnUnit(procRoot, cgRoot, 20, 10, syscall.SIGTERM); err == nil {
-		t.Fatal("non-main process accepted")
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
+	t.Cleanup(func() { ownUnitEnv, ownUnitMainPID = oldEnv, oldMainPID })
+	if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); !errors.Is(err, ErrNotServiceMainProcess) {
+		t.Fatalf("non-main process error = %v, want ErrNotServiceMainProcess", err)
+	}
+}
+
+func TestSignalOwnUnitRequiresInvocationAndSystemdMainPID(t *testing.T) {
+	procRoot, cgRoot := t.TempDir(), t.TempDir()
+	fakeStat(t, procRoot, 10, 1, "systemd", "S")
+	fakeStat(t, procRoot, 20, 10, "worker", "S")
+	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::/system.slice/worker.service\n")
+	oldEnv, oldMainPID := ownUnitEnv, ownUnitMainPID
+	t.Cleanup(func() { ownUnitEnv, ownUnitMainPID = oldEnv, oldMainPID })
+	ownUnitEnv = func(string) string { return "" }
+	if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); !errors.Is(err, ErrNoInvocationID) {
+		t.Fatalf("missing invocation error = %v, want ErrNoInvocationID", err)
+	}
+	ownUnitEnv = func(string) string { return "invocation" }
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 21, nil }
+	if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); !errors.Is(err, ErrNotUnitMainPID) {
+		t.Fatalf("MainPID mismatch error = %v, want ErrNotUnitMainPID", err)
+	}
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 0, errors.New("systemctl failed") }
+	if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); !errors.Is(err, ErrNotUnitMainPID) {
+		t.Fatalf("MainPID query error = %v, want ErrNotUnitMainPID", err)
+	}
+}
+
+func TestSignalOwnUnitRequiresSystemdParent(t *testing.T) {
+	procRoot, cgRoot := t.TempDir(), t.TempDir()
+	fakeStat(t, procRoot, 10, 1, "ordinary-parent", "S")
+	fakeStat(t, procRoot, 20, 10, "worker", "S")
+	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::/system.slice/worker.service\n")
+	oldEnv, oldMainPID := ownUnitEnv, ownUnitMainPID
+	ownUnitEnv = func(string) string { return "invocation" }
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
+	t.Cleanup(func() { ownUnitEnv, ownUnitMainPID = oldEnv, oldMainPID })
+	if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); !errors.Is(err, ErrNotSystemdParent) {
+		t.Fatalf("parent check error = %v, want ErrNotSystemdParent", err)
+	}
+}
+
+func TestOwnServiceCgroupSelectsSystemdManagerForUnitPath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cg   string
+		user bool
+	}{
+		{name: "system", cg: "/system.slice/worker.service"},
+		{name: "user", cg: "/user.slice/user-1000.slice/user@1000.service/app.slice/worker.service", user: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			fakeStat(t, root, 10, 1, "systemd", "S")
+			fakeStat(t, root, 20, 10, "worker", "S")
+			writeTestFile(t, filepath.Join(root, "self", "cgroup"), "0::"+tc.cg+"\n")
+			oldEnv, oldMainPID := ownUnitEnv, ownUnitMainPID
+			ownUnitEnv = func(string) string { return "invocation" }
+			called := false
+			ownUnitMainPID = func(_ context.Context, user bool, unit string) (int, error) {
+				called = true
+				if user != tc.user || unit != "worker.service" {
+					t.Fatalf("MainPID query = (user=%v, unit=%q), want (user=%v, worker.service)", user, unit, tc.user)
+				}
+				return 20, nil
+			}
+			t.Cleanup(func() { ownUnitEnv, ownUnitMainPID = oldEnv, oldMainPID })
+			if _, err := ownServiceCgroup(context.Background(), root, 20, 10); err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				t.Fatal("systemd MainPID was not queried")
+			}
+		})
+	}
+}
+
+func TestSignalOwnUnitDoesNotSignalParent(t *testing.T) {
+	procRoot, cgRoot := t.TempDir(), t.TempDir()
+	cg := "/system.slice/worker.service"
+	fakeStat(t, procRoot, 10, 1, "systemd", "S")
+	fakeStat(t, procRoot, 20, 10, "worker", "S")
+	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::"+cg+"\n")
+	writeTestFile(t, filepath.Join(procRoot, "10", "cgroup"), "0::"+cg+"\n")
+	writeTestFile(t, filepath.Join(cgRoot, cg, "cgroup.procs"), "10\n20\n")
+	oldEnv, oldMainPID, oldSignal, oldOpen := ownUnitEnv, ownUnitMainPID, ownUnitSignal, ownUnitPidfdOpen
+	ownUnitEnv = func(string) string { return "invocation" }
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
+	readFD, writeFD, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readFD.Close()
+	defer writeFD.Close()
+	ownUnitPidfdOpen = func(int, int) (int, error) { return int(readFD.Fd()), nil }
+	calls := 0
+	ownUnitSignal = func(pid int, _ *trackedProcess, _ unix.Signal) error {
+		calls++
+		if pid == 10 {
+			t.Fatalf("signaled service parent PID %d", pid)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		ownUnitEnv, ownUnitMainPID, ownUnitSignal, ownUnitPidfdOpen = oldEnv, oldMainPID, oldSignal, oldOpen
+	})
+	if _, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("signal calls = %d, want 0 after excluding parent and self", calls)
+	}
+}
+
+func TestSignalOwnUnitDetectsStartReplacementAfterPidfdOpen(t *testing.T) {
+	procRoot, cgRoot := t.TempDir(), t.TempDir()
+	cg := "/system.slice/worker.service"
+	fakeStat(t, procRoot, 10, 1, "systemd", "S")
+	fakeStat(t, procRoot, 20, 10, "worker", "S")
+	fakeStat(t, procRoot, 30, 20, "worker-child", "S")
+	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::"+cg+"\n")
+	writeTestFile(t, filepath.Join(procRoot, "30", "cgroup"), "0::"+cg+"\n")
+	writeTestFile(t, filepath.Join(cgRoot, cg, "cgroup.procs"), "30\n")
+	oldEnv, oldMainPID, oldOpen, oldSignal, oldAfter := ownUnitEnv, ownUnitMainPID, ownUnitPidfdOpen, ownUnitSignal, ownUnitAfterPidfdOpen
+	ownUnitEnv = func(string) string { return "invocation" }
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
+	readFD, writeFD, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readFD.Close()
+	defer writeFD.Close()
+	ownUnitPidfdOpen = func(int, int) (int, error) { return int(readFD.Fd()), nil }
+	ownUnitAfterPidfdOpen = func(pid int) { fakeStatStart(t, procRoot, pid, 20, "worker-child", "changed-start") }
+	calls := 0
+	ownUnitSignal = func(int, *trackedProcess, unix.Signal) error { calls++; return nil }
+	t.Cleanup(func() {
+		ownUnitEnv, ownUnitMainPID, ownUnitPidfdOpen, ownUnitSignal, ownUnitAfterPidfdOpen = oldEnv, oldMainPID, oldOpen, oldSignal, oldAfter
+	})
+	count, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 || calls != 0 {
+		t.Fatalf("replacement process was signaled: count=%d calls=%d", count, calls)
+	}
+}
+
+func fakeStatStart(t *testing.T, root string, pid, parent int, name, start string) {
+	t.Helper()
+	fakeStat(t, root, pid, parent, name, "S")
+	path := filepath.Join(root, strconv.Itoa(pid), "stat")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(data))
+	fields[len(fields)-1] = start
+	if err := os.WriteFile(path, []byte(strings.Join(fields, " ")+"\n"), 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -189,8 +411,9 @@ func TestSignalOwnUnitRechecksCgroupAfterPidfdOpen(t *testing.T) {
 	writeTestFile(t, filepath.Join(procRoot, "self", "cgroup"), "0::"+cg+"\n")
 	writeTestFile(t, filepath.Join(procRoot, "30", "cgroup"), "0::"+cg+"\n")
 	writeTestFile(t, filepath.Join(cgRoot, cg, "cgroup.procs"), "20\n30\n")
-	oldEnv, oldOpen, oldSignal, oldAfter := ownUnitEnv, ownUnitPidfdOpen, ownUnitSignal, ownUnitAfterPidfdOpen
+	oldEnv, oldOpen, oldSignal, oldAfter, oldMainPID := ownUnitEnv, ownUnitPidfdOpen, ownUnitSignal, ownUnitAfterPidfdOpen, ownUnitMainPID
 	ownUnitEnv = func(string) string { return "id" }
+	ownUnitMainPID = func(context.Context, bool, string) (int, error) { return 20, nil }
 	readFD, writeFD, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -204,9 +427,9 @@ func TestSignalOwnUnitRechecksCgroupAfterPidfdOpen(t *testing.T) {
 	calls := 0
 	ownUnitSignal = func(int, *trackedProcess, unix.Signal) error { calls++; return nil }
 	t.Cleanup(func() {
-		ownUnitEnv, ownUnitPidfdOpen, ownUnitSignal, ownUnitAfterPidfdOpen = oldEnv, oldOpen, oldSignal, oldAfter
+		ownUnitEnv, ownUnitPidfdOpen, ownUnitSignal, ownUnitAfterPidfdOpen, ownUnitMainPID = oldEnv, oldOpen, oldSignal, oldAfter, oldMainPID
 	})
-	count, err := signalOwnUnit(procRoot, cgRoot, 20, 10, syscall.SIGTERM)
+	count, err := signalOwnUnit(context.Background(), procRoot, cgRoot, 20, 10, syscall.SIGTERM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,6 +460,9 @@ func TestSignalOwnUnitLiveService(t *testing.T) {
 		if !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
 			t.Fatalf("unit child Wait status = %v, want SIGTERM", exitErr.Sys())
 		}
+		if err := os.WriteFile(os.Getenv("AKIT_LIVE_SYSTEMD_MARKER"), []byte("ran\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
 		return
 	}
 	if os.Getenv("AKIT_LIVE_SYSTEMD_TEST") != "1" {
@@ -264,10 +490,13 @@ func TestSignalOwnUnitLiveService(t *testing.T) {
 	base := fmt.Sprintf("akit-test-%d-%d", os.Getpid(), time.Now().UnixNano())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	unit := exec.CommandContext(ctx, systemdRun, "--user", "--unit", base+".service", "--wait", "--collect", "--", os.Args[0], "-test.run=^TestSignalOwnUnitLiveService$")
-	unit.Env = append(os.Environ(), "AKIT_LIVE_SYSTEMD_HELPER=1")
+	marker := filepath.Join(t.TempDir(), "helper-ran")
+	unit := exec.CommandContext(ctx, systemdRun, "--user", "--unit", base+".service", "--wait", "--collect", "--setenv=AKIT_LIVE_SYSTEMD_HELPER=1", "--setenv=AKIT_LIVE_SYSTEMD_MARKER="+marker, "--", os.Args[0], "-test.run=^TestSignalOwnUnitLiveService$")
 	if output, err := unit.CombinedOutput(); err != nil {
 		t.Fatalf("temporary systemd service failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("systemd helper did not run: %v", err)
 	}
 }
 

@@ -134,9 +134,9 @@ func verifiedCommandTarget(root string, self, leader, pid int) (*trackedProcess,
 	if !commandMembership(before, pid, leader, stat.Pgid) {
 		return nil, fmt.Errorf("PID %d left command tree and group", pid)
 	}
-	fd, err := unix.PidfdOpen(pid, 0)
+	fd, err := openProcessPidfd(pid, 0)
 	if err != nil {
-		return nil, fmt.Errorf("pidfd_open target PID %d: %w", pid, err)
+		return nil, fmt.Errorf("pidfd_open target PID %d: %w", pid, pidfdOpenError(err))
 	}
 	afterCommandTargetPidfdOpen(pid)
 	after, err := processAncestry(root, pid, self)

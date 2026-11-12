@@ -40,10 +40,14 @@ func StopChild(pid int, grace time.Duration, request func() error) (StopResult, 
 // was placed in this group is outside this contract and may lose its Wait
 // status. Adopted zombies in other groups, including descendants that changed
 // groups with setsid or setpgid, remain until their owner or process exit reaps
-// them.
+// them. If pidfd_open is unavailable, it returns ErrPidfdUnavailable without
+// signaling the command group.
 func StopChildGroup(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	pid, err := validateChildGroupCommand(cmd, grace, sig)
 	if err != nil {
+		return StopResult{}, err
+	}
+	if err := ensurePidfdAvailable(pid); err != nil {
 		return StopResult{}, err
 	}
 	self := os.Getpid()
@@ -124,9 +128,40 @@ var beforeStopChildGroupTree = func(int) {}
 var beforeStopTargetPidfdOpen = func(int) {}
 var afterStopTargetPidfdOpen = func(int) {}
 
+var openProcessPidfd = unix.PidfdOpen
+
+func pidfdOpenError(err error) error {
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) {
+		return errors.Join(ErrPidfdUnavailable, err)
+	}
+	return err
+}
+
+func ensurePidfdAvailable(pid int) error {
+	fd, err := openProcessPidfd(pid, 0)
+	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return nil
+		}
+		return pidfdOpenError(err)
+	}
+	return unix.Close(fd)
+}
+
+func ensureSignalChildPidfd(pid int) error {
+	fd, err := openSignalChildPidfd(pid, 0)
+	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return nil
+		}
+		return pidfdOpenError(err)
+	}
+	return unix.Close(fd)
+}
+
 var readSignalChildStat = ReadStat
 var beforeSignalChildPidfdOpen = func(int) {}
-var openSignalChildPidfd = unix.PidfdOpen
+var openSignalChildPidfd = func(pid, flags int) (int, error) { return openProcessPidfd(pid, flags) }
 
 // SignalChild signals only the verified direct child; its descendants are untouched and the child decides when to exit.
 func SignalChild(pid int, sig syscall.Signal) error {
@@ -153,7 +188,7 @@ func SignalChild(pid int, sig syscall.Signal) error {
 		if errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("pidfd_open child %d: %w", pid, errors.Join(errStopTargetChanged, os.ErrProcessDone))
 		}
-		return fmt.Errorf("pidfd_open %d: %w", pid, err)
+		return fmt.Errorf("pidfd_open %d: %w", pid, pidfdOpenError(err))
 	}
 	defer unix.Close(fd)
 	checked, err := readSignalChildStat("/proc", pid)
@@ -372,12 +407,12 @@ func openStopTarget(root string, self, pid int, sig unix.Signal) (processTree, b
 		return nil, true, nil
 	}
 	beforeStopTargetPidfdOpen(pid)
-	fd, err := unix.PidfdOpen(pid, 0)
+	fd, err := openProcessPidfd(pid, 0)
 	if err != nil {
 		if errors.Is(err, unix.ESRCH) {
 			return nil, false, fmt.Errorf("pidfd_open %d: %w", pid, errors.Join(errStopTargetChanged, err))
 		}
-		return nil, false, fmt.Errorf("pidfd_open %d: %w", pid, err)
+		return nil, false, fmt.Errorf("pidfd_open %d: %w", pid, pidfdOpenError(err))
 	}
 	afterStopTargetPidfdOpen(pid)
 	checked, err := validateStop(root, self, pid, sig != 0)
@@ -577,12 +612,12 @@ func captureProcess(root string, tree processTree, stats map[int]Stat, pid int, 
 	if !ok || ps.Start != parent.start {
 		return false, nil
 	}
-	fd, err := unix.PidfdOpen(pid, 0)
+	fd, err := openProcessPidfd(pid, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("pidfd_open: %w", err)
+		return false, fmt.Errorf("pidfd_open: %w", pidfdOpenError(err))
 	}
 	current, err := ReadStat(root, pid)
 	if err != nil {

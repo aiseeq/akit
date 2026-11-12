@@ -10,6 +10,32 @@ import (
 	"time"
 )
 
+// SignalCmd signals only cmd's direct child. The caller owns Wait; after Wait
+// this returns os.ErrProcessDone without signaling.
+func SignalCmd(cmd *exec.Cmd, sig syscall.Signal) error {
+	process, err := validateCmdSignal(cmd, sig)
+	if err != nil {
+		return err
+	}
+	return directProcessSignal(process, sig)
+}
+
+// SignalCmdWithResult is SignalCmd with an explicit degradation result. The
+// non-Linux direct-child implementation is the native path and is not degraded.
+func SignalCmdWithResult(cmd *exec.Cmd, sig syscall.Signal) (SignalResult, error) {
+	return SignalResult{}, SignalCmd(cmd, sig)
+}
+
+// StopCmd stops only cmd's direct process. It waits the full grace period
+// before Kill because it cannot inspect descendants or safely poll by PID.
+func StopCmd(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
+	return stopCmdDirect(cmd, grace, sig, false)
+}
+
+func stopCmdForCancel(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
+	return stopCmdDirectState(cmd, grace, sig, false, false)
+}
+
 // StopChild is unsupported outside Linux because a bare PID cannot be verified
 // as this process's direct child. It returns errors.ErrUnsupported without
 // sending a signal.
@@ -45,6 +71,9 @@ func StopDescendants(time.Duration, syscall.Signal) (StopResult, error) {
 func StopSession(SessionRecord, time.Duration, syscall.Signal) (StopResult, error) {
 	return StopResult{}, errors.ErrUnsupported
 }
+
+// SignalDescendant is unsupported outside Linux and sends no signal.
+func SignalDescendant(int, syscall.Signal) error { return errors.ErrUnsupported }
 
 // BecomeChildSubreaper is unsupported outside Linux.
 func BecomeChildSubreaper() error { return errors.ErrUnsupported }

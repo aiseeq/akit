@@ -62,6 +62,9 @@ func main() {
 	}
 	started := time.Now()
 	result, err := proc.StopFromShell(pid, *grace, sig)
+	if result.Degraded {
+		fmt.Fprintln(os.Stderr, "pstop: degraded stop; descendants may remain")
+	}
 	if err != nil {
 		if result.Killed > 0 {
 			fmt.Println(killedLine(pid, result.Killed, *grace))

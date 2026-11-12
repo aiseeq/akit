@@ -22,18 +22,22 @@ type trackedOwnedProcess struct {
 
 var afterDescendantPidfdOpen = func(int) {}
 var readSessionStat = ReadStat
-var openSessionPidfd = unix.PidfdOpen
+var openSessionPidfd = func(pid, flags int) (int, error) { return openProcessPidfd(pid, flags) }
 var afterSessionPidfdOpen = func(int) {}
 
 // StopDescendants signals every verified descendant of this process, then
 // SIGKILLs survivors after grace. It never reaps direct children; their Cmd
 // owners retain responsibility for Wait. Callers must be child subreapers to
 // find descendants reparented after an intermediate process exits.
+// If pidfd_open is unavailable, it returns ErrPidfdUnavailable without signaling.
 func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
 	}
 	self := os.Getpid()
+	if err := ensurePidfdAvailable(self); err != nil {
+		return StopResult{}, err
+	}
 	ops := ownedStopOps{
 		scan:   func() ([]int, error) { return descendantPIDs("/proc", self) },
 		open:   func(pid int) (*trackedOwnedProcess, error) { return ownedDescendantTarget("/proc", self, pid) },
@@ -45,6 +49,7 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 // StopSession signals verified members of rec's detached session and then
 // SIGKILLs survivors after grace. The session ID cannot be reused by a new
 // session leader while any process from the recorded session remains.
+// If pidfd_open is unavailable, it returns ErrPidfdUnavailable without signaling.
 func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	if err := validateOwnedStopArgs(grace, sig); err != nil {
 		return StopResult{}, err
@@ -57,6 +62,9 @@ func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (St
 		return StopResult{}, err
 	}
 	self := os.Getpid()
+	if err := ensurePidfdAvailable(self); err != nil {
+		return StopResult{}, err
+	}
 	if err := validateSessionTarget("/proc", self, rec, start); err != nil {
 		return StopResult{}, err
 	}
@@ -68,6 +76,31 @@ func StopSession(rec SessionRecord, grace time.Duration, sig syscall.Signal) (St
 		},
 	}
 	return stopOwnedProcesses(grace, sig, ops)
+}
+
+// SignalDescendant signals one verified descendant of the caller. Orphaned
+// descendants can be verified only when the caller is a child subreaper.
+// pidfd_open pins the process identity; if it is unavailable, no signal is sent.
+func SignalDescendant(pid int, sig syscall.Signal) error {
+	if err := validateSignalTarget(pid, sig); err != nil {
+		return err
+	}
+	self := os.Getpid()
+	if pid == self {
+		return fmt.Errorf("refusing to signal the caller PID %d", pid)
+	}
+	target, err := ownedDescendantTarget("/proc", self, pid)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(target.tracked.fd)
+	if err := revalidateDescendant("/proc", self, pid, target.identity.start); err != nil {
+		return err
+	}
+	if err := signalProcess(pid, target.tracked, unix.Signal(sig)); err != nil {
+		return err
+	}
+	return nil
 }
 
 type ownedStopOps struct {
@@ -295,9 +328,9 @@ func ownedDescendantTarget(root string, self, pid int) (*trackedOwnedProcess, er
 	if serviceManager(pid, stat) {
 		return nil, fmt.Errorf("refusing process manager PID %d", pid)
 	}
-	fd, err := unix.PidfdOpen(pid, 0)
+	fd, err := openProcessPidfd(pid, 0)
 	if err != nil {
-		return nil, fmt.Errorf("pidfd_open descendant PID %d: %w", pid, err)
+		return nil, fmt.Errorf("pidfd_open descendant PID %d: %w", pid, pidfdOpenError(err))
 	}
 	afterDescendantPidfdOpen(pid)
 	after, err := processAncestry(root, pid, self)
@@ -376,7 +409,7 @@ func ownedSessionTarget(root string, sessionID int, minStart uint64, pid int) (*
 	}
 	fd, err := openSessionPidfd(pid, 0)
 	if err != nil {
-		return nil, fmt.Errorf("pidfd_open session PID %d: %w", pid, err)
+		return nil, fmt.Errorf("pidfd_open session PID %d: %w", pid, pidfdOpenError(err))
 	}
 	afterSessionPidfdOpen(pid)
 	checked, err := readSessionStat(root, pid)

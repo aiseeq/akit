@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -78,6 +79,130 @@ func TestStopDescendantsStopsAdoptedGrandchildAndNotSibling(t *testing.T) {
 	}
 	if st, err := ReadStat("/proc", outsider.Process.Pid); err != nil || st.State == "Z" || st.State == "X" {
 		t.Fatalf("sibling process was affected: stat=%+v err=%v", st, err)
+	}
+}
+
+func TestSignalDescendantSignalsGrandchild(t *testing.T) {
+	dir := t.TempDir()
+	marker, ready, pidPath := filepath.Join(dir, "term"), filepath.Join(dir, "ready"), filepath.Join(dir, "pid")
+	if os.Getenv("PROC_SIGNAL_DESCENDANT_TARGET") == "1" {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		defer signal.Stop(signals)
+		if err := os.WriteFile(os.Getenv("PROC_SIGNAL_DESCENDANT_READY"), []byte("ready\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		<-signals
+		if err := os.WriteFile(os.Getenv("PROC_SIGNAL_DESCENDANT_MARKER"), []byte("term\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	script := `"$1" -test.run=^TestSignalDescendantSignalsGrandchild$ & child=$!; echo "$child" > "$2"; wait`
+	cmd := exec.Command("sh", "-c", script, "sh", os.Args[0], pidPath)
+	cmd.Env = append(os.Environ(), "PROC_SIGNAL_DESCENDANT_TARGET=1", "PROC_SIGNAL_DESCENDANT_READY="+ready, "PROC_SIGNAL_DESCENDANT_MARKER="+marker)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	targetPID := 0
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			if targetPID > 1 {
+				_ = SignalDescendant(targetPID, syscall.SIGKILL)
+			}
+			_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	waitReady(t, ready)
+	targetPID = readPID(t, pidPath)
+	if err := SignalDescendant(targetPID, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wait for test-owned parent: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("grandchild did not receive SIGTERM: %v", err)
+	}
+}
+
+func TestSignalDescendantRejectsNonDescendantAlive(t *testing.T) {
+	if os.Getenv("PROC_SIGNAL_DESCENDANT_OUTSIDER_HELPER") == "1" {
+		pid, err := strconv.Atoi(os.Getenv("PROC_SIGNAL_DESCENDANT_OUTSIDER_PID"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := SignalDescendant(pid, syscall.SIGTERM); err == nil {
+			t.Fatal("accepted non-descendant")
+		}
+		oldSignal := signalProcess
+		calls := 0
+		signalProcess = func(int, *trackedProcess, unix.Signal) error { calls++; return nil }
+		defer func() { signalProcess = oldSignal }()
+		if err := SignalDescendant(os.Getpid(), syscall.SIGTERM); err == nil {
+			t.Fatal("accepted caller PID")
+		}
+		if calls != 0 {
+			t.Fatalf("caller signal attempts = %d, want 0", calls)
+		}
+		return
+	}
+	outsider := exec.Command("sleep", "30")
+	if err := outsider.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if outsider.ProcessState == nil {
+			_ = SignalChild(outsider.Process.Pid, syscall.SIGKILL)
+			_ = outsider.Wait()
+		}
+	})
+	helper := exec.Command(os.Args[0], "-test.run=^TestSignalDescendantRejectsNonDescendantAlive$")
+	helper.Env = append(os.Environ(), "PROC_SIGNAL_DESCENDANT_OUTSIDER_HELPER=1", "PROC_SIGNAL_DESCENDANT_OUTSIDER_PID="+strconv.Itoa(outsider.Process.Pid))
+	if output, err := helper.CombinedOutput(); err != nil {
+		t.Fatalf("non-descendant helper: %v: %s", err, output)
+	}
+	if st, err := ReadStat("/proc", outsider.Process.Pid); err != nil || st.State == "Z" || st.State == "X" {
+		t.Fatalf("non-descendant was affected: stat=%+v err=%v", st, err)
+	}
+}
+
+func TestSignalDescendantRejectsStartChangeAfterPidfdOpen(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	changed := false
+	postOpenReads := 0
+	oldTarget, oldAfter := readCommandTargetStat, afterDescendantPidfdOpen
+	readCommandTargetStat = func(root string, pid int) (Stat, error) {
+		stat, err := ReadStat(root, pid)
+		if err == nil && changed && pid == cmd.Process.Pid {
+			postOpenReads++
+			if postOpenReads == 1 {
+				stat.Start = "0"
+			}
+		}
+		return stat, err
+	}
+	afterDescendantPidfdOpen = func(pid int) {
+		if pid == cmd.Process.Pid {
+			changed = true
+		}
+	}
+	t.Cleanup(func() { readCommandTargetStat, afterDescendantPidfdOpen = oldTarget, oldAfter })
+	if err := SignalDescendant(cmd.Process.Pid, syscall.SIGTERM); err == nil {
+		t.Fatal("accepted changed descendant identity")
+	}
+	if st, err := ReadStat("/proc", cmd.Process.Pid); err != nil || st.State == "Z" || st.State == "X" {
+		t.Fatalf("changed descendant was signaled: stat=%+v err=%v", st, err)
 	}
 }
 
