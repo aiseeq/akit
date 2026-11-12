@@ -30,26 +30,40 @@ var clockLike = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{1,2}(:[0-9]{1,2})?$`)
 var guessedClockRE = regexp.MustCompile(`(?i)(?:^|[^\p{N}:])((?:[01]?\d|2[0-3]):[0-5][xх])(?:$|[^a-z0-9])`)
 var dateTokenRE = regexp.MustCompile(`^(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})$`)
 
-// GuessedTime возвращает угаданное время («06:4x»), если оно есть в тексте.
-func GuessedTime(value string) (string, bool) {
+func guessedTime(value string) string {
 	match := guessedClockRE.FindStringSubmatch(value)
 	if match == nil {
+		return ""
+	}
+	return match[1]
+}
+
+// GuessedTime возвращает угаданное время с двузначным часом, если оно есть в тексте записи.
+func GuessedTime(value string) (string, bool) {
+	clock := guessedTime(value)
+	return clock, clock != "" && strings.IndexByte(clock, ':') == 2
+}
+
+// DatedGuessedTime возвращает угаданное время после даты, с одним словом между ними или без него.
+func DatedGuessedTime(value string) (string, bool) {
+	fields := strings.Fields(value)
+	if len(fields) < 2 || !dateTokenRE.MatchString(strings.TrimRight(fields[0], ":,;")) {
 		return "", false
 	}
-	return match[1], true
+	clock := guessedTime(strings.TrimRight(fields[1], ":,;"))
+	if clock != "" {
+		return clock, true
+	}
+	if len(fields) < 3 || strings.ContainsRune(fields[1], ':') {
+		return "", false
+	}
+	clock = guessedTime(strings.TrimRight(fields[2], ":,;"))
+	return clock, clock != ""
 }
 
 // HasDatedGuessedTime сообщает, что после начальной даты записано угаданное время.
 func HasDatedGuessedTime(value string) bool {
-	fields := strings.Fields(value)
-	if len(fields) < 2 || !dateTokenRE.MatchString(strings.TrimRight(fields[0], ":,;")) {
-		return false
-	}
-	clockField := 1
-	if strings.TrimRight(fields[clockField], ":,;") == "в" && len(fields) > clockField+1 {
-		clockField++
-	}
-	_, ok := GuessedTime(strings.TrimRight(fields[clockField], ":,;"))
+	_, ok := DatedGuessedTime(value)
 	return ok
 }
 

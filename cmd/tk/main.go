@@ -234,6 +234,12 @@ func timeHint(o options, now time.Time) string {
 			continue
 		}
 		suspect, guessed := timearg.GuessedTime(field.value)
+		if field.flag == "--until" {
+			suspect, guessed = timearg.DatedGuessedTime(field.value)
+			if !guessed {
+				suspect, guessed = timearg.GuessedTime(field.value)
+			}
+		}
 		kind := "похоже на угаданное время"
 		if !guessed && field.flag != "--until" {
 			suspect = futureApproxTime(field.value, now)
@@ -249,7 +255,8 @@ func timeHint(o options, now time.Time) string {
 			label = "--note"
 		}
 		if field.flag == "--until" {
-			if deadline, ok := timearg.Deadline(field.value, now); ok {
+			normalized := datedWait(field.value, now)
+			if deadline, ok := timearg.Deadline(normalized, now); ok {
 				return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок распознан: %s", suspect, label, kind, deadline.Format(time.RFC3339))
 			}
 			return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]», срок не распознан, tk ls --due его не покажет", suspect, label, kind)
@@ -276,6 +283,9 @@ func markedJournalText(o options, value string) string {
 
 func markedGuessedTime(value string) string {
 	if _, guessed := timearg.GuessedTime(value); guessed {
+		return value + " [время требует проверки]"
+	}
+	if _, guessed := timearg.DatedGuessedTime(value); guessed {
 		return value + " [время требует проверки]"
 	}
 	return value
@@ -3539,8 +3549,12 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 		body = removeExecutor(body)
 	}
 	if o.cmd == "wait" {
-		o.until = datedWait(o.until, time.Now())
-		if _, ok := timearg.Deadline(o.until, time.Now()); !ok {
+		now := o.timeNow
+		if now.IsZero() {
+			now = time.Now()
+		}
+		o.until = datedWait(o.until, now)
+		if _, ok := timearg.Deadline(o.until, now); !ok && !timearg.HasDatedGuessedTime(o.until) {
 			if datedBadClock.MatchString(o.until) {
 				fmt.Fprintln(errout, "tk: --until starts with a date and time that do not exist: no deadline, tk ls --due will not show it")
 			} else {

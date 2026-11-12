@@ -2196,7 +2196,6 @@ func TestJournalTextAcceptsAndMarksGuessedTime(t *testing.T) {
 		{"review", "task", "--note", "06:4X сдано"},
 		{"note", "task", "в06:4x найдено"},
 		{"note", "task", "в 06:4xМСК найдено"},
-		{"note", "task", "6:4x найдено"},
 		{"skip", "task", "accept", "--why", "06:4x упало"},
 		{"wait", "task", "--until", "сегодня 11:0x"},
 	} {
@@ -2220,14 +2219,19 @@ func TestJournalTextAcceptsAndMarksGuessedTime(t *testing.T) {
 			t.Errorf("%q: missing marker or hint", args)
 		}
 	}
-	for _, args := range [][]string{
-		{"note", "task", "06:41 найдено"},
-		{"note", "task", "box 06:4xyz"},
-		{"note", "task", "шаг 1:4x"},
-		{"note", "task", "код 99:9x"},
-	} {
-		if _, err := parseArgs(args); err != nil {
-			t.Errorf("%q: %v", args, err)
+	_, dir := testRunMainRoot(t)
+	path := writeRunMainTask(t, dir, "20200101-1200-MED-unmarked.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	for _, text := range []string{"06:41 найдено", "box 06:4xyz", "шаг 1:4x", "код 99:9x", "6:4x найдено"} {
+		var out, errout bytes.Buffer
+		if code := runMain([]string{"note", "unmarked", text, "--by", "tester"}, time.Date(2026, 11, 12, 12, 0, 0, 0, time.Local), &out, &errout); code != 0 {
+			t.Fatalf("note %q: code=%d stderr=%q", text, code, errout.String())
+		}
+		if got := lastStderrLine(errout.String()); got != "" {
+			t.Errorf("note %q printed hint %q", text, got)
+		}
+		updated, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(updated), "note — tester: "+text) || strings.Contains(string(updated), "note — tester: "+text+" [время требует проверки]") {
+			t.Errorf("note %q marked or missing: %s err=%v", text, updated, err)
 		}
 	}
 }
@@ -2438,7 +2442,7 @@ func TestMarkedJournalFieldsAndUnmarkedHeaders(t *testing.T) {
 	until := "2000-01-01 06:4x"
 	code := runMain([]string{"wait", "header-reason", "--until", until, "--by", "tester"}, now, &waitOut, &waitErr)
 	lines := strings.Split(strings.TrimSpace(waitErr.String()), "\n")
-	if code != 0 || len(lines) < 2 || lines[len(lines)-1] != timeHint(options{until: until}, now) {
+	if code != 0 || len(lines) != 1 || lines[len(lines)-1] != timeHint(options{until: until}, now) {
 		t.Fatalf("wait result: code=%d, stdout=%q stderr=%q", code, waitOut.String(), waitErr.String())
 	}
 	updated, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
@@ -2653,6 +2657,7 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 		"12.11 06:4x: итог", "12.11 06:4x, итог", "12.11 06:4x; итог",
 		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
 		"12.11 в 06:4x", "12.11 6:4x: итог",
+		"13.11 до 06:4x", "13.11 к 06:4x", "13.11 около 06:4x", "13.11 В 06:4x",
 	}
 	for _, until := range forms {
 		var out, errout bytes.Buffer
@@ -2660,6 +2665,9 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 			t.Fatalf("wait %q: code=%d stderr=%q", until, code, errout.String())
 		}
 		requireHintParts(t, errout.String(), "tk ls --due")
+		if strings.Count(strings.TrimSpace(errout.String()), "\n") != 0 {
+			t.Fatalf("wait %q printed contradictory diagnostics: %q", until, errout.String())
+		}
 		if !strings.Contains(lastStderrLine(errout.String()), "срок не распознан") {
 			t.Fatalf("wait %q lacks deadline explanation: %q", until, errout.String())
 		}
@@ -2688,7 +2696,7 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 		t.Fatalf("same-day exact future wait got a hint: %q", todayErr.String())
 	}
 	todayBody, err := os.ReadFile(path)
-	todayStored := time.Now().Format("2006-01-02 ") + todayClock
+	todayStored := "2026-11-11 " + todayClock
 	if err != nil || !strings.Contains(string(todayBody), "Ждёт: "+todayStored) || strings.Contains(string(todayBody), todayStored+" [") {
 		t.Fatalf("same-day exact future wait marked: %s, %v", todayBody, err)
 	}
@@ -2711,11 +2719,12 @@ func TestRunMainUntilHintReflectsDeadlineParsing(t *testing.T) {
 	for _, tc := range []struct {
 		name, until, want string
 	}{
-		{"deadline", now.Add(24*time.Hour).Format("02.01") + " 18:00 итог, прошлый был 06:4x", "срок распознан:"},
+		{"past-date", "10.11 18:00 итог 06:4x", "срок распознан:"},
+		{"tomorrow", "12.11 18:00 итог, прошлый был 06:4x", "срок распознан:"},
 		{"no-deadline", "12.11 в 06:4x", "срок не распознан"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, dir := testRunMainRoot(t)
+			root, dir := testRunMainRoot(t)
 			path := writeRunMainTask(t, dir, "20200101-1200-MED-wait.md", "# Wait\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
 			var out, errout bytes.Buffer
 			if code := runMain([]string{"wait", "wait", "--until", tc.until, "--by", "tester"}, now, &out, &errout); code != 0 {
@@ -2729,18 +2738,40 @@ func TestRunMainUntilHintReflectsDeadlineParsing(t *testing.T) {
 			if err != nil || !strings.Contains(string(updated), " [время требует проверки]") {
 				t.Fatalf("journal not marked: %s err=%v", updated, err)
 			}
-			waitTask, err := find(dir, "wait")
-			if err != nil {
-				t.Fatal(err)
+			var jsonOut, jsonErr bytes.Buffer
+			if code := list("", options{cmd: "ls", root: root, json: true}, &jsonOut, &jsonErr); code != 0 {
+				t.Fatalf("ls --json: code=%d out=%q err=%q", code, jsonOut.String(), jsonErr.String())
 			}
-			got := taskObject("", waitTask, "", false).Due
-			if tc.name == "deadline" && got == "" {
-				t.Fatalf("parsed deadline missing from due field, stderr=%q", errout.String())
+			var rows []taskJSON
+			if err := json.Unmarshal(jsonOut.Bytes(), &rows); err != nil || len(rows) != 1 {
+				t.Fatalf("ls --json rows=%#v raw=%q err=%v", rows, jsonOut.String(), err)
+			}
+			got := rows[0].Due
+			if tc.name != "no-deadline" && (got == "" || !strings.Contains(hint, got)) {
+				t.Fatalf("hint deadline differs from due: hint=%q due=%q stderr=%q", hint, got, errout.String())
 			}
 			if tc.name == "no-deadline" && got != "" {
 				t.Fatalf("guessed time became due %q", got)
 			}
 		})
+	}
+}
+
+func TestRunMainUntilExactTimeAfterWordKeepsExistingDeadline(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.Local)
+	root, dir := testRunMainRoot(t)
+	writeRunMainTask(t, dir, "20200101-1200-MED-exact.md", "# Exact\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	var out, errout bytes.Buffer
+	if code := runMain([]string{"wait", "exact", "--until", "13.11 до 18:00", "--by", "tester"}, now, &out, &errout); code != 0 {
+		t.Fatalf("wait: code=%d stderr=%q", code, errout.String())
+	}
+	var jsonOut, jsonErr bytes.Buffer
+	if code := list("", options{cmd: "ls", root: root, json: true}, &jsonOut, &jsonErr); code != 0 {
+		t.Fatalf("ls --json: code=%d out=%q err=%q", code, jsonOut.String(), jsonErr.String())
+	}
+	var rows []taskJSON
+	if err := json.Unmarshal(jsonOut.Bytes(), &rows); err != nil || len(rows) != 1 || rows[0].Due != "2026-11-13T00:00:00+01:00" || lastStderrLine(errout.String()) != "" {
+		t.Fatalf("exact time after word changed: rows=%#v stderr=%q err=%v", rows, errout.String(), err)
 	}
 }
 

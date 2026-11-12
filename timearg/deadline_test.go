@@ -17,18 +17,34 @@ func TestDeadlineQuirks(t *testing.T) {
 		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
 		"12.11 в 06:4x", "12.11 6:4x: итог",
 		"12.11: 06:4x итог", "12.11, 06:4x итог",
+		"13.11 до 06:4x", "13.11 к 06:4x", "13.11 около 06:4x", "13.11 В 06:4x",
 	} {
 		if at, ok := Deadline(wait, now); ok {
 			t.Errorf("Deadline(%q) = %v, want no deadline", wait, at)
 		}
 	}
-	for _, value := range []string{"06:4x", "06:4х", "06:4xМСК", "06:4x:", "06:4x,", "6:4x"} {
+	for _, value := range []string{"06:4x", "06:4х", "06:4xМСК", "06:4x:", "06:4x,"} {
 		if got, ok := GuessedTime(value); !ok || !strings.HasPrefix(value, got) {
 			t.Errorf("GuessedTime(%q) = %q, %v", value, got, ok)
 		}
 	}
+	if _, ok := GuessedTime("6:4x"); ok {
+		t.Error("GuessedTime accepted a one-digit hour in text")
+	}
+	for _, value := range []string{"13.11 до 06:4x", "13.11 к 06:4x", "13.11 около 06:4x", "13.11 В 06:4x"} {
+		if got, ok := DatedGuessedTime(value); !ok || !strings.Contains(value, got) {
+			t.Errorf("DatedGuessedTime(%q) = %q, %v", value, got, ok)
+		}
+	}
+	if _, ok := DatedGuessedTime("6:4x"); ok {
+		t.Error("DatedGuessedTime accepted a clock without a date")
+	}
 	if _, ok := GuessedTime("06:41"); ok {
 		t.Error("exact clock detected as guessed")
+	}
+	// Exact time after an intervening word keeps the existing date-only deadline behavior.
+	if at, ok := Deadline("13.11 до 18:00", now); !ok || !at.Equal(time.Date(2026, 11, 13, 0, 0, 0, 0, loc)) {
+		t.Errorf("Deadline with exact time after word = %v, %v", at, ok)
 	}
 	// A one-digit day or month reads as the two-digit one.
 	for wait, want := range map[string]time.Time{
