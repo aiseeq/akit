@@ -51,8 +51,8 @@ path (Claude Code or codex rollout).
   --project S   with --all: project folders containing S
   --max N       last N events (default 100, 0 = all)
   --width N     characters of text per event (default 300, 0 = whole)
-  --usage       tokens and API cost of model replies instead of events: a TSV
-                row per session and the total (--role defaults to all); the
+  --usage       tokens, API cost, and subscription-week percentage instead of
+                events: a TSV row per session and the total (--role defaults to all); the
                 summary names the transcripts read: runs that leave none
                 (claude -p --no-session-persistence) and codex rollouts
                 (their token counts are not read) are not in it
@@ -141,7 +141,7 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	if err := useMaskKey(maskKeyPath(home)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 	}
-	return run(opts, env{home: home, sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now}, stdout, stderr)
+	return run(opts, env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now}, stdout, stderr)
 }
 
 // printMasked prints like fmt.Fprint, with secret values masked.
@@ -152,9 +152,10 @@ func printMasked(w io.Writer, text string) {
 
 // env — то, что tl берёт из окружения; в тестах подменяется.
 type env struct {
-	home      string
-	sessionID string
-	now       time.Time
+	home       string
+	configHome string
+	sessionID  string
+	now        time.Time
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
