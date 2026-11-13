@@ -2932,6 +2932,41 @@ func TestLegacyTaskJSONHasNormalizedMetadataFields(t *testing.T) {
 	}
 }
 
+func TestJournalContinuationReadersUseRecordHeaders(t *testing.T) {
+	t.Run("rename lookup", func(t *testing.T) {
+		body := "# T\n\n## Журнал\n- 2026-01-01 10:00 переименован — tester: old.md → new.md\n      continued\n"
+		ticket := task{path: "/repo/docs/tasks/20260101-1000-MED-new.md", slug: "new", body: body}
+		if !matchesID(ticket, "old") {
+			t.Fatal("rename lookup lost the record with a continuation")
+		}
+	})
+	t.Run("actor regex stops at record header", func(t *testing.T) {
+		body := "# T\n\n## Журнал\n- 2026-01-01 10:00 note\n      x — y: continuation\n"
+		if actors := journalActors(body); len(actors) != 0 {
+			t.Fatalf("continuation supplied a journal actor: %#v", actors)
+		}
+	})
+	t.Run("completion ignores note continuation", func(t *testing.T) {
+		body := "# T\n\n## Журнал\n- 2026-01-01 10:00 готово — reviewer: verified\n      verified continuation\n- 2026-01-02 10:00 note — tester: memo\n      готово — fake: not a completion\n"
+		checker, check, _ := completion(body)
+		if checker != "reviewer" || check != "verified" {
+			t.Fatalf("completion = %q %q", checker, check)
+		}
+	})
+	t.Run("opener returns the record value", func(t *testing.T) {
+		body := "# T\n\n## Журнал\n- 2026-01-01 10:00 открыт — requester\n      continuation\n"
+		if got := opener(body); got != "requester" {
+			t.Fatalf("opener = %q", got)
+		}
+	})
+	t.Run("plan skip reason reads a record with continuation", func(t *testing.T) {
+		body := "# T\n\n## Журнал\n- 2026-01-01 10:00 план — tester: пропущен: item — reason\n      continuation\n"
+		if got, ok := planSkipReason(body, "item"); !ok || got != "reason" {
+			t.Fatalf("plan skip reason = %q, %v", got, ok)
+		}
+	})
+}
+
 func TestJournalJSONUsesListFlagAndShowKind(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "docs", "tasks")
@@ -3980,6 +4015,13 @@ func TestNoteTextTrimsLeadingAndTrailingNewlines(t *testing.T) {
 	var errout bytes.Buffer
 	if code := readTicketText(&o, &errout); code != 0 || o.note != "foo" {
 		t.Fatalf("read note: code=%d note=%q stderr=%q", code, o.note, errout.String())
+	}
+	if err := os.WriteFile(path, []byte("  \nfoo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o = options{cmd: "note", text: path}
+	if code := readTicketText(&o, &errout); code != 0 || o.note != "foo" {
+		t.Fatalf("leading blank line with spaces: code=%d note=%q stderr=%q", code, o.note, errout.String())
 	}
 	if err := os.WriteFile(path, []byte("foo  \n"), 0o644); err != nil {
 		t.Fatal(err)

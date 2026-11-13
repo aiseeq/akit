@@ -1712,8 +1712,8 @@ func readTicketText(o *options, errout io.Writer) int {
 				return fail(errout, fmt.Errorf("note text line %d contains a forbidden character", i+1))
 			}
 		}
-		o.text = strings.Trim(o.text, "\n")
-		if strings.TrimSpace(o.text) == "" {
+		o.text = strings.Join(trimBlankEdges(strings.Split(o.text, "\n")), "\n")
+		if o.text == "" {
 			return fail(errout, errors.New("note text must not be empty"))
 		}
 		o.note = o.text
