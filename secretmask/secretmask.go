@@ -1549,21 +1549,18 @@ func skipValueSpace(text string, at int) int {
 
 func scanValue(text string, at int, colon bool) (contextValue, bool) {
 	at = skipValueSpace(text, at)
-	if at >= len(text) || strings.HasPrefix(text[at:], maskMarker) || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' || text[at] == '`' {
+	if at >= len(text) || strings.HasPrefix(text[at:], maskMarker) || text[at] == '\n' || text[at] == '\r' || text[at] == '=' || text[at] == '>' {
 		return contextValue{}, false
+	}
+	if text[at] == '`' {
+		return scanBacktickValue(text, at)
 	}
 	quoteAt := at
 	for quoteAt < len(text) && text[quoteAt] == '\\' {
 		quoteAt++
 	}
 	if slashes := quoteAt - at; quoteAt < len(text) && (text[quoteAt] == '\'' || text[quoteAt] == '"') && opensQuote(text[quoteAt], slashes) {
-		end := closingQuote(text, quoteAt, slashes)
-		if end < 0 {
-			return contextValue{}, false
-		}
-		// The closing mark of a nested string takes its slashes with it.
-		end -= slashes
-		return contextValue{quoteAt + 1, end, true}, end > quoteAt+1
+		return scanQuotedValue(text, quoteAt, slashes)
 	}
 	if text[at] == '$' && at+1 < len(text) && (text[at+1] == '\'' || text[at+1] == '"') {
 		quoteAt := at + 1
@@ -1574,6 +1571,33 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		return contextValue{quoteAt + 1, end, true}, end > quoteAt+1
 	}
 	return scanBareValue(text, at, colon)
+}
+
+func scanBacktickValue(text string, at int) (contextValue, bool) {
+	end := closingQuote(text, at, 0)
+	if end < 0 {
+		return contextValue{}, false
+	}
+	return contextValue{at + 1, end, true}, end > at+1 && !looksLikePath(text[at+1:end])
+}
+
+func scanQuotedValue(text string, quoteAt, slashes int) (contextValue, bool) {
+	if slashes == 0 && text[quoteAt] == '"' && quoteAt+1 < len(text) && text[quoteAt+1] == '`' {
+		end := closingQuote(text, quoteAt+1, 0)
+		if end > quoteAt+2 && end+1 < len(text) && text[end+1] == '"' {
+			if looksLikePath(text[quoteAt+2 : end]) {
+				return contextValue{}, false
+			}
+			return contextValue{quoteAt + 2, end, true}, true
+		}
+	}
+	end := closingQuote(text, quoteAt, slashes)
+	if end < 0 {
+		return contextValue{}, false
+	}
+	// The closing mark of a nested string takes its slashes with it.
+	end -= slashes
+	return contextValue{quoteAt + 1, end, true}, end > quoteAt+1
 }
 
 func scanBareValue(text string, at int, colon bool) (contextValue, bool) {
@@ -1624,6 +1648,11 @@ func valueIsValueFor(text string, value contextValue, name, kind string, colon, 
 func quotedIsValue(value string) bool {
 	// A value starting with a space is the gap between two neighbouring quotes: "NAME=" .env "...".
 	return value != "" && !strings.ContainsRune(" \t\r\n", rune(value[0])) && !isReference(value) && !isPlaceholder(value) && !strings.Contains(value, maskMarker)
+}
+
+func looksLikePath(value string) bool {
+	return strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\`) || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") || strings.HasPrefix(value, ".\\") ||
+		len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
 }
 
 func bareIsValue(value, name, kind string, colon bool) bool {
