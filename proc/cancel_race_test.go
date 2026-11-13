@@ -47,8 +47,11 @@ func TestCmdHelpersTreatReleasedProcessAsWaited(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	oldProbe, oldSignal := probeCmdProcess, directProcessSignal
-	t.Cleanup(func() { probeCmdProcess, directProcessSignal = oldProbe, oldSignal })
+	oldProbe, oldSignal, oldWindows := probeCmdProcess, directProcessSignal, releasedProcessIsInvalid
+	t.Cleanup(func() {
+		probeCmdProcess, directProcessSignal, releasedProcessIsInvalid = oldProbe, oldSignal, oldWindows
+	})
+	releasedProcessIsInvalid = true
 	signals := 0
 	directProcessSignal = func(*os.Process, syscall.Signal) error { signals++; return nil }
 	// Windows Wait releases the handle, and a later Signal reports EINVAL.
@@ -61,5 +64,26 @@ func TestCmdHelpersTreatReleasedProcessAsWaited(t *testing.T) {
 	}
 	if signals != 0 {
 		t.Fatalf("signals sent to a released process = %d, want 0", signals)
+	}
+}
+
+func TestCmdHelpersKeepSignalingWhenUnixProbeSaysInvalid(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	oldProbe, oldWindows := probeCmdProcess, releasedProcessIsInvalid
+	t.Cleanup(func() { probeCmdProcess, releasedProcessIsInvalid = oldProbe, oldWindows })
+	releasedProcessIsInvalid = false
+	probeCmdProcess = func(*os.Process) error { return syscall.EINVAL }
+	if err := SignalCmd(cmd, syscall.SIGKILL); err != nil {
+		t.Fatalf("SignalCmd with a Unix EINVAL probe = %v, want the signal delivered", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("Wait succeeded; want the child killed")
 	}
 }

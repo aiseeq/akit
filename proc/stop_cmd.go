@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -20,11 +21,14 @@ var directProcessKill = func(process *os.Process) error { return process.Kill() 
 var probeCmdProcess = func(process *os.Process) error { return process.Signal(syscall.Signal(0)) }
 
 // cmdProcessWaited reports a probe result that means Wait already finished:
-// os.ErrProcessDone on Unix, and EINVAL on Windows, where Wait releases the
-// process handle instead of marking it done. Signal 0 is never itself invalid.
+// os.ErrProcessDone, and on Windows also EINVAL, because Wait there releases
+// the process handle instead of marking it done. On Unix EINVAL comes from the
+// kernel and says nothing about Wait.
 func cmdProcessWaited(err error) bool {
-	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.EINVAL)
+	return errors.Is(err, os.ErrProcessDone) || (releasedProcessIsInvalid && errors.Is(err, syscall.EINVAL))
 }
+
+var releasedProcessIsInvalid = runtime.GOOS == "windows"
 
 // validateCmdSignal never reads cmd.ProcessState: os/exec calls Cancel from its
 // own goroutine while Wait writes that field. os.Process records a completed
