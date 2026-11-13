@@ -15,6 +15,17 @@ var directProcessSignal = func(process *os.Process, sig syscall.Signal) error {
 
 var directProcessKill = func(process *os.Process) error { return process.Kill() }
 
+// probeCmdProcess asks os.Process, without delivering anything, whether Wait
+// has already finished with it.
+var probeCmdProcess = func(process *os.Process) error { return process.Signal(syscall.Signal(0)) }
+
+// cmdProcessWaited reports a probe result that means Wait already finished:
+// os.ErrProcessDone on Unix, and EINVAL on Windows, where Wait releases the
+// process handle instead of marking it done. Signal 0 is never itself invalid.
+func cmdProcessWaited(err error) bool {
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.EINVAL)
+}
+
 // validateCmdSignal never reads cmd.ProcessState: os/exec calls Cancel from its
 // own goroutine while Wait writes that field. os.Process records a completed
 // Wait itself and may be queried concurrently, so a reaped child is reported
@@ -29,7 +40,7 @@ func validateCmdSignal(cmd *exec.Cmd, sig syscall.Signal) (*os.Process, error) {
 	if err := validateCmdPID(cmd.Process.Pid); err != nil {
 		return nil, err
 	}
-	if errors.Is(cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+	if cmdProcessWaited(probeCmdProcess(cmd.Process)) {
 		return nil, os.ErrProcessDone
 	}
 	return cmd.Process, nil
