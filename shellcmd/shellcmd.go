@@ -2343,26 +2343,7 @@ type remoteStdin struct {
 
 func newRemoteStdin(file *syntax.File, src string, pos []int) *remoteStdin {
 	remote := &remoteStdin{file: file, src: src, plain: !strings.ContainsAny(src, "<|"), unmapped: -1}
-	for i, outer := range pos {
-		if outer < 0 {
-			if remote.unmapped < 0 {
-				remote.unmapped = i
-			}
-			continue
-		}
-		if n := len(remote.outers); n > 0 && outer <= remote.outers[n-1] {
-			remote.outers, remote.inners = nil, nil
-			remote.inner = make(map[int]int, len(pos))
-			for i, outer := range pos {
-				if _, ok := remote.inner[outer]; !ok {
-					remote.inner[outer] = i
-				}
-			}
-			break
-		}
-		remote.outers = append(remote.outers, outer)
-		remote.inners = append(remote.inners, i)
-	}
+	remote.indexOffsets(pos)
 	hasXargs := strings.Contains(src, "xargs")
 	syntax.Walk(file, func(node syntax.Node) bool {
 		remote.pipes.steps++
@@ -2418,6 +2399,37 @@ func (remote *remoteStdin) reads(offset int) bool {
 		return true
 	}
 	return resolveStdinAt(remote.index, inner, stdinValue{inherited: true}).inherited
+}
+
+// indexOffsets fills the lookup from outer offsets to bytes of src: sorted
+// pairs while the outer offsets ascend, a map of first bytes otherwise.
+func (remote *remoteStdin) indexOffsets(pos []int) {
+	for i, outer := range pos {
+		if outer < 0 {
+			if remote.unmapped < 0 {
+				remote.unmapped = i
+			}
+			continue
+		}
+		if n := len(remote.outers); n > 0 && outer <= remote.outers[n-1] {
+			remote.outers, remote.inners = nil, nil
+			remote.inner = firstInnerOffsets(pos)
+			return
+		}
+		remote.outers = append(remote.outers, outer)
+		remote.inners = append(remote.inners, i)
+	}
+}
+
+// firstInnerOffsets maps each outer offset in pos to its first index.
+func firstInnerOffsets(pos []int) map[int]int {
+	first := make(map[int]int, len(pos))
+	for i, outer := range pos {
+		if _, ok := first[outer]; !ok {
+			first[outer] = i
+		}
+	}
+	return first
 }
 
 // innerOffset returns the first byte of src at outer offset.
@@ -2618,13 +2630,17 @@ func (index *stdinIndex) functionEntry(fn stdinFunc, initial stdinValue) stdinEn
 	if entry, ok := index.entry[key]; ok && initial.redir == nil {
 		return entry
 	}
+	// The last call in walk order outside the body wins; scanning back from
+	// the end stops at it, so disjoint definitions sharing a name each look
+	// only past the calls inside their own body.
 	var entry stdinEntry
-	for _, start := range index.calls[fn.name] {
+	calls := index.calls[fn.name]
+	for i := len(calls) - 1; i >= 0; i-- {
 		index.callSteps++
-		if fn.start <= start && start < fn.end {
-			continue
+		if start := calls[i]; start < fn.start || start >= fn.end {
+			entry = stdinEntry{invoked: true, input: index.resolveContexts(start, initial)}
+			break
 		}
-		entry = stdinEntry{invoked: true, input: index.resolveContexts(start, initial)}
 	}
 	if initial.redir == nil {
 		index.entry[key] = entry

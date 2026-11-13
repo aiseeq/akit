@@ -2615,6 +2615,9 @@ func TestFindStdinResolutionGrowsLinearly(t *testing.T) {
 		{"function calls", func(n int) string {
 			return "f() { " + strings.Repeat("cat; ", n) + "}; " + strings.Repeat("f </dev/null; ", n)
 		}, "cat"},
+		{"redefined function", func(n int) string {
+			return strings.Repeat("f() { cat; }; f </dev/null; ", n)
+		}, "cat"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			steps := func(n int) int {
