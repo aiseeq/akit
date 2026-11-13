@@ -92,6 +92,18 @@ func TestArgLiteralContract(t *testing.T) {
 		{"function in input disables inner script", `f() { :; }; bash -c 'kill 1'`, "kill", 0, false},
 		{"history expansion", "set -o history -H\n: $PPID\nkill !!:1", "kill", 0, false},
 		{"escaped history mark", `kill \!`, "kill", 0, true},
+
+		{"builtin alias changes script", "set -o posix\nbuiltin alias kill='eval kill'\nkill '$PPID'", "kill", 0, false},
+		{"command alias changes script", "set -o posix\ncommand alias kill='eval kill'\nkill '$PPID'", "kill", 0, false},
+		{"eval alias and shopt change script", strings.Join([]string{`eval "alias kill='eval kill'"; eval "shopt -s expand_aliases"; kill '$`, `PPID'`}, ""), "kill", 0, false},
+		{"double quoted history expansion", "set -o history -H\n: $PPID\nkill \"!!:1\"", "kill", 0, false},
+		{"nested double quoted history expansion", "bash -c 'set -o history -H\n: $PPID\nkill \"!!:1\"'", "kill", 0, false},
+		{"assignment keeps script simple", `X=1 kill 'a'`, "kill", 0, true},
+		{"set option disables script", `kill 'a'; set -e`, "kill", 0, false},
+		{"nested shell state sticks to script", `kill 'a'; bash -c 'set -e'; bash -c 'echo hi'`, "kill", 0, false},
+		{"bang single quoted", `kill '!'`, "kill", 0, true},
+		{"bang double quoted", `kill "!"`, "kill", 0, false},
+		{"bang unquoted", `kill !`, "kill", 0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -104,6 +116,17 @@ func TestArgLiteralContract(t *testing.T) {
 			}
 			if got := calls[0].ArgLiteral(tt.arg); got != tt.want {
 				t.Errorf("ArgLiteral(%d) = %v, want %v; call=%+v", tt.arg, got, tt.want, calls[0])
+			}
+		})
+	}
+	for _, word := range []string{"eval", "alias", "unalias", "shopt", "enable", "set", "builtin", "command", "source", ".", "declare", "typeset", "export", "readonly", "local", "trap", "hash"} {
+		t.Run("state-changing word "+word, func(t *testing.T) {
+			calls, err := Find("echo "+word+"; kill 'a'", "kill")
+			if err != nil || len(calls) != 1 {
+				t.Fatalf("Find: calls=%#v, err=%v", calls, err)
+			}
+			if calls[0].ArgLiteral(0) {
+				t.Errorf("ArgLiteral(0) = true for script containing %q", word)
 			}
 		})
 	}
@@ -142,6 +165,23 @@ func TestArgLiteralContract(t *testing.T) {
 	}
 	if !foundTarget {
 		t.Fatalf("function override target not found in %#v", calls)
+	}
+	evalFunctionSource := strings.Join([]string{`eval 'kill() { eval builtin kill "$@"; }'; kill '$`, `PPID'`}, "")
+	calls, err = Find(evalFunctionSource, "kill")
+	if err != nil {
+		t.Fatalf("eval function: Find: %v", err)
+	}
+	foundTarget = false
+	for _, call := range calls {
+		if call.Raw == strings.Join([]string{`kill '$`, `PPID'`}, "") {
+			foundTarget = true
+			if call.ArgLiteral(0) {
+				t.Errorf("eval function: ArgLiteral(0) = true, want false")
+			}
+		}
+	}
+	if !foundTarget {
+		t.Fatalf("eval function target not found in %#v", calls)
 	}
 	if got := unsafe.Sizeof(Call{}); got != 128 {
 		t.Errorf("sizeof Call = %d, want 128", got)

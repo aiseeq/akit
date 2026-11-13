@@ -39,12 +39,16 @@ type Call struct {
 	ScriptInput bool
 }
 
-// ArgLiteral сообщает, что аргумент i — литеральное слово на верхнем уровне входного
-// скрипта или на верхнем уровне скрипта из прямого `bash/sh -c '…'`. Всё прочее,
-// включая вызовы в скрипте с определением функции или вызовом alias, shopt или enable,
-// слова с раскрытиями или неподдерживаемыми кавычками и индексы вне [0, 32) дают false.
-// Переопределение имени команды вне видимого скрипта (например, через rc-файлы,
-// BASH_ENV или `bash -i`) не учитывается.
+// ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: это прямой
+// вызов верхнего уровня входного скрипта или скрипта из прямого `bash/sh -c '…'`, без
+// обёрток, вложенности, перенаправлений и управляющих команд. Слово должно состоять из
+// литералов, одинарных кавычек без $, либо двойных кавычек с Lit без обратной косой, без
+// раскрытий; ! допустим только в одинарных кавычках и как \\! вне кавычек. i в [0, 32).
+// Иначе false.
+// Любая функция или команда из набора eval, alias, unalias, shopt, enable, set, builtin,
+// command, source, ., declare, typeset, export, readonly, local, trap, hash делает скрипт
+// непростым. Переопределения извне (rc-файлы, BASH_ENV, `bash -i`) и содержимое source-файлов
+// не учитываются.
 func (c Call) ArgLiteral(i int) bool {
 	return i >= 0 && i < 32 && c.literalArgs&(uint32(1)<<uint(i)) != 0
 }
@@ -155,7 +159,14 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
-	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, budget)
+	first := len(*calls)
+	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, budget)
+	if budget.literalUnsafe {
+		for i := first; i < len(*calls); i++ {
+			(*calls)[i].literalArgs = 0
+		}
+	}
+	return err
 }
 
 func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
@@ -229,9 +240,7 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
-	previousLiteralUnsafe := budget.literalUnsafe
 	budget.literalUnsafe = budget.literalUnsafe || info.literalUnsafe
-	defer func() { budget.literalUnsafe = previousLiteralUnsafe }()
 	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
@@ -1286,13 +1295,16 @@ func hasUnquotedExpansion(text string) bool {
 			continue
 		}
 		if quote != 0 {
+			if quote == '"' && ch == '!' {
+				return true
+			}
 			continue
 		}
 		if ch == '\\' {
 			i++
 			continue
 		}
-		if strings.ContainsRune("{}~*?[]$`!", rune(ch)) {
+		if ch == '!' || strings.ContainsRune("{}~*?[]$`", rune(ch)) {
 			return true
 		}
 	}
@@ -1324,17 +1336,22 @@ func literalUnsafeNode(node syntax.Node) bool {
 	case *syntax.FuncDecl:
 		return true
 	case *syntax.CallExpr:
-		if len(n.Args) == 0 {
-			return false
-		}
-		if name, ok := wordValue(n.Args[0]); ok {
-			switch commandName(name) {
-			case "alias", "shopt", "enable":
+		for _, word := range n.Args {
+			if name, ok := wordValue(word); ok && literalUnsafeWord(name) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func literalUnsafeWord(word string) bool {
+	switch word {
+	case "eval", "alias", "unalias", "shopt", "enable", "set", "builtin", "command", "source", ".", "declare", "typeset", "export", "readonly", "local", "trap", "hash":
+		return true
+	default:
+		return false
+	}
 }
 
 func literalArgsMask(words []*syntax.Word, src string) uint32 {
