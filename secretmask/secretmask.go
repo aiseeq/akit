@@ -1563,7 +1563,7 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		quoteAt++
 	}
 	if slashes := quoteAt - at; quoteAt < len(text) && (text[quoteAt] == '\'' || text[quoteAt] == '"') && opensQuote(text[quoteAt], slashes) {
-		return scanQuotedValue(text, quoteAt, slashes)
+		return scanQuotedValue(text, quoteAt, slashes, colon)
 	}
 	if text[at] == '$' && at+1 < len(text) && (text[at+1] == '\'' || text[at+1] == '"') {
 		quoteAt := at + 1
@@ -1585,8 +1585,10 @@ func scanBacktickValue(text string, at int) (contextValue, bool) {
 	return contextValue{at + 1, end, true}, end > at+1 && !strings.ContainsAny(value, " \t") && !looksLikePath(value)
 }
 
-func scanQuotedValue(text string, quoteAt, slashes int) (contextValue, bool) {
-	if slashes == 0 && text[quoteAt] == '"' && quoteAt+1 < len(text) && text[quoteAt+1] == '`' {
+// scanQuotedValue reads a quoted value; backticks right inside double quotes are a value only after a colon,
+// since after = or in a flag the shell runs them as command substitution.
+func scanQuotedValue(text string, quoteAt, slashes int, colon bool) (contextValue, bool) {
+	if colon && slashes == 0 && text[quoteAt] == '"' && quoteAt+1 < len(text) && text[quoteAt+1] == '`' {
 		end := closingQuote(text, quoteAt+1, 0)
 		if end > quoteAt+2 && end+1 < len(text) && text[end+1] == '"' {
 			if strings.ContainsAny(text[quoteAt+2:end], " \t") || looksLikePath(text[quoteAt+2:end]) {
