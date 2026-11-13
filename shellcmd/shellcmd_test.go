@@ -2800,3 +2800,66 @@ func TestFindDashHeredocStripsTabsBeforeTheInnerShellReadsIt(t *testing.T) {
 		t.Fatalf("kill calls = %+v, want kill 1 after the inner heredoc", calls)
 	}
 }
+
+func TestFindHeredocLineContinuationJoinsTheTarget(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		args []string
+	}{
+		{"bash <<EOF\nkill \\\n $PPID\nEOF\n", []string{"$PPID"}},
+		{"bash <<EOF\nkill \\\n 123\nEOF\n", []string{"123"}},
+		{"bash <<EOF\nkill -9 \\\n-1\nEOF\n", []string{"-9", "-1"}},
+		{"bash <<-EOF\n\tkill \\\n\t 123\n\tEOF\n", []string{"123"}},
+		// The outer shell turns \\ into one backslash, which then joins the
+		// lines for the inner shell: it runs "echo akill 1".
+		{"bash <<EOF\necho a\\\\\n0 kill 1\nkill 2\nEOF\n", []string{"2"}},
+	} {
+		calls, err := Find(tc.src, "kill")
+		if err != nil {
+			t.Fatalf("%q: %v", tc.src, err)
+		}
+		if len(calls) != 1 || !slices.Equal(calls[0].Args, tc.args) {
+			t.Fatalf("%q: kill calls = %+v, want args %q", tc.src, calls, tc.args)
+		}
+	}
+}
+
+func TestFindHeredocSubstitutionInsideExpansionReportedOnce(t *testing.T) {
+	for _, src := range []string{
+		"bash <<EOF\necho ${X:-$(kill 123)}\nEOF\n",
+		"bash <<EOF\necho $(( $(kill 123) + 1 ))\nEOF\n",
+		"bash <<EOF\necho ${X:-${Y:-`kill 123`}}\nEOF\n",
+		"bash <<< \"${X:-$(kill 123)}\"\n",
+		// Substitutions nested in a recorded one stay out of the lookup.
+		"bash <<EOF\necho ${X:-$(echo $(true); kill 123)} $(true)\nEOF\n",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil {
+			t.Fatalf("%q: %v", src, err)
+		}
+		if len(calls) != 1 || len(calls[0].Via) != 0 {
+			t.Fatalf("%q: kill calls = %+v, want one local call", src, calls)
+		}
+	}
+}
+
+func TestFindHeredocSubstitutionLookupGrowsLinearly(t *testing.T) {
+	steps := func(n int) int {
+		src := "bash <<EOF\n" + strings.Repeat("echo $(true)\n", n) + "EOF\n"
+		var calls []Call
+		budget := newNestedParseBudget(len(src))
+		budget.trackWork = true
+		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		if callsNamed(calls, "true") != n {
+			t.Fatalf("true calls = %d, want %d", callsNamed(calls, "true"), n)
+		}
+		return budget.substSteps
+	}
+	small, large := steps(400), steps(1600)
+	t.Logf("subst steps: 400=%d 1600=%d", small, large)
+	if small == 0 || large > small*5 {
+		t.Fatalf("4x input took %d substitution steps after %d; want near-linear growth", large, small)
+	}
+}

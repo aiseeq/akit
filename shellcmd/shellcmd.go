@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sort"
 
 	"strconv"
 	"strings"
@@ -111,6 +112,7 @@ type nestedParseBudget struct {
 	visitedNodes  int
 	walkInfoNodes int
 	stdinSteps    int
+	substSteps    int
 	trackWork     bool
 	parsedShells  map[string]int
 }
@@ -837,7 +839,7 @@ func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inh
 		if err := parseNestedWithBudget(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
 			nestedErrs = append(nestedErrs, err)
 		}
-		dropSubstCalls(calls, first, body)
+		dropSubstCalls(calls, first, body, budget)
 		preserveMappedRaw(*calls, first, body, src)
 	}
 	return errors.Join(nestedErrs...)
@@ -2705,7 +2707,7 @@ func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int
 	if err := parseNestedWithBudget(body.String(), body.pos, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
 		return err
 	}
-	dropSubstCalls(calls, first, body)
+	dropSubstCalls(calls, first, body, c.budget)
 	preserveMappedRaw(*calls, first, body, c.source)
 	return nil
 }
@@ -2779,14 +2781,27 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 				}
 				continue
 			}
-			m.keepSource(part, start, end, src)
-		case *syntax.CmdSubst, *syntax.ProcSubst:
-			m.subst = append(m.subst, [2]int{start, end})
-			m.keepSource(part, start, end, src)
+			m.keepExpansion(part, start, end, src)
 		default:
-			m.keepSource(part, start, end, src)
+			m.keepExpansion(part, start, end, src)
 		}
 	}
+}
+
+// keepExpansion keeps the source text of an expansion and records every
+// command or process substitution the outer shell runs inside it, at any
+// depth of ${…} or $((…)), but not those nested in another substitution: the
+// outermost one is reported by the outer walk with all it contains.
+func (m *mapped) keepExpansion(part syntax.WordPart, start, end int, src string) {
+	syntax.Walk(part, func(node syntax.Node) bool {
+		switch node.(type) {
+		case *syntax.CmdSubst, *syntax.ProcSubst:
+			m.subst = append(m.subst, [2]int{int(node.Pos().Offset()), int(node.End().Offset())})
+			return false
+		}
+		return true
+	})
+	m.keepSource(part, start, end, src)
 }
 
 // knownParam returns the value of a plain $NAME or ${NAME} whose value the
@@ -2835,7 +2850,8 @@ func (m *mapped) unescapeSpans(raw string, base int, double bool) {
 }
 
 // unescapeHeredoc appends a literal of an unquoted heredoc body: a backslash
-// escapes only $, `, \ and a newline.
+// escapes only $, `, \ and a newline. A literal can end just before the
+// newline of a line continuation, its backslash being the last source byte.
 func (m *mapped) unescapeHeredoc(lit *syntax.Lit, src string) {
 	start, end := int(lit.Pos().Offset()), min(int(lit.End().Offset()), len(src))
 	raw, base := lit.Value, -1
@@ -2843,6 +2859,9 @@ func (m *mapped) unescapeHeredoc(lit *syntax.Lit, src string) {
 		raw, base = src[start:end], start
 	}
 	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 == len(raw) && base >= 0 && end < len(src) && src[end] == '\n' {
+			break
+		}
 		if raw[i] == '\\' && i+1 < len(raw) && strings.IndexByte("\\$`\n", raw[i+1]) >= 0 {
 			i++
 			if raw[i] == '\n' {
@@ -2885,21 +2904,22 @@ func (m mapped) stripLeadingTabs() mapped {
 }
 
 // dropSubstCalls removes calls found inside the kept text of a substitution
-// the outer shell runs: the outer walk reports them already.
-func dropSubstCalls(calls *[]Call, first int, body mapped) {
+// the outer shell runs: the outer walk reports them already. The spans come
+// in source order and do not overlap, so each call is looked up by binary
+// search.
+func dropSubstCalls(calls *[]Call, first int, body mapped, budget *nestedParseBudget) {
 	if len(body.subst) == 0 {
 		return
 	}
 	kept := (*calls)[:first]
 	for _, call := range (*calls)[first:] {
-		inside := false
-		for _, span := range body.subst {
-			if span[0] <= call.Offset && call.Offset < span[1] {
-				inside = true
-				break
+		i := sort.Search(len(body.subst), func(i int) bool {
+			if budget != nil && budget.trackWork {
+				budget.substSteps++
 			}
-		}
-		if !inside {
+			return body.subst[i][1] > call.Offset
+		})
+		if i == len(body.subst) || call.Offset < body.subst[i][0] {
 			kept = append(kept, call)
 		}
 	}
