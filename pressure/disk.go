@@ -34,7 +34,6 @@ type DiskNow struct {
 	OpenMs int64
 	// OpenCapped — идущая заморозка по своим детальным записям признана ожиданием под потолком io.max.
 	OpenCapped bool
-	Profile    json.RawMessage
 }
 
 // DiskCapped — признание источника по окну: ждали только упёршиеся в потолок io.max cgroup
@@ -62,9 +61,8 @@ type DiskWindow struct {
 }
 
 type diskRequest struct {
-	V    int    `json:"v"`
-	Q    string `json:"q"`
-	Kind string `json:"kind,omitempty"`
+	V int    `json:"v"`
+	Q string `json:"q"`
 }
 
 type diskResponse struct {
@@ -80,7 +78,6 @@ type diskResponse struct {
 		MS     int64 `json:"ms"`
 		Capped *bool `json:"capped"`
 	} `json:"open"`
-	Profile json.RawMessage `json:"profile"`
 }
 
 // diskPath задаёт сокет источника состояния диска для замерщика.
@@ -88,7 +85,7 @@ func diskPath() string {
 	return filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "io-state.sock")
 }
 
-func readDisk(ctx context.Context, path, kind string, now time.Time) (*DiskNow, error) {
+func readDisk(ctx context.Context, path string, now time.Time) (*DiskNow, error) {
 	if os.Getenv("XDG_RUNTIME_DIR") == "" && path == diskPath() {
 		return nil, ErrNoIOSource
 	}
@@ -104,7 +101,7 @@ func readDisk(ctx context.Context, path, kind string, now time.Time) (*DiskNow, 
 	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, fmt.Errorf("%w: deadline: %w", ErrIOSourceFailed, err)
 	}
-	if err := json.NewEncoder(conn).Encode(diskRequest{V: 1, Q: "now", Kind: kind}); err != nil {
+	if err := json.NewEncoder(conn).Encode(diskRequest{V: 1, Q: "now"}); err != nil {
 		return nil, fmt.Errorf("%w: request: %w", ErrIOSourceFailed, err)
 	}
 	line, err := bufio.NewReader(conn).ReadBytes('\n')
@@ -133,7 +130,7 @@ func readDisk(ctx context.Context, path, kind string, now time.Time) (*DiskNow, 
 	}
 	return &DiskNow{At: at, One: response.One, Five: response.Five, Thirty: response.Thirty,
 		NProc: response.NProc, Open: response.Open.Open, OpenMs: response.Open.MS,
-		OpenCapped: response.Open.Capped != nil && *response.Open.Capped, Profile: response.Profile}, nil
+		OpenCapped: response.Open.Capped != nil && *response.Open.Capped}, nil
 }
 
 // checkCapped — признание ожидания под потолком есть в окне 5 с и в идущей заморозке вместе или нигде.

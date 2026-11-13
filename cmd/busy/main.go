@@ -23,7 +23,7 @@ import (
 const usage = `busy — is the machine busy by the shared rule (akit/pressure), in one line.
 
 Usage:
-  busy [--runnable N] [--mem-some P] [--io-full P] [--dirty-mb M] [--kind K] [--window D] [--proc DIR] [--ignore-quiet]
+  busy [--runnable N] [--mem-some P] [--io-full P] [--dirty-mb M] [--window D] [--proc DIR] [--ignore-quiet]
   busy (--half-until TIME | --half D) [--why TEXT] | --half-off
   busy (--quiet-until TIME | --quiet D) [--why TEXT] | --quiet-off
 
@@ -58,7 +58,6 @@ Flags:
   --mem-some P    memory pressure limit, % (default 10)
   --io-full P     disk IO pressure limit, % (default 9.6; 100 or more disables disk checks)
   --dirty-mb M    write-out limit: dirty and writeback memory, MiB (default: the background write-out threshold)
-  --kind K        disk state profile kind to request
   --window D      swapping measured over D (default 1s)
   --proc DIR      read DIR instead of /proc
   --half-until T half mode until T: 14:45 today, "30.10 09:00", or RFC3339
@@ -87,7 +86,6 @@ type options struct {
 	limits      pressure.Limits
 	overrides   [][2]string // флаги порогов (ключ файла, значение) — поверх файла порогов
 	procRoot    string
-	kind        string
 	quiet       time.Time // срок тихого режима, который поставить
 	half        time.Time // срок режима половины машины, который поставить
 	why         string    // зачем активный режим
@@ -216,8 +214,6 @@ func (opts *options) set(name, value string, now time.Time) error {
 		if err = probe.Set(limitFlags[name], value); err == nil {
 			opts.overrides = append(opts.overrides, [2]string{limitFlags[name], value})
 		}
-	case "--kind":
-		opts.kind = value
 	case "--proc":
 		opts.procRoot = value
 	case "--quiet-until", "--quiet", "--why":
@@ -283,7 +279,7 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	if opts.halfOff || !opts.half.IsZero() {
 		return setMode(opts.half, opts.why, opts.halfOff, "half", pressure.HalfPath, stdout, stderr)
 	}
-	v, err := pressure.Check(ctx, opts.procRoot, opts.limits, opts.kind)
+	v, err := pressure.Check(ctx, opts.procRoot, opts.limits, "")
 	if err != nil {
 		fmt.Fprintf(stderr, "busy: %v\n", err)
 		return exitUsage

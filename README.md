@@ -77,7 +77,7 @@ waiting for its own limit, not for the disk: when the source judges that only cg
 waited in the 5-second window, or in the freeze in progress, that pressure or freeze is not busy, and
 the busy line says so. Without the source, or with a source that gives no such judgement, caps are
 not told apart and the line names the missing judgement. Use `--io-full` to change the threshold
-(100 disables disk checks, the freeze too) and `--kind K` to request a profile kind. Your own thresholds go in
+(100 disables disk checks, the freeze too). Your own thresholds go in
 `$XDG_CONFIG_HOME/akit/pressure.yaml` as `key: value` lines (`runnable`, `max_io_full`, `max_mem_some`,
 `max_swap_kbs`, `swap_window`, `max_dirty_mb`), shared with graft; flags override the file, and a value that is not a
 finite positive number (or a positive duration) is an error. Use busy instead of reading `/proc/loadavg`
@@ -92,16 +92,15 @@ measurement taken inside quiet mode by the readings alone; `--quiet-off` ends it
 
 The optional disk state source listens on the Unix socket `$XDG_RUNTIME_DIR/io-state.sock`. Each
 connection carries one JSON request line and returns one JSON response line. The request is
-`{"v":1,"q":"now","kind":"…"}`; `kind` is omitted when empty. Without `XDG_RUNTIME_DIR` there is no
-source.
+`{"v":1,"q":"now"}`. Without `XDG_RUNTIME_DIR` there is no source.
 
-The client reads `v`, `error`, `at` (RFC 3339 with nanoseconds), `1s`, `5s`, `30s`, `nproc`, `open`, and `profile`. Each window
+The client reads `v`, `error`, `at` (RFC 3339 with nanoseconds), `1s`, `5s`, `30s`, `nproc`, and `open`. Each window
 contains `steps`, `io_full_ms`, `stall_ms`, `write_bps`, `read_bps`, `w_await_ms`, `inflight_max`,
 `cpu_some_ms`, and `runnable_max`, and optionally `capped`: `{"capped":…,"outside_ms":…,"capped_ms":…}`,
 whether only cgroups at their `io.max` caps waited in that window, the largest wait of a cgroup outside
 caps and the wait of leaves at caps, in ms. `open` contains `open`, `ms`, and optionally `capped`,
 the same judgement for the freeze in progress; a source that sends `capped` in the 5-second window
-must send it in an open freeze too. `profile` is passed through byte for byte without interpretation.
+must send it in an open freeze too.
 Extra response fields are ignored.
 
 The client allows 200 ms for connection and response. A response with a version other than 1, a

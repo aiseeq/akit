@@ -42,28 +42,28 @@ func response(at time.Time, ioFullMS float64) string {
 	return fmt.Sprintf(`{"v":1,"at":%q,"5s":{"io_full_ms":%v},"profile": { "mode" : "x" }}`+"\n", at.Format(time.RFC3339Nano), ioFullMS)
 }
 
-func TestReadDiskRequestAndProfile(t *testing.T) {
+func TestReadDiskRequestAndLegacyProfile(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	now := time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC)
-	var request diskRequest
+	var request map[string]json.RawMessage
 	path := socket(t, func(conn net.Conn) {
 		defer conn.Close()
 		_ = json.NewDecoder(bufio.NewReader(conn)).Decode(&request)
 		_, _ = conn.Write([]byte(response(now, 480)))
 	})
-	disk, err := readDisk(context.Background(), path, "worker:x", now)
+	disk, err := readDisk(context.Background(), path, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.V != 1 || request.Q != "now" || request.Kind != "worker:x" {
-		t.Errorf("запрос = %+v", request)
+	if string(request["v"]) != "1" || string(request["q"]) != `"now"` || len(request) != 2 {
+		t.Errorf("запрос now = %s", request)
 	}
-	if disk.Five.IOFullMS != 480 || string(disk.Profile) != `{ "mode" : "x" }` || !disk.At.Equal(now) {
-		t.Errorf("снимок = %+v, profile %s", disk, disk.Profile)
+	if disk.Five.IOFullMS != 480 || !disk.At.Equal(now) {
+		t.Errorf("снимок = %+v", disk)
 	}
 }
 
-func TestReadDiskOmitsEmptyKind(t *testing.T) {
+func TestReadDiskRequestHasNoKind(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	now := time.Now()
 	var request map[string]json.RawMessage
@@ -72,7 +72,7 @@ func TestReadDiskOmitsEmptyKind(t *testing.T) {
 		_ = json.NewDecoder(bufio.NewReader(conn)).Decode(&request)
 		_, _ = conn.Write([]byte(response(now, 0)))
 	})
-	if _, err := readDisk(context.Background(), path, "", now); err != nil {
+	if _, err := readDisk(context.Background(), path, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := request["kind"]; ok {
@@ -97,7 +97,7 @@ func TestReadDiskFailures(t *testing.T) {
 				defer conn.Close()
 				_, _ = conn.Write([]byte(tc.body + "\n"))
 			})
-			if _, err := readDisk(context.Background(), path, "", now); !errors.Is(err, ErrIOSourceFailed) {
+			if _, err := readDisk(context.Background(), path, now); !errors.Is(err, ErrIOSourceFailed) {
 				t.Errorf("ошибка источника = %v", err)
 			}
 		})
@@ -106,12 +106,12 @@ func TestReadDiskFailures(t *testing.T) {
 
 func TestReadDiskMissingDefaultRuntime(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	if _, err := readDisk(context.Background(), diskPath(), "", time.Now()); !errors.Is(err, ErrNoIOSource) {
+	if _, err := readDisk(context.Background(), diskPath(), time.Now()); !errors.Is(err, ErrNoIOSource) {
 		t.Errorf("путь по умолчанию без XDG_RUNTIME_DIR: %v", err)
 	}
 }
 
-func TestMeterDiskWindowAndKind(t *testing.T) {
+func TestMeterDiskWindowIgnoresKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		ms   float64
@@ -127,7 +127,7 @@ func TestMeterDiskWindowAndKind(t *testing.T) {
 				"pressure/memory": "some avg10=0 avg60=0 avg300=0 total=1\n",
 				"vmstat":          "pswpin 1\npswpout 1\n",
 			})
-			var request diskRequest
+			var request map[string]json.RawMessage
 			m.disk = socket(t, func(conn net.Conn) {
 				defer conn.Close()
 				_ = json.NewDecoder(bufio.NewReader(conn)).Decode(&request)
@@ -143,11 +143,8 @@ func TestMeterDiskWindowAndKind(t *testing.T) {
 			if tc.ms == 480 && v.Why() != "IO pressure 9.6% of the last 5s is at or above 9.6%" {
 				t.Errorf("Why = %q", v.Why())
 			}
-			if request.Kind != "worker:x" {
-				t.Errorf("kind = %q", request.Kind)
-			}
-			if string(v.Load.Disk.Profile) != `{ "mode" : "x" }` {
-				t.Errorf("profile = %s", v.Load.Disk.Profile)
+			if _, exists := request["kind"]; exists {
+				t.Errorf("kind попал в запрос now: %s", request["kind"])
 			}
 		})
 	}
@@ -281,7 +278,7 @@ func TestSkippedWindowReportsMissingCounters(t *testing.T) {
 	}
 }
 
-func TestMeterOmitsEmptyKind(t *testing.T) {
+func TestMeterRequestHasNoKind(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	m, now := fakeProc(t, map[string]string{
 		"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1\n",
@@ -294,15 +291,12 @@ func TestMeterOmitsEmptyKind(t *testing.T) {
 		_ = json.NewDecoder(bufio.NewReader(conn)).Decode(&request)
 		_, _ = conn.Write([]byte(response(*now, 0)))
 	})
-	v, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 9.6}, "", true)
+	_, err := m.Check(context.Background(), Limits{Runnable: 100, MaxIOFull: 9.6}, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := request["kind"]; exists {
 		t.Errorf("пустой kind попал в запрос: %s", request["kind"])
-	}
-	if string(v.Load.Disk.Profile) != `{ "mode" : "x" }` {
-		t.Errorf("profile = %s", v.Load.Disk.Profile)
 	}
 }
 

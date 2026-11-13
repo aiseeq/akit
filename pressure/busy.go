@@ -283,13 +283,14 @@ func NewMeter(procRoot string) *Meter {
 	return &Meter{procRoot: procRoot, now: time.Now, sleep: sleepCtx}
 }
 
-// Check замеряет машину и применяет правило. fresh — обмен со свопом за l.SwapWindow (ждёт окно),
+// Check замеряет машину и применяет правило. kind не используется; внешние потребители передают этот параметр при вызове.
+// fresh — обмен со свопом за l.SwapWindow (ждёт окно),
 // кроме случая, когда источник диска ответил и давление памяти не выше порога: тогда своп не влияет
 // на правило и не измеряется. Иначе обмен — с прошлого Check, а у первого — тоже за окно. Файл тихого
 // режима читается первым, затем
 // меры из procRoot: и в тихом режиме вердикт несёт все замеры. Ошибка — без вердикта: файл тихого
 // режима не читается или не разбирается, мера есть, но не читается.
-func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (Verdict, error) {
+func (m *Meter) Check(ctx context.Context, l Limits, _ string, fresh bool) (Verdict, error) {
 	var load Load
 	var meminfo string // текст /proc/meminfo: из него и порог фонового сброса по доле
 	var skipped []error
@@ -375,14 +376,14 @@ func (m *Meter) Check(ctx context.Context, l Limits, kind string, fresh bool) (V
 			return Verdict{}, fmt.Errorf("CPU pressure: %w", err)
 		}
 	}
-	if err := m.measureSwapAndDisk(ctx, l, kind, fresh, &load, &skipped); err != nil {
+	if err := m.measureSwapAndDisk(ctx, l, fresh, &load, &skipped); err != nil {
 		return Verdict{}, err
 	}
 	return Rule(load, l, skipped), nil
 }
 
-func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, kind string, fresh bool, load *Load, skipped *[]error) error {
-	load.Disk, load.DiskFault = readDisk(ctx, m.socketPath(), kind, m.now())
+func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, fresh bool, load *Load, skipped *[]error) error {
+	load.Disk, load.DiskFault = readDisk(ctx, m.socketPath(), m.now())
 	if fresh && load.Disk != nil && !skippedAny(*skipped, ErrNoMemPressure) && load.MemSome <= l.MemSomeLimit() {
 		load.SwapUnmeasured = true
 		if err := m.markBaseline(skipped); err != nil {
@@ -477,9 +478,9 @@ func (m *Meter) measureSwapAndIO(ctx context.Context, l Limits, fresh bool, load
 	return nil
 }
 
-// Check — один свежий замер машины procRoot по правилу.
-func Check(ctx context.Context, procRoot string, l Limits, kind string) (Verdict, error) {
-	return NewMeter(procRoot).Check(ctx, l, kind, true)
+// Check — один свежий замер машины procRoot по правилу. kind не используется; внешние потребители передают этот параметр при вызове.
+func Check(ctx context.Context, procRoot string, l Limits, _ string) (Verdict, error) {
+	return NewMeter(procRoot).Check(ctx, l, "", true)
 }
 
 func (m *Meter) socketPath() string {
