@@ -138,9 +138,22 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 	for id := range per {
 		ids = append(ids, id)
 	}
-	providers := slices.Sorted(maps.Keys(rates))
-	slices.SortFunc(ids, func(a, b string) int { // biggest provider percentage first
-		return cmp.Or(cmp.Compare(usageMaxPct(per[b], providers), usageMaxPct(per[a], providers)), cmp.Compare(a, b))
+	providerSet := make(map[string]bool, len(rates))
+	for provider := range rates {
+		providerSet[provider] = true
+	}
+	for _, rp := range replies {
+		if provider := usageProvider(rp.r.Model); provider != "" {
+			providerSet[provider] = true
+		}
+	}
+	providers := slices.Sorted(maps.Keys(providerSet))
+	hasPct := slices.ContainsFunc(ids, func(id string) bool { return len(per[id].week100Replies) > 0 })
+	slices.SortFunc(ids, func(a, b string) int {
+		if hasPct {
+			return cmp.Or(cmp.Compare(usageMaxPct(per[b], providers), usageMaxPct(per[a], providers)), cmp.Compare(a, b))
+		}
+		return cmp.Or(cmp.Compare(per[b].usd, per[a].usd), cmp.Compare(a, b))
 	})
 	header := []string{"session", "replies", "input", "cache_write", "cache_read", "output"}
 	for _, provider := range providers {

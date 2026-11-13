@@ -42,8 +42,8 @@ func TestUsage(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("want header, session, total and summary:\n%s", out)
 	}
-	if !strings.Contains(rows[0], "output\tusd_api") || strings.Contains(rows[0], "pct100_") {
-		t.Errorf("unexpected provider columns without a rates file:\n%s", out)
+	if !strings.Contains(rows[0], "pct100_anthropic\tusd_api") || strings.Split(rows[2], "\t")[6] != "-" {
+		t.Errorf("reply provider should have a '-' column without a rates file:\n%s", out)
 	}
 	if !strings.Contains(rows[3], "configure XDG_CONFIG_HOME/akit/rates.tsv") {
 		t.Errorf("missing rates setup hint: %q", rows[3])
@@ -267,6 +267,86 @@ func TestUsageInvalidRateNumbers(t *testing.T) {
 			got := rates["anthropic"]
 			if got.usable() || !strings.Contains(got.invalid, ":2:"+test.column+":") {
 				t.Fatalf("course should be invalid at its source cell: %+v", got)
+			}
+		})
+	}
+}
+
+func TestUsageColumnsIncludeReplyProviderWithoutCourse(t *testing.T) {
+	e := fakeHome(t)
+	e.configHome = t.TempDir()
+	ratesDir := filepath.Join(e.configHome, "akit")
+	if err := os.MkdirAll(ratesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ratesDir, "rates.tsv"), []byte("valid_from\tprovider\tplan_usd_month\tapi_usd_week\n2026-01-01\tanthropic\t200\t1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transcriptPath := filepath.Join(t.TempDir(), "mixed.jsonl")
+	records := []string{
+		usageRecord("a1", "claude-opus-5-5", "anthropic", 2_500_000, 0, 0, 1),
+		usageRecord("o1", "gpt-6-luna", "openai", 1_000_000, 0, 0, 1),
+	}
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join(records, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runTL(t, e, "--usage", transcriptPath)
+	if code != 0 {
+		t.Fatalf("code %d, stderr %s", code, errOut)
+	}
+	rows := strings.Split(strings.TrimSpace(out), "\n")
+	if rows[0] != "session\treplies\tinput\tcache_write\tcache_read\toutput\tpct100_anthropic\tpct100_openai\tusd_api" {
+		t.Fatalf("reply provider without a course needs a column: %q", rows[0])
+	}
+	fields := strings.Split(rows[1], "\t")
+	if fields[6] != "2.00" || fields[7] != "-" {
+		t.Fatalf("Anthropic course should be used and missing OpenAI course should be '-': %q", rows[1])
+	}
+}
+
+func TestUsageNoRatesColumnsAndSortByAPIPrice(t *testing.T) {
+	for _, emptyFile := range []bool{false, true} {
+		name := "missing-rates"
+		if emptyFile {
+			name = "empty-rates"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := fakeHome(t)
+			e.configHome = t.TempDir()
+			if emptyFile {
+				ratesDir := filepath.Join(e.configHome, "akit")
+				if err := os.MkdirAll(ratesDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(ratesDir, "rates.tsv"), []byte("valid_from\tprovider\tplan_usd_month\tapi_usd_week\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write := func(name, model string, input int64) string {
+				t.Helper()
+				path := filepath.Join(t.TempDir(), name)
+				if err := os.WriteFile(path, []byte(usageRecord(name, model, "fixture", input, 0, 0, 1)+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			}
+			cheap := write("a-cheap.jsonl", "gpt-6-luna", 1_000_000)
+			expensive := write("z-expensive.jsonl", "claude-opus-5-5", 2_500_000)
+			code, out, errOut := runTL(t, e, "--usage", cheap, expensive)
+			if code != 0 {
+				t.Fatalf("code %d, stderr %s", code, errOut)
+			}
+			rows := strings.Split(strings.TrimSpace(out), "\n")
+			if rows[0] != "session\treplies\tinput\tcache_write\tcache_read\toutput\tpct100_anthropic\tpct100_openai\tusd_api" {
+				t.Errorf("model providers need columns with %s: %q", name, rows[0])
+			}
+			first := strings.Split(rows[1], "\t")
+			if len(first) < 9 {
+				t.Errorf("missing provider percentage fields in first row: %q", rows[1])
+				return
+			}
+			if !strings.Contains(first[0], "z-expensive.jsonl") || first[6] != "-" || first[7] != "-" || first[8] != "10.00" {
+				t.Fatalf("without percentages, rows should sort by usd_api descending and show '-': %q", rows[1])
 			}
 		})
 	}
