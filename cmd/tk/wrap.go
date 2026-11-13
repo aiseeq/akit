@@ -9,7 +9,7 @@ import (
 const showWidth = 150
 
 // wrapLines переносит строки длиннее width по пробелам, продолжение — с отступом строки плюс два пробела.
-// Блоки ``` не трогает: команды в них копируют как есть.
+// Fence-ограждения с отступом до трёх пробелов не переносятся.
 func wrapLines(s string, width int) string {
 	var b strings.Builder
 	fenced := false
@@ -17,7 +17,9 @@ func wrapLines(s string, width int) string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		if fence := strings.HasPrefix(strings.TrimSpace(line), "```"); fence || fenced {
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		fence := indent <= 3 && strings.HasPrefix(line[indent:], "```")
+		if fence || fenced {
 			if fence {
 				fenced = !fenced
 			}

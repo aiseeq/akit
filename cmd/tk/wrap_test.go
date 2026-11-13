@@ -41,6 +41,30 @@ func TestWrapLinesKeepsText(t *testing.T) {
 	}
 }
 
+func TestShowWrapsJournalAfterIndentedNoteFence(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	long := "- 2026-01-02 10:00 note — tester: " + strings.Repeat("слово ", 40) + "конец"
+	text := "# Task\n\nСтатус: открыт\n\n## Журнал\n- 2026-01-01 10:00 note — tester: first\n      ```\n" + long + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "20260101-1000-LOW-fence.md"), []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(home))
+	t.Chdir(home)
+	var out, errOut bytes.Buffer
+	if code := run(options{cmd: "show", id: "fence"}, &out, &errOut); code != 0 {
+		t.Fatalf("show %d: %s", code, errOut.String())
+	}
+	t.Logf("tk show output:\n%s", out.String())
+	if !strings.Contains(out.String(), wrapLines(long, showWidth)) || strings.Contains(out.String(), long) {
+		t.Fatalf("show did not wrap the journal after the indented fence:\n%s", out.String())
+	}
+}
+
 func TestShowWrapsLongLines(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(home, "docs", "tasks")

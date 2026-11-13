@@ -3904,6 +3904,17 @@ func TestNextUnderCritOnlySaysWhy(t *testing.T) {
 	}
 }
 
+func TestNoteArgumentCounts(t *testing.T) {
+	for _, args := range [][]string{
+		{"note", "--text", "-", "--by", "tester"},
+		{"note", "task", "a", "b", "--by", "tester"},
+	} {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%q) accepted wrong argument count", args)
+		}
+	}
+}
+
 func TestNoteTextFlagRejectsConflictingOrEmptyInput(t *testing.T) {
 	if _, err := parseArgs([]string{"note", "task", "legacy", "--text", "-", "--by", "tester"}); err == nil || !strings.Contains(err.Error(), "either TEXT or --text FILE|-") {
 		t.Fatalf("mixed note inputs error = %v", err)
@@ -3920,26 +3931,58 @@ func TestNoteTextFlagRejectsConflictingOrEmptyInput(t *testing.T) {
 	if code := readTicketText(&options{cmd: "note", text: input.Name()}, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text must not be empty") {
 		t.Fatalf("empty note input: code=%d stderr=%q", code, errout.String())
 	}
+	if err := os.WriteFile(input.Name(), []byte("  \n\t \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	errout.Reset()
+	if code := readTicketText(&options{cmd: "note", text: input.Name()}, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text must not be empty") {
+		t.Fatalf("whitespace-only note input: code=%d stderr=%q", code, errout.String())
+	}
 }
 
 func TestNoteTextRejectsForbiddenLineCharsAndNormalizesCRLF(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "note.txt")
-	for _, value := range []string{"one\rtwo", "one\u2028two", "one\u0001two"} {
+	for _, value := range []string{"one\nbad\rtwo", "one\nbad\u2028two", "one\nbad\u0001two"} {
 		if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		var errout bytes.Buffer
 		o := options{cmd: "note", text: path}
-		if code := readTicketText(&o, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text line") {
+		if code := readTicketText(&o, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text line 2") {
 			t.Errorf("input %q: code=%d stderr=%q", value, code, errout.String())
 		}
+	}
+	if err := os.WriteFile(path, []byte("first\nbad\xff\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var errout bytes.Buffer
+	o := options{cmd: "note", text: path}
+	if code := readTicketText(&o, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text line 2") {
+		t.Fatalf("invalid UTF-8 note: code=%d stderr=%q", code, errout.String())
 	}
 	if err := os.WriteFile(path, []byte("one\r\ntwo\r\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	o := options{cmd: "note", text: path}
-	if code := readTicketText(&o, &bytes.Buffer{}); code != 0 || o.note != "one\ntwo\n" {
+	o = options{cmd: "note", text: path}
+	if code := readTicketText(&o, &bytes.Buffer{}); code != 0 || o.note != "one\ntwo" {
 		t.Fatalf("CRLF note = %q, code=%d", o.note, code)
+	}
+}
+
+func TestNoteTextTrimsTrailingNewlinesBeforeTimeMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "note.txt")
+	if err := os.WriteFile(path, []byte("было в 14:3x\nвторая\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := options{cmd: "note", text: path}
+	var errout bytes.Buffer
+	if code := readTicketText(&o, &errout); code != 0 {
+		t.Fatalf("read note: code=%d stderr=%q", code, errout.String())
+	}
+	line := journalNoteLine("2026-11-13 12:00", "tester", markedJournalTextFor(o, "note", o.note))
+	lines := strings.Split(line, "\n")
+	if got := lines[len(lines)-1]; got != "      вторая [время требует проверки]" {
+		t.Fatalf("marked final continuation = %q; journal line: %q", got, line)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/queuegate"
@@ -221,13 +222,9 @@ func parseArgs(a []string) (options, error) {
 	return o, nil
 }
 
-// validateOneLine — текст для строки журнала или заголовка должен быть однострочным,
-// кроме заметки из --text: её продолжение записывается с отступом.
+// validateOneLine — текст для строки журнала или заголовка должен быть однострочным.
 func validateOneLine(o options) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--back", o.back}, {"--until", o.until}, {"--add", o.add}, {"--repin", o.repin}} {
-		if f.flag == "note" && o.text != "" {
-			continue
-		}
 		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
@@ -1709,9 +1706,9 @@ func readTicketText(o *options, errout io.Writer) int {
 		return fail(errout, errors.New("--text has no ticket sections"))
 	}
 	if o.cmd == "note" {
-		o.text = strings.ReplaceAll(o.text, "\r\n", "\n")
+		o.text = strings.TrimRight(strings.ReplaceAll(o.text, "\r\n", "\n"), "\n")
 		for i, line := range strings.Split(o.text, "\n") {
-			if strings.ContainsFunc(line, notInLine) {
+			if !utf8.ValidString(line) || strings.ContainsFunc(line, notInLine) {
 				return fail(errout, fmt.Errorf("note text line %d contains a forbidden character", i+1))
 			}
 		}
