@@ -3,9 +3,12 @@
 package proc
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -165,74 +168,92 @@ type ownedStopOps struct {
 	guard  func() error
 }
 
+// ownedStopState — how the stop loop ended: still able to finish normally, or
+// which condition decides the finish.
+type ownedStopState int
+
+const (
+	ownedStopRunning ownedStopState = iota
+	ownedStopLeaderGone
+	ownedStopAborted
+)
+
+// ownedGuardState checks the guard. A leader that exited after a requested
+// signal was sent ends discovery but lets the stop finish on pinned processes;
+// any other guard failure is recorded and aborts the stop.
+func ownedGuardState(ops ownedStopOps, result *StopResult, failures *stopFailures) ownedStopState {
+	err := checkOwnedStopGuard(ops)
+	switch {
+	case err == nil:
+		return ownedStopRunning
+	case errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0:
+		return ownedStopLeaderGone
+	default:
+		failures.add(0, err)
+		return ownedStopAborted
+	}
+}
+
 func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOps) (StopResult, error) {
 	tracked := make(map[processIdentity]*trackedOwnedProcess)
 	defer closeOwnedProcesses(tracked)
 	var failures stopFailures
 	result := StopResult{}
 	deadline := time.Now().Add(grace)
-	pidfdUnavailable := false
-	guardFailed := false
-	leaderGone := false
-	for {
-		if err := checkOwnedStopGuard(ops); err != nil {
-			if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
-				leaderGone = true
-			} else {
-				failures.add(0, err)
-				guardFailed = true
-			}
-			break
-		}
-		pids, err := ops.scan()
-		if err != nil {
-			failures.add(0, err)
-			pidfdUnavailable = errors.Is(err, ErrPidfdUnavailable)
-			break
-		}
-		previous := snapshotOwnedProcesses(tracked)
-		batch, err := prepareOwnedCandidates(pids, ops, tracked, &failures, false)
-		if err != nil {
-			failures.add(0, err)
-			pidfdUnavailable = errors.Is(err, ErrPidfdUnavailable)
-			break
-		}
-		if err := checkOwnedStopGuard(ops); err != nil {
-			discardNewOwnedProcesses(tracked, previous)
-			if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
-				leaderGone = true
-			} else {
-				failures.add(0, err)
-				guardFailed = true
-			}
-			break
-		}
-		requestOwnedCandidates(batch, sig, &failures, &result)
-		if sig == syscall.SIGKILL || !time.Now().Before(deadline) {
-			break
-		}
-		time.Sleep(min(5*time.Millisecond, time.Until(deadline)))
+	state := requestOwnedBatches(sig, deadline, ops, tracked, &failures, &result)
+	if sig != syscall.SIGKILL && state == ownedStopRunning {
+		state = ownedGuardState(ops, &result, &failures)
 	}
-	if sig != syscall.SIGKILL && !pidfdUnavailable && !guardFailed && !leaderGone {
-		if err := checkOwnedStopGuard(ops); err != nil {
-			if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
-				leaderGone = true
-			} else {
-				failures.add(0, err)
-				guardFailed = true
-			}
-		}
-	}
-	if sig != syscall.SIGKILL && !pidfdUnavailable && !guardFailed {
-		if leaderGone {
+	if sig != syscall.SIGKILL {
+		switch state {
+		case ownedStopRunning:
+			finishOwnedStop(sig, ops, tracked, &failures, &result)
+		case ownedStopLeaderGone:
 			waitOwnedStopGrace(deadline, tracked, &failures)
 			finishPinnedOwnedStop(sig, ops, tracked, &failures, &result)
-		} else {
-			finishOwnedStop(sig, ops, tracked, &failures, &result)
 		}
 	}
 	result.AlreadyExited = len(tracked) == 0
 	return result, failures.err()
+}
+
+// requestOwnedBatches sends the requested signal to verified batches until
+// grace ends, SIGKILL was requested, or a guard or scan failure stops it.
+func requestOwnedBatches(sig syscall.Signal, deadline time.Time, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures, result *StopResult) ownedStopState {
+	for {
+		if state := ownedGuardState(ops, result, failures); state != ownedStopRunning {
+			return state
+		}
+		pids, err := ops.scan()
+		if err != nil {
+			failures.add(0, err)
+			return ownedScanFailure(err)
+		}
+		previous := snapshotOwnedProcesses(tracked)
+		batch, err := prepareOwnedCandidates(pids, ops, tracked, failures, false)
+		if err != nil {
+			failures.add(0, err)
+			return ownedScanFailure(err)
+		}
+		if state := ownedGuardState(ops, result, failures); state != ownedStopRunning {
+			discardNewOwnedProcesses(tracked, previous)
+			return state
+		}
+		requestOwnedCandidates(batch, sig, failures, result)
+		if sig == syscall.SIGKILL || !time.Now().Before(deadline) {
+			return ownedStopRunning
+		}
+		time.Sleep(min(5*time.Millisecond, time.Until(deadline)))
+	}
+}
+
+// ownedScanFailure: pidfd unavailability aborts the finish (no reliable
+// handles); any other scan failure still lets already pinned processes finish.
+func ownedScanFailure(err error) ownedStopState {
+	if errors.Is(err, ErrPidfdUnavailable) {
+		return ownedStopAborted
+	}
+	return ownedStopRunning
 }
 
 func checkOwnedStopGuard(ops ownedStopOps) error {
@@ -286,10 +307,9 @@ func discardNewOwnedProcesses(tracked map[processIdentity]*trackedOwnedProcess, 
 }
 
 func finishPinnedOwnedStop(sig syscall.Signal, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures, result *StopResult) {
-	batch := make([]*trackedOwnedProcess, 0, len(tracked))
-	for _, entry := range tracked {
-		batch = append(batch, entry)
-	}
+	batch := slices.SortedFunc(maps.Values(tracked), func(a, b *trackedOwnedProcess) int {
+		return cmp.Compare(a.identity.pid, b.identity.pid)
+	})
 	result.Killed += killOwnedCandidates(batch, sig, ops, failures, result)
 }
 
