@@ -2602,28 +2602,44 @@ func manyHeredocSubstitutionScript(heredocs int) string {
 	return b.String()
 }
 
-func TestFindStdinResolutionGrowsLinearlyWithHeredocs(t *testing.T) {
-	steps := func(heredocs int) int {
-		src := manyHeredocSubstitutionScript(heredocs)
-		var calls []Call
-		budget := newNestedParseBudget(len(src))
-		budget.trackWork = true
-		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
-			t.Fatal(err)
-		}
-		if kills := callsNamed(calls, "kill"); kills != 1 {
-			t.Fatalf("got %d kill calls, want 1", kills)
-		}
-		return budget.stdinSteps
-	}
-	small, large := steps(400), steps(1600)
-	t.Logf("stdin lookup steps: 400 heredocs=%d 1600 heredocs=%d", small, large)
-	if small == 0 || large > small*5 {
-		t.Fatalf("4x heredocs took %d stdin lookup steps after %d; want linear growth", large, small)
+func TestFindStdinResolutionGrowsLinearly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		script func(int) string
+		want   string
+	}{
+		{"heredocs in substitution", manyHeredocSubstitutionScript, "kill"},
+		{"remote shells", func(n int) string {
+			return "ssh h '" + strings.Repeat("bash -s </dev/null; ", n) + "bash -s' <<'EOF'\nkill 1\nEOF\n"
+		}, "kill"},
+		{"function calls", func(n int) string {
+			return "f() { " + strings.Repeat("cat; ", n) + "}; " + strings.Repeat("f </dev/null; ", n)
+		}, "cat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			steps := func(n int) int {
+				src := tc.script(n)
+				var calls []Call
+				budget := newNestedParseBudget(len(src))
+				budget.trackWork = true
+				if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+					t.Fatal(err)
+				}
+				if callsNamed(calls, tc.want) == 0 {
+					t.Fatalf("no %s call found", tc.want)
+				}
+				return budget.stdinSteps
+			}
+			small, large := steps(400), steps(1600)
+			t.Logf("stdin steps: 400=%d 1600=%d", small, large)
+			if small == 0 || large > small*5 {
+				t.Fatalf("4x input took %d stdin steps after %d; want linear growth", large, small)
+			}
+		})
 	}
 }
 
-func TestStdinIndexContainingMatchesFullScan(t *testing.T) {
+func TestRangeIndexContainingMatchesFullScan(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		ranges [][2]int
@@ -2631,32 +2647,29 @@ func TestStdinIndexContainingMatchesFullScan(t *testing.T) {
 	}{
 		{"nested", [][2]int{{0, 20}, {2, 5}, {6, 15}, {7, 9}, {16, 18}}, true},
 		{"same start", [][2]int{{0, 10}, {0, 4}, {5, 8}}, true},
+		{"inner added first", [][2]int{{7, 9}, {6, 15}, {0, 20}}, true},
 		{"overlap", [][2]int{{0, 10}, {2, 5}, {4, 12}}, false},
-		{"start out of order", [][2]int{{5, 9}, {1, 3}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			index := &stdinIndex{nested: true}
-			for _, r := range tc.ranges {
-				index.addRange(r[0], r[1], nil)
+			var index rangeIndex
+			for id, r := range tc.ranges {
+				index.add(r[0], r[1], id)
+			}
+			for offset := -1; offset <= 22; offset++ {
+				var want []int
+				for id, r := range tc.ranges {
+					if r[0] <= offset && offset < r[1] {
+						want = append(want, id)
+					}
+				}
+				size := func(id int) int { return tc.ranges[id][1] - tc.ranges[id][0] }
+				slices.SortStableFunc(want, func(a, b int) int { return size(b) - size(a) })
+				if got := index.containing(offset); !slices.Equal(got, want) {
+					t.Fatalf("containing(%d) = %v, want %v", offset, got, want)
+				}
 			}
 			if index.nested != tc.nested {
 				t.Fatalf("nested = %v, want %v", index.nested, tc.nested)
-			}
-			for offset := -1; offset <= 22; offset++ {
-				var want [][2]int
-				for _, r := range tc.ranges {
-					if r[0] <= offset && offset < r[1] {
-						want = append(want, r)
-					}
-				}
-				slices.SortStableFunc(want, func(a, b [2]int) int { return (b[1] - b[0]) - (a[1] - a[0]) })
-				var got [][2]int
-				for _, stmt := range index.containing(offset) {
-					got = append(got, [2]int{stmt.start, stmt.end})
-				}
-				if !slices.Equal(got, want) {
-					t.Fatalf("containing(%d) = %v, want %v", offset, got, want)
-				}
 			}
 		})
 	}

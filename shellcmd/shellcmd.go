@@ -295,7 +295,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 	if budget.trackWork {
 		budget.walkInfoNodes += info.workNodes
 		if info.stdinIndex != nil {
-			budget.stdinSteps += info.stdinIndex.steps
+			budget.stdinSteps += info.stdinIndex.steps()
 		}
 	}
 	return info
@@ -2284,14 +2284,36 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 		return nil
 	}
 	if input := c.stdinInput; input != nil {
-		for _, call := range (*calls)[first:] {
-			if isShell(call.Name) && shellReadsHeredoc(call.Args) && remoteStdinIsSSH(file, remoteText, remote.pos, call.Offset) {
-				candidate := call
-				return expandSSHStdin(c, &candidate, input, lineBase, vars, calls)
-			}
+		if candidate, ok := remoteStdinReader(c, file, remoteText, remote.pos, (*calls)[first:]); ok {
+			return expandSSHStdin(c, &candidate, input, lineBase, vars, calls)
 		}
 	}
 	return nil
+}
+
+// remoteStdinReader returns the first shell call of a remote script that reads
+// the ssh command's stdin.
+func remoteStdinReader(c cmd, file *syntax.File, src string, pos []int, remoteCalls []Call) (Call, bool) {
+	var reader *remoteStdin
+	if c.budget.trackWork {
+		defer func() {
+			if reader != nil {
+				c.budget.stdinSteps += reader.steps()
+			}
+		}()
+	}
+	for _, call := range remoteCalls {
+		if !isShell(call.Name) || !shellReadsHeredoc(call.Args) {
+			continue
+		}
+		if reader == nil {
+			reader = newRemoteStdin(file, src, pos)
+		}
+		if reader.reads(call.Offset) {
+			return call, true
+		}
+	}
+	return Call{}, false
 }
 
 type stdinValue struct {
@@ -2299,34 +2321,189 @@ type stdinValue struct {
 	redir     *syntax.Redirect
 }
 
-func remoteStdinIsSSH(file *syntax.File, src string, pos []int, offset int) bool {
-	inner := mappedOffset(offset, pos)
-	if inner < 0 || sshPipelineReader(file, src, pos, offset) || strings.Contains(src, "xargs") && xargsConsumesStdin(file, src, inner) {
+// remoteStdin answers, for calls of one remote ssh script, whether a shell
+// call reads the ssh command's stdin. It walks the script once.
+type remoteStdin struct {
+	file  *syntax.File
+	src   string
+	plain bool // no `<` or `|`: every shell call inherits the ssh stdin
+	// inner maps an outer offset to its first byte in src.
+	inner map[int]int
+	// pipes are the right-hand sides of pipelines, in outer offsets.
+	pipes rangeIndex
+	// xargs are xargs statements, in src offsets.
+	xargs rangeIndex
+	index *stdinIndex
+}
+
+func newRemoteStdin(file *syntax.File, src string, pos []int) *remoteStdin {
+	remote := &remoteStdin{file: file, src: src, plain: !strings.ContainsAny(src, "<|"), inner: make(map[int]int, len(pos))}
+	for i, outer := range pos {
+		if _, ok := remote.inner[outer]; !ok {
+			remote.inner[outer] = i
+		}
+	}
+	hasXargs := strings.Contains(src, "xargs")
+	syntax.Walk(file, func(node syntax.Node) bool {
+		remote.pipes.steps++
+		switch node := node.(type) {
+		case *syntax.BinaryCmd:
+			remote.addPipe(node, pos)
+		case *syntax.Stmt:
+			if hasXargs {
+				remote.addXargs(node)
+			}
+		}
+		return true
+	})
+	if !remote.plain {
+		remote.index = newStdinIndex(file)
+	}
+	return remote
+}
+
+func (remote *remoteStdin) addPipe(binary *syntax.BinaryCmd, pos []int) {
+	op := binary.Op.String()
+	if (op != "|" && op != "|&") || binary.Y == nil {
+		return
+	}
+	start, end := int(binary.Y.Pos().Offset()), int(binary.Y.End().Offset())
+	if start < 0 || end <= start || start >= len(remote.src) {
+		return
+	}
+	if mappedStart, mappedEnd := outerSpan(start, min(end, len(remote.src)), pos); mappedStart >= 0 {
+		remote.pipes.add(mappedStart, mappedEnd, 0)
+	}
+}
+
+func (remote *remoteStdin) addXargs(stmt *syntax.Stmt) {
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return
+	}
+	if name, literal := wordValue(call.Args[0]); literal && commandName(name) == "xargs" {
+		remote.xargs.add(int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset()), 0)
+	}
+}
+
+// reads reports whether the shell call at outer offset reads the ssh stdin:
+// it is not the reader of a pipeline or an xargs child, and no redirection
+// gives its fd 0 another source.
+func (remote *remoteStdin) reads(offset int) bool {
+	inner, ok := remote.inner[offset]
+	if !ok || len(remote.pipes.containing(offset)) > 0 || len(remote.xargs.containing(inner)) > 0 {
 		return false
 	}
-	if !strings.ContainsAny(src, "<|") {
+	if remote.plain {
 		return true
 	}
-	return resolveStdinAt(newStdinIndex(file), inner, stdinValue{inherited: true}).inherited
+	return resolveStdinAt(remote.index, inner, stdinValue{inherited: true}).inherited
+}
+
+func (remote *remoteStdin) steps() int {
+	steps := remote.pipes.steps + remote.xargs.steps
+	if remote.index != nil {
+		steps += remote.index.steps()
+	}
+	return steps
+}
+
+// rangeIndex finds the ranges that hold an offset. Ranges taken from one
+// syntax tree nest or are disjoint; then the ranges holding an offset are the
+// last range starting at or before it and those of its ancestors that still
+// hold it, since an earlier range holding the offset cannot end before that
+// range starts. Ranges that overlap without nesting fall back to a full scan.
+type rangeIndex struct {
+	items  []rangeItem
+	built  bool
+	nested bool
+	// steps counts ranges visited, for work-growth tests.
+	steps int
+}
+
+type rangeItem struct {
+	start, end int
+	id         int
+	// parent is the index of the nearest enclosing item, -1 for none.
+	parent int
+}
+
+func (ranges *rangeIndex) add(start, end, id int) {
+	ranges.items = append(ranges.items, rangeItem{start: start, end: end, id: id, parent: -1})
+	ranges.built = false
+}
+
+func (ranges *rangeIndex) build() {
+	ranges.built, ranges.nested = true, true
+	slices.SortStableFunc(ranges.items, func(a, b rangeItem) int {
+		if a.start != b.start {
+			return a.start - b.start
+		}
+		return b.end - a.end
+	})
+	var open []int
+	for i := range ranges.items {
+		item := &ranges.items[i]
+		for len(open) > 0 && ranges.items[open[len(open)-1]].end <= item.start {
+			open = open[:len(open)-1]
+		}
+		item.parent = -1
+		if len(open) > 0 {
+			item.parent = open[len(open)-1]
+			if item.end > ranges.items[item.parent].end {
+				ranges.nested = false
+			}
+		}
+		open = append(open, i)
+	}
+	ranges.steps += len(ranges.items)
+}
+
+// containing returns the ids of the ranges holding offset, outermost first.
+func (ranges *rangeIndex) containing(offset int) []int {
+	if !ranges.built {
+		ranges.build()
+	}
+	var found []rangeItem
+	if !ranges.nested {
+		for _, item := range ranges.items {
+			ranges.steps++
+			if item.start <= offset && offset < item.end {
+				found = append(found, item)
+			}
+		}
+		slices.SortStableFunc(found, func(a, b rangeItem) int { return (b.end - b.start) - (a.end - a.start) })
+	} else {
+		i, _ := slices.BinarySearchFunc(ranges.items, offset+1, func(item rangeItem, target int) int { return item.start - target })
+		for i--; i >= 0; i = ranges.items[i].parent {
+			ranges.steps++
+			if offset < ranges.items[i].end {
+				found = append(found, ranges.items[i])
+			}
+		}
+		slices.Reverse(found)
+	}
+	ids := make([]int, len(found))
+	for i, item := range found {
+		ids[i] = item.id
+	}
+	return ids
 }
 
 // stdinIndex holds what resolving a call's stdin needs from one parsed file,
 // gathered in a single walk so that each call is resolved without walking the
 // file again.
 type stdinIndex struct {
-	funcs []stdinFunc
-	// stmts are statements with redirections, in walk order, which is the
-	// order of their start offsets.
-	stmts []stdinStmt
-	// open holds the indexes of stmts still open at the last added start.
-	open []int
-	// nested is false once two statement ranges overlap without nesting;
-	// resolveContexts then scans every statement.
-	nested bool
-	// steps counts statements visited by lookups, for work-growth tests.
-	steps int
+	funcs  []stdinFunc
+	fnSpan rangeIndex
+	redirs [][]*syntax.Redirect
+	stmts  rangeIndex
 	// calls maps a literal command name to the offsets of its calls, in walk order.
 	calls map[string][]int
+	// entry caches the stdin a function body starts with, by name and initial value.
+	entry     map[stdinEntryKey]stdinEntry
+	walk      int
+	callSteps int
 }
 
 type stdinFunc struct {
@@ -2334,20 +2511,26 @@ type stdinFunc struct {
 	start, end int
 }
 
-type stdinStmt struct {
-	start, end int
-	redirs     []*syntax.Redirect
-	// parent is the index of the nearest statement enclosing this one, -1 for none.
-	parent int
+type stdinEntryKey struct {
+	name      string
+	inherited bool
+}
+
+type stdinEntry struct {
+	invoked bool
+	input   stdinValue
 }
 
 func newStdinIndex(file *syntax.File) *stdinIndex {
-	index := &stdinIndex{calls: make(map[string][]int), nested: true}
+	index := &stdinIndex{calls: make(map[string][]int), entry: make(map[stdinEntryKey]stdinEntry)}
 	syntax.Walk(file, func(node syntax.Node) bool {
+		index.walk++
 		switch node := node.(type) {
 		case *syntax.FuncDecl:
 			if node.Name != nil && node.Body != nil {
-				index.funcs = append(index.funcs, stdinFunc{node.Name.Value, int(node.Body.Pos().Offset()), int(node.Body.End().Offset())})
+				start, end := int(node.Body.Pos().Offset()), int(node.Body.End().Offset())
+				index.fnSpan.add(start, end, len(index.funcs))
+				index.funcs = append(index.funcs, stdinFunc{node.Name.Value, start, end})
 			}
 		case *syntax.Stmt:
 			index.addStmt(node)
@@ -2362,7 +2545,8 @@ func (index *stdinIndex) addStmt(stmt *syntax.Stmt) {
 		return
 	}
 	if len(stmt.Redirs) > 0 {
-		index.addRange(int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset()), stmt.Redirs)
+		index.stmts.add(int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset()), len(index.redirs))
+		index.redirs = append(index.redirs, stmt.Redirs)
 	}
 	call, ok := stmt.Cmd.(*syntax.CallExpr)
 	if !ok || len(call.Args) == 0 {
@@ -2374,86 +2558,56 @@ func (index *stdinIndex) addStmt(stmt *syntax.Stmt) {
 	}
 }
 
-func (index *stdinIndex) addRange(start, end int, redirs []*syntax.Redirect) {
-	if last := len(index.stmts) - 1; last >= 0 && start < index.stmts[last].start {
-		index.nested = false
-	}
-	for len(index.open) > 0 && index.stmts[index.open[len(index.open)-1]].end <= start {
-		index.open = index.open[:len(index.open)-1]
-	}
-	parent := -1
-	if len(index.open) > 0 {
-		parent = index.open[len(index.open)-1]
-		if end > index.stmts[parent].end {
-			index.nested = false
-		}
-	}
-	index.open = append(index.open, len(index.stmts))
-	index.stmts = append(index.stmts, stdinStmt{start: start, end: end, redirs: redirs, parent: parent})
-}
-
-// containing returns the statements whose range holds offset, outermost first.
-// With nested ranges they are the last statement starting at or before offset
-// and its ancestors: an earlier range holding offset cannot end before that
-// statement starts, so it encloses it.
-func (index *stdinIndex) containing(offset int) []stdinStmt {
-	var found []stdinStmt
-	if !index.nested {
-		for _, stmt := range index.stmts {
-			index.steps++
-			if stmt.start <= offset && offset < stmt.end {
-				found = append(found, stmt)
-			}
-		}
-		slices.SortStableFunc(found, func(a, b stdinStmt) int { return (b.end - b.start) - (a.end - a.start) })
-		return found
-	}
-	i, _ := slices.BinarySearchFunc(index.stmts, offset+1, func(stmt stdinStmt, target int) int { return stmt.start - target })
-	for i--; i >= 0; i = index.stmts[i].parent {
-		index.steps++
-		if offset < index.stmts[i].end {
-			found = append(found, index.stmts[i])
-		}
-	}
-	slices.Reverse(found)
-	return found
+func (index *stdinIndex) steps() int {
+	return index.walk + index.fnSpan.steps + index.stmts.steps + index.callSteps
 }
 
 func resolveStdinAt(index *stdinIndex, offset int, initial stdinValue) stdinValue {
 	if fn, ok := index.enclosingFunction(offset); ok {
-		invoked := false
-		var input stdinValue
-		for _, start := range index.calls[fn.name] {
-			if fn.start <= start && start < fn.end {
-				continue
-			}
-			invoked = true
-			input = index.resolveContexts(start, initial)
-		}
-		if !invoked {
+		entry := index.functionEntry(fn, initial)
+		if !entry.invoked {
 			return stdinValue{}
 		}
-		initial = input
+		initial = entry.input
 	}
 	return index.resolveContexts(offset, initial)
 }
 
+// functionEntry is the stdin a function body starts with: that of its last
+// call outside its own body. Every call in the body shares it, so it is
+// resolved once per function.
+func (index *stdinIndex) functionEntry(fn stdinFunc, initial stdinValue) stdinEntry {
+	key := stdinEntryKey{fn.name, initial.inherited}
+	if entry, ok := index.entry[key]; ok && initial.redir == nil {
+		return entry
+	}
+	var entry stdinEntry
+	for _, start := range index.calls[fn.name] {
+		index.callSteps++
+		if fn.start <= start && start < fn.end {
+			continue
+		}
+		entry = stdinEntry{invoked: true, input: index.resolveContexts(start, initial)}
+	}
+	if initial.redir == nil {
+		index.entry[key] = entry
+	}
+	return entry
+}
+
 // enclosingFunction returns the innermost function whose body holds offset.
 func (index *stdinIndex) enclosingFunction(offset int) (stdinFunc, bool) {
-	var found stdinFunc
-	ok := false
-	for _, fn := range index.funcs {
-		if fn.start <= offset && offset < fn.end {
-			found, ok = fn, true
-		}
+	ids := index.fnSpan.containing(offset)
+	if len(ids) == 0 {
+		return stdinFunc{}, false
 	}
-	return found, ok
+	return index.funcs[ids[len(ids)-1]], true
 }
 
 func (index *stdinIndex) resolveContexts(offset int, initial stdinValue) stdinValue {
 	fds := map[string]stdinValue{"0": initial}
-	for _, context := range index.containing(offset) {
-		for _, redir := range context.redirs {
+	for _, id := range index.stmts.containing(offset) {
+		for _, redir := range index.redirs[id] {
 			fd := "0"
 			if redir.N != nil && redir.N.Value != "" {
 				fd = redir.N.Value
@@ -2474,41 +2628,6 @@ func (index *stdinIndex) resolveContexts(offset int, initial stdinValue) stdinVa
 		}
 	}
 	return fds["0"]
-}
-
-func xargsConsumesStdin(file *syntax.File, src string, offset int) bool {
-	if !strings.Contains(src, "xargs") {
-		return false
-	}
-	consumed := false
-	syntax.Walk(file, func(node syntax.Node) bool {
-		stmt, ok := node.(*syntax.Stmt)
-		if !ok || stmt.Cmd == nil {
-			return true
-		}
-		start, end := int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset())
-		if start > offset || offset >= end {
-			return true
-		}
-		call, ok := stmt.Cmd.(*syntax.CallExpr)
-		if ok && len(call.Args) > 0 {
-			name, literal := wordValue(call.Args[0])
-			if literal && commandName(name) == "xargs" {
-				consumed = true
-			}
-		}
-		return true
-	})
-	return consumed
-}
-
-func mappedOffset(offset int, pos []int) int {
-	for i, outer := range pos {
-		if outer == offset {
-			return i
-		}
-	}
-	return -1
 }
 
 func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int, vars map[string]string, calls *[]Call) error {
@@ -2654,30 +2773,6 @@ func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
 		out.rawEnd[i] = out.pos[i] + 1
 	}
 	return out
-}
-
-func sshPipelineReader(file *syntax.File, src string, pos []int, offset int) bool {
-	reading := false
-	syntax.Walk(file, func(node syntax.Node) bool {
-		binary, ok := node.(*syntax.BinaryCmd)
-		if !ok {
-			return true
-		}
-		op := binary.Op.String()
-		if (op != "|" && op != "|&") || binary.Y == nil {
-			return true
-		}
-		start, end := int(binary.Y.Pos().Offset()), int(binary.Y.End().Offset())
-		if start >= 0 && end > start && start < len(src) {
-			mappedStart, mappedEnd := outerSpan(start, min(end, len(src)), pos)
-			if mappedStart >= 0 && offset >= mappedStart && offset < mappedEnd {
-				reading = true
-				return false
-			}
-		}
-		return true
-	})
-	return reading
 }
 
 func relocateNestedLines(parent cmd, first int, calls *[]Call) {
