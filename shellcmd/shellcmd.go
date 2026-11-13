@@ -4,6 +4,7 @@ package shellcmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 
@@ -837,7 +838,6 @@ func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inh
 		if err := parseNestedWithBudget(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
 			nestedErrs = append(nestedErrs, err)
 		}
-		dropSubstCalls(calls, first, body)
 		preserveMappedRaw(*calls, first, body, src)
 	}
 	return errors.Join(nestedErrs...)
@@ -1384,9 +1384,6 @@ type mapped struct {
 	pos      []int
 	rawStart []int
 	rawEnd   []int
-	// subst are source spans of substitutions the outer shell runs while
-	// expanding a heredoc body or here-string.
-	subst [][2]int
 }
 
 func (m *mapped) String() string { return string(m.text) }
@@ -2705,205 +2702,130 @@ func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int
 	if err := parseNestedWithBudget(body.String(), body.pos, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
 		return err
 	}
-	dropSubstCalls(calls, first, body)
 	preserveMappedRaw(*calls, first, body, c.source)
 	return nil
 }
 
 func stdinRedirectBody(input *syntax.Redirect, src string, vars map[string]string) (mapped, error) {
-	switch {
-	case input.Hdoc != nil && quotedHeredoc(input.Word):
-		return heredocScript(input, src), nil
-	case input.Hdoc != nil:
-		// The parts of a heredoc word can reach past its body into the
-		// delimiter line; the body ends where heredocText ends it.
-		var body mapped
-		limit := src[:int(input.Hdoc.Pos().Offset())+len(heredocText(input, src))]
-		body.expandParts(input.Hdoc.Parts, limit, vars, partHeredoc)
+	var raw string
+	var base int
+	var value string
+	var sourceWord *syntax.Word
+	if input.Hdoc != nil {
+		raw = heredocText(input, src)
+		base = int(input.Hdoc.Pos().Offset())
+		sourceWord = input.Hdoc
+		if quotedHeredoc(input.Word) {
+			return heredocScript(input, src), nil
+		}
+		expanded, err := expandDocument(input.Hdoc, vars)
+		if err != nil {
+			return mapped{}, err
+		}
+		value = expanded
 		if input.Op.String() == "<<-" {
-			body = body.stripLeadingTabs()
+			value = stripHeredocTabs(value)
 		}
-		return body, nil
-	case input.Word != nil:
-		var body mapped
-		body.expandParts(input.Word.Parts, src, vars, partUnquoted)
-		body.pushSpan('\n', -1, -1, -1)
-		return body, nil
+	} else if input.Word != nil {
+		raw = nodeText(input.Word, src)
+		base = int(input.Word.Pos().Offset())
+		sourceWord = input.Word
+		expanded, err := expandDocument(input.Word, vars)
+		if err != nil {
+			return mapped{}, err
+		}
+		value = expanded + "\n"
+	} else {
+		return mapped{}, nil
 	}
-	return mapped{}, nil
+	return mapExpandedText(value, raw, base, sourceWord), nil
 }
 
-// partContext is where a word part stands, which decides what a backslash escapes.
-type partContext int
+func expandDocument(word *syntax.Word, vars map[string]string) (string, error) {
+	pairs := make([]string, 0, len(vars)*2)
+	for name, value := range vars {
+		pairs = append(pairs, name+"="+value)
+	}
+	config := &shExpand.Config{
+		Env: shExpand.ListEnviron(pairs...),
+		CmdSubst: func(_ io.Writer, _ *syntax.CmdSubst) error {
+			return nil
+		},
+		ProcSubst: func(*syntax.ProcSubst) (string, error) { return "", nil },
+	}
+	return shExpand.Document(config, word)
+}
 
-const (
-	partUnquoted partContext = iota
-	partDouble
-	partHeredoc
-)
+func stripHeredocTabs(text string) string {
+	var out strings.Builder
+	for len(text) > 0 {
+		line, rest, found := strings.Cut(text, "\n")
+		out.WriteString(strings.TrimLeft(line, "\t"))
+		if found {
+			out.WriteByte('\n')
+			text = rest
+		} else {
+			break
+		}
+	}
+	return out.String()
+}
 
-// expandParts appends the text the outer shell passes on for parts of a
-// heredoc body or here-string. Literal text is unescaped, and a plain $NAME or
-// ${NAME} with a known literal value takes that value. Any other expansion —
-// an unknown or special parameter, a command, process or arithmetic
-// substitution — is kept as its source text: its value is not known here, and
-// dropping it would hide an argument such as the target of kill. Substitutions
-// the outer shell runs are recorded in subst, so that calls found again inside
-// their kept text can be dropped.
-func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[string]string, context partContext) {
-	for _, part := range parts {
-		start, end := int(part.Pos().Offset()), min(int(part.End().Offset()), len(src))
-		if start >= end {
+func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
+	out := mapped{text: []byte(expanded), pos: make([]int, len(expanded)), rawStart: make([]int, len(expanded)), rawEnd: make([]int, len(expanded))}
+	var omitted [][2]int
+	syntax.Walk(word, func(node syntax.Node) bool {
+		switch node.(type) {
+		case *syntax.ParamExp, *syntax.CmdSubst, *syntax.ProcSubst, *syntax.ArithmExp:
+			start, end := int(node.Pos().Offset())-base, int(node.End().Offset())-base
+			if start >= 0 && end > start && end <= len(raw) {
+				omitted = append(omitted, [2]int{start, end})
+			}
+			return false
+		}
+		return true
+	})
+	slices.SortFunc(omitted, func(a, b [2]int) int { return a[0] - b[0] })
+	var positions [256][]int
+	omit := 0
+	for i := 0; i < len(raw); i++ {
+		for omit < len(omitted) && i >= omitted[omit][1] {
+			omit++
+		}
+		if omit < len(omitted) && i >= omitted[omit][0] {
 			continue
 		}
-		switch p := part.(type) {
-		case *syntax.Lit:
-			if context == partHeredoc {
-				m.unescapeHeredoc(p, src)
-			} else {
-				raw, base := litSource(p, src, context == partDouble)
-				m.unescapeSpans(raw, base, context == partDouble)
-			}
-		case *syntax.SglQuoted:
-			if p.Dollar || context != partUnquoted {
-				m.keepSource(part, start, end, src)
-				continue
-			}
-			m.addSpans(p.Value, start+1)
-		case *syntax.DblQuoted:
-			m.expandParts(p.Parts, src, vars, partDouble)
-		case *syntax.ParamExp:
-			if value, ok := knownParam(p, vars); ok {
-				for i := 0; i < len(value); i++ {
-					m.pushSpan(value[i], -1, start, end)
-				}
-				continue
-			}
-			m.keepSource(part, start, end, src)
-		case *syntax.CmdSubst, *syntax.ProcSubst:
-			m.subst = append(m.subst, [2]int{start, end})
-			m.keepSource(part, start, end, src)
-		default:
-			m.keepSource(part, start, end, src)
+		positions[raw[i]] = append(positions[raw[i]], i)
+	}
+	var heads [256]int
+	next, skip := 0, 0
+	for i := range expanded {
+		b := expanded[i]
+		places := positions[b]
+		head := heads[b]
+		for head < len(places) && places[head] < next {
+			head++
 		}
-	}
-}
-
-// knownParam returns the value of a plain $NAME or ${NAME} whose value the
-// script set to a literal.
-func knownParam(p *syntax.ParamExp, vars map[string]string) (string, bool) {
-	if p.Param == nil || p.Excl || p.Length || p.Width || p.Index != nil || p.Slice != nil || p.Repl != nil || p.Names != 0 || p.Exp != nil {
-		return "", false
-	}
-	value, ok := vars[p.Param.Value]
-	return value, ok
-}
-
-func (m *mapped) keepSource(part syntax.Node, start, end int, src string) {
-	if !validSpan(src, start, end) {
-		// No source span: keep the printed part, so the word is not lost.
-		var printed strings.Builder
-		if err := syntax.NewPrinter().Print(&printed, part); err == nil {
-			for i := 0; i < printed.Len(); i++ {
-				m.pushSpan(printed.String()[i], -1, -1, -1)
-			}
+		for skip < len(omitted) && omitted[skip][1] <= next {
+			skip++
 		}
-		return
-	}
-	for i := start; i < end; i++ {
-		m.pushSpan(src[i], i, i, i+1)
-	}
-}
-
-func (m *mapped) addSpans(text string, base int) {
-	for i := 0; i < len(text); i++ {
-		m.pushSpan(text[i], base+i, base+i, base+i+1)
-	}
-}
-
-// unescapeSpans is unescape that also records the source span of each byte.
-func (m *mapped) unescapeSpans(raw string, base int, double bool) {
-	for i := 0; i < len(raw); i++ {
-		if raw[i] == '\\' && i+1 < len(raw) && (!double || strings.IndexByte("\"\\$`\n", raw[i+1]) >= 0) {
-			i++
-			if raw[i] == '\n' {
-				continue
-			}
-		}
-		m.pushOffset(raw[i], base, i)
-	}
-}
-
-// unescapeHeredoc appends a literal of an unquoted heredoc body: a backslash
-// escapes only $, `, \ and a newline.
-func (m *mapped) unescapeHeredoc(lit *syntax.Lit, src string) {
-	start, end := int(lit.Pos().Offset()), min(int(lit.End().Offset()), len(src))
-	raw, base := lit.Value, -1
-	if validSpan(src, start, end) {
-		raw, base = src[start:end], start
-	}
-	for i := 0; i < len(raw); i++ {
-		if raw[i] == '\\' && i+1 < len(raw) && strings.IndexByte("\\$`\n", raw[i+1]) >= 0 {
-			i++
-			if raw[i] == '\n' {
-				continue
-			}
-		}
-		m.pushOffset(raw[i], base, i)
-	}
-}
-
-func (m *mapped) pushOffset(b byte, base, i int) {
-	if base < 0 {
-		m.pushSpan(b, -1, -1, -1)
-		return
-	}
-	m.pushSpan(b, base+i, base+i, base+i+1)
-}
-
-func (m *mapped) pushSpan(b byte, pos, rawStart, rawEnd int) {
-	m.text = append(m.text, b)
-	m.pos = append(m.pos, pos)
-	m.rawStart = append(m.rawStart, rawStart)
-	m.rawEnd = append(m.rawEnd, rawEnd)
-}
-
-// stripLeadingTabs drops the tabs <<- removes: those at the start of a body
-// line in the source, not ones a parameter value brings.
-func (m mapped) stripLeadingTabs() mapped {
-	var out mapped
-	out.subst = m.subst
-	lineStart := true
-	for i, b := range m.text {
-		if lineStart && b == '\t' && m.pos[i] >= 0 {
+		if skip < len(omitted) && (head == len(places) || places[head] > omitted[skip][1]) {
+			out.pos[i] = -1
+			out.rawStart[i] = base + omitted[skip][0]
+			out.rawEnd[i] = base + omitted[skip][1]
 			continue
 		}
-		lineStart = b == '\n' && m.pos[i] >= 0
-		out.pushSpan(b, m.pos[i], m.rawStart[i], m.rawEnd[i])
+		if head == len(places) {
+			out.pos[i] = -1
+			continue
+		}
+		next = places[head] + 1
+		heads[b] = head + 1
+		out.pos[i] = base + next - 1
+		out.rawStart[i] = out.pos[i]
+		out.rawEnd[i] = out.pos[i] + 1
 	}
 	return out
-}
-
-// dropSubstCalls removes calls found inside the kept text of a substitution
-// the outer shell runs: the outer walk reports them already.
-func dropSubstCalls(calls *[]Call, first int, body mapped) {
-	if len(body.subst) == 0 {
-		return
-	}
-	kept := (*calls)[:first]
-	for _, call := range (*calls)[first:] {
-		inside := false
-		for _, span := range body.subst {
-			if span[0] <= call.Offset && call.Offset < span[1] {
-				inside = true
-				break
-			}
-		}
-		if !inside {
-			kept = append(kept, call)
-		}
-	}
-	*calls = kept
 }
 
 func relocateNestedLines(parent cmd, first int, calls *[]Call) {
