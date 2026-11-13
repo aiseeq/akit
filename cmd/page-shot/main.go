@@ -85,6 +85,7 @@ func run() error {
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "--element: только окно 1536x860@1.25, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.")
 		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, значок не выровнен с текстом или нет разметки Gazette; подробности в stderr.")
+		fmt.Fprintln(fs.Output(), "Подсказки title= (и <title> в SVG) - предупреждение в stderr с числом и первыми 5, код выхода не меняют: их рисует браузер цветами системы.")
 	}
 	at := fs.String("at", "1s", "моменты съёмки после загрузки через запятую (анимация - несколько)")
 	out := fs.String("out", "", "папка кадров (по умолчанию <файл>-shots рядом со страницей)")
@@ -133,10 +134,14 @@ func run() error {
 	}
 	var overflowed, overlapped, misaligned []string
 	gazetteMissing := false
-	for _, vp := range viewports {
+	for i, vp := range viewports {
 		lay, err := shoot(allocCtx, target, dir, vp, moments)
 		if err != nil {
 			return fmt.Errorf("%s: %w", vp.name(), err)
+		}
+		// Tooltips do not depend on the window: one warning is enough.
+		if i == 0 && lay.titles != nil {
+			fmt.Fprint(os.Stderr, lay.titles.report())
 		}
 		if lay.overflow != nil {
 			fmt.Fprint(os.Stderr, lay.overflow.report(vp.name()))
@@ -173,6 +178,7 @@ type layout struct {
 	overflow       *overflow
 	overlap        *overlapResult
 	align          *alignResult
+	titles         *titleTips
 	gazetteMissing bool
 }
 
@@ -216,6 +222,9 @@ func shoot(allocCtx context.Context, target, dir string, vp viewport, moments []
 				return layout{}, err
 			}
 			if lay.align, err = checkAlign(tabCtx); err != nil {
+				return layout{}, err
+			}
+			if lay.titles, err = checkTitles(tabCtx); err != nil {
 				return layout{}, err
 			}
 			buf, err := chromedp.Run(tabCtx, chromedp.FullScreenshot(100))
