@@ -17,7 +17,16 @@ categories:
     rules:
       python-file: {enabled: true}
   duplication: {enabled: true}
-  patterns: {enabled: true}
+  patterns:
+    enabled: true
+    rules:
+      signal-implicit-target:
+        exceptions:
+          - file: "shellcmd/shellcmd_test.go"
+            reason: >-
+              The shell snippets are cases of the parser's tests: the file
+              hands them to shellcmd.Find and runs bash only with -n, which
+              reads a script and runs nothing.
   typesafety: {enabled: true}
   security: {enabled: true}
   deadcode: {enabled: true}
