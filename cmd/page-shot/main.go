@@ -132,6 +132,11 @@ func run() error {
 	if *selector != "" {
 		return shootElements(allocCtx, target, dir, *selector, moments[len(moments)-1])
 	}
+	return shootViewports(allocCtx, target, dir, moments)
+}
+
+// shootViewports снимает страницу на всех окнах и собирает находки раскладки в одну ошибку.
+func shootViewports(allocCtx context.Context, target, dir string, moments []time.Duration) error {
 	var overflowed, overlapped, misaligned []string
 	gazetteMissing := false
 	for i, vp := range viewports {

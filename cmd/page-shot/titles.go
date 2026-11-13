@@ -32,13 +32,17 @@ const titlesJS = `(() => {
     const cls = (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
     return cls.length ? tag + '.' + cls.join('.') : tag;
   };
+  const short = text => {
+    const chars = [...text.trim()];
+    return chars.length > 60 ? chars.slice(0, 60).join('') + '…' : chars.join('');
+  };
   const found = [];
   for (const el of document.querySelectorAll('body [title]')) {
-    const text = el.getAttribute('title').trim();
+    const text = short(el.getAttribute('title'));
     if (text) found.push({selector: describe(el), text});
   }
   for (const el of document.querySelectorAll('svg title')) {
-    const text = el.textContent.trim();
+    const text = short(el.textContent);
     if (text && el.parentElement) found.push({selector: describe(el.parentElement) + ' > title', text});
   }
   return {count: found.length, samples: found};
@@ -62,18 +66,10 @@ func (t *titleTips) report() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "page-shot: предупреждение: подсказок title= на странице: %d — их рисует браузер цветами системы (стили страницы не действуют), кадр их не показывает; нужна своя подсказка в стиле страницы\n", t.Count)
 	for _, s := range t.Samples {
-		fmt.Fprintf(&b, "  %s «%s»\n", s.Selector, truncateRunes(s.Text, 60))
+		fmt.Fprintf(&b, "  %s «%s»\n", s.Selector, s.Text)
 	}
 	if t.Count > len(t.Samples) {
 		fmt.Fprintf(&b, "  ...и ещё %d\n", t.Count-len(t.Samples))
 	}
 	return b.String()
-}
-
-func truncateRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "…"
 }
