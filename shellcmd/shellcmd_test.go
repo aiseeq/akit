@@ -2736,3 +2736,67 @@ func TestRemoteStdinInnerOffsetMatchesFirstByte(t *testing.T) {
 		}
 	}
 }
+
+func TestFindHeredocBodyKeepsExpansionsWithUnknownValues(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		args []string
+		raw  string
+	}{
+		{"bash <<EOF\nkill -9 $PPID\nEOF\n", []string{"-9", "$PPID"}, "kill -9 $PPID"},
+		{"bash <<EOF\nkill -9 ${PPID}\nEOF\n", []string{"-9", "${PPID}"}, "kill -9 ${PPID}"},
+		{"bash <<EOF\nkill $$ $1\nEOF\n", []string{"$$", "$1"}, "kill $$ $1"},
+		{"bash <<EOF\nkill ${X:-1}\nEOF\n", []string{"${X:-1}"}, "kill ${X:-1}"},
+		{"bash <<EOF\nkill $((1+2))\nEOF\n", []string{"$((1+2))"}, "kill $((1+2))"},
+		{"X=5; bash <<EOF\nkill $X $PPID\nEOF\n", []string{"5", "$PPID"}, ""},
+		{"bash <<EOF\nkill \\$PPID\nEOF\n", []string{"$PPID"}, ""},
+		{"bash <<-EOF\n\tkill $PPID\n\tEOF\n", []string{"$PPID"}, "kill $PPID"},
+		{"bash <<< \"kill -9 $PPID\"\n", []string{"-9", "$PPID"}, "kill -9 $PPID"},
+		{"bash <<< kill\\ $PPID\n", []string{"$PPID"}, ""},
+	} {
+		calls, err := Find(tc.src, "kill")
+		if err != nil {
+			t.Fatalf("%q: %v", tc.src, err)
+		}
+		if len(calls) != 1 || !slices.Equal(calls[0].Args, tc.args) || tc.raw != "" && calls[0].Raw != tc.raw {
+			t.Fatalf("%q: kill calls = %+v, want args %q raw %q", tc.src, calls, tc.args, tc.raw)
+		}
+	}
+}
+
+func TestFindHeredocCommandSubstitutionReportedOnceAsLocal(t *testing.T) {
+	src := "bash <<EOF\nkill \"$(cat pid)\" <(cat other)\nEOF\n"
+	calls, err := Calls(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cats, kills []Call
+	for _, call := range calls {
+		switch call.Name {
+		case "cat":
+			cats = append(cats, call)
+		case "kill":
+			kills = append(kills, call)
+		}
+	}
+	// $(...) runs in the outer shell; <(...) is plain text in a heredoc body, run by the inner bash.
+	if len(cats) != 2 || len(cats[0].Via) != 0 || !slices.Equal(cats[1].Via, []string{"bash"}) {
+		t.Fatalf("cat calls = %+v, want $(cat pid) once and local, <(cat other) under bash", cats)
+	}
+	if len(kills) != 1 || !slices.Equal(kills[0].Args, []string{`"$(cat pid)"`, "<(cat other)"}) {
+		t.Fatalf("kill calls = %+v, want the substitutions kept as arguments", kills)
+	}
+}
+
+func TestFindDashHeredocStripsTabsBeforeTheInnerShellReadsIt(t *testing.T) {
+	// Without the stripped tabs the inner terminator "\tX" would not end
+	// cat's heredoc and kill would stay data.
+	src := "bash <<-EOF\n\tcat <<X\n\tdata\n\tX\n\tkill 1\nEOF\n"
+	calls, err := Find(src, "kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || !slices.Equal(calls[0].Args, []string{"1"}) {
+		t.Fatalf("kill calls = %+v, want kill 1 after the inner heredoc", calls)
+	}
+}
