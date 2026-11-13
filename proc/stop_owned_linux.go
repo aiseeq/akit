@@ -75,9 +75,10 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 // as members of the recorded session while its original leader was live. A
 // member may leave the session, or the leader may exit, after the second check;
 // pidfds still pin the exact processes verified in the session, and the
-// requested signal to those processes remains authorized. Before SIGKILL each
-// pinned process is checked again: one that has left the session by then is
-// not killed and is not reported as an error. If the leader exits before any requested
+// requested signal to those processes remains authorized. When the requested
+// signal is not SIGKILL, each pinned process is checked again before the final
+// SIGKILL after grace: one that has left the session by then is not killed and
+// is not reported as an error. If the leader exits before any requested
 // signal is sent, the batch is not signaled and ErrSessionLeaderGone is returned.
 // After at least one requested signal is sent, leader exit ends discovery of
 // new members; the stop waits out grace (or until all pinned members exit) and
@@ -210,7 +211,7 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 		if sig == syscall.SIGKILL || !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(min(5*time.Millisecond, time.Until(deadline)))
 	}
 	if sig != syscall.SIGKILL && !pidfdUnavailable && !guardFailed && !leaderGone {
 		if err := checkOwnedStopGuard(ops); err != nil {
