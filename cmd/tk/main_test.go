@@ -3943,6 +3943,44 @@ func TestNoteTextRejectsForbiddenLineCharsAndNormalizesCRLF(t *testing.T) {
 	}
 }
 
+func TestJournalNoteLineUsesSixSpaceContinuation(t *testing.T) {
+	input := "first\n## X\n---\n===\n- 2026-11-13 12:00 done — x: y\n1. a\n* a\n```\n~~~\n> цитата\n<div>\n\tтаб\n\nlast\n\n"
+	got := journalNoteLine("2026-11-13 12:00", "tester", input)
+	lines := strings.Split(got, "\n")
+	want := []string{
+		"- 2026-11-13 12:00 note — tester: first",
+		"      ## X",
+		"      ---",
+		"      ===",
+		"      - 2026-11-13 12:00 done — x: y",
+		"      1. a",
+		"      * a",
+		"      ```",
+		"      ~~~",
+		"      > цитата",
+		"      <div>",
+		"      \tтаб",
+		"      ",
+		"      last",
+		"      ",
+	}
+	if !reflect.DeepEqual(lines, want) {
+		t.Fatalf("journal note lines = %#v, want %#v", lines, want)
+	}
+	// Одно завершающее LF является разделителем последней строки и убирается;
+	// предшествующий пустой ряд заметки сохраняется.
+	var restored []string
+	for _, line := range lines[1:] {
+		if !strings.HasPrefix(line, "      ") {
+			t.Fatalf("continuation lacks six-space indent: %q", line)
+		}
+		restored = append(restored, strings.TrimPrefix(line, "      "))
+	}
+	if got := strings.Join(append([]string{"first"}, restored...), "\n"); got != strings.TrimSuffix(input, "\n") {
+		t.Fatalf("restored text = %q, want %q", got, strings.TrimSuffix(input, "\n"))
+	}
+}
+
 func TestNoteReadsMultilineTextFromStdin(t *testing.T) {
 	root := t.TempDir()
 	taskDir := filepath.Join(root, "docs", "tasks")
@@ -3983,7 +4021,7 @@ func TestNoteReadsMultilineTextFromStdin(t *testing.T) {
 		t.Fatalf("note: code=%d stderr=%q err=%v", code, errout.String(), readErr)
 	}
 	entries := journalRecords(parseTicketBody(string(updated)))
-	if len(entries) != 1 || len(entries[0]) != 4 || !strings.HasPrefix(entries[0][0], "- ") || entries[0][1] != "  \\## Приёмка" || entries[0][2] != "  \\- 2026-11-13 12:00 note — forged: second line" || entries[0][3] != "  third line" {
+	if len(entries) != 1 || len(entries[0]) != 4 || !strings.HasPrefix(entries[0][0], "- ") || entries[0][1] != "      ## Приёмка" || entries[0][2] != "      - 2026-11-13 12:00 note — forged: second line" || entries[0][3] != "      third line" {
 		t.Fatalf("journal records = %#v; body:\n%s", entries, updated)
 	}
 }

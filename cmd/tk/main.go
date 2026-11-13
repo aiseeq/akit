@@ -3957,20 +3957,10 @@ func renameJournal(actor, oldPath, newPath string) string {
 
 var renameTaskFile = os.Rename
 
-var markdownBlockStartRE = regexp.MustCompile("^ {0,3}(?:#{1,6}(?:[ \\t]|$)|[-+*](?:[ \\t]|$)|[0-9]{1,9}[.)](?:[ \\t]|$))")
-
-func escapeJournalBlockStart(line string) string {
-	indent := len(line) - len(strings.TrimLeft(line, " "))
-	if indent > 3 || !markdownBlockStartRE.MatchString(line) {
-		return line
-	}
-	return line[:indent] + "\\" + line[indent:]
-}
-
 func journalNoteLine(stamp, actor, note string) string {
 	lines := strings.Split(strings.TrimSuffix(note, "\n"), "\n")
 	for i := 1; i < len(lines); i++ {
-		lines[i] = "  " + escapeJournalBlockStart(lines[i])
+		lines[i] = "      " + lines[i]
 	}
 	note = strings.Join(lines, "\n")
 	return fmt.Sprintf("- %s note — %s: %s", stamp, actor, note)
