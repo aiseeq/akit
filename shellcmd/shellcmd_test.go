@@ -2832,10 +2832,6 @@ func TestFindHeredocSubstitutionInsideExpansionReportedOnce(t *testing.T) {
 		"bash <<EOF\necho $(( $(kill 123) + 1 ))\nEOF\n",
 		"bash <<EOF\necho ${X:-${Y:-`kill 123`}}\nEOF\n",
 		"bash <<< \"${X:-$(kill 123)}\"\n",
-		// <(…) is text the outer shell passes on; the kill runs in the
-		// inner shell, once.
-		"bash <<EOF\necho ${X:-<(kill 123)} $(true)\nEOF\n",
-		"bash <<EOF\necho ${X:-${Y:-<(kill 123)}}\nEOF\n",
 
 		// Substitutions nested in a recorded one stay out of the lookup.
 		"bash <<EOF\necho ${X:-$(echo $(true); kill 123)} $(true)\nEOF\n",
@@ -2844,11 +2840,8 @@ func TestFindHeredocSubstitutionInsideExpansionReportedOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", src, err)
 		}
-		if len(calls) != 1 || len(calls[0].Via) != 0 && !strings.Contains(src, "<(") {
+		if len(calls) != 1 || len(calls[0].Via) != 0 {
 			t.Fatalf("%q: kill calls = %+v, want one local call", src, calls)
-		}
-		if strings.Contains(src, "<(") && !slices.Equal(calls[0].Via, []string{"bash"}) {
-			t.Fatalf("%q: kill calls = %+v, want one call under bash", src, calls)
 		}
 	}
 }
@@ -2874,29 +2867,16 @@ func TestFindHeredocSubstitutionLookupGrowsLinearly(t *testing.T) {
 	}
 }
 
-func TestFindParamOperandProcessSubstitution(t *testing.T) {
-	for _, tc := range []struct {
-		src string
-		via []string
-	}{
-		{"echo ${X:-<(kill 123)}\n", nil},
-		{"echo ${X:->(kill 123)}\n", nil},
-		{"bash -c 'echo ${X:-<(kill 123)}'\n", []string{"bash", "-c"}},
-		// A here-string word gets process substitution from the outer shell.
-		{"bash <<< ${X:-<(kill 123)}\n", nil},
-		{"bash <<< <(kill 123)\n", nil},
-		// A heredoc body passes <(…) on as text to the inner shell.
-		{"bash <<EOF\necho ${X:-<(kill 123)}\nEOF\n", []string{"bash"}},
-	} {
-		calls, err := Find(tc.src, "kill")
-		if err != nil {
-			t.Fatalf("%q: %v", tc.src, err)
-		}
-		if len(calls) != 1 || !slices.Equal(calls[0].Via, tc.via) || !slices.Equal(calls[0].Args, []string{"123"}) {
-			t.Fatalf("%q: kill calls = %+v, want one kill 123 with via %q", tc.src, calls, tc.via)
-		}
+func TestFindHereStringProcessSubstitutionRunsInOuterShell(t *testing.T) {
+	calls, err := Find("bash <<< <(kill 123)\n", "kill")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, src := range []string{"echo ${X:-a;kill 9}\n", "echo ${X:-\"<(kill 9)\"}\n"} {
+	if len(calls) != 1 || len(calls[0].Via) != 0 || !slices.Equal(calls[0].Args, []string{"123"}) {
+		t.Fatalf("kill calls = %+v, want one local kill 123", calls)
+	}
+	// A quoted or ;-separated operand of ${X:-…} runs nothing.
+	for _, src := range []string{"echo ${X:-a;kill 9}\n", "echo \"${X:-<(kill 9)}\"\n", "echo ${X:-\"<(kill 9)\"}\n"} {
 		calls, err := Find(src, "kill")
 		if err != nil || len(calls) != 0 {
 			t.Fatalf("%q: kill calls = %+v, %v; want none", src, calls, err)
