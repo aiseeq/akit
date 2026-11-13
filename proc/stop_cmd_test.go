@@ -134,7 +134,6 @@ func TestSignalCmdRefusesInvalidTargetWithoutSignaling(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		cmd.ProcessState = nil
 		_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 	})
@@ -142,11 +141,6 @@ func TestSignalCmdRefusesInvalidTargetWithoutSignaling(t *testing.T) {
 	calls := 0
 	directProcessSignal = func(*os.Process, syscall.Signal) error { calls++; return nil }
 	t.Cleanup(func() { directProcessSignal = oldSignal })
-	cmd.ProcessState = &os.ProcessState{}
-	if err := SignalCmd(cmd, syscall.SIGTERM); !errors.Is(err, os.ErrProcessDone) {
-		t.Fatalf("ProcessState refusal = %v, want os.ErrProcessDone", err)
-	}
-	cmd.ProcessState = nil
 	if _, err := validateCmdSignal(cmd, 0); err == nil {
 		t.Fatal("validateCmdSignal accepted signal zero")
 	}
@@ -341,7 +335,7 @@ func TestCancelByStopDirectHandlerInstallsAndStopsChild(t *testing.T) {
 	called := 0
 	if err := installCancelByStop(cmd, 30*time.Millisecond, syscall.SIGTERM, func(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 		called++
-		return stopCmdDirectState(cmd, grace, sig, false, false)
+		return stopCmdDirect(cmd, grace, sig, false)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -421,37 +415,30 @@ func TestPidfdUnavailableRefusesVerifiedHelpers(t *testing.T) {
 }
 
 func TestStopCmdDirectKillsAtOnceWhenSignalUnsupported(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		check bool
-	}{{"StopCmd", true}, {"CancelByStop", false}} {
-		t.Run(tc.name, func(t *testing.T) {
-			cmd := exec.Command("sleep", "30")
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			oldSignal, oldKill := directProcessSignal, directProcessKill
-			defer func() { directProcessSignal, directProcessKill = oldSignal, oldKill }()
-			directProcessSignal = func(*os.Process, syscall.Signal) error {
-				return fmt.Errorf("signal: %w", errors.ErrUnsupported)
-			}
-			kills := 0
-			directProcessKill = func(process *os.Process) error {
-				kills++
-				return process.Kill()
-			}
-			started := time.Now()
-			result, err := stopCmdDirectState(cmd, 5*time.Second, syscall.SIGTERM, false, tc.check)
-			if err != nil || result.Killed != 1 || !result.SignalUnsupported || kills != 1 {
-				t.Fatalf("stopCmdDirectState = (%+v, %v), kills=%d; want Kill and SignalUnsupported", result, err, kills)
-			}
-			if elapsed := time.Since(started); elapsed > 2*time.Second {
-				t.Fatalf("waited %s for grace although the signal was unsupported", elapsed)
-			}
-			if err := cmd.Wait(); err == nil {
-				t.Fatal("Wait succeeded after Kill")
-			}
-		})
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	oldSignal, oldKill := directProcessSignal, directProcessKill
+	defer func() { directProcessSignal, directProcessKill = oldSignal, oldKill }()
+	directProcessSignal = func(*os.Process, syscall.Signal) error {
+		return fmt.Errorf("signal: %w", errors.ErrUnsupported)
+	}
+	kills := 0
+	directProcessKill = func(process *os.Process) error {
+		kills++
+		return process.Kill()
+	}
+	started := time.Now()
+	result, err := stopCmdDirect(cmd, 5*time.Second, syscall.SIGTERM, false)
+	if err != nil || result.Killed != 1 || !result.SignalUnsupported || kills != 1 {
+		t.Fatalf("stopCmdDirect = (%+v, %v), kills=%d; want Kill and SignalUnsupported", result, err, kills)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("waited %s for grace although the signal was unsupported", elapsed)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("Wait succeeded after Kill")
 	}
 }
 

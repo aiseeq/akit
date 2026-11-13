@@ -13,7 +13,7 @@ import (
 // pidfd fallback was required, Cancel returns ErrPidfdUnavailable; the caller
 // can use ctx.Err() to identify the cancellation cause.
 func CancelByStop(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) error {
-	return installCancelByStop(cmd, grace, sig, stopCmdForCancel)
+	return installCancelByStop(cmd, grace, sig, StopCmd)
 }
 
 // CancelByStopWithObserver installs the same cancellation handler as
@@ -21,5 +21,5 @@ func CancelByStop(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) error 
 // Wait may return the process exit error instead of the Cancel error, so this
 // lets callers still report a degraded direct-child fallback.
 func CancelByStopWithObserver(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, observer func(bool, error)) error {
-	return installCancelByStopWithObserver(cmd, grace, sig, stopCmdForCancel, observer)
+	return installCancelByStopWithObserver(cmd, grace, sig, StopCmd, observer)
 }

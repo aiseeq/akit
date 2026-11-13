@@ -19,7 +19,8 @@ var cmdProcRoot = "/proc"
 // created by cmd.Start. Wait remains the caller's responsibility; before Wait
 // the child PID cannot be reused, and after Wait this returns
 // os.ErrProcessDone without signaling. If pidfd_open is unavailable, it uses
-// os.Process.Signal and SignalCmdWithResult reports the degraded path.
+// os.Process.Signal and SignalCmdWithResult reports the degraded path. It does
+// not read cmd.ProcessState, so it may be called from cmd.Cancel while Wait runs.
 func SignalCmd(cmd *exec.Cmd, sig syscall.Signal) error {
 	_, err := SignalCmdWithResult(cmd, sig)
 	return err
@@ -28,11 +29,7 @@ func SignalCmd(cmd *exec.Cmd, sig syscall.Signal) error {
 // SignalCmdWithResult is SignalCmd with an explicit indication that a direct
 // os.Process fallback was used because pidfd_open was unavailable.
 func SignalCmdWithResult(cmd *exec.Cmd, sig syscall.Signal) (SignalResult, error) {
-	return signalCmdWithResultState(cmd, sig, true)
-}
-
-func signalCmdWithResultState(cmd *exec.Cmd, sig syscall.Signal, checkProcessState bool) (SignalResult, error) {
-	process, err := validateCmdSignalState(cmd, sig, checkProcessState)
+	process, err := validateCmdSignal(cmd, sig)
 	if err != nil {
 		return SignalResult{}, err
 	}
@@ -56,16 +53,9 @@ func signalCmdWithResultState(cmd *exec.Cmd, sig syscall.Signal, checkProcessSta
 // started as its own group/session. If pidfd_open is unavailable it falls back
 // to the direct child only and marks StopResult.Degraded; descendants are then
 // left alone. A nonzero Setpgid Pgid is treated as a direct child for safety.
+// Like SignalCmd it may be called from cmd.Cancel while Wait runs.
 func StopCmd(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
-	return stopCmdLinux(cmd, grace, sig, true)
-}
-
-func stopCmdForCancel(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
-	return stopCmdLinux(cmd, grace, sig, false)
-}
-
-func stopCmdLinux(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, checkProcessState bool) (StopResult, error) {
-	process, err := validateCmdStopState(cmd, grace, sig, checkProcessState)
+	process, err := validateCmdStop(cmd, grace, sig)
 	if err != nil {
 		return StopResult{}, err
 	}
@@ -77,23 +67,23 @@ func stopCmdLinux(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, checkP
 		probe = ensurePidfdAvailable
 	}
 	if err := probe(process.Pid); errors.Is(err, ErrPidfdUnavailable) {
-		return stopCmdDirectState(cmd, grace, sig, true, checkProcessState)
+		return stopCmdDirect(cmd, grace, sig, true)
 	}
 	if ownGroupConfig(cmd.SysProcAttr) {
 		result, err := stopCmdGroup(cmd, grace, sig)
 		if errors.Is(err, ErrPidfdUnavailable) {
-			return stopCmdDirectState(cmd, grace, sig, true, checkProcessState)
+			return stopCmdDirect(cmd, grace, sig, true)
 		}
 		return result, err
 	}
 	degraded := false
 	result, err := stopCmdSingle(process.Pid, grace, func() error {
-		signalResult, signalErr := signalCmdWithResultState(cmd, sig, checkProcessState)
+		signalResult, signalErr := SignalCmdWithResult(cmd, sig)
 		degraded = signalResult.Degraded
 		return signalErr
 	})
 	if errors.Is(err, ErrPidfdUnavailable) {
-		return stopCmdDirectState(cmd, grace, sig, true, checkProcessState)
+		return stopCmdDirect(cmd, grace, sig, true)
 	}
 	result.Degraded = degraded
 	return result, err
