@@ -269,7 +269,7 @@ func TestTicketBodyParseRoundTripsSectionBoundaries(t *testing.T) {
 	if got != body {
 		t.Fatalf("parse/render changed body:\nwant %q\n got %q", body, got)
 	}
-	if got := journalLines(body); !reflect.DeepEqual(got, []string{"- entry"}) {
+	if got := journalLines(body); !reflect.DeepEqual(got, []string{"- entry\n\ncontinuation"}) {
 		t.Fatalf("journal entries = %q", got)
 	}
 	if got := showTail(body, 0); got != body {
@@ -2939,7 +2939,7 @@ func TestJournalJSONUsesListFlagAndShowKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "20260101-1000-MED-journal.md")
-	body := "# Journal\n\nСтатус: открыт\nВид: журнал\n\n## Приёмка\n- check\n\n## Журнал\n- entry\n"
+	body := "# Journal\n\nСтатус: открыт\nВид: журнал\n\n## Приёмка\n- check\n\n## Журнал\n- 2026-01-01 10:00 note — tester: first\n      second\n      third\n- 2026-01-02 10:00 note — tester: next\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2958,11 +2958,13 @@ func TestJournalJSONUsesListFlagAndShowKind(t *testing.T) {
 	if code := showJSON(root, task{path: path, slug: "journal", status: "открыт", prio: "MED", body: body}, &showOut, &showErr); code != 0 {
 		t.Fatalf("show: code %d, stderr %q", code, showErr.String())
 	}
+	t.Logf("tk show --json: %s", strings.TrimSpace(showOut.String()))
 	var showRow map[string]any
 	if err := json.Unmarshal(showOut.Bytes(), &showRow); err != nil {
 		t.Fatal(err)
 	}
-	if showRow["kind"] != "журнал" || len(showRow["journal"].([]any)) != 1 {
+	journal := showRow["journal"].([]any)
+	if showRow["kind"] != "журнал" || len(journal) != 2 || journal[0] != "- 2026-01-01 10:00 note — tester: first\n      second\n      third" || journal[1] != "- 2026-01-02 10:00 note — tester: next" {
 		t.Fatalf("show JSON = %#v", showRow)
 	}
 }
@@ -3969,6 +3971,25 @@ func TestNoteTextRejectsForbiddenLineCharsAndNormalizesCRLF(t *testing.T) {
 	}
 }
 
+func TestNoteTextTrimsLeadingAndTrailingNewlines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "note.txt")
+	if err := os.WriteFile(path, []byte("\n\nfoo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := options{cmd: "note", text: path}
+	var errout bytes.Buffer
+	if code := readTicketText(&o, &errout); code != 0 || o.note != "foo" {
+		t.Fatalf("read note: code=%d note=%q stderr=%q", code, o.note, errout.String())
+	}
+	if err := os.WriteFile(path, []byte("foo  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o = options{cmd: "note", text: path}
+	if code := readTicketText(&o, &errout); code != 0 || o.note != "foo  " {
+		t.Fatalf("trailing spaces lost: code=%d note=%q stderr=%q", code, o.note, errout.String())
+	}
+}
+
 func TestNoteTextTrimsTrailingNewlinesBeforeTimeMarker(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "note.txt")
 	if err := os.WriteFile(path, []byte("было в 14:3x\nвторая\n\n"), 0o644); err != nil {
@@ -3987,7 +4008,7 @@ func TestNoteTextTrimsTrailingNewlinesBeforeTimeMarker(t *testing.T) {
 }
 
 func TestJournalNoteLineUsesSixSpaceContinuation(t *testing.T) {
-	input := "first\n## X\n---\n===\n- 2026-11-13 12:00 done — x: y\n1. a\n* a\n```\n~~~\n> цитата\n<div>\n\tтаб\n\nlast\n\n"
+	input := "first\n## X\n---\n===\n- 2026-11-13 12:00 done — x: y\n1. a\n* a\n```\n~~~\n> цитата\n<div>\n\tтаб\n\nlast"
 	got := journalNoteLine("2026-11-13 12:00", "tester", input)
 	lines := strings.Split(got, "\n")
 	want := []string{
@@ -4005,13 +4026,10 @@ func TestJournalNoteLineUsesSixSpaceContinuation(t *testing.T) {
 		"      \tтаб",
 		"      ",
 		"      last",
-		"      ",
 	}
 	if !reflect.DeepEqual(lines, want) {
 		t.Fatalf("journal note lines = %#v, want %#v", lines, want)
 	}
-	// Одно завершающее LF является разделителем последней строки и убирается;
-	// предшествующий пустой ряд заметки сохраняется.
 	var restored []string
 	for _, line := range lines[1:] {
 		if !strings.HasPrefix(line, "      ") {
@@ -4019,8 +4037,8 @@ func TestJournalNoteLineUsesSixSpaceContinuation(t *testing.T) {
 		}
 		restored = append(restored, strings.TrimPrefix(line, "      "))
 	}
-	if got := strings.Join(append([]string{"first"}, restored...), "\n"); got != strings.TrimSuffix(input, "\n") {
-		t.Fatalf("restored text = %q, want %q", got, strings.TrimSuffix(input, "\n"))
+	if got := strings.Join(append([]string{"first"}, restored...), "\n"); got != input {
+		t.Fatalf("restored text = %q, want %q", got, input)
 	}
 }
 

@@ -28,6 +28,43 @@ func TestWrapLines(t *testing.T) {
 	}
 }
 
+func TestWrapFenceIndentBoundariesAndTab(t *testing.T) {
+	long := strings.Repeat("word ", 10) + "end"
+	fence := strings.Repeat(string(rune(96)), 3)
+	for _, tc := range []struct {
+		name, prefix, suffix string
+		wantWrapped          bool
+	}{
+		{name: "three spaces opens fence", prefix: "   " + fence + "\n", suffix: "\n   " + fence + "\n", wantWrapped: false},
+		{name: "four spaces do not open fence", prefix: "    " + fence + "\n", suffix: "\n", wantWrapped: true},
+		{name: "tab does not open fence", prefix: "\t" + fence + "\n", suffix: "\n", wantWrapped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapLines(tc.prefix+long+tc.suffix, 20)
+			wrapped := wrapLines(long, 20)
+			if strings.Contains(got, wrapped) != tc.wantWrapped {
+				t.Fatalf("wrapLines(%q) = %q; wrapped=%v, want %v", tc.prefix, got, strings.Contains(got, wrapped), tc.wantWrapped)
+			}
+		})
+	}
+}
+
+func TestWrapFenceIndentIsRelativeToListContent(t *testing.T) {
+	long := "- 2026-01-02 10:00 note — tester: " + strings.Repeat("word ", 20) + "end"
+	fence := strings.Repeat(string(rune(96)), 3)
+	insideFence := "- item\n    " + fence + "\n" + long + "\n    " + fence + "\n"
+	got := wrapLines(insideFence, 20)
+	if !strings.Contains(got, long) {
+		t.Fatalf("four-space fence inside list item did not protect its content:\n%s", got)
+	}
+	noteContinuation := "- note: first\n      " + fence + "\n- next: " + strings.Repeat("word ", 20) + "end\n"
+	got = wrapLines(noteContinuation, 20)
+	next := strings.SplitN(noteContinuation, "\n", 3)[2]
+	if !strings.Contains(got, wrapLines(next, 20)) || strings.Contains(got, next) {
+		t.Fatalf("six-space note continuation was treated as a fence:\n%s", got)
+	}
+}
+
 func TestWrapLinesKeepsText(t *testing.T) {
 	long := "- 2026-01-01 10:00 note — a: " + strings.Repeat("слово ", 60) + "конец"
 	got := wrapLines(long+"\n", showWidth)

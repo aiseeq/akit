@@ -1706,12 +1706,13 @@ func readTicketText(o *options, errout io.Writer) int {
 		return fail(errout, errors.New("--text has no ticket sections"))
 	}
 	if o.cmd == "note" {
-		o.text = strings.TrimRight(strings.ReplaceAll(o.text, "\r\n", "\n"), "\n")
+		o.text = strings.ReplaceAll(o.text, "\r\n", "\n")
 		for i, line := range strings.Split(o.text, "\n") {
 			if !utf8.ValidString(line) || strings.ContainsFunc(line, notInLine) {
 				return fail(errout, fmt.Errorf("note text line %d contains a forbidden character", i+1))
 			}
 		}
+		o.text = strings.Trim(o.text, "\n")
 		if strings.TrimSpace(o.text) == "" {
 			return fail(errout, errors.New("note text must not be empty"))
 		}
@@ -2111,8 +2112,8 @@ func matchesID(t task, id string) bool {
 	if t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id {
 		return true
 	}
-	for _, line := range journalLines(t.body) {
-		if m := renameHistoryRE.FindStringSubmatch(line); m != nil && (m[1] == id || strings.TrimSuffix(m[1], ".md") == id) {
+	for _, record := range journalLines(t.body) {
+		if m := renameHistoryRE.FindStringSubmatch(journalRecordHeader(record)); m != nil && (m[1] == id || strings.TrimSuffix(m[1], ".md") == id) {
 			return true
 		}
 	}
@@ -2474,7 +2475,8 @@ func opener(s string) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	part := strings.SplitN(lines[0], " — ", 2)
+	first, _, _ := strings.Cut(lines[0], "\n")
+	part := strings.SplitN(first, " — ", 2)
 	if len(part) != 2 {
 		return ""
 	}
@@ -2486,19 +2488,17 @@ func opener(s string) string {
 }
 
 func journalLines(s string) []string {
-	doc := parseTicketBody(s)
-	entries := make([]string, 0)
-	for _, section := range doc.sections {
-		if section.heading != "## Журнал" {
-			continue
-		}
-		for _, line := range section.lines {
-			if strings.HasPrefix(line, "- ") {
-				entries = append(entries, line)
-			}
-		}
+	records := journalRecords(parseTicketBody(s))
+	entries := make([]string, 0, len(records))
+	for _, record := range records {
+		entries = append(entries, strings.Join(record, "\n"))
 	}
 	return entries
+}
+
+func journalRecordHeader(record string) string {
+	header, _, _ := strings.Cut(record, "\n")
+	return header
 }
 
 func journalRecords(doc ticketDocument) [][]string {
@@ -2842,13 +2842,14 @@ func validatePlanSection(body string) error {
 func planSkipReason(body, name string) (string, bool) {
 	lines := journalLines(body)
 	for i := len(lines) - 1; i >= 0; i-- {
-		if m := planAddRE.FindStringSubmatch(lines[i]); m != nil && m[3] == name {
+		line := journalRecordHeader(lines[i])
+		if m := planAddRE.FindStringSubmatch(line); m != nil && m[3] == name {
 			return "", false
 		}
-		if m := planUnskipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
+		if m := planUnskipRE.FindStringSubmatch(line); m != nil && m[1] == name {
 			return "", false
 		}
-		if m := planSkipRE.FindStringSubmatch(lines[i]); m != nil && m[1] == name {
+		if m := planSkipRE.FindStringSubmatch(line); m != nil && m[1] == name {
 			return strings.TrimSpace(m[2]), true
 		}
 	}
@@ -3955,7 +3956,7 @@ func renameJournal(actor, oldPath, newPath string) string {
 var renameTaskFile = os.Rename
 
 func journalNoteLine(stamp, actor, note string) string {
-	lines := strings.Split(strings.TrimSuffix(note, "\n"), "\n")
+	lines := strings.Split(note, "\n")
 	for i := 1; i < len(lines); i++ {
 		lines[i] = "      " + lines[i]
 	}
@@ -4056,8 +4057,8 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 // in time, so the latest time wins, not the last line.
 func journalActors(body string) map[string]string {
 	actors := map[string]string{}
-	for _, line := range journalLines(body) {
-		m := journalActorRE.FindStringSubmatch(line)
+	for _, record := range journalLines(body) {
+		m := journalActorRE.FindStringSubmatch(journalRecordHeader(record))
 		if m == nil {
 			continue
 		}
@@ -4545,8 +4546,8 @@ func nextLine(choice nextChoice, errout io.Writer) string {
 
 // completion — проверяющий и проверка последней строки «готово» журнала: тикет могли открыть заново.
 func completion(s string) (checker, check, checkerSession string) {
-	for _, line := range journalLines(s) {
-		_, after, ok := strings.Cut(line, " готово — ")
+	for _, record := range journalLines(s) {
+		_, after, ok := strings.Cut(journalRecordHeader(record), " готово — ")
 		if !ok {
 			continue
 		}
