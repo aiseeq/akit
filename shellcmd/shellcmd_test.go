@@ -1192,6 +1192,135 @@ func TestWrapperArgumentScansAlwaysAdvance(t *testing.T) {
 	}
 }
 
+func TestLiteralPipeBoundaries(t *testing.T) {
+	for _, binary := range []*syntax.BinaryCmd{
+		{X: nil, Y: &syntax.Stmt{}},
+		{X: &syntax.Stmt{}, Y: nil},
+	} {
+		ok, err := collectPipedLiteralWalkInfo(binary, "", nil, &walkInfo{})
+		if ok || err != nil {
+			t.Fatalf("incomplete pipe = %t, %v", ok, err)
+		}
+	}
+	for _, src := range []string{
+		`echo 'kill -1' >file | bash`,
+		`echo 'kill -1' | bash <file`,
+		`(echo 'kill -1') | bash`,
+		`X=y | bash`,
+		`printf '%b' 'echo hi\c\nkill -1' | bash`,
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want no calls", src, calls, err)
+		}
+	}
+	calls, err := Find(`echo -e 'echo hi\c\nkill -1' | bash`, "kill")
+	if err != nil || len(calls) != 0 {
+		t.Errorf("echo stop = %#v, %v; want no calls", calls, err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{
+		{`\c`, 0}, {`a\c`, 1}, {`\\c`, -1}, {`\\\c`, 2}, {"x", -1},
+	} {
+		if got := echoStop(tc.value); got != tc.want {
+			t.Errorf("echoStop(%q) = %d; want %d", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestLiteralPrintfBoundaries(t *testing.T) {
+	for _, args := range [][]string{nil, {"-x"}, {"%"}, {"%q", "value"}} {
+		body, ok, err := literalPrintfBody(args)
+		if ok || err != nil {
+			t.Errorf("literalPrintfBody(%q) = %q, %t, %v; want unknown", args, body.String(), ok, err)
+		}
+	}
+	body, ok, err := literalPrintfBody([]string{"%s", "a", "b"})
+	if !ok || err != nil || body.String() != "ab" {
+		t.Errorf("repeated printf = %q, %t, %v", body.String(), ok, err)
+	}
+	_, ok, err = literalPrintfBody([]string{strings.Repeat("a", maxNestedScriptBytes+1)})
+	if ok || err == nil {
+		t.Errorf("oversized printf = %t, %v; want error", ok, err)
+	}
+}
+
+func TestEchoLiteralOptions(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "\n"},
+		{[]string{"-en", `a\nb`}, "a\nb"},
+		{[]string{"-ne", `a\nb`}, "a\nb"},
+		{[]string{"-neE", `a\nb`}, `a\nb`},
+		{[]string{"-nE", `a\nb`}, `a\nb`},
+		{[]string{"-nx", "a"}, "-nx a\n"},
+		{[]string{"-en1", "a"}, "-en1 a\n"},
+		{[]string{"-", "a"}, "- a\n"},
+	} {
+		parts := make([]mapped, len(tc.args))
+		for i, arg := range tc.args {
+			parts[i].add(arg, -1)
+		}
+		body, err := literalEchoBody(tc.args, parts)
+		if err != nil || body.String() != tc.want {
+			t.Errorf("echo %q = %q, %v; want %q", tc.args, body.String(), err, tc.want)
+		}
+	}
+}
+
+func TestScriptWordsEmptyLiteralAndUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offset int
+		want   bool
+	}{
+		{"eval", 0, true},
+		{"eval", -1, false},
+		{"watch", 0, false},
+	} {
+		c := cmd{call: Call{Name: tc.name}, words: []word{{}, {offset: tc.offset}}}
+		_, ok := mappedScriptWords(c, []scriptArg{{index: 0}})
+		if ok != tc.want {
+			t.Errorf("%s offset %d = %t; want %t", tc.name, tc.offset, ok, tc.want)
+		}
+	}
+}
+
+func TestKillGuardGapsRound2(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		args []string
+		via  []string
+	}{
+		{`eval '' 'kill -1'`, []string{"-1"}, []string{"eval"}},
+		{`eval "kill $PPID" ''`, []string{"$PPID"}, []string{"eval"}},
+		{`eval "" kill -1`, []string{"-1"}, []string{"eval"}},
+		{`echo -en 'kill -1' | bash`, []string{"-1"}, []string{"pipe", "bash"}},
+		{`echo -ne 'kill -1' | bash`, []string{"-1"}, []string{"pipe", "bash"}},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Find(tc.src, "kill")
+			if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, tc.args) || !reflect.DeepEqual(calls[0].Via, tc.via) {
+				t.Fatalf("Find = %#v, %v; want args %v via %v", calls, err, tc.args, tc.via)
+			}
+		})
+	}
+	calls, err := Find(`eval '' ''`, "kill")
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("empty eval = %#v, %v", calls, err)
+	}
+	for _, src := range []string{`eval $CMD`, `eval "${CMD}"`} {
+		calls, err := Calls(src)
+		if err != nil || len(calls) != 2 || calls[1].Name != "$CMD" && calls[1].Name != "${CMD}" || !reflect.DeepEqual(calls[1].Via, []string{"eval"}) {
+			t.Errorf("dynamic eval %q = %#v, %v", src, calls, err)
+		}
+	}
+}
+
 func TestKillGuardGaps(t *testing.T) {
 	for _, tc := range []struct {
 		src       string

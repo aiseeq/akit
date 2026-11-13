@@ -395,14 +395,16 @@ func literalPipeBody(name string, args []*syntax.Word, src string, vars map[stri
 func literalEchoBody(values []string, parts []mapped) (mapped, error) {
 	var body mapped
 	newline, expand := true, false
-	for len(values) > 0 && (values[0] == "-n" || values[0] == "-E" || values[0] == "-e") {
-		switch values[0] {
-		case "-n":
-			newline = false
-		case "-e":
-			expand = true
-		case "-E":
-			expand = false
+	for len(values) > 0 && len(values[0]) > 1 && values[0][0] == '-' && strings.Trim(values[0][1:], "neE") == "" {
+		for _, option := range values[0][1:] {
+			switch option {
+			case 'n':
+				newline = false
+			case 'e':
+				expand = true
+			case 'E':
+				expand = false
+			}
 		}
 		values, parts = values[1:], parts[1:]
 	}
@@ -3275,7 +3277,7 @@ func mappedScriptWords(c cmd, words []scriptArg) (mapped, bool) {
 			return mapped{}, false
 		}
 		w := c.words[arg.index+1]
-		if w.script == "" || arg.offset > len(w.script) {
+		if w.script == "" && (c.call.Name != "eval" || w.offset < 0) || arg.offset > len(w.script) {
 			return mapped{}, false
 		}
 		if i > 0 {
