@@ -80,12 +80,15 @@ import (
 	"unicode/utf8"
 )
 
+const contextRussianNamePattern = `(?:(?:\*\*|__|\x60|["'«])?)(?:[Пп][Аа][Рр][Оо][Лл][\p{L}]*|[Тт][Оо][Кк][Ее][Нн][\p{L}]*|[Кк][Лл][Юю][Чч][\p{L}]*)(?:["'»]|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}\p{N}]+){0,4}[ \t]*(?::=|=>|=|:|—|–| - )(?:(?:\*\*|__|\x60)[ \t]+)?`
+
 var (
-	privateKeyRE         = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
-	awsRE                = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	escapeRE             = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
-	contextNameRE        = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
-	contextRussianNameRE = regexp.MustCompile(`(?:(?:\*\*|__|\x60|["'«])?)(?:[Пп][Аа][Рр][Оо][Лл][\p{L}]*|[Тт][Оо][Кк][Ее][Нн][\p{L}]*|[Кк][Лл][Юю][Чч][\p{L}]*)(?:["'»]|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}\p{N}]+){0,4}[ \t]*(?::=|=>|=|:|—|–| - )(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	privateKeyRE           = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
+	awsRE                  = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	escapeRE               = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
+	contextNameRE          = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
+	contextRussianNameRE   = regexp.MustCompile(contextRussianNamePattern)
+	contextRussianNameAtRE = regexp.MustCompile(`\A` + contextRussianNamePattern)
 
 	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
@@ -242,7 +245,13 @@ func buildAnchorAutomaton() anchorAutomaton {
 // contextAnchorGroups returns the groups of the anchors found in text, in one
 // pass over it.
 func contextAnchorGroups(text string) anchorGroup {
+	groups, _ := contextAnchorScan(text)
+	return groups
+}
+
+func contextAnchorScan(text string) (anchorGroup, []int) {
 	var groups anchorGroup
+	var russianStarts []int
 	automaton := &contextAnchorAutomaton
 	state := uint16(0)
 	for i := 0; i < len(text); i++ {
@@ -252,15 +261,18 @@ func contextAnchorGroups(text string) anchorGroup {
 		}
 		for _, index := range automaton.anchors[state&^anchorHit] {
 			anchor := contextAnchors[index]
+			if anchor.group == anchorRuName {
+				russianStarts = append(russianStarts, i+1-len(anchor.word)-2)
+			}
 			if groups&anchor.group == 0 && anchorEdgeAt(text, i+1-len(anchor.word), i+1, anchor.edge) {
 				groups |= anchor.group
 			}
 		}
 	}
-	if groups&anchorRuName != 0 && russianHeaderCandidateInText(text) {
+	if len(russianStarts) != 0 {
 		groups |= anchorRuCandidate
 	}
-	return groups
+	return groups, russianStarts
 }
 
 func isNameByte(c byte) bool {
@@ -423,9 +435,9 @@ func (m *masking) mask(text string) string {
 			scan = nil // replacements invalidate byte offsets and run metadata
 		}
 	}
-	if groups := contextAnchorGroups(text); groups != 0 {
+	if groups, russianStarts := contextAnchorScan(text); groups != 0 {
 		text = maskJSONContext(text, m, groups)
-		text = maskContext(text, m, groups)
+		text = maskContext(text, m, groups, russianStarts)
 	}
 	if m.found[liveKeyKind] != 0 {
 		text = m.dropLiveKeyTails(text)
@@ -501,7 +513,7 @@ func (m *masking) extend(index int, tail string) {
 }
 
 // Context rules recognize values after familiar command and configuration names.
-func maskContext(text string, m *masking, groups anchorGroup) string {
+func maskContext(text string, m *masking, groups anchorGroup, russianStarts []int) string {
 	matches := make([]contextMatch, 0)
 	if groups&anchorHeader != 0 {
 		matches = append(matches, headerMatches(text)...)
@@ -511,7 +523,7 @@ func maskContext(text string, m *masking, groups anchorGroup) string {
 		matches = append(matches, flagMatches(text)...)
 	}
 	if groups&anchorRuCandidate != 0 {
-		matches = append(matches, russianNameMatches(text)...)
+		matches = append(matches, russianNameMatches(text, russianStarts)...)
 	}
 	if groups&anchorURL != 0 {
 		matches = append(matches, urlMatches(text)...)
@@ -793,36 +805,6 @@ func headerMatches(text string) []contextMatch {
 	return matches
 }
 
-func russianHeaderCandidateInText(text string) bool {
-	for at := 0; at < len(text); at++ {
-		if russianNameAnchorAt(text, at) && russianHeaderCandidateAt(text, at-2) {
-			return true
-		}
-	}
-	return false
-}
-
-func russianNameAnchorAt(text string, at int) bool {
-	if at+8 > len(text) || text[at] != 0xD0 && text[at] != 0xD1 {
-		return false
-	}
-	for _, base := range [...]string{"арол", "окен"} {
-		if russianAnchorBytesMatch(text[at:at+len(base)], base) {
-			return true
-		}
-	}
-	return at+6 <= len(text) && russianAnchorBytesMatch(text[at:at+6], "люч")
-}
-
-func russianAnchorBytesMatch(text, base string) bool {
-	for i := range len(base) {
-		if anchorFold[text[i]] != anchorFold[base[i]] {
-			return false
-		}
-	}
-	return true
-}
-
 func russianHeaderCandidateAt(text string, wordStart int) bool {
 	end, ok := russianCandidateLabelEnd(text, wordStart)
 	return ok && russianCandidateHasDelimiter(text, end)
@@ -912,11 +894,19 @@ func russianDelimiterAtStart(text string) string {
 	return ""
 }
 
-func russianNameMatches(text string) []contextMatch {
+func russianNameMatches(text string, starts []int) []contextMatch {
 	var matches []contextMatch
-	for _, ix := range contextRussianNameRE.FindAllStringIndex(text, -1) {
-		start, end := ix[0], ix[1]
-		if !russianNameBoundaryAt(text, start) || withinMaskMarker(text, start) || withinMaskMarker(text, end) {
+	for _, wordStart := range starts {
+		if !russianHeaderCandidateAt(text, wordStart) {
+			continue
+		}
+		start := russianCandidateBoundaryStart(text, wordStart)
+		ix := contextRussianNameAtRE.FindStringIndex(text[start:])
+		if ix == nil {
+			continue
+		}
+		end := start + ix[1]
+		if withinMaskMarker(text, start) || withinMaskMarker(text, end) {
 			continue
 		}
 		name, kind, delimiter := russianNameFromHeader(text[start:end])
@@ -924,10 +914,9 @@ func russianNameMatches(text string) []contextMatch {
 			continue
 		}
 		value, ok := russianContextValue(text, end, name, kind, delimiter)
-		if !ok {
-			continue
+		if ok {
+			matches = append(matches, contextMatch{value.start, value.end, kind})
 		}
-		matches = append(matches, contextMatch{value.start, value.end, kind})
 	}
 	return matches
 }

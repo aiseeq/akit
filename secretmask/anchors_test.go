@@ -91,6 +91,10 @@ func TestContextAnchorGroups(t *testing.T) {
 
 func TestMaskRussianLabels(t *testing.T) {
 	secret := "Zq7xW9vK2mPq8Rt"
+	quoted := `"токен": ` + secret
+	if ix := contextRussianNameRE.FindStringIndex(quoted); ix == nil || ix[0] != 0 {
+		t.Fatalf("Russian quoted label was not matched from opening quote: %v", ix)
+	}
 	for _, label := range []string{
 		"пароль", "Пароль", "ПАРОЛЬ", "паРОЛЬ", "ПаРоЛь", "пароля", "паролем",
 		"токен", "Токен", "ТОКЕН", "тОкЕн", "токена",
@@ -103,6 +107,7 @@ func TestMaskRussianLabels(t *testing.T) {
 		}
 	}
 	for _, input := range []string{
+		"автопароль пароль: " + secret,
 		"Пароль учётки: " + secret,
 		"тОкЕн= " + secret,
 		"КЛЮЧ: " + secret,
