@@ -34,6 +34,9 @@ type DiskNow struct {
 	OpenMs int64
 	// OpenCapped — идущая заморозка по своим детальным записям признана ожиданием под потолком io.max.
 	OpenCapped bool
+	// Deprecated: always nil. The disk state source no longer sends a task kind profile;
+	// the field stays so that callers which still read it keep building.
+	Profile json.RawMessage
 }
 
 // DiskCapped — признание источника по окну: ждали только упёршиеся в потолок io.max cgroup
