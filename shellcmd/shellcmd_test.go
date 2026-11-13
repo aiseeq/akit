@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -2764,6 +2765,79 @@ func TestFindHeredocBodyKeepsExpansionsWithUnknownValues(t *testing.T) {
 		if len(calls) != 1 || !slices.Equal(calls[0].Args, tc.args) || tc.raw != "" && calls[0].Raw != tc.raw {
 			t.Fatalf("%q: kill calls = %+v, want args %q raw %q", tc.src, calls, tc.args, tc.raw)
 		}
+	}
+}
+
+func TestCallLiteralArguments(t *testing.T) {
+	parentPID := string([]byte{'$', 'P', 'P', 'I', 'D'})
+	tests := []struct {
+		name    string
+		src     string
+		args    []string
+		literal []bool
+		raw     string
+	}{
+		{"bare expansion", "kill $PPID", []string{"$PPID"}, []bool{false}, ""},
+		{"escaped dollar", `kill \$PPID`, []string{"$PPID"}, []bool{true}, ""},
+		{"single quotes", `kill '$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+		{"double quotes", `kill "$PPID"`, []string{`"$PPID"`}, []bool{false}, ""},
+		{"nested single quoted script", `bash -c 'kill \$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+		{"nested double quoted script", `bash -c "kill \$PPID"`, []string{"$PPID"}, []bool{false}, ""},
+		{"wrapper", "sudo kill '" + parentPID + "'", []string{"$PPID"}, []bool{true}, ""},
+		{"split argv0", `K='kill option'; $K '$PPID'`, []string{"option", "$PPID"}, []bool{false, true}, ""},
+		{"env wrapper", `env X=1 kill '$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+		{"nice wrapper", `nice -n 5 kill '$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+		{"timeout wrapper", "timeout 3 kill '" + parentPID + "'", []string{"$PPID"}, []bool{true}, ""},
+		{"exec wrapper", "exec kill '" + parentPID + "'", []string{"$PPID"}, []bool{true}, ""},
+		{"known variable", "X=1; bash <<EOF\nkill $X\nEOF", []string{"1"}, []bool{false}, ""},
+		{"quoted heredoc", "bash <<'EOF'\nkill \\$PPID\nEOF", []string{"$PPID"}, []bool{true}, ""},
+		{"unquoted heredoc", "bash <<EOF\nkill \\$PPID\nEOF", []string{"$PPID"}, []bool{false}, `kill \$PPID`},
+		{"quoted heredoc expansion", "bash <<'EOF'\nkill $PPID\nEOF", []string{"$PPID"}, []bool{false}, ""},
+		{"unquoted heredoc expansion", "bash <<EOF\nkill $PPID\nEOF", []string{"$PPID"}, []bool{false}, ""},
+		{"here string", `bash <<< "kill '\$PPID'"`, []string{"$PPID"}, []bool{true}, ""},
+		{"ssh nested script", `ssh host 'kill \$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != 1 || !slices.Equal(calls[0].Args, tt.args) {
+				t.Fatalf("kill calls = %+v, want args %q", calls, tt.args)
+			}
+			for i, want := range tt.literal {
+				if got := calls[0].ArgLiteral(i); got != want {
+					t.Errorf("ArgLiteral(%d) = %v, want %v", i, got, want)
+				}
+			}
+			if calls[0].ArgLiteral(len(tt.args)) {
+				t.Errorf("ArgLiteral(%d) = true outside Args", len(tt.args))
+			}
+			if tt.raw != "" && calls[0].Raw != tt.raw {
+				t.Fatalf("Raw = %q, want original source %q", calls[0].Raw, tt.raw)
+			}
+		})
+	}
+}
+
+func TestCallLiteralMaskSizeAndBounds(t *testing.T) {
+	size := unsafe.Sizeof(Call{})
+	t.Logf("sizeof(Call) = %d", size)
+	if size > 128 {
+		t.Fatalf("sizeof(Call) = %d, want at most 128", size)
+	}
+	call := Call{Args: make([]string, 33), literalMask: ^uint32(0)}
+	if !call.ArgLiteral(31) {
+		t.Fatal("ArgLiteral(31) = false, want true")
+	}
+	for _, i := range []int{-1, 32, 33} {
+		if call.ArgLiteral(i) {
+			t.Errorf("ArgLiteral(%d) = true, want false", i)
+		}
+	}
+	if (Call{Args: []string{"x"}}).ArgLiteral(0) {
+		t.Fatal("unset literal mask reports a literal argument")
 	}
 }
 

@@ -21,6 +21,7 @@ type Call struct {
 	// Name — имя программы без каталога; "" — в слове имени есть `$(` или обратная кавычка.
 	Name string
 	Args []string
+	// Raw — исходный текст команды; во вложенных скриптах он может отличаться от текста, который исполняет внутренняя оболочка.
 	Raw  string
 	Line int
 	Via  []string
@@ -36,6 +37,13 @@ type Call struct {
 	Background bool
 	// ScriptInput сообщает, что оболочка исполняет неизвестный текст из stdin или process substitution.
 	ScriptInput bool
+	literalMask uint32
+}
+
+// ArgLiteral сообщает, что оболочка не раскрывает Args[i] (Lit, '…' или экранирование без подстановок).
+// Для i вне Args и i ≥ 32 возвращает false: раскрытие аргумента не исключено.
+func (c Call) ArgLiteral(i int) bool {
+	return i >= 0 && i < len(c.Args) && i < 32 && c.literalMask&(uint32(1)<<uint(i)) != 0
 }
 
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
@@ -52,9 +60,10 @@ type cmd struct {
 
 // word — место слова в исходной команде и его текст как скрипта.
 type word struct {
-	offset int    // смещение в исходной команде; -1 — слово не литерал
-	script string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
-	pos    []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
+	offset  int    // смещение в исходной команде; -1 — источник слова не найден
+	literal bool   // true — значение слова не содержит раскрытия оболочки
+	script  string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
+	pos     []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -131,6 +140,10 @@ func parse(src string, lineBase int, inherited []string, vars map[string]string,
 }
 
 func parseWithBudget(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+	return parseWithSourceMap(src, nil, lineBase, inherited, vars, calls, budget)
+}
+
+func parseWithSourceMap(src string, sourceMap []int, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
@@ -138,15 +151,15 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
-	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, budget)
+	return walkFileWithSourceMap(file, full, src, sourceMap, lineBase, inherited, vars, calls, budget)
 }
 
-func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+func walkFileWithSourceMap(file *syntax.File, full, src string, sourceMap []int, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
 	first := len(*calls)
-	err := walkCalls(file, full, lineBase, inherited, vars, calls, budget)
+	err := walkCalls(file, full, sourceMap, lineBase, inherited, vars, calls, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -209,10 +222,10 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 	return nil, full, err
 }
 
-func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+func walkCalls(file *syntax.File, src string, sourceMap []int, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
-	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
+	walker := callWalker{src: src, sourceMap: sourceMap, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -643,6 +656,7 @@ func shellInputNextTargetWithScan(name string, args []string, argOffset int, sca
 
 type callWalker struct {
 	src        string
+	sourceMap  []int
 	lineBase   int
 	inherited  []string
 	vars       map[string]string
@@ -749,7 +763,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	if !needsScripts {
 		needsScripts = mainShellArgIndex(args[1:]) >= 0
 	}
-	words, err := cmdWords(call.Args, w.src, needsScripts, literals)
+	words, err := cmdWords(call.Args, w.src, needsScripts, literals, w.sourceMap)
 	if err != nil {
 		w.parseErr = fmt.Errorf("shellcmd: expand command word: %w", err)
 		return
@@ -1244,9 +1258,9 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	maps.Copy(nestedVars, vars)
 	var err error
 	if file == nil {
-		err = parseWithBudget(src, lineBase, via, nestedVars, &nestedCalls, budget)
+		err = parseWithSourceMap(src, pos, lineBase, via, nestedVars, &nestedCalls, budget)
 	} else {
-		err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, budget)
+		err = walkFileWithSourceMap(file, full, src, pos, lineBase, via, nestedVars, &nestedCalls, budget)
 	}
 	if err != nil {
 		var nestedErr *NestedError
@@ -1327,10 +1341,11 @@ func heredocBodyLen(text, delim string) int {
 }
 
 // cmdWords — место и текст скрипта каждого слова команды.
-func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) ([]word, error) {
+func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool, sourceMap []int) ([]word, error) {
 	ws := make([]word, len(args))
 	for i, arg := range args {
 		ws[i].offset = -1
+		ws[i].literal = literals[i]
 		if scripts {
 			var err error
 			ws[i].script, ws[i].pos, err = wordScript(arg, src, literals[i])
@@ -1340,9 +1355,27 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) ([
 		}
 		if literals[i] {
 			ws[i].offset = int(arg.Pos().Offset())
+			if !sourceSpanMapped(int(arg.Pos().Offset()), int(arg.End().Offset()), sourceMap) {
+				ws[i].literal = false
+			}
 		}
 	}
 	return ws, nil
+}
+
+func sourceSpanMapped(start, end int, sourceMap []int) bool {
+	if len(sourceMap) == 0 {
+		return true
+	}
+	if start < 0 || end > len(sourceMap) || start >= end {
+		return false
+	}
+	for _, offset := range sourceMap[start:end] {
+		if offset < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // wordScript returns the shell text of a word and its source offsets.
@@ -1781,6 +1814,12 @@ func (c cmd) via(more ...string) []string {
 func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
 	if c.expansionDepth > maxNestedScripts {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: command expansion depth exceeds %d", maxNestedScripts)}
+	}
+	c.call.literalMask = 0
+	for i := 0; i < len(c.call.Args) && i < 32; i++ {
+		if i+1 < len(c.words) && c.words[i+1].literal {
+			c.call.literalMask |= uint32(1) << uint(i)
+		}
 	}
 	appendCall(seen, calls, c.call)
 
