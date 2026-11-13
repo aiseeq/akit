@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -114,6 +118,46 @@ func TestParseCacheReadRaceUsesUncachedBytes(t *testing.T) {
 		t.Fatal("unstable read was added to cache")
 	}
 	assertCacheEqual(t, root)
+}
+
+func TestParseCacheRaceParsesChangedMtimeFromPostStat(t *testing.T) {
+	root, path := cacheProject(t, "# before\nСтатус: открыт\n")
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMtime := oldInfo.ModTime().Add(24 * time.Hour)
+	parseCacheAfterStat = func(got string) {
+		if got != path {
+			return
+		}
+		parseCacheAfterStat = nil
+		replacement := path + ".replacement"
+		if err := os.WriteFile(replacement, []byte("# after\nСтатус: открыт\n"), 0o600); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Chtimes(replacement, newMtime, newMtime); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(replacement, path); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { parseCacheAfterStat = nil }()
+	_, got, _ := runCacheList(t, root, false)
+	var rows []struct {
+		Slug    string `json:"slug"`
+		Changed string `json:"changed"`
+	}
+	if err := json.Unmarshal([]byte(got), &rows); err != nil {
+		t.Fatal(err)
+	}
+	want := newMtime.In(time.Local).Format(time.RFC3339)
+	if len(rows) != 1 || rows[0].Changed != want {
+		t.Fatalf("changed=%v, want %s; json=%s", rows, want, got)
+	}
 }
 
 func TestParseCacheStatReadMetadataChangesAreNotCached(t *testing.T) {
@@ -374,24 +418,69 @@ func TestParseCacheDeleteCreateSameNameRefreshesTicket(t *testing.T) {
 
 func TestParseCacheSymlinkRootSwapRefreshesTicket(t *testing.T) {
 	parent := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	a := filepath.Join(parent, "a")
 	b := filepath.Join(parent, "b")
 	link := filepath.Join(parent, "project")
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	for _, item := range []struct{ root, title string }{{a, "first"}, {b, "second"}} {
 		dir := filepath.Join(item.root, "docs", "tasks")
 		_ = os.MkdirAll(dir, 0o700)
 		_ = os.Mkdir(filepath.Join(item.root, ".git"), 0o700)
-		_ = os.WriteFile(filepath.Join(dir, "20200101-1000-MED-cache-test.md"), []byte(cacheBody(item.title, "открыт", "x")), 0o600)
+		path := filepath.Join(dir, "20200101-1000-MED-cache-test.md")
+		_ = os.WriteFile(path, []byte(cacheBody(item.title, "открыт", "x")), 0o600)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
 	}
 	_ = os.Symlink(a, link)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Setenv("TK_NO_PARSE_CACHE", "")
-	_, _, _ = runCacheList(t, link, false)
+	if code, _, stderr := runCacheList(t, link, false); code != 0 {
+		t.Fatalf("cold list: %d %s", code, stderr)
+	}
+	reads := 0
+	oldRead := parseCacheBeforeRead
+	parseCacheBeforeRead = func(string) { reads++ }
+	defer func() { parseCacheBeforeRead = oldRead }()
+	if code, _, stderr := runCacheList(t, link, false); code != 0 {
+		t.Fatalf("warm list: %d %s", code, stderr)
+	}
+	if reads != 0 {
+		t.Fatalf("pre-swap warm list reread %d tickets", reads)
+	}
+	parseCacheBeforeRead = nil
 	_ = os.Remove(link)
 	_ = os.Symlink(b, link)
 	got := assertCacheEqual(t, link)
 	if !bytes.Contains([]byte(got), []byte("second")) {
 		t.Fatal("symlink root replacement was missed")
+	}
+}
+
+type cacheTestFileInfo struct {
+	os.FileInfo
+	sys *syscall.Stat_t
+}
+
+func (i cacheTestFileInfo) Sys() any { return i.sys }
+
+func TestParseCacheBinaryIdentityIncludesInodeAndCtime(t *testing.T) {
+	info, err := os.Stat(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	changedInode := *stat
+	changedInode.Ino++
+	if cacheIdentity(info) == cacheIdentity(cacheTestFileInfo{FileInfo: info, sys: &changedInode}) {
+		t.Fatal("binary identity ignored inode")
+	}
+	changedCTime := *stat
+	changedCTime.Ctim.Nsec++
+	if cacheIdentity(info) == cacheIdentity(cacheTestFileInfo{FileInfo: info, sys: &changedCTime}) {
+		t.Fatal("binary identity ignored ctime")
 	}
 }
 
@@ -538,6 +627,25 @@ func TestParseCacheUnavailableAndDisabledFallBack(t *testing.T) {
 	}
 }
 
+func TestParseCacheTicketReadErrorMatchesUncached(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission bits are bypassed for root")
+	}
+	root, path := cacheProject(t, cacheBody("denied", "открыт", "x"))
+	if code, _, stderr := runCacheList(t, root, false); code != 0 {
+		t.Fatalf("warm list: %d %s", code, stderr)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(path, 0o600)
+	cachedCode, _, cachedErr := runCacheList(t, root, false)
+	plainCode, _, plainErr := runCacheList(t, root, true)
+	if cachedCode == 0 || plainCode == 0 || cachedErr != plainErr {
+		t.Fatalf("read error differs: cached (%d) %q, uncached (%d) %q", cachedCode, cachedErr, plainCode, plainErr)
+	}
+}
+
 func TestParseCacheWalkErrorDoesNotPruneEntries(t *testing.T) {
 	root, ticket := cacheProject(t, cacheBody("kept", "открыт", "x"))
 	assertCacheEqual(t, root)
@@ -573,6 +681,7 @@ func TestParseCacheWalkErrorDoesNotPruneEntries(t *testing.T) {
 }
 
 func TestParseCacheNoteRefreshesNextList(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root, dir := testRunMainRoot(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Setenv("TK_NO_PARSE_CACHE", "")
@@ -603,6 +712,7 @@ func TestParseCacheNoteRefreshesNextList(t *testing.T) {
 }
 
 func TestParseCacheBlockStatusPreservesCRLFBehavior(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root, dir := testRunMainRoot(t)
 	blocker := filepath.Join(dir, "20200101-0900-MED-cache-blocker.md")
 	if err := os.WriteFile(blocker, []byte("# Blocker\nСтатус: открыт\r\n"), 0o600); err != nil {
@@ -624,6 +734,7 @@ func TestParseCacheBlockStatusPreservesCRLFBehavior(t *testing.T) {
 }
 
 func TestParseCacheBlockStatusDefaultsMissingStatusToOpen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root, dir := testRunMainRoot(t)
 	blocker := filepath.Join(dir, "20200101-0900-MED-cache-blocker.md")
 	if err := os.WriteFile(blocker, []byte("# Blocker\n"), 0o600); err != nil {
@@ -643,6 +754,7 @@ func TestParseCacheBlockStatusDefaultsMissingStatusToOpen(t *testing.T) {
 }
 
 func TestParseCacheBlockStatusKeepsRenameAndDuplicateSemantics(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root, dir := testRunMainRoot(t)
 	parent := filepath.Join(dir, "20200101-1000-MED-cache-parent.md")
 	if err := os.WriteFile(parent, []byte("# Parent\nЗаблокирован: cache-old\n"), 0o600); err != nil {
@@ -674,6 +786,7 @@ func TestParseCacheBlockStatusKeepsRenameAndDuplicateSemantics(t *testing.T) {
 }
 
 func TestParseCacheBlockStatusIgnoresArchivedOpenTicket(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root, dir := testRunMainRoot(t)
 	archive := filepath.Join(root, "docs", "tasks-archive")
 	if err := os.MkdirAll(archive, 0o700); err != nil {
@@ -691,6 +804,122 @@ func TestParseCacheBlockStatusIgnoresArchivedOpenTicket(t *testing.T) {
 	}
 	if bytes.Contains(out.Bytes(), []byte("заблокирован: cache-blocker")) {
 		t.Fatalf("archived ticket still blocks: %s", out.String())
+	}
+}
+
+func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
+	cases := []struct {
+		name, blockerStatus              string
+		archived, duplicate, omitProject bool
+		wantOne, wantTwo                 int
+		wantMark                         string
+	}{
+		{name: "open", blockerStatus: "открыт", wantOne: 2, wantTwo: 1, wantMark: " заблокирован: git/b/blk-open"},
+		{name: "closed", blockerStatus: "готово", wantOne: 1, wantTwo: 2},
+		{name: "archived", blockerStatus: "открыт", archived: true, wantOne: 1, wantTwo: 2},
+		{name: "duplicate", blockerStatus: "открыт", duplicate: true, wantOne: 1, wantTwo: 2},
+		{name: "project-not-loaded", blockerStatus: "открыт", omitProject: true, wantOne: 2, wantTwo: 1, wantMark: " заблокирован: git/b/blk-open"},
+		{name: "unknown-status", blockerStatus: "странный", wantOne: 1, wantTwo: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			gateDir := filepath.Join(home, ".local", "state", "queue")
+			if err := os.MkdirAll(gateDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			gate, err := json.Marshal(map[string]any{"at": time.Now().Add(-time.Minute).Format(time.RFC3339), "live": []string{}, "open_by_root": map[string][]string{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), gate, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TK_NO_PARSE_CACHE", "")
+			gitRoot := filepath.Join(home, "git")
+			a, b := filepath.Join(gitRoot, "a"), filepath.Join(gitRoot, "b")
+			for _, repo := range []string{a, b} {
+				if err := os.MkdirAll(filepath.Join(repo, "docs", "tasks"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeRankTicket := func(path, body string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+				if err := os.Chtimes(path, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeRankTicket(filepath.Join(a, "docs/tasks/20200101-1000-MED-p-one.md"), "# one\nСтатус: открыт\nЗаблокирован: git/b/blk-open\n")
+			writeRankTicket(filepath.Join(a, "docs/tasks/20200102-1000-MED-p-two.md"), "# two\nСтатус: открыт\n")
+			blockerDir := filepath.Join(b, "docs/tasks")
+			if tc.archived {
+				blockerDir = filepath.Join(b, "docs/tasks-archive")
+			}
+			if err := os.MkdirAll(blockerDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.blockerStatus == "странный" {
+				writeRankTicket(filepath.Join(blockerDir, "20200103-1000-MED-blk-open.md"), "# blocker\nСтатус: странный\n")
+			} else {
+				writeRankTicket(filepath.Join(blockerDir, "20200103-1000-MED-blk-open.md"), "# blocker\nСтатус: "+tc.blockerStatus+"\n")
+			}
+			if tc.duplicate {
+				writeRankTicket(filepath.Join(blockerDir, "20200104-1000-MED-blk-open.md"), "# duplicate\nСтатус: открыт\n")
+			}
+			listRoot := gitRoot
+			if tc.omitProject {
+				listRoot = a
+			}
+			var out, errout bytes.Buffer
+			if code := list(listRoot, options{all: true, json: true, root: listRoot}, &out, &errout); code != 0 {
+				t.Fatalf("ls: %d %s", code, errout.String())
+			}
+			var rows []struct {
+				Slug     string `json:"slug"`
+				NextRank *int   `json:"next_rank"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+				t.Fatal(err)
+			}
+			ranks := map[string]int{}
+			for _, row := range rows {
+				if row.NextRank != nil {
+					ranks[row.Slug] = *row.NextRank
+				}
+			}
+			if ranks["p-one"] != tc.wantOne || ranks["p-two"] != tc.wantTwo {
+				t.Fatalf("next_rank: p-one=%d p-two=%d, want %d/%d; json=%s", ranks["p-one"], ranks["p-two"], tc.wantOne, tc.wantTwo, out.String())
+			}
+			loaded, err := loadCachedTasks(filepath.Join(a, "docs/tasks"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			loadedByProject := map[string][]task{filepath.Clean(a): loaded}
+			if !tc.omitProject {
+				blockerTasks := filepath.Join(b, "docs/tasks")
+				if tc.archived {
+					blockerTasks = filepath.Join(b, "docs/tasks-archive")
+				}
+				loaded, err = loadCachedTasks(blockerTasks)
+				if err != nil {
+					t.Fatal(err)
+				}
+				loadedByProject[filepath.Clean(b)] = loaded
+			}
+			mark := cachedListBlockMark(a, "git/b/blk-open", loadedByProject, io.Discard)
+			if mark != tc.wantMark {
+				t.Fatalf("blocked mark=%q, want %q", mark, tc.wantMark)
+			}
+		})
 	}
 }
 
@@ -743,6 +972,176 @@ func TestParseCacheJSONRankKeepsRenamedReferenceSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCacheEqual(t, root)
+}
+
+func TestParseCacheFreshnessUsesAbsoluteWriteDelta(t *testing.T) {
+	_, path := cacheProject(t, cacheBody("freshness", "открыт", "x"))
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := info.ModTime().UnixNano() - int64(3*time.Second)
+	if cacheTooFresh(info, written) {
+		t.Fatal("old entry was rejected by a negative write delta")
+	}
+}
+
+func TestParseCacheFreshFileIsNotStored(t *testing.T) {
+	root, path := cacheProject(t, cacheBody("fresh", "открыт", "x"))
+	now := time.Now()
+	if err := os.Chtimes(path, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runCacheList(t, root, false); code != 0 {
+		t.Fatalf("ls: %d %s", code, stderr)
+	}
+	cachePath, _, err := parseCachePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := parseCacheBinaryIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := readParseCacheEntries(cachePath, binary)
+	if len(entries) != 0 {
+		t.Fatalf("racy file was cached: %d entries", len(entries))
+	}
+}
+
+func TestParseCacheCreatedStampCorruptionMisses(t *testing.T) {
+	root, path := cacheProject(t, cacheBody("stamp", "открыт", "x"))
+	assertCacheEqual(t, root)
+	cachePath, key, err := parseCachePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := parseCacheBinaryIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := readParseCacheEntries(cachePath, binary)
+	entry := entries[key]
+	entry.Task.CreatedStamp = "invalid"
+	entries[key] = entry
+	if err := writeParseCacheEntries(cachePath, binary, entries, nil); err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	oldRead := parseCacheBeforeRead
+	parseCacheBeforeRead = func(string) { reads++ }
+	defer func() { parseCacheBeforeRead = oldRead }()
+	_, got, _ := runCacheList(t, root, false)
+	_, want, _ := runCacheList(t, root, true)
+	if got != want || reads == 0 {
+		t.Fatalf("invalid stamp not treated as miss: reads=%d got=%s want=%s", reads, got, want)
+	}
+}
+
+func TestParseCacheMalformedJournalStampDoesNotDisableWarmHit(t *testing.T) {
+	body := "# malformed\nСтатус: открыт\n\n## Журнал\n- 2020-99-99 99:99 note — actor: invalid\n"
+	root, _ := cacheProject(t, body)
+	assertCacheEqual(t, root)
+	reads := 0
+	oldRead := parseCacheBeforeRead
+	parseCacheBeforeRead = func(string) { reads++ }
+	defer func() { parseCacheBeforeRead = oldRead }()
+	if code, _, stderr := runCacheList(t, root, false); code != 0 {
+		t.Fatalf("warm list: %d %s", code, stderr)
+	}
+	if reads != 0 {
+		t.Fatalf("malformed journal stamp caused %d ticket rereads", reads)
+	}
+}
+
+func TestParseCacheLastChangeStampStopsAtSectionEnd(t *testing.T) {
+	body := "## Журнал\n- 2020-01-02 11:30 note — actor: first\n## Дополнительно\n- 2021-03-04 05:06 note — actor: later\n"
+	if got, want := lastChangeStamp(body), "2020-01-02 11:30"; got != want {
+		t.Fatalf("lastChangeStamp=%q, want %q", got, want)
+	}
+}
+
+func TestParseCacheOversizedPayloadIsIgnored(t *testing.T) {
+	_, ticket := cacheProject(t, cacheBody("oversized", "открыт", "x"))
+	cachePath, _, err := parseCachePath(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := parseCacheBinaryIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := parseCacheEntry{Task: cachedTask{Title: strings.Repeat("x", (32<<20)+1)}}
+	payload, err := json.Marshal(parseCacheFile{Version: parseCacheVersion, Binary: binary, Entries: map[string]parseCacheEntry{"oversized": entry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) <= 32<<20 {
+		t.Fatalf("fixture payload too small: %d", len(payload))
+	}
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cachePath, compressed.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := readParseCacheEntries(cachePath, binary)
+	if len(entries) != 0 {
+		t.Fatalf("oversized cache accepted %d entries", len(entries))
+	}
+}
+
+func TestParseCacheNullEntriesAreIgnored(t *testing.T) {
+	root, ticket := cacheProject(t, cacheBody("null-cache", "открыт", "x"))
+	cachePath, _, err := parseCachePath(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := parseCacheBinaryIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(parseCacheFile{Version: parseCacheVersion, Binary: binary, Entries: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cachePath, compressed.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runCacheList(t, root, false); code != 0 {
+		t.Fatalf("null cache failed ls: %d %s", code, stderr)
+	}
+}
+
+func TestParseCacheExecutableStatErrorFallsBack(t *testing.T) {
+	root, _ := cacheProject(t, cacheBody("fallback", "открыт", "x"))
+	old := parseCacheExecutableInfo
+	parseCacheExecutableInfo = func() (os.FileInfo, error) { return nil, errors.New("synthetic stat failure") }
+	defer func() { parseCacheExecutableInfo = old }()
+	code, got, stderr := runCacheList(t, root, false)
+	plainCode, want, plainErr := runCacheList(t, root, true)
+	if code != 0 || plainCode != 0 || got != want || stderr != plainErr {
+		t.Fatalf("fallback differs: got=%q err=%q want=%q err=%q", got, stderr, want, plainErr)
+	}
 }
 
 func TestParseCacheCorruptAndForeignVersionRebuild(t *testing.T) {
