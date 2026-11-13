@@ -1230,7 +1230,7 @@ func TestLiteralPipeBoundaries(t *testing.T) {
 	}
 }
 
-func TestRound4PipelineProducer(t *testing.T) {
+func TestLiteralPipeProducerLeftOfShell(t *testing.T) {
 	for _, tc := range []struct {
 		src  string
 		args [][]string
@@ -1256,7 +1256,7 @@ func TestRound4PipelineProducer(t *testing.T) {
 	}
 }
 
-func TestRound4PipelineBoundaries(t *testing.T) {
+func TestLiteralPipeProducerBoundaries(t *testing.T) {
 	nonPipe := &syntax.Stmt{Cmd: &syntax.BinaryCmd{Op: syntax.AndStmt, Y: &syntax.Stmt{Cmd: &syntax.CallExpr{}}}}
 	if got := literalPipeProducer(nonPipe); got != nil {
 		t.Errorf("non-pipe producer = %#v; want nil", got)
@@ -1271,7 +1271,7 @@ func TestRound4PipelineBoundaries(t *testing.T) {
 	}
 }
 
-func TestRound4OctalEscapes(t *testing.T) {
+func TestLiteralPipeOctalEscapes(t *testing.T) {
 	for _, src := range []string{
 		`printf '%b' '\0153ill 1' | bash`,
 		`printf '%b' '\153ill 1' | bash`,
@@ -1283,6 +1283,18 @@ func TestRound4OctalEscapes(t *testing.T) {
 			t.Errorf("Find(%q) = %#v, %v; want kill 1", src, calls, err)
 		}
 	}
+	// \8 and \9 are not octal digits: bash keeps the backslash.
+	for _, tc := range []struct{ src, arg string }{
+		{`printf '%b' "kill '\8x'" | bash`, `\8x`},
+		{`echo -e "kill '\8x'" | bash`, `\8x`},
+		{`printf '%b' "kill '\9x'" | bash`, `\9x`},
+		{`echo -e "kill '\9x'" | bash`, `\9x`},
+	} {
+		calls, err := Find(tc.src, "kill")
+		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{tc.arg}) {
+			t.Errorf("Find(%q) = %#v, %v; want kill %s", tc.src, calls, err, tc.arg)
+		}
+	}
 	for _, src := range []string{`echo -e '\153ill 1' | bash`, `printf '\0153ill 1' | bash`} {
 		calls, err := Find(src, "kill")
 		if err != nil || len(calls) != 0 {
@@ -1291,7 +1303,7 @@ func TestRound4OctalEscapes(t *testing.T) {
 	}
 }
 
-func TestRound4EscapeOutput(t *testing.T) {
+func TestPrintfBEscapeOutput(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
 		want string
@@ -1338,7 +1350,7 @@ func TestRound4EscapeOutput(t *testing.T) {
 	}
 }
 
-func TestRound4EchoEscapeOutput(t *testing.T) {
+func TestEchoEscapeOutput(t *testing.T) {
 	for _, tc := range []struct {
 		value string
 		want  string
@@ -1363,7 +1375,7 @@ func TestRound4EchoEscapeOutput(t *testing.T) {
 	}
 }
 
-func TestRound4PrintfArgumentIsolation(t *testing.T) {
+func TestPrintfArgumentIsolation(t *testing.T) {
 	args := []string{`\0153`, `\0153ill`}
 	before := slices.Clone(args)
 	body, ok, err := literalPrintfBody(append([]string{"%s%b"}, args...))
@@ -1386,7 +1398,7 @@ func TestRound4PrintfArgumentIsolation(t *testing.T) {
 	}
 }
 
-func TestRound4PrintfFormatAlternatives(t *testing.T) {
+func TestPrintfFormatAlternatives(t *testing.T) {
 	for _, tc := range []struct {
 		format string
 		want   bool
@@ -1400,7 +1412,7 @@ func TestRound4PrintfFormatAlternatives(t *testing.T) {
 	}
 }
 
-func TestRound4PrintfEscapedPercent(t *testing.T) {
+func TestPrintfEscapedPercent(t *testing.T) {
 	calls, err := Find(`printf '\%b' 'kill 1' | bash`, "kill")
 	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"1"}) || !reflect.DeepEqual(calls[0].Via, []string{"pipe", "bash"}) {
 		t.Fatalf("escaped percent = %#v, %v; want kill 1", calls, err)
@@ -1658,7 +1670,7 @@ func TestScriptWordsEmptyLiteralAndUnknown(t *testing.T) {
 	}
 }
 
-func TestKillGuardGapsRound2(t *testing.T) {
+func TestEvalEmptyArgsAndEchoCombinedOptions(t *testing.T) {
 	for _, tc := range []struct {
 		src  string
 		args []string
