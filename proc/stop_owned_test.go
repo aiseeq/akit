@@ -803,3 +803,73 @@ func writeFakeSessionStat(t *testing.T, root string, pid int, name, state string
 		t.Fatal(err)
 	}
 }
+
+// ownedStopScript runs stopOwnedProcesses with grace 0 against synthetic ops and
+// returns the signals sent; scan and guard answer by call number.
+func ownedStopScript(t *testing.T, scan func(n int) ([]int, error), guard func(n, scans int) error) ([]string, error) {
+	t.Helper()
+	oldSignal := signalProcess
+	var sent []string
+	signalProcess = func(pid int, _ *trackedProcess, sig unix.Signal) error {
+		sent = append(sent, fmt.Sprintf("%d:%s", pid, unix.SignalName(sig)))
+		return nil
+	}
+	t.Cleanup(func() { signalProcess = oldSignal })
+	var scans, guards int
+	ops := ownedStopOps{
+		guard: func() error {
+			guards++
+			return guard(guards, scans)
+		},
+		scan: func() ([]int, error) {
+			scans++
+			return scan(scans)
+		},
+		open: func(pid int) (*trackedOwnedProcess, error) {
+			fd, err := unix.Open("/dev/null", unix.O_RDONLY, 0)
+			if err != nil {
+				return nil, err
+			}
+			return &trackedOwnedProcess{identity: processIdentity{pid: pid, start: "200"}, tracked: &trackedProcess{fd: fd, start: "200"}}, nil
+		},
+		verify: func(int, string) error { return nil },
+	}
+	_, err := stopOwnedProcesses(0, syscall.SIGTERM, ops)
+	return sent, err
+}
+
+func TestStopOwnedProcessesScanFailureStillFinishes(t *testing.T) {
+	sent, err := ownedStopScript(t, func(n int) ([]int, error) {
+		if n == 1 {
+			return nil, errors.New("synthetic scan failure")
+		}
+		return []int{51}, nil
+	}, func(int, int) error { return nil })
+	if err == nil || fmt.Sprint(sent) != "[51:SIGTERM 51:SIGKILL]" {
+		t.Fatalf("signals = %v, err = %v; want the finish pass to stop 51 and the scan failure reported", sent, err)
+	}
+}
+
+func TestStopOwnedProcessesPidfdUnavailableScanSendsNothing(t *testing.T) {
+	sent, err := ownedStopScript(t, func(n int) ([]int, error) {
+		if n == 1 {
+			return nil, ErrPidfdUnavailable
+		}
+		return []int{51}, nil
+	}, func(int, int) error { return nil })
+	if !errors.Is(err, ErrPidfdUnavailable) || len(sent) != 0 {
+		t.Fatalf("signals = %v, err = %v; want no signals and ErrPidfdUnavailable", sent, err)
+	}
+}
+
+func TestStopOwnedProcessesFinalGuardFailureSkipsFinish(t *testing.T) {
+	sent, err := ownedStopScript(t, func(int) ([]int, error) { return []int{51}, nil }, func(n, scans int) error {
+		if n >= 3 && scans == 1 {
+			return errors.New("synthetic guard failure")
+		}
+		return nil
+	})
+	if err == nil || fmt.Sprint(sent) != "[51:SIGTERM]" {
+		t.Fatalf("signals = %v, err = %v; want only the batch TERM and the guard failure", sent, err)
+	}
+}
