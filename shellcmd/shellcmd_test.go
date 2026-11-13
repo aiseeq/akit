@@ -1192,6 +1192,63 @@ func TestWrapperArgumentScansAlwaysAdvance(t *testing.T) {
 	}
 }
 
+func TestKillGuardGaps(t *testing.T) {
+	for _, tc := range []struct {
+		src       string
+		args, via []string
+	}{
+		{`echo -n kill -9 101 | sh`, []string{"-9", "101"}, []string{"pipe", "sh"}},
+		{`echo 'kill -9 101' | bash -s`, []string{"-9", "101"}, []string{"pipe", "bash"}},
+		{`echo -e 'kill -9 101\n' | bash`, []string{"-9", "101"}, []string{"pipe", "bash"}},
+		{`printf '%b' 'kill -9 101\n' | bash`, []string{"-9", "101"}, []string{"pipe", "bash"}},
+		{`printf '%s\n' 'kill -9 101' | nice sh`, []string{"-9", "101"}, []string{"pipe", "nice", "sh"}},
+		{`eval kill -9 $PPID`, []string{"-9", "$PPID"}, []string{"eval"}},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Find(tc.src, "kill")
+			if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, tc.args) || !reflect.DeepEqual(calls[0].Via, tc.via) {
+				t.Fatalf("Find = %#v, %v; want args %v via %v", calls, err, tc.args, tc.via)
+			}
+		})
+	}
+	t.Run("eval substitution reported once", func(t *testing.T) {
+		calls, err := Find(`eval echo $(kill -1)`, "kill")
+		if err != nil || len(calls) != 1 || len(calls[0].Via) != 0 {
+			t.Fatalf("Find = %#v, %v; want only the outer substitution", calls, err)
+		}
+	})
+	t.Run("echo stops output", func(t *testing.T) {
+		calls, err := Find(`echo -e 'echo hi\c' '\nkill -1' | bash`, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Fatalf("Find = %#v, %v; want no calls", calls, err)
+		}
+	})
+	t.Run("unknown pipe input", func(t *testing.T) {
+		calls, err := Calls(`echo "kill $X" | bash`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, call := range calls {
+			found = found || call.Name == "bash" && call.ScriptInput
+		}
+		if !found {
+			t.Fatalf("unknown input not marked: %#v", calls)
+		}
+		for _, call := range calls {
+			if call.Name == "kill" {
+				t.Fatalf("unknown input parsed as literal: %#v", calls)
+			}
+		}
+	})
+	t.Run("sudo option value", func(t *testing.T) {
+		calls, err := Find(`sudo -u exec echo -- kill`, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Fatalf("Find = %#v, %v; want no calls", calls, err)
+		}
+	})
+}
+
 func TestUnknownShellScriptInput(t *testing.T) {
 	for _, command := range []string{
 		`echo 'kill 1' | bash`,

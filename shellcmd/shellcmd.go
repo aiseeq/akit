@@ -55,6 +55,7 @@ type word struct {
 	offset int    // смещение в исходной команде; -1 — слово не литерал
 	script string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
 	pos    []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
+	subst  [][2]int
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -321,11 +322,160 @@ func collectPipelineWalkInfo(binary *syntax.BinaryCmd, src string, vars map[stri
 	if binary.Op != syntax.Pipe && binary.Op != syntax.PipeAll {
 		return
 	}
+	_, err := collectPipedLiteralWalkInfo(binary, src, vars, info)
+	if err != nil {
+		info.errors = append(info.errors, err)
+	}
 	if collectPipedHeredocWalkInfo(binary, src, vars, info) {
 		knownPipes[binary] = true
 		return
 	}
 	markPipeline(binary.Y, src, vars, info.scriptInputs)
+}
+
+func collectPipedLiteralWalkInfo(binary *syntax.BinaryCmd, src string, vars map[string]string, info *walkInfo) (bool, error) {
+	if binary.X == nil || binary.Y == nil || len(binary.X.Redirs) != 0 || len(binary.Y.Redirs) != 0 {
+		return false, nil
+	}
+	producer, ok := binary.X.Cmd.(*syntax.CallExpr)
+	if !ok || len(producer.Args) == 0 {
+		return false, nil
+	}
+	name, literal := wordValue(producer.Args[0])
+	if !literal || (commandName(name) != "echo" && commandName(name) != "printf") {
+		return false, nil
+	}
+	shell, via, ok := pipedShellName(binary.Y, src, vars)
+	if !ok {
+		return false, nil
+	}
+	if call, ok := binary.Y.Cmd.(*syntax.CallExpr); ok {
+		for _, arg := range call.Args[1:] {
+			if value, literal := wordValue(arg); literal && value == "--noexec" {
+				return false, nil
+			}
+		}
+	}
+	body, ok, err := literalPipeBody(commandName(name), producer.Args[1:], src, vars)
+	if err != nil {
+		return true, &NestedError{Script: nodeText(producer, src), Err: err}
+	}
+	if !ok {
+		return false, nil
+	}
+	info.pipedHeredocs = append(info.pipedHeredocs, pipedHeredoc{body: &body, shell: binary.Y, name: shell, via: via})
+	return true, nil
+}
+
+func literalPipeBody(name string, args []*syntax.Word, src string, vars map[string]string) (mapped, bool, error) {
+	values := make([]string, 0, len(args))
+	parts := make([]mapped, 0, len(args))
+	for _, arg := range args {
+		value, literal := wordValue(arg)
+		if !literal {
+			return mapped{}, false, nil
+		}
+		var part mapped
+		if err := part.expandParts(arg.Parts, src, vars, partUnquoted); err != nil {
+			return mapped{}, false, err
+		}
+		if name == "printf" && strings.Contains(value, `\c`) {
+			return mapped{}, false, nil
+		}
+		values = append(values, value)
+		parts = append(parts, part)
+	}
+	if name == "echo" {
+		body, err := literalEchoBody(values, parts)
+		return body, true, err
+	}
+	return literalPrintfBody(values)
+}
+
+func literalEchoBody(values []string, parts []mapped) (mapped, error) {
+	var body mapped
+	newline, expand := true, false
+	for len(values) > 0 && (values[0] == "-n" || values[0] == "-E" || values[0] == "-e") {
+		switch values[0] {
+		case "-n":
+			newline = false
+		case "-e":
+			expand = true
+		case "-E":
+			expand = false
+		}
+		values, parts = values[1:], parts[1:]
+	}
+	for i, part := range parts {
+		if i > 0 {
+			body.add(" ", -1)
+		}
+		if expand {
+			value := values[i]
+			stop := echoStop(value)
+			if stop >= 0 {
+				value = value[:stop]
+			}
+			text, _, err := shExpand.Format(nil, value, nil)
+			if err != nil {
+				return mapped{}, fmt.Errorf("shellcmd: expand piped echo: %w", err)
+			}
+			body.add(text, -1)
+			if stop >= 0 {
+				return body, nil
+			}
+		} else {
+			body.text = append(body.text, part.text...)
+			body.pos = append(body.pos, part.pos...)
+		}
+	}
+	if newline {
+		body.add("\n", -1)
+	}
+	return body, nil
+}
+
+func echoStop(value string) int {
+	for i := 0; i+1 < len(value); i++ {
+		if value[i] == '\\' {
+			if value[i+1] == 'c' {
+				return i
+			}
+			i++
+		}
+	}
+	return -1
+}
+
+func literalPrintfBody(values []string) (mapped, bool, error) {
+	if len(values) == 0 || strings.HasPrefix(values[0], "-") {
+		return mapped{}, false, nil
+	}
+	format, args := values[0], values[1:]
+	for i := 0; i < len(format); i++ {
+		if format[i] == '%' {
+			i++
+			if i >= len(format) || !strings.ContainsRune("%sbdiuoxc", rune(format[i])) {
+				return mapped{}, false, nil
+			}
+		}
+	}
+	var body mapped
+	for {
+		text, consumed, err := shExpand.Format(nil, format, args)
+		if err != nil {
+			return mapped{}, false, fmt.Errorf("shellcmd: format piped printf: %w", err)
+		}
+		if len(text) > maxNestedScriptBytes-len(body.text) {
+			return mapped{}, false, fmt.Errorf("shellcmd: piped printf exceeds %d bytes", maxNestedScriptBytes)
+		}
+		body.add(text, -1)
+		if consumed == 0 || consumed >= len(args) {
+			break
+		}
+		args = args[consumed:]
+	}
+	return body, true, nil
 }
 
 func hasHeredocRedir(redirs []*syntax.Redirect) bool {
@@ -430,6 +580,7 @@ func needsWalkInfo(src string) bool {
 }
 
 type pipedHeredoc struct {
+	body  *mapped
 	redir *syntax.Redirect
 	shell *syntax.Stmt
 	name  string
@@ -493,7 +644,7 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 			operand, command, stdin := shellArgs(args)
 			return name, via, !shellNoExec(args) && !command && (stdin || operand == len(args))
 		}
-		if target, ok := scan.find(args); ok {
+		if target, ok := scan.find(execScanArgs(name, args)); ok {
 			via = append(via, name, "exec")
 			name, args = commandName(target[0]), target[1:]
 			continue
@@ -620,7 +771,7 @@ func shellInputNextTarget(name string, args []string, argOffset int) (string, []
 }
 
 func shellInputNextTargetWithScan(name string, args []string, argOffset int, scan *wrapperExecScan) (string, []string, int, bool) {
-	if target, ok := scan.find(args); ok {
+	if target, ok := scan.find(execScanArgs(name, args)); ok {
 		argOffset += len(args) - len(target) + 1
 		return commandName(target[0]), target[1:], argOffset, true
 	}
@@ -753,6 +904,18 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	if err != nil {
 		w.parseErr = fmt.Errorf("shellcmd: expand command word: %w", err)
 		return
+	}
+	if commandName(args[0]) == "eval" {
+		for i := 1; i < len(call.Args); i++ {
+			if !literals[i] {
+				var text mapped
+				if err := text.expandParts(call.Args[i].Parts, w.src, w.vars, partUnquoted); err != nil {
+					w.parseErr = err
+					return
+				}
+				words[i].script, words[i].pos, words[i].subst = text.String(), text.pos, text.subst
+			}
+		}
 	}
 	ws := splitWords(words, split)
 	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
@@ -900,7 +1063,12 @@ func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherite
 	var nestedErrs []error
 	for _, input := range piped {
 		redir := input.redir
-		body := heredocScript(redir, src)
+		var body mapped
+		if input.body != nil {
+			body = *input.body
+		} else {
+			body = heredocScript(redir, src)
+		}
 		via := append(slices.Clone(inherited), "pipe")
 		via = append(via, input.via...)
 		via = append(via, input.name)
@@ -1095,7 +1263,7 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 }
 
 func nextShellInputTarget(name string, args []string, via []string, scan *wrapperExecScan) (string, []string, []string, bool) {
-	if target, ok := scan.find(args); ok {
+	if target, ok := scan.find(execScanArgs(name, args)); ok {
 		return commandName(target[0]), target[1:], append(via, name, "exec"), true
 	}
 	if wrappers[name] {
@@ -2253,7 +2421,7 @@ func parallelCommandStart(args []string) (int, bool) {
 // expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).
 func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
 	name, args := c.call.Name, c.call.Args
-	if target, ok := execTarget(args); ok {
+	if target, ok := execTarget(execScanArgs(name, args)); ok {
 		return emit(c.sub(len(c.words)-len(target), c.via(name, "exec")), lineBase, vars, calls, seen)
 	}
 	switch {
@@ -3029,6 +3197,7 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 	viaName := c.call.Name
 	first := len(*calls)
 	err := parseNestedWithBudget(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
+	dropSubstCalls(calls, first, script, c.budget)
 	relocateNestedLines(c, first, calls)
 	return err
 }
@@ -3114,6 +3283,7 @@ func mappedScriptWords(c cmd, words []scriptArg) (mapped, bool) {
 		}
 		script.text = append(script.text, w.script[arg.offset:]...)
 		script.pos = append(script.pos, w.pos[arg.offset:]...)
+		script.subst = append(script.subst, w.subst...)
 	}
 	return script, true
 }
@@ -3523,6 +3693,13 @@ func (s *wrapperExecScan) find(args []string) ([]string, bool) {
 		return nil, false
 	}
 	return s.args[target:], true
+}
+
+func execScanArgs(name string, args []string) []string {
+	if wrappers[name] {
+		return args[wrapperOptionEnd(name, args, 0):]
+	}
+	return args
 }
 
 func execTarget(args []string) ([]string, bool) {
