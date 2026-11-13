@@ -21,7 +21,7 @@ type Call struct {
 	// Name — имя программы без каталога; "" — в слове имени есть `$(` или обратная кавычка.
 	Name string
 	Args []string
-	// Raw — исходный текст команды; во вложенных скриптах он может отличаться от текста, который исполняет внутренняя оболочка.
+	// Raw — исходный текст команды, а не обязательно текст, который исполняет внутренняя оболочка.
 	Raw  string
 	Line int
 	Via  []string
@@ -40,8 +40,9 @@ type Call struct {
 	literalMask uint32
 }
 
-// ArgLiteral сообщает, что оболочка не раскрывает Args[i] (Lit, '…' или экранирование без подстановок).
-// Для i вне Args и i ≥ 32 возвращает false: раскрытие аргумента не исключено.
+// ArgLiteral возвращает true, только если процесс получает ровно Args[i] и значение не зависит
+// от окружения, файловой системы или подстановок ни на одном уровне вложенности. При сомнении
+// возвращает false. Индексы от 32 не кодируются в маске и всегда дают false; вне Args также false.
 func (c Call) ArgLiteral(i int) bool {
 	return i >= 0 && i < len(c.Args) && i < 32 && c.literalMask&(uint32(1)<<uint(i)) != 0
 }
@@ -1288,7 +1289,30 @@ func outerOffset(offset int, pos []int) int {
 	if offset < 0 || offset >= len(pos) {
 		return -1
 	}
-	return pos[offset]
+	return sourceOffset(pos[offset])
+}
+
+// sourceOffset decodes a mapped source position. Values at most -3 retain an
+// offset while marking expansion; -1 is unmapped and -2 is expanded without an offset.
+func sourceOffset(pos int) int {
+	if pos <= -3 {
+		return -pos - 3
+	}
+	if pos < 0 {
+		return -1
+	}
+	return pos
+}
+
+func markSourceExpanded(pos int) int {
+	if pos <= -2 {
+		return pos
+	}
+	return -pos - 3
+}
+
+func sourceExpanded(pos int) bool {
+	return pos == -2 || pos <= -3
 }
 
 // outerSpan переводит непустой диапазон [start, end) вложенного скрипта во внешний текст по карте pos:
@@ -1352,6 +1376,7 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool, so
 			if err != nil {
 				return nil, err
 			}
+			ws[i].pos = inheritSourceExpansion(ws[i].pos, sourceMap)
 		}
 		if literals[i] {
 			ws[i].offset = int(arg.Pos().Offset())
@@ -1363,6 +1388,20 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool, so
 	return ws, nil
 }
 
+func inheritSourceExpansion(pos, sourceMap []int) []int {
+	if len(sourceMap) == 0 {
+		return pos
+	}
+	for i, offset := range pos {
+		if offset < 0 || offset >= len(sourceMap) || sourceMap[offset] == -1 {
+			pos[i] = -1
+		} else if sourceExpanded(sourceMap[offset]) {
+			pos[i] = markSourceExpanded(offset)
+		}
+	}
+	return pos
+}
+
 func sourceSpanMapped(start, end int, sourceMap []int) bool {
 	if len(sourceMap) == 0 {
 		return true
@@ -1371,7 +1410,7 @@ func sourceSpanMapped(start, end int, sourceMap []int) bool {
 		return false
 	}
 	for _, offset := range sourceMap[start:end] {
-		if offset < 0 {
+		if offset < 0 || sourceExpanded(offset) {
 			return false
 		}
 	}
@@ -1385,6 +1424,11 @@ func wordScript(w *syntax.Word, src string, literal bool) (string, []int, error)
 		for _, part := range w.Parts {
 			if err := text.addLiteral(part, src); err != nil {
 				return "", nil, err
+			}
+		}
+		for _, part := range w.Parts {
+			if ansiQuotedHasEscape(part, src) {
+				markMappedSpanExpanded(&text, int(part.Pos().Offset()), int(part.End().Offset()))
 			}
 		}
 		return text.String(), text.pos, nil
@@ -1401,7 +1445,30 @@ func wordScript(w *syntax.Word, src string, literal bool) (string, []int, error)
 		return "", nil, nil
 	}
 	text.unescape(src[start+1:end-1], start+1, true)
+	for _, part := range quoted.Parts {
+		if _, ok := part.(*syntax.Lit); ok {
+			continue
+		}
+		markMappedSpanExpanded(&text, int(part.Pos().Offset()), int(part.End().Offset()))
+	}
 	return text.String(), text.pos, nil
+}
+
+func markMappedSpanExpanded(m *mapped, start, end int) {
+	for i, offset := range m.pos {
+		if offset >= start && offset < end {
+			m.pos[i] = markSourceExpanded(m.pos[i])
+		}
+	}
+}
+
+func ansiQuotedHasEscape(part syntax.WordPart, src string) bool {
+	quoted, ok := part.(*syntax.SglQuoted)
+	if !ok || !quoted.Dollar {
+		return false
+	}
+	start, end := int(quoted.Pos().Offset())+2, int(quoted.End().Offset())-1
+	return validSpan(src, start, end) && strings.Contains(src[start:end], `\`)
 }
 
 func ansiSourceBase(n syntax.Node, value, src string) int {
@@ -1633,7 +1700,7 @@ func wordValues(ws []*syntax.Word, src string, vars map[string]string, needLiter
 		if value, ok := wordValue(w); ok {
 			result[i] = value
 			if needLiterals {
-				literals[i] = true
+				literals[i] = !wordCanExpand(w, src)
 			}
 			continue
 		}
@@ -1663,6 +1730,61 @@ func wordValues(ws []*syntax.Word, src string, vars map[string]string, needLiter
 		}
 	}
 	return result, 0, literals
+}
+
+// wordCanExpand reports unquoted expansions that can change a literal word's value.
+func wordCanExpand(w *syntax.Word, src string) bool {
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			start, end := int(p.Pos().Offset()), int(p.End().Offset())
+			raw := p.Value
+			if validSpan(src, start, end) {
+				raw = src[start:end]
+			}
+			if unquotedExpandChars(raw) {
+				return true
+			}
+		case *syntax.DblQuoted:
+			// Tilde, pathname and brace expansion are suppressed by quotes.
+		case *syntax.SglQuoted:
+			if ansiQuotedHasEscape(p, src) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func unquotedExpandChars(raw string) bool {
+	escaped := false
+	for i := 0; i < len(raw); i++ {
+		b := raw[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if b == '\\' {
+			escaped = true
+			continue
+		}
+		if b == '*' || b == '?' || b == '[' {
+			return true
+		}
+		if b == '~' && (i == 0 || raw[i-1] == '=' || raw[i-1] == ':') {
+			return true
+		}
+		if b == '{' {
+			end := strings.IndexByte(raw[i+1:], '}')
+			if end >= 0 {
+				body := raw[i+1 : i+1+end]
+				if strings.Contains(body, ",") || strings.Contains(body, "..") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // splitFields делит значение переменной на слова по пробелам, табам и переводам строк вне подстановок
@@ -2478,13 +2600,14 @@ func (remote *remoteStdin) reads(offset int) bool {
 // indexOffsets fills the lookup from outer offsets to bytes of src: sorted
 // pairs while the outer offsets ascend, a map of first bytes otherwise.
 func (remote *remoteStdin) indexOffsets(pos []int) {
-	for i, outer := range pos {
-		if outer < 0 {
+	for i, mapped := range pos {
+		if sourceOffset(mapped) < 0 {
 			if remote.unmapped < 0 {
 				remote.unmapped = i
 			}
 			continue
 		}
+		outer := sourceOffset(mapped)
 		if n := len(remote.outers); n > 0 && outer <= remote.outers[n-1] {
 			remote.outers, remote.inners = nil, nil
 			remote.inner = firstInnerOffsets(pos)
@@ -2498,7 +2621,11 @@ func (remote *remoteStdin) indexOffsets(pos []int) {
 // firstInnerOffsets maps each outer offset in pos to its first index.
 func firstInnerOffsets(pos []int) map[int]int {
 	first := make(map[int]int, len(pos))
-	for i, outer := range pos {
+	for i, mapped := range pos {
+		if mapped == -2 {
+			continue
+		}
+		outer := sourceOffset(mapped)
 		if _, ok := first[outer]; !ok {
 			first[outer] = i
 		}
@@ -2860,7 +2987,7 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 		case *syntax.ParamExp:
 			if value, ok := knownParam(p, vars); ok {
 				for i := 0; i < len(value); i++ {
-					m.pushSpan(value[i], -1, start, end)
+					m.pushSpan(value[i], -2, start, end)
 				}
 				continue
 			}
@@ -2888,6 +3015,7 @@ func (m *mapped) keepExpansion(part syntax.WordPart, start, end int, src string)
 		return true
 	})
 	m.keepSource(part, start, end, src)
+	markMappedSpanExpanded(m, start, end)
 }
 
 // knownParam returns the value of a plain $NAME or ${NAME} whose value the
@@ -2980,10 +3108,10 @@ func (m mapped) stripLeadingTabs() mapped {
 	out.subst = m.subst
 	lineStart := true
 	for i, b := range m.text {
-		if lineStart && b == '\t' && m.pos[i] >= 0 {
+		if lineStart && b == '\t' && sourceOffset(m.pos[i]) >= 0 {
 			continue
 		}
-		lineStart = b == '\n' && m.pos[i] >= 0
+		lineStart = b == '\n' && sourceOffset(m.pos[i]) >= 0
 		out.pushSpan(b, m.pos[i], m.rawStart[i], m.rawEnd[i])
 	}
 	return out

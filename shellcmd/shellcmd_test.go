@@ -2796,6 +2796,20 @@ func TestCallLiteralArguments(t *testing.T) {
 		{"unquoted heredoc expansion", "bash <<EOF\nkill $PPID\nEOF", []string{"$PPID"}, []bool{false}, ""},
 		{"here string", `bash <<< "kill '\$PPID'"`, []string{"$PPID"}, []bool{true}, ""},
 		{"ssh nested script", `ssh host 'kill \$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+		{"outer expansion in bash script", `bash -c "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
+		{"outer expansion in eval", `eval "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
+		{"outer expansion in ssh", `ssh host "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
+		{"outer expansion in here string", `bash <<< "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
+		{"expansion provenance through heredoc and bash", "X=1; bash <<EOF\nbash -c 'kill $X'\nEOF", []string{"1"}, []bool{false}, ""},
+		{"tilde expansion", `kill ~`, []string{"~"}, []bool{false}, ""},
+		{"glob expansion", `kill /etc/passw*`, []string{"/etc/passw*"}, []bool{false}, ""},
+		{"brace list expansion", `kill {a,b}`, []string{"{a,b}"}, []bool{false}, ""},
+		{"brace sequence expansion", `kill {1..3}`, []string{"{1..3}"}, []bool{false}, ""},
+		{"quoted tilde", `kill '~'`, []string{"~"}, []bool{true}, ""},
+		{"quoted glob", `kill '/etc/passw*'`, []string{"/etc/passw*"}, []bool{true}, ""},
+		{"quoted braces", `kill '{a,b}'`, []string{"{a,b}"}, []bool{true}, ""},
+		{"ANSI-C no escape", `kill $'abc'`, []string{"abc"}, []bool{true}, ""},
+		{"ANSI-C decoded escape", `kill $'a\nb'`, []string{`a\nb`}, []bool{false}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2838,6 +2852,25 @@ func TestCallLiteralMaskSizeAndBounds(t *testing.T) {
 	}
 	if (Call{Args: []string{"x"}}).ArgLiteral(0) {
 		t.Fatal("unset literal mask reports a literal argument")
+	}
+}
+
+func TestCallLiteralMaskArgument31(t *testing.T) {
+	args := make([]string, 32)
+	for i := range args {
+		args[i] = "x"
+	}
+	args[31] = `'$PPID'`
+	src := "kill " + strings.Join(args, " ")
+	calls, err := Find(src, "kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || len(calls[0].Args) != 32 {
+		t.Fatalf("calls = %+v, want one call with 32 args", calls)
+	}
+	if !calls[0].ArgLiteral(31) {
+		t.Fatal("ArgLiteral(31) = false, want true")
 	}
 }
 
