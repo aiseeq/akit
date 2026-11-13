@@ -53,8 +53,8 @@ func exitWithSignal(sig syscall.Signal) {
 
 // restoreDefaultAction puts sig back to SIG_DFL past the Go runtime, which
 // otherwise catches QUIT, ABRT, SEGV, PIPE, USR1 and the rest, and unblocks it
-// on this thread. The process dies on the very next delivery, so the runtime
-// never sees the change. It turns non-dumpable first: the crash, if the
+// on this thread. The process dies on the next delivery unless os/signal
+// installs a handler for sig in between (see ExitWithSignal). It turns non-dumpable first: the crash, if the
 // signal dumps core, is the child's, and a second core record would be ours.
 func restoreDefaultAction(sig syscall.Signal) error {
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
