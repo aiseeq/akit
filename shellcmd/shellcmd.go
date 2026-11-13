@@ -261,6 +261,8 @@ type walkInfo struct {
 	workNodes     int
 	trackWork     bool
 	stdinIndex    *stdinIndex
+	// hasInputRedir says whether src holds any `<`; without one no call has stdin to resolve.
+	hasInputRedir bool
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
@@ -268,9 +270,10 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		return walkInfo{redirs: make(map[*syntax.CallExpr][]Redir)}
 	}
 	info := walkInfo{
-		trackWork:  budget.trackWork,
-		timedCalls: make(map[*syntax.CallExpr]bool),
-		redirs:     make(map[*syntax.CallExpr][]Redir),
+		trackWork:     budget.trackWork,
+		hasInputRedir: strings.Contains(src, "<"),
+		timedCalls:    make(map[*syntax.CallExpr]bool),
+		redirs:        make(map[*syntax.CallExpr][]Redir),
 
 		stdinInputs:     make(map[*syntax.CallExpr]*syntax.Redirect),
 		loopCalls:       make(map[*syntax.CallExpr]bool),
@@ -379,7 +382,7 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 	}
 	offset := int(call.Args[0].Pos().Offset())
 	var stdin stdinValue
-	if strings.Contains(src, "<") {
+	if info.hasInputRedir {
 		if info.stdinIndex == nil {
 			info.stdinIndex = newStdinIndex(file)
 		}
