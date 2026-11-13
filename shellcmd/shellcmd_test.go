@@ -82,6 +82,16 @@ func TestArgLiteralContract(t *testing.T) {
 		{"watch", `watch kill \$PPID ~`, "kill", 0, false},
 		{"tilde command", `~/kill 1`, "kill", 0, false},
 		{"sudo tilde command", `sudo ~/kill 1`, "kill", 0, false},
+		{"alias overrides kill", "shopt -s expand_aliases\nalias kill='eval kill'\nkill '$PPID'", "kill", 0, false},
+		{"alias call disables script", `alias x=y; kill 'a'`, "kill", 0, false},
+		{"shopt call disables script", `shopt -s expand_aliases; kill 'a'`, "kill", 0, false},
+		{"enable call disables script", `enable -n kill; kill 'a'`, "kill", 0, false},
+
+		{"function disables unrelated command", `other() { :; }; kill 'a'`, "kill", 0, false},
+		{"nested function disables script", `if true; then other() { :; }; fi; kill 'a'`, "kill", 0, false},
+		{"function in input disables inner script", `f() { :; }; bash -c 'kill 1'`, "kill", 0, false},
+		{"history expansion", "set -o history -H\n: $PPID\nkill !!:1", "kill", 0, false},
+		{"escaped history mark", `kill \!`, "kill", 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -108,6 +118,30 @@ func TestArgLiteralContract(t *testing.T) {
 	}
 	if !calls[0].ArgLiteral(31) || calls[0].ArgLiteral(32) {
 		t.Errorf("boundary arguments: ArgLiteral(31)=%v, ArgLiteral(32)=%v", calls[0].ArgLiteral(31), calls[0].ArgLiteral(32))
+	}
+	calls, err = Find(`kill $PPID b`, "kill")
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("mixed arguments: calls=%#v, err=%v", calls, err)
+	}
+	if calls[0].ArgLiteral(0) || !calls[0].ArgLiteral(1) {
+		t.Errorf("mixed argument literals: got [%v, %v], want [false, true]", calls[0].ArgLiteral(0), calls[0].ArgLiteral(1))
+	}
+	functionSource := strings.Join([]string{`kill() { eval builtin kill "$@"; }; kill '$`, `PPID'`}, "")
+	calls, err = Find(functionSource, "kill")
+	if err != nil {
+		t.Fatalf("function override: Find: %v", err)
+	}
+	foundTarget := false
+	for _, call := range calls {
+		if call.Raw == strings.Join([]string{`kill '$`, `PPID'`}, "") {
+			foundTarget = true
+			if call.ArgLiteral(0) {
+				t.Errorf("function override: ArgLiteral(0) = true, want false")
+			}
+		}
+	}
+	if !foundTarget {
+		t.Fatalf("function override target not found in %#v", calls)
 	}
 	if got := unsafe.Sizeof(Call{}); got != 128 {
 		t.Errorf("sizeof Call = %d, want 128", got)

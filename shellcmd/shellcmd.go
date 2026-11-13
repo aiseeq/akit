@@ -41,7 +41,10 @@ type Call struct {
 
 // ArgLiteral сообщает, что аргумент i — литеральное слово на верхнем уровне входного
 // скрипта или на верхнем уровне скрипта из прямого `bash/sh -c '…'`. Всё прочее,
+// включая вызовы в скрипте с определением функции или вызовом alias, shopt или enable,
 // слова с раскрытиями или неподдерживаемыми кавычками и индексы вне [0, 32) дают false.
+// Переопределение имени команды вне видимого скрипта (например, через rc-файлы,
+// BASH_ENV или `bash -i`) не учитывается.
 func (c Call) ArgLiteral(i int) bool {
 	return i >= 0 && i < 32 && c.literalArgs&(uint32(1)<<uint(i)) != 0
 }
@@ -131,6 +134,7 @@ type nestedParseBudget struct {
 	substSteps     int
 	trackWork      bool
 	literalShell   string
+	literalUnsafe  bool
 	parsedShells   map[string]int
 }
 
@@ -225,6 +229,9 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
+	previousLiteralUnsafe := budget.literalUnsafe
+	budget.literalUnsafe = budget.literalUnsafe || info.literalUnsafe
+	defer func() { budget.literalUnsafe = previousLiteralUnsafe }()
 	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
@@ -283,6 +290,7 @@ type walkInfo struct {
 	stdinIndex    *stdinIndex
 	// hasInputRedir says whether src holds any `<`; without one no call has stdin to resolve.
 	hasInputRedir bool
+	literalUnsafe bool
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
@@ -293,7 +301,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		}
 	}
 	if !needsWalkInfo(src) {
-		return walkInfo{topLevelCalls: topLevelCalls, redirs: make(map[*syntax.CallExpr][]Redir)}
+		return walkInfo{topLevelCalls: topLevelCalls, redirs: make(map[*syntax.CallExpr][]Redir), literalUnsafe: hasLiteralUnsafeContext(file)}
 	}
 	info := walkInfo{
 		topLevelCalls: topLevelCalls,
@@ -317,6 +325,9 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 			info.workNodes++
 		}
 		collectWalkNode(node, file, src, vars, &info, knownPipes)
+		if literalUnsafeNode(node) {
+			info.literalUnsafe = true
+		}
 		collectCallContextNode(node, &info)
 		return true
 	})
@@ -1202,7 +1213,7 @@ func validSpan(src string, start, end int) bool {
 }
 
 func setLiteralArgs(c *cmd, expr *syntax.CallExpr, src string, info walkInfo, budget *nestedParseBudget) {
-	c.literalContext = literalCallContext(c, expr, info, budget)
+	c.literalContext = !budget.literalUnsafe && literalCallContext(c, expr, info, budget)
 	if !c.literalContext || len(expr.Args) == 0 || !literalWord(expr.Args[0], src) {
 		return
 	}
@@ -1281,7 +1292,7 @@ func hasUnquotedExpansion(text string) bool {
 			i++
 			continue
 		}
-		if strings.ContainsRune("{}~*?[]$`", rune(ch)) {
+		if strings.ContainsRune("{}~*?[]$`!", rune(ch)) {
 			return true
 		}
 	}
@@ -1294,6 +1305,36 @@ func singleQuotedWord(word *syntax.Word) bool {
 	}
 	quoted, ok := word.Parts[0].(*syntax.SglQuoted)
 	return ok && !quoted.Dollar
+}
+
+func hasLiteralUnsafeContext(file *syntax.File) bool {
+	unsafe := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if literalUnsafeNode(node) {
+			unsafe = true
+			return false
+		}
+		return true
+	})
+	return unsafe
+}
+
+func literalUnsafeNode(node syntax.Node) bool {
+	switch n := node.(type) {
+	case *syntax.FuncDecl:
+		return true
+	case *syntax.CallExpr:
+		if len(n.Args) == 0 {
+			return false
+		}
+		if name, ok := wordValue(n.Args[0]); ok {
+			switch commandName(name) {
+			case "alias", "shopt", "enable":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func literalArgsMask(words []*syntax.Word, src string) uint32 {
