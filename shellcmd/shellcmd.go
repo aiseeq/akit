@@ -2721,14 +2721,18 @@ func stdinRedirectBody(input *syntax.Redirect, src string, vars map[string]strin
 		// delimiter line; the body ends where heredocText ends it.
 		var body mapped
 		limit := src[:int(input.Hdoc.Pos().Offset())+len(heredocText(input, src))]
-		body.expandParts(input.Hdoc.Parts, limit, vars, partHeredoc)
+		if err := body.expandParts(input.Hdoc.Parts, limit, vars, partHeredoc); err != nil {
+			return mapped{}, err
+		}
 		if input.Op.String() == "<<-" {
 			body = body.stripLeadingTabs()
 		}
 		return body, nil
 	case input.Word != nil:
 		var body mapped
-		body.expandParts(input.Word.Parts, src, vars, partUnquoted)
+		if err := body.expandParts(input.Word.Parts, src, vars, partUnquoted); err != nil {
+			return mapped{}, err
+		}
 		body.pushSpan('\n', -1, -1, -1)
 		return body, nil
 	}
@@ -2752,7 +2756,7 @@ const (
 // dropping it would hide an argument such as the target of kill. Substitutions
 // the outer shell runs are recorded in subst, so that calls found again inside
 // their kept text can be dropped.
-func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[string]string, context partContext) {
+func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[string]string, context partContext) error {
 	for _, part := range parts {
 		start, end := int(part.Pos().Offset()), min(int(part.End().Offset()), len(src))
 		if start >= end {
@@ -2775,13 +2779,15 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 				// An unquoted $'…' in a here-string word: the outer shell
 				// decodes its escapes before the inner shell reads it.
 				if err := m.unescapeANSI(p.Value, ansiSourceBase(p, p.Value, src)); err != nil {
-					m.keepSource(part, start, end, src)
+					return err
 				}
 				continue
 			}
 			m.addSpans(p.Value, start+1)
 		case *syntax.DblQuoted:
-			m.expandParts(p.Parts, src, vars, partDouble)
+			if err := m.expandParts(p.Parts, src, vars, partDouble); err != nil {
+				return err
+			}
 		case *syntax.ParamExp:
 			if value, ok := knownParam(p, vars); ok {
 				for i := 0; i < len(value); i++ {
@@ -2794,6 +2800,7 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 			m.keepExpansion(part, start, end, src)
 		}
 	}
+	return nil
 }
 
 // keepExpansion keeps the source text of an expansion and records every
