@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
@@ -810,7 +811,7 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 	cases := []struct {
 		name, blockerStatus              string
 		archived, duplicate, omitProject bool
-		strayUnknown                     bool
+		strayStatus, blockerLine         string
 		wantOne, wantTwo                 int
 		wantMark                         string
 	}{
@@ -820,7 +821,11 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 		{name: "duplicate", blockerStatus: "открыт", duplicate: true, wantOne: 1, wantTwo: 2},
 		{name: "project-not-loaded", blockerStatus: "открыт", omitProject: true, wantOne: 2, wantTwo: 1, wantMark: " заблокирован: git/b/blk-open"},
 		{name: "unknown-status", blockerStatus: "странный", wantOne: 1, wantTwo: 2},
-		{name: "unknown-status-elsewhere-in-blocker-project", blockerStatus: "открыт", strayUnknown: true, wantOne: 1, wantTwo: 2},
+		{name: "unknown-status-elsewhere-in-blocker-project", blockerStatus: "открыт", strayStatus: "Статус: странный", wantOne: 1, wantTwo: 2},
+		{name: "carriage-return-status-elsewhere-in-blocker-project", blockerStatus: "открыт", strayStatus: "Статус: готово\r", wantOne: 1, wantTwo: 2},
+		{name: "trailing-space-status-elsewhere-in-blocker-project", blockerStatus: "открыт", strayStatus: "Статус: готово ", wantOne: 1, wantTwo: 2},
+		{name: "double-space-status-elsewhere-in-blocker-project", blockerStatus: "открыт", strayStatus: "Статус:  готово", wantOne: 1, wantTwo: 2},
+		{name: "carriage-return-status-on-blocker", blockerLine: "Статус: открыт\r", wantOne: 1, wantTwo: 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -868,40 +873,40 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 			if err := os.MkdirAll(blockerDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if tc.blockerStatus == "странный" {
-				writeRankTicket(filepath.Join(blockerDir, "20200103-1000-MED-blk-open.md"), "# blocker\nСтатус: странный\n")
-			} else {
-				writeRankTicket(filepath.Join(blockerDir, "20200103-1000-MED-blk-open.md"), "# blocker\nСтатус: "+tc.blockerStatus+"\n")
-			}
+			blockerLine := cmp.Or(tc.blockerLine, "Статус: "+tc.blockerStatus)
+			writeRankTicket(filepath.Join(blockerDir, "20200103-1000-MED-blk-open.md"), "# blocker\n"+blockerLine+"\n")
 			if tc.duplicate {
 				writeRankTicket(filepath.Join(blockerDir, "20200104-1000-MED-blk-open.md"), "# duplicate\nСтатус: открыт\n")
 			}
-			if tc.strayUnknown {
-				writeRankTicket(filepath.Join(blockerDir, "20200105-1000-MED-bad-status.md"), "# other\nСтатус: странный\n")
+			if tc.strayStatus != "" {
+				writeRankTicket(filepath.Join(blockerDir, "20200105-1000-MED-bad-status.md"), "# other\n"+tc.strayStatus+"\n")
 			}
 			listRoot := gitRoot
 			if tc.omitProject {
 				listRoot = a
 			}
-			var out, errout bytes.Buffer
-			if code := list(listRoot, options{all: true, json: true, root: listRoot}, &out, &errout); code != 0 {
-				t.Fatalf("ls: %d %s", code, errout.String())
-			}
-			var rows []struct {
-				Slug     string `json:"slug"`
-				NextRank *int   `json:"next_rank"`
-			}
-			if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
-				t.Fatal(err)
-			}
-			ranks := map[string]int{}
-			for _, row := range rows {
-				if row.NextRank != nil {
-					ranks[row.Slug] = *row.NextRank
+			// The first pass parses the files and fills the cache, the second reads every ticket from it.
+			for _, pass := range []string{"cold", "warm"} {
+				var out, errout bytes.Buffer
+				if code := list(listRoot, options{all: true, json: true, root: listRoot}, &out, &errout); code != 0 {
+					t.Fatalf("%s ls: %d %s", pass, code, errout.String())
 				}
-			}
-			if ranks["p-one"] != tc.wantOne || ranks["p-two"] != tc.wantTwo {
-				t.Fatalf("next_rank: p-one=%d p-two=%d, want %d/%d; json=%s", ranks["p-one"], ranks["p-two"], tc.wantOne, tc.wantTwo, out.String())
+				var rows []struct {
+					Slug     string `json:"slug"`
+					NextRank *int   `json:"next_rank"`
+				}
+				if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+					t.Fatal(err)
+				}
+				ranks := map[string]int{}
+				for _, row := range rows {
+					if row.NextRank != nil {
+						ranks[row.Slug] = *row.NextRank
+					}
+				}
+				if ranks["p-one"] != tc.wantOne || ranks["p-two"] != tc.wantTwo {
+					t.Fatalf("%s next_rank: p-one=%d p-two=%d, want %d/%d; json=%s", pass, ranks["p-one"], ranks["p-two"], tc.wantOne, tc.wantTwo, out.String())
+				}
 			}
 			loaded, err := loadCachedTasks(filepath.Join(a, "docs/tasks"))
 			if err != nil {

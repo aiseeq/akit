@@ -164,6 +164,8 @@ type task struct {
 	path, slug, status, prio, diff, title, body string
 	created, changed                            time.Time
 	facts                                       *taskFacts
+	// statusErr: the strict status parse failed and the status was taken leniently.
+	statusErr bool
 }
 
 type taskFacts struct {
@@ -2133,7 +2135,7 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 			}
 			st, _ = explicitStatus(s)
 		}
-		ts = append(ts, task{path: p, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(s), body: s, created: created, changed: lastChange(s, info.ModTime())})
+		ts = append(ts, task{path: p, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(s), body: s, created: created, changed: lastChange(s, info.ModTime()), statusErr: err != nil})
 	}
 	return ts, nil
 }
@@ -4675,9 +4677,9 @@ func cachedListBlockMark(project, ref string, allProjects map[string][]task, err
 	matches := 0
 	for i := range loaded {
 		candidate := &loaded[i]
-		if !validStatus(candidate.status) {
-			// The plain resolver fails on any ticket with an unknown status in the project;
-			// the same project goes through it so the rank stays as without the cache.
+		if candidate.statusErr {
+			// The plain resolver parses status strictly and fails on any such ticket in the
+			// project; the same project goes through it so the rank stays as without the cache.
 			return refBlockMark(project, ref, errout)
 		}
 		if matchesID(*candidate, id) {

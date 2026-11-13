@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const parseCacheVersion = 3
+const parseCacheVersion = 4
 const parseCacheRacyWindow = 2 * time.Second
 
 var parseCacheAfterStat func(string)
@@ -47,6 +47,7 @@ type cachedTask struct {
 	Slug, Status, Prio, Diff, Title string
 	CreatedStamp, ChangedStamp      string
 	Facts                           taskFacts
+	StatusErr                       bool
 }
 
 type parseCacheFile struct {
@@ -139,7 +140,7 @@ func parseCachedBody(path, body string, info os.FileInfo, tolerateUnknownStatus 
 		}
 		st, _ = explicitStatus(body)
 	}
-	return task{path: path, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(body), body: body, created: created, changed: lastChange(body, info.ModTime())}, nil
+	return task{path: path, slug: name.slug, status: st, prio: name.prio, diff: name.diff, title: title(body), body: body, created: created, changed: lastChange(body, info.ModTime()), statusErr: err != nil}, nil
 }
 
 func loadCachedTaskFromEntries(ticket string, tolerateUnknownStatus bool, entries map[string]parseCacheEntry) (task, error) {
@@ -206,7 +207,7 @@ func taskFromParseCache(ticket string, current os.FileInfo, entry parseCacheEntr
 			return task{}, false
 		}
 	}
-	return task{path: ticket, slug: entry.Task.Slug, status: entry.Task.Status, prio: entry.Task.Prio, diff: entry.Task.Diff, title: entry.Task.Title, created: created, changed: changed, facts: &entry.Task.Facts}, true
+	return task{path: ticket, slug: entry.Task.Slug, status: entry.Task.Status, prio: entry.Task.Prio, diff: entry.Task.Diff, title: entry.Task.Title, created: created, changed: changed, facts: &entry.Task.Facts, statusErr: entry.Task.StatusErr}, true
 }
 
 func cacheTooFresh(info os.FileInfo, written int64) bool {
@@ -260,7 +261,7 @@ func makeParseCacheEntry(info os.FileInfo, t task) (parseCacheEntry, bool) {
 	return parseCacheEntry{
 		Size: info.Size(), ModNS: mod, CTimeNS: ctime, FileID: fileID, Written: parseCacheNow().UnixNano(),
 		Task: cachedTask{Slug: t.slug, Status: t.status, Prio: t.prio, Diff: t.diff, Title: t.title,
-			CreatedStamp: name.date + "-" + name.clock, ChangedStamp: lastChangeStamp(t.body), Facts: *factsForTask(t)},
+			CreatedStamp: name.date + "-" + name.clock, ChangedStamp: lastChangeStamp(t.body), Facts: *factsForTask(t), StatusErr: t.statusErr},
 	}, true
 }
 
