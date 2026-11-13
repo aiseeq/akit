@@ -2397,9 +2397,6 @@ EOF`, []string{"ssh", "bash"}, 2},
 		{"stdin null disabled", `ssh -o StdinNull=no host bash <<'EOF'
 kill 1
 EOF`, []string{"ssh", "bash"}, 2},
-		{"open tty xargs", `xargs -o ssh host bash <<'EOF'
-kill 1
-EOF`, []string{"xargs", "ssh", "bash"}, 2},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			calls, err := Find(tt.src, "kill")
@@ -2475,6 +2472,72 @@ func TestSSHUnquotedHeredocSplitsLocalAndRemoteSubstitutions(t *testing.T) {
 	}
 }
 
+func TestRoundSixLocalHeredocUsesExpandedReaderText(t *testing.T) {
+	for _, src := range []string{
+		"bash <<EOF\necho \\$(kill 1)\nEOF",
+		"bash <<EOF\necho \"\\$(kill 1)\"\nEOF",
+		"K=kill; bash <<EOF\n\"$K\" 1\nEOF",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 1 {
+			t.Fatalf("Find(%q) = %#v, %v; want one kill", src, calls, err)
+		}
+		if !reflect.DeepEqual(calls[0].Via, []string{"bash"}) || calls[0].Line != 2 {
+			t.Errorf("kill = %#v; want Via [bash], line 2", calls[0])
+		}
+	}
+}
+
+func TestRoundSixExpandedBodyKeepsAssignedVariables(t *testing.T) {
+	for _, tt := range []struct {
+		src string
+		via []string
+		raw string
+	}{
+		{"K=kill; runuser -k <<EOF\n$K 1\nEOF", []string{"runuser", "sh"}, "$K 1"},
+		{"K=kill; setpriv --split-string runuser <<EOF\n${K} 1\nEOF", []string{"setpriv", "runuser", "sh"}, "${K} 1"},
+	} {
+		calls, err := Find(tt.src, "kill")
+		if err != nil || len(calls) != 1 {
+			t.Errorf("Find(%q) = %#v, %v; want one kill", tt.src, calls, err)
+			continue
+		}
+		if !reflect.DeepEqual(calls[0].Via, tt.via) || calls[0].Line != 2 || calls[0].Raw != tt.raw || calls[0].Offset != -1 {
+			t.Errorf("kill = %#v; want Via %v, line 2, Raw %q, and Offset -1", calls[0], tt.via, tt.raw)
+		}
+	}
+}
+
+func TestRoundSixLocalSSHInheritsEffectiveStdin(t *testing.T) {
+	for _, src := range []string{
+		"{ ssh host bash; } <<'EOF'\nkill 1\nEOF",
+		"( ssh host bash ) <<'EOF'\nkill 1\nEOF",
+		"f() { ssh host bash; }; f <<'EOF'\nkill 1\nEOF",
+		"ssh host bash 3<<'EOF' 0<&3\nkill 1\nEOF",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 1 {
+			t.Fatalf("Find(%q) = %#v, %v; want one kill", src, calls, err)
+		}
+		if !reflect.DeepEqual(calls[0].Via, []string{"ssh", "bash"}) || calls[0].Line != 2 {
+			t.Errorf("kill = %#v; want Via [ssh bash], line 2", calls[0])
+		}
+	}
+}
+
+func TestRoundSixXargsConsumesOrReplacesSSHStdin(t *testing.T) {
+	for _, src := range []string{
+		"ssh host 'xargs bash -s' <<'EOF'\nkill 1\nEOF",
+		"xargs -o ssh host bash <<'EOF'\nkill 1\nEOF",
+		"xargs --open-tty ssh host bash <<'EOF'\nkill 1\nEOF",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want no kill from data on stdin", src, calls, err)
+		}
+	}
+}
+
 func TestSSHRemoteCommandParsedOnce(t *testing.T) {
 	src := "ssh host bash <<'EOF'\nkill 1\nEOF"
 	budget := newNestedParseBudget(len(src))
@@ -2494,6 +2557,7 @@ func TestSSHStdinRedirectionsRespectOrderAndDescriptor(t *testing.T) {
 		line      int
 	}{
 		{"fd 3 does not replace stdin", "ssh host bash <<'A' 3<<'B'\nkill 1\nA\ndata\nB", 2},
+		{"fd 3 duplicated to stdin", "ssh host bash 3<<'A' 0<&3\nkill 1\nA", 2},
 		{"dup fd zero retains heredoc", "ssh host bash <<'A' <&0\nkill 1\nA", 2},
 		{"last stdin redirect wins", "ssh host bash <<'A' </dev/null <<'B'\nkill 2\nA\nkill 1\nB", 4},
 		{"group dup of fd zero", "ssh host '{ bash -s; } <&0' <<'EOF'\nkill 1\nEOF", 2},

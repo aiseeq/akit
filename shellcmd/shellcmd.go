@@ -40,11 +40,12 @@ type Call struct {
 
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
 type cmd struct {
-	call          Call
-	words         []word
-	budget        *nestedParseBudget
-	source        string
-	syntaxRedirs  []*syntax.Redirect
+	call   Call
+	words  []word
+	budget *nestedParseBudget
+	source string
+
+	stdinInput    *syntax.Redirect
 	stdinConsumed bool
 }
 
@@ -236,19 +237,22 @@ func dedupeCalls(calls []Call, seen *callSet) []Call {
 }
 
 type heredocShellInput struct {
-	stmt *syntax.Stmt
-	name string
-	via  []string
+	stmt  *syntax.Stmt
+	redir *syntax.Redirect
+	name  string
+	via   []string
 }
 
 type walkInfo struct {
-	timedCalls      map[*syntax.CallExpr]bool
-	redirs          map[*syntax.CallExpr][]Redir
-	syntaxRedirs    map[*syntax.CallExpr][]*syntax.Redirect
+	timedCalls map[*syntax.CallExpr]bool
+	redirs     map[*syntax.CallExpr][]Redir
+
+	stdinInputs     map[*syntax.CallExpr]*syntax.Redirect
 	loopCalls       map[*syntax.CallExpr]bool
 	backgroundCalls map[*syntax.CallExpr]bool
 	shellInputs     []heredocShellInput
 	shellHdocs      map[*syntax.Redirect]bool
+	localSubstHdocs map[*syntax.Redirect]bool
 
 	errors        []error
 	scriptInputs  map[*syntax.CallExpr]bool
@@ -262,13 +266,15 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		return walkInfo{redirs: make(map[*syntax.CallExpr][]Redir)}
 	}
 	info := walkInfo{
-		trackWork:       budget.trackWork,
-		timedCalls:      make(map[*syntax.CallExpr]bool),
-		redirs:          make(map[*syntax.CallExpr][]Redir),
-		syntaxRedirs:    make(map[*syntax.CallExpr][]*syntax.Redirect),
+		trackWork:  budget.trackWork,
+		timedCalls: make(map[*syntax.CallExpr]bool),
+		redirs:     make(map[*syntax.CallExpr][]Redir),
+
+		stdinInputs:     make(map[*syntax.CallExpr]*syntax.Redirect),
 		loopCalls:       make(map[*syntax.CallExpr]bool),
 		backgroundCalls: make(map[*syntax.CallExpr]bool),
 		shellHdocs:      make(map[*syntax.Redirect]bool),
+		localSubstHdocs: make(map[*syntax.Redirect]bool),
 
 		scriptInputs: make(map[*syntax.CallExpr]bool),
 	}
@@ -277,7 +283,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		if info.trackWork {
 			info.workNodes++
 		}
-		collectWalkNode(node, src, vars, &info, knownPipes)
+		collectWalkNode(node, file, src, vars, &info, knownPipes)
 		collectCallContextNode(node, &info)
 		return true
 	})
@@ -287,14 +293,14 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 	return info
 }
 
-func collectWalkNode(node syntax.Node, src string, vars map[string]string, info *walkInfo, knownPipes map[*syntax.BinaryCmd]bool) {
+func collectWalkNode(node syntax.Node, file *syntax.File, src string, vars map[string]string, info *walkInfo, knownPipes map[*syntax.BinaryCmd]bool) {
 	switch n := node.(type) {
 	case *syntax.BinaryCmd:
 		collectPipelineWalkInfo(n, src, vars, info, knownPipes)
 	case *syntax.CallExpr:
 		collectCallWalkInfo(n, src, vars, info)
 	case *syntax.Stmt:
-		collectStmtWalkInfo(n, src, vars, info)
+		collectStmtWalkInfo(n, file, src, vars, info)
 	}
 }
 
@@ -338,6 +344,7 @@ func collectPipedHeredocWalkInfo(binary *syntax.BinaryCmd, src string, vars map[
 		}
 		info.pipedHeredocs = append(info.pipedHeredocs, pipedHeredoc{redir: redir, shell: binary.Y, name: name, via: via})
 		info.shellHdocs[redir] = true
+		delete(info.localSubstHdocs, redir)
 		found = true
 	}
 	return found
@@ -360,23 +367,28 @@ func collectCallWalkInfo(call *syntax.CallExpr, src string, vars map[string]stri
 	}
 }
 
-func collectStmtWalkInfo(stmt *syntax.Stmt, src string, vars map[string]string, info *walkInfo) {
-	name, shellVia, input, err := shellInputName(stmt, src, vars)
+func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars map[string]string, info *walkInfo) {
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return
+	}
+	offset := int(call.Args[0].Pos().Offset())
+	var stdin stdinValue
+	if strings.Contains(src, "<") {
+		stdin = resolveStdinAt(file, offset, stdinValue{})
+	}
+	if stdin.redir != nil {
+		info.stdinInputs[call] = stdin.redir
+	}
+	name, shellVia, input, err := shellInputName(stmt, src, vars, stdin.redir)
 	if err != nil {
 		info.errors = append(info.errors, err)
 	} else if input {
-		info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, name: name, via: shellVia})
-		if !slices.Contains(shellVia, "ssh") {
-			for _, redirect := range stmt.Redirs {
-				if redirect.Hdoc != nil {
-					info.shellHdocs[redirect] = true
-				}
-			}
+		info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: stdin.redir, name: name, via: shellVia})
+		if !slices.Contains(shellVia, "ssh") && stdin.redir != nil && stdin.redir.Hdoc != nil {
+			info.shellHdocs[stdin.redir] = true
+			info.localSubstHdocs[stdin.redir] = true
 		}
-	}
-	call, ok := stmt.Cmd.(*syntax.CallExpr)
-	if !ok {
-		return
 	}
 	for _, redir := range stmt.Redirs {
 		if redir.Op.String() != "<" || !hasProcessSubstitution([]*syntax.Word{redir.Word}, src) {
@@ -647,9 +659,24 @@ func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
 	if redirect.Word != nil {
 		syntax.Walk(redirect.Word, w.visit)
 	}
-	if redirect.Hdoc != nil && !w.info.shellHdocs[redirect] && !quotedHeredoc(redirect.Word) {
-		syntax.Walk(redirect.Hdoc, w.visit)
+	if redirect.Hdoc == nil || quotedHeredoc(redirect.Word) {
+		return
 	}
+	if !w.info.shellHdocs[redirect] {
+		syntax.Walk(redirect.Hdoc, w.visit)
+		return
+	}
+	if !w.info.localSubstHdocs[redirect] {
+		return
+	}
+	syntax.Walk(redirect.Hdoc, func(node syntax.Node) bool {
+		switch node.(type) {
+		case *syntax.CmdSubst, *syntax.ProcSubst:
+			syntax.Walk(node, w.visit)
+			return false
+		}
+		return true
+	})
 }
 
 func (w *callWalker) addTime(clause *syntax.TimeClause) {
@@ -664,7 +691,7 @@ func (w *callWalker) addTime(clause *syntax.TimeClause) {
 func (w *callWalker) visitStmt(stmt *syntax.Stmt) {
 	if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(stmt.Redirs) > 0 {
 		w.info.redirs[call] = stmtRedirs(stmt.Redirs, w.src)
-		w.info.syntaxRedirs[call] = stmt.Redirs
+
 	}
 }
 
@@ -698,7 +725,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		return
 	}
 	ws := splitWords(words, split)
-	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, syntaxRedirs: w.info.syntaxRedirs[call]}
+	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
 	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
 		if errors.As(err, &nested) {
@@ -781,46 +808,61 @@ func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
 }
 
-func heredocRedirectBody(redir *syntax.Redirect, src string) (mapped, error) {
-	if redir.Hdoc != nil {
-		return heredocScript(redir, src), nil
-	}
-	var body mapped
-	if redir.Word != nil {
-		for _, part := range redir.Word.Parts {
-			if err := body.addLiteral(part, src); err != nil {
-				return mapped{}, fmt.Errorf("shellcmd: decode here-string: %w", err)
-			}
-		}
-	}
-	return body, nil
-}
-
 func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
 	var nestedErrs []error
 	for _, input := range inputs {
-		stmt, name, shellVia := input.stmt, input.name, input.via
-		for _, redir := range stmt.Redirs {
-			if redir.Hdoc == nil && redir.Op.String() != "<<<" {
-				continue
-			}
-			body, err := heredocRedirectBody(redir, src)
-			if err != nil {
-				nestedErrs = append(nestedErrs, err)
-				continue
-			}
-			via := append(append(append([]string(nil), inherited...), shellVia...), name)
-			call, _ := stmt.Cmd.(*syntax.CallExpr)
-			line := int(stmt.Pos().Line()) + lineBase - 1
-			if redir.Hdoc != nil {
-				line = int(redir.Hdoc.Pos().Line()) + lineBase - 1
-			}
-			if err := parseNestedWithBudget(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
-				nestedErrs = append(nestedErrs, err)
-			}
+		stmt, name, shellVia, redir := input.stmt, input.name, input.via, input.redir
+		body, err := stdinRedirectBody(redir, src, vars)
+		if err != nil {
+			nestedErrs = append(nestedErrs, err)
+			continue
 		}
+		via := append(append(append([]string(nil), inherited...), shellVia...), name)
+		call, _ := stmt.Cmd.(*syntax.CallExpr)
+		line := int(stmt.Pos().Line()) + lineBase - 1
+		if redir != nil && redir.Hdoc != nil {
+			line = int(redir.Hdoc.Pos().Line()) + lineBase - 1
+		}
+		first := len(*calls)
+		if err := parseNestedWithBudget(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
+			nestedErrs = append(nestedErrs, err)
+		}
+		preserveMappedRaw(*calls, first, body, src)
 	}
 	return errors.Join(nestedErrs...)
+}
+
+func preserveMappedRaw(calls []Call, first int, body mapped, src string) {
+	if len(body.rawStart) != len(body.text) || len(body.rawEnd) != len(body.text) {
+		return
+	}
+	text := body.String()
+	searchFrom := 0
+	for i := first; i < len(calls); i++ {
+		start := strings.Index(text[searchFrom:], calls[i].Raw)
+		if start < 0 {
+			continue
+		}
+		start += searchFrom
+		end := start + len(calls[i].Raw)
+		searchFrom = end
+		if start >= end || end > len(body.rawEnd) {
+			continue
+		}
+		sourceStart, sourceEnd := body.rawStart[start], body.rawEnd[end-1]
+		if !validSpan(src, sourceStart, sourceEnd) || sourceEnd <= sourceStart {
+			continue
+		}
+		calls[i].Raw = src[sourceStart:sourceEnd]
+		if dynamicFirstWord(calls[i].Raw) {
+			calls[i].Offset = -1
+		}
+	}
+}
+
+func dynamicFirstWord(raw string) bool {
+	word := strings.Fields(raw)
+	return len(word) > 0 && (strings.ContainsAny(word[0], "$") || strings.Contains(word[0], "\x60"))
 }
 
 func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
@@ -882,12 +924,12 @@ func heredocText(redir *syntax.Redirect, src string) string {
 	return src[start:end]
 }
 
-func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (string, []string, bool, error) {
+func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect) (string, []string, bool, error) {
 	call, ok := stmt.Cmd.(*syntax.CallExpr)
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false, nil
 	}
-	hasHeredoc := stdinScriptRedir(stmt.Redirs) != nil
+	hasHeredoc := stdinInput != nil
 	if first, literal := wordValue(call.Args[0]); literal {
 		name := commandName(first)
 		if !isShell(name) && !wrappers[name] {
@@ -917,11 +959,11 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	if name == "ssh" {
 		return "", nil, false, nil
 	}
-	target, shellVia, err := resolveShellInput(name, args[1:], stmt.Redirs, hasHeredoc)
+	target, shellVia, err := resolveShellInput(name, args[1:], hasHeredoc)
 	return target, shellVia, target != "", err
 }
 
-func resolveShellInput(name string, args []string, redirs []*syntax.Redirect, hasHeredoc bool) (string, []string, error) {
+func resolveShellInput(name string, args []string, hasHeredoc bool) (string, []string, error) {
 	var via []string
 	for {
 		if name == "sudo" && hasHeredoc && sudoReadsStdin(args) {
@@ -931,7 +973,7 @@ func resolveShellInput(name string, args []string, redirs []*syntax.Redirect, ha
 			return "sh", append(via, name), nil
 		}
 		if isShell(name) {
-			target, shellVia, ok := shellInputForShell(name, args, redirs, hasHeredoc, via)
+			target, shellVia, ok := shellInputForShell(name, args, hasHeredoc, via)
 			if !ok {
 				return "", nil, nil
 			}
@@ -1003,8 +1045,8 @@ func sshConfigDisablesStdin(option string) bool {
 	return false
 }
 
-func shellInputForShell(name string, args []string, redirs []*syntax.Redirect, hasHeredoc bool, via []string) (string, []string, bool) {
-	if stdinScriptRedir(redirs) == nil && !hasHeredoc {
+func shellInputForShell(name string, args []string, hasHeredoc bool, via []string) (string, []string, bool) {
+	if !hasHeredoc {
 		return "", nil, false
 	}
 	if shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args) {
@@ -1327,8 +1369,10 @@ func litSource(lit *syntax.Lit, src string, double bool) (raw string, base int) 
 
 // mapped — текст и смещение каждого его байта в исходной команде (-1 — такого байта нет).
 type mapped struct {
-	text []byte
-	pos  []int
+	text     []byte
+	pos      []int
+	rawStart []int
+	rawEnd   []int
 }
 
 func (m *mapped) String() string { return string(m.text) }
@@ -1681,8 +1725,8 @@ func wordValue(w *syntax.Word) (string, bool) {
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source, syntaxRedirs: c.syntaxRedirs,
-		stdinConsumed: c.stdinConsumed || c.call.Name == "xargs" && !hasOption("xargs", c.call.Args, "-o")}
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source,
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs"}
 }
 
 func (c cmd) via(more ...string) []string {
@@ -2146,7 +2190,7 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 	child := cmd{call: Call{Name: commandName(parallelArgs[start]), Args: args, Raw: c.call.Raw, Line: c.call.Line,
 		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
-		syntaxRedirs: c.syntaxRedirs, stdinConsumed: c.stdinConsumed}
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed}
 	return child, true
 }
 
@@ -2198,7 +2242,7 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 	stdinDisabled := sshExecutionDisablesStdin(args, host, start)
 	if !ok {
 		if !c.stdinConsumed && !stdinDisabled {
-			if input := stdinScriptRedir(c.syntaxRedirs); input != nil {
+			if input := c.stdinInput; input != nil {
 				return expandSSHStdin(c, nil, input, lineBase, vars, calls)
 			}
 		}
@@ -2228,7 +2272,7 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 	if c.stdinConsumed || stdinDisabled {
 		return nil
 	}
-	if input := stdinScriptRedir(c.syntaxRedirs); input != nil {
+	if input := c.stdinInput; input != nil {
 		for _, call := range (*calls)[first:] {
 			if isShell(call.Name) && shellReadsHeredoc(call.Args) && remoteStdinIsSSH(file, remoteText, remote.pos, call.Offset) {
 				candidate := call
@@ -2239,37 +2283,27 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 	return nil
 }
 
-func stdinScriptRedir(redirs []*syntax.Redirect) *syntax.Redirect {
-	var source *syntax.Redirect
-	for _, redir := range redirs {
-		if redir.N != nil && redir.N.Value != "0" {
-			continue
-		}
-		switch redir.Op.String() {
-		case "<<", "<<-", "<<<":
-			source = redir
-		case "<", "<>":
-			source = nil
-		case "<&":
-			if value, ok := wordValue(redir.Word); !ok || value != "0" {
-				source = nil
-			}
-		}
-	}
-	return source
+type stdinValue struct {
+	inherited bool
+	redir     *syntax.Redirect
 }
 
 func remoteStdinIsSSH(file *syntax.File, src string, pos []int, offset int) bool {
+	inner := mappedOffset(offset, pos)
+	if inner < 0 || sshPipelineReader(file, src, pos, offset) || strings.Contains(src, "xargs") && xargsConsumesStdin(file, src, inner) {
+		return false
+	}
 	if !strings.ContainsAny(src, "<|") {
 		return true
 	}
-	inner := mappedOffset(offset, pos)
-	if inner < 0 {
-		return false
-	}
-	functionName, functionStart, functionEnd := enclosingFunction(file, inner)
+	return resolveStdinAt(file, inner, stdinValue{inherited: true}).inherited
+}
+
+func resolveStdinAt(file *syntax.File, offset int, initial stdinValue) stdinValue {
+	functionName, functionStart, functionEnd := enclosingFunction(file, offset)
 	if functionName != "" {
-		invoked, receivesSSHStdin := false, false
+		invoked := false
+		var input stdinValue
 		syntax.Walk(file, func(node syntax.Node) bool {
 			stmt, ok := node.(*syntax.Stmt)
 			if !ok {
@@ -2285,18 +2319,15 @@ func remoteStdinIsSSH(file *syntax.File, src string, pos []int, offset int) bool
 				return true
 			}
 			invoked = true
-			outer := outerOffset(start, pos)
-			if outer >= 0 && remoteStdinAt(file, src, pos, start, outer) {
-				receivesSSHStdin = true
-			}
+			input = resolveStdinContexts(file, start, initial)
 			return true
 		})
-		if invoked {
-			return receivesSSHStdin
+		if !invoked {
+			return stdinValue{}
 		}
-		return false
+		initial = input
 	}
-	return remoteStdinAt(file, src, pos, inner, offset)
+	return resolveStdinContexts(file, offset, initial)
 }
 
 func enclosingFunction(file *syntax.File, offset int) (string, int, int) {
@@ -2316,10 +2347,7 @@ func enclosingFunction(file *syntax.File, offset int) (string, int, int) {
 	return name, bodyStart, bodyEnd
 }
 
-func remoteStdinAt(file *syntax.File, src string, pos []int, inner, outer int) bool {
-	if sshPipelineReader(file, src, pos, outer) {
-		return false
-	}
+func resolveStdinContexts(file *syntax.File, offset int, initial stdinValue) stdinValue {
 	type contextRedirs struct {
 		size   int
 		redirs []*syntax.Redirect
@@ -2331,28 +2359,61 @@ func remoteStdinAt(file *syntax.File, src string, pos []int, inner, outer int) b
 			return true
 		}
 		start, end := int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset())
-		if start <= inner && inner < end {
+		if start <= offset && offset < end {
 			contexts = append(contexts, contextRedirs{size: end - start, redirs: stmt.Redirs})
 		}
 		return true
 	})
 	slices.SortFunc(contexts, func(a, b contextRedirs) int { return b.size - a.size })
+	fds := map[string]stdinValue{"0": initial}
 	for _, context := range contexts {
 		for _, redir := range context.redirs {
-			if redir.N != nil && redir.N.Value != "0" {
-				continue
+			fd := "0"
+			if redir.N != nil && redir.N.Value != "" {
+				fd = redir.N.Value
 			}
 			switch redir.Op.String() {
-			case "<", "<<", "<<-", "<<<", "<>":
-				return false
+			case "<<", "<<-", "<<<":
+				fds[fd] = stdinValue{redir: redir}
+			case "<", "<>":
+				fds[fd] = stdinValue{}
 			case "<&":
-				if value, ok := wordValue(redir.Word); !ok || value != "0" {
-					return false
+				target, ok := wordValue(redir.Word)
+				if !ok || target == "-" {
+					fds[fd] = stdinValue{}
+				} else {
+					fds[fd] = fds[target]
 				}
 			}
 		}
 	}
-	return true
+	return fds["0"]
+}
+
+func xargsConsumesStdin(file *syntax.File, src string, offset int) bool {
+	if !strings.Contains(src, "xargs") {
+		return false
+	}
+	consumed := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok || stmt.Cmd == nil {
+			return true
+		}
+		start, end := int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset())
+		if start > offset || offset >= end {
+			return true
+		}
+		call, ok := stmt.Cmd.(*syntax.CallExpr)
+		if ok && len(call.Args) > 0 {
+			name, literal := wordValue(call.Args[0])
+			if literal && commandName(name) == "xargs" {
+				consumed = true
+			}
+		}
+		return true
+	})
+	return consumed
 }
 
 func mappedOffset(offset int, pos []int) int {
@@ -2369,7 +2430,7 @@ func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int
 	if candidate != nil {
 		via = append(slices.Clone(candidate.Via), candidate.Name)
 	}
-	body, err := sshInputText(input, c.source, vars)
+	body, err := stdinRedirectBody(input, c.source, vars)
 	if err != nil {
 		return &NestedError{Script: nodeText(input.Hdoc, c.source), Err: err}
 	}
@@ -2379,13 +2440,15 @@ func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int
 	} else if input.Word != nil {
 		bodyLine = int(input.Word.Pos().Line()) - 1
 	}
+	first := len(*calls)
 	if err := parseNestedWithBudget(body.String(), body.pos, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
 		return err
 	}
+	preserveMappedRaw(*calls, first, body, c.source)
 	return nil
 }
 
-func sshInputText(input *syntax.Redirect, src string, vars map[string]string) (mapped, error) {
+func stdinRedirectBody(input *syntax.Redirect, src string, vars map[string]string) (mapped, error) {
 	var raw string
 	var base int
 	var value string
@@ -2451,7 +2514,7 @@ func stripHeredocTabs(text string) string {
 }
 
 func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
-	out := mapped{text: []byte(expanded), pos: make([]int, len(expanded))}
+	out := mapped{text: []byte(expanded), pos: make([]int, len(expanded)), rawStart: make([]int, len(expanded)), rawEnd: make([]int, len(expanded))}
 	var omitted [][2]int
 	syntax.Walk(word, func(node syntax.Node) bool {
 		switch node.(type) {
@@ -2477,7 +2540,7 @@ func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
 		positions[raw[i]] = append(positions[raw[i]], i)
 	}
 	var heads [256]int
-	next := 0
+	next, skip := 0, 0
 	for i := range expanded {
 		b := expanded[i]
 		places := positions[b]
@@ -2485,14 +2548,24 @@ func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
 		for head < len(places) && places[head] < next {
 			head++
 		}
+		for skip < len(omitted) && omitted[skip][1] <= next {
+			skip++
+		}
+		if skip < len(omitted) && (head == len(places) || places[head] > omitted[skip][1]) {
+			out.pos[i] = -1
+			out.rawStart[i] = base + omitted[skip][0]
+			out.rawEnd[i] = base + omitted[skip][1]
+			continue
+		}
 		if head == len(places) {
 			out.pos[i] = -1
-			heads[b] = head
 			continue
 		}
 		next = places[head] + 1
 		heads[b] = head + 1
 		out.pos[i] = base + next - 1
+		out.rawStart[i] = out.pos[i]
+		out.rawEnd[i] = out.pos[i] + 1
 	}
 	return out
 }
