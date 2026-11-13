@@ -25,14 +25,17 @@ skills/<name> for each line of manifest/skills.txt, work/CLAUDE.md, global/CLAUD
 with the sections of ~/.claude/CLAUDE.md named in manifest/global-sections.txt, and
 README.md from README.template.md. Then in every file but README.md the literal
 replacements of manifest/replace.tsv (FROM<TAB>TO) are made and lines containing a
-line of manifest/drop-lines.txt are dropped. Last, manifest/pii.tsv
+line of manifest/drop-lines.txt are dropped. A section name or a line to drop that matches
+nothing fails the run before OUT_DIR is touched; a replacement that never applies is
+only warned about. Last, manifest/pii.tsv
 (KIND<TAB>REGEXP<TAB>ALLOWED REGEXP) is searched for: each hit not fully matching
 ALLOWED is printed as file:line: KIND.
 
 The export is built and checked in a folder of its own first, then put into OUT_DIR. In
 OUT_DIR only the previous run's own entries are removed, and only while unchanged: each
 file's and folder's path, mode (setuid, setgid and sticky too), owner and group, extended
-attributes (ACLs and SELinux labels too, links' as well), device, inode and birth time, each file's size and sha256 and each
+attributes (ACLs and SELinux labels too, links' as well), file system id (statfs f_fsid, not
+the device number, which a reboot may change), inode and birth time, each file's size and sha256 and each
 link's text must
 match the list that run kept in $XDG_STATE_HOME/claude-rules-export (default
 ~/.local/state), keyed by the OUT_DIR path; the build lies there too. Nothing new gets its
