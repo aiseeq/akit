@@ -2285,10 +2285,10 @@ func TestSSHHeredocDataAndDisabledRemoteExecution(t *testing.T) {
 	}
 }
 
-func TestSSHWithForkOptionStillReadsStdin(t *testing.T) {
-	calls, err := Find("ssh -f host <<'EOF'\necho start\nkill 1\nEOF", "kill")
-	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, []string{"ssh", "bash"}) {
-		t.Fatalf("Find = %#v, %v; want kill via ssh bash", calls, err)
+func TestSSHWithForkOptionDisablesStdin(t *testing.T) {
+	calls, err := Find("ssh -f host 'bash -s' <<'EOF'\necho start\nkill 1\nEOF", "kill")
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("Find = %#v, %v; -f implies -n, so body is data", calls, err)
 	}
 }
 
@@ -2328,5 +2328,43 @@ func TestANSILiteralNewlineMapsPhysicalLines(t *testing.T) {
 				t.Errorf("Find lines = %v, want %v", got, tt.lines)
 			}
 		})
+	}
+}
+
+func TestSSHRemoteStdinShellsThroughCallsAndCompoundSyntax(t *testing.T) {
+	body := "echo start\nkill 1\nEOF"
+	for _, tt := range []struct {
+		name, command string
+		via           []string
+	}{
+		{"env wrapper with ansi shell word", "env ssh host $'bash\\x20-s'", []string{"env", "ssh", "bash"}},
+		{"sudo wrapper", "sudo ssh -T host bash", []string{"sudo", "ssh", "bash"}},
+		{"timeout wrapper", "timeout 5 ssh host 'bash -s'", []string{"timeout", "ssh", "bash"}},
+		{"command wrapper", "command ssh host 'true && bash -s'", []string{"command", "ssh", "bash"}},
+		{"and list", "ssh host 'true && bash -s'", []string{"ssh", "bash"}},
+		{"or list", "ssh host 'false || bash -s'", []string{"ssh", "bash"}},
+		{"if clause", "ssh host 'if true; then bash -s; fi'", []string{"ssh", "bash"}},
+		{"first pipeline stage", "ssh host 'bash -s | cat'", []string{"ssh", "bash"}},
+		{"group", "ssh host '{ true; bash -s; }'", []string{"ssh", "bash"}},
+		{"while body", "ssh host 'while true; do bash -s; break; done'", []string{"ssh", "bash"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			src := tt.command + " <<'EOF'\n" + body
+			calls, err := Find(src, "kill")
+			if err != nil || len(calls) != 1 {
+				t.Fatalf("Find = %#v, %v; want one kill", calls, err)
+			}
+			if !reflect.DeepEqual(calls[0].Via, tt.via) || calls[0].Line != 3 {
+				t.Errorf("kill = %#v; want Via %v and line 3", calls[0], tt.via)
+			}
+		})
+	}
+}
+
+func TestSSHRemotePipelineReaderGetsPipeNotHeredoc(t *testing.T) {
+	src := "ssh host 'cat | bash -s' <<'EOF'\necho start\nkill 1\nEOF"
+	calls, err := Find(src, "kill")
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("Find = %#v, %v; later pipeline stage reads the pipe, not SSH stdin", calls, err)
 	}
 }
