@@ -55,11 +55,13 @@ milliseconds and CPU seconds drift by tens of percent: the instruction count
 repeats within about 0.01%, so one run of each side is enough. Each run goes
 under perf stat --no-scale (on a hybrid CPU the default scaling invents counts
 for a core type the command barely ran on); counts of all core types are
-summed. Children of the command are counted too. For a Go program set
-GOMAXPROCS=1 in the environment: otherwise idle scheduler threads add noise.
+summed. Children of the command are counted too. The command gets
+GOMAXPROCS=1 unless the environment sets it: idle Go scheduler threads add
+noise. A command killed by a signal shows as exit 128+N (perf reports it so),
+and a count perf could not take (no counter, command not started) exits 2.
 Needs perf and kernel.perf_event_paranoid <= 2.
-  GOMAXPROCS=1 timeit --instructions --runs 1 -- ./probe-old big.txt
-  GOMAXPROCS=1 timeit --instructions --runs 1 -- ./probe-new big.txt
+  timeit --instructions --runs 1 -- ./probe-old big.txt
+  timeit --instructions --runs 1 -- ./probe-new big.txt
 
 Exit: 0 median written, 1 stderr match with exit 0, command exit code on a failed run,
 2 usage or launch error, 128+signal when the command is killed by a signal
@@ -311,6 +313,12 @@ func run(opts options, stdout, stderr io.Writer, now func() time.Time, startComm
 				budget = remaining
 			}
 		}
+		if res.countErr != nil {
+			// perf could not count (no counter, command not started): its own
+			// errors are in the captured stderr, so neither the exit code nor
+			// --fail-on-stderr describes the command.
+			return failedRun(stderr, res, runNumber, opts.runs, "")
+		}
 		failedText := ""
 		if opts.failOnStderr != "" {
 			found, err := false, error(nil)
@@ -333,10 +341,6 @@ func run(opts options, stdout, stderr io.Writer, now func() time.Time, startComm
 		}
 		cleanupResult(res)
 		if opts.instructions {
-			if res.countErr != nil {
-				fmt.Fprintf(stderr, "timeit: %v\n", res.countErr)
-				return exitError
-			}
 			counts = append(counts, res.instructions)
 		}
 	}
@@ -385,6 +389,10 @@ func failedRun(stderr io.Writer, res result, runNumber, runs int, text string) i
 	}
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		fmt.Fprintln(stderr)
+	}
+	if res.countErr != nil {
+		fmt.Fprintf(stderr, "timeit: run %d of %d: %v\n", runNumber, runs, res.countErr)
+		return exitError
 	}
 	if text != "" {
 		fmt.Fprintf(stderr, "timeit: run %d of %d: stderr has %q\n", runNumber, runs, text)
@@ -501,15 +509,17 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		cleanup()
 		return result{}, 0, fmt.Errorf("open null output: %w", err)
 	}
-	argv, perfPath, err := commandArgv(opts)
+	argv, perfOut, err := commandArgv(opts)
 	if err != nil {
 		cleanup()
 		return result{}, 0, errors.Join(err, stdoutFile.Close())
 	}
-	if perfPath != "" {
-		defer os.Remove(perfPath)
-	}
 	cmd := exec.Command(argv[0], argv[1:]...)
+	if perfOut != nil {
+		defer perfOut.Close()
+		cmd.ExtraFiles = []*os.File{perfOut}
+		cmd.Env = instructionsEnv(os.Environ())
+	}
 	cmd.Stdout = stdoutFile
 	cmd.Stderr = stderrFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -565,8 +575,8 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		activeCommand.CompareAndSwap(cmd, nil)
 		duration := time.Since(started)
 		res := result{stderrFile: stderrFile, processGroup: cmd}
-		if perfPath != "" {
-			res.instructions, res.countErr = readPerfInstructions(perfPath)
+		if perfOut != nil {
+			res.instructions, res.countErr = readPerfInstructions(perfOut)
 		}
 		if !setExitStatus(&res, err) {
 			cleanup()

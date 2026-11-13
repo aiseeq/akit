@@ -3,34 +3,48 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 )
 
-// perfArgs wraps the command in perf stat counting user-space instructions.
+// perfArgs wraps the command in perf stat counting user-space instructions,
+// written to file descriptor 3 (the first of exec.Cmd.ExtraFiles).
 // --no-scale keeps raw counts: on a hybrid CPU each core type has its own
 // counter, and the default scaling extrapolates a counter that barely ran
 // into an invented number. The real total is the plain sum over core types.
-func perfArgs(outPath string, command []string) []string {
-	return append([]string{"perf", "stat", "--no-scale", "-x,", "-e", "instructions:u", "-o", outPath, "--"}, command...)
+func perfArgs(command []string) []string {
+	return append([]string{"perf", "stat", "--no-scale", "-x,", "-e", "instructions:u", "--log-fd", "3", "--"}, command...)
+}
+
+// instructionsEnv sets GOMAXPROCS=1 unless the caller chose a value: idle
+// threads of a Go scheduler spin and add instructions that vary run to run.
+func instructionsEnv(env []string) []string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GOMAXPROCS=") {
+			return env
+		}
+	}
+	return append(slices.Clone(env), "GOMAXPROCS=1")
 }
 
 // commandArgv is the argv to start; with --instructions it runs under perf
-// stat, whose counts go to the returned temporary file.
-func commandArgv(opts options) ([]string, string, error) {
+// stat, whose counts go to the returned file. The file is unlinked at once,
+// so an interrupted run leaves nothing behind.
+func commandArgv(opts options) ([]string, *os.File, error) {
 	if !opts.instructions {
-		return opts.command, "", nil
+		return opts.command, nil, nil
 	}
 	out, err := os.CreateTemp("", "timeit-perf-*")
 	if err != nil {
-		return nil, "", fmt.Errorf("create perf output: %w", err)
+		return nil, nil, fmt.Errorf("create perf output: %w", err)
 	}
-	if err := out.Close(); err != nil {
-		return nil, "", errors.Join(fmt.Errorf("close perf output: %w", err), os.Remove(out.Name()))
+	if err := os.Remove(out.Name()); err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("unlink perf output: %w", err), out.Close())
 	}
-	return perfArgs(out.Name(), opts.command), out.Name(), nil
+	return perfArgs(opts.command), out, nil
 }
 
 // parsePerfInstructions sums the instructions:u lines of perf stat -x, output.
@@ -62,8 +76,11 @@ func parsePerfInstructions(data []byte) (int64, error) {
 
 const perfHint = "needs perf (dnf install perf) and kernel.perf_event_paranoid <= 2"
 
-func readPerfInstructions(path string) (int64, error) {
-	data, err := os.ReadFile(path)
+func readPerfInstructions(f *os.File) (int64, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("perf output: %w", err)
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return 0, fmt.Errorf("perf output: %w", err)
 	}

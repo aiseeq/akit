@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -52,7 +53,7 @@ func TestInstructionsFlag(t *testing.T) {
 	if err != nil || !opts.instructions || opts.runs != 2 {
 		t.Fatalf("%+v, %v", opts, err)
 	}
-	if args := perfArgs("/out", []string{"prog", "--x"}); strings.Join(args, " ") != "perf stat --no-scale -x, -e instructions:u -o /out -- prog --x" {
+	if args := perfArgs([]string{"prog", "--x"}); strings.Join(args, " ") != "perf stat --no-scale -x, -e instructions:u --log-fd 3 -- prog --x" {
 		t.Fatalf("perf args %q", args)
 	}
 }
@@ -99,5 +100,60 @@ func TestRunCommandCountsInstructions(t *testing.T) {
 	}
 	if res.code != 0 || res.instructions <= 0 {
 		t.Fatalf("code %d, instructions %d", res.code, res.instructions)
+	}
+}
+
+func TestInstructionsEnv(t *testing.T) {
+	got := instructionsEnv([]string{"A=1"})
+	if strings.Join(got, " ") != "A=1 GOMAXPROCS=1" {
+		t.Fatalf("unset: %q", got)
+	}
+	if got := instructionsEnv([]string{"GOMAXPROCS=4"}); strings.Join(got, " ") != "GOMAXPROCS=4" {
+		t.Fatalf("set: %q", got)
+	}
+}
+
+func TestCountErrorWinsOverExitAndStderrMatch(t *testing.T) {
+	var out, stderr bytes.Buffer
+	opts := options{runs: 1, budget: time.Hour, limit: time.Hour, okExit: map[int]bool{0: true}, instructions: true, failOnStderr: "Error"}
+	code := run(opts, &out, &stderr, time.Now, func(options) (result, time.Duration, error) {
+		_, err := parsePerfInstructions(nil)
+		return result{code: 1, stderrData: []byte("Error:\nNo supported events found.\n"), countErr: err}, time.Second, nil
+	})
+	if code != exitError || out.Len() != 0 || !strings.Contains(stderr.String(), "No supported events") || !strings.Contains(stderr.String(), "perf_event_paranoid") || strings.Contains(stderr.String(), "stderr has") {
+		t.Fatalf("code %d, out %q, stderr %q", code, out.String(), stderr.String())
+	}
+}
+
+func TestMissingCommandUnderPerfIsLaunchError(t *testing.T) {
+	if _, err := exec.LookPath("perf"); err != nil {
+		t.Skip("perf not installed")
+	}
+	var out, stderr bytes.Buffer
+	opts := options{runs: 1, budget: time.Hour, limit: time.Hour, okExit: map[int]bool{0: true}, instructions: true, command: []string{"/no/such/timeit-command"}}
+	code := run(opts, &out, &stderr, time.Now, func(o options) (result, time.Duration, error) { return runCommand(o, nil) })
+	if code != exitError {
+		t.Fatalf("code %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestInstructionsChildSeesGOMAXPROCS(t *testing.T) {
+	if _, err := exec.LookPath("perf"); err != nil {
+		t.Skip("perf not installed")
+	}
+	t.Setenv("GOMAXPROCS", "")
+	if err := os.Unsetenv("GOMAXPROCS"); err != nil {
+		t.Fatal(err)
+	}
+	res, _, err := runCommand(options{instructions: true, command: []string{"/bin/sh", "-c", `test "$GOMAXPROCS" = 1`}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupResult(res)
+	if res.countErr != nil {
+		t.Skipf("perf cannot count here: %v", res.countErr)
+	}
+	if res.code != 0 {
+		t.Fatalf("child did not get GOMAXPROCS=1: exit %d", res.code)
 	}
 }
