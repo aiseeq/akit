@@ -228,6 +228,99 @@ func TestStopSessionLeaderExitBeforeNextScanDoesNotSelectMembers(t *testing.T) {
 	}
 }
 
+func TestStopOwnedProcessesLeaderExitBetweenBatchesFinishesPinnedTargetsOnly(t *testing.T) {
+	oldSignal := signalProcess
+	var sent []struct {
+		pid int
+		sig unix.Signal
+	}
+	signalProcess = func(pid int, _ *trackedProcess, sig unix.Signal) error {
+		sent = append(sent, struct {
+			pid int
+			sig unix.Signal
+		}{pid, sig})
+		return nil
+	}
+	t.Cleanup(func() { signalProcess = oldSignal })
+
+	var scans, guards int
+	ops := ownedStopOps{
+		guard: func() error {
+			guards++
+			if guards == 4 {
+				return fmt.Errorf("%w: synthetic leader exited", ErrSessionLeaderGone)
+			}
+			return nil
+		},
+		scan: func() ([]int, error) {
+			scans++
+			if scans == 1 {
+				return []int{51}, nil
+			}
+			return []int{52}, nil // Would be a new member after leader exit.
+		},
+		open: func(pid int) (*trackedOwnedProcess, error) {
+			fd, err := unix.Open("/dev/null", unix.O_RDONLY, 0)
+			if err != nil {
+				return nil, err
+			}
+			return &trackedOwnedProcess{identity: processIdentity{pid: pid, start: "200"}, tracked: &trackedProcess{fd: fd, start: "200"}}, nil
+		},
+		verify: func(int, string) error { return nil },
+	}
+	result, err := stopOwnedProcesses(30*time.Millisecond, syscall.SIGTERM, ops)
+	if err != nil || result.Signaled != 1 || result.Killed != 1 {
+		t.Fatalf("stopOwnedProcesses = (%+v, %v), want completed pinned stop with one TERM and one KILL", result, err)
+	}
+	if scans != 2 {
+		t.Fatalf("scans = %d, want candidate preflight followed by leader exit", scans)
+	}
+	want := []struct {
+		pid int
+		sig unix.Signal
+	}{{51, unix.SIGTERM}, {51, unix.SIGKILL}}
+	if fmt.Sprint(sent) != fmt.Sprint(want) {
+		t.Fatalf("signals = %v, want %v", sent, want)
+	}
+}
+
+func TestStopSessionLeaderExitAfterTERMStillKillsPinnedStubbornMember(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "member.ready")
+	memberFile := filepath.Join(dir, "member.pid")
+	cmd := exec.Command("sh", "-c", `trap 'exit 0' TERM; sh -c 'trap "" TERM; echo ready > "$1"; while :; do :; done' sh "$2" & member=$!; echo "$member" > "$3"; while [ ! -f "$2" ]; do sleep 0.01; done; wait`, "sh", ready, ready, memberFile)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	rec := sessionRecordFor(t, cmd.Process.Pid)
+	waitReady(t, ready)
+	member := readPID(t, memberFile)
+	memberFD, err := unix.PidfdOpen(member, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = unix.PidfdSendSignal(memberFD, unix.SIGKILL, nil, 0)
+		_ = unix.Close(memberFD)
+		if cmd.ProcessState == nil {
+			_ = SignalChild(cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	result, err := StopSession(rec, 100*time.Millisecond, syscall.SIGTERM)
+	if err != nil {
+		t.Fatalf("StopSession = (%+v, %v), want successful stop after leader exits", result, err)
+	}
+	if result.Killed != 1 {
+		t.Fatalf("StopSession Killed = %d, want stubborn member killed", result.Killed)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wait for session leader after TERM: %v", err)
+	}
+	waitForGoneOrZombie(t, member)
+}
+
 func TestSignalDescendantSignalsGrandchild(t *testing.T) {
 	dir := t.TempDir()
 	marker, ready, pidPath := filepath.Join(dir, "term"), filepath.Join(dir, "ready"), filepath.Join(dir, "pid")

@@ -75,12 +75,15 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 // as members of the recorded session while its original leader was live. A
 // member may leave the session, or the leader may exit, after the second check;
 // pidfds still pin the exact processes verified in the session, and signaling
-// those processes remains authorized. If either check finds the leader gone,
-// that batch is not signaled and ErrSessionLeaderGone is returned with work
-// already completed; any other failure of a check also stops before the batch
-// is signaled and is returned. Orphans of an exited leader cannot be
-// identified safely; use StopDescendants as a subreaper or a dedicated systemd
-// scope. If pidfd_open is unavailable (ErrPidfdUnavailable: ENOSYS or EPERM)
+// those processes remains authorized. If the leader exits before any requested
+// signal is sent, the batch is not signaled and ErrSessionLeaderGone is returned.
+// After at least one requested signal is sent, leader exit ends discovery of
+// new members; the stop waits out grace (or until all pinned members exit) and
+// SIGKILLs only members already pinned before the leader exit. Other guard
+// failures stop before the current batch is signaled and are returned. Orphans
+// of an exited leader cannot be identified safely; use StopDescendants as a
+// subreaper or a dedicated systemd scope. If pidfd_open is unavailable
+// (ErrPidfdUnavailable: ENOSYS or EPERM)
 // in the first batch, no signals are sent. If it becomes unavailable later,
 // the scan stops and ErrPidfdUnavailable is returned with StopResult.Signaled
 // counting processes already sent the requested signal. Any other pidfd_open
@@ -167,10 +170,15 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 	deadline := time.Now().Add(grace)
 	pidfdUnavailable := false
 	guardFailed := false
+	leaderGone := false
 	for {
 		if err := checkOwnedStopGuard(ops); err != nil {
-			failures.add(0, err)
-			guardFailed = true
+			if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
+				leaderGone = true
+			} else {
+				failures.add(0, err)
+				guardFailed = true
+			}
 			break
 		}
 		pids, err := ops.scan()
@@ -179,6 +187,7 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 			pidfdUnavailable = errors.Is(err, ErrPidfdUnavailable)
 			break
 		}
+		previous := snapshotOwnedProcesses(tracked)
 		batch, err := prepareOwnedCandidates(pids, ops, tracked, &failures, false)
 		if err != nil {
 			failures.add(0, err)
@@ -186,8 +195,13 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 			break
 		}
 		if err := checkOwnedStopGuard(ops); err != nil {
-			failures.add(0, err)
-			guardFailed = true
+			discardNewOwnedProcesses(tracked, previous)
+			if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
+				leaderGone = true
+			} else {
+				failures.add(0, err)
+				guardFailed = true
+			}
 			break
 		}
 		requestOwnedCandidates(batch, sig, &failures, &result)
@@ -196,14 +210,23 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if sig != syscall.SIGKILL && !pidfdUnavailable && !guardFailed {
+	if sig != syscall.SIGKILL && !pidfdUnavailable && !guardFailed && !leaderGone {
 		if err := checkOwnedStopGuard(ops); err != nil {
-			failures.add(0, err)
-			guardFailed = true
+			if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
+				leaderGone = true
+			} else {
+				failures.add(0, err)
+				guardFailed = true
+			}
 		}
 	}
 	if sig != syscall.SIGKILL && !pidfdUnavailable && !guardFailed {
-		finishOwnedStop(sig, ops, tracked, &failures, &result)
+		if leaderGone {
+			waitOwnedStopGrace(deadline, tracked, &failures)
+			finishPinnedOwnedStop(sig, ops, tracked, &failures, &result)
+		} else {
+			finishOwnedStop(sig, ops, tracked, &failures, &result)
+		}
 	}
 	result.AlreadyExited = len(tracked) == 0
 	return result, failures.err()
@@ -222,16 +245,68 @@ func finishOwnedStop(sig syscall.Signal, ops ownedStopOps, tracked map[processId
 		failures.add(0, err)
 		return
 	}
+	previous := snapshotOwnedProcesses(tracked)
 	batch, err := prepareOwnedCandidates(pids, ops, tracked, failures, true)
 	if err != nil {
 		failures.add(0, err)
 		return
 	}
 	if err := checkOwnedStopGuard(ops); err != nil {
+		discardNewOwnedProcesses(tracked, previous)
+		if errors.Is(err, ErrSessionLeaderGone) && result.Signaled > 0 {
+			waitOwnedStopGrace(time.Now(), tracked, failures)
+			finishPinnedOwnedStop(sig, ops, tracked, failures, result)
+			return
+		}
 		failures.add(0, err)
 		return
 	}
 	result.Killed += killOwnedCandidates(batch, sig, ops, failures, result)
+}
+
+func snapshotOwnedProcesses(tracked map[processIdentity]*trackedOwnedProcess) map[processIdentity]struct{} {
+	previous := make(map[processIdentity]struct{}, len(tracked))
+	for identity := range tracked {
+		previous[identity] = struct{}{}
+	}
+	return previous
+}
+
+func discardNewOwnedProcesses(tracked map[processIdentity]*trackedOwnedProcess, previous map[processIdentity]struct{}) {
+	for identity, entry := range tracked {
+		if _, existed := previous[identity]; existed {
+			continue
+		}
+		_ = unix.Close(entry.tracked.fd)
+		delete(tracked, identity)
+	}
+}
+
+func finishPinnedOwnedStop(sig syscall.Signal, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures, result *StopResult) {
+	batch := make([]*trackedOwnedProcess, 0, len(tracked))
+	for _, entry := range tracked {
+		batch = append(batch, entry)
+	}
+	result.Killed += killOwnedCandidates(batch, sig, ops, failures, result)
+}
+
+func waitOwnedStopGrace(deadline time.Time, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures) {
+	for time.Now().Before(deadline) {
+		anyAlive := false
+		for _, entry := range tracked {
+			alive, err := processAlive(entry.tracked)
+			if err != nil {
+				recordOwnedFailure(failures, entry.identity.pid, err)
+				anyAlive = true
+				continue
+			}
+			anyAlive = anyAlive || alive
+		}
+		if !anyAlive {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func prepareOwnedCandidates(pids []int, ops ownedStopOps, tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures, includeRequested bool) ([]*trackedOwnedProcess, error) {
