@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"reflect"
@@ -2588,5 +2589,75 @@ func TestSSHConfigOptionsThatDisableRemoteStdin(t *testing.T) {
 		if err != nil || len(calls) != 0 {
 			t.Errorf("Find(%q) = %#v, %v; want body treated as data", src, calls, err)
 		}
+	}
+}
+
+func manyHeredocSubstitutionScript(heredocs int) string {
+	var b strings.Builder
+	b.WriteString("x=$(")
+	for i := range heredocs {
+		fmt.Fprintf(&b, "cat <<E%d\nbody %d\nE%d\n", i, i, i)
+	}
+	b.WriteString("kill -1\n)\n")
+	return b.String()
+}
+
+func TestFindStdinResolutionGrowsLinearlyWithHeredocs(t *testing.T) {
+	steps := func(heredocs int) int {
+		src := manyHeredocSubstitutionScript(heredocs)
+		var calls []Call
+		budget := newNestedParseBudget(len(src))
+		budget.trackWork = true
+		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		if kills := callsNamed(calls, "kill"); kills != 1 {
+			t.Fatalf("got %d kill calls, want 1", kills)
+		}
+		return budget.stdinSteps
+	}
+	small, large := steps(400), steps(1600)
+	t.Logf("stdin lookup steps: 400 heredocs=%d 1600 heredocs=%d", small, large)
+	if small == 0 || large > small*5 {
+		t.Fatalf("4x heredocs took %d stdin lookup steps after %d; want linear growth", large, small)
+	}
+}
+
+func TestStdinIndexContainingMatchesFullScan(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ranges [][2]int
+		nested bool
+	}{
+		{"nested", [][2]int{{0, 20}, {2, 5}, {6, 15}, {7, 9}, {16, 18}}, true},
+		{"same start", [][2]int{{0, 10}, {0, 4}, {5, 8}}, true},
+		{"overlap", [][2]int{{0, 10}, {2, 5}, {4, 12}}, false},
+		{"start out of order", [][2]int{{5, 9}, {1, 3}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			index := &stdinIndex{nested: true}
+			for _, r := range tc.ranges {
+				index.addRange(r[0], r[1], nil)
+			}
+			if index.nested != tc.nested {
+				t.Fatalf("nested = %v, want %v", index.nested, tc.nested)
+			}
+			for offset := -1; offset <= 22; offset++ {
+				var want [][2]int
+				for _, r := range tc.ranges {
+					if r[0] <= offset && offset < r[1] {
+						want = append(want, r)
+					}
+				}
+				slices.SortStableFunc(want, func(a, b [2]int) int { return (b[1] - b[0]) - (a[1] - a[0]) })
+				var got [][2]int
+				for _, stmt := range index.containing(offset) {
+					got = append(got, [2]int{stmt.start, stmt.end})
+				}
+				if !slices.Equal(got, want) {
+					t.Fatalf("containing(%d) = %v, want %v", offset, got, want)
+				}
+			}
+		})
 	}
 }

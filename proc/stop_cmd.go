@@ -108,21 +108,27 @@ func stopCmdDirectState(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, 
 	if err != nil {
 		return StopResult{}, err
 	}
+	unsupported := false
 	if err := directProcessSignal(process, sig); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			return StopResult{AlreadyExited: true, Degraded: degraded}, nil
 		}
-		return StopResult{Degraded: degraded}, err
+		// Windows delivers only Kill; a gentler signal has no effect there, so
+		// waiting the grace period would only delay the Kill that follows.
+		if !errors.Is(err, errors.ErrUnsupported) || sig == syscall.SIGKILL {
+			return StopResult{Degraded: degraded}, err
+		}
+		unsupported = true
 	}
-	if grace > 0 {
+	if grace > 0 && !unsupported {
 		timer := time.NewTimer(grace)
 		<-timer.C
 	}
 	if err := directProcessKill(process); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
-			return StopResult{AlreadyExited: true, Degraded: degraded}, nil
+			return StopResult{AlreadyExited: true, Degraded: degraded, SignalUnsupported: unsupported}, nil
 		}
-		return StopResult{Degraded: degraded}, err
+		return StopResult{Degraded: degraded, SignalUnsupported: unsupported}, err
 	}
-	return StopResult{Killed: 1, Degraded: degraded}, nil
+	return StopResult{Killed: 1, Degraded: degraded, SignalUnsupported: unsupported}, nil
 }

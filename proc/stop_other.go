@@ -27,7 +27,9 @@ func SignalCmdWithResult(cmd *exec.Cmd, sig syscall.Signal) (SignalResult, error
 }
 
 // StopCmd stops only cmd's direct process from cmd.Start. It waits the full grace period
-// before Kill because it cannot inspect descendants or safely poll by PID.
+// before Kill because it cannot inspect descendants or safely poll by PID. Where
+// the platform rejects sig as unsupported (Windows accepts only Kill), it kills
+// at once and sets StopResult.SignalUnsupported.
 func StopCmd(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal) (StopResult, error) {
 	return stopCmdDirect(cmd, grace, sig, false)
 }

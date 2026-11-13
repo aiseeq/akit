@@ -17,6 +17,10 @@ type StopResult struct {
 	// Degraded reports that StopCmd used direct-child os.Process signaling
 	// because pidfd_open was unavailable. Descendants were not inspected.
 	Degraded bool
+	// SignalUnsupported reports that the platform rejected the requested
+	// signal (Windows delivers only Kill), so StopCmd killed the process at
+	// once without the grace period.
+	SignalUnsupported bool
 }
 
 // SignalResult reports whether SignalCmd had to use direct-child fallback.

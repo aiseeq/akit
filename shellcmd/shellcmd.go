@@ -111,6 +111,7 @@ type nestedParseBudget struct {
 	parsedBytes   int
 	visitedNodes  int
 	walkInfoNodes int
+	stdinSteps    int
 	trackWork     bool
 	parsedShells  map[string]int
 }
@@ -259,6 +260,7 @@ type walkInfo struct {
 	pipedHeredocs []pipedHeredoc
 	workNodes     int
 	trackWork     bool
+	stdinIndex    *stdinIndex
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
@@ -289,6 +291,9 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 	})
 	if budget.trackWork {
 		budget.walkInfoNodes += info.workNodes
+		if info.stdinIndex != nil {
+			budget.stdinSteps += info.stdinIndex.steps
+		}
 	}
 	return info
 }
@@ -375,7 +380,10 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 	offset := int(call.Args[0].Pos().Offset())
 	var stdin stdinValue
 	if strings.Contains(src, "<") {
-		stdin = resolveStdinAt(file, offset, stdinValue{})
+		if info.stdinIndex == nil {
+			info.stdinIndex = newStdinIndex(file)
+		}
+		stdin = resolveStdinAt(info.stdinIndex, offset, stdinValue{})
 	}
 	if stdin.redir != nil {
 		info.stdinInputs[call] = stdin.redir
@@ -2296,77 +2304,152 @@ func remoteStdinIsSSH(file *syntax.File, src string, pos []int, offset int) bool
 	if !strings.ContainsAny(src, "<|") {
 		return true
 	}
-	return resolveStdinAt(file, inner, stdinValue{inherited: true}).inherited
+	return resolveStdinAt(newStdinIndex(file), inner, stdinValue{inherited: true}).inherited
 }
 
-func resolveStdinAt(file *syntax.File, offset int, initial stdinValue) stdinValue {
-	functionName, functionStart, functionEnd := enclosingFunction(file, offset)
-	if functionName != "" {
+// stdinIndex holds what resolving a call's stdin needs from one parsed file,
+// gathered in a single walk so that each call is resolved without walking the
+// file again.
+type stdinIndex struct {
+	funcs []stdinFunc
+	// stmts are statements with redirections, in walk order, which is the
+	// order of their start offsets.
+	stmts []stdinStmt
+	// open holds the indexes of stmts still open at the last added start.
+	open []int
+	// nested is false once two statement ranges overlap without nesting;
+	// resolveContexts then scans every statement.
+	nested bool
+	// steps counts statements visited by lookups, for work-growth tests.
+	steps int
+	// calls maps a literal command name to the offsets of its calls, in walk order.
+	calls map[string][]int
+}
+
+type stdinFunc struct {
+	name       string
+	start, end int
+}
+
+type stdinStmt struct {
+	start, end int
+	redirs     []*syntax.Redirect
+	// parent is the index of the nearest statement enclosing this one, -1 for none.
+	parent int
+}
+
+func newStdinIndex(file *syntax.File) *stdinIndex {
+	index := &stdinIndex{calls: make(map[string][]int), nested: true}
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch node := node.(type) {
+		case *syntax.FuncDecl:
+			if node.Name != nil && node.Body != nil {
+				index.funcs = append(index.funcs, stdinFunc{node.Name.Value, int(node.Body.Pos().Offset()), int(node.Body.End().Offset())})
+			}
+		case *syntax.Stmt:
+			index.addStmt(node)
+		}
+		return true
+	})
+	return index
+}
+
+func (index *stdinIndex) addStmt(stmt *syntax.Stmt) {
+	if stmt.Cmd == nil {
+		return
+	}
+	if len(stmt.Redirs) > 0 {
+		index.addRange(int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset()), stmt.Redirs)
+	}
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return
+	}
+	if name, literal := wordValue(call.Args[0]); literal {
+		name = commandName(name)
+		index.calls[name] = append(index.calls[name], int(call.Args[0].Pos().Offset()))
+	}
+}
+
+func (index *stdinIndex) addRange(start, end int, redirs []*syntax.Redirect) {
+	if last := len(index.stmts) - 1; last >= 0 && start < index.stmts[last].start {
+		index.nested = false
+	}
+	for len(index.open) > 0 && index.stmts[index.open[len(index.open)-1]].end <= start {
+		index.open = index.open[:len(index.open)-1]
+	}
+	parent := -1
+	if len(index.open) > 0 {
+		parent = index.open[len(index.open)-1]
+		if end > index.stmts[parent].end {
+			index.nested = false
+		}
+	}
+	index.open = append(index.open, len(index.stmts))
+	index.stmts = append(index.stmts, stdinStmt{start: start, end: end, redirs: redirs, parent: parent})
+}
+
+// containing returns the statements whose range holds offset, outermost first.
+// With nested ranges they are the last statement starting at or before offset
+// and its ancestors: an earlier range holding offset cannot end before that
+// statement starts, so it encloses it.
+func (index *stdinIndex) containing(offset int) []stdinStmt {
+	var found []stdinStmt
+	if !index.nested {
+		for _, stmt := range index.stmts {
+			index.steps++
+			if stmt.start <= offset && offset < stmt.end {
+				found = append(found, stmt)
+			}
+		}
+		slices.SortStableFunc(found, func(a, b stdinStmt) int { return (b.end - b.start) - (a.end - a.start) })
+		return found
+	}
+	i, _ := slices.BinarySearchFunc(index.stmts, offset+1, func(stmt stdinStmt, target int) int { return stmt.start - target })
+	for i--; i >= 0; i = index.stmts[i].parent {
+		index.steps++
+		if offset < index.stmts[i].end {
+			found = append(found, index.stmts[i])
+		}
+	}
+	slices.Reverse(found)
+	return found
+}
+
+func resolveStdinAt(index *stdinIndex, offset int, initial stdinValue) stdinValue {
+	if fn, ok := index.enclosingFunction(offset); ok {
 		invoked := false
 		var input stdinValue
-		syntax.Walk(file, func(node syntax.Node) bool {
-			stmt, ok := node.(*syntax.Stmt)
-			if !ok {
-				return true
-			}
-			call, ok := stmt.Cmd.(*syntax.CallExpr)
-			if !ok || len(call.Args) == 0 {
-				return true
-			}
-			name, literal := wordValue(call.Args[0])
-			start := int(call.Args[0].Pos().Offset())
-			if !literal || commandName(name) != functionName || functionStart <= start && start < functionEnd {
-				return true
+		for _, start := range index.calls[fn.name] {
+			if fn.start <= start && start < fn.end {
+				continue
 			}
 			invoked = true
-			input = resolveStdinContexts(file, start, initial)
-			return true
-		})
+			input = index.resolveContexts(start, initial)
+		}
 		if !invoked {
 			return stdinValue{}
 		}
 		initial = input
 	}
-	return resolveStdinContexts(file, offset, initial)
+	return index.resolveContexts(offset, initial)
 }
 
-func enclosingFunction(file *syntax.File, offset int) (string, int, int) {
-	name := ""
-	var bodyStart, bodyEnd int
-	syntax.Walk(file, func(node syntax.Node) bool {
-		fn, ok := node.(*syntax.FuncDecl)
-		if !ok || fn.Name == nil || fn.Body == nil {
-			return true
+// enclosingFunction returns the innermost function whose body holds offset.
+func (index *stdinIndex) enclosingFunction(offset int) (stdinFunc, bool) {
+	var found stdinFunc
+	ok := false
+	for _, fn := range index.funcs {
+		if fn.start <= offset && offset < fn.end {
+			found, ok = fn, true
 		}
-		start, end := int(fn.Body.Pos().Offset()), int(fn.Body.End().Offset())
-		if start <= offset && offset < end {
-			name, bodyStart, bodyEnd = fn.Name.Value, start, end
-		}
-		return true
-	})
-	return name, bodyStart, bodyEnd
-}
-
-func resolveStdinContexts(file *syntax.File, offset int, initial stdinValue) stdinValue {
-	type contextRedirs struct {
-		size   int
-		redirs []*syntax.Redirect
 	}
-	var contexts []contextRedirs
-	syntax.Walk(file, func(node syntax.Node) bool {
-		stmt, ok := node.(*syntax.Stmt)
-		if !ok || stmt.Cmd == nil {
-			return true
-		}
-		start, end := int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset())
-		if start <= offset && offset < end {
-			contexts = append(contexts, contextRedirs{size: end - start, redirs: stmt.Redirs})
-		}
-		return true
-	})
-	slices.SortFunc(contexts, func(a, b contextRedirs) int { return b.size - a.size })
+	return found, ok
+}
+
+func (index *stdinIndex) resolveContexts(offset int, initial stdinValue) stdinValue {
 	fds := map[string]stdinValue{"0": initial}
-	for _, context := range contexts {
+	for _, context := range index.containing(offset) {
 		for _, redir := range context.redirs {
 			fd := "0"
 			if redir.N != nil && redir.N.Value != "" {
