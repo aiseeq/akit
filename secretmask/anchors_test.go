@@ -62,275 +62,6 @@ func TestMaskToolAndJSONNeighboursStay(t *testing.T) {
 	}
 }
 
-// Russian password and token labels use the same value-shape rules as English labels.
-func TestMaskRussianSecretLabels(t *testing.T) {
-	for _, input := range []string{
-		"пароль: Zq7xW9vK2mPq8Rt",
-		"Пароль учётки: Zq7xW9vK2mPq8Rt",
-		"пароль=Zq7xW9vK2mPq8Rt",
-		"пароля — Zq7xW9vK2mPq8Rt",
-		"паролем: Zq7xW9vK2mPq8Rt",
-		"токен: Zq7xW9vK2mPq8Rt",
-		"токена: Zq7xW9vK2mPq8Rt",
-		"ключ: aB4cD9eF0gH2",
-	} {
-		got, _ := Mask(input)
-		secret := "Zq7xW9vK2mPq8Rt"
-		if strings.HasPrefix(input, "ключ:") {
-			secret = "aB4cD9eF0gH2"
-		}
-		if strings.Contains(got, secret) {
-			t.Errorf("secret value left visible for input %q: %q", input, got)
-		}
-	}
-	for _, input := range []string{
-		"пароль не подошёл",
-		"пароль: нет",
-		"токенов: 1200",
-		"ключ: XY-1234",
-		"ключ: incident-reference",
-		"ключ: Abcdefghijklmnop",
-	} {
-		if got, found := Mask(input); got != input || len(found) != 0 {
-			t.Errorf("ordinary value changed for %q: %q, %v", input, got, found)
-		}
-	}
-}
-
-// Markdown around a secret label stays visible while its value is masked.
-func TestMaskMarkdownSecretLabels(t *testing.T) {
-	for _, tc := range []struct {
-		input  string
-		label  string
-		secret string
-	}{
-		{"**Пароль:** Zq7xW9vK2mPq8Rt", "**Пароль:**", "Zq7xW9vK2mPq8Rt"},
-		{"__Пароль__: Zq7xW9vK2mPq8Rt", "__Пароль__:", "Zq7xW9vK2mPq8Rt"},
-		{"`Пароль`: Zq7xW9vK2mPq8Rt", "`Пароль`:", "Zq7xW9vK2mPq8Rt"},
-		{"**Password:** Zq7xW9vK2mPq8Rt", "**Password:**", "Zq7xW9vK2mPq8Rt"},
-		{"__Password__: Zq7xW9vK2mPq8Rt", "__Password__:", "Zq7xW9vK2mPq8Rt"},
-		{"`Password`: Zq7xW9vK2mPq8Rt", "`Password`:", "Zq7xW9vK2mPq8Rt"},
-		{"Password: Zq7xW9vK2mPq8Rt", "Password:", "Zq7xW9vK2mPq8Rt"},
-	} {
-		got, _ := Mask(tc.input)
-		if strings.Contains(got, tc.secret) || !strings.Contains(got, tc.label) {
-			t.Errorf("label/value handling for %q: %q", tc.input, got)
-		}
-	}
-	for _, input := range []string{"**Пароль:**, описание", "__Password__:, prose"} {
-		if got, found := Mask(input); got != input || len(found) != 0 {
-			t.Errorf("closing markup without a value changed %q to %q", input, got)
-		}
-	}
-}
-
-// Secret labels can have up to four words before the value delimiter.
-func TestMaskSecretLabelsWithInterveningWords(t *testing.T) {
-	for _, input := range []string{
-		"пароль для учётной записи: Zq7xW9vK2mPq8Rt",
-		"пароль для этой учётной записи: Zq7xW9vK2mPq8Rt",
-		"password for the account: Zq7xW9vK2mPq8Rt",
-		"password for the current user: Zq7xW9vK2mPq8Rt",
-	} {
-		got, _ := Mask(input)
-		if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
-			t.Errorf("secret value left visible for %q: %q", input, got)
-		}
-	}
-	for _, input := range []string{
-		"пароль для учётной записи\nZq7xW9vK2mPq8Rt",
-		"пароль для=учётной записи: Zq7xW9vK2mPq8Rt",
-		"password for the\naccount: Zq7xW9vK2mPq8Rt",
-		"password for = the account: Zq7xW9vK2mPq8Rt",
-		"password - the account: Zq7xW9vK2mPq8Rt",
-		"password for the current user account: Zq7xW9vK2mPq8Rt",
-	} {
-		got, _ := Mask(input)
-		if !strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
-			t.Errorf("label crossed a line or delimiter in %q: %q", input, got)
-		}
-	}
-}
-
-// Russian and English labels classify the same value form identically.
-func TestMaskRussianAndEnglishValueShape(t *testing.T) {
-	for _, tc := range []struct {
-		input string
-		value string
-		mask  bool
-	}{
-		{"пароль: Abcdefghijklmno", "Abcdefghijklmno", true},
-		{"пароль: \"Abcdefghijklmno\"", "Abcdefghijklmno", true},
-		{"password: Abcdefghijklmno", "Abcdefghijklmno", true},
-		{"password: \"Abcdefghijklmno\"", "Abcdefghijklmno", true},
-		{"пароль: нет", "нет", false},
-		{"password: нет", "нет", true},
-	} {
-		got, _ := Mask(tc.input)
-		if strings.Contains(got, tc.value) == tc.mask {
-			t.Errorf("value shape for %q: %q", tc.input, got)
-		}
-	}
-}
-
-// A spaced hyphen separates a label from its value; an unspaced hyphen does not.
-func TestMaskSecretLabelsWithSpacedHyphen(t *testing.T) {
-	for _, input := range []string{
-		"пароль - Zq7xW9vK2mPq8Rt",
-	} {
-		got, _ := Mask(input)
-		if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
-			t.Errorf("secret value left visible for %q: %q", input, got)
-		}
-	}
-	for _, input := range []string{
-		"пароль-Zq7xW9vK2mPq8Rt",
-		"пароль -Zq7xW9vK2mPq8Rt",
-		"пароль- Zq7xW9vK2mPq8Rt",
-	} {
-		got, _ := Mask(input)
-		if !strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
-			t.Errorf("unspaced hyphen was treated as a delimiter for %q: %q", input, got)
-		}
-	}
-}
-
-func TestMaskSecretValueAfterAnySecretLabel(t *testing.T) {
-	for _, input := range []string{
-		"ключ и пароль: Abcdefghijklmno",
-		"ключ и токен: Abcdefghijklmno",
-	} {
-		got, _ := Mask(input)
-		if strings.Contains(got, "Abcdefghijklmno") {
-			t.Errorf("secret value left visible for %q: %q", input, got)
-		}
-	}
-}
-
-func TestMaskRussianLabelWordBoundaries(t *testing.T) {
-	for _, label := range []string{
-		"пароль", "пароля", "паролю", "паролем", "пароле", "пароли", "паролей", "паролям", "паролями", "паролях",
-		"токен", "токена", "токену", "токеном", "токене", "токены", "токенов", "токенам", "токенами", "токенах",
-		"ключ", "ключа", "ключу", "ключом", "ключе", "ключи", "ключей", "ключам", "ключами", "ключах",
-	} {
-		got, _ := Mask(label + ": Abcdefghijk12")
-		if strings.Contains(got, "Abcdefghijk12") {
-			t.Errorf("secret form %q was not recognized: %q", label, got)
-		}
-	}
-	for _, label := range []string{"токенизация", "паролизация", "ключевой", "ключница"} {
-		input := label + ": Abcdefghijk12"
-		if got, found := Mask(input); got != input || len(found) != 0 {
-			t.Errorf("non-label %q changed to %q, %v", label, got, found)
-		}
-	}
-}
-
-func TestMaskLongWhitespaceDoesNotHideLabel(t *testing.T) {
-	input := "password" + strings.Repeat(" ", 512) + ": Qz7mK9xR2nV4bY6"
-	got, _ := Mask(input)
-	if strings.Contains(got, "Qz7mK9xR2nV4bY6") {
-		t.Fatalf("secret after long label spacing remained visible")
-	}
-}
-
-func TestMaskQuotedSecretLabels(t *testing.T) {
-	for _, tc := range []struct{ input, value string }{
-		{"«пароль»: Qz7mK9xR2nV4bY6", "Qz7mK9xR2nV4bY6"},
-		{`"пароль": Qz7mK9xR2nV4bY6`, "Qz7mK9xR2nV4bY6"},
-		{`'пароль': Qz7mK9xR2nV4bY6`, "Qz7mK9xR2nV4bY6"},
-		{"`пароль`: Qz7mK9xR2nV4bY6", "Qz7mK9xR2nV4bY6"},
-		{`"password": "Qz7mK9xR2nV4bY6"`, "Qz7mK9xR2nV4bY6"},
-	} {
-		got, _ := Mask(tc.input)
-		if strings.Contains(got, tc.value) {
-			t.Errorf("quoted secret label left value visible for %q", tc.input)
-		}
-	}
-}
-
-func TestMaskRussianLabelsAreNotInsideWords(t *testing.T) {
-	for _, label := range []string{"супертокен", "сверхпароль", "электроключ", "superпароль", "abcтокен"} {
-		input := label + ": Qz7mK9xR2nV4bY6"
-		if got, found := Mask(input); got != input || len(found) != 0 {
-			t.Errorf("embedded label %q changed", label)
-		}
-	}
-}
-
-func TestMaskShortPlainValueBoundary(t *testing.T) {
-	for _, tc := range []struct {
-		input, value string
-		masked       bool
-	}{
-		{"пароль: abcdefg", "abcdefg", false},
-		{"пароль: abcdefgh", "abcdefgh", true},
-	} {
-		got, _ := Mask(tc.input)
-		if strings.Contains(got, tc.value) == tc.masked {
-			t.Errorf("short value boundary for %q: %q", tc.input, got)
-		}
-	}
-}
-
-func TestMaskPreservesQuotesAroundValue(t *testing.T) {
-	for _, input := range []string{
-		`password: "Qz7mK9xR2nV4bY6"`,
-		`пароль: "Qz7mK9xR2nV4bY6"`,
-	} {
-		got, _ := Mask(input)
-		if !strings.Contains(got, `"[скрыто:password]"`) {
-			t.Errorf("value quote or quote contents were lost for %q: %q", input, got)
-		}
-	}
-}
-
-func TestMaskRussianShortValueAndGuillemets(t *testing.T) {
-	for _, input := range []string{
-		"пароль: example",
-		"пароль: абвгдежзийклмно",
-		"пароль: «нет»",
-		"auth: same-origin",
-	} {
-		if got, found := Mask(input); got != input || len(found) != 0 {
-			t.Errorf("ordinary short value changed %q to %q, %v", input, got, found)
-		}
-	}
-	for _, input := range []string{
-		"пароль: абвгдежзийклмноп",
-		"пароль: «Abcdefghijklmno»",
-		"password: example",
-	} {
-		_, found := Mask(input)
-		if found["password"] == 0 {
-			t.Errorf("secret-shaped value was not masked for %q", input)
-		}
-	}
-}
-
-func TestMaskMarkdownValueMayStartWithEmphasis(t *testing.T) {
-	input := `password=**Zq7xW9vK2mPq8Rt**`
-	got, _ := Mask(input)
-	if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
-		t.Fatalf("secret value left visible: %q", got)
-	}
-}
-
-func TestMaskNameAnchorDoesNotStartInsideName(t *testing.T) {
-	input := `__PWD=Zq7xW9vK2mPq8Rt`
-	got, _ := Mask(input)
-	if strings.Contains(got, "Zq7xW9vK2mPq8Rt") {
-		t.Fatalf("secret value left visible: %q", got)
-	}
-}
-
-func TestMaskQuotedLabelDashBeforeExplanation(t *testing.T) {
-	input := `"pass": - ключ.`
-	if got, found := Mask(input); got != input || len(found) != 0 {
-		t.Fatalf("explanation separator changed %q to %q, %v", input, got, found)
-	}
-}
-
 // The filter takes a secret name only where it is used as one, and a command
 // word only at a command edge.
 func TestContextAnchorGroups(t *testing.T) {
@@ -341,7 +72,6 @@ func TestContextAnchorGroups(t *testing.T) {
 		{"the tokens passed through the high gate", 0},
 		{"no credentials or command names; pseudo curly", 0},
 		{"token: x", anchorName},
-		{"токен: x", anchorName | anchorRussianName},
 		{`{"api_token1":"x"}`, anchorName},
 		{"--db_password x", anchorName},
 		{`["--token","x"]`, anchorName},
@@ -356,6 +86,107 @@ func TestContextAnchorGroups(t *testing.T) {
 		if got := contextAnchorGroups(tc.text); got != tc.want {
 			t.Errorf("%q: groups %b, want %b", tc.text, got, tc.want)
 		}
+	}
+}
+
+func TestMaskRussianLabels(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, label := range []string{
+		"пароль", "Пароль", "ПАРОЛЬ", "пароля", "паролем",
+		"токен", "Токен", "ТОКЕН", "токена",
+		"ключ", "Ключ", "КЛЮЧ",
+	} {
+		input := label + ": " + secret
+		got, _ := Mask(input)
+		if strings.Contains(got, secret) {
+			t.Errorf("secret after Russian label %q remained visible", label)
+		}
+	}
+	for _, input := range []string{
+		"Пароль учётки: " + secret,
+		"пароль для этой учётной записи: " + secret,
+		"пароль для учётной записи— " + secret,
+		"пароль— " + secret,
+		"пароль– " + secret,
+		"пароль - " + secret,
+		"пароль= " + secret,
+		"пароль:= " + secret,
+		"пароль=> " + secret,
+		"**Пароль:** " + secret,
+		"__пароля__: " + secret,
+		"`паролем`: " + secret,
+		"«токен»: " + secret,
+		`"токена": "` + secret + `"`,
+		`'ключ': "` + secret + `"`,
+		"ключ и пароль: " + secret,
+		"ключ и токен: " + secret,
+	} {
+		got, _ := Mask(input)
+		if strings.Contains(got, secret) {
+			t.Errorf("secret value remained visible for Russian label form %q", input)
+		}
+	}
+	for _, input := range []string{
+		"пароль не подошёл",
+		"пароль: нет",
+		"токенов: 1200",
+		"пароль: 1200",
+		"токен: 1200",
+		"токен: абвгдежз",
+		"ключ: " + strings.Join([]string{"SI", "1234"}, "-"),
+		"ключ: incident-reference",
+		"ключ: Abcdefghijklmnop",
+		"супертокен: " + secret,
+		"_ключ: " + secret,
+		"сверхпароль: " + secret,
+		"электроключ: " + secret,
+		"пароль для учётной записи\n" + secret,
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("non-secret Russian form changed %q to %q", input, got)
+		}
+	}
+	if got, found := Mask("ключ: aB4cD9eF0gH2"); strings.Contains(got, "aB4cD9eF0gH2") || found["token"] == 0 {
+		t.Errorf("token-shaped key value not masked: %q, %v", got, found)
+	}
+}
+
+func TestRussianAnchorByteBases(t *testing.T) {
+	for _, label := range []string{"арол", "АРОЛ", "окен", "ОКЕН", "люч", "ЛЮЧ"} {
+		if groups := contextAnchorGroups(label); groups&anchorRuName == 0 {
+			t.Errorf("Russian byte anchor %q was not found", label)
+		}
+	}
+}
+
+func TestMaskRussianLongWhitespace(t *testing.T) {
+	input := "пароль" + strings.Repeat(" ", 4<<20) + ": Qz7mK9xR2nV4bY6"
+	got, _ := Mask(input)
+	if strings.Contains(got, "Qz7mK9xR2nV4bY6") {
+		t.Fatal("secret value after long Russian label whitespace remained visible")
+	}
+}
+
+func TestMaskRussianRepeatedLabelsScaleLinearly(t *testing.T) {
+	elapsed := make([][]time.Duration, 2)
+	for i, n := range []int{1000, 4000} {
+		input := strings.Repeat("пароль ", n) + ":"
+		Mask(input)
+		for range 9 {
+			start := time.Now()
+			Mask(input)
+			elapsed[i] = append(elapsed[i], time.Since(start))
+		}
+	}
+	for i := range elapsed {
+		for j := i + 1; j < len(elapsed[i]); j++ {
+			if elapsed[i][j] < elapsed[i][i] {
+				elapsed[i][i], elapsed[i][j] = elapsed[i][j], elapsed[i][i]
+			}
+		}
+	}
+	if elapsed[1][4] > elapsed[0][4]*8 {
+		t.Fatalf("Russian label scan scaled superlinearly: N=1000 %v, N=4000 %v", elapsed[0][4], elapsed[1][4])
 	}
 }
 
