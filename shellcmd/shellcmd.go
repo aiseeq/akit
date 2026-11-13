@@ -334,11 +334,11 @@ func collectPipelineWalkInfo(binary *syntax.BinaryCmd, src string, vars map[stri
 }
 
 func collectPipedLiteralWalkInfo(binary *syntax.BinaryCmd, src string, vars map[string]string, info *walkInfo) (bool, error) {
-	if binary.X == nil || binary.Y == nil || len(binary.X.Redirs) != 0 || len(binary.Y.Redirs) != 0 {
+	if binary.Y == nil || len(binary.Y.Redirs) != 0 {
 		return false, nil
 	}
-	producer, ok := binary.X.Cmd.(*syntax.CallExpr)
-	if !ok || len(producer.Args) == 0 {
+	producer := literalPipeProducer(binary.X)
+	if producer == nil || len(producer.Args) == 0 {
 		return false, nil
 	}
 	name, literal := wordValue(producer.Args[0])
@@ -370,6 +370,21 @@ func collectPipedLiteralWalkInfo(binary *syntax.BinaryCmd, src string, vars map[
 	return true, nil
 }
 
+func literalPipeProducer(stmt *syntax.Stmt) *syntax.CallExpr {
+	for stmt != nil && len(stmt.Redirs) == 0 {
+		left, ok := stmt.Cmd.(*syntax.BinaryCmd)
+		if !ok {
+			call, _ := stmt.Cmd.(*syntax.CallExpr)
+			return call
+		}
+		if left.Op != syntax.Pipe && left.Op != syntax.PipeAll {
+			return nil
+		}
+		stmt = left.Y
+	}
+	return nil
+}
+
 func literalPipeBody(name string, args []*syntax.Word, src string, vars map[string]string) (mapped, bool, error) {
 	values := make([]string, 0, len(args))
 	parts := make([]mapped, 0, len(args))
@@ -390,10 +405,10 @@ func literalPipeBody(name string, args []*syntax.Word, src string, vars map[stri
 		return body, true, err
 	}
 	body, ok, err := literalPrintfBody(values)
-	if err != nil || !ok || len(values) == 0 || !strings.Contains(values[0], `\c`) || echoStop(values[0]) < 0 {
+	if !ok || !printfFormatAlternatives(values[0]) {
 		return body, ok, err
 	}
-	// Bash сохраняет \c в формате, а внешний printf может обрывать вывод.
+	// Bash и внешний printf по-разному обрабатывают \c и \% в формате.
 	alternate, alternateOK, err := literalPrintfBodyMode(values, false)
 	if err != nil {
 		return mapped{}, false, err
@@ -430,7 +445,7 @@ func literalEchoBody(values []string, parts []mapped) (mapped, error) {
 			if stop >= 0 {
 				value = value[:stop]
 			}
-			text, _, err := shExpand.Format(nil, value, nil)
+			text, _, err := shExpand.Format(nil, bashEscapeInput(value, true), nil)
 			if err != nil {
 				return mapped{}, fmt.Errorf("shellcmd: expand piped echo: %w", err)
 			}
@@ -470,6 +485,9 @@ func literalPrintfBodyMode(values []string, stopFormat bool) (mapped, bool, erro
 		return mapped{}, false, nil
 	}
 	format, args := values[0], values[1:]
+	if !stopFormat {
+		format = bashPrintfFormat(format)
+	}
 	hasStop := slices.ContainsFunc(values, func(value string) bool { return strings.Contains(value, `\c`) })
 	var body mapped
 	for {
@@ -485,7 +503,7 @@ func literalPrintfBodyMode(values []string, stopFormat bool) (mapped, bool, erro
 				}
 			}
 		}
-		text, consumed, err := shExpand.Format(nil, current, currentArgs)
+		text, consumed, err := shExpand.Format(nil, current, bashPrintfArgs(current, currentArgs))
 		if err != nil {
 			return mapped{}, false, fmt.Errorf("shellcmd: format piped printf: %w", err)
 		}
@@ -499,6 +517,110 @@ func literalPrintfBodyMode(values []string, stopFormat bool) (mapped, bool, erro
 		args = args[consumed:]
 	}
 	return body, true, nil
+}
+
+// bashEscapeInput приводит восьмеричные escape аргументов echo и %b к формату expand.Format.
+func bashEscapeInput(value string, echo bool) string {
+	if !strings.Contains(value, `\`) {
+		return value
+	}
+	var out strings.Builder
+	for i := 0; i < len(value); {
+		if value[i] != '\\' || i+1 >= len(value) {
+			out.WriteByte(value[i])
+			i++
+			continue
+		}
+		next := value[i+1]
+		if next == '0' || !echo && next >= '1' && next <= '7' {
+			start := i + 1
+			if next == '0' {
+				start++
+			}
+			end, number := start, 0
+			for end < len(value) && end < start+3 && value[end] >= '0' && value[end] <= '7' {
+				number = number*8 + int(value[end]-'0')
+				end++
+			}
+			const hex = "0123456789abcdef"
+			out.WriteString(`\x`)
+			out.WriteByte(hex[(number>>4)&15])
+			out.WriteByte(hex[number&15])
+			i = end
+			continue
+		}
+		if echo && next >= '1' && next <= '7' {
+			out.WriteByte('\\')
+		}
+		out.WriteByte('\\')
+		out.WriteByte(next)
+		i += 2
+	}
+	return out.String()
+}
+
+// printfFormatAlternatives определяет, может ли встроенный printf отличаться от внешнего.
+func printfFormatAlternatives(format string) bool {
+	for i := 0; i+1 < len(format); i++ {
+		if format[i] != '\\' {
+			continue
+		}
+		if format[i+1] == 'c' || format[i+1] == '%' {
+			return true
+		}
+		i++
+	}
+	return false
+}
+
+func bashPrintfFormat(format string) string {
+	if !strings.Contains(format, `\%`) {
+		return format
+	}
+	var out strings.Builder
+	for i := 0; i < len(format); i++ {
+		if format[i] == '\\' && i+1 < len(format) {
+			if format[i+1] == '%' {
+				out.WriteByte('\\')
+			}
+			out.WriteByte(format[i])
+			i++
+		}
+		out.WriteByte(format[i])
+	}
+	return out.String()
+}
+
+func bashPrintfArgs(format string, args []string) []string {
+	var result []string
+	argument := 0
+	for i := 0; i < len(format); i++ {
+		if format[i] == '\\' && i+1 < len(format) {
+			i++
+			continue
+		}
+		if format[i] != '%' || i+1 >= len(format) {
+			continue
+		}
+		i++
+		if format[i] == '%' {
+			continue
+		}
+		if format[i] == 'b' && argument < len(args) {
+			value := bashEscapeInput(args[argument], false)
+			if value != args[argument] {
+				if result == nil {
+					result = slices.Clone(args)
+				}
+				result[argument] = value
+			}
+		}
+		argument++
+	}
+	if result != nil {
+		return result
+	}
+	return args
 }
 
 // printfStop находит первую остановку в формате или в аргументе %b.

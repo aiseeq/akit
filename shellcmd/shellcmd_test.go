@@ -1230,6 +1230,183 @@ func TestLiteralPipeBoundaries(t *testing.T) {
 	}
 }
 
+func TestRound4PipelineProducer(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		args [][]string
+	}{
+		{`true | echo 'kill -1' | bash`, [][]string{{"-1"}}},
+		{`true |& echo 'kill -1' | bash`, [][]string{{"-1"}}},
+		{`echo 'kill 12345' | bash | echo 'kill -1' | bash`, [][]string{{"12345"}, {"-1"}}},
+	} {
+		calls, err := Find(tc.src, "kill")
+		if err != nil || len(calls) != len(tc.args) {
+			t.Errorf("Find(%q) = %#v, %v; want %d calls", tc.src, calls, err, len(tc.args))
+			continue
+		}
+		for _, want := range tc.args {
+			found := false
+			for _, call := range calls {
+				found = found || reflect.DeepEqual(call.Args, want) && reflect.DeepEqual(call.Via, []string{"pipe", "bash"})
+			}
+			if !found {
+				t.Errorf("Find(%q) = %#v; missing args %q", tc.src, calls, want)
+			}
+		}
+	}
+}
+
+func TestRound4PipelineBoundaries(t *testing.T) {
+	nonPipe := &syntax.Stmt{Cmd: &syntax.BinaryCmd{Op: syntax.AndStmt, Y: &syntax.Stmt{Cmd: &syntax.CallExpr{}}}}
+	if got := literalPipeProducer(nonPipe); got != nil {
+		t.Errorf("non-pipe producer = %#v; want nil", got)
+	}
+	calls, err := Find(`true | printf '%s' 'kill -1' | nice sh -s`, "kill")
+	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, []string{"pipe", "nice", "sh"}) {
+		t.Fatalf("wrapped pipeline = %#v, %v", calls, err)
+	}
+	calls, err = Find(`true | echo 'kill -1' >file | bash`, "kill")
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("redirected producer = %#v, %v; want no calls", calls, err)
+	}
+}
+
+func TestRound4OctalEscapes(t *testing.T) {
+	for _, src := range []string{
+		`printf '%b' '\0153ill 1' | bash`,
+		`printf '%b' '\153ill 1' | bash`,
+		`echo -e '\0153ill 1' | bash`,
+		`printf '\153ill 1' | bash`,
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"1"}) || !reflect.DeepEqual(calls[0].Via, []string{"pipe", "bash"}) {
+			t.Errorf("Find(%q) = %#v, %v; want kill 1", src, calls, err)
+		}
+	}
+	for _, src := range []string{`echo -e '\153ill 1' | bash`, `printf '\0153ill 1' | bash`} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want no kill", src, calls, err)
+		}
+	}
+}
+
+func TestRound4EscapeOutput(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"%b", `\0153ill`}, "kill"},
+		{[]string{"%b", `\153ill`}, "kill"},
+		{[]string{"%b", `\0000`}, "\x00"},
+		{[]string{"%b", `\0377`}, "\xff"},
+		{[]string{"%b", `\01234`}, "S4"},
+		{[]string{"%b", `\0128`}, "\n8"},
+		{[]string{"%b", `\128`}, "\n8"},
+		{[]string{"%b", `\08`}, "\x008"},
+		{[]string{"%b", `\0`}, "\x00"},
+		{[]string{"%b", `\777`}, "\xff"},
+		{[]string{"%b", `\\0153`}, `\0153`},
+		{[]string{"%s", `\0153`}, `\0153`},
+		{[]string{"%s%b", `\0153`, `\0153ill`}, `\0153kill`},
+	} {
+		body, ok, err := literalPrintfBody(tc.args)
+		if err != nil || !ok || body.String() != tc.want {
+			t.Errorf("printf %q = %q, %t, %v; want %q", tc.args, body.String(), ok, err, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		format            string
+		args              []string
+		builtin, external string
+	}{
+		{`\%b`, []string{"echo ok"}, `\echo ok`, `\%b`},
+		{`\%s`, []string{"echo ok"}, `\echo ok`, `\%s`},
+		{`\\%b`, []string{"echo ok"}, `\echo ok`, `\echo ok`},
+		{`\%b`, []string{`echo ok\c ignored`}, `\echo ok`, `\%b`},
+		{`\%b\`, []string{"echo ok"}, `\echo ok\`, `\%b\`},
+	} {
+		for _, mode := range []struct {
+			stop bool
+			want string
+		}{{false, tc.builtin}, {true, tc.external}} {
+			body, ok, err := literalPrintfBodyMode(append([]string{tc.format}, tc.args...), mode.stop)
+			if err != nil || !ok || body.String() != mode.want {
+				t.Errorf("printf %q %q mode %t = %q, %t, %v; want %q", tc.format, tc.args, mode.stop, body.String(), ok, err, mode.want)
+			}
+		}
+	}
+}
+
+func TestRound4EchoEscapeOutput(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  string
+	}{
+		{`\0153ill`, "kill\n"},
+		{`\153ill`, "\\153ill\n"},
+		{`\777`, "\\777\n"},
+		{`\\0153`, "\\0153\n"},
+		{`\0000`, "\x00\n"},
+		{`\08`, "\x008\n"},
+		{`\`, "\\\n"},
+	} {
+		args := []string{"-e", tc.value}
+		parts := make([]mapped, len(args))
+		for i, arg := range args {
+			parts[i].add(arg, -1)
+		}
+		body, err := literalEchoBody(args, parts)
+		if err != nil || body.String() != tc.want {
+			t.Errorf("echo -e %q = %q, %v; want %q", tc.value, body.String(), err, tc.want)
+		}
+	}
+}
+
+func TestRound4PrintfArgumentIsolation(t *testing.T) {
+	args := []string{`\0153`, `\0153ill`}
+	before := slices.Clone(args)
+	body, ok, err := literalPrintfBody(append([]string{"%s%b"}, args...))
+	if err != nil || !ok || body.String() != `\0153kill` || !slices.Equal(args, before) {
+		t.Fatalf("printf = %q, %t, %v, args %q", body.String(), ok, err, args)
+	}
+	adjusted := bashPrintfArgs("%s%b", args)
+	if !slices.Equal(args, before) || !slices.Equal(adjusted, []string{`\0153`, `\x6bill`}) {
+		t.Fatalf("printf arguments = %q, original %q", adjusted, args)
+	}
+	for _, format := range []string{`%% %b`, `\%s%b`} {
+		if got := bashPrintfArgs(format, []string{`\0153ill`}); !slices.Equal(got, []string{`\x6bill`}) {
+			t.Errorf("bashPrintfArgs(%q) = %q", format, got)
+		}
+	}
+	for _, format := range []string{`%b`, `%`, `\`} {
+		if got := bashPrintfArgs(format, nil); got != nil {
+			t.Errorf("bashPrintfArgs(%q, nil) = %q", format, got)
+		}
+	}
+}
+
+func TestRound4PrintfFormatAlternatives(t *testing.T) {
+	for _, tc := range []struct {
+		format string
+		want   bool
+	}{
+		{`\c`, true}, {`\%b`, true}, {`\\c`, false}, {`\\%b`, false},
+		{`\q`, false}, {`plain`, false}, {`\`, false},
+	} {
+		if got := printfFormatAlternatives(tc.format); got != tc.want {
+			t.Errorf("printfFormatAlternatives(%q) = %t; want %t", tc.format, got, tc.want)
+		}
+	}
+}
+
+func TestRound4PrintfEscapedPercent(t *testing.T) {
+	calls, err := Find(`printf '\%b' 'kill 1' | bash`, "kill")
+	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"1"}) || !reflect.DeepEqual(calls[0].Via, []string{"pipe", "bash"}) {
+		t.Fatalf("escaped percent = %#v, %v; want kill 1", calls, err)
+	}
+}
+
 func TestPrintfStopLiteralPipe(t *testing.T) {
 	for _, src := range []string{
 		`printf '%b' 'kill 1\t#\c' | bash`,
