@@ -1230,6 +1230,197 @@ func TestLiteralPipeBoundaries(t *testing.T) {
 	}
 }
 
+func TestPrintfStopLiteralPipe(t *testing.T) {
+	for _, src := range []string{
+		`printf '%b' 'kill 1\t#\c' | bash`,
+		`printf '%s' 'kill 1 #\c' | bash`,
+		`printf 'kill 1\c rest' | bash`,
+		`printf '%b%b' 'kill 1 #\c' 'kill 2' | bash`,
+		`echo -e 'kill 1\c' | bash`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Find(src, "kill")
+			found := false
+			for _, call := range calls {
+				found = found || reflect.DeepEqual(call.Args, []string{"1"}) && reflect.DeepEqual(call.Via, []string{"pipe", "bash"})
+			}
+			if err != nil || !found {
+				t.Fatalf("Find(%q) = %#v, %v; want kill 1 via pipe bash", src, calls, err)
+			}
+		})
+	}
+}
+
+func TestPrintfStopUnsupportedAndBudget(t *testing.T) {
+	for _, tc := range []struct {
+		src       string
+		wantError bool
+	}{
+		{`printf '%q\c' value`, false},
+		{`printf 'x\c` + strings.Repeat("x", maxNestedScriptBytes+1) + `'`, true},
+	} {
+		file, err := syntax.NewParser().Parse(strings.NewReader(tc.src), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := file.Stmts[0].Cmd.(*syntax.CallExpr)
+		_, ok, err := literalPipeBody("printf", call.Args[1:], tc.src, nil)
+		if ok || (err != nil) != tc.wantError {
+			t.Errorf("literalPipeBody = %t, %v; want unknown, error %t", ok, err, tc.wantError)
+		}
+	}
+}
+
+func TestPrintfStopFirstEvent(t *testing.T) {
+	for _, tc := range []struct {
+		format     string
+		args       []string
+		stopFormat bool
+		wantFormat string
+		wantArgs   []string
+		stopped    bool
+	}{
+		{`%b`, []string{`a\c tail`}, true, `%b`, []string{"a"}, true},
+		{`%% %b`, []string{`a\c tail`}, true, `%% %b`, []string{"a"}, true},
+		{`%s %b`, []string{`a\c`, `b\c tail`}, true, `%s %b`, []string{`a\c`, "b"}, true},
+		{`x\c y`, nil, true, "x", nil, true},
+		{`x\c %b`, []string{`y\c tail`}, false, `x\c %b`, []string{"y"}, true},
+		{`%b`, nil, true, `%b`, nil, false},
+		{`x\\c`, nil, true, `x\\c`, nil, false},
+		{`\`, nil, true, `\`, nil, false},
+		{`%`, nil, true, `%`, nil, false},
+		{`%s`, []string{`a\c`}, true, `%s`, []string{`a\c`}, false},
+	} {
+		before := slices.Clone(tc.args)
+		format, args, stopped := printfStop(tc.format, tc.args, tc.stopFormat)
+		if !reflect.DeepEqual(tc.args, before) {
+			t.Errorf("printfStop changed arguments: %q to %q", before, tc.args)
+		}
+		if format != tc.wantFormat || !reflect.DeepEqual(args, tc.wantArgs) || stopped != tc.stopped {
+			t.Errorf("printfStop(%q, %q, %t) = %q, %q, %t; want %q, %q, %t", tc.format, tc.args, tc.stopFormat, format, args, stopped, tc.wantFormat, tc.wantArgs, tc.stopped)
+		}
+	}
+}
+
+func TestPrintfStopIdenticalAlternativesFitBudget(t *testing.T) {
+	src := `printf '%b\c' 'kill 1 #\c' | bash`
+	budget := newNestedParseBudget(len(src))
+	budget.limit = len("kill 1 #")
+	var calls []Call
+	if err := parseWithBudget(src, 0, nil, map[string]string{}, &calls, budget); err != nil || callsNamed(calls, "kill") != 1 {
+		t.Fatalf("identical alternatives = %#v, %v; want one kill within budget", calls, err)
+	}
+}
+
+func TestPrintfStopSameCallInAlternatives(t *testing.T) {
+	calls, err := Find(`printf 'kill 1 #\c' | bash`, "kill")
+	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"1"}) {
+		t.Fatalf("printf alternatives = %#v, %v; want one kill", calls, err)
+	}
+}
+
+func TestPipedAlternativesStayWithinPipe(t *testing.T) {
+	var first, second, alternate mapped
+	first.add("kill 1", -1)
+	second.add("kill 1", -1)
+	alternate.add("kill 1; kill 1", -1)
+	shell := &syntax.Stmt{Cmd: &syntax.CallExpr{}}
+	inputs := []pipedHeredoc{
+		{body: &first, shell: shell, name: "bash"},
+		{body: &second, shell: shell, name: "bash"},
+		{body: &alternate, shell: shell, name: "bash", alternate: true},
+	}
+	var calls []Call
+	if err := parsePipedHeredocs(inputs, "", 0, nil, nil, nil, nil, &calls, newNestedParseBudget(100)); err != nil || len(calls) != 3 {
+		t.Fatalf("piped alternatives = %#v, %v; want three calls", calls, err)
+	}
+}
+
+func TestDedupePipedAlternativesPreservesDifferences(t *testing.T) {
+	base := Call{Name: "kill", Args: []string{"1"}, Via: []string{"pipe", "bash"}, Offset: -1, Line: 1}
+	for _, change := range []func(*Call){
+		func(c *Call) { c.Name = "other" },
+		func(c *Call) { c.Args = []string{"2"} },
+		func(c *Call) { c.Via = []string{"other"} },
+		func(c *Call) { c.Offset = 4 },
+		func(c *Call) { c.Line = 2 },
+		func(c *Call) { c.Loop = true },
+		func(c *Call) { c.Background = true },
+		func(c *Call) { c.ScriptInput = true },
+		func(c *Call) { c.Redirs = []Redir{{Op: ">", Target: "file"}} },
+	} {
+		other := base
+		change(&other)
+		calls := []Call{base, other}
+		dedupePipedAlternatives(&calls, 0, 1)
+		if len(calls) != 2 {
+			t.Errorf("distinct calls removed: %#v and %#v", base, other)
+		}
+	}
+}
+
+func TestPrintfStopAlternativesPreserveCalls(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		args [][]string
+	}{
+		{`printf 'kill 1; kill 1 #\c' | bash`, [][]string{{"1"}, {"1"}}},
+		{`printf 'kill 1 #\c\nkill 2' | bash`, [][]string{{"1"}, {"2"}}},
+		{`printf 'kill 1 >a #\c\nkill 1 >b' | bash`, [][]string{{"1"}, {"1"}}},
+		{`printf 'kill 1 #\c' | bash; printf 'kill 2 #\c' | bash`, [][]string{{"1"}, {"2"}}},
+	} {
+		calls, err := Find(tc.src, "kill")
+		if err != nil || len(calls) != len(tc.args) {
+			t.Errorf("Find(%q) = %#v, %v; want %d calls", tc.src, calls, err, len(tc.args))
+			continue
+		}
+		for i, call := range calls {
+			if !reflect.DeepEqual(call.Args, tc.args[i]) {
+				t.Errorf("Find(%q)[%d].Args = %q; want %q", tc.src, i, call.Args, tc.args[i])
+			}
+		}
+	}
+}
+
+func TestPrintfStopIdenticalAlternatives(t *testing.T) {
+	calls, err := Find(`printf '%b\c' 'kill 1 #\c' | bash`, "kill")
+	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"1"}) {
+		t.Fatalf("identical printf alternatives = %#v, %v; want one kill", calls, err)
+	}
+}
+
+func TestPrintfFormatStopKeepsBashOutput(t *testing.T) {
+	calls, err := Find(`printf 'echo hi\c\nkill 1' | bash`, "kill")
+	if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"1"}) {
+		t.Fatalf("bash printf format = %#v, %v; want kill 1", calls, err)
+	}
+}
+
+func TestPrintfStopOutput(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{`%b`, `echo 1\t#\c`, "ignored"}, "echo 1\t#"},
+		{[]string{`%s`, `echo 1 #\c`}, `echo 1 #\c`},
+		{[]string{`echo 1\c rest`}, "echo 1"},
+		{[]string{`%s %b rest`, "first", `second\c ignored`}, "first second"},
+		{[]string{`%% %b`, `a\\c`}, `% a\c`},
+		{[]string{`%b`, "one", `two\c ignored`, "three"}, "onetwo"},
+		{[]string{`echo 1\c %q`}, "echo 1"},
+		{[]string{`%s%b`, `a\c`, `b\c ignored`}, `a\cb`},
+		{[]string{`%c%b`, "x", `b\c ignored`}, "xb"},
+		{[]string{`%b`, `\\c`}, `\c`},
+		{[]string{`%b`, `\c ignored`}, ""},
+		{[]string{`x\\c`}, `x\c`},
+	} {
+		body, ok, err := literalPrintfBody(tc.args)
+		if err != nil || !ok || body.String() != tc.want {
+			t.Errorf("printf %q = %q, %t, %v; want %q", tc.args, body.String(), ok, err, tc.want)
+		}
+	}
+}
+
 func TestLiteralPrintfBoundaries(t *testing.T) {
 	for _, args := range [][]string{nil, {"-x"}, {"%"}, {"%q", "value"}} {
 		body, ok, err := literalPrintfBody(args)

@@ -364,6 +364,9 @@ func collectPipedLiteralWalkInfo(binary *syntax.BinaryCmd, src string, vars map[
 		return false, nil
 	}
 	info.pipedHeredocs = append(info.pipedHeredocs, pipedHeredoc{body: &body, shell: binary.Y, name: shell, via: via})
+	if body.alternate != nil {
+		info.pipedHeredocs = append(info.pipedHeredocs, pipedHeredoc{body: body.alternate, shell: binary.Y, name: shell, via: via, alternate: true})
+	}
 	return true, nil
 }
 
@@ -379,9 +382,6 @@ func literalPipeBody(name string, args []*syntax.Word, src string, vars map[stri
 		if err := part.expandParts(arg.Parts, src, vars, partUnquoted); err != nil {
 			return mapped{}, false, err
 		}
-		if name == "printf" && strings.Contains(value, `\c`) {
-			return mapped{}, false, nil
-		}
 		values = append(values, value)
 		parts = append(parts, part)
 	}
@@ -389,7 +389,19 @@ func literalPipeBody(name string, args []*syntax.Word, src string, vars map[stri
 		body, err := literalEchoBody(values, parts)
 		return body, true, err
 	}
-	return literalPrintfBody(values)
+	body, ok, err := literalPrintfBody(values)
+	if err != nil || !ok || len(values) == 0 || !strings.Contains(values[0], `\c`) || echoStop(values[0]) < 0 {
+		return body, ok, err
+	}
+	// Bash сохраняет \c в формате, а внешний printf может обрывать вывод.
+	alternate, alternateOK, err := literalPrintfBodyMode(values, false)
+	if err != nil {
+		return mapped{}, false, err
+	}
+	if alternateOK && alternate.String() != body.String() {
+		body.alternate = &alternate
+	}
+	return body, true, nil
 }
 
 func literalEchoBody(values []string, parts []mapped) (mapped, error) {
@@ -450,21 +462,30 @@ func echoStop(value string) int {
 }
 
 func literalPrintfBody(values []string) (mapped, bool, error) {
+	return literalPrintfBodyMode(values, true)
+}
+
+func literalPrintfBodyMode(values []string, stopFormat bool) (mapped, bool, error) {
 	if len(values) == 0 || strings.HasPrefix(values[0], "-") {
 		return mapped{}, false, nil
 	}
 	format, args := values[0], values[1:]
-	for i := 0; i < len(format); i++ {
-		if format[i] == '%' {
-			i++
-			if i >= len(format) || !strings.ContainsRune("%sbdiuoxc", rune(format[i])) {
-				return mapped{}, false, nil
-			}
-		}
-	}
+	hasStop := slices.ContainsFunc(values, func(value string) bool { return strings.Contains(value, `\c`) })
 	var body mapped
 	for {
-		text, consumed, err := shExpand.Format(nil, format, args)
+		current, currentArgs, stopped := format, args, false
+		if hasStop {
+			current, currentArgs, stopped = printfStop(format, args, stopFormat)
+		}
+		for i := 0; i < len(current); i++ {
+			if current[i] == '%' {
+				i++
+				if i >= len(current) || !strings.ContainsRune("%sbdiuoxc", rune(current[i])) {
+					return mapped{}, false, nil
+				}
+			}
+		}
+		text, consumed, err := shExpand.Format(nil, current, currentArgs)
 		if err != nil {
 			return mapped{}, false, fmt.Errorf("shellcmd: format piped printf: %w", err)
 		}
@@ -472,12 +493,42 @@ func literalPrintfBody(values []string) (mapped, bool, error) {
 			return mapped{}, false, fmt.Errorf("shellcmd: piped printf exceeds %d bytes", maxNestedScriptBytes)
 		}
 		body.add(text, -1)
-		if consumed == 0 || consumed >= len(args) {
+		if stopped || consumed == 0 || consumed >= len(args) {
 			break
 		}
 		args = args[consumed:]
 	}
 	return body, true, nil
+}
+
+// printfStop находит первую остановку в формате или в аргументе %b.
+func printfStop(format string, args []string, stopFormat bool) (string, []string, bool) {
+	argument := 0
+	for i := 0; i < len(format); i++ {
+		if format[i] == '\\' && i+1 < len(format) {
+			if stopFormat && format[i+1] == 'c' {
+				return format[:i], args, true
+			}
+			i++
+			continue
+		}
+		if format[i] != '%' || i+1 >= len(format) {
+			continue
+		}
+		i++
+		if format[i] == '%' {
+			continue
+		}
+		if format[i] == 'b' && argument < len(args) {
+			if stop := echoStop(args[argument]); stop >= 0 {
+				short := slices.Clone(args)
+				short[argument] = short[argument][:stop]
+				return format[:i+1], short, true
+			}
+		}
+		argument++
+	}
+	return format, args, false
 }
 
 func hasHeredocRedir(redirs []*syntax.Redirect) bool {
@@ -582,11 +633,12 @@ func needsWalkInfo(src string) bool {
 }
 
 type pipedHeredoc struct {
-	body  *mapped
-	redir *syntax.Redirect
-	shell *syntax.Stmt
-	name  string
-	via   []string
+	body      *mapped
+	redir     *syntax.Redirect
+	shell     *syntax.Stmt
+	name      string
+	via       []string
+	alternate bool
 }
 
 func stdinEchoingCall(call *syntax.CallExpr, src string, vars map[string]string) bool {
@@ -1063,6 +1115,7 @@ func dynamicFirstWord(raw string) bool {
 
 func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
 	var nestedErrs []error
+	previousFirst := 0
 	for _, input := range piped {
 		redir := input.redir
 		var body mapped
@@ -1083,11 +1136,48 @@ func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherite
 				(*calls)[i].Line = lineBase + 1 + strings.Count(src[:offset], "\n")
 			}
 		}
+		if input.alternate {
+			dedupePipedAlternatives(calls, previousFirst, first)
+		} else {
+			previousFirst = first
+		}
 		if err != nil {
 			nestedErrs = append(nestedErrs, err)
 		}
 	}
 	return errors.Join(nestedErrs...)
+}
+
+// dedupePipedAlternatives объединяет одинаковые вызовы двух вариантов stdout,
+// сохраняя кратность и различия в перенаправлениях и контексте.
+func dedupePipedAlternatives(calls *[]Call, first, second int) {
+	key := func(call Call) callIdentity {
+		hash := hashCallParts(callHashOffsetBasis, call.Args)
+		return callIdentity{name: call.Name, offset: call.Offset, hash: hashCallParts(hash, call.Via)}
+	}
+	previous := make(map[callIdentity][]Call)
+	for _, call := range (*calls)[first:second] {
+		id := key(call)
+		previous[id] = append(previous[id], call)
+	}
+	kept := (*calls)[:second]
+	for _, call := range (*calls)[second:] {
+		id := key(call)
+		matches := previous[id]
+		duplicate := false
+		for i, match := range matches {
+			if sameCall(match, call) && match.Line == call.Line && match.Loop == call.Loop && match.Background == call.Background && match.ScriptInput == call.ScriptInput && slices.Equal(match.Redirs, call.Redirs) {
+				matches[i] = matches[len(matches)-1]
+				previous[id] = matches[:len(matches)-1]
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			kept = append(kept, call)
+		}
+	}
+	*calls = kept
 }
 
 func heredocScript(redir *syntax.Redirect, src string) mapped {
@@ -1580,10 +1670,11 @@ func litSource(lit *syntax.Lit, src string, double bool) (raw string, base int) 
 
 // mapped — текст и смещение каждого его байта в исходной команде (-1 — такого байта нет).
 type mapped struct {
-	text     []byte
-	pos      []int
-	rawStart []int
-	rawEnd   []int
+	alternate *mapped
+	text      []byte
+	pos       []int
+	rawStart  []int
+	rawEnd    []int
 	// subst are source spans of substitutions the outer shell runs while
 	// expanding a heredoc body or here-string.
 	subst [][2]int
