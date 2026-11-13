@@ -40,9 +40,12 @@ type Call struct {
 	literalMask uint32
 }
 
-// ArgLiteral возвращает true, только если процесс получает ровно Args[i] и значение не зависит
-// от окружения, файловой системы или подстановок ни на одном уровне вложенности. При сомнении
-// возвращает false. Индексы от 32 не кодируются в маске и всегда дают false; вне Args также false.
+// ArgLiteral возвращает true только для аргументов из консервативного белого списка: верхний
+// уровень, либо скрипт, целиком переданный в одинарных кавычках через bash/sh -c, eval или
+// кавыченный heredoc, и слово только из безопасных Lit, одинарных кавычек без $, либо двойных
+// кавычек с Lit без обратной косой. Обёртки xargs, find -exec и parallel, раскрываемые символы,
+// подстановки и любые неразрешённые формы дают false. Всё прочее также false без анализа.
+// Маска ограничивает API первыми 32 аргументами: индексы от 32 и вне Args всегда дают false.
 func (c Call) ArgLiteral(i int) bool {
 	return i >= 0 && i < len(c.Args) && i < 32 && c.literalMask&(uint32(1)<<uint(i)) != 0
 }
@@ -54,6 +57,7 @@ type cmd struct {
 	budget         *nestedParseBudget
 	source         string
 	expansionDepth int
+	contextTrusted bool
 
 	stdinInput    *syntax.Redirect
 	stdinConsumed bool
@@ -61,10 +65,11 @@ type cmd struct {
 
 // word — место слова в исходной команде и его текст как скрипта.
 type word struct {
-	offset  int    // смещение в исходной команде; -1 — источник слова не найден
-	literal bool   // true — значение слова не содержит раскрытия оболочки
-	script  string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
-	pos     []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
+	offset       int  // смещение в исходной команде; -1 — источник слова не найден
+	literal      bool // true — значение слова не содержит раскрытия оболочки
+	singleQuoted bool
+	script       string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
+	pos          []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -232,7 +237,7 @@ func walkCalls(file *syntax.File, src string, sourceMap []int, lineBase int, inh
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
 	}
 	nestedErrs := append(walker.nestedErrs, info.errors...)
-	if err := parseHeredocStmts(info.shellInputs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls, budget); err != nil {
+	if err := parseHeredocStmts(info.shellInputs, src, sourceMap, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls, budget); err != nil {
 		nestedErrs = append(nestedErrs, err)
 	}
 	if err := parsePipedHeredocs(info.pipedHeredocs, src, lineBase, inherited, vars, info.loopCalls, info.backgroundCalls, calls, budget); err != nil {
@@ -770,7 +775,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		return
 	}
 	ws := splitWords(words, split)
-	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
+	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], contextTrusted: sourceContextTrusted(w.sourceMap)}
 	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
 		if errors.As(err, &nested) {
@@ -853,7 +858,7 @@ func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
 }
 
-func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
+func parseHeredocStmts(inputs []heredocShellInput, src string, sourceMap []int, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
 	var nestedErrs []error
 	for _, input := range inputs {
 		stmt, name, shellVia, redir := input.stmt, input.name, input.via, input.redir
@@ -861,6 +866,9 @@ func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inh
 		if err != nil {
 			nestedErrs = append(nestedErrs, err)
 			continue
+		}
+		if sourceContextTrusted(sourceMap) && redir != nil && (redir.Op.String() == "<<" || redir.Op.String() == "<<-") && quotedHeredoc(redir.Word) {
+			body = trustMapped(body)
 		}
 		via := append(append(append([]string(nil), inherited...), shellVia...), name)
 		call, _ := stmt.Cmd.(*syntax.CallExpr)
@@ -1253,6 +1261,12 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	if len(src) > budget.limit-budget.used {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested parse budget exceeds %d bytes", budget.limit)}
 	}
+	if len(pos) == 0 {
+		pos = make([]int, len(src))
+		for i := range pos {
+			pos[i] = -1
+		}
+	}
 	budget.used += len(src)
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
@@ -1295,6 +1309,15 @@ func outerOffset(offset int, pos []int) int {
 // sourceOffset decodes a mapped source position. Values at most -3 retain an
 // offset while marking expansion; -1 is unmapped and -2 is expanded without an offset.
 func sourceOffset(pos int) int {
+	if pos == -sourceTrustBit-2 {
+		return -1
+	}
+	if pos >= sourceTrustBit {
+		return pos - sourceTrustBit
+	}
+	if pos <= -sourceTrustBit-3 {
+		return -pos - sourceTrustBit - 3
+	}
 	if pos <= -3 {
 		return -pos - 3
 	}
@@ -1305,6 +1328,9 @@ func sourceOffset(pos int) int {
 }
 
 func markSourceExpanded(pos int) int {
+	if pos >= sourceTrustBit {
+		return -sourceOffset(pos) - sourceTrustBit - 3
+	}
 	if pos <= -2 {
 		return pos
 	}
@@ -1313,6 +1339,39 @@ func markSourceExpanded(pos int) int {
 
 func sourceExpanded(pos int) bool {
 	return pos == -2 || pos <= -3
+}
+
+const sourceTrustBit = 1 << 30
+
+func sourceIsTrusted(pos int) bool {
+	return pos >= sourceTrustBit || pos == -sourceTrustBit-2 || pos <= -sourceTrustBit-3
+}
+
+func markSourceTrusted(pos int) int {
+	if pos == -1 || pos == -2 {
+		return -sourceTrustBit - 2
+	}
+	if pos == -sourceTrustBit-2 {
+		return pos
+	}
+	if sourceExpanded(pos) {
+		return -sourceOffset(pos) - sourceTrustBit - 3
+	}
+	return sourceOffset(pos) + sourceTrustBit
+}
+
+func trustMapped(m mapped) mapped {
+	for i, pos := range m.pos {
+		m.pos[i] = markSourceTrusted(pos)
+	}
+	return m
+}
+
+func markTrustedPositions(pos []int) []int {
+	for i := range pos {
+		pos[i] = markSourceTrusted(pos[i])
+	}
+	return pos
 }
 
 // outerSpan переводит непустой диапазон [start, end) вложенного скрипта во внешний текст по карте pos:
@@ -1369,7 +1428,8 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool, so
 	ws := make([]word, len(args))
 	for i, arg := range args {
 		ws[i].offset = -1
-		ws[i].literal = literals[i]
+		ws[i].literal = whitelistWord(arg, src) && trustedSourceSpan(int(arg.Pos().Offset()), int(arg.End().Offset()), sourceMap)
+		ws[i].singleQuoted = singleQuotedWord(arg)
 		if scripts {
 			var err error
 			ws[i].script, ws[i].pos, err = wordScript(arg, src, literals[i])
@@ -1395,6 +1455,8 @@ func inheritSourceExpansion(pos, sourceMap []int) []int {
 	for i, offset := range pos {
 		if offset < 0 || offset >= len(sourceMap) || sourceMap[offset] == -1 {
 			pos[i] = -1
+		} else if sourceIsTrusted(sourceMap[offset]) {
+			pos[i] = markSourceTrusted(offset)
 		} else if sourceExpanded(sourceMap[offset]) {
 			pos[i] = markSourceExpanded(offset)
 		}
@@ -1925,11 +1987,88 @@ func wordValue(w *syntax.Word) (string, bool) {
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
 		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source,
-		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1}
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, contextTrusted: c.contextTrusted}
 }
 
 func (c cmd) via(more ...string) []string {
 	return append(slices.Clone(c.call.Via), more...)
+}
+
+func whitelistWord(w *syntax.Word, src string) bool {
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			start, end := int(p.Pos().Offset()), int(p.End().Offset())
+			if !validSpan(src, start, end) || unsafeUnquoted(src[start:end]) {
+				return false
+			}
+		case *syntax.SglQuoted:
+			if p.Dollar {
+				return false
+			}
+		case *syntax.DblQuoted:
+			if p.Dollar {
+				return false
+			}
+			for _, inner := range p.Parts {
+				lit, ok := inner.(*syntax.Lit)
+				if !ok {
+					return false
+				}
+				start, end := int(lit.Pos().Offset()), int(lit.End().Offset())
+				if !validSpan(src, start, end) || strings.Contains(src[start:end], "\\") {
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func unsafeUnquoted(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if strings.ContainsRune("{}~*?[]\\$`", rune(s[i])) {
+			return true
+		}
+	}
+	return false
+}
+
+func singleQuotedWord(w *syntax.Word) bool {
+	return len(w.Parts) == 1 && func() bool { p, ok := w.Parts[0].(*syntax.SglQuoted); return ok && !p.Dollar }()
+}
+
+func trustedSourceSpan(start, end int, sourceMap []int) bool {
+	if len(sourceMap) == 0 {
+		return true
+	}
+	if start < 0 || end > len(sourceMap) || start >= end {
+		return false
+	}
+	for _, pos := range sourceMap[start:end] {
+		if !sourceIsTrusted(pos) {
+			return false
+		}
+	}
+	return true
+}
+
+func sourceContextTrusted(sourceMap []int) bool {
+	if len(sourceMap) == 0 {
+		return true
+	}
+	for _, pos := range sourceMap {
+		if !sourceIsTrusted(pos) {
+			return false
+		}
+	}
+	return true
 }
 
 // emit записывает вызовы точного разбора и совместимого с прежней версией обхода.
@@ -1938,11 +2077,17 @@ func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *call
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: command expansion depth exceeds %d", maxNestedScripts)}
 	}
 	c.call.literalMask = 0
+	for _, via := range c.call.Via {
+		if via == "xargs" || strings.HasPrefix(via, "find") || via == "parallel" {
+			goto appendCall
+		}
+	}
 	for i := 0; i < len(c.call.Args) && i < 32; i++ {
 		if i+1 < len(c.words) && c.words[i+1].literal {
 			c.call.literalMask |= uint32(1) << uint(i)
 		}
 	}
+appendCall:
 	appendCall(seen, calls, c.call)
 
 	if err := emitExpanded(c, lineBase, vars, calls, seen); err != nil {
@@ -2422,6 +2567,9 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 		operand, command, _ := shellArgs(args)
 		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
 			script := c.words[operand+1]
+			if (name == "bash" || name == "sh") && c.contextTrusted && script.literal && script.singleQuoted {
+				script.pos = markTrustedPositions(script.pos)
+			}
 			first := len(*calls)
 			err := parseNestedWithBudget(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
 			relocateNestedLines(c, first, calls)
@@ -3194,6 +3342,19 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 	}
 	c.budget.expansionUsed += len(script.text)
 	viaName := c.call.Name
+	if viaName == "eval" && c.contextTrusted {
+		args := evalScriptArgs(c.call.Args)
+		allQuoted := len(args) > 0
+		for _, arg := range args {
+			if arg.index+1 >= len(c.words) || !c.words[arg.index+1].literal || !c.words[arg.index+1].singleQuoted {
+				allQuoted = false
+				break
+			}
+		}
+		if allQuoted {
+			script = trustMapped(script)
+		}
+	}
 	first := len(*calls)
 	err := parseNestedWithBudget(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
 	relocateNestedLines(c, first, calls)

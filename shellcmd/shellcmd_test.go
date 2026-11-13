@@ -2794,8 +2794,8 @@ func TestCallLiteralArguments(t *testing.T) {
 		{"unquoted heredoc", "bash <<EOF\nkill \\$PPID\nEOF", []string{"$PPID"}, []bool{false}, `kill \$PPID`},
 		{"quoted heredoc expansion", "bash <<'EOF'\nkill $PPID\nEOF", []string{"$PPID"}, []bool{false}, ""},
 		{"unquoted heredoc expansion", "bash <<EOF\nkill $PPID\nEOF", []string{"$PPID"}, []bool{false}, ""},
-		{"here string", `bash <<< "kill '\$PPID'"`, []string{"$PPID"}, []bool{true}, ""},
-		{"ssh nested script", `ssh host 'kill \$PPID'`, []string{"$PPID"}, []bool{true}, ""},
+		{"here string", `bash <<< "kill '\$PPID'"`, []string{"$PPID"}, []bool{false}, ""},
+		{"ssh nested script", `ssh host 'kill \$PPID'`, []string{"$PPID"}, []bool{false}, ""},
 		{"outer expansion in bash script", `bash -c "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
 		{"outer expansion in eval", `eval "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
 		{"outer expansion in ssh", `ssh host "kill '` + parentPID + `'"`, []string{"$PPID"}, []bool{false}, ""},
@@ -2808,7 +2808,7 @@ func TestCallLiteralArguments(t *testing.T) {
 		{"quoted tilde", `kill '~'`, []string{"~"}, []bool{true}, ""},
 		{"quoted glob", `kill '/etc/passw*'`, []string{"/etc/passw*"}, []bool{true}, ""},
 		{"quoted braces", `kill '{a,b}'`, []string{"{a,b}"}, []bool{true}, ""},
-		{"ANSI-C no escape", `kill $'abc'`, []string{"abc"}, []bool{true}, ""},
+		{"ANSI-C no escape", `kill $'abc'`, []string{"abc"}, []bool{false}, ""},
 		{"ANSI-C decoded escape", `kill $'a\nb'`, []string{`a\nb`}, []bool{false}, ""},
 	}
 	for _, tt := range tests {
@@ -2830,6 +2830,67 @@ func TestCallLiteralArguments(t *testing.T) {
 			}
 			if tt.raw != "" && calls[0].Raw != tt.raw {
 				t.Fatalf("Raw = %q, want original source %q", calls[0].Raw, tt.raw)
+			}
+		})
+	}
+}
+
+func TestCallLiteralWhitelist(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want bool
+	}{
+		{"top bare", `kill 1`, true},
+		{"top single", `echo 'a b'`, true},
+		{"top double", `echo "abc"`, true},
+		{"top quoted dollar", `echo '$PPID'`, true},
+		{"top escaped dollar", `echo \$PPID`, true},
+		{"brace split dollar", `kill {$,x}PPID`, false},
+		{"brace split quote dollar", `kill {'a',$}PPID`, false},
+		{"brace split nested shell", `bash -c 'kill {"a",$}PPID'`, false},
+		{"brace split quotes", `kill a{b,"c"}`, false},
+		{"brace range split", `kill {'1'..3}`, false},
+		{"brace range split middle", `kill {1'..'3}`, false},
+		{"quoted brace literal", `kill '{a,b}'`, true},
+		{"localized quote", `kill $"abc"`, false},
+		{"raw cat heredoc", "cat <<EOF | bash\nkill '$PPID'\nEOF\n", false},
+		{"raw cat heredoc substitution", "cat <<EOF | bash\nkill '$(echo 1)'\nEOF\n", false},
+		{"raw cat escaped dollar", "cat <<EOF | bash\nkill '\\$PPID'\nEOF\n", false},
+		{"wrapped xargs", `echo $PPID | xargs -I{} kill {}`, false},
+		{"wrapped xargs short", `xargs -i kill {}`, false},
+		{"wrapped xargs percent", `xargs -I % kill %`, false},
+		{"wrapped find exec", `find . -exec kill {} \;`, false},
+		{"wrapped find execdir", `find . -execdir kill {} \;`, false},
+		{"wrapped find ok", `find . -ok kill {} \;`, false},
+		{"wrapped find okdir", `find . -okdir kill {} \;`, false},
+		{"wrapped parallel", `parallel kill ::: 1`, false},
+		{"nested single shell", `bash -c 'echo hi'`, true},
+		{"nested double shell", `bash -c "echo hi"`, false},
+		{"heredoc quoted shell", "bash <<'E'\necho hi\nE\n", true},
+		{"heredoc unquoted shell", "bash <<E\necho hi\nE\n", false},
+		{"quoted heredoc recursive", "bash <<'E'\nbash <<'IN'\necho hi\nIN\nE\n", true},
+		{"unquoted heredoc recursive", "bash <<E\nbash <<'IN'\necho hi\nIN\nE\n", false},
+		{"nested quoted heredoc via double", "bash -c \"bash <<'E'\necho '$PPID'\nE\"", false},
+		{"eval single", `eval 'echo hi'`, true},
+		{"eval single args", `eval 'echo' 'hi'`, true},
+		{"eval double", `eval "echo hi"`, false},
+		{"ssh single", `ssh h 'echo hi'`, false},
+		{"here string", `bash <<< 'echo hi'`, false},
+		{"tmux source", `tmux new-window 'echo hi'`, false},
+		{"watch source", `watch 'echo hi'`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill", "echo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) == 0 {
+				t.Fatalf("no target call in %q", tt.src)
+			}
+			if got := calls[len(calls)-1].ArgLiteral(0); got != tt.want {
+				t.Fatalf("ArgLiteral(0) = %v, want %v; calls=%+v", got, tt.want, calls)
 			}
 		})
 	}
