@@ -2454,70 +2454,126 @@ func TestFourLargeNestedHeredocScriptsFitBudget(t *testing.T) {
 	t.Fatalf("nested script calls missing: %d calls", len(calls))
 }
 
-func TestCommentBackslashContinuation(t *testing.T) {
+func TestCommentContinuationCallsMatchBash(t *testing.T) {
 	tests := []struct {
-		name, src    string
-		line, offset int
-		raw          string
-		args         []string
+		name, src string
+		want      Call
 	}{
-		{"top level", "echo x #\\\nkill 1", 2, 10, "kill 1", []string{"1"}},
-		{"bash c", "bash -c 'echo x #\\\nkill 1'", 2, 19, "kill 1", []string{"1"}},
-		{"shell heredoc", "bash <<'E'\necho x #\\\nkill 1\nE\n", 3, 21, "kill 1", []string{"1"}},
-		{"eval", "eval 'echo x #\\\nkill 1'", 2, 16, "kill 1", []string{"1"}},
-		{"initial comment", "# c \\\nkill 1", 2, 6, "kill 1", []string{"1"}},
+		{"top level", "echo x #\\\nkill 1", Call{Name: "kill", Args: []string{"1"}, Raw: "kill 1", Line: 2, Offset: 10}},
+		{"bash command string", "bash -c 'echo x #\\\nkill 1'", Call{Name: "kill", Args: []string{"1"}, Raw: "kill 1", Line: 2, Via: []string{"bash", "-c"}, Offset: 19}},
+		{"quoted shell input", "bash <<'E'\necho x #\\\nkill 1\nE\n", Call{Name: "kill", Args: []string{"1"}, Raw: "kill 1", Line: 3, Via: []string{"bash"}, Offset: 21}},
+		{"eval string", "eval 'echo x #\\\nkill 1'", Call{Name: "kill", Args: []string{"1"}, Raw: "kill 1", Line: 2, Via: []string{"eval"}, Offset: 16}},
+		{"initial comment", `# c \
+kill 1`, Call{Name: "kill", Args: []string{"1"}, Raw: "kill 1", Line: 2, Offset: 6}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			calls, err := Find(tt.src, "kill")
+			calls, err := Find(tt.src, tt.want.Name)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(calls) != 1 {
-				t.Fatalf("Find = %+v, want one kill", calls)
-			}
-			c := calls[0]
-			if c.Line != tt.line || c.Offset != tt.offset || c.Raw != tt.raw || !reflect.DeepEqual(c.Args, tt.args) {
-				t.Errorf("call = %+v", c)
+			if len(calls) != 1 || calls[0].Name != tt.want.Name || !reflect.DeepEqual(calls[0].Args, tt.want.Args) || calls[0].Raw != tt.want.Raw || calls[0].Line != tt.want.Line || calls[0].Offset != tt.want.Offset || !reflect.DeepEqual(calls[0].Via, tt.want.Via) {
+				t.Fatalf("Find = %+v, want %+v", calls, tt.want)
 			}
 		})
 	}
 }
 
-func TestCommentMarkerAndQuotedBackslash(t *testing.T) {
-	for _, tt := range []struct {
+func TestCommentMarkerAndQuotedContinuation(t *testing.T) {
+	tests := []struct {
 		name, src string
-		args      []string
-	}{{"hash within word", "echo a#\\\nb", []string{"a#b"}}, {"quoted hash", "echo '#\\\n'", []string{"#\\\n"}}} {
+		want      []string
+	}{
+		{"hash inside word", "echo a#\\\nb", []string{"a#b"}},
+		{"quoted hash and slash", "echo '#\\\n'", []string{"#\\\n"}},
+	}
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			calls, err := Find(tt.src, "echo")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, tt.args) {
-				t.Fatalf("Find = %+v, want Args %q", calls, tt.args)
+			if len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, tt.want) {
+				t.Fatalf("Find = %+v, want Args %q", calls, tt.want)
 			}
 		})
 	}
 }
 
-func TestUnquotedHeredocContinuationIsExpanded(t *testing.T) {
-	calls, err := Find("bash <<E\necho x #\\\nkill 1\nE\n", "kill")
-	if err != nil {
-		t.Fatal(err)
+func TestCommentContinuationParserContexts(t *testing.T) {
+	tests := []struct {
+		name, src string
+		wantZK    int
+	}{
+		{"parameter expansion comment marker", "zz ${x:- #}\\\nzk 1", 0},
+		{"command substitution word", "zz $(true)#\\\nzk 1", 0},
+		{"failed correction keeps original parse", "! #\\\nzk 1", 1},
+		{"comment after prior continuation", "zz a \\\n#c \\\nzk 1", 1},
+		{"heredoc apostrophe before comment", "zc <<E\nit's\nE\nzz x # c \\\nzk 1", 1},
+		{"ANSI quoted word before comment", `zz $'\'' # c \
+zk 1`, 1},
 	}
-	if len(calls) != 0 {
-		t.Fatalf("Find = %+v, want no kill after heredoc backslash-newline expansion", calls)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "zk")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != tt.wantZK {
+				t.Fatalf("Find(zk) = %+v, want %d calls", calls, tt.wantZK)
+			}
+		})
 	}
+
+	t.Run("unquoted shell heredoc expands before script parsing", func(t *testing.T) {
+		src := "bash <<E\necho x #\\\nkill 1\nE\n"
+		calls, err := Find(src, "kill")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("Find(kill) = %+v, want no kill after heredoc expansion", calls)
+		}
+	})
+
+	t.Run("nested command substitution comment", func(t *testing.T) {
+		src := `zz "$(zz y # c \
+zk 1)"`
+		calls, err := Find(src, "zk")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 1 || calls[0].Args[0] != "1" {
+			t.Fatalf("Find(zk) = %+v, want one nested call with Args [1]", calls)
+		}
+	})
+
+	t.Run("backquote comments keep line continuation", func(t *testing.T) {
+		for _, src := range []string{
+			"zz `# c \\\nzk 1`",
+			"zz \"`# c \\\nzk 1`\"",
+			"zz `zz y # c \\\nzk 1`",
+		} {
+			calls, err := Find(src, "zk")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != 0 {
+				t.Fatalf("Find(%q) = %+v, want no zk in backquotes", src, calls)
+			}
+		}
+	})
 }
 
 func TestCommentMarkerInsideHeredocData(t *testing.T) {
-	calls, err := Calls("cat <<E\n# c \\\nE\n")
+	src := "zc <<E\n# c \\\nE\nit's\nE\n"
+	calls, err := Calls(src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 1 || len(calls[0].Redirs) != 1 || calls[0].Redirs[0].Body != "# c \\\n" {
-		t.Fatalf("Calls = %+v, want heredoc body unchanged", calls)
+	wantBody := "# c \\\nE\nit's\n"
+	if len(calls) != 1 || len(calls[0].Redirs) != 1 || calls[0].Redirs[0].Body != wantBody {
+		t.Fatalf("Calls = %+v, want heredoc body %q", calls, wantBody)
 	}
 }
 

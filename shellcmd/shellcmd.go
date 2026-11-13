@@ -258,14 +258,14 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
-	file, full, err := budget.parseShell(src)
+	file, full, ignored, err := budget.parseShell(src)
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
-	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, budget)
+	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, budget)
 }
 
-func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, budget *nestedParseBudget) error {
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
@@ -274,7 +274,7 @@ func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inher
 	if len(full) > len(src) {
 		walkText = full
 	}
-	err := walkCalls(file, walkText, lineBase, inherited, vars, calls, budget)
+	err := walkCalls(file, walkText, lineBase, inherited, vars, calls, ignored, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -306,130 +306,154 @@ func trimAppended(calls []Call, src string) []Call {
 
 // parseShell разбирает текст как bash. Незакрытый heredoc bash дочитывает до конца текста с предупреждением,
 // а разбор считает ошибкой — тогда ограничитель дописывается в конец; full — разобранный текст.
-func (b *nestedParseBudget) parseShell(src string) (*syntax.File, string, error) {
+func (b *nestedParseBudget) parseShell(src string) (*syntax.File, string, [][2]int, error) {
 	if b.trackWork {
 		if b.parsedShells == nil {
 			b.parsedShells = make(map[string]int)
 		}
 		b.parsedShells[src]++
 	}
-	return parseShell(src)
+	return parseShellWithMetadata(src)
 }
 
-func endCommentBackslashes(src string) string {
-	if !hasCommentContinuationCandidate(src) {
-		return src
-	}
-	data := []byte(src)
-	quote := byte(0)
-	escaped := false
-	wordStart := true
-	for i := 0; i < len(data); i++ {
-		c := data[i]
-		if quote != 0 {
-			if quote == '\'' && c == '\'' {
-				quote = 0
-				wordStart = false
-				continue
-			}
-			if quote == '\'' {
-				continue
-			}
-			if escaped {
-				escaped = false
-				continue
-			}
-			if c == '\\' {
-				escaped = true
-				continue
-			}
-			if c == quote {
-				quote = 0
-				wordStart = false
-			}
-			continue
-		}
-		if escaped {
-			escaped = false
-			wordStart = false
-			continue
-		}
-		if c == '\\' {
-			escaped = true
-			wordStart = false
-			continue
-		}
-		if c == '\'' || c == '"' {
-			quote = c
-			wordStart = false
-			continue
-		}
-		if c == '#' && wordStart {
-			i = neutralizeCommentEnd(data, i) - 1
-			wordStart = true
-			continue
-		}
-		switch c {
-		case ' ', '\t', '\n', ';', '|', '&', '(', ')', '<', '>':
-			wordStart = true
-		default:
-			wordStart = false
-		}
-	}
-	return string(data)
+type commentNodes struct {
+	comments   []*syntax.Comment
+	backquotes [][2]int
 }
 
-func hasCommentContinuationCandidate(src string) bool {
-	for start := 0; start < len(src); {
-		end := strings.IndexByte(src[start:], '\n')
-		if end < 0 {
-			return false
+func collectCommentNodes(file *syntax.File) commentNodes {
+	var nodes commentNodes
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch node := node.(type) {
+		case *syntax.Comment:
+			nodes.comments = append(nodes.comments, node)
+		case *syntax.CmdSubst:
+			if node.Backquotes {
+				nodes.backquotes = append(nodes.backquotes, [2]int{int(node.Pos().Offset()), int(node.End().Offset())})
+			}
 		}
-		end += start
-		last := end - 1
-		if last >= start && src[last] == '\r' {
+		return true
+	})
+	return nodes
+}
+
+func continuedCommentLine(src string, start, end int) (slash, continuedAt, commentEnd int) {
+	slash, continuedAt = -1, -1
+	end = min(end, len(src))
+	commentEnd = end
+	for newline := start + 1; newline < end; newline++ {
+		if src[newline] != '\n' {
+			continue
+		}
+		last := newline - 1
+		for last >= start && src[last] == '\\' {
 			last--
 		}
-		if last >= start && src[last] == '\\' && strings.Contains(src[start:last], "#") {
-			count := 1
-			for j := last - 1; j >= start && src[j] == '\\'; j-- {
-				count++
+		if (newline-1-last)%2 == 1 {
+			if slash < 0 {
+				slash, continuedAt = newline-1, newline+1
 			}
-			if count%2 == 1 {
-				return true
-			}
+			continue
 		}
-		start = end + 1
+		commentEnd = newline + 1
+		break
 	}
-	return false
+	return slash, continuedAt, commentEnd
 }
 
-func neutralizeCommentEnd(data []byte, start int) int {
-	end := start
-	for end < len(data) && data[end] != '\n' {
-		end++
-	}
-	last := end - 1
-	if last >= start && data[last] == '\r' {
-		last--
-	}
-	if last >= start && data[last] == '\\' {
-		count := 1
-		for j := last - 1; j >= start && data[j] == '\\'; j-- {
-			count++
+func commentContinuations(file *syntax.File, src string) []int {
+	nodes := collectCommentNodes(file)
+	var offsets []int
+	for _, comment := range nodes.comments {
+		start, end := int(comment.Pos().Offset()), int(comment.End().Offset())
+		if start < 0 || start >= len(src) {
+			continue
 		}
-		if count%2 == 1 {
-			data[last] = ' '
+		inBackquote := false
+		for _, span := range nodes.backquotes {
+			if start >= span[0] && start < span[1] {
+				inBackquote = true
+				break
+			}
+		}
+		if inBackquote {
+			continue
+		}
+		if slash, _, _ := continuedCommentLine(src, start, end); slash >= 0 {
+			offsets = append(offsets, slash)
 		}
 	}
-	return end
+	return offsets
 }
 
-func parseShell(src string) (file *syntax.File, full string, err error) {
-	src = endCommentBackslashes(src)
+func backquoteCommentCommands(file *syntax.File, src string) [][2]int {
+	nodes := collectCommentNodes(file)
+	var ignored [][2]int
+	for _, comment := range nodes.comments {
+		start := int(comment.Pos().Offset())
+		if start < 0 || start >= len(src) {
+			continue
+		}
+		for _, quote := range nodes.backquotes {
+			if start < quote[0] || start >= quote[1] {
+				continue
+			}
+			_, continuedAt, end := continuedCommentLine(src, start, quote[1])
+			if continuedAt >= 0 && continuedAt < end {
+				ignored = append(ignored, [2]int{continuedAt, end})
+			}
+			break
+		}
+	}
+	return ignored
+}
+func parseShell(src string) (*syntax.File, string, error) {
+	file, full, _, err := parseShellWithMetadata(src)
+	return file, full, err
+}
+
+func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) {
+	if !strings.Contains(src, "\\\n") || !strings.Contains(src, "#") {
+		file, full, err := parseShellVariant(src, false)
+		return file, full, nil, err
+	}
+	originalFile, originalFull, originalErr := parseShellVariant(src, false)
+	working := src
+	for range strings.Count(src, "\\\n") + 1 {
+		file, parsedFull, err := parseShellVariant(working, true)
+		if err != nil {
+			return originalFile, originalFull, nil, originalErr
+		}
+		offsets := commentContinuations(file, working)
+		if len(offsets) == 0 {
+			if working == src {
+				return file, parsedFull, backquoteCommentCommands(file, working), nil
+			}
+			fixedFile, fixedFull, fixedErr := parseShellVariant(working, true)
+			if fixedErr != nil {
+				return originalFile, originalFull, nil, originalErr
+			}
+			return fixedFile, fixedFull, backquoteCommentCommands(fixedFile, working), nil
+		}
+		data := []byte(working)
+		for _, offset := range offsets {
+			if offset >= 0 && offset < len(data) {
+				data[offset] = ' '
+			}
+		}
+		working = string(data)
+	}
+	return originalFile, originalFull, nil, originalErr
+}
+
+func parseShellVariant(src string, keepComments bool) (file *syntax.File, full string, err error) {
 	full = src
 	for range 8 {
-		file, err = syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(full), "")
+		options := []syntax.ParserOption{syntax.Variant(syntax.LangBash)}
+		if keepComments {
+			options = append(options, syntax.KeepComments(true))
+		}
+		file, err = syntax.NewParser(options...).Parse(strings.NewReader(full), "")
 		var pe syntax.ParseError
 		if !errors.As(err, &pe) {
 			return file, full, err
@@ -438,8 +462,7 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 		if !ok {
 			return nil, full, err
 		}
-		if trailing := len(full) - len(strings.TrimRight(full, `\`)); trailing%2 == 1 {
-			// `\` в конце продолжил бы строку дописанным ограничителем.
+		if trailing := len(full) - len(strings.TrimRight(full, `\\`)); trailing%2 == 1 {
 			full += "\n"
 		}
 		full += "\n" + strings.TrimSuffix(delim, "`") + "\n"
@@ -447,11 +470,11 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 	return nil, full, err
 }
 
-func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
 
-	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
+	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info, ignoredCalls: ignored}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -1223,16 +1246,17 @@ func shellInputNextTargetWithScan(name string, args []string, argOffset int, sca
 }
 
 type callWalker struct {
-	src        string
-	lineBase   int
-	inherited  []string
-	vars       map[string]string
-	calls      *[]Call
-	info       walkInfo
-	seen       *callSet
-	budget     *nestedParseBudget
-	parseErr   error
-	nestedErrs []error
+	src          string
+	lineBase     int
+	inherited    []string
+	vars         map[string]string
+	calls        *[]Call
+	info         walkInfo
+	seen         *callSet
+	budget       *nestedParseBudget
+	ignoredCalls [][2]int
+	parseErr     error
+	nestedErrs   []error
 }
 
 func (w *callWalker) visit(node syntax.Node) bool {
@@ -1257,6 +1281,12 @@ func (w *callWalker) visit(node syntax.Node) bool {
 		w.visitStmt(stmt)
 	}
 	if call, ok := node.(*syntax.CallExpr); ok {
+		start := int(call.Pos().Offset())
+		for _, span := range w.ignoredCalls {
+			if start >= span[0] && start < span[1] {
+				return false
+			}
+		}
 		w.visitCall(call)
 		if w.parseErr != nil {
 			return false
@@ -2023,10 +2053,10 @@ func parseNested(src string, pos []int, lineBase int, via []string, inLoop, inBa
 }
 
 func parseNestedWithBudget(src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
-	return parseNestedFileWithBudget(nil, "", src, pos, lineBase, via, inLoop, inBackground, vars, calls, budget)
+	return parseNestedFileWithBudget(nil, "", src, pos, lineBase, via, inLoop, inBackground, vars, calls, nil, budget)
 }
 
-func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, ignored [][2]int, budget *nestedParseBudget) error {
 	if budget.depth >= maxNestedScripts {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script depth exceeds %d", maxNestedScripts)}
 	}
@@ -2046,7 +2076,7 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	if file == nil {
 		err = parseWithBudget(src, lineBase, via, nestedVars, &nestedCalls, budget)
 	} else {
-		err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, budget)
+		err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, ignored, budget)
 	}
 	if err != nil {
 		var nestedErr *NestedError
@@ -3126,12 +3156,12 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 		remote.pos = append(remote.pos, w.pos...)
 	}
 	remoteText := remote.String()
-	file, full, parseErr := c.budget.parseShell(remoteText)
+	file, full, ignored, parseErr := c.budget.parseShell(remoteText)
 	if parseErr != nil {
 		return &NestedError{Script: remoteText, Err: fmt.Errorf("shellcmd: parse shell: %w", parseErr)}
 	}
 	first := len(*calls)
-	if err := parseNestedFileWithBudget(file, full, remoteText, remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
+	if err := parseNestedFileWithBudget(file, full, remoteText, remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, ignored, c.budget); err != nil {
 		return err
 	}
 	relocateNestedLines(c, first, calls)
