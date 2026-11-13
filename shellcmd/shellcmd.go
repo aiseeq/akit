@@ -4,6 +4,7 @@ package shellcmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 
@@ -39,10 +40,12 @@ type Call struct {
 
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
 type cmd struct {
-	call   Call
-	words  []word
-	budget *nestedParseBudget
-	source string
+	call          Call
+	words         []word
+	budget        *nestedParseBudget
+	source        string
+	syntaxRedirs  []*syntax.Redirect
+	stdinConsumed bool
 }
 
 // word — место слова в исходной команде и его текст как скрипта.
@@ -108,6 +111,7 @@ type nestedParseBudget struct {
 	visitedNodes  int
 	walkInfoNodes int
 	trackWork     bool
+	parsedShells  map[string]int
 }
 
 func newNestedParseBudget(inputSize int) *nestedParseBudget {
@@ -123,7 +127,7 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
-	file, full, err := parseShell(src)
+	file, full, err := budget.parseShell(src)
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
@@ -167,6 +171,16 @@ func trimAppended(calls []Call, src string) []Call {
 
 // parseShell разбирает текст как bash. Незакрытый heredoc bash дочитывает до конца текста с предупреждением,
 // а разбор считает ошибкой — тогда ограничитель дописывается в конец; full — разобранный текст.
+func (b *nestedParseBudget) parseShell(src string) (*syntax.File, string, error) {
+	if b.trackWork {
+		if b.parsedShells == nil {
+			b.parsedShells = make(map[string]int)
+		}
+		b.parsedShells[src]++
+	}
+	return parseShell(src)
+}
+
 func parseShell(src string) (file *syntax.File, full string, err error) {
 	full = src
 	for range 8 {
@@ -230,6 +244,7 @@ type heredocShellInput struct {
 type walkInfo struct {
 	timedCalls      map[*syntax.CallExpr]bool
 	redirs          map[*syntax.CallExpr][]Redir
+	syntaxRedirs    map[*syntax.CallExpr][]*syntax.Redirect
 	loopCalls       map[*syntax.CallExpr]bool
 	backgroundCalls map[*syntax.CallExpr]bool
 	shellInputs     []heredocShellInput
@@ -250,6 +265,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		trackWork:       budget.trackWork,
 		timedCalls:      make(map[*syntax.CallExpr]bool),
 		redirs:          make(map[*syntax.CallExpr][]Redir),
+		syntaxRedirs:    make(map[*syntax.CallExpr][]*syntax.Redirect),
 		loopCalls:       make(map[*syntax.CallExpr]bool),
 		backgroundCalls: make(map[*syntax.CallExpr]bool),
 		shellHdocs:      make(map[*syntax.Redirect]bool),
@@ -648,6 +664,7 @@ func (w *callWalker) addTime(clause *syntax.TimeClause) {
 func (w *callWalker) visitStmt(stmt *syntax.Stmt) {
 	if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(stmt.Redirs) > 0 {
 		w.info.redirs[call] = stmtRedirs(stmt.Redirs, w.src)
+		w.info.syntaxRedirs[call] = stmt.Redirs
 	}
 }
 
@@ -681,7 +698,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		return
 	}
 	ws := splitWords(words, split)
-	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src}
+	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, syntaxRedirs: w.info.syntaxRedirs[call]}
 	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
 		if errors.As(err, &nested) {
@@ -870,7 +887,7 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false, nil
 	}
-	hasHeredoc := hasScriptInputRedir(stmt.Redirs)
+	hasHeredoc := stdinScriptRedir(stmt.Redirs) != nil
 	if first, literal := wordValue(call.Args[0]); literal {
 		name := commandName(first)
 		if !isShell(name) && !wrappers[name] {
@@ -904,15 +921,6 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	return target, shellVia, target != "", err
 }
 
-func hasScriptInputRedir(redirs []*syntax.Redirect) bool {
-	for _, redir := range redirs {
-		if redir.Hdoc != nil || redir.Op.String() == "<<<" {
-			return true
-		}
-	}
-	return false
-}
-
 func resolveShellInput(name string, args []string, redirs []*syntax.Redirect, hasHeredoc bool) (string, []string, error) {
 	var via []string
 	for {
@@ -942,6 +950,19 @@ func sshExecutionDisablesStdin(args []string, host, command int) bool {
 	for _, span := range [][2]int{{0, host}, {host + 1, end}} {
 		for i := span[0]; i < span[1]; i++ {
 			arg := args[i]
+			if arg == "-o" {
+				if i+1 < span[1] && sshConfigDisablesStdin(args[i+1]) {
+					return true
+				}
+				i++
+				continue
+			}
+			if strings.HasPrefix(arg, "-o") && len(arg) > 2 {
+				if sshConfigDisablesStdin(arg[2:]) {
+					return true
+				}
+				continue
+			}
 			if arg == "-N" || arg == "-n" || arg == "-f" || arg == "-s" || arg == "-O" || strings.HasPrefix(arg, "-O") || strings.HasPrefix(arg, "-W") {
 				return true
 			}
@@ -957,8 +978,33 @@ func sshExecutionDisablesStdin(args []string, host, command int) bool {
 	return false
 }
 
+func sshConfigDisablesStdin(option string) bool {
+	fields := strings.Fields(option)
+	if len(fields) == 0 {
+		return false
+	}
+	key, value, hasValue := strings.Cut(fields[0], "=")
+	if hasValue {
+		fields = append([]string{key, value}, fields[1:]...)
+	} else if len(fields) > 1 {
+		key, value = fields[0], fields[1]
+	} else {
+		return false
+	}
+	key, value = strings.ToLower(key), strings.ToLower(value)
+	switch key {
+	case "stdinnull":
+		return value == "yes"
+	case "forkafterauthentication":
+		return value == "yes"
+	case "sessiontype":
+		return value == "none" || value == "subsystem"
+	}
+	return false
+}
+
 func shellInputForShell(name string, args []string, redirs []*syntax.Redirect, hasHeredoc bool, via []string) (string, []string, bool) {
-	if !hasScriptInputRedir(redirs) && !hasHeredoc {
+	if stdinScriptRedir(redirs) == nil && !hasHeredoc {
 		return "", nil, false
 	}
 	if shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args) {
@@ -1635,7 +1681,8 @@ func wordValue(w *syntax.Word) (string, bool) {
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source}
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source, syntaxRedirs: c.syntaxRedirs,
+		stdinConsumed: c.stdinConsumed || c.call.Name == "xargs" && !hasOption("xargs", c.call.Args, "-o")}
 }
 
 func (c cmd) via(more ...string) []string {
@@ -2098,7 +2145,8 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 	}
 	child := cmd{call: Call{Name: commandName(parallelArgs[start]), Args: args, Raw: c.call.Raw, Line: c.call.Line,
 		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
-		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source}
+		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
+		syntaxRedirs: c.syntaxRedirs, stdinConsumed: c.stdinConsumed}
 	return child, true
 }
 
@@ -2149,8 +2197,10 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 	}
 	stdinDisabled := sshExecutionDisablesStdin(args, host, start)
 	if !ok {
-		if callHasScriptInput(c.call) && !stdinDisabled {
-			return expandSSHStdin(c, nil, lineBase, vars, calls)
+		if !c.stdinConsumed && !stdinDisabled {
+			if input := stdinScriptRedir(c.syntaxRedirs); input != nil {
+				return expandSSHStdin(c, nil, input, lineBase, vars, calls)
+			}
 		}
 		return nil
 	}
@@ -2166,7 +2216,7 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 		remote.pos = append(remote.pos, w.pos...)
 	}
 	remoteText := remote.String()
-	file, full, parseErr := parseShell(remoteText)
+	file, full, parseErr := c.budget.parseShell(remoteText)
 	if parseErr != nil {
 		return &NestedError{Script: remoteText, Err: fmt.Errorf("shellcmd: parse shell: %w", parseErr)}
 	}
@@ -2175,70 +2225,276 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 		return err
 	}
 	relocateNestedLines(c, first, calls)
-	if stdinDisabled || !callHasScriptInput(c.call) {
+	if c.stdinConsumed || stdinDisabled {
 		return nil
 	}
-	for _, call := range (*calls)[first:] {
-		if isShell(call.Name) && shellReadsHeredoc(call.Args) && !callRedirectsStdin(call.Redirs) && !sshPipelineReader(file, remoteText, remote.pos, call.Offset) {
-			candidate := call
-			return expandSSHStdin(c, &candidate, lineBase, vars, calls)
+	if input := stdinScriptRedir(c.syntaxRedirs); input != nil {
+		for _, call := range (*calls)[first:] {
+			if isShell(call.Name) && shellReadsHeredoc(call.Args) && remoteStdinIsSSH(file, remoteText, remote.pos, call.Offset) {
+				candidate := call
+				return expandSSHStdin(c, &candidate, input, lineBase, vars, calls)
+			}
 		}
 	}
 	return nil
 }
 
-func callRedirectsStdin(redirs []Redir) bool {
+func stdinScriptRedir(redirs []*syntax.Redirect) *syntax.Redirect {
+	var source *syntax.Redirect
 	for _, redir := range redirs {
-		if redir.N != "" && redir.N != "0" {
+		if redir.N != nil && redir.N.Value != "0" {
 			continue
 		}
-		switch redir.Op {
-		case "<", "<<", "<<-", "<<<", "<&", "<>":
-			return true
+		switch redir.Op.String() {
+		case "<<", "<<-", "<<<":
+			source = redir
+		case "<", "<>":
+			source = nil
+		case "<&":
+			if value, ok := wordValue(redir.Word); !ok || value != "0" {
+				source = nil
+			}
 		}
 	}
-	return false
+	return source
 }
 
-func callHasScriptInput(call Call) bool {
-	for _, redir := range call.Redirs {
-		if redir.Op == "<<" || redir.Op == "<<-" || redir.Op == "<<<" {
+func remoteStdinIsSSH(file *syntax.File, src string, pos []int, offset int) bool {
+	if !strings.ContainsAny(src, "<|") {
+		return true
+	}
+	inner := mappedOffset(offset, pos)
+	if inner < 0 {
+		return false
+	}
+	functionName, functionStart, functionEnd := enclosingFunction(file, inner)
+	if functionName != "" {
+		invoked, receivesSSHStdin := false, false
+		syntax.Walk(file, func(node syntax.Node) bool {
+			stmt, ok := node.(*syntax.Stmt)
+			if !ok {
+				return true
+			}
+			call, ok := stmt.Cmd.(*syntax.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			name, literal := wordValue(call.Args[0])
+			start := int(call.Args[0].Pos().Offset())
+			if !literal || commandName(name) != functionName || functionStart <= start && start < functionEnd {
+				return true
+			}
+			invoked = true
+			outer := outerOffset(start, pos)
+			if outer >= 0 && remoteStdinAt(file, src, pos, start, outer) {
+				receivesSSHStdin = true
+			}
+			return true
+		})
+		if invoked {
+			return receivesSSHStdin
+		}
+		return false
+	}
+	return remoteStdinAt(file, src, pos, inner, offset)
+}
+
+func enclosingFunction(file *syntax.File, offset int) (string, int, int) {
+	name := ""
+	var bodyStart, bodyEnd int
+	syntax.Walk(file, func(node syntax.Node) bool {
+		fn, ok := node.(*syntax.FuncDecl)
+		if !ok || fn.Name == nil || fn.Body == nil {
 			return true
 		}
-	}
-	return false
+		start, end := int(fn.Body.Pos().Offset()), int(fn.Body.End().Offset())
+		if start <= offset && offset < end {
+			name, bodyStart, bodyEnd = fn.Name.Value, start, end
+		}
+		return true
+	})
+	return name, bodyStart, bodyEnd
 }
 
-func expandSSHStdin(c cmd, candidate *Call, lineBase int, vars map[string]string, calls *[]Call) error {
+func remoteStdinAt(file *syntax.File, src string, pos []int, inner, outer int) bool {
+	if sshPipelineReader(file, src, pos, outer) {
+		return false
+	}
+	type contextRedirs struct {
+		size   int
+		redirs []*syntax.Redirect
+	}
+	var contexts []contextRedirs
+	syntax.Walk(file, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok || stmt.Cmd == nil {
+			return true
+		}
+		start, end := int(stmt.Cmd.Pos().Offset()), int(stmt.Cmd.End().Offset())
+		if start <= inner && inner < end {
+			contexts = append(contexts, contextRedirs{size: end - start, redirs: stmt.Redirs})
+		}
+		return true
+	})
+	slices.SortFunc(contexts, func(a, b contextRedirs) int { return b.size - a.size })
+	for _, context := range contexts {
+		for _, redir := range context.redirs {
+			if redir.N != nil && redir.N.Value != "0" {
+				continue
+			}
+			switch redir.Op.String() {
+			case "<", "<<", "<<-", "<<<", "<>":
+				return false
+			case "<&":
+				if value, ok := wordValue(redir.Word); !ok || value != "0" {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func mappedOffset(offset int, pos []int) int {
+	for i, outer := range pos {
+		if outer == offset {
+			return i
+		}
+	}
+	return -1
+}
+
+func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int, vars map[string]string, calls *[]Call) error {
 	via := c.via("ssh", "bash")
 	if candidate != nil {
 		via = append(slices.Clone(candidate.Via), candidate.Name)
 	}
-	for _, redir := range c.call.Redirs {
-		if redir.Op != "<<" && redir.Op != "<<-" && redir.Op != "<<<" {
-			continue
-		}
-		body := mapped{text: []byte(redir.Body)}
-		if redir.BodyStart >= 0 {
-			body.pos = make([]int, len(redir.Body))
-			for i := range body.pos {
-				body.pos[i] = redir.BodyStart + i
-			}
-		} else {
-			body.pos = make([]int, len(redir.Body))
-			for i := range body.pos {
-				body.pos[i] = -1
-			}
-		}
-		bodyLine := lineBase
-		if redir.BodyStart >= 0 && redir.BodyStart <= len(c.source) {
-			bodyLine = strings.Count(c.source[:redir.BodyStart], "\n")
-		}
-		if err := parseNestedWithBudget(body.String(), body.pos, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
-			return err
-		}
+	body, err := sshInputText(input, c.source, vars)
+	if err != nil {
+		return &NestedError{Script: nodeText(input.Hdoc, c.source), Err: err}
+	}
+	bodyLine := lineBase
+	if input.Hdoc != nil {
+		bodyLine = int(input.Hdoc.Pos().Line()) - 1
+	} else if input.Word != nil {
+		bodyLine = int(input.Word.Pos().Line()) - 1
+	}
+	if err := parseNestedWithBudget(body.String(), body.pos, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
+		return err
 	}
 	return nil
+}
+
+func sshInputText(input *syntax.Redirect, src string, vars map[string]string) (mapped, error) {
+	var raw string
+	var base int
+	var value string
+	var sourceWord *syntax.Word
+	if input.Hdoc != nil {
+		raw = heredocText(input, src)
+		base = int(input.Hdoc.Pos().Offset())
+		sourceWord = input.Hdoc
+		if quotedHeredoc(input.Word) {
+			return heredocScript(input, src), nil
+		}
+		expanded, err := expandDocument(input.Hdoc, vars)
+		if err != nil {
+			return mapped{}, err
+		}
+		value = expanded
+		if input.Op.String() == "<<-" {
+			value = stripHeredocTabs(value)
+		}
+	} else if input.Word != nil {
+		raw = nodeText(input.Word, src)
+		base = int(input.Word.Pos().Offset())
+		sourceWord = input.Word
+		expanded, err := expandDocument(input.Word, vars)
+		if err != nil {
+			return mapped{}, err
+		}
+		value = expanded + "\n"
+	} else {
+		return mapped{}, nil
+	}
+	return mapExpandedText(value, raw, base, sourceWord), nil
+}
+
+func expandDocument(word *syntax.Word, vars map[string]string) (string, error) {
+	pairs := make([]string, 0, len(vars)*2)
+	for name, value := range vars {
+		pairs = append(pairs, name+"="+value)
+	}
+	config := &shExpand.Config{
+		Env: shExpand.ListEnviron(pairs...),
+		CmdSubst: func(_ io.Writer, _ *syntax.CmdSubst) error {
+			return nil
+		},
+		ProcSubst: func(*syntax.ProcSubst) (string, error) { return "", nil },
+	}
+	return shExpand.Document(config, word)
+}
+
+func stripHeredocTabs(text string) string {
+	var out strings.Builder
+	for len(text) > 0 {
+		line, rest, found := strings.Cut(text, "\n")
+		out.WriteString(strings.TrimLeft(line, "\t"))
+		if found {
+			out.WriteByte('\n')
+			text = rest
+		} else {
+			break
+		}
+	}
+	return out.String()
+}
+
+func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
+	out := mapped{text: []byte(expanded), pos: make([]int, len(expanded))}
+	var omitted [][2]int
+	syntax.Walk(word, func(node syntax.Node) bool {
+		switch node.(type) {
+		case *syntax.ParamExp, *syntax.CmdSubst, *syntax.ProcSubst, *syntax.ArithmExp:
+			start, end := int(node.Pos().Offset())-base, int(node.End().Offset())-base
+			if start >= 0 && end > start && end <= len(raw) {
+				omitted = append(omitted, [2]int{start, end})
+			}
+			return false
+		}
+		return true
+	})
+	slices.SortFunc(omitted, func(a, b [2]int) int { return a[0] - b[0] })
+	var positions [256][]int
+	omit := 0
+	for i := 0; i < len(raw); i++ {
+		for omit < len(omitted) && i >= omitted[omit][1] {
+			omit++
+		}
+		if omit < len(omitted) && i >= omitted[omit][0] {
+			continue
+		}
+		positions[raw[i]] = append(positions[raw[i]], i)
+	}
+	var heads [256]int
+	next := 0
+	for i := range expanded {
+		b := expanded[i]
+		places := positions[b]
+		head := heads[b]
+		for head < len(places) && places[head] < next {
+			head++
+		}
+		if head == len(places) {
+			out.pos[i] = -1
+			heads[b] = head
+			continue
+		}
+		next = places[head] + 1
+		heads[b] = head + 1
+		out.pos[i] = base + next - 1
+	}
+	return out
 }
 
 func sshPipelineReader(file *syntax.File, src string, pos []int, offset int) bool {

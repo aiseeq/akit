@@ -509,6 +509,18 @@ func TestHeredocSubstitutionOffset(t *testing.T) {
 	}
 }
 
+func TestLocalShellStdinUsesEffectiveDescriptor(t *testing.T) {
+	for _, src := range []string{
+		"bash 3<<EOF\nkill 1\nEOF",
+		"bash <<A </dev/null\nkill 1\nA",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want fd 0 not to receive script", src, calls, err)
+		}
+	}
+}
+
 func TestPipedHeredocScripts(t *testing.T) {
 	tests := []struct {
 		name, command string
@@ -2242,7 +2254,7 @@ func TestSSHRemoteHeredocRoundThree(t *testing.T) {
 	}{
 		{"ansi remote shell word", "ssh host $'bash\\x20-s' <<'EOF'\n" + body, [][]string{{"ssh", "bash"}}},
 		{"second remote command reads stdin", "ssh host 'true; bash -s' <<'EOF'\n" + body, [][]string{{"ssh", "bash"}}},
-		{"stdin shell heredoc substitutions local and remote", "ssh host <<EOF\necho $(kill 1)\nEOF", [][]string{nil, {"ssh", "bash"}}},
+		{"stdin shell heredoc substitution is local", "ssh host <<EOF\necho $(kill 1)\nEOF", [][]string{nil}},
 		{"quoted heredoc substitution is remote only", "ssh host <<'EOF'\necho $(kill 1)\nEOF", [][]string{{"ssh", "bash"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2366,5 +2378,151 @@ func TestSSHRemotePipelineReaderGetsPipeNotHeredoc(t *testing.T) {
 	calls, err := Find(src, "kill")
 	if err != nil || len(calls) != 0 {
 		t.Fatalf("Find = %#v, %v; later pipeline stage reads the pipe, not SSH stdin", calls, err)
+	}
+}
+
+func TestSSHStdinSourceAndExpandedRemoteBody(t *testing.T) {
+	for _, tt := range []struct {
+		name, src string
+		wantVia   []string
+		line      int
+	}{
+		{"escaped expansion in double quotes", `ssh host bash <<EOF
+echo "\$(kill 1)"
+EOF`, []string{"ssh", "bash"}, 2},
+		{"escaped expansion unquoted", `ssh host bash <<EOF
+echo \$(kill 1)
+EOF`, []string{"ssh", "bash"}, 2},
+		{"here string", "ssh host bash <<< 'kill 1'", []string{"ssh", "bash"}, 1},
+		{"stdin null disabled", `ssh -o StdinNull=no host bash <<'EOF'
+kill 1
+EOF`, []string{"ssh", "bash"}, 2},
+		{"open tty xargs", `xargs -o ssh host bash <<'EOF'
+kill 1
+EOF`, []string{"xargs", "ssh", "bash"}, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil || len(calls) != 1 {
+				t.Fatalf("Find = %#v, %v; want one call", calls, err)
+			}
+			if !reflect.DeepEqual(calls[0].Via, tt.wantVia) || calls[0].Line != tt.line {
+				t.Errorf("call = %#v; want Via %v, line %d", calls[0], tt.wantVia, tt.line)
+			}
+		})
+	}
+}
+
+func TestSSHFunctionCallRedirectControlsFunctionStdin(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		src  string
+		want bool
+	}{
+		{"redirected call gets data", "ssh host 'f() { bash -s; }; f </dev/null' <<'EOF'\nkill 1\nEOF", false},
+		{"plain call gets ssh stdin", "ssh host 'f() { bash -s; }; f' <<'EOF'\nkill 1\nEOF", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil {
+				t.Fatalf("Find error: %v", err)
+			}
+			if tt.want {
+				if len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, []string{"ssh", "bash"}) || calls[0].Line != 2 {
+					t.Errorf("Find = %#v; want Via [ssh bash], line 2", calls)
+				}
+			} else if len(calls) != 0 {
+				t.Errorf("Find = %#v; redirected function stdin should be data", calls)
+			}
+		})
+	}
+}
+
+func TestSSHStdinDataSourcesDoNotBecomeRemoteScripts(t *testing.T) {
+	for _, src := range []string{
+		"ssh host bash 3<<'EOF'\nkill 1\nEOF",
+		"ssh host bash <<'EOF' </dev/null\nkill 1\nEOF",
+		"ssh host '{ bash -s; } </dev/null' <<'EOF'\nkill 1\nEOF",
+		"ssh host '( bash -s ) </dev/null' <<'EOF'\nkill 1\nEOF",
+		"xargs ssh host bash <<'EOF'\nkill 1\nEOF",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want body treated as data", src, calls, err)
+		}
+	}
+}
+
+func TestSSHUnquotedHeredocSplitsLocalAndRemoteSubstitutions(t *testing.T) {
+	src := "ssh host bash <<EOF\necho $(kill 1)\nkill 1\nEOF"
+	calls, err := Find(src, "kill")
+	if err != nil || len(calls) != 2 {
+		t.Fatalf("Find = %#v, %v; want local substitution and remote script calls", calls, err)
+	}
+	var local, remote *Call
+	for i := range calls {
+		if len(calls[i].Via) == 0 {
+			local = &calls[i]
+		} else {
+			remote = &calls[i]
+		}
+	}
+	if local == nil || local.Line != 2 {
+		t.Errorf("local substitution = %#v; want Via nil, line 2", local)
+	}
+	if remote == nil || !reflect.DeepEqual(remote.Via, []string{"ssh", "bash"}) || remote.Line != 3 {
+		t.Errorf("remote script = %#v; want Via [ssh bash], line 3", remote)
+	}
+}
+
+func TestSSHRemoteCommandParsedOnce(t *testing.T) {
+	src := "ssh host bash <<'EOF'\nkill 1\nEOF"
+	budget := newNestedParseBudget(len(src))
+	budget.trackWork = true
+	var calls []Call
+	if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+		t.Fatalf("parse = %v", err)
+	}
+	if got := budget.parsedShells["bash"]; got != 1 {
+		t.Fatalf("remote command parsed %d times; want once", got)
+	}
+}
+
+func TestSSHStdinRedirectionsRespectOrderAndDescriptor(t *testing.T) {
+	for _, tt := range []struct {
+		name, src string
+		line      int
+	}{
+		{"fd 3 does not replace stdin", "ssh host bash <<'A' 3<<'B'\nkill 1\nA\ndata\nB", 2},
+		{"dup fd zero retains heredoc", "ssh host bash <<'A' <&0\nkill 1\nA", 2},
+		{"last stdin redirect wins", "ssh host bash <<'A' </dev/null <<'B'\nkill 2\nA\nkill 1\nB", 4},
+		{"group dup of fd zero", "ssh host '{ bash -s; } <&0' <<'EOF'\nkill 1\nEOF", 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil {
+				t.Fatalf("Find error: %v", err)
+			}
+			if len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, []string{"ssh", "bash"}) || calls[0].Line != tt.line {
+				t.Errorf("Find = %#v; want Via [ssh bash] on line %d", calls, tt.line)
+			}
+		})
+	}
+}
+
+func TestSSHConfigOptionsThatDisableRemoteStdin(t *testing.T) {
+	for _, src := range []string{
+		"ssh -o StdinNull=yes host bash <<'EOF'\nkill 1\nEOF",
+		"ssh -oStdinNull=yes host bash <<'EOF'\nkill 1\nEOF",
+		"ssh -o 'StdinNull yes' host bash <<'EOF'\nkill 1\nEOF",
+		"ssh -o ForkAfterAuthentication=yes host bash <<'EOF'\nkill 1\nEOF",
+		"ssh -o SessionType=none host bash <<'EOF'\nkill 1\nEOF",
+		"ssh -o SessionType=subsystem host bash <<'EOF'\nkill 1\nEOF",
+		"ssh -Tf host bash <<'EOF'\nkill 1\nEOF",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want body treated as data", src, calls, err)
+		}
 	}
 }
