@@ -16,6 +16,104 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
+// bashBuiltinAndKeywordNames is from GNU Bash 5.3.9:
+// `bash --version`, `compgen -b`, and `compgen -k`.
+const bashBuiltinAndKeywordNames = `
+.
+:
+[
+alias
+bg
+bind
+break
+builtin
+caller
+cd
+command
+compgen
+complete
+compopt
+continue
+declare
+dirs
+disown
+echo
+enable
+eval
+exec
+exit
+export
+false
+fc
+fg
+getopts
+hash
+help
+history
+jobs
+kill
+let
+local
+logout
+mapfile
+popd
+printf
+pushd
+pwd
+read
+readarray
+readonly
+return
+set
+shift
+shopt
+source
+suspend
+test
+times
+trap
+true
+type
+typeset
+ulimit
+umask
+unalias
+unset
+wait
+!
+[[
+]]
+case
+coproc
+do
+done
+elif
+else
+esac
+for
+function
+if
+in
+select
+then
+time
+until
+while
+{
+}
+`
+
+var bashBuiltinAndKeywordSet = literalWordSet(bashBuiltinAndKeywordNames)
+var literalBuiltinAllowSet = literalWordSet(`kill echo true false : test [ pwd exit wait`)
+
+func literalWordSet(words string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for word := range strings.FieldsSeq(words) {
+		set[word] = struct{}{}
+	}
+	return set
+}
+
 // Call описывает простой вызов программы в тексте оболочки.
 type Call struct {
 	// Name — имя программы без каталога; "" — в слове имени есть `$(` или обратная кавычка.
@@ -39,16 +137,15 @@ type Call struct {
 	ScriptInput bool
 }
 
-// ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: это прямой
-// вызов верхнего уровня входного скрипта или скрипта из прямого `bash/sh -c '…'`, без
-// обёрток, вложенности, перенаправлений и управляющих команд. Слово должно состоять из
-// литералов, одинарных кавычек без $, либо двойных кавычек с Lit без обратной косой, без
-// раскрытий; ! допустим только в одинарных кавычках и как \\! вне кавычек. i в [0, 32).
-// Иначе false.
-// Любая функция или команда из набора eval, alias, unalias, shopt, enable, set, builtin,
-// command, source, ., declare, typeset, export, readonly, local, trap, hash делает скрипт
-// непростым. Переопределения извне (rc-файлы, BASH_ENV, `bash -i`) и содержимое source-файлов
-// не учитываются.
+// ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: все его
+// предложения — простые вызовы без присваиваний, перенаправлений, списков, составных команд
+// и нелитеральных слов. Имя вызова должно быть внешней командой либо builtin из списка
+// kill echo true false : test [ pwd exit wait. Список builtin и ключевых слов взят из
+// GNU Bash 5.3.9 (`bash --version`, `compgen -b`, `compgen -k`). Вложенный скрипт разрешён
+// только как `bash/sh -c '…'` с литеральными дополнительными словами, один уровень.
+// `!` разрешён только в одинарных кавычках или как `\\!` вне кавычек; i должен быть [0, 32).
+// Всё прочее даёт false. Не учитываются изменения извне: окружение (BASH_ENV, PATH,
+// экспортированные функции), rc-файлы и содержимое source-файлов.
 func (c Call) ArgLiteral(i int) bool {
 	return i >= 0 && i < 32 && c.literalArgs&(uint32(1)<<uint(i)) != 0
 }
@@ -138,7 +235,6 @@ type nestedParseBudget struct {
 	substSteps     int
 	trackWork      bool
 	literalShell   string
-	literalUnsafe  bool
 	parsedShells   map[string]int
 }
 
@@ -159,14 +255,7 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
-	first := len(*calls)
-	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, budget)
-	if budget.literalUnsafe {
-		for i := first; i < len(*calls); i++ {
-			(*calls)[i].literalArgs = 0
-		}
-	}
-	return err
+	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, budget)
 }
 
 func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
@@ -240,7 +329,7 @@ func parseShell(src string) (file *syntax.File, full string, err error) {
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
-	budget.literalUnsafe = budget.literalUnsafe || info.literalUnsafe
+
 	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
@@ -299,7 +388,7 @@ type walkInfo struct {
 	stdinIndex    *stdinIndex
 	// hasInputRedir says whether src holds any `<`; without one no call has stdin to resolve.
 	hasInputRedir bool
-	literalUnsafe bool
+	literalSimple bool
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
@@ -310,10 +399,11 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		}
 	}
 	if !needsWalkInfo(src) {
-		return walkInfo{topLevelCalls: topLevelCalls, redirs: make(map[*syntax.CallExpr][]Redir), literalUnsafe: hasLiteralUnsafeContext(file)}
+		return walkInfo{topLevelCalls: topLevelCalls, redirs: make(map[*syntax.CallExpr][]Redir), literalSimple: literalScriptSimple(file, src)}
 	}
 	info := walkInfo{
 		topLevelCalls: topLevelCalls,
+		literalSimple: true,
 		trackWork:     budget.trackWork,
 		hasInputRedir: strings.Contains(src, "<"),
 		timedCalls:    make(map[*syntax.CallExpr]bool),
@@ -334,8 +424,8 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 			info.workNodes++
 		}
 		collectWalkNode(node, file, src, vars, &info, knownPipes)
-		if literalUnsafeNode(node) {
-			info.literalUnsafe = true
+		if info.literalSimple && !literalScriptNodeSimple(node, src) {
+			info.literalSimple = false
 		}
 		collectCallContextNode(node, &info)
 		return true
@@ -1222,7 +1312,7 @@ func validSpan(src string, start, end int) bool {
 }
 
 func setLiteralArgs(c *cmd, expr *syntax.CallExpr, src string, info walkInfo, budget *nestedParseBudget) {
-	c.literalContext = !budget.literalUnsafe && literalCallContext(c, expr, info, budget)
+	c.literalContext = info.literalSimple && literalCallContext(c, expr, info, budget)
 	if !c.literalContext || len(expr.Args) == 0 || !literalWord(expr.Args[0], src) {
 		return
 	}
@@ -1319,39 +1409,49 @@ func singleQuotedWord(word *syntax.Word) bool {
 	return ok && !quoted.Dollar
 }
 
-func hasLiteralUnsafeContext(file *syntax.File) bool {
-	unsafe := false
+func literalScriptSimple(file *syntax.File, src string) bool {
+	simple := true
 	syntax.Walk(file, func(node syntax.Node) bool {
-		if literalUnsafeNode(node) {
-			unsafe = true
-			return false
+		if simple && !literalScriptNodeSimple(node, src) {
+			simple = false
 		}
 		return true
 	})
-	return unsafe
+	return simple
 }
 
-func literalUnsafeNode(node syntax.Node) bool {
+func literalScriptNodeSimple(node syntax.Node, src string) bool {
 	switch n := node.(type) {
-	case *syntax.FuncDecl:
-		return true
+	case *syntax.Stmt:
+		if n.Negated || n.Background || n.Coprocess || n.Disown || len(n.Redirs) != 0 {
+			return false
+		}
+		if _, ok := n.Cmd.(*syntax.CallExpr); !ok {
+			return false
+		}
 	case *syntax.CallExpr:
+		if len(n.Assigns) != 0 || len(n.Args) == 0 {
+			return false
+		}
 		for _, word := range n.Args {
-			if name, ok := wordValue(word); ok && literalUnsafeWord(name) {
-				return true
+			if !literalWord(word, src) {
+				return false
 			}
 		}
+		name, ok := wordValue(n.Args[0])
+		if !ok {
+			return false
+		}
+		if _, builtin := bashBuiltinAndKeywordSet[name]; builtin {
+			_, allowed := literalBuiltinAllowSet[name]
+			return allowed
+		}
+	case syntax.Command:
+		if _, ok := n.(*syntax.CallExpr); !ok {
+			return false
+		}
 	}
-	return false
-}
-
-func literalUnsafeWord(word string) bool {
-	switch word {
-	case "eval", "alias", "unalias", "shopt", "enable", "set", "builtin", "command", "source", ".", "declare", "typeset", "export", "readonly", "local", "trap", "hash":
-		return true
-	default:
-		return false
-	}
+	return true
 }
 
 func literalArgsMask(words []*syntax.Word, src string) uint32 {
@@ -2828,10 +2928,10 @@ func parallelCommandStart(args []string) (int, bool) {
 }
 
 func literalShellScript(c cmd, name string, operand int) bool {
-	if (name != "bash" && name != "sh") || c.call.Name != name || !c.literalContext || len(c.call.Via) != 0 || len(c.call.Redirs) != 0 || c.call.Loop || c.call.Background || c.call.ScriptInput || operand < 0 || operand+1 >= len(c.words) || c.words[0].raw != name {
+	if (name != "bash" && name != "sh") || c.call.Name != name || !c.literalContext || len(c.call.Via) != 0 || len(c.call.Redirs) != 0 || c.call.Loop || c.call.Background || c.call.ScriptInput || operand != 1 || len(c.words) < 3 || c.words[0].raw != name || c.call.Args[0] != "-c" {
 		return false
 	}
-	return c.words[operand+1].singleQuoted
+	return c.words[2].singleQuoted
 }
 
 // expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).

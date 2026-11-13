@@ -98,12 +98,30 @@ func TestArgLiteralContract(t *testing.T) {
 		{"eval alias and shopt change script", strings.Join([]string{`eval "alias kill='eval kill'"; eval "shopt -s expand_aliases"; kill '$`, `PPID'`}, ""), "kill", 0, false},
 		{"double quoted history expansion", "set -o history -H\n: $PPID\nkill \"!!:1\"", "kill", 0, false},
 		{"nested double quoted history expansion", "bash -c 'set -o history -H\n: $PPID\nkill \"!!:1\"'", "kill", 0, false},
-		{"assignment keeps script simple", `X=1 kill 'a'`, "kill", 0, true},
+		{"assignment prefix disables script", `X=1 kill 'a'`, "kill", 0, false},
 		{"set option disables script", `kill 'a'; set -e`, "kill", 0, false},
-		{"nested shell state sticks to script", `kill 'a'; bash -c 'set -e'; bash -c 'echo hi'`, "kill", 0, false},
+		{"nested shell stays separately simple", `kill 'a'; bash -c 'set -e'; bash -c 'echo hi'`, "kill", 0, true},
 		{"bang single quoted", `kill '!'`, "kill", 0, true},
 		{"bang double quoted", `kill "!"`, "kill", 0, false},
 		{"bang unquoted", `kill !`, "kill", 0, false},
+		{"expanded command name brace", strings.Join([]string{`{eval,} 'kill() { eval echo "$@"; }'; kill '$`, `PPID'`}, ""), "kill", 0, false},
+		{"expanded command name parameter", strings.Join([]string{`"${x-eval}" 'kill() { eval echo "$@"; }'; kill '$`, `PPID'`}, ""), "kill", 0, false},
+		{"mapfile callback", strings.Join([]string{`mapfile -c 1 -C 'kill() { eval echo "$@"; }; :' a <<< x; kill '$`, `PPID'`}, ""), "kill", 0, false},
+		{"readarray callback", strings.Join([]string{`readarray -c 1 -C 'kill() { eval echo "$@"; }; :' a <<< x; kill '$`, `PPID'`}, ""), "kill", 0, false},
+		{"mapfile builtin disallowed", `mapfile x; kill 'a'`, "kill", 0, false},
+		{"posix and aliases array", "POSIXLY_CORRECT=1\nBASH_ALIASES[kill]='eval echo'\nkill '$PPID'", "kill", 0, false},
+		{"sh aliases array", "sh -c 'BASH_ALIASES[kill]=\"eval echo\"\nkill \\$PPID'", "kill", 0, false},
+		{"sh printf array", "sh -c 'printf -v BASH_ALIASES[kill] %s \"eval echo\"\nkill \\$PPID'", "kill", 0, false},
+		{"path assignment", `PATH=/tmp/evil; pkill 'foo'`, "pkill", 0, false},
+		{"bash commands array", `BASH_CMDS[pkill]=/bin/echo; pkill 'foo'`, "pkill", 0, false},
+		{"bash env assignment", `BASH_ENV=/tmp/evil bash -c 'kill 1'`, "kill", 0, false},
+		{"bash keep flag", `bash -k -c 'kill 1'`, "kill", 0, false},
+		{"simple sh script args", `sh -c 'kill 1' sh x`, "kill", 0, true},
+		{"simple multiple commands", `echo 'a b'; kill 1`, "kill", 0, true},
+		{"nonliteral word poisons script", `echo $PPID; kill 1`, "kill", 0, false},
+		{"assignment statement disables script", `X=1; kill 'a'`, "kill", 0, false},
+		{"and list disables script", `kill 'a' && true`, "kill", 0, false},
+		{"cd builtin disables script", `cd /; kill 'a'`, "kill", 0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -119,14 +137,41 @@ func TestArgLiteralContract(t *testing.T) {
 			}
 		})
 	}
-	for _, word := range []string{"eval", "alias", "unalias", "shopt", "enable", "set", "builtin", "command", "source", ".", "declare", "typeset", "export", "readonly", "local", "trap", "hash"} {
-		t.Run("state-changing word "+word, func(t *testing.T) {
-			calls, err := Find("echo "+word+"; kill 'a'", "kill")
+	for word := range bashBuiltinAndKeywordSet {
+		if _, allowed := literalBuiltinAllowSet[word]; allowed {
+			continue
+		}
+		t.Run("disallowed builtin or keyword "+word, func(t *testing.T) {
+			calls, err := Find("'"+word+"' x; kill 'a'", "kill")
 			if err != nil || len(calls) != 1 {
 				t.Fatalf("Find: calls=%#v, err=%v", calls, err)
 			}
 			if calls[0].ArgLiteral(0) {
-				t.Errorf("ArgLiteral(0) = true for script containing %q", word)
+				t.Errorf("ArgLiteral(0) = true for command %q", word)
+			}
+		})
+	}
+	for name := range literalBuiltinAllowSet {
+		invocation := name + " x"
+		if name == "[" {
+			invocation = "'[' x ']'"
+		}
+		t.Run("allowed builtin "+name, func(t *testing.T) {
+			calls, err := Find(invocation+"; echo ok", name)
+			if err != nil {
+				t.Fatalf("Find: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Raw == invocation {
+					found = true
+					if !call.ArgLiteral(0) {
+						t.Errorf("ArgLiteral(0) = false for allowed builtin %q", name)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("invocation %q not found in %#v", invocation, calls)
 			}
 		})
 	}
@@ -146,8 +191,8 @@ func TestArgLiteralContract(t *testing.T) {
 	if err != nil || len(calls) != 1 {
 		t.Fatalf("mixed arguments: calls=%#v, err=%v", calls, err)
 	}
-	if calls[0].ArgLiteral(0) || !calls[0].ArgLiteral(1) {
-		t.Errorf("mixed argument literals: got [%v, %v], want [false, true]", calls[0].ArgLiteral(0), calls[0].ArgLiteral(1))
+	if calls[0].ArgLiteral(0) || calls[0].ArgLiteral(1) {
+		t.Errorf("mixed argument literals: got [%v, %v], want [false, false]", calls[0].ArgLiteral(0), calls[0].ArgLiteral(1))
 	}
 	functionSource := strings.Join([]string{`kill() { eval builtin kill "$@"; }; kill '$`, `PPID'`}, "")
 	calls, err = Find(functionSource, "kill")
