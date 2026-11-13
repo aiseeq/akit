@@ -107,6 +107,13 @@ func TestMaskRussianLabels(t *testing.T) {
 		}
 	}
 	for _, input := range []string{
+		"sk-" + strings.Repeat("a1B", 12) + " пароль: " + secret,
+		`["--password","Abc123Xyz789"] пароль: ` + secret,
+		`["--password","Abc123Xyz789Abc123Xyz789"] пароль: ` + secret,
+		`["--password","Abc123"] пароль: ` + secret,
+		`["--password","Abc123Xyz789"] ["--password","Abc123"] пароль: ` + secret,
+		`["--password","Abc123"] пароль: ` + secret + ` ["--password","` + strings.Repeat("Abc123Xyz789", 3) + `Abc1"]`,
+		`пароль: ` + secret + ` ["--password","Abc123"]`,
 		"автопароль пароль: " + secret,
 		"Пароль учётки: " + secret,
 		"тОкЕн= " + secret,
@@ -157,6 +164,15 @@ func TestMaskRussianLabels(t *testing.T) {
 	}
 	if got, found := Mask("ключ: aB4cD9eF0gH2"); strings.Contains(got, "aB4cD9eF0gH2") || found["token"] == 0 {
 		t.Errorf("token-shaped key value not masked: %q, %v", got, found)
+	}
+}
+
+func TestRussianOffsetsAfterTokenReplacement(t *testing.T) {
+	token := "sk-" + strings.Repeat("a1B", 12)
+	secret := "Zq7xW9vK2mPq8Rt"
+	got, found := Mask(token + " пароль: " + secret)
+	if len(token) == len("[скрыто:sk]") || found["sk"] != 1 || found["password"] != 1 || strings.Contains(got, secret) {
+		t.Fatalf("token rewrite did not leave current Russian offsets: counts %v", found)
 	}
 }
 

@@ -435,8 +435,13 @@ func (m *masking) mask(text string) string {
 			scan = nil // replacements invalidate byte offsets and run metadata
 		}
 	}
-	if groups, russianStarts := contextAnchorScan(text); groups != 0 {
-		text = maskJSONContext(text, m, groups)
+	groups, russianStarts := contextAnchorScan(text)
+	if groups != 0 {
+		var jsonChanged bool
+		text, jsonChanged = maskJSONContext(text, m, groups)
+		if jsonChanged {
+			groups, russianStarts = contextAnchorScan(text)
+		}
 		text = maskContext(text, m, groups, russianStarts)
 	}
 	if m.found[liveKeyKind] != 0 {
@@ -554,9 +559,9 @@ func maskContext(text string, m *masking, groups anchorGroup, russianStarts []in
 // maskJSONContext hides values that JSON keeps apart from their name: an
 // option and its value as neighbouring array elements, an array or an object
 // under a secret key, and a {"name": ..., "value": ...} pair.
-func maskJSONContext(text string, m *masking, groups anchorGroup) string {
+func maskJSONContext(text string, m *masking, groups anchorGroup) (string, bool) {
 	if groups&(anchorName|anchorCurl|anchorRuCandidate) == 0 {
-		return text
+		return text, false
 	}
 	var spans []contextSpan
 	for at := 0; ; {
@@ -586,7 +591,10 @@ func maskJSONContext(text string, m *masking, groups anchorGroup) string {
 			last = span.end
 		}
 	}
-	return replaceSpans(text, kept, m)
+	if len(kept) == 0 {
+		return text, false
+	}
+	return replaceSpans(text, kept, m), true
 }
 
 // jsonString returns the content of the JSON string opening at quote, or false.
