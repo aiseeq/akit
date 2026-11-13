@@ -14,6 +14,8 @@ func TestCheckTitles(t *testing.T) {
 		{name: "attribute", html: `<!doctype html><body><abbr id="a" title="  full name ">FN</abbr></body>`, pairs: 1, contains: "abbr#a «full name»"},
 		{name: "svg", html: `<!doctype html><body><svg><rect class="bar"><title>42 runs</title></rect></svg></body>`, pairs: 1, contains: "rect.bar > title «42 runs»"},
 		{name: "long text cut", html: `<!doctype html><meta charset="utf-8"><body><i title="` + strings.Repeat("я", 70) + `">x</i></body>`, pairs: 1, contains: "i «" + strings.Repeat("я", 60) + "…»"},
+		{name: "root elements", html: `<!doctype html><html title="h"><body title="b">x</body></html>`, pairs: 2, contains: "html «h»\n  body «b»"},
+		{name: "document order", html: `<!doctype html><body><svg><rect id="r"><title>first</title></rect></svg><b title="second">x</b></body>`, pairs: 2, contains: "rect#r > title «first»\n  b «second»"},
 		{name: "empty title ignored", html: `<!doctype html><body><span title="">x</span></body>`},
 		{name: "first five and the rest", html: `<!doctype html><body>` + many + `</body>`, pairs: 7, contains: "...и ещё 2"},
 	}, func(ctx context.Context) (int, string, error) {

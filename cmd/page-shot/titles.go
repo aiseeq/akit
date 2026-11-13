@@ -36,14 +36,17 @@ const titlesJS = `(() => {
     const chars = [...text.trim()];
     return chars.length > 60 ? chars.slice(0, 60).join('') + '…' : chars.join('');
   };
+  // One pass in document order. The <title> in <head> has no title attribute
+  // and is not inside an <svg>, so it is not matched; an empty text shows no tooltip.
   const found = [];
-  for (const el of document.querySelectorAll('body [title]')) {
+  for (const el of document.querySelectorAll('[title], svg title')) {
+    if (el.tagName.toLowerCase() === 'title' && el.closest('svg')) {
+      const text = short(el.textContent);
+      if (text && el.parentElement) found.push({selector: describe(el.parentElement) + ' > title', text});
+      continue;
+    }
     const text = short(el.getAttribute('title'));
     if (text) found.push({selector: describe(el), text});
-  }
-  for (const el of document.querySelectorAll('svg title')) {
-    const text = short(el.textContent);
-    if (text && el.parentElement) found.push({selector: describe(el.parentElement) + ' > title', text});
   }
   return {count: found.length, samples: found};
 })()`

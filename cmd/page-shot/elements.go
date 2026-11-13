@@ -95,6 +95,13 @@ func shootElements(allocCtx context.Context, target, dir, selector string, momen
 	if len(els) == 0 {
 		return fmt.Errorf("--element %s: на странице нет таких элементов", quoted)
 	}
+	tips, err := checkTitles(tabCtx)
+	if err != nil {
+		return err
+	}
+	if tips != nil {
+		fmt.Fprint(os.Stderr, tips.report())
+	}
 	shot := 0
 	for i, name := range elementNames(els) {
 		if els[i].Width == 0 || els[i].Height == 0 {
