@@ -318,7 +318,7 @@ func collectWalkNode(node syntax.Node, file *syntax.File, src string, vars map[s
 }
 
 func collectPipelineWalkInfo(binary *syntax.BinaryCmd, src string, vars map[string]string, info *walkInfo, knownPipes map[*syntax.BinaryCmd]bool) {
-	if !strings.Contains(binary.Op.String(), "|") {
+	if binary.Op != syntax.Pipe && binary.Op != syntax.PipeAll {
 		return
 	}
 	if collectPipedHeredocWalkInfo(binary, src, vars, info) {
