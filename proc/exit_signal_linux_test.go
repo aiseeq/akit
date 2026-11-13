@@ -3,6 +3,8 @@
 package proc
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,7 +12,10 @@ import (
 	"strconv"
 	"syscall"
 	"testing"
+	"time"
 )
+
+const exitSignalObserved = "unexpected signal delivered"
 
 func TestExitWithSignalHelper(t *testing.T) {
 	value := os.Getenv("PROC_EXIT_SIGNAL")
@@ -28,6 +33,22 @@ func TestExitWithSignalHelper(t *testing.T) {
 	}
 	if os.Getenv("PROC_EXIT_NO_DELIVERY") == "1" {
 		sendExitSignal = func(syscall.Signal) error { return nil }
+	}
+	if os.Getenv("PROC_EXIT_OBSERVE") == "1" {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, sig)
+		send := sendExitSignal
+		sendExitSignal = func(sig syscall.Signal) error {
+			err := send(sig)
+			if err == nil {
+				select {
+				case <-ch:
+					fmt.Fprintln(os.Stderr, exitSignalObserved)
+				case <-time.After(time.Second):
+				}
+			}
+			return err
+		}
 	}
 	ExitWithSignal(sig)
 	t.Fatal("ExitWithSignal returned")
@@ -69,12 +90,14 @@ func TestExitWithSignal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 			args := []string{"-test.run=^TestExitWithSignalHelper$"}
 			var cmd *exec.Cmd
 			if tc.ignore {
-				cmd = exec.Command("sh", "-c", `trap '' HUP; exec "$@"`, "sh", os.Args[0], args[0])
+				cmd = exec.CommandContext(ctx, "sh", "-c", `trap '' HUP; exec "$@"`, "sh", os.Args[0], args[0])
 			} else {
-				cmd = exec.Command(os.Args[0], args...)
+				cmd = exec.CommandContext(ctx, os.Args[0], args...)
 			}
 			cmd.Env = append(os.Environ(), fmt.Sprintf("PROC_EXIT_SIGNAL=%d", tc.sig))
 			if tc.notify {
@@ -83,7 +106,17 @@ func TestExitWithSignal(t *testing.T) {
 			if tc.noDelivery {
 				cmd.Env = append(cmd.Env, "PROC_EXIT_NO_DELIVERY=1")
 			}
+			switch tc.sig {
+			case syscall.SIGCHLD, syscall.SIGURG, syscall.SIGWINCH, syscall.SIGCONT:
+				cmd.Env = append(cmd.Env, "PROC_EXIT_OBSERVE=1")
+			}
 			output, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("child timed out: %s", output)
+			}
+			if bytes.Contains(output, []byte(exitSignalObserved)) {
+				t.Fatalf("unexpected signal delivery: %s", output)
+			}
 			if _, ok := err.(*exec.ExitError); !ok {
 				t.Fatalf("expected process exit, got %v: %s", err, output)
 			}
