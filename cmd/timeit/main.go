@@ -29,7 +29,7 @@ const usage = `timeit — measure a command's median runtime within a time budge
 
 Usage:
   timeit [--runs N] [--budget D] [--limit D] [--ok-exit CODES]
-         [--fail-on-stderr TEXT] [--stdin FILE] -- CMD [ARG...]
+         [--fail-on-stderr TEXT] [--stdin FILE] [--instructions] -- CMD [ARG...]
 
 Flags:
   --runs N              maximum runs (default 5; at least 1)
@@ -38,6 +38,8 @@ Flags:
   --ok-exit CODES       comma-separated successful exit codes (default 0)
   --fail-on-stderr TEXT fail if a run writes TEXT to stderr
   --stdin FILE          reopen FILE for every run (default: empty stdin)
+  --instructions        print the median user-space instruction count instead
+                        of milliseconds (perf stat; see below)
   -h, --help            show this help
 
 Example:
@@ -47,6 +49,17 @@ The first run always starts. Later runs start only while elapsed time is below
 the effective budget. A failed run prints at most the last 64 KiB of stderr,
 with a truncation note when earlier output is omitted. The median runtime is
 printed in milliseconds.
+
+--instructions compares CPU work of two builds on a loaded machine, where
+milliseconds and CPU seconds drift by tens of percent: the instruction count
+repeats within about 0.01%, so one run of each side is enough. Each run goes
+under perf stat --no-scale (on a hybrid CPU the default scaling invents counts
+for a core type the command barely ran on); counts of all core types are
+summed. Children of the command are counted too. For a Go program set
+GOMAXPROCS=1 in the environment: otherwise idle scheduler threads add noise.
+Needs perf and kernel.perf_event_paranoid <= 2.
+  GOMAXPROCS=1 timeit --instructions --runs 1 -- ./probe-old big.txt
+  GOMAXPROCS=1 timeit --instructions --runs 1 -- ./probe-new big.txt
 
 Exit: 0 median written, 1 stderr match with exit 0, command exit code on a failed run,
 2 usage or launch error, 128+signal when the command is killed by a signal
@@ -60,6 +73,7 @@ type options struct {
 	okExit       map[int]bool
 	failOnStderr string
 	stdinPath    string
+	instructions bool
 	command      []string
 }
 
@@ -186,43 +200,54 @@ func parseArgs(args []string) (options, error) {
 		if !strings.HasPrefix(a, "--") {
 			return options{}, fmt.Errorf("expected -- before command, got %q", a)
 		}
+		if a == "--instructions" {
+			opts.instructions = true
+			continue
+		}
 		if i+1 == len(args) {
 			return options{}, fmt.Errorf("%s needs a value", a)
 		}
 		i++
-		v := args[i]
-		switch a {
-		case "--runs":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return options{}, fmt.Errorf("--runs %q: want an integer of at least 1", v)
-			}
-			opts.runs = n
-		case "--budget", "--limit":
-			d, err := time.ParseDuration(v)
-			if err != nil || d < 0 {
-				return options{}, fmt.Errorf("%s %q: want a non-negative duration like 45s", a, v)
-			}
-			if a == "--budget" {
-				opts.budget = d
-			} else {
-				opts.limit = d
-			}
-		case "--ok-exit":
-			codes, err := parseExitCodes(v)
-			if err != nil {
-				return options{}, err
-			}
-			opts.okExit = codes
-		case "--fail-on-stderr":
-			opts.failOnStderr = v
-		case "--stdin":
-			opts.stdinPath = v
-		default:
-			return options{}, fmt.Errorf("unknown flag %q", a)
+		if err := setValueFlag(&opts, a, args[i]); err != nil {
+			return options{}, err
 		}
 	}
 	return options{}, errors.New("missing -- and command")
+}
+
+// setValueFlag applies a flag that takes a value.
+func setValueFlag(opts *options, flag, v string) error {
+	switch flag {
+	case "--runs":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return fmt.Errorf("--runs %q: want an integer of at least 1", v)
+		}
+		opts.runs = n
+	case "--budget", "--limit":
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return fmt.Errorf("%s %q: want a non-negative duration like 45s", flag, v)
+		}
+		if flag == "--budget" {
+			opts.budget = d
+		} else {
+			opts.limit = d
+		}
+	case "--ok-exit":
+		codes, err := parseExitCodes(v)
+		if err != nil {
+			return err
+		}
+		opts.okExit = codes
+	case "--fail-on-stderr":
+		opts.failOnStderr = v
+	case "--stdin":
+		opts.stdinPath = v
+	default:
+		return fmt.Errorf("unknown flag %q", flag)
+	}
+	return nil
 }
 
 func parseExitCodes(s string) (map[int]bool, error) {
@@ -249,6 +274,8 @@ type result struct {
 	interrupted  int
 	signalName   string
 	processGroup *exec.Cmd
+	instructions int64
+	countErr     error
 }
 type commandRunner func(options) (result, time.Duration, error)
 
@@ -258,6 +285,7 @@ func run(opts options, stdout, stderr io.Writer, now func() time.Time, startComm
 		return exitError
 	}
 	var durations []time.Duration
+	var counts []int64
 	var firstStart time.Time
 	budget := opts.budget
 	for runNumber := 1; runNumber <= opts.runs; runNumber++ {
@@ -304,6 +332,17 @@ func run(opts options, stdout, stderr io.Writer, now func() time.Time, startComm
 			return failedRun(stderr, res, runNumber, opts.runs, failedText)
 		}
 		cleanupResult(res)
+		if opts.instructions {
+			if res.countErr != nil {
+				fmt.Fprintf(stderr, "timeit: %v\n", res.countErr)
+				return exitError
+			}
+			counts = append(counts, res.instructions)
+		}
+	}
+	if opts.instructions {
+		fmt.Fprintln(stdout, medianCount(counts))
+		return 0
 	}
 	fmt.Fprintln(stdout, medianMillis(durations))
 	return 0
@@ -462,7 +501,15 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		cleanup()
 		return result{}, 0, fmt.Errorf("open null output: %w", err)
 	}
-	cmd := exec.Command(opts.command[0], opts.command[1:]...)
+	argv, perfPath, err := commandArgv(opts)
+	if err != nil {
+		cleanup()
+		return result{}, 0, errors.Join(err, stdoutFile.Close())
+	}
+	if perfPath != "" {
+		defer os.Remove(perfPath)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = stdoutFile
 	cmd.Stderr = stderrFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -518,21 +565,33 @@ func runCommand(opts options, signals <-chan os.Signal) (result, time.Duration, 
 		activeCommand.CompareAndSwap(cmd, nil)
 		duration := time.Since(started)
 		res := result{stderrFile: stderrFile, processGroup: cmd}
-		if err == nil {
-			return res, duration, nil
+		if perfPath != "" {
+			res.instructions, res.countErr = readPerfInstructions(perfPath)
 		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			res.code = exitErr.ExitCode()
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-				res.code = 128 + int(status.Signal())
-				res.signalName = signalLabel(status.Signal())
-			}
-			return res, duration, nil
+		if !setExitStatus(&res, err) {
+			cleanup()
+			return result{}, 0, fmt.Errorf("%s: %w", opts.command[0], err)
 		}
-		cleanup()
-		return result{}, 0, fmt.Errorf("%s: %w", opts.command[0], err)
+		return res, duration, nil
 	}
+}
+
+// setExitStatus records the exit code of a finished command, 128+signal when a
+// signal killed it; false when err is not an exit status.
+func setExitStatus(res *result, err error) bool {
+	if err == nil {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	res.code = exitErr.ExitCode()
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		res.code = 128 + int(status.Signal())
+		res.signalName = signalLabel(status.Signal())
+	}
+	return true
 }
 
 func stopCommand(cmd *exec.Cmd) {
