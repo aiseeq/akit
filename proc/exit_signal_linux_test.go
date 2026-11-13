@@ -62,31 +62,36 @@ func TestExitWithSignal(t *testing.T) {
 		notify     bool
 		ignore     bool
 		noDelivery bool
+		blocked    bool
 	}{
-		{"HUP", syscall.SIGHUP, true, false, false, false},
-		{"INT", syscall.SIGINT, true, false, false, false},
-		{"TERM", syscall.SIGTERM, true, false, false, false},
-		{"KILL", syscall.SIGKILL, true, false, false, false},
-		{"TERM-notify", syscall.SIGTERM, true, true, false, false},
-		{"HUP-inherited-ignore", syscall.SIGHUP, false, false, true, false},
-		{"TERM-undelivered", syscall.SIGTERM, false, false, false, true},
-		{"STOP", syscall.SIGSTOP, false, false, false, false},
-		{"TSTP", syscall.SIGTSTP, false, false, false, false},
-		{"TTIN", syscall.SIGTTIN, false, false, false, false},
-		{"TTOU", syscall.SIGTTOU, false, false, false, false},
-		{"CHLD", syscall.SIGCHLD, false, false, false, false},
-		{"URG", syscall.SIGURG, false, false, false, false},
-		{"WINCH", syscall.SIGWINCH, false, false, false, false},
-		{"CONT", syscall.SIGCONT, false, false, false, false},
-		{"QUIT", syscall.SIGQUIT, false, false, false, false},
-		{"ABRT", syscall.SIGABRT, false, false, false, false},
-		{"SEGV", syscall.SIGSEGV, false, false, false, false},
-		{"PIPE", syscall.SIGPIPE, false, false, false, false},
-		{"USR1", syscall.SIGUSR1, false, false, false, false},
-		{"ALRM", syscall.SIGALRM, false, false, false, false},
-		{"zero", 0, false, false, false, false},
-		{"negative", -1, false, false, false, false},
-		{"too-large", 65, false, false, false, false},
+		{"USR1-inherited-block", syscall.SIGUSR1, true, false, false, false, true},
+		{"HUP", syscall.SIGHUP, true, false, false, false, false},
+		{"INT", syscall.SIGINT, true, false, false, false, false},
+		{"TERM", syscall.SIGTERM, true, false, false, false, false},
+		{"KILL", syscall.SIGKILL, true, false, false, false, false},
+		{"TERM-notify", syscall.SIGTERM, true, true, false, false, false},
+		{"HUP-inherited-ignore", syscall.SIGHUP, false, false, true, false, false},
+		{"TERM-undelivered", syscall.SIGTERM, false, false, false, true, false},
+		{"STOP", syscall.SIGSTOP, false, false, false, false, false},
+		{"TSTP", syscall.SIGTSTP, false, false, false, false, false},
+		{"TTIN", syscall.SIGTTIN, false, false, false, false, false},
+		{"TTOU", syscall.SIGTTOU, false, false, false, false, false},
+		{"CHLD", syscall.SIGCHLD, false, false, false, false, false},
+		{"URG", syscall.SIGURG, false, false, false, false, false},
+		{"WINCH", syscall.SIGWINCH, false, false, false, false, false},
+		{"CONT", syscall.SIGCONT, false, false, false, false, false},
+		{"QUIT", syscall.SIGQUIT, true, false, false, false, false},
+		{"ABRT", syscall.SIGABRT, true, false, false, false, false},
+		{"SEGV", syscall.SIGSEGV, true, false, false, false, false},
+		{"PIPE", syscall.SIGPIPE, true, false, false, false, false},
+		{"USR1", syscall.SIGUSR1, true, false, false, false, false},
+		{"ALRM", syscall.SIGALRM, true, false, false, false, false},
+		{"USR2-notify", syscall.SIGUSR2, true, true, false, false, false},
+		{"RTMIN+2", 36, true, false, false, false, false},
+		{"ABRT-undelivered", syscall.SIGABRT, false, false, false, true, false},
+		{"zero", 0, false, false, false, false, false},
+		{"negative", -1, false, false, false, false, false},
+		{"too-large", 65, false, false, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,7 +99,15 @@ func TestExitWithSignal(t *testing.T) {
 			defer cancel()
 			args := []string{"-test.run=^TestExitWithSignalHelper$"}
 			var cmd *exec.Cmd
-			if tc.ignore {
+			if tc.blocked {
+				python, err := exec.LookPath("python3")
+				if err != nil {
+					t.Skip("python3 not installed: needed to start the child with a blocked signal")
+				}
+				// The blocked mask survives exec, and Go keeps it on its threads.
+				script := fmt.Sprintf(`import os, signal, sys; signal.pthread_sigmask(signal.SIG_BLOCK, [%d]); os.execv(sys.argv[1], sys.argv[1:])`, tc.sig)
+				cmd = exec.CommandContext(ctx, python, "-I", "-c", script, os.Args[0], args[0])
+			} else if tc.ignore {
 				cmd = exec.CommandContext(ctx, "sh", "-c", `trap '' HUP; exec "$@"`, "sh", os.Args[0], args[0])
 			} else {
 				cmd = exec.CommandContext(ctx, os.Args[0], args...)
@@ -124,6 +137,12 @@ func TestExitWithSignal(t *testing.T) {
 			if tc.signaled {
 				if !status.Signaled() || status.Signal() != tc.sig {
 					t.Fatalf("status = %v, want signal %v: %s", status, tc.sig, output)
+				}
+				if status.CoreDump() {
+					t.Fatalf("status = %v: core dumped, want the process non-dumpable", status)
+				}
+				if bytes.Contains(output, []byte("goroutine ")) {
+					t.Fatalf("Go runtime handled %v: %s", tc.sig, output)
 				}
 			} else {
 				want := 1
