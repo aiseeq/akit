@@ -14,9 +14,105 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"mvdan.cc/sh/v3/syntax"
 )
+
+func TestArgLiteralContract(t *testing.T) {
+	tests := []struct {
+		name, src, call string
+		arg             int
+		want            bool
+	}{
+		{"expansion", `kill $PPID`, "kill", 0, false},
+		{"escaped expansion", `kill \$PPID`, "kill", 0, true},
+		{"single quoted dollar", `kill '$PPID'`, "kill", 0, true},
+		{"double quoted expansion", `kill "$PPID"`, "kill", 0, false},
+		{"double quoted escaped dollar", `kill "\$PPID"`, "kill", 0, false},
+		{"double quoted backslash", `kill "a\\b"`, "kill", 0, false},
+		{"backtick expansion", "kill `printf x`", "kill", 0, false},
+		{"process substitution", `kill <(printf x)`, "kill", 0, false},
+		{"pipeline", `echo '$PPID' | cat`, "echo", 0, false},
+		{"here string", `kill '$PPID' <<< input`, "kill", 0, false},
+		{"background", `echo '$PPID' &`, "echo", 0, false},
+		{"time prefix", `time kill '$PPID'`, "kill", 0, false},
+		{"conditional body", `if true; then echo '$PPID'; fi`, "echo", 0, false},
+		{"conditional shell script", "if true; then bash -c 'kill 1'; fi", "kill", 0, false},
+		{"pipelined shell script", "bash -c 'kill 1' | cat", "kill", 0, false},
+		{"bash single quoted script", `bash -c 'kill \$PPID'`, "kill", 0, true},
+		{"sh single quoted script", `sh -c 'kill \$PPID'`, "kill", 0, true},
+		{"bash double quoted script", `bash -c "kill \$PPID"`, "kill", 0, false},
+		{"heredoc", "bash <<B\nkill \\$PPID\nB", "kill", 0, false},
+		{"brace expansion dollar", `kill {$,x}PPID`, "kill", 0, false},
+		{"brace expansion quote", `kill a{b,"c"}`, "kill", 0, false},
+		{"piped heredoc", "cat <<EOF | bash\nkill '$PPID'\nEOF", "kill", 0, false},
+		{"nested heredoc in double quoted script", "bash -c \"bash <<'E'\nkill '$PPID'\nE\"", "kill", 0, false},
+		{"quoted heredoc expansion", "bash <<'E'\nX=\"'\"; bash -c \"kill -9 $X '\\$PPID' $X\"\nE", "kill", 2, false},
+		{"systemd wrapper", `systemd-run --user --scope kill '$HOME'`, "kill", 0, false},
+		{"sudo shell wrapper", `sudo -s kill '$PPID'`, "kill", 0, false},
+		{"zsh heredoc", "zsh <<'E'\nkill =ls\nE", "kill", 0, false},
+		{"xargs", `xargs -I{} kill {}`, "kill", 0, false},
+		{"find exec", `find . -exec kill {} \;`, "kill", 0, false},
+		{"tilde", `kill ~`, "kill", 0, false},
+		{"glob star", `kill *`, "kill", 0, false},
+		{"escaped glob star", `kill \*`, "kill", 0, true},
+
+		{"glob question", `kill ?`, "kill", 0, false},
+		{"glob bracket", `kill [a]`, "kill", 0, false},
+		{"brace list", `kill {a,b}`, "kill", 0, false},
+		{"ansi quote", `kill $'\t'`, "kill", 0, false},
+		{"locale quote", `kill $"x"`, "kill", 0, false},
+		{"literal number", `kill 1`, "kill", 0, true},
+		{"literal single quoted spaces", `echo 'a b'`, "echo", 0, true},
+		{"literal double quoted", `echo "abc"`, "echo", 0, true},
+		{"bash simple script", `bash -c 'echo hi'`, "echo", 0, true},
+		{"bash double quoted simple script", `bash -c "echo hi"`, "echo", 0, false},
+		{"sudo bash script", `sudo bash -c 'kill 1'`, "kill", 0, false},
+		{"second shell level", `bash -c 'bash -c "kill 1"'`, "kill", 0, false},
+		{"relative shell executable", `./bash -c 'kill 1'`, "kill", 0, false},
+		{"unquoted trailing dollar", `kill foo$`, "kill", 0, false},
+		{"nested sudo wrapper", `bash -c 'sudo kill 1'`, "kill", 0, false},
+		{"zsh command script", `zsh -c 'kill 1'`, "kill", 0, false},
+		{"nice bash script", `nice bash -c 'kill 1'`, "kill", 0, false},
+
+		{"eval", `eval "kill $PPID" *`, "kill", 0, false},
+		{"eval with extra target", `eval kill \$PPID ~/x`, "kill", 0, false},
+		{"ssh", `ssh h kill \$PPID ~`, "kill", 0, false},
+		{"watch", `watch kill \$PPID ~`, "kill", 0, false},
+		{"tilde command", `~/kill 1`, "kill", 0, false},
+		{"sudo tilde command", `sudo ~/kill 1`, "kill", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, tt.call)
+			if err != nil {
+				t.Fatalf("Find: %v", err)
+			}
+			if len(calls) != 1 {
+				t.Fatalf("Find returned %d calls: %#v", len(calls), calls)
+			}
+			if got := calls[0].ArgLiteral(tt.arg); got != tt.want {
+				t.Errorf("ArgLiteral(%d) = %v, want %v; call=%+v", tt.arg, got, tt.want, calls[0])
+			}
+		})
+	}
+	for _, i := range []int{-1, 32, 100} {
+		if (Call{}).ArgLiteral(i) {
+			t.Errorf("ArgLiteral(%d) = true", i)
+		}
+	}
+	calls, err := Find("kill"+strings.Repeat(" 1", 32), "kill")
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("32 arguments: calls=%#v, err=%v", calls, err)
+	}
+	if !calls[0].ArgLiteral(31) || calls[0].ArgLiteral(32) {
+		t.Errorf("boundary arguments: ArgLiteral(31)=%v, ArgLiteral(32)=%v", calls[0].ArgLiteral(31), calls[0].ArgLiteral(32))
+	}
+	if got := unsafe.Sizeof(Call{}); got != 128 {
+		t.Errorf("sizeof Call = %d, want 128", got)
+	}
+}
 
 func nestedSubstitutionScript(lines int) string {
 	const line = `x="$(printf "%%s" "it's $(echo "a)b" | tr a b)")"; y=` + "`date \"+%%s\"`" + `; z=$(( (i+1) * 2 )) # c` + "\n"

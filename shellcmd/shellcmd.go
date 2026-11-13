@@ -29,7 +29,8 @@ type Call struct {
 	// в исходном тексте как слова: argv0 из переменной или с подстановкой, байт скрипта из $'…'.
 	Offset int
 	// Redirs — перенаправления простой команды по порядку (у снятой обёртки — те же, что у неё).
-	Redirs []Redir
+	Redirs      []Redir
+	literalArgs uint32
 	// Loop — вызов в теле цикла while, until, for или select (и во вложенном скрипте такого тела).
 	Loop bool
 	// Background — вызов в задании, чей оператор или объемлющий оператор заканчивается `&`.
@@ -38,9 +39,17 @@ type Call struct {
 	ScriptInput bool
 }
 
+// ArgLiteral сообщает, что аргумент i — литеральное слово на верхнем уровне входного
+// скрипта или на верхнем уровне скрипта из прямого `bash/sh -c '…'`. Всё прочее,
+// слова с раскрытиями или неподдерживаемыми кавычками и индексы вне [0, 32) дают false.
+func (c Call) ArgLiteral(i int) bool {
+	return i >= 0 && i < 32 && c.literalArgs&(uint32(1)<<uint(i)) != 0
+}
+
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
 type cmd struct {
 	call           Call
+	literalContext bool
 	words          []word
 	budget         *nestedParseBudget
 	source         string
@@ -52,10 +61,12 @@ type cmd struct {
 
 // word — место слова в исходной команде и его текст как скрипта.
 type word struct {
-	offset int    // смещение в исходной команде; -1 — слово не литерал
-	script string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
-	pos    []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
-	subst  [][2]int
+	singleQuoted bool
+	raw          string
+	offset       int    // смещение в исходной команде; -1 — слово не литерал
+	script       string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
+	pos          []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
+	subst        [][2]int
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -119,6 +130,7 @@ type nestedParseBudget struct {
 	stdinSteps     int
 	substSteps     int
 	trackWork      bool
+	literalShell   string
 	parsedShells   map[string]int
 }
 
@@ -251,10 +263,12 @@ type heredocShellInput struct {
 }
 
 type walkInfo struct {
-	timedCalls map[*syntax.CallExpr]bool
-	redirs     map[*syntax.CallExpr][]Redir
+	topLevelCalls map[*syntax.CallExpr]bool
+	timedCalls    map[*syntax.CallExpr]bool
+	redirs        map[*syntax.CallExpr][]Redir
 
-	stdinInputs     map[*syntax.CallExpr]*syntax.Redirect
+	stdinInputs map[*syntax.CallExpr]*syntax.Redirect
+
 	loopCalls       map[*syntax.CallExpr]bool
 	backgroundCalls map[*syntax.CallExpr]bool
 	shellInputs     []heredocShellInput
@@ -272,16 +286,24 @@ type walkInfo struct {
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
+	topLevelCalls := make(map[*syntax.CallExpr]bool)
+	for _, stmt := range file.Stmts {
+		if call, ok := stmt.Cmd.(*syntax.CallExpr); ok {
+			topLevelCalls[call] = true
+		}
+	}
 	if !needsWalkInfo(src) {
-		return walkInfo{redirs: make(map[*syntax.CallExpr][]Redir)}
+		return walkInfo{topLevelCalls: topLevelCalls, redirs: make(map[*syntax.CallExpr][]Redir)}
 	}
 	info := walkInfo{
+		topLevelCalls: topLevelCalls,
 		trackWork:     budget.trackWork,
 		hasInputRedir: strings.Contains(src, "<"),
 		timedCalls:    make(map[*syntax.CallExpr]bool),
 		redirs:        make(map[*syntax.CallExpr][]Redir),
 
-		stdinInputs:     make(map[*syntax.CallExpr]*syntax.Redirect),
+		stdinInputs: make(map[*syntax.CallExpr]*syntax.Redirect),
+
 		loopCalls:       make(map[*syntax.CallExpr]bool),
 		backgroundCalls: make(map[*syntax.CallExpr]bool),
 		shellHdocs:      make(map[*syntax.Redirect]bool),
@@ -322,6 +344,7 @@ func collectPipelineWalkInfo(binary *syntax.BinaryCmd, src string, vars map[stri
 	if binary.Op != syntax.Pipe && binary.Op != syntax.PipeAll {
 		return
 	}
+
 	_, err := collectPipedLiteralWalkInfo(binary, src, vars, info)
 	if err != nil {
 		info.errors = append(info.errors, err)
@@ -1095,6 +1118,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	}
 	ws := splitWords(words, split)
 	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
+	setLiteralArgs(&c, call, w.src, w.info, w.budget)
 	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
 		if errors.As(err, &nested) {
@@ -1175,6 +1199,111 @@ func commandName(name string) string {
 
 func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
+}
+
+func setLiteralArgs(c *cmd, expr *syntax.CallExpr, src string, info walkInfo, budget *nestedParseBudget) {
+	c.literalContext = literalCallContext(c, expr, info, budget)
+	if !c.literalContext || len(expr.Args) == 0 || !literalWord(expr.Args[0], src) {
+		return
+	}
+	c.call.literalArgs = literalArgsMask(expr.Args[1:], src)
+}
+
+func literalCallContext(c *cmd, expr *syntax.CallExpr, info walkInfo, budget *nestedParseBudget) bool {
+	if !info.topLevelCalls[expr] || len(c.call.Redirs) != 0 || c.call.Loop || c.call.Background || c.call.ScriptInput || info.timedCalls[expr] {
+		return false
+	}
+	if len(c.call.Via) == 0 {
+		return true
+	}
+	return budget.literalShell != "" && len(c.call.Via) == 2 && c.call.Via[0] == budget.literalShell && c.call.Via[1] == "-c"
+}
+
+func literalWord(word *syntax.Word, src string) bool {
+	if word == nil || len(word.Parts) == 0 {
+		return false
+	}
+	start, end := int(word.Pos().Offset()), int(word.End().Offset())
+	if !validSpan(src, start, end) {
+		return false
+	}
+	for _, part := range word.Parts {
+		if !literalWordPart(part, src) {
+			return false
+		}
+	}
+	return !hasUnquotedExpansion(src[start:end])
+}
+
+func literalWordPart(part syntax.WordPart, src string) bool {
+	switch p := part.(type) {
+	case *syntax.Lit:
+		return true
+	case *syntax.SglQuoted:
+		return !p.Dollar
+	case *syntax.DblQuoted:
+		if p.Dollar {
+			return false
+		}
+		for _, inner := range p.Parts {
+			lit, ok := inner.(*syntax.Lit)
+			if !ok || !literalDoublePart(lit, src) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func literalDoublePart(lit *syntax.Lit, src string) bool {
+	start, end := int(lit.Pos().Offset()), int(lit.End().Offset())
+	return validSpan(src, start, end) && !strings.Contains(src[start:end], `\`)
+}
+
+func hasUnquotedExpansion(text string) bool {
+	var quote byte
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if quote == 0 && (ch == '"' || ch == '\'') {
+			quote = ch
+			continue
+		}
+		if quote == ch {
+			quote = 0
+			continue
+		}
+		if quote != 0 {
+			continue
+		}
+		if ch == '\\' {
+			i++
+			continue
+		}
+		if strings.ContainsRune("{}~*?[]$`", rune(ch)) {
+			return true
+		}
+	}
+	return false
+}
+
+func singleQuotedWord(word *syntax.Word) bool {
+	if word == nil || len(word.Parts) != 1 {
+		return false
+	}
+	quoted, ok := word.Parts[0].(*syntax.SglQuoted)
+	return ok && !quoted.Dollar
+}
+
+func literalArgsMask(words []*syntax.Word, src string) uint32 {
+	var mask uint32
+	for i, word := range words {
+		if i < 32 && literalWord(word, src) {
+			mask |= uint32(1) << uint(i)
+		}
+	}
+	return mask
 }
 
 func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inherited []string, vars map[string]string, loopCalls, backgroundCalls map[*syntax.CallExpr]bool, calls *[]Call, budget *nestedParseBudget) error {
@@ -1713,6 +1842,13 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) ([
 	ws := make([]word, len(args))
 	for i, arg := range args {
 		ws[i].offset = -1
+		ws[i].singleQuoted = singleQuotedWord(arg)
+		if i == 0 {
+			start, end := int(arg.Pos().Offset()), int(arg.End().Offset())
+			if validSpan(src, start, end) {
+				ws[i].raw = src[start:end]
+			}
+		}
 		if scripts {
 			var err error
 			ws[i].script, ws[i].pos, err = wordScript(arg, src, literals[i])
@@ -2633,6 +2769,13 @@ func parallelCommandStart(args []string) (int, bool) {
 	return start, false
 }
 
+func literalShellScript(c cmd, name string, operand int) bool {
+	if (name != "bash" && name != "sh") || c.call.Name != name || !c.literalContext || len(c.call.Via) != 0 || len(c.call.Redirs) != 0 || c.call.Loop || c.call.Background || c.call.ScriptInput || operand < 0 || operand+1 >= len(c.words) || c.words[0].raw != name {
+		return false
+	}
+	return c.words[operand+1].singleQuoted
+}
+
 // expand раскрывает то, что вызов запускает, кроме программы под обёрткой (её раскрывает emit).
 func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
 	name, args := c.call.Name, c.call.Args
@@ -2645,7 +2788,12 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
 			script := c.words[operand+1]
 			first := len(*calls)
+			previousLiteralShell := c.budget.literalShell
+			if literalShellScript(c, name, operand) {
+				c.budget.literalShell = name
+			}
 			err := parseNestedWithBudget(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+			c.budget.literalShell = previousLiteralShell
 			relocateNestedLines(c, first, calls)
 			return err
 		}
