@@ -195,6 +195,60 @@ func TestMaskSecretLabelsWithSpacedHyphen(t *testing.T) {
 	}
 }
 
+func TestMaskSecretValueAfterAnySecretLabel(t *testing.T) {
+	for _, input := range []string{
+		"ключ и пароль: Abcdefghijklmno",
+		"ключ и токен: Abcdefghijklmno",
+	} {
+		got, _ := Mask(input)
+		if strings.Contains(got, "Abcdefghijklmno") {
+			t.Errorf("secret value left visible for %q: %q", input, got)
+		}
+	}
+}
+
+func TestMaskRussianLabelWordBoundaries(t *testing.T) {
+	for _, label := range []string{
+		"пароль", "пароля", "паролю", "паролем", "пароле", "пароли", "паролей", "паролям", "паролями", "паролях",
+		"токен", "токена", "токену", "токеном", "токене", "токены", "токенов", "токенам", "токенами", "токенах",
+		"ключ", "ключа", "ключу", "ключом", "ключе", "ключи", "ключей", "ключам", "ключами", "ключах",
+	} {
+		got, _ := Mask(label + ": Abcdefghijk12")
+		if strings.Contains(got, "Abcdefghijk12") {
+			t.Errorf("secret form %q was not recognized: %q", label, got)
+		}
+	}
+	for _, label := range []string{"токенизация", "паролизация", "ключевой", "ключница"} {
+		input := label + ": Abcdefghijk12"
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("non-label %q changed to %q, %v", label, got, found)
+		}
+	}
+}
+
+func TestMaskRussianShortValueAndGuillemets(t *testing.T) {
+	for _, input := range []string{
+		"пароль: example",
+		"пароль: абвгдежзийклмно",
+		"пароль: «нет»",
+		"auth: same-origin",
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("ordinary short value changed %q to %q, %v", input, got, found)
+		}
+	}
+	for _, input := range []string{
+		"пароль: абвгдежзийклмноп",
+		"пароль: «Abcdefghijklmno»",
+		"password: example",
+	} {
+		_, found := Mask(input)
+		if found["password"] == 0 {
+			t.Errorf("secret-shaped value was not masked for %q", input)
+		}
+	}
+}
+
 func TestMaskMarkdownValueMayStartWithEmphasis(t *testing.T) {
 	input := `password=**Zq7xW9vK2mPq8Rt**`
 	got, _ := Mask(input)
@@ -228,6 +282,7 @@ func TestContextAnchorGroups(t *testing.T) {
 		{"the tokens passed through the high gate", 0},
 		{"no credentials or command names; pseudo curly", 0},
 		{"token: x", anchorName},
+		{"токен: x", anchorName | anchorRussianName},
 		{`{"api_token1":"x"}`, anchorName},
 		{"--db_password x", anchorName},
 		{`["--token","x"]`, anchorName},
