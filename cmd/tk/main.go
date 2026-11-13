@@ -173,6 +173,7 @@ type taskFacts struct {
 	Plan                               []planJSON
 	Blocks, BlockedBy                  []string
 	Actors                             map[string]string
+	RenamedFrom                        []string
 }
 
 func factsFromBody(body string) *taskFacts {
@@ -183,8 +184,18 @@ func factsFromBody(body string) *taskFacts {
 		NoCheck: noCheck(body), Journal: lineValue(body, "Вид: ") == "журнал",
 		Checker: checker, Check: check, CheckerSession: checkerSession,
 		Plan: planItems(body), Blocks: headerLinks(body, blocksPrefix),
-		BlockedBy: headerLinks(body, blockedPrefix), Actors: journalActors(body),
+		BlockedBy: headerLinks(body, blockedPrefix), Actors: journalActors(body), RenamedFrom: renamedFrom(body),
 	}
+}
+
+func renamedFrom(body string) []string {
+	var names []string
+	for _, record := range journalLines(body) {
+		if match := renameHistoryRE.FindStringSubmatch(journalRecordHeader(record)); match != nil {
+			names = append(names, match[1])
+		}
+	}
+	return names
 }
 
 func factsForTask(t task) *taskFacts {
@@ -2018,6 +2029,15 @@ func ensureTaskExclude(main, commonDir string) error {
 }
 func fail(w io.Writer, e error) int { fmt.Fprintf(w, "tk: %v\n", e); return exitUsage }
 func loadCachedTasks(dir string) ([]task, error) {
+	if value := os.Getenv("TK_NO_PARSE_CACHE"); value != "" {
+		disabled, err := strconv.ParseBool(value)
+		if err != nil { //nolint:silent-error-handling // An invalid optional switch disables caching by falling back to ordinary parsing.
+			return loadTasks(dir, true)
+		}
+		if disabled {
+			return loadTasks(dir, true)
+		}
+	}
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -2025,12 +2045,17 @@ func loadCachedTasks(dir string) ([]task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read task directory %s: %w", dir, err)
 	}
-	cachePath, _, err := parseCachePathFor(dir, filepath.Join(dir, "cache-index.md"))
-	if err != nil {
-		return nil, fmt.Errorf("resolve ticket cache path: %w", err)
+	cachePath, _, err := parseCachePathFor(dir, dir)
+	if err != nil { //nolint:silent-error-handling // An unavailable optional cache path leaves ordinary ticket parsing available.
+		return loadTasks(dir, true)
 	}
-	cache := readParseCacheEntries(cachePath)
+	binary, err := parseCacheBinaryIdentity()
+	if err != nil { //nolint:silent-error-handling // An unavailable executable identity disables only the optional cache.
+		return loadTasks(dir, true)
+	}
+	cache, previous := readParseCacheEntries(cachePath, binary)
 	var tasks []task
+	seen := make(map[string]bool)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -2043,10 +2068,25 @@ func loadCachedTasks(dir string) ([]task, error) {
 		if err != nil {
 			return nil, err
 		}
+		key, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ticket cache key: %w", err)
+		}
+		seen[key] = true
 		tasks = append(tasks, cached)
 	}
-	if err := writeParseCacheEntries(cachePath, cache); err != nil {
-		return nil, err
+	absDir, err := filepath.Abs(dir)
+	if err != nil { //nolint:silent-error-handling // Ticket data is complete; only stale-entry pruning needs an absolute directory.
+		return tasks, nil
+	}
+	prefix := absDir + string(os.PathSeparator)
+	for key := range cache {
+		if strings.HasPrefix(key, prefix) && !seen[key] {
+			delete(cache, key)
+		}
+	}
+	if err := writeParseCacheEntries(cachePath, binary, cache, previous); err != nil { // Cache writes are optional; preserve the list result on failure.
+		return tasks, nil
 	}
 	return tasks, nil
 }
@@ -2056,10 +2096,6 @@ func load(dir string) ([]task, error) {
 }
 
 func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
-	return loadTasksMode(dir, tolerateUnknownStatus, false)
-}
-
-func loadTasksMode(dir string, tolerateUnknownStatus, useCache bool) ([]task, error) {
 	es, e := os.ReadDir(dir)
 	if errors.Is(e, os.ErrNotExist) {
 		return nil, nil
@@ -2077,14 +2113,6 @@ func loadTasksMode(dir string, tolerateUnknownStatus, useCache bool) ([]task, er
 			continue
 		}
 		p := filepath.Join(dir, en.Name())
-		if useCache {
-			t, loadErr := loadCachedTask(p, tolerateUnknownStatus)
-			if loadErr != nil {
-				return nil, loadErr
-			}
-			ts = append(ts, t)
-			continue
-		}
 		b, e := os.ReadFile(p)
 		if e != nil {
 			return nil, e
@@ -2164,6 +2192,9 @@ func lastChange(s string, mtime time.Time) time.Time {
 	return changed
 }
 func find(dir, id string) (task, error) {
+	if parseCacheBeforeLinkedFind != nil {
+		parseCacheBeforeLinkedFind()
+	}
 	ts, e := load(dir)
 	if e != nil {
 		return task{}, e
@@ -2188,8 +2219,8 @@ func matchesID(t task, id string) bool {
 	if t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id {
 		return true
 	}
-	for _, record := range journalLines(t.body) {
-		if m := renameHistoryRE.FindStringSubmatch(journalRecordHeader(record)); m != nil && (m[1] == id || strings.TrimSuffix(m[1], ".md") == id) {
+	for _, old := range factsForTask(t).RenamedFrom {
+		if old == id || strings.TrimSuffix(old, ".md") == id {
 			return true
 		}
 	}
@@ -2209,12 +2240,12 @@ func parseTaskName(name string) (taskName, bool) {
 }
 
 func list(root string, o options, out, errout io.Writer) int {
-	all, labels, skipped, err := gatherTasks(root, o)
+	all, labels, skipped, loadedByProject, err := gatherTasks(root, o)
 	if err != nil {
 		return fail(errout, err)
 	}
 	if o.json {
-		return writeListJSON(root, all, labels, o, out, errout)
+		return writeListJSON(root, all, labels, loadedByProject, o, out, errout)
 	}
 	if len(all) == 0 && len(skipped) == 0 {
 		fmt.Fprintln(out, "no tasks")
@@ -2231,34 +2262,35 @@ func list(root string, o options, out, errout io.Writer) int {
 	return 0
 }
 
-func gatherTasks(root string, o options) ([]task, map[string]string, []string, error) {
+func gatherTasks(root string, o options) ([]task, map[string]string, []string, map[string][]task, error) {
 	repos, err := taskRepos(root, o.root)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	labels := make(map[string]string)
+	loadedByProject := make(map[string][]task)
 	var skipped []string
 	var tasks []task
 	for _, repo := range repos {
 		dir := filepath.Join(repo, "docs/tasks")
 		var loaded []task
-		var err error
 		if o.json {
 			loaded, err = loadCachedTasks(dir)
 		} else {
 			loaded, err = loadTasks(dir, true)
 		}
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		label, err := repoLabel(o.root, repo)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
+		loadedByProject[repo] = loaded
 		for _, entry := range entries {
 			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") {
 				if _, ok := parseTaskName(entry.Name()); !ok {
@@ -2274,7 +2306,7 @@ func gatherTasks(root string, o options) ([]task, map[string]string, []string, e
 			}
 		}
 	}
-	return tasks, labels, skipped, nil
+	return tasks, labels, skipped, loadedByProject, nil
 }
 
 func repoLabel(baseDir, repo string) (string, error) {
@@ -4558,6 +4590,17 @@ func nextGroup(t task, actor string, gate queuegate.Scope) int {
 }
 
 func orderedNextCandidates(tasks []task, actor string, gate queuegate.Scope) []task {
+	return orderedNextCandidatesUsing(tasks, actor, gate, refBlockMark)
+}
+
+func orderedNextCandidatesForList(tasks []task, actor string, gate queuegate.Scope, allProjects map[string][]task) []task {
+	lookup := func(project, ref string, errout io.Writer) string {
+		return cachedListBlockMark(project, ref, allProjects, errout)
+	}
+	return orderedNextCandidatesUsing(tasks, actor, gate, lookup)
+}
+
+func orderedNextCandidatesUsing(tasks []task, actor string, gate queuegate.Scope, blockMark func(string, string, io.Writer) string) []task {
 	candidates := nextCandidates(tasks, actor, gate)
 	bySlug := make(map[string]*task, len(tasks))
 	indices := make([]int, len(tasks))
@@ -4583,7 +4626,7 @@ func orderedNextCandidates(tasks []task, actor string, gate queuegate.Scope) []t
 		for _, ref := range factsForTask(*t).BlockedBy {
 			target, found := bySlug[ref]
 			if strings.Contains(ref, "/") || !found {
-				if maxDepth < 1 && refBlockMark(taskProject(t.path), ref, io.Discard) != "" {
+				if maxDepth < 1 && blockMark(taskProject(t.path), ref, io.Discard) != "" {
 					maxDepth = 1
 				}
 				continue
@@ -4617,6 +4660,33 @@ func orderedNextCandidates(tasks []task, actor string, gate queuegate.Scope) []t
 		return left.slug < right.slug
 	})
 	return candidates
+}
+
+func cachedListBlockMark(project, ref string, allProjects map[string][]task, errout io.Writer) string {
+	dir, id, err := referenceLocation(project, ref)
+	if err != nil { //nolint:silent-error-handling // The existing resolver handles diagnostics and transfer-ledger fallbacks.
+		return refBlockMark(project, ref, errout)
+	}
+	loaded, ok := allProjects[filepath.Clean(dirProject(dir))]
+	if !ok {
+		return refBlockMark(project, ref, errout)
+	}
+	var match *task
+	matches := 0
+	for i := range loaded {
+		candidate := &loaded[i]
+		if matchesID(*candidate, id) {
+			match = candidate
+			matches++
+		}
+	}
+	if matches != 1 || !validStatus(match.status) || isArchivedTask(match.path) {
+		return refBlockMark(project, ref, errout)
+	}
+	if !closedStatus(match.status) {
+		return " заблокирован: " + ref
+	}
+	return ""
 }
 
 func nextLine(choice nextChoice, errout io.Writer) string {
@@ -4656,7 +4726,7 @@ func completionParts(who, check string) (string, string, string) {
 	return checker, strings.TrimSpace(check), ""
 }
 
-func writeListJSON(root string, ts []task, labels map[string]string, o options, out, errout io.Writer) int {
+func writeListJSON(root string, ts []task, labels map[string]string, loadedByProject map[string][]task, o options, out, errout io.Writer) int {
 	if o.root != "" {
 		var err error
 		root, err = filepath.Abs(o.root)
@@ -4678,11 +4748,13 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 		if _, ok := projects[project]; ok {
 			continue
 		}
-		loaded, err := loadCachedTasks(filepath.Join(project, "docs", "tasks"))
-		if err != nil {
-			return fail(errout, err)
+		projectKey := filepath.Clean(project)
+		if o.root != "" {
+			projectKey = filepath.Clean(taskProject(t.path))
+		} else if o.mainRoot != "" {
+			projectKey = filepath.Clean(o.mainRoot)
 		}
-		projects[project] = loaded
+		projects[project] = loadedByProject[projectKey]
 	}
 	for project, loaded := range projects {
 		state := takes.project(project, errout)
@@ -4693,7 +4765,7 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 		if actor == "" {
 			actor = state.master
 		}
-		ordered := orderedNextCandidates(loaded, actor, state.scope)
+		ordered := orderedNextCandidatesForList(loaded, actor, state.scope, loadedByProject)
 		for i := range ordered {
 			ranks[ordered[i].path] = i + 1
 		}

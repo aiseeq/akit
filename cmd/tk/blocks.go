@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -666,83 +665,9 @@ func blockMark(t task, errout io.Writer) string {
 	return ""
 }
 
-func directTaskPath(dir, id string) (string, bool, error) {
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("read task directory %s: %w", dir, err)
-	}
-	var match string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name, ok := parseTaskName(entry.Name())
-		if !ok || (name.slug != id && entry.Name() != id && strings.TrimSuffix(entry.Name(), ".md") != id) {
-			continue
-		}
-		if match != "" {
-			return "", false, nil
-		}
-		match = filepath.Join(dir, entry.Name())
-	}
-	return match, match != "", nil
-}
-
-func readTaskStatus(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open blocking ticket %s: %w", path, err)
-	}
-	defer file.Close()
-	reader := bufio.NewReader(file)
-	for {
-		line, readErr := reader.ReadString('\n')
-		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
-		if value, ok := strings.CutPrefix(line, "Статус: "); ok {
-			if !validStatus(value) {
-				return "", fmt.Errorf("unknown status %q", value)
-			}
-			return value, nil
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				return "открыт", nil
-			}
-			return "", fmt.Errorf("read blocking ticket %s: %w", path, readErr)
-		}
-	}
-}
-
 // refBlockMark is the mark of one blocking link when it still blocks: the ticket
 // is open and not archived, or it went to an external tracker; empty otherwise.
 func refBlockMark(project, ref string, errout io.Writer) string {
-	if dir, id, err := referenceLocation(project, ref); err == nil {
-		path, found, directErr := directTaskPath(dir, id)
-		if directErr == nil && !found {
-			if archive, archiveErr := archiveDir(dirProject(dir)); archiveErr == nil {
-				path, found, directErr = directTaskPath(archive, id)
-			}
-		}
-		if directErr != nil {
-			fmt.Fprintf(errout, "tk: warning: cannot find blocking ticket %s: %v\n", ref, directErr)
-		} else if found {
-			if isArchivedTask(path) {
-				return ""
-			}
-			st, statusErr := readTaskStatus(path)
-			if statusErr != nil {
-				fmt.Fprintf(errout, "tk: warning: cannot read blocking ticket %s: %v\n", ref, statusErr)
-				return ""
-			}
-			if !closedStatus(st) {
-				return " заблокирован: " + ref
-			}
-			return ""
-		}
-	}
 	dir, path, err := linkedPath(project, ref)
 	if err == nil {
 		if isArchivedTask(path) {
