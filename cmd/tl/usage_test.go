@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aiseeq/akit/price"
 )
@@ -41,13 +42,19 @@ func TestUsage(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("want header, session, total and summary:\n%s", out)
 	}
+	if !strings.Contains(rows[0], "pct_week100\tusd_api") || strings.Split(rows[2], "\t")[6] != "-" {
+		t.Errorf("missing pct_week100 column or absent-rate marker:\n%s", out)
+	}
+	if !strings.Contains(rows[3], "configure XDG_CONFIG_HOME/akit/rates.tsv") {
+		t.Errorf("missing rates setup hint: %q", rows[3])
+	}
 	opus, _ := price.Cost("claude-opus-5-5", price.Usage{Input: 10, CacheWrite: 1000, CacheRead: 20000, Output: 300})
 	sonnet, _ := price.Cost("claude-sonnet-5-5", price.Usage{Input: 5, CacheRead: 30000, Output: 100})
 	f := strings.Split(rows[2], "\t")
 	if f[0] != "total" || f[1] != "3" || f[2] != "16" || f[3] != "1000" || f[4] != "50000" || f[5] != "401" {
 		t.Errorf("split reply counted twice or sums wrong: %q", rows[2])
 	}
-	if got, _ := strconv.ParseFloat(f[6], 64); math.Abs(got-(opus+sonnet)) > 0.005 {
+	if got, _ := strconv.ParseFloat(f[7], 64); math.Abs(got-(opus+sonnet)) > 0.005 {
 		t.Errorf("usd_api %v, want %.4f", got, opus+sonnet)
 	}
 	if !strings.Contains(rows[3], "1 reply(ies) without a price") {
@@ -58,6 +65,73 @@ func TestUsage(t *testing.T) {
 	}
 	if code, _, _ := runTL(t, e, "--usage", "--role", "user", path); code != exitNone {
 		t.Errorf("--role user has no replies, code %d", code)
+	}
+}
+
+func TestUsageWeek100(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rates.tsv")
+	content := "# synthetic rates\napi_usd_week\tprovider\tvalid_from\tplan_usd_month\n" +
+		"1000\tanthropic\t2026-01-01\t200\n" +
+		"1500\tanthropic\t2026-02-01\t200\n" +
+		"2000\tanthropic\t2026-02-01\t200\n" +
+		"9000\tanthropic\t2099-01-01\t200\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rates, err := readUsageRates(path, time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rates["anthropic"]; got.apiWeek != 2000 || got.validFrom.Format(time.DateOnly) != "2026-02-01" {
+		t.Fatalf("latest equal-date row = %+v", got)
+	}
+	var gotTally tally
+	// $10 / ($2000 × $100 / $200 = $1000 API per $100 week) × 100 = 1.00%.
+	gotTally.addWeek100("claude-example", 10, true, rates)
+	if gotTally.pctWeek100 != 1 || gotTally.week100Replies != 1 || gotTally.noWeek100 != 0 {
+		t.Fatalf("$10 with plan $200 and api_usd_week $2000 = %+v", gotTally)
+	}
+	// The illustrative $1000 weekly API limit yields $500 API per $100 week: $10 is 2.00%.
+	var example tally
+	example.addWeek100("claude-example", 10, true, map[string]usageRate{"anthropic": {apiWeek: 1000, planMonth: 200}})
+	if example.pctWeek100 != 2 {
+		t.Fatalf("$10 with plan $200 and api_usd_week $1000 = %.2f%%, want 2.00%%", example.pctWeek100)
+	}
+	mixedRates := map[string]usageRate{
+		"anthropic": {apiWeek: 1000, planMonth: 200},
+		"openai":    {apiWeek: 500, planMonth: 100},
+	}
+	var mixed tally
+	mixed.addWeek100("claude-example", 10, true, mixedRates)
+	mixed.addWeek100("gpt-example", 5, true, mixedRates)
+	if mixed.pctWeek100 != 3 || mixed.week100Replies != 2 {
+		t.Fatalf("mixed providers should calculate each reply using its provider rate: %+v", mixed)
+	}
+	if got := usageProvider("mystery-model"); got != "" {
+		t.Fatalf("unknown model provider = %q", got)
+	}
+	var unknown tally
+	unknown.addWeek100("mystery-model", 10, true, rates)
+	if unknown.noWeek100 != 1 {
+		t.Fatalf("unknown model should have no rate: %+v", unknown)
+	}
+	var missingProvider tally
+	missingProvider.addWeek100("gpt-example", 10, true, rates)
+	if missingProvider.noWeek100 != 1 {
+		t.Fatalf("provider without a course should be counted: %+v", missingProvider)
+	}
+	if _, err := readUsageRates(filepath.Join(t.TempDir(), "absent.tsv"), time.Now()); err == nil {
+		t.Fatal("missing rates file should be reported")
+	}
+}
+
+func TestUsageProvider(t *testing.T) {
+	for model, want := range map[string]string{
+		"claude-opus": "anthropic", "gpt-5": "openai", "o3-mini": "openai", "codex-test": "openai", "local-model": "",
+	} {
+		if got := usageProvider(model); got != want {
+			t.Errorf("usageProvider(%q) = %q, want %q", model, got, want)
+		}
 	}
 }
 
