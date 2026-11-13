@@ -154,7 +154,7 @@ func TestExport(t *testing.T) {
 
 func TestExportPII(t *testing.T) {
 	src, rules := fixture(t)
-	write(t, filepath.Join(src, ".claude/skills/jira/SKILL.md"), "# jira\nКонтакт: fixture@example.org, хост 10.1.2.3, локально 127.0.0.1\nnoreply@anthropic.com\n", 0o644)
+	write(t, filepath.Join(src, ".claude/skills/jira/SKILL.md"), "# jira\nКонтакт: fixture@example.org, хост 10.1.2.3, локально 127.0.0.1\nnoreply@anthropic.com\nличное: убрать\n", 0o644)
 	// README — шаблон как есть, без замен: почта в нём ловится проверкой
 	write(t, filepath.Join(rules, "README.template.md"), "# Правила\nАвтор: me@corp.example\n", 0o644)
 	out := filepath.Join(t.TempDir(), "out")
@@ -232,6 +232,46 @@ func TestExportErrors(t *testing.T) {
 	write(t, filepath.Join(rules, "manifest/replace.tsv"), "без табуляции\n", 0o644)
 	if code, _, _ := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(t.TempDir(), "o")); code != exitUsage {
 		t.Errorf("кривая замена: code %d", code)
+	}
+}
+
+func TestExportRejectsUnmatchedManifestEntriesBeforeReplacement(t *testing.T) {
+	for _, c := range []struct {
+		name, file, value, source string
+	}{
+		{"section", "global-sections.txt", "gone-section", "old-section\n- hidden\n"},
+		{"drop line", "drop-lines.txt", "gone-line", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src, rules := fixture(t)
+			out := filepath.Join(t.TempDir(), "out")
+			if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+				t.Fatalf("initial export: code %d %q", code, stderr)
+			}
+			if c.name == "section" {
+				write(t, filepath.Join(src, ".claude/CLAUDE.md"), c.source, 0o644)
+				write(t, filepath.Join(rules, "manifest/global-sections.txt"), c.value+"\n", 0o644)
+			} else {
+				write(t, filepath.Join(rules, "manifest/drop-lines.txt"), c.value+"\n", 0o644)
+			}
+			before := snapshot(t, out)
+			code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+			if code != exitDirty || !strings.Contains(stdout+stderr, c.file) || !strings.Contains(stdout+stderr, c.value) {
+				t.Fatalf("code %d, output %q %q", code, stdout, stderr)
+			}
+			if snapshot(t, out) != before {
+				t.Fatal("OUT_DIR changed")
+			}
+		})
+	}
+}
+
+func TestExportWarnsAboutUnmatchedReplacement(t *testing.T) {
+	src, rules := fixture(t)
+	write(t, filepath.Join(rules, "manifest/replace.tsv"), "me@corp.example\t<твоя почта>\nnot-present\treplaced\n", 0o644)
+	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(t.TempDir(), "out"))
+	if code != 0 || !strings.Contains(stdout+stderr, "replace.tsv") || !strings.Contains(stdout+stderr, "not-present") {
+		t.Fatalf("code %d, output %q %q", code, stdout, stderr)
 	}
 }
 
@@ -369,6 +409,9 @@ func TestExportKeepsMountedData(t *testing.T) {
 	run := `"$3" -test.run '^TestExportKeepsMountedData$' -test.count=1 >/dev/null`
 	twoFS := `mkdir -p "$2/a" "$2/b" && mount -t tmpfs tmpfs "$2/a" && mount -t tmpfs tmpfs "$2/b" && ` +
 		`CRE_BIND_WANT0=1 CRE_BIND_OUT="$2/a/out" ` + run + ` && CRE_BIND_WANT0=1 CRE_BIND_OUT="$2/b/out" ` + run +
+		` && test "$(stat -c %i "$2/a/out/skills/jira/SKILL.md")" = "$(stat -c %i "$2/b/out/skills/jira/SKILL.md")"` +
+		` && test "$(stat -c %d "$2/a/out/skills/jira/SKILL.md")" != "$(stat -c %d "$2/b/out/skills/jira/SKILL.md")"` +
+		` && printf 'same inode, other device: inode=%s devices=%s,%s\n' "$(stat -c %i "$2/a/out/skills/jira/SKILL.md")" "$(stat -c %d "$2/a/out/skills/jira/SKILL.md")" "$(stat -c %d "$2/b/out/skills/jira/SKILL.md")"` +
 		` && mount --bind "$2/b/out/skills/jira" "$2/a/out/skills/jira"`
 	for _, c := range []struct{ name, mount, from, out, after string }{
 		{"prior", `mount --bind "$1" "$2/out/skills/jira"`, twin, "out", ""},
@@ -409,6 +452,8 @@ func TestExportKeepsMountedData(t *testing.T) {
 			t.Logf("%s: no casefold tmpfs: %s", c.name, b)
 		} else if err != nil {
 			t.Errorf("%s: %v\n%s", c.name, err, b)
+		} else if c.name == "same inode, other device" {
+			t.Logf("%s: %s", c.name, strings.TrimSpace(string(b)))
 		}
 		for _, f := range []string{"work/CLAUDE.md", ".claude/CLAUDE.md", ".claude/hooks/h.sh", ".claude/skills/secret/SKILL.md", "../rules/extra/x", repo + "/skills/z/f", twin + "/SKILL.md"} {
 			if !filepath.IsAbs(f) {

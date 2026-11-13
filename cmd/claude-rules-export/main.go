@@ -51,7 +51,7 @@ and paths differing only in case are refused.
 
 --rules is the folder with manifest/ and README.template.md
 (default ~/.claude/tools/claude-rules-export).
-Exit: 0 clean, 1 private data or a missing skill, 2 usage/IO error.
+Exit: 0 clean, 1 private data, a missing skill, an unmatched section name or an unmatched line to remove, 2 usage/IO error.
 `
 
 const (
@@ -127,6 +127,9 @@ func run(opts options, stdout, stderr io.Writer) int {
 	case errors.Is(err, errDirty):
 		return exitDirty
 	case errors.As(err, new(missingSkill)):
+		fmt.Fprintf(stderr, "claude-rules-export: %v\n", err)
+		return exitDirty
+	case errors.As(err, new(missingManifestEntry)):
 		fmt.Fprintf(stderr, "claude-rules-export: %v\n", err)
 		return exitDirty
 	case err != nil:

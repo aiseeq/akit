@@ -23,10 +23,11 @@ import (
 )
 
 // Выгрузка удаляет в OUT_DIR только записи своего прошлого прогона, которые с тех пор не менялись: путь, тип,
-// права с битами suid, sgid и sticky, размер и sha256 файла, текст ссылки, xattr (в них и ACL), устройство, inode
-// и время рождения — как в списке. Список лежит вне OUT_DIR, в каталоге состояния, под ключом физического пути
+// права с битами suid, sgid и sticky, размер и sha256 файла, текст ссылки, xattr (в них и ACL), файловую систему,
+// inode и время рождения — как в списке. Номер устройства сохраняется для чтения старых списков, но не сверяется.
+// Список лежит вне OUT_DIR, в каталоге состояния, под ключом физического пути
 // OUT_DIR: под другим путём (ссылка, bind mount, overlay, /proc) его нет, и непустая папка без списка — отказ. Чужой
-// файл с тем же содержимым — другие устройство, inode или время рождения, тоже отказ. Папки удаляются только
+// файл с тем же содержимым — другая файловая система, inode или время рождения, тоже отказ. Папки удаляются только
 // пустыми, все операции в OUT_DIR — через os.Root: ни путь из списка, ни ссылка, подменённая на ходу, не выводят
 // за OUT_DIR.
 //
@@ -49,6 +50,7 @@ type entry struct {
 	Uid   uint32      `json:"uid,omitempty"`
 	Gid   uint32      `json:"gid,omitempty"`
 	Dev   uint64      `json:"dev,omitempty"`
+	FSID  string      `json:"fsid,omitempty"`
 	Ino   uint64      `json:"ino,omitempty"`
 	Birth int64       `json:"birth,omitempty"`
 }
@@ -243,11 +245,11 @@ func scanStage(dir string) ([]entry, error) {
 		if err != nil {
 			return err
 		}
-		// права нужны при переносе; владелец, xattr, устройство и inode — у созданной в OUT_DIR записи, не у сборки
+		// права нужны при переносе; владелец, xattr, устройство, filesystem ID и inode — у записи OUT_DIR, не у сборки
 		if e.Kind == "d" && e.Mode.Perm()&0o700 != 0o700 {
 			return fmt.Errorf("folder %s: mode %v, the owner cannot write into it", rel, e.Mode)
 		}
-		e.Uid, e.Gid, e.Xattr, e.Dev, e.Ino = 0, 0, "", 0, 0
+		e.Uid, e.Gid, e.Xattr, e.Dev, e.FSID, e.Ino = 0, 0, "", 0, "", 0
 		entries = append(entries, e)
 		return nil
 	})
@@ -258,7 +260,7 @@ func scanStage(dir string) ([]entry, error) {
 }
 
 // describe — запись по пути rel: тип, права, владелец и группа, размер, sha256 файла, текст ссылки, xattr,
-// устройство, inode.
+// устройство и inode.
 func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), readlink func() (string, error), rel string) (entry, error) {
 	if err := checkEntryPath(rel); err != nil {
 		return entry{}, err
@@ -349,7 +351,22 @@ func same(have, want *entry) bool {
 	case "tl":
 		return have.Kind == "l" && have.Link == want.Link
 	}
-	return *have == *want
+	h, w := *have, *want
+	// st_dev can be reassigned when a filesystem is mounted. Older lists have no fsid;
+	// accept them using their remaining identity fields and refresh them on this export.
+	h.Dev, w.Dev = 0, 0
+	if w.FSID == "" {
+		h.FSID = ""
+	}
+	return h == w
+}
+
+func filesystemID(fd int) (string, error) {
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(fd, &st); err != nil {
+		return "", fmt.Errorf("statfs: %w", err)
+	}
+	return fmt.Sprintf("%08x%08x", uint32(st.Fsid.Val[0]), uint32(st.Fsid.Val[1])), nil
 }
 
 // statx — тест подменяет его файловой системой без времени рождения.
@@ -446,6 +463,19 @@ func verifyOut(root *os.Root, known []entry) error {
 			have, err := describe(func() (fs.FileInfo, error) { return root.Lstat(rel) },
 				func() (*os.File, error) { return root.Open(rel) },
 				func() (string, error) { return root.Readlink(rel) }, rel)
+			if err != nil {
+				return fmt.Errorf("OUT_DIR: %w", err)
+			}
+			fsPath := rel
+			if have.Kind == "l" {
+				fsPath = path.Dir(rel)
+			}
+			fsFile, err := root.Open(fsPath)
+			if err != nil {
+				return fmt.Errorf("OUT_DIR: %w", err)
+			}
+			have.FSID, err = filesystemID(int(fsFile.Fd()))
+			_ = fsFile.Close()
 			if err != nil {
 				return fmt.Errorf("OUT_DIR: %w", err)
 			}
@@ -566,6 +596,10 @@ func writeOther(root *os.Root, e *entry, journal *os.File) (entry, error) {
 	if err != nil {
 		return entry{}, err
 	}
+	have.FSID, err = filesystemID(int(dir.Fd()))
+	if err != nil {
+		return entry{}, err
+	}
 	if have.Birth, err = birthAt(int(dir.Fd()), name, 0); err != nil {
 		return entry{}, err
 	}
@@ -625,6 +659,10 @@ func placeFile(root *os.Root, src string, e *entry, journal *os.File) (entry, er
 		}
 		return os.NewFile(uintptr(d), e.Path), nil
 	}, nil, e.Path)
+	if err != nil {
+		return entry{}, err
+	}
+	have.FSID, err = filesystemID(fd)
 	if err != nil {
 		return entry{}, err
 	}

@@ -363,7 +363,7 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 		name   string
 		change func(e *entry)
 	}{
-		{"device", func(e *entry) { e.Dev++ }},
+		{"filesystem id", func(e *entry) { e.FSID += "1" }},
 		{"birth", func(e *entry) { e.Birth++ }},
 		// у root владелец и группа и так 0: случай ничего бы не менял
 		{"owner", func(e *entry) { e.Uid = 0 }},
@@ -418,6 +418,58 @@ func TestExportRefusesOtherIdentity(t *testing.T) {
 				t.Error("OUT_DIR changed")
 			}
 		})
+	}
+}
+
+func TestExportAcceptsLegacyListWithoutFilesystemID(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("first run: code %d %q", code, stderr)
+	}
+	file, err := listFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := loadList(file, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range entries {
+		entries[i].FSID = ""
+	}
+	if err := saveList(file, out, entries); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("legacy list: code %d %q", code, stderr)
+	}
+}
+
+// A stored device number may change across mounts of the same filesystem. The prior list
+// must remain usable when every other recorded property still matches.
+func TestExportAcceptsChangedDeviceNumber(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("first run: code %d %q", code, stderr)
+	}
+	file, err := listFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := loadList(file, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range entries {
+		entries[i].Dev++
+	}
+	if err := saveList(file, out, entries); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("changed device number: code %d %q", code, stderr)
 	}
 }
 

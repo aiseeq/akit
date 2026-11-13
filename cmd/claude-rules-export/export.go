@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -14,6 +16,17 @@ import (
 type missingSkill struct{ name string }
 
 func (m missingSkill) Error() string { return "missing skill: " + m.name }
+
+type missingManifestEntry struct{ file, line string }
+
+func (m missingManifestEntry) Error() string {
+	return fmt.Sprintf("manifest %s: no match for %q", m.file, m.line)
+}
+
+type rewriteMatches struct {
+	replace []bool
+	drop    []bool
+}
 
 func export(opts options, stdout io.Writer) (err error) {
 	// сверяются, читаются и очищаются одни и те же пути — разрешённые так, как их поймёт система
@@ -55,13 +68,9 @@ func export(opts options, stdout io.Writer) (err error) {
 		return err
 	}
 	readme := filepath.Join(stage, "README.md")
-	for _, f := range files {
-		if f == readme {
-			continue // шаблон README — как есть, проверка на личные данные его видит
-		}
-		if err := rewrite(f, m); err != nil {
-			return err
-		}
+	matches, err := rewriteFiles(files, readme, m)
+	if err != nil {
+		return err
 	}
 	hits, err := findPII(stage, files, m.pii)
 	if err != nil {
@@ -70,6 +79,7 @@ func export(opts options, stdout io.Writer) (err error) {
 	if err := replaceExport(out, stage); err != nil {
 		return err
 	}
+	printReplaceWarnings(stdout, m, matches)
 	for _, h := range hits {
 		fmt.Fprintln(stdout, h)
 	}
@@ -79,6 +89,32 @@ func export(opts options, stdout io.Writer) (err error) {
 	}
 	fmt.Fprintf(stdout, "claude-rules-export: %d file(s) in %s, no private data\n", len(files), out)
 	return nil
+}
+
+func rewriteFiles(files []string, readme string, m manifest) (rewriteMatches, error) {
+	matches := rewriteMatches{replace: make([]bool, len(m.replace)), drop: make([]bool, len(m.drop))}
+	for _, f := range files {
+		if f == readme {
+			continue // шаблон README — как есть, проверка на личные данные его видит
+		}
+		if err := rewrite(f, m, &matches); err != nil {
+			return matches, err
+		}
+	}
+	for i, found := range matches.drop {
+		if !found {
+			return matches, missingManifestEntry{file: "drop-lines.txt", line: m.drop[i]}
+		}
+	}
+	return matches, nil
+}
+
+func printReplaceWarnings(stdout io.Writer, m manifest, matches rewriteMatches) {
+	for i, found := range matches.replace {
+		if !found {
+			fmt.Fprintf(stdout, "claude-rules-export: warning: replace.tsv: no match for %q\n", m.replace[i].from)
+		}
+	}
 }
 
 // assemble собирает выгрузку из источника: скиллы, правила рабочего пространства, разделы общего CLAUDE.md, README.
@@ -107,7 +143,14 @@ func assemble(out, src, rules string, m manifest) error {
 	if err != nil {
 		return fmt.Errorf("global rules: %w", err)
 	}
-	if err := writeFile(filepath.Join(out, "global", "CLAUDE.md"), []byte(sections(string(global), m.sections)), 0o644); err != nil {
+	selected, found := sections(string(global), m.sections)
+	names := slices.Sorted(maps.Keys(m.sections))
+	for _, name := range names {
+		if !found[name] {
+			return missingManifestEntry{file: "global-sections.txt", line: name}
+		}
+	}
+	if err := writeFile(filepath.Join(out, "global", "CLAUDE.md"), []byte(selected), 0o644); err != nil {
 		return err
 	}
 	return copyFile(filepath.Join(rules, "README.template.md"), filepath.Join(out, "README.md"))
@@ -115,23 +158,27 @@ func assemble(out, src, rules string, m manifest) error {
 
 // sections — разделы CLAUDE.md из списка. Заголовок раздела — непустая строка не с «-» и не с пробела; раздел
 // идёт до следующего заголовка.
-func sections(text string, wanted map[string]bool) string {
+func sections(text string, wanted map[string]bool) (string, map[string]bool) {
 	var b strings.Builder
+	found := map[string]bool{}
 	active := false
 	for l := range strings.Lines(text) {
 		line := strings.TrimSuffix(l, "\n")
 		if strings.TrimSpace(line) != "" && line[0] != '-' && line[0] != ' ' {
 			active = wanted[line]
+			if active {
+				found[line] = true
+			}
 		}
 		if active {
 			b.WriteString(line + "\n")
 		}
 	}
-	return b.String()
+	return b.String(), found
 }
 
 // rewrite делает замены в каждой строке файла по порядку, затем вычёркивает строки с подстрокой из списка.
-func rewrite(path string, m manifest) error {
+func rewrite(path string, m manifest, matches *rewriteMatches) error {
 	st, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("rewrite: %w", err)
@@ -143,10 +190,21 @@ func rewrite(path string, m manifest) error {
 	var b strings.Builder
 	for l := range strings.Lines(string(data)) {
 		line := strings.TrimSuffix(l, "\n")
-		for _, r := range m.replace {
-			line = strings.ReplaceAll(line, r.from, r.to)
+		for i, r := range m.replace {
+			changed := strings.ReplaceAll(line, r.from, r.to)
+			if changed != line {
+				matches.replace[i] = true
+			}
+			line = changed
 		}
-		if !dropped(line, m.drop) {
+		removed := false
+		for i, d := range m.drop {
+			if strings.Contains(line, d) {
+				matches.drop[i] = true
+				removed = true
+			}
+		}
+		if !removed {
 			b.WriteString(line + "\n")
 		}
 	}
@@ -161,15 +219,6 @@ func rewrite(path string, m manifest) error {
 		return fmt.Errorf("rewrite: %w", err)
 	}
 	return nil
-}
-
-func dropped(line string, drop []string) bool {
-	for _, d := range drop {
-		if strings.Contains(line, d) {
-			return true
-		}
-	}
-	return false
 }
 
 // findPII — совпадения шаблонов личных данных, кроме разрешённых значений: «файл:строка: вид».
