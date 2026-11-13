@@ -226,6 +226,65 @@ func TestMaskRussianLabelWordBoundaries(t *testing.T) {
 	}
 }
 
+func TestMaskLongWhitespaceDoesNotHideLabel(t *testing.T) {
+	input := "password" + strings.Repeat(" ", 512) + ": Qz7mK9xR2nV4bY6"
+	got, _ := Mask(input)
+	if strings.Contains(got, "Qz7mK9xR2nV4bY6") {
+		t.Fatalf("secret after long label spacing remained visible")
+	}
+}
+
+func TestMaskQuotedSecretLabels(t *testing.T) {
+	for _, tc := range []struct{ input, value string }{
+		{"«пароль»: Qz7mK9xR2nV4bY6", "Qz7mK9xR2nV4bY6"},
+		{`"пароль": Qz7mK9xR2nV4bY6`, "Qz7mK9xR2nV4bY6"},
+		{`'пароль': Qz7mK9xR2nV4bY6`, "Qz7mK9xR2nV4bY6"},
+		{"`пароль`: Qz7mK9xR2nV4bY6", "Qz7mK9xR2nV4bY6"},
+		{`"password": "Qz7mK9xR2nV4bY6"`, "Qz7mK9xR2nV4bY6"},
+	} {
+		got, _ := Mask(tc.input)
+		if strings.Contains(got, tc.value) {
+			t.Errorf("quoted secret label left value visible for %q", tc.input)
+		}
+	}
+}
+
+func TestMaskRussianLabelsAreNotInsideWords(t *testing.T) {
+	for _, label := range []string{"супертокен", "сверхпароль", "электроключ", "superпароль", "abcтокен"} {
+		input := label + ": Qz7mK9xR2nV4bY6"
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("embedded label %q changed", label)
+		}
+	}
+}
+
+func TestMaskShortPlainValueBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		input, value string
+		masked       bool
+	}{
+		{"пароль: abcdefg", "abcdefg", false},
+		{"пароль: abcdefgh", "abcdefgh", true},
+	} {
+		got, _ := Mask(tc.input)
+		if strings.Contains(got, tc.value) == tc.masked {
+			t.Errorf("short value boundary for %q: %q", tc.input, got)
+		}
+	}
+}
+
+func TestMaskPreservesQuotesAroundValue(t *testing.T) {
+	for _, input := range []string{
+		`password: "Qz7mK9xR2nV4bY6"`,
+		`пароль: "Qz7mK9xR2nV4bY6"`,
+	} {
+		got, _ := Mask(input)
+		if !strings.Contains(got, `"[скрыто:password]"`) {
+			t.Errorf("value quote or quote contents were lost for %q: %q", input, got)
+		}
+	}
+}
+
 func TestMaskRussianShortValueAndGuillemets(t *testing.T) {
 	for _, input := range []string{
 		"пароль: example",

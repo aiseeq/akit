@@ -77,16 +77,17 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 var (
 	privateKeyRE       = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
 	awsRE              = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE           = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
-	contextNameRE      = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([a-z0-9_.-]+?)(?:\\*["']|(?:\*\*|__|\x60))?([ \t]*)(:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
-	contextNameWordsRE = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([a-z0-9_.-]+?)(?:\\*["']|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}0-9]+){0,4}([ \t]*)(:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
-	russianNameRE      = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([\p{Cyrillic}]+)(?:\\*["']|(?:\*\*|__|\x60))?([ \t]*)( - |—|–|:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
-	russianNameWordsRE = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([\p{Cyrillic}]+)(?:\\*["']|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}0-9]+){0,4}([ \t]*)( - |—|–|:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	contextNameRE      = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([a-z0-9_.-]+?)(?:\\*["']|»|(?:\*\*|__|\x60))?([ \t]*)(:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	contextNameWordsRE = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([a-z0-9_.-]+?)(?:\\*["']|»|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}0-9]+){0,4}([ \t]*)(:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	russianNameRE      = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([\p{Cyrillic}]+)(?:\\*["']|»|(?:\*\*|__|\x60))?([ \t]*)( - |—|–|:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	russianNameWordsRE = regexp.MustCompile(`(?i)(?:\*\*|__|\x60)?([\p{Cyrillic}]+)(?:\\*["']|»|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}0-9]+){0,4}([ \t]*)( - |—|–|:=|=>|=|:)(?:(?:\*\*|__|\x60)[ \t]+)?`)
 
 	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
@@ -242,6 +243,12 @@ func russianNameHintAt(text string, i int) bool {
 }
 
 func russianLabelEnd(text string, start int) (int, bool) {
+	if start > 0 {
+		prev, _ := utf8.DecodeLastRuneInString(text[:start])
+		if unicode.IsLetter(prev) {
+			return 0, false
+		}
+	}
 	if !russianNameHintAt(text, start) {
 		return 0, false
 	}
@@ -361,6 +368,8 @@ func nameBeforeDelimiter(text string, at int) bool {
 	}
 	if at < len(text) && (text[at] == '"' || text[at] == '\'') {
 		at++
+	} else if strings.HasPrefix(text[at:], "»") {
+		at += len("»")
 	}
 	spaces := at
 	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
@@ -881,25 +890,76 @@ func nameMatches(text string, russian, withWords bool) []contextMatch {
 	return matches
 }
 
-func nameCandidateWindow(text string) int {
-	limit := min(len(text), 512)
-	for i := range limit {
-		switch text[i] {
-		case '\r', '\n':
-			return i
-		case ':', '=', ',':
-			return min(i+1+32, limit)
-		case '-':
-			if i > 0 && i+1 < limit && (text[i-1] == ' ' || text[i-1] == '\t') && (text[i+1] == ' ' || text[i+1] == '\t') {
-				return min(i+2+32, limit)
-			}
-		case 0xe2:
-			if strings.HasPrefix(text[i:], "—") || strings.HasPrefix(text[i:], "–") {
-				return min(i+len("—")+32, limit)
-			}
-		}
+func nameCandidateWindow(text string, russian bool) int {
+	limit := len(text)
+	at := 0
+	for strings.HasPrefix(text[at:], "**") || strings.HasPrefix(text[at:], "__") {
+		at += 2
 	}
-	return limit
+	if at < limit && text[at] == '`' {
+		at++
+	}
+	for at < limit {
+		r, size := utf8.DecodeRuneInString(text[at:])
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r < utf8.RuneSelf && strings.ContainsRune("_.-", r) {
+			at += size
+			continue
+		}
+		break
+	}
+	words := 0
+	for at < limit {
+		for at < limit && text[at] == '\\' {
+			at++
+		}
+		if at < limit && (text[at] == '\'' || text[at] == '"') {
+			at++
+		} else if strings.HasPrefix(text[at:], "»") {
+			at += len("»")
+		} else if strings.HasPrefix(text[at:], "**") || strings.HasPrefix(text[at:], "__") {
+			at += 2
+		} else if at < limit && text[at] == '`' {
+			at++
+		}
+		spaces := at
+		for at < limit && (text[at] == ' ' || text[at] == '\t') {
+			at++
+		}
+		if delimiter := nameCandidateDelimiter(text[at:], russian); delimiter != 0 {
+			return min(at+delimiter+32, limit)
+		}
+		if at == spaces || words == 4 {
+			return at
+		}
+		start := at
+		for at < limit {
+			r, size := utf8.DecodeRuneInString(text[at:])
+			if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+				break
+			}
+			at += size
+		}
+		if at == start {
+			return at
+		}
+		words++
+	}
+	return at
+}
+
+func nameCandidateDelimiter(text string, russian bool) int {
+	switch {
+	case strings.HasPrefix(text, ":="), strings.HasPrefix(text, "=>"):
+		return 2
+	case strings.HasPrefix(text, "="), strings.HasPrefix(text, ":"):
+		return 1
+	case russian && (strings.HasPrefix(text, "—") || strings.HasPrefix(text, "–")):
+		return len("—")
+	case strings.HasPrefix(text, "-") && len(text) > 1 && (text[1] == ' ' || text[1] == '\t'):
+		return 1
+	default:
+		return 0
+	}
 }
 
 func namePatternIndices(text string, pattern *regexp.Regexp) [][]int {
@@ -909,13 +969,21 @@ func namePatternIndices(text string, pattern *regexp.Regexp) [][]int {
 		return nil
 	}
 	indices := make([][]int, 0, len(starts))
+	lineEnd := 0
 	for _, start := range starts {
 		if !russian {
 			for start > 0 && isNameByte(text[start-1]) {
 				start--
 			}
 		}
-		end := start + nameCandidateWindow(text[start:])
+		if start >= lineEnd {
+			nextLine := strings.IndexAny(text[start:], "\r\n")
+			lineEnd = len(text)
+			if nextLine >= 0 {
+				lineEnd = start + nextLine
+			}
+		}
+		end := start + nameCandidateWindow(text[start:lineEnd], russian)
 		ix := pattern.FindStringSubmatchIndex(text[start:end])
 		if ix == nil || ix[0] != 0 {
 			continue
