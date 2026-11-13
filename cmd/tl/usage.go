@@ -5,6 +5,8 @@ import (
 	"cmp"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -22,8 +24,8 @@ type tally struct {
 	replies                            int
 	input, cacheWrite, cacheRead, outp int64
 	usd                                float64
-	pctWeek100                         float64
-	week100Replies                     int
+	pctWeek100                         map[string]float64
+	week100Replies                     map[string]int
 	noWeek100                          int
 	unpriced                           int // ответов, у модели или режима которых нет цены
 }
@@ -49,7 +51,7 @@ func (t *tally) add(model string, u *price.Usage) {
 func (t *tally) addWeek100(model string, usd float64, priced bool, rates map[string]usageRate) {
 	provider := usageProvider(model)
 	rate, ok := rates[provider]
-	if !ok || provider == "" || rate.apiWeek <= 0 || rate.planMonth <= 0 {
+	if !ok || provider == "" || !rate.usable() {
 		t.noWeek100++
 		return
 	}
@@ -57,8 +59,12 @@ func (t *tally) addWeek100(model string, usd float64, priced bool, rates map[str
 		return
 	}
 	week100 := rate.apiWeek * 100 / rate.planMonth
-	t.pctWeek100 += usd / week100 * 100
-	t.week100Replies++
+	if t.pctWeek100 == nil {
+		t.pctWeek100 = map[string]float64{}
+		t.week100Replies = map[string]int{}
+	}
+	t.pctWeek100[provider] += usd / week100 * 100
+	t.week100Replies[provider]++
 }
 
 func (t *tally) merge(o *tally) {
@@ -68,8 +74,14 @@ func (t *tally) merge(o *tally) {
 	t.cacheRead += o.cacheRead
 	t.outp += o.outp
 	t.usd += o.usd
-	t.pctWeek100 += o.pctWeek100
-	t.week100Replies += o.week100Replies
+	for provider, pct := range o.pctWeek100 {
+		if t.pctWeek100 == nil {
+			t.pctWeek100 = map[string]float64{}
+			t.week100Replies = map[string]int{}
+		}
+		t.pctWeek100[provider] += pct
+		t.week100Replies[provider] += o.week100Replies[provider]
+	}
 	t.noWeek100 += o.noWeek100
 	t.unpriced += o.unpriced
 }
@@ -126,10 +138,16 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 	for id := range per {
 		ids = append(ids, id)
 	}
-	slices.SortFunc(ids, func(a, b string) int { // дорогие сверху
-		return cmp.Or(cmp.Compare(per[b].pctWeek100, per[a].pctWeek100), cmp.Compare(a, b))
+	providers := slices.Sorted(maps.Keys(rates))
+	slices.SortFunc(ids, func(a, b string) int { // biggest provider percentage first
+		return cmp.Or(cmp.Compare(usageMaxPct(per[b], providers), usageMaxPct(per[a], providers)), cmp.Compare(a, b))
 	})
-	fmt.Fprintln(w, "session\treplies\tinput\tcache_write\tcache_read\toutput\tpct_week100\tusd_api")
+	header := []string{"session", "replies", "input", "cache_write", "cache_read", "output"}
+	for _, provider := range providers {
+		header = append(header, "pct100_"+provider)
+	}
+	header = append(header, "usd_api")
+	fmt.Fprintln(w, strings.Join(header, "\t"))
 	var total tally
 	for _, id := range ids {
 		t := per[id]
@@ -138,20 +156,23 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 		if n := res.names[id]; n != "" {
 			name += " " + n
 		}
-		fmt.Fprintln(w, usageRow(name, t))
+		fmt.Fprintln(w, usageRow(name, t, providers))
 	}
-	fmt.Fprintln(w, usageRow("total", &total))
+	fmt.Fprintln(w, usageRow("total", &total, providers))
 	fmt.Fprintln(w, usageSummary(total, replies, len(ids), ratePath, rates, rateErr, sources, opts, e, res))
 	return 0
 }
 
 func usageSummary(total tally, replies []usageReply, sessionCount int, ratePath string, rates map[string]usageRate, rateErr error, sources []source, opts options, e env, res result) string {
-	summary := fmt.Sprintf("tl: %d session(s), %d reply(ies); pct_week100 — %% of provider $100 subscription week; usd_api — API list price (price table %s); rates: %s",
+	summary := fmt.Sprintf("tl: %d session(s), %d reply(ies); pct100_<provider> — %% of provider $100 subscription week; usd_api — API list price (price table %s); rates: %s",
 		sessionCount, total.replies, price.Checked, ratePath)
 	if rateErr != nil {
 		summary += "; no subscription rates (" + rateErr.Error() + "); configure XDG_CONFIG_HOME/akit/rates.tsv or ~/.config/akit/rates.tsv"
 	} else {
 		providers := map[string]bool{}
+		for provider := range rates {
+			providers[provider] = true
+		}
 		for _, rp := range replies {
 			if provider := usageProvider(rp.r.Model); provider != "" {
 				providers[provider] = true
@@ -159,7 +180,7 @@ func usageSummary(total tally, replies []usageReply, sessionCount int, ratePath 
 		}
 		used := make([]string, 0, len(providers))
 		for provider := range providers {
-			if rate, ok := rates[provider]; ok {
+			if rate, ok := rates[provider]; ok && !rate.validFrom.IsZero() {
 				used = append(used, provider+"="+rate.validFrom.Format(time.DateOnly))
 			} else {
 				used = append(used, provider+"=missing")
@@ -168,6 +189,14 @@ func usageSummary(total tally, replies []usageReply, sessionCount int, ratePath 
 		slices.Sort(used)
 		summary += "; valid_from: " + strings.Join(used, ",")
 	}
+	var invalidRates strings.Builder
+	for _, provider := range slices.Sorted(maps.Keys(rates)) {
+		if rate := rates[provider]; rate.invalid != "" {
+			invalidRates.WriteString("; invalid subscription rate: ")
+			invalidRates.WriteString(rate.invalid)
+		}
+	}
+	summary += invalidRates.String()
 	if total.noWeek100 > 0 {
 		summary += fmt.Sprintf("; %d reply(ies) without a subscription rate", total.noWeek100)
 	}
@@ -204,17 +233,40 @@ func usageScope(sources []source, opts options, e env) string {
 	return scope
 }
 
-func usageRow(name string, t *tally) string {
-	pct := "-"
-	if t.week100Replies > 0 {
-		pct = fmt.Sprintf("%.2f", t.pctWeek100)
+func usageRow(name string, t *tally, providers []string) string {
+	fields := []string{name, strconv.Itoa(t.replies), strconv.FormatInt(t.input, 10), strconv.FormatInt(t.cacheWrite, 10),
+		strconv.FormatInt(t.cacheRead, 10), strconv.FormatInt(t.outp, 10)}
+	for _, provider := range providers {
+		pct := "-"
+		if t.week100Replies[provider] > 0 {
+			pct = fmt.Sprintf("%.2f", t.pctWeek100[provider])
+		}
+		fields = append(fields, pct)
 	}
-	return fmt.Sprintf("%s\t%d\t%d\t%d\t%d\t%d\t%s\t%.2f", name, t.replies, t.input, t.cacheWrite, t.cacheRead, t.outp, pct, t.usd)
+	fields = append(fields, fmt.Sprintf("%.2f", t.usd))
+	return strings.Join(fields, "\t")
+}
+
+func usageMaxPct(t *tally, providers []string) float64 {
+	var max float64
+	for _, provider := range providers {
+		if pct := t.pctWeek100[provider]; pct > max {
+			max = pct
+		}
+	}
+	return max
 }
 
 type usageRate struct {
 	apiWeek, planMonth float64
 	validFrom          time.Time
+	line               int
+	invalid            string
+}
+
+func (r usageRate) usable() bool {
+	return r.invalid == "" && r.apiWeek > 0 && r.planMonth > 0 && !math.IsNaN(r.apiWeek) && !math.IsInf(r.apiWeek, 0) &&
+		!math.IsNaN(r.planMonth) && !math.IsInf(r.planMonth, 0)
 }
 
 func usageRatesPath(e env) string {
@@ -249,23 +301,26 @@ func readUsageRates(path string, now time.Time) (map[string]usageRate, error) {
 			}
 			for _, name := range []string{"valid_from", "provider", "plan_usd_month", "api_usd_week"} {
 				if _, ok := columns[name]; !ok {
-					return nil, fmt.Errorf("header missing %s", name)
+					return nil, fmt.Errorf("%s: header missing %s", path, name)
 				}
 			}
 			continue
 		}
 		if len(fields) != width {
-			return nil, fmt.Errorf("line %d: wrong number of columns", lineNo)
+			return nil, fmt.Errorf("%s:%d: wrong number of columns", path, lineNo)
 		}
-		provider, rate, future, err := parseUsageRateRow(lineNo, fields, columns, now)
+		provider, rate, future, err := parseUsageRateRow(path, lineNo, fields, columns, now)
 		if err != nil {
 			return nil, err
 		}
 		if future {
+			if _, exists := rates[provider]; !exists {
+				rates[provider] = usageRate{}
+			}
 			continue
 		}
 		old, exists := rates[provider]
-		if !exists || rate.validFrom.After(old.validFrom) || rate.validFrom.Equal(old.validFrom) {
+		if !exists || old.validFrom.IsZero() || rate.validFrom.After(old.validFrom) || rate.validFrom.Equal(old.validFrom) {
 			rates[provider] = rate
 		}
 	}
@@ -273,26 +328,34 @@ func readUsageRates(path string, now time.Time) (map[string]usageRate, error) {
 		return nil, fmt.Errorf("read rates %s: %w", path, err)
 	}
 	if width == 0 {
-		return nil, fmt.Errorf("no header")
+		return nil, fmt.Errorf("%s: no header", path)
 	}
 	return rates, nil
 }
 
-func parseUsageRateRow(lineNo int, fields []string, columns map[string]int, now time.Time) (string, usageRate, bool, error) {
+func parseUsageRateRow(path string, lineNo int, fields []string, columns map[string]int, now time.Time) (string, usageRate, bool, error) {
 	provider := fields[columns["provider"]]
 	valid, err := parseUsageValidFrom(fields[columns["valid_from"]])
 	if err != nil {
-		return "", usageRate{}, false, fmt.Errorf("line %d: invalid valid_from", lineNo)
+		return "", usageRate{}, false, fmt.Errorf("%s:%d:valid_from: invalid date", path, lineNo)
 	}
 	if valid.After(now) {
-		return provider, usageRate{}, true, nil
+		return provider, usageRate{validFrom: valid}, true, nil
 	}
 	week, weekErr := strconv.ParseFloat(fields[columns["api_usd_week"]], 64)
 	plan, planErr := strconv.ParseFloat(fields[columns["plan_usd_month"]], 64)
-	if weekErr != nil || planErr != nil || week <= 0 || plan <= 0 {
-		return "", usageRate{}, false, fmt.Errorf("line %d: invalid subscription rate", lineNo)
+	rate := usageRate{apiWeek: week, planMonth: plan, validFrom: valid, line: lineNo}
+	switch {
+	case planErr != nil || !validRateNumber(plan):
+		rate.invalid = fmt.Sprintf("%s:%d:plan_usd_month: invalid value %q", path, lineNo, fields[columns["plan_usd_month"]])
+	case weekErr != nil || !validRateNumber(week):
+		rate.invalid = fmt.Sprintf("%s:%d:api_usd_week: invalid value %q", path, lineNo, fields[columns["api_usd_week"]])
 	}
-	return provider, usageRate{apiWeek: week, planMonth: plan, validFrom: valid}, false, nil
+	return provider, rate, false, nil
+}
+
+func validRateNumber(value float64) bool {
+	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func parseUsageValidFrom(value string) (time.Time, error) {
