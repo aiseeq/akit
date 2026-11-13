@@ -885,8 +885,12 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 			if tc.omitProject {
 				listRoot = a
 			}
-			// The first pass parses the files and fills the cache, the second reads every ticket from it.
-			for _, pass := range []string{"cold", "warm"} {
+			// The first pass parses the files and fills the cache, the second reads every ticket from it,
+			// the third runs with the cache turned off.
+			for _, pass := range []string{"cold", "warm", "off"} {
+				if pass == "off" {
+					t.Setenv("TK_NO_PARSE_CACHE", "1")
+				}
 				var out, errout bytes.Buffer
 				if code := list(listRoot, options{all: true, json: true, root: listRoot}, &out, &errout); code != 0 {
 					t.Fatalf("%s ls: %d %s", pass, code, errout.String())
