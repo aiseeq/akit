@@ -663,7 +663,70 @@ func (w *callWalker) visit(node syntax.Node) bool {
 			return false
 		}
 	}
+	if param, ok := node.(*syntax.ParamExp); ok {
+		w.visitParamOperand(param)
+	}
 	return true
+}
+
+// paramOperandHasProcSubst reports <( or >( in the literal operand text of a
+// parameter expansion, which bash runs as a process substitution.
+func paramOperandHasProcSubst(param *syntax.ParamExp) bool {
+	if param.Exp == nil || param.Exp.Word == nil {
+		return false
+	}
+	for _, part := range param.Exp.Word.Parts {
+		if lit, ok := part.(*syntax.Lit); ok && (strings.Contains(lit.Value, "<(") || strings.Contains(lit.Value, ">(")) {
+			return true
+		}
+	}
+	return false
+}
+
+// visitParamOperand finds process substitutions in the operand of ${X:-word}
+// and the like: bash runs <(…) and >(…) there, while the parser keeps the
+// operand as plain text.
+func (w *callWalker) visitParamOperand(param *syntax.ParamExp) {
+	if !paramOperandHasProcSubst(param) {
+		return
+	}
+	for _, part := range param.Exp.Word.Parts {
+		lit, ok := part.(*syntax.Lit)
+		if !ok || !strings.Contains(lit.Value, "<(") && !strings.Contains(lit.Value, ">(") {
+			continue
+		}
+		start, end := int(lit.Pos().Offset()), int(lit.End().Offset())
+		base := -1
+		if validSpan(w.src, start, end) && w.src[start:end] == lit.Value {
+			base = start
+		}
+		file, err := syntax.NewParser().Parse(strings.NewReader(lit.Value), "")
+		if err != nil {
+			continue
+		}
+		syntax.Walk(file, func(node syntax.Node) bool {
+			subst, ok := node.(*syntax.ProcSubst)
+			if !ok {
+				return true
+			}
+			from, to := int(subst.OpPos.Offset())+2, int(subst.Rparen.Offset())
+			if from > to || to > len(lit.Value) {
+				return false
+			}
+			pos := make([]int, to-from)
+			for i := range pos {
+				pos[i] = -1
+				if base >= 0 {
+					pos[i] = base + from + i
+				}
+			}
+			line := int(lit.Pos().Line()) + w.lineBase - 1 + strings.Count(lit.Value[:from], "\n")
+			if err := parseNestedWithBudget(lit.Value[from:to], pos, line, w.inherited, false, false, w.vars, w.calls, w.budget); err != nil {
+				w.nestedErrs = append(w.nestedErrs, err)
+			}
+			return false
+		})
+	}
 }
 
 func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
@@ -2767,8 +2830,16 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 				m.unescapeSpans(raw, base, context == partDouble)
 			}
 		case *syntax.SglQuoted:
-			if p.Dollar || context != partUnquoted {
+			if context != partUnquoted {
 				m.keepSource(part, start, end, src)
+				continue
+			}
+			if p.Dollar {
+				// An unquoted $'…' in a here-string word: the outer shell
+				// decodes its escapes before the inner shell reads it.
+				if err := m.unescapeANSI(p.Value, ansiSourceBase(p, p.Value, src)); err != nil {
+					m.keepSource(part, start, end, src)
+				}
 				continue
 			}
 			m.addSpans(p.Value, start+1)
@@ -2781,21 +2852,37 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 				}
 				continue
 			}
-			m.keepExpansion(part, start, end, src)
+			m.keepExpansion(part, start, end, src, context)
 		default:
-			m.keepExpansion(part, start, end, src)
+			m.keepExpansion(part, start, end, src, context)
 		}
 	}
 }
 
 // keepExpansion keeps the source text of an expansion and records every
-// command or process substitution the outer shell runs inside it, at any
-// depth of ${…} or $((…)), but not those nested in another substitution: the
-// outermost one is reported by the outer walk with all it contains.
-func (m *mapped) keepExpansion(part syntax.WordPart, start, end int, src string) {
+// substitution the outer shell runs inside it, at any depth of ${…} or
+// $((…)), but not those nested in another substitution: the outermost one is
+// reported by the outer walk with all it contains. Command substitutions run
+// in the outer shell everywhere; process substitutions only in an unquoted
+// here-string word — in a heredoc body or in double quotes <(…) stays text
+// that the inner shell runs.
+func (m *mapped) keepExpansion(part syntax.WordPart, start, end int, src string, context partContext) {
+	outerProcSubst := context == partUnquoted
+	if param, ok := part.(*syntax.ParamExp); ok && outerProcSubst && paramOperandHasProcSubst(param) {
+		// The parser keeps <(…) in the operand as text; the whole expansion
+		// is then what the outer shell runs.
+		m.subst = append(m.subst, [2]int{start, end})
+		m.keepSource(part, start, end, src)
+		return
+	}
 	syntax.Walk(part, func(node syntax.Node) bool {
 		switch node.(type) {
-		case *syntax.CmdSubst, *syntax.ProcSubst:
+		case *syntax.ProcSubst:
+			if outerProcSubst {
+				m.subst = append(m.subst, [2]int{int(node.Pos().Offset()), int(node.End().Offset())})
+			}
+			return false
+		case *syntax.CmdSubst:
 			m.subst = append(m.subst, [2]int{int(node.Pos().Offset()), int(node.End().Offset())})
 			return false
 		}
