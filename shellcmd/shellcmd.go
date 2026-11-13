@@ -40,10 +40,11 @@ type Call struct {
 
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
 type cmd struct {
-	call   Call
-	words  []word
-	budget *nestedParseBudget
-	source string
+	call           Call
+	words          []word
+	budget         *nestedParseBudget
+	source         string
+	expansionDepth int
 
 	stdinInput    *syntax.Redirect
 	stdinConsumed bool
@@ -106,20 +107,23 @@ func Find(cmd string, names ...string) ([]Call, error) {
 }
 
 type nestedParseBudget struct {
-	used          int
-	limit         int
-	parsedBytes   int
-	visitedNodes  int
-	walkInfoNodes int
-	stdinSteps    int
-	substSteps    int
-	trackWork     bool
-	parsedShells  map[string]int
+	used           int
+	depth          int
+	expansionUsed  int
+	expansionLimit int
+	limit          int
+	parsedBytes    int
+	visitedNodes   int
+	walkInfoNodes  int
+	stdinSteps     int
+	substSteps     int
+	trackWork      bool
+	parsedShells   map[string]int
 }
 
 func newNestedParseBudget(inputSize int) *nestedParseBudget {
-	limit := max(inputSize*4, 4096)
-	return &nestedParseBudget{limit: limit}
+	limit := max(inputSize*(maxNestedScripts+1), 4096)
+	return &nestedParseBudget{limit: limit, expansionLimit: max(inputSize*2, 4096)}
 }
 
 func parse(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
@@ -472,6 +476,10 @@ func stdinEchoingCall(call *syntax.CallExpr, src string, vars map[string]string)
 }
 
 func pipedShellName(stmt *syntax.Stmt, src string, vars map[string]string) (string, []string, bool) {
+	return pipedShellNameWithWork(stmt, src, vars, nil)
+}
+
+func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]string, work *int) (string, []string, bool) {
 	call, ok := stmt.Cmd.(*syntax.CallExpr)
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false
@@ -479,12 +487,13 @@ func pipedShellName(stmt *syntax.Stmt, src string, vars map[string]string) (stri
 	values, _ := words(call.Args, src, vars)
 	name, args := commandName(values[0]), values[1:]
 	var via []string
+	scan := wrapperExecScan{work: work}
 	for {
 		if isShell(name) {
 			operand, command, stdin := shellArgs(args)
 			return name, via, !shellNoExec(args) && !command && (stdin || operand == len(args))
 		}
-		if target, ok := execTarget(args); ok {
+		if target, ok := scan.find(args); ok {
 			via = append(via, name, "exec")
 			name, args = commandName(target[0]), target[1:]
 			continue
@@ -558,6 +567,10 @@ func hasProcessSubstitution(words []*syntax.Word, src string) bool {
 }
 
 func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string) bool {
+	return shellInputTargetWithWork(call, src, vars, nil)
+}
+
+func shellInputTargetWithWork(call *syntax.CallExpr, src string, vars map[string]string, work *int) bool {
 	if len(call.Args) == 0 {
 		return false
 	}
@@ -571,6 +584,7 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 	}
 	args := values[1:]
 	argOffset := 0
+	scan := wrapperExecScan{work: work}
 	for {
 		if name == "sudo" && sudoReadsStdin(args) {
 			return true
@@ -582,7 +596,7 @@ func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string)
 			return shellInputForShellCall(call, args, argOffset, src)
 		}
 		var ok bool
-		name, args, argOffset, ok = shellInputNextTarget(name, args, argOffset)
+		name, args, argOffset, ok = shellInputNextTargetWithScan(name, args, argOffset, &scan)
 		if !ok {
 			return false
 		}
@@ -602,7 +616,11 @@ func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int,
 }
 
 func shellInputNextTarget(name string, args []string, argOffset int) (string, []string, int, bool) {
-	if target, ok := execTarget(args); ok {
+	return shellInputNextTargetWithScan(name, args, argOffset, &wrapperExecScan{})
+}
+
+func shellInputNextTargetWithScan(name string, args []string, argOffset int, scan *wrapperExecScan) (string, []string, int, bool) {
+	if target, ok := scan.find(args); ok {
 		argOffset += len(args) - len(target) + 1
 		return commandName(target[0]), target[1:], argOffset, true
 	}
@@ -938,6 +956,9 @@ func heredocText(redir *syntax.Redirect, src string) string {
 }
 
 func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect) (string, []string, bool, error) {
+	if stdinInput == nil {
+		return "", nil, false, nil
+	}
 	call, ok := stmt.Cmd.(*syntax.CallExpr)
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false, nil
@@ -977,7 +998,12 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdin
 }
 
 func resolveShellInput(name string, args []string, hasHeredoc bool) (string, []string, error) {
+	return resolveShellInputWithWork(name, args, hasHeredoc, nil)
+}
+
+func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work *int) (string, []string, error) {
 	var via []string
+	scan := wrapperExecScan{work: work}
 	for {
 		if name == "sudo" && hasHeredoc && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), nil
@@ -993,7 +1019,7 @@ func resolveShellInput(name string, args []string, hasHeredoc bool) (string, []s
 			return target, shellVia, nil
 		}
 		var ok bool
-		name, args, via, ok = nextShellInputTarget(name, args, via)
+		name, args, via, ok = nextShellInputTarget(name, args, via, &scan)
 		if !ok {
 			return "", nil, nil
 		}
@@ -1068,15 +1094,15 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 	return "", nil, false
 }
 
-func nextShellInputTarget(name string, args []string, via []string) (string, []string, []string, bool) {
-	if target, ok := execTarget(args); ok {
+func nextShellInputTarget(name string, args []string, via []string, scan *wrapperExecScan) (string, []string, []string, bool) {
+	if target, ok := scan.find(args); ok {
 		return commandName(target[0]), target[1:], append(via, name, "exec"), true
 	}
 	if wrappers[name] {
 		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
 			if !isShell(commandName(wrapped[0])) {
 				if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(target[1:]) {
-					return baseName(target[0]), target[1:], append(append(via, fallbackVia...), name), true
+					return baseName(target[0]), target[1:], append(via, fallbackVia...), true
 				}
 			}
 			return commandName(wrapped[0]), wrapped[1:], append(via, name), true
@@ -1087,7 +1113,7 @@ func nextShellInputTarget(name string, args []string, via []string) (string, []s
 		return commandName(wrapped[0]), wrapped[1:], append(via, wrapperVia...), true
 	}
 	if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(target[1:]) {
-		return baseName(target[0]), target[1:], append(append(via, fallbackVia...), name), true
+		return baseName(target[0]), target[1:], append(via, fallbackVia...), true
 	}
 	return "", nil, nil, false
 }
@@ -1201,9 +1227,11 @@ func parseNestedWithBudget(src string, pos []int, lineBase int, via []string, in
 }
 
 func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
-	if len(via) > maxNestedScripts {
+	if budget.depth >= maxNestedScripts {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script depth exceeds %d", maxNestedScripts)}
 	}
+	budget.depth++
+	defer func() { budget.depth-- }()
 	if len(src) > maxNestedScriptBytes {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script exceeds %d bytes", maxNestedScriptBytes)}
 	}
@@ -1742,7 +1770,7 @@ func wordValue(w *syntax.Word) (string, bool) {
 func (c cmd) sub(i int, via []string) cmd {
 	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
 		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source,
-		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs"}
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1}
 }
 
 func (c cmd) via(more ...string) []string {
@@ -1751,8 +1779,8 @@ func (c cmd) via(more ...string) []string {
 
 // emit записывает вызовы точного разбора и совместимого с прежней версией обхода.
 func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
-	if len(c.call.Via) > maxNestedScripts {
-		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: nested execution depth exceeds %d", maxNestedScripts)}
+	if c.expansionDepth > maxNestedScripts {
+		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: command expansion depth exceeds %d", maxNestedScripts)}
 	}
 	appendCall(seen, calls, c.call)
 
@@ -2139,14 +2167,16 @@ var baselineValueOptions = map[string]map[string]bool{
 }
 
 func unwrapMain(name string, args []string) ([]string, []string, bool) {
-	var via []string
+	var via [maxNestedScripts]string
+	count := 0
 	for baselineWrapper(name) {
-		if len(via) >= maxNestedScripts {
-			return nil, via, false
+		if count >= maxNestedScripts {
+			return nil, nil, false
 		}
-		via = append(via, name)
+		via[count] = name
+		count++
 		if name == "command" && commandIsLookup(args) {
-			return nil, via, false
+			return nil, nil, false
 		}
 		i := 0
 		for i < len(args) && strings.HasPrefix(args[i], "-") {
@@ -2167,14 +2197,14 @@ func unwrapMain(name string, args []string) ([]string, []string, bool) {
 			i++
 		}
 		if i >= len(args) {
-			return nil, via, false
+			return nil, nil, false
 		}
 		name, args = baseName(args[i]), args[i+1:]
 	}
 	if name == "" {
-		return nil, via, false
+		return nil, nil, false
 	}
-	return append([]string{name}, args...), via, len(via) > 0
+	return append([]string{name}, args...), slices.Clone(via[:count]), count > 0
 }
 
 func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
@@ -2992,6 +3022,10 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 	if !ok {
 		return nil
 	}
+	if len(script.text) > c.budget.expansionLimit-c.budget.expansionUsed {
+		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: script expansion budget exceeds %d bytes", c.budget.expansionLimit)}
+	}
+	c.budget.expansionUsed += len(script.text)
 	viaName := c.call.Name
 	first := len(*calls)
 	err := parseNestedWithBudget(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
@@ -3450,13 +3484,61 @@ func shellCommandOption(arg string) bool {
 	return strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && strings.Contains(arg[1:], "c")
 }
 
-func execTarget(args []string) ([]string, bool) {
-	for i, arg := range args {
-		if arg != "--" {
-			continue
+// wrapperExecScan indexes exec targets for successive suffixes of one argument list.
+// work counts indexed arguments and lookups for growth tests.
+type wrapperExecScan struct {
+	args    []string
+	targets []int
+	work    *int
+}
+
+func (s *wrapperExecScan) find(args []string) ([]string, bool) {
+	if len(args) == 0 {
+		return nil, false
+	}
+	offset := len(s.args) - len(args)
+	if offset < 0 || len(s.args) == 0 || &args[0] != &s.args[offset] {
+		s.args = args
+		s.targets = make([]int, len(args))
+		nextDash, target := -1, -1
+		for i := len(args) - 1; i >= 0; i-- {
+			if s.work != nil {
+				*s.work++
+			}
+			if args[i] == "--" && i+1 < len(args) {
+				nextDash = i
+			}
+			if args[i] == "exec" && nextDash >= 0 {
+				target = nextDash + 1
+			}
+			s.targets[i] = target
 		}
-		exec := slices.Contains(args[:i], "exec")
-		if exec && i+1 < len(args) {
+		offset = 0
+	}
+	if s.work != nil {
+		*s.work++
+	}
+	target := s.targets[offset]
+	if target < 0 {
+		return nil, false
+	}
+	return s.args[target:], true
+}
+
+func execTarget(args []string) ([]string, bool) {
+	return execTargetWithWork(args, nil)
+}
+
+func execTargetWithWork(args []string, work *int) ([]string, bool) {
+	seen := false
+	for i, arg := range args {
+		if work != nil {
+			*work++
+		}
+		if arg == "exec" {
+			seen = true
+		}
+		if arg == "--" && seen && i+1 < len(args) {
 			return append([]string{args[i+1]}, args[i+2:]...), true
 		}
 	}

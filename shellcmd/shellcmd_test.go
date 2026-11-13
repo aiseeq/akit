@@ -569,7 +569,7 @@ func TestPipedHeredocScripts(t *testing.T) {
 
 func TestPipedHeredocDepthLimit(t *testing.T) {
 	script := "kill 1"
-	for range maxNestedScripts {
+	for range maxNestedScripts + 1 {
 		script = "cat <<'E' | bash\n" + script + "\nE"
 	}
 	calls, err := Calls(script)
@@ -1022,8 +1022,9 @@ func TestPipedCatOptions(t *testing.T) {
 
 func TestParseNestedDepthLimitDirectly(t *testing.T) {
 	calls := []Call(nil)
-	via := make([]string, maxNestedScripts+1)
-	err := parseNested("", nil, 0, via, false, false, map[string]string{}, &calls)
+	budget := newNestedParseBudget(0)
+	budget.depth = maxNestedScripts
+	err := parseNestedWithBudget("", nil, 0, nil, false, false, map[string]string{}, &calls, budget)
 	var nested *NestedError
 	if !errors.As(err, &nested) {
 		t.Fatalf("parseNested over limit returned %v", err)
