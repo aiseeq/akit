@@ -4675,12 +4675,17 @@ func cachedListBlockMark(project, ref string, allProjects map[string][]task, err
 	matches := 0
 	for i := range loaded {
 		candidate := &loaded[i]
+		if !validStatus(candidate.status) {
+			// The plain resolver fails on any ticket with an unknown status in the project;
+			// the same project goes through it so the rank stays as without the cache.
+			return refBlockMark(project, ref, errout)
+		}
 		if matchesID(*candidate, id) {
 			match = candidate
 			matches++
 		}
 	}
-	if matches != 1 || !validStatus(match.status) || isArchivedTask(match.path) {
+	if matches != 1 || isArchivedTask(match.path) {
 		return refBlockMark(project, ref, errout)
 	}
 	if !closedStatus(match.status) {

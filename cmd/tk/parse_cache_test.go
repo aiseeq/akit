@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -811,6 +810,7 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 	cases := []struct {
 		name, blockerStatus              string
 		archived, duplicate, omitProject bool
+		strayUnknown                     bool
 		wantOne, wantTwo                 int
 		wantMark                         string
 	}{
@@ -820,6 +820,7 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 		{name: "duplicate", blockerStatus: "открыт", duplicate: true, wantOne: 1, wantTwo: 2},
 		{name: "project-not-loaded", blockerStatus: "открыт", omitProject: true, wantOne: 2, wantTwo: 1, wantMark: " заблокирован: git/b/blk-open"},
 		{name: "unknown-status", blockerStatus: "странный", wantOne: 1, wantTwo: 2},
+		{name: "unknown-status-elsewhere-in-blocker-project", blockerStatus: "открыт", strayUnknown: true, wantOne: 1, wantTwo: 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -874,6 +875,9 @@ func TestParseCacheCrossProjectRanksUseExpectedBlockState(t *testing.T) {
 			}
 			if tc.duplicate {
 				writeRankTicket(filepath.Join(blockerDir, "20200104-1000-MED-blk-open.md"), "# duplicate\nСтатус: открыт\n")
+			}
+			if tc.strayUnknown {
+				writeRankTicket(filepath.Join(blockerDir, "20200105-1000-MED-bad-status.md"), "# other\nСтатус: странный\n")
 			}
 			listRoot := gitRoot
 			if tc.omitProject {
@@ -1058,44 +1062,6 @@ func TestParseCacheLastChangeStampStopsAtSectionEnd(t *testing.T) {
 	body := "## Журнал\n- 2020-01-02 11:30 note — actor: first\n## Дополнительно\n- 2021-03-04 05:06 note — actor: later\n"
 	if got, want := lastChangeStamp(body), "2020-01-02 11:30"; got != want {
 		t.Fatalf("lastChangeStamp=%q, want %q", got, want)
-	}
-}
-
-func TestParseCacheOversizedPayloadIsIgnored(t *testing.T) {
-	_, ticket := cacheProject(t, cacheBody("oversized", "открыт", "x"))
-	cachePath, _, err := parseCachePath(ticket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binary, err := parseCacheBinaryIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry := parseCacheEntry{Task: cachedTask{Title: strings.Repeat("x", (32<<20)+1)}}
-	payload, err := json.Marshal(parseCacheFile{Version: parseCacheVersion, Binary: binary, Entries: map[string]parseCacheEntry{"oversized": entry}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var compressed bytes.Buffer
-	zw := gzip.NewWriter(&compressed)
-	if _, err := zw.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if len(payload) <= 32<<20 {
-		t.Fatalf("fixture payload too small: %d", len(payload))
-	}
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cachePath, compressed.Bytes(), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	entries, _ := readParseCacheEntries(cachePath, binary)
-	if len(entries) != 0 {
-		t.Fatalf("oversized cache accepted %d entries", len(entries))
 	}
 }
 

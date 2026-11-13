@@ -164,7 +164,7 @@ func loadCachedTaskFromEntries(ticket string, tolerateUnknownStatus bool, entrie
 	}
 	body, err := os.ReadFile(ticket)
 	if err != nil {
-		return task{}, err //nolint:error-wrap // Сохраняем текст ошибки обычного ls.
+		return task{}, err //nolint:error-wrap // os.ReadFile already names the operation and path; plain ls prints this exact text.
 	}
 	post, err := os.Stat(ticket)
 	if err != nil {
