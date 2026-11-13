@@ -2327,8 +2327,13 @@ type remoteStdin struct {
 	file  *syntax.File
 	src   string
 	plain bool // no `<` or `|`: every shell call inherits the ssh stdin
-	// inner maps an outer offset to its first byte in src.
-	inner map[int]int
+	// outers and inners pair each byte of src that has an outer offset with
+	// that offset; when the outer offsets ascend, a lookup is a binary search.
+	// Otherwise inner maps an outer offset to its first byte in src.
+	outers, inners []int
+	inner          map[int]int
+	// unmapped is the first byte of src without an outer offset, -1 for none.
+	unmapped int
 	// pipes are the right-hand sides of pipelines, in outer offsets.
 	pipes rangeIndex
 	// xargs are xargs statements, in src offsets.
@@ -2337,11 +2342,26 @@ type remoteStdin struct {
 }
 
 func newRemoteStdin(file *syntax.File, src string, pos []int) *remoteStdin {
-	remote := &remoteStdin{file: file, src: src, plain: !strings.ContainsAny(src, "<|"), inner: make(map[int]int, len(pos))}
+	remote := &remoteStdin{file: file, src: src, plain: !strings.ContainsAny(src, "<|"), unmapped: -1}
 	for i, outer := range pos {
-		if _, ok := remote.inner[outer]; !ok {
-			remote.inner[outer] = i
+		if outer < 0 {
+			if remote.unmapped < 0 {
+				remote.unmapped = i
+			}
+			continue
 		}
+		if n := len(remote.outers); n > 0 && outer <= remote.outers[n-1] {
+			remote.outers, remote.inners = nil, nil
+			remote.inner = make(map[int]int, len(pos))
+			for i, outer := range pos {
+				if _, ok := remote.inner[outer]; !ok {
+					remote.inner[outer] = i
+				}
+			}
+			break
+		}
+		remote.outers = append(remote.outers, outer)
+		remote.inners = append(remote.inners, i)
 	}
 	hasXargs := strings.Contains(src, "xargs")
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -2390,7 +2410,7 @@ func (remote *remoteStdin) addXargs(stmt *syntax.Stmt) {
 // it is not the reader of a pipeline or an xargs child, and no redirection
 // gives its fd 0 another source.
 func (remote *remoteStdin) reads(offset int) bool {
-	inner, ok := remote.inner[offset]
+	inner, ok := remote.innerOffset(offset)
 	if !ok || len(remote.pipes.containing(offset)) > 0 || len(remote.xargs.containing(inner)) > 0 {
 		return false
 	}
@@ -2398,6 +2418,22 @@ func (remote *remoteStdin) reads(offset int) bool {
 		return true
 	}
 	return resolveStdinAt(remote.index, inner, stdinValue{inherited: true}).inherited
+}
+
+// innerOffset returns the first byte of src at outer offset.
+func (remote *remoteStdin) innerOffset(offset int) (int, bool) {
+	if remote.inner != nil {
+		inner, ok := remote.inner[offset]
+		return inner, ok
+	}
+	if offset < 0 {
+		return remote.unmapped, offset == -1 && remote.unmapped >= 0
+	}
+	i, found := slices.BinarySearch(remote.outers, offset)
+	if !found {
+		return 0, false
+	}
+	return remote.inners[i], true
 }
 
 func (remote *remoteStdin) steps() int {
@@ -2500,7 +2536,7 @@ type stdinIndex struct {
 	stmts  rangeIndex
 	// calls maps a literal command name to the offsets of its calls, in walk order.
 	calls map[string][]int
-	// entry caches the stdin a function body starts with, by name and initial value.
+	// entry caches the stdin a function body starts with, by definition and initial value.
 	entry     map[stdinEntryKey]stdinEntry
 	walk      int
 	callSteps int
@@ -2511,8 +2547,9 @@ type stdinFunc struct {
 	start, end int
 }
 
+// stdinEntryKey names one function definition: two definitions may share a name.
 type stdinEntryKey struct {
-	name      string
+	start     int
 	inherited bool
 }
 
@@ -2577,7 +2614,7 @@ func resolveStdinAt(index *stdinIndex, offset int, initial stdinValue) stdinValu
 // call outside its own body. Every call in the body shares it, so it is
 // resolved once per function.
 func (index *stdinIndex) functionEntry(fn stdinFunc, initial stdinValue) stdinEntry {
-	key := stdinEntryKey{fn.name, initial.inherited}
+	key := stdinEntryKey{fn.start, initial.inherited}
 	if entry, ok := index.entry[key]; ok && initial.redir == nil {
 		return entry
 	}
@@ -2777,6 +2814,7 @@ func mapExpandedText(expanded, raw string, base int, word *syntax.Word) mapped {
 
 func relocateNestedLines(parent cmd, first int, calls *[]Call) {
 	base := parent.call.Offset
+	var newlines []int
 	for i := first; i < len(*calls); i++ {
 		offset := (*calls)[i].Offset
 		if offset < 0 {
@@ -2790,8 +2828,23 @@ func relocateNestedLines(parent cmd, first int, calls *[]Call) {
 		if start < 0 || start >= len(parent.call.Raw) {
 			continue
 		}
-		(*calls)[i].Line = parent.call.Line + strings.Count(parent.call.Raw[:start], "\n")
+		if newlines == nil {
+			newlines = newlineOffsets(parent.call.Raw)
+		}
+		before, _ := slices.BinarySearch(newlines, start)
+		(*calls)[i].Line = parent.call.Line + before
 	}
+}
+
+// newlineOffsets returns the offsets of the newlines in text, in order.
+func newlineOffsets(text string) []int {
+	offsets := []int{}
+	for i := range len(text) {
+		if text[i] == '\n' {
+			offsets = append(offsets, i)
+		}
+	}
+	return offsets
 }
 
 func scriptInvocation(name string, args []string) bool {

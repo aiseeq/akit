@@ -2674,3 +2674,62 @@ func TestRangeIndexContainingMatchesFullScan(t *testing.T) {
 		})
 	}
 }
+
+func TestFindFunctionsSharingANameResolveStdinPerDefinition(t *testing.T) {
+	src := "f() { f <<'A'\nkill A\nA\nbash; }\nf() { f <<'B'\nkill B\nB\nbash; }\n"
+	calls, err := Find(src, "kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, call := range calls {
+		got = append(got, strings.Join(call.Args, " "))
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"A", "B"}) {
+		t.Fatalf("kill calls = %v, want A and B", got)
+	}
+}
+
+func TestFindRemoteScriptLinesAfterManyLongLines(t *testing.T) {
+	src := "ssh h '" + strings.Repeat("bash -s </dev/null; # "+strings.Repeat("x", 40)+"\n", 3) + "bash -s' <<'EOF'\nkill 1\nEOF\n"
+	calls, err := Calls(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []int
+	for _, call := range calls {
+		if call.Name == "bash" {
+			lines = append(lines, call.Line)
+		}
+	}
+	if !slices.Equal(lines, []int{1, 2, 3, 4}) {
+		t.Fatalf("remote bash lines = %v, want 1..4", lines)
+	}
+}
+
+func TestRemoteStdinInnerOffsetMatchesFirstByte(t *testing.T) {
+	file, err := syntax.NewParser().Parse(strings.NewReader("true"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pos := range [][]int{
+		{10, 11, -1, 12, 20, -1, -1, 21},
+		{10, 11, 10, -1, 30, 12, 12},
+	} {
+		remote := newRemoteStdin(file, "true", pos)
+		for offset := -2; offset <= 32; offset++ {
+			want, wantOK := -1, false
+			for i, outer := range pos {
+				if outer == offset {
+					want, wantOK = i, true
+					break
+				}
+			}
+			got, ok := remote.innerOffset(offset)
+			if ok != wantOK || ok && got != want {
+				t.Fatalf("pos %v: innerOffset(%d) = %d, %v; want %d, %v", pos, offset, got, ok, want, wantOK)
+			}
+		}
+	}
+}
