@@ -270,7 +270,11 @@ func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inher
 		budget.parsedBytes += len(src)
 	}
 	first := len(*calls)
-	err := walkCalls(file, full, lineBase, inherited, vars, calls, budget)
+	walkText := src
+	if len(full) > len(src) {
+		walkText = full
+	}
+	err := walkCalls(file, walkText, lineBase, inherited, vars, calls, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -312,7 +316,117 @@ func (b *nestedParseBudget) parseShell(src string) (*syntax.File, string, error)
 	return parseShell(src)
 }
 
+func endCommentBackslashes(src string) string {
+	if !hasCommentContinuationCandidate(src) {
+		return src
+	}
+	data := []byte(src)
+	quote := byte(0)
+	escaped := false
+	wordStart := true
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if quote != 0 {
+			if quote == '\'' && c == '\'' {
+				quote = 0
+				wordStart = false
+				continue
+			}
+			if quote == '\'' {
+				continue
+			}
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == quote {
+				quote = 0
+				wordStart = false
+			}
+			continue
+		}
+		if escaped {
+			escaped = false
+			wordStart = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			wordStart = false
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			wordStart = false
+			continue
+		}
+		if c == '#' && wordStart {
+			i = neutralizeCommentEnd(data, i) - 1
+			wordStart = true
+			continue
+		}
+		switch c {
+		case ' ', '\t', '\n', ';', '|', '&', '(', ')', '<', '>':
+			wordStart = true
+		default:
+			wordStart = false
+		}
+	}
+	return string(data)
+}
+
+func hasCommentContinuationCandidate(src string) bool {
+	for start := 0; start < len(src); {
+		end := strings.IndexByte(src[start:], '\n')
+		if end < 0 {
+			return false
+		}
+		end += start
+		last := end - 1
+		if last >= start && src[last] == '\r' {
+			last--
+		}
+		if last >= start && src[last] == '\\' && strings.Contains(src[start:last], "#") {
+			count := 1
+			for j := last - 1; j >= start && src[j] == '\\'; j-- {
+				count++
+			}
+			if count%2 == 1 {
+				return true
+			}
+		}
+		start = end + 1
+	}
+	return false
+}
+
+func neutralizeCommentEnd(data []byte, start int) int {
+	end := start
+	for end < len(data) && data[end] != '\n' {
+		end++
+	}
+	last := end - 1
+	if last >= start && data[last] == '\r' {
+		last--
+	}
+	if last >= start && data[last] == '\\' {
+		count := 1
+		for j := last - 1; j >= start && data[j] == '\\'; j-- {
+			count++
+		}
+		if count%2 == 1 {
+			data[last] = ' '
+		}
+	}
+	return end
+}
+
 func parseShell(src string) (file *syntax.File, full string, err error) {
+	src = endCommentBackslashes(src)
 	full = src
 	for range 8 {
 		file, err = syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(full), "")

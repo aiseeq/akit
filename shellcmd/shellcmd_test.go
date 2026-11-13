@@ -2454,6 +2454,73 @@ func TestFourLargeNestedHeredocScriptsFitBudget(t *testing.T) {
 	t.Fatalf("nested script calls missing: %d calls", len(calls))
 }
 
+func TestCommentBackslashContinuation(t *testing.T) {
+	tests := []struct {
+		name, src    string
+		line, offset int
+		raw          string
+		args         []string
+	}{
+		{"top level", "echo x #\\\nkill 1", 2, 10, "kill 1", []string{"1"}},
+		{"bash c", "bash -c 'echo x #\\\nkill 1'", 2, 19, "kill 1", []string{"1"}},
+		{"shell heredoc", "bash <<'E'\necho x #\\\nkill 1\nE\n", 3, 21, "kill 1", []string{"1"}},
+		{"eval", "eval 'echo x #\\\nkill 1'", 2, 16, "kill 1", []string{"1"}},
+		{"initial comment", "# c \\\nkill 1", 2, 6, "kill 1", []string{"1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "kill")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != 1 {
+				t.Fatalf("Find = %+v, want one kill", calls)
+			}
+			c := calls[0]
+			if c.Line != tt.line || c.Offset != tt.offset || c.Raw != tt.raw || !reflect.DeepEqual(c.Args, tt.args) {
+				t.Errorf("call = %+v", c)
+			}
+		})
+	}
+}
+
+func TestCommentMarkerAndQuotedBackslash(t *testing.T) {
+	for _, tt := range []struct {
+		name, src string
+		args      []string
+	}{{"hash within word", "echo a#\\\nb", []string{"a#b"}}, {"quoted hash", "echo '#\\\n'", []string{"#\\\n"}}} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "echo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, tt.args) {
+				t.Fatalf("Find = %+v, want Args %q", calls, tt.args)
+			}
+		})
+	}
+}
+
+func TestUnquotedHeredocContinuationIsExpanded(t *testing.T) {
+	calls, err := Find("bash <<E\necho x #\\\nkill 1\nE\n", "kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("Find = %+v, want no kill after heredoc backslash-newline expansion", calls)
+	}
+}
+
+func TestCommentMarkerInsideHeredocData(t *testing.T) {
+	calls, err := Calls("cat <<E\n# c \\\nE\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || len(calls[0].Redirs) != 1 || calls[0].Redirs[0].Body != "# c \\\n" {
+		t.Fatalf("Calls = %+v, want heredoc body unchanged", calls)
+	}
+}
+
 func TestOffset(t *testing.T) {
 	tests := []struct {
 		name, command, program string
