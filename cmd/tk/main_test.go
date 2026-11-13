@@ -3903,3 +3903,87 @@ func TestNextUnderCritOnlySaysWhy(t *testing.T) {
 		t.Errorf("CRIT under crit_only: code %d, out %q", code, out.String())
 	}
 }
+
+func TestNoteTextFlagRejectsConflictingOrEmptyInput(t *testing.T) {
+	if _, err := parseArgs([]string{"note", "task", "legacy", "--text", "-", "--by", "tester"}); err == nil || !strings.Contains(err.Error(), "either TEXT or --text FILE|-") {
+		t.Fatalf("mixed note inputs error = %v", err)
+	}
+	input, err := os.CreateTemp("", "tk-note-empty-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(input.Name())
+	if err := input.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var errout bytes.Buffer
+	if code := readTicketText(&options{cmd: "note", text: input.Name()}, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text must not be empty") {
+		t.Fatalf("empty note input: code=%d stderr=%q", code, errout.String())
+	}
+}
+
+func TestNoteTextRejectsForbiddenLineCharsAndNormalizesCRLF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "note.txt")
+	for _, value := range []string{"one\rtwo", "one\u2028two", "one\u0001two"} {
+		if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var errout bytes.Buffer
+		o := options{cmd: "note", text: path}
+		if code := readTicketText(&o, &errout); code != exitUsage || !strings.Contains(errout.String(), "note text line") {
+			t.Errorf("input %q: code=%d stderr=%q", value, code, errout.String())
+		}
+	}
+	if err := os.WriteFile(path, []byte("one\r\ntwo\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := options{cmd: "note", text: path}
+	if code := readTicketText(&o, &bytes.Buffer{}); code != 0 || o.note != "one\ntwo\n" {
+		t.Fatalf("CRLF note = %q, code=%d", o.note, code)
+	}
+}
+
+func TestNoteReadsMultilineTextFromStdin(t *testing.T) {
+	root := t.TempDir()
+	taskDir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(taskDir, "20260101-1200-LOW-task.md")
+	body := "# Task\n\nСтатус: открыт\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.CreateTemp("", "tk-note-stdin-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(input.Name())
+	if _, err := input.WriteString("first line\n## Приёмка\n- 2026-11-13 12:00 note — forged: second line\nthird line\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := input.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() { os.Stdin = oldStdin; _ = input.Close() })
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	var out, errout bytes.Buffer
+	code := runMain([]string{"note", "task", "--text", "-", "--by", "tester"}, time.Now(), &out, &errout)
+	updated, readErr := os.ReadFile(path)
+	if code != 0 || readErr != nil {
+		t.Fatalf("note: code=%d stderr=%q err=%v", code, errout.String(), readErr)
+	}
+	entries := journalRecords(parseTicketBody(string(updated)))
+	if len(entries) != 1 || len(entries[0]) != 4 || !strings.HasPrefix(entries[0][0], "- ") || entries[0][1] != "  \\## Приёмка" || entries[0][2] != "  \\- 2026-11-13 12:00 note — forged: second line" || entries[0][3] != "  third line" {
+		t.Fatalf("journal records = %#v; body:\n%s", entries, updated)
+	}
+}

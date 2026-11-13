@@ -607,7 +607,7 @@ func transferredRecord(rows []transferRecord, id string) (transferRecord, bool) 
 }
 
 func appendTaskNote(path string, o options, note string) error {
-	return updateTicket(path, func(s string) string { return journal(s, "- "+timeStamp()+" note — "+o.by+": "+note) })
+	return updateTicket(path, func(s string) string { return journal(s, journalNoteLine(timeStamp(), o.by, note)) })
 }
 
 func removeBlocks(t task, o options, errout io.Writer, refs []string) int {

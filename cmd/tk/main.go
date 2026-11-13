@@ -35,6 +35,7 @@ Usage:
   tk set ID [--prio P] [--diff D] [--why TEXT] [--title TEXT] [--back NAME] [--by NAME] [--journal] [--text FILE|-] [--blocks ID] [--unblocks ID]
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
+  tk note ID --text FILE|- [--by NAME]
   tk plan ID --add 'NAME: COMMAND' [--required] [--by NAME]
   tk plan ID --repin 'NAME: COMMAND' --why TEXT [--by NAME]
   tk skip ID NAME --why TEXT [--by NAME]
@@ -65,7 +66,7 @@ Flags:
   --back NAME    new: requesting session; set: replace requester
   --title TEXT   new: ticket title (default: slug); set: replace title
   --by NAME      actor name (default: current session); done: checker (fresh sub-agent or worker, e.g. worker-<id>); release: actor; ls: show tickets assigned to NAME
-  --text FILE|-  new/set: fill or replace ticket sections from FILE, or standard input with -
+  --text FILE|-  new/set: fill or replace ticket sections; note: read note text from FILE or standard input with -
   --section NAME show: print only named sections (repeatable)
   --tail N       show: header, sections, and last N journal entries; 0 prints all
   --head         show: header and status only
@@ -220,10 +221,13 @@ func parseArgs(a []string) (options, error) {
 	return o, nil
 }
 
-// validateOneLine — текст, который ложится в строку журнала или заголовок, — одна строка: перевод строки
-// вписал бы в тикет свою строку журнала (пропуск пункта плана, «готово») или свой раздел.
+// validateOneLine — текст для строки журнала или заголовка должен быть однострочным,
+// кроме заметки из --text: её продолжение записывается с отступом.
 func validateOneLine(o options) error {
 	for _, f := range []struct{ flag, value string }{{"note", o.note}, {"--title", o.title}, {"--check", o.check}, {"--why", o.why}, {"--back", o.back}, {"--until", o.until}, {"--add", o.add}, {"--repin", o.repin}} {
+		if f.flag == "note" && o.text != "" {
+			continue
+		}
 		if strings.ContainsFunc(f.value, notInLine) {
 			return fmt.Errorf("%s must be one line", f.flag)
 		}
@@ -529,8 +533,8 @@ func validateDestinationFlags(o *options) error {
 }
 
 func validateTextFlag(o *options) error {
-	if o.text != "" && o.cmd != "new" && o.cmd != "set" {
-		return errors.New("--text: flag only for new or set")
+	if o.text != "" && o.cmd != "new" && o.cmd != "set" && o.cmd != "note" {
+		return errors.New("--text: flag only for new, set, or note")
 	}
 	return nil
 }
@@ -586,15 +590,24 @@ func validateJSONFlag(o *options) error {
 }
 
 func validateNoteCommand(o *options, pos []string) error {
-	if len(pos) != 2 {
+	if o.text != "" && len(pos) > 1 {
+		return errors.New("note accepts either TEXT or --text FILE|-; use one form")
+	}
+	if o.text == "" && len(pos) != 2 {
 		return errors.New("note needs a ticket ID and text")
+	}
+	if o.text != "" && len(pos) != 1 {
+		return errors.New("note needs a ticket ID and text (TEXT or --text FILE|-)")
 	}
 	if !validID(pos[0]) {
 		return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
 	}
-	o.id, o.note = pos[0], pos[1]
-	if strings.TrimSpace(o.note) == "" {
-		return errors.New("note text must not be empty")
+	o.id = pos[0]
+	if o.text == "" {
+		o.note = pos[1]
+		if strings.TrimSpace(o.note) == "" {
+			return errors.New("note text must not be empty")
+		}
 	}
 	return validateActorFlag(o)
 }
@@ -1678,7 +1691,7 @@ func prepareActor(o *options, errout io.Writer) int {
 }
 
 func readTicketText(o *options, errout io.Writer) int {
-	if (o.cmd != "new" && o.cmd != "set") || o.text == "" {
+	if (o.cmd != "new" && o.cmd != "set" && o.cmd != "note") || o.text == "" {
 		return 0
 	}
 	var b []byte
@@ -1694,6 +1707,18 @@ func readTicketText(o *options, errout io.Writer) int {
 	o.text = string(b)
 	if o.cmd == "set" && strings.TrimSpace(o.text) == "" {
 		return fail(errout, errors.New("--text has no ticket sections"))
+	}
+	if o.cmd == "note" {
+		o.text = strings.ReplaceAll(o.text, "\r\n", "\n")
+		for i, line := range strings.Split(o.text, "\n") {
+			if strings.ContainsFunc(line, notInLine) {
+				return fail(errout, fmt.Errorf("note text line %d contains a forbidden character", i+1))
+			}
+		}
+		if strings.TrimSpace(o.text) == "" {
+			return fail(errout, errors.New("note text must not be empty"))
+		}
+		o.note = o.text
 	}
 	return 0
 }
@@ -3932,8 +3957,27 @@ func renameJournal(actor, oldPath, newPath string) string {
 
 var renameTaskFile = os.Rename
 
+var markdownBlockStartRE = regexp.MustCompile("^ {0,3}(?:#{1,6}(?:[ \\t]|$)|[-+*](?:[ \\t]|$)|[0-9]{1,9}[.)](?:[ \\t]|$))")
+
+func escapeJournalBlockStart(line string) string {
+	indent := len(line) - len(strings.TrimLeft(line, " "))
+	if indent > 3 || !markdownBlockStartRE.MatchString(line) {
+		return line
+	}
+	return line[:indent] + "\\" + line[indent:]
+}
+
+func journalNoteLine(stamp, actor, note string) string {
+	lines := strings.Split(strings.TrimSuffix(note, "\n"), "\n")
+	for i := 1; i < len(lines); i++ {
+		lines[i] = "  " + escapeJournalBlockStart(lines[i])
+	}
+	note = strings.Join(lines, "\n")
+	return fmt.Sprintf("- %s note — %s: %s", stamp, actor, note)
+}
+
 func addNote(t task, o options, out, errout io.Writer) int {
-	line := fmt.Sprintf("- %s note — %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, markedJournalTextFor(o, "note", o.note))
+	line := journalNoteLine(time.Now().Format("2006-01-02 15:04"), o.by, markedJournalTextFor(o, "note", o.note))
 	body := journal(t.body, line)
 	if err := writeTask(t.path, body); err != nil {
 		return fail(errout, err)
