@@ -104,3 +104,26 @@ func TestShowWrapsLongLines(t *testing.T) {
 		t.Fatalf("show does not wrap the journal:\n%s", out.String())
 	}
 }
+
+func TestWrapJournalSectionBoundaries(t *testing.T) {
+	fence := strings.Repeat(string(rune(96)), 3)
+	long := strings.Repeat("word ", 40) + "end"
+	cases := []struct {
+		name    string
+		text    string
+		wrapped bool
+	}{
+		{"journal heading inside a code block of another section", "## Вход\n" + fence + "\n## Журнал\n" + fence + "\n" + fence + "\n" + long + "\n" + fence, false},
+		{"subheading inside the journal keeps the journal open", "## Журнал\n### x\n" + fence + "\n" + long, true},
+		{"heading that only starts with the journal name", "## Журнал старый\n" + fence + "\n" + long + "\n" + fence, false},
+		{"fence inside the journal", "## Журнал\n" + fence + "\n" + long, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := wrapLines(c.text, showWidth)
+			if wrapped := !strings.Contains(got, long); wrapped != c.wrapped {
+				t.Fatalf("wrapped = %v, want %v:\n%s", wrapped, c.wrapped, got)
+			}
+		})
+	}
+}

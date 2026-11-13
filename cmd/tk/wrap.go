@@ -19,7 +19,8 @@ func wrapLines(s string, width int) string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		if strings.HasPrefix(line, "## ") {
+		// Заголовок внутри блока кода другого раздела — пример, а не начало раздела.
+		if strings.HasPrefix(line, "## ") && (!fenced || journal) {
 			journal = line == "## Журнал"
 		}
 		if fence := strings.HasPrefix(strings.TrimSpace(line), fencePrefix); fence || fenced {

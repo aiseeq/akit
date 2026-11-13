@@ -2959,6 +2959,17 @@ func TestJournalContinuationReadersUseRecordHeaders(t *testing.T) {
 			t.Fatalf("opener = %q", got)
 		}
 	})
+	t.Run("plan add and unskip with continuation end an earlier skip", func(t *testing.T) {
+		skip := "- 2026-01-01 10:00 план — tester: пропущен: item — reason\n"
+		for _, later := range []string{
+			"- 2026-01-02 10:00 план — tester: добавлен пункт item: go test\n      continuation\n",
+			"- 2026-01-02 10:00 план — tester: возвращён: item — back\n      continuation\n",
+		} {
+			if got, ok := planSkipReason("# T\n\n## Журнал\n"+skip+later, "item"); ok {
+				t.Fatalf("skip survived %q: %q", later, got)
+			}
+		}
+	})
 	t.Run("plan skip reason reads a record with continuation", func(t *testing.T) {
 		body := "# T\n\n## Журнал\n- 2026-01-01 10:00 план — tester: пропущен: item — reason\n      continuation\n"
 		if got, ok := planSkipReason(body, "item"); !ok || got != "reason" {
