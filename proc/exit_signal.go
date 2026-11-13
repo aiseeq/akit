@@ -16,8 +16,9 @@ import "syscall"
 //     sent to itself. The process is made non-dumpable first, so a core-dumping
 //     signal leaves no second core: the crash is the child's.
 //
-// Should the process survive delivery, it exits 128+sig. Invalid numbers exit
-// 1. Outside Linux all valid signals exit 128+sig. Signals go only to the
+// Should the process survive delivery, it exits 128+sig: so it does when another
+// goroutine calls os/signal for the same signal meanwhile, which installs a
+// handler again. Numbers outside 1..64 are invalid and exit 1. Outside Linux all valid signals exit 128+sig. Signals go only to the
 // current process.
 func ExitWithSignal(sig syscall.Signal) {
 	if sig <= 0 || sig > 64 {

@@ -5,11 +5,13 @@ package proc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -30,6 +32,9 @@ func TestExitWithSignalHelper(t *testing.T) {
 	if os.Getenv("PROC_EXIT_NOTIFY") == "1" {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, sig)
+	}
+	if os.Getenv("PROC_EXIT_RESTORE_FAILS") == "1" {
+		restoreSignalDefault = func(syscall.Signal) error { return errors.New("injected") }
 	}
 	if os.Getenv("PROC_EXIT_NO_DELIVERY") == "1" {
 		sendExitSignal = func(syscall.Signal) error { return nil }
@@ -89,6 +94,7 @@ func TestExitWithSignal(t *testing.T) {
 		{"USR2-notify", syscall.SIGUSR2, true, true, false, false, false},
 		{"RTMIN+2", 36, true, false, false, false, false},
 		{"ABRT-undelivered", syscall.SIGABRT, false, false, false, true, false},
+		{"QUIT-restore-fails", syscall.SIGQUIT, false, false, false, false, false},
 		{"zero", 0, false, false, false, false, false},
 		{"negative", -1, false, false, false, false, false},
 		{"too-large", 65, false, false, false, false, false},
@@ -115,6 +121,9 @@ func TestExitWithSignal(t *testing.T) {
 			cmd.Env = append(os.Environ(), fmt.Sprintf("PROC_EXIT_SIGNAL=%d", tc.sig))
 			if tc.notify {
 				cmd.Env = append(cmd.Env, "PROC_EXIT_NOTIFY=1")
+			}
+			if strings.HasSuffix(tc.name, "-restore-fails") {
+				cmd.Env = append(cmd.Env, "PROC_EXIT_RESTORE_FAILS=1")
 			}
 			if tc.noDelivery {
 				cmd.Env = append(cmd.Env, "PROC_EXIT_NO_DELIVERY=1")
