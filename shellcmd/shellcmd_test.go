@@ -65,6 +65,9 @@ func TestArgLiteralContract(t *testing.T) {
 		{"carriage return inside a shell script", "bash -c 'kill 1\r'", "kill", 0, false},
 		{"tab between words", "kill\t'$X'", "kill", 0, true},
 		{"newline between statements", "echo a\nkill '$X'", "kill", 0, true},
+		{"comment ending in a backslash", "echo x #\\\neval 'kill $X'", "echo", 1, false},
+		{"comment backslash before a function", ": #\\\neval 'kill() { :; }'\nkill '$X'", "kill", 0, false},
+		{"line continuation between words", "kill 'a' \\\n'b'", "kill", 0, false},
 
 		{"glob question", `kill ?`, "kill", 0, false},
 		{"glob bracket", `kill [a]`, "kill", 0, false},

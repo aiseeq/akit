@@ -149,7 +149,8 @@ type Call struct {
 // только как `bash/sh -c '…'` с литеральными дополнительными словами, один уровень.
 // `!` разрешён только в одинарных кавычках или как `\!` вне кавычек; i должен быть [0, 32).
 // Управляющий байт в тексте скрипта, кроме перевода строки и табуляции, даёт false для всего
-// скрипта: парсер и bash по-разному читают `\r` (bash считает его литерой слова) и NUL.
+// скрипта: парсер и bash по-разному читают `\r` (bash считает его литерой слова) и NUL. Так же
+// действует обратная косая перед переводом строки: в конце комментария bash её не продолжает.
 // Всё прочее даёт false. Не учитываются изменения извне: окружение (BASH_ENV, PATH,
 // экспортированные функции), rc-файлы и содержимое source-файлов.
 func (c Call) ArgLiteral(i int) bool {
@@ -1415,10 +1416,11 @@ func singleQuotedWord(word *syntax.Word) bool {
 	return ok && !quoted.Dollar
 }
 
-// literalScriptText отвергает управляющие байты, кроме перевода строки и табуляции: `\r` и NUL
-// парсер читает не так, как bash.
+// literalScriptText отвергает управляющие байты, кроме перевода строки и табуляции, и обратную
+// косую перед переводом строки: `\r` и NUL парсер читает не так, как bash, а `\` с переводом строки
+// в конце комментария парсер считает продолжением строки, bash — нет.
 func literalScriptText(src string) bool {
-	return !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' })
+	return !strings.Contains(src, "\\\n") && !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' })
 }
 
 func literalScriptSimple(file *syntax.File, src string) bool {
