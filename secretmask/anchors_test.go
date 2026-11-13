@@ -92,9 +92,9 @@ func TestContextAnchorGroups(t *testing.T) {
 func TestMaskRussianLabels(t *testing.T) {
 	secret := "Zq7xW9vK2mPq8Rt"
 	for _, label := range []string{
-		"пароль", "Пароль", "ПАРОЛЬ", "пароля", "паролем",
-		"токен", "Токен", "ТОКЕН", "токена",
-		"ключ", "Ключ", "КЛЮЧ",
+		"пароль", "Пароль", "ПАРОЛЬ", "паРОЛЬ", "ПаРоЛь", "пароля", "паролем",
+		"токен", "Токен", "ТОКЕН", "тОкЕн", "токена",
+		"ключ", "Ключ", "КЛЮЧ", "КлЮч",
 	} {
 		input := label + ": " + secret
 		got, _ := Mask(input)
@@ -104,6 +104,9 @@ func TestMaskRussianLabels(t *testing.T) {
 	}
 	for _, input := range []string{
 		"Пароль учётки: " + secret,
+		"тОкЕн= " + secret,
+		"КЛЮЧ: " + secret,
+		"пароль:токен: " + secret,
 		"пароль для этой учётной записи: " + secret,
 		"пароль для учётной записи— " + secret,
 		"пароль— " + secret,
@@ -135,6 +138,7 @@ func TestMaskRussianLabels(t *testing.T) {
 		"токен: абвгдежз",
 		"ключ: " + strings.Join([]string{"SI", "1234"}, "-"),
 		"ключ: incident-reference",
+		"ключ: abcdefghij123456",
 		"ключ: Abcdefghijklmnop",
 		"супертокен: " + secret,
 		"_ключ: " + secret,
@@ -172,10 +176,12 @@ func TestMaskRussianRepeatedLabelsScaleLinearly(t *testing.T) {
 	for i, n := range []int{1000, 4000} {
 		input := strings.Repeat("пароль ", n) + ":"
 		Mask(input)
-		for range 9 {
+		for range 5 {
 			start := time.Now()
-			Mask(input)
-			elapsed[i] = append(elapsed[i], time.Since(start))
+			for range 4 {
+				Mask(input)
+			}
+			elapsed[i] = append(elapsed[i], time.Since(start)/4)
 		}
 	}
 	for i := range elapsed {

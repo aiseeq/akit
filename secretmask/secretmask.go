@@ -85,7 +85,7 @@ var (
 	awsRE                = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	escapeRE             = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
 	contextNameRE        = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
-	contextRussianNameRE = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])((?:\*\*|__|\x60|["'«])?)(парол[\p{L}]*|токен[\p{L}]*|ключ[\p{L}]*)(["'»]|(?:\*\*|__|\x60))?((?:[ \t]+[\p{L}\p{N}]+){0,4})([ \t]*)(:=|=>|=|:|—|–| - )(?:(?:\*\*|__|\x60)[ \t]+)?`)
+	contextRussianNameRE = regexp.MustCompile(`(?:(?:\*\*|__|\x60|["'«])?)(?:[Пп][Аа][Рр][Оо][Лл][\p{L}]*|[Тт][Оо][Кк][Ее][Нн][\p{L}]*|[Кк][Лл][Юю][Чч][\p{L}]*)(?:["'»]|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}\p{N}]+){0,4}[ \t]*(?::=|=>|=|:|—|–| - )(?:(?:\*\*|__|\x60)[ \t]+)?`)
 
 	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
@@ -97,12 +97,13 @@ var (
 type anchorGroup uint8
 
 const (
-	anchorName   anchorGroup = 1 << iota // secret names: assignments, flags, JSON keys and arrays
-	anchorHeader                         // Authorization headers
-	anchorURL                            // credentials in a URL
-	anchorCurl                           // curl options, also in a JSON argv
-	anchorTool                           // passwords in tool options and pipelines
-	anchorRuName anchorGroup = 1 << 5    // Russian password, token and key labels
+	anchorName        anchorGroup = 1 << iota // secret names: assignments, flags, JSON keys and arrays
+	anchorHeader                              // Authorization headers
+	anchorURL                                 // credentials in a URL
+	anchorCurl                                // curl options, also in a JSON argv
+	anchorTool                                // passwords in tool options and pipelines
+	anchorRuName      anchorGroup = 1 << 5    // Russian password, token and key labels
+	anchorRuCandidate anchorGroup = 1 << 6
 )
 
 // anchorEdge is what must surround an anchor for it to count.
@@ -129,9 +130,9 @@ type contextAnchor struct {
 }
 
 var contextAnchors = [...]contextAnchor{
-	{"арол", anchorRuName, edgeNone}, {"АРОЛ", anchorRuName, edgeNone},
-	{"окен", anchorRuName, edgeNone}, {"ОКЕН", anchorRuName, edgeNone},
-	{"люч", anchorRuName, edgeNone}, {"ЛЮЧ", anchorRuName, edgeNone},
+	{"арол", anchorRuName, edgeNone},
+	{"окен", anchorRuName, edgeNone},
+	{"люч", anchorRuName, edgeNone},
 	{"authorization", anchorHeader, edgeNone},
 	{"password", anchorName, edgeNameUse}, {"passwd", anchorName, edgeNameUse},
 	{"passphrase", anchorName, edgeNameUse}, {"pass", anchorName, edgeNameUse},
@@ -156,19 +157,33 @@ var contextAnchors = [...]contextAnchor{
 // failure links folded in: next is defined for every byte after anchorFold.
 // A target state where anchors end carries anchorHit in its number.
 type anchorAutomaton struct {
-	next    [][256]uint16
+	next    [][128]uint16
 	anchors [][]uint8 // indices into contextAnchors ending in each state
 }
 
 const anchorHit = 1 << 15
 
-// anchorFold lowers ASCII letters and preserves all other bytes.
+// anchorFold folds ASCII and Russian label bytes for the anchor automaton.
 var anchorFold = func() (fold [256]byte) {
-	for c := range 256 {
+	for c := range 128 {
 		fold[c] = byte(c)
 		if c >= 'A' && c <= 'Z' {
 			fold[c] = byte(c + 32)
 		}
+	}
+	fold[0xD0], fold[0xD1] = 1, 1
+	for i, pair := range [...][2]byte{
+		{0x90, 0xB0}, // а
+		{0xA0, 0x80}, // р
+		{0x9E, 0xBE}, // о
+		{0x9B, 0xBB}, // л
+		{0x9A, 0xBA}, // к
+		{0x95, 0xB5}, // е
+		{0x9D, 0xBD}, // н
+		{0xAE, 0x8E}, // ю
+		{0xA7, 0x87}, // ч
+	} {
+		fold[pair[0]], fold[pair[1]] = byte(i+2), byte(i+2)
 	}
 	return fold
 }()
@@ -176,14 +191,14 @@ var anchorFold = func() (fold [256]byte) {
 var contextAnchorAutomaton = buildAnchorAutomaton()
 
 func buildAnchorAutomaton() anchorAutomaton {
-	children := [][256]uint16{{}}
+	children := [][128]uint16{{}}
 	anchors := [][]uint8{nil}
 	for index, anchor := range contextAnchors {
 		state := 0
 		for i := 0; i < len(anchor.word); i++ {
-			c := anchor.word[i]
+			c := anchorFold[anchor.word[i]]
 			if children[state][c] == 0 {
-				children = append(children, [256]uint16{})
+				children = append(children, [128]uint16{})
 				anchors = append(anchors, nil)
 				children[state][c] = uint16(len(children) - 1)
 			}
@@ -191,10 +206,10 @@ func buildAnchorAutomaton() anchorAutomaton {
 		}
 		anchors[state] = append(anchors[state], uint8(index))
 	}
-	next := make([][256]uint16, len(children))
+	next := make([][128]uint16, len(children))
 	fail := make([]int, len(children))
 	queue := make([]int, 0, len(children))
-	for c := range 256 {
+	for c := range 128 {
 		if child := children[0][c]; child != 0 {
 			queue = append(queue, int(child))
 		}
@@ -203,7 +218,7 @@ func buildAnchorAutomaton() anchorAutomaton {
 	for head := 0; head < len(queue); head++ {
 		state := queue[head]
 		anchors[state] = append(anchors[state], anchors[fail[state]]...)
-		for c := range 256 {
+		for c := range 128 {
 			child := children[state][c]
 			if child == 0 {
 				next[state][c] = next[fail[state]][c]
@@ -215,7 +230,7 @@ func buildAnchorAutomaton() anchorAutomaton {
 		}
 	}
 	for state := range next {
-		for c := range 256 {
+		for c := range 128 {
 			if len(anchors[next[state][c]]) != 0 {
 				next[state][c] |= anchorHit
 			}
@@ -241,6 +256,9 @@ func contextAnchorGroups(text string) anchorGroup {
 				groups |= anchor.group
 			}
 		}
+	}
+	if groups&anchorRuName != 0 && russianHeaderCandidateInText(text) {
+		groups |= anchorRuCandidate
 	}
 	return groups
 }
@@ -492,7 +510,7 @@ func maskContext(text string, m *masking, groups anchorGroup) string {
 		matches = append(matches, nameMatches(text)...)
 		matches = append(matches, flagMatches(text)...)
 	}
-	if groups&anchorRuName != 0 {
+	if groups&anchorRuCandidate != 0 {
 		matches = append(matches, russianNameMatches(text)...)
 	}
 	if groups&anchorURL != 0 {
@@ -525,7 +543,7 @@ func maskContext(text string, m *masking, groups anchorGroup) string {
 // option and its value as neighbouring array elements, an array or an object
 // under a secret key, and a {"name": ..., "value": ...} pair.
 func maskJSONContext(text string, m *masking, groups anchorGroup) string {
-	if groups&(anchorName|anchorCurl|anchorRuName) == 0 {
+	if groups&(anchorName|anchorCurl|anchorRuCandidate) == 0 {
 		return text
 	}
 	var spans []contextSpan
@@ -775,35 +793,200 @@ func headerMatches(text string) []contextMatch {
 	return matches
 }
 
+func russianHeaderCandidateInText(text string) bool {
+	for at := 0; at < len(text); at++ {
+		if russianNameAnchorAt(text, at) && russianHeaderCandidateAt(text, at-2) {
+			return true
+		}
+	}
+	return false
+}
+
+func russianNameAnchorAt(text string, at int) bool {
+	if at+8 > len(text) || text[at] != 0xD0 && text[at] != 0xD1 {
+		return false
+	}
+	for _, base := range [...]string{"арол", "окен"} {
+		if russianAnchorBytesMatch(text[at:at+len(base)], base) {
+			return true
+		}
+	}
+	return at+6 <= len(text) && russianAnchorBytesMatch(text[at:at+6], "люч")
+}
+
+func russianAnchorBytesMatch(text, base string) bool {
+	for i := range len(base) {
+		if anchorFold[text[i]] != anchorFold[base[i]] {
+			return false
+		}
+	}
+	return true
+}
+
+func russianHeaderCandidateAt(text string, wordStart int) bool {
+	end, ok := russianCandidateLabelEnd(text, wordStart)
+	return ok && russianCandidateHasDelimiter(text, end)
+}
+
+func russianCandidateLabelEnd(text string, wordStart int) (int, bool) {
+	if wordStart < 0 || wordStart >= len(text) {
+		return 0, false
+	}
+	boundaryStart := russianCandidateBoundaryStart(text, wordStart)
+	if !russianNameBoundaryAt(text, boundaryStart) {
+		return 0, false
+	}
+	end := wordEnd(text, wordStart, false)
+	if _, _, ok := russianSecretLabel(text[wordStart:end]); !ok {
+		return 0, false
+	}
+	if strings.HasPrefix(text[end:], "**") || strings.HasPrefix(text[end:], "__") {
+		end += 2
+	} else if end < len(text) {
+		r, size := utf8.DecodeRuneInString(text[end:])
+		if strings.ContainsRune("`\"'»", r) {
+			end += size
+		}
+	}
+	return end, true
+}
+
+func russianCandidateBoundaryStart(text string, start int) int {
+	if start >= 2 && (text[start-2:start] == "**" || text[start-2:start] == "__") {
+		return start - 2
+	}
+	if start > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:start])
+		if strings.ContainsRune("`\"'«", r) {
+			return start - size
+		}
+	}
+	return start
+}
+
+func wordEnd(text string, start int, numbers bool) int {
+	for end := start; end < len(text); {
+		r, size := utf8.DecodeRuneInString(text[end:])
+		if !unicode.IsLetter(r) && (!numbers || !unicode.IsNumber(r)) {
+			return end
+		}
+		end += size
+	}
+	return len(text)
+}
+
+func russianCandidateHasDelimiter(text string, end int) bool {
+	for words := 0; words <= 4; words++ {
+		if russianDelimiterAtStart(text[end:]) != "" {
+			return true
+		}
+		end = skipRussianSpace(text, end)
+		if russianDelimiterAtStart(text[end:]) != "" {
+			return true
+		}
+		if words == 4 {
+			return false
+		}
+		next := wordEnd(text, end, true)
+		if next == end {
+			return false
+		}
+		end = next
+	}
+	return false
+}
+
+func skipRussianSpace(text string, at int) int {
+	for at < len(text) && (text[at] == ' ' || text[at] == '	') {
+		at++
+	}
+	return at
+}
+
+func russianDelimiterAtStart(text string) string {
+	for _, delimiter := range [...]string{":=", "=>", "=", ":", "—", "–", " - "} {
+		if strings.HasPrefix(text, delimiter) {
+			return delimiter
+		}
+	}
+	return ""
+}
+
 func russianNameMatches(text string) []contextMatch {
 	var matches []contextMatch
-	for _, ix := range contextRussianNameRE.FindAllStringSubmatchIndex(text, -1) {
-		if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[12]) {
+	for _, ix := range contextRussianNameRE.FindAllStringIndex(text, -1) {
+		start, end := ix[0], ix[1]
+		if !russianNameBoundaryAt(text, start) || withinMaskMarker(text, start) || withinMaskMarker(text, end) {
 			continue
 		}
-		phraseWords := append([]string{text[ix[4]:ix[5]]}, strings.Fields(text[ix[8]:ix[9]])...)
-		name, kind, key := "", "", false
-		for _, word := range phraseWords {
-			wordKind, wordIsKey, ok := russianSecretLabel(word)
-			if ok && (name == "" || key && !wordIsKey) {
-				name, kind, key = word, wordKind, wordIsKey
-			}
-		}
+		name, kind, delimiter := russianNameFromHeader(text[start:end])
 		if name == "" {
 			continue
 		}
-		delimiter := text[ix[12]:ix[13]]
-		value, ok := scanValue(text, ix[1], delimiter == ":" || delimiter == ":=")
-		if !ok || valueIsStructure(text, value) ||
-			!valueIsValueFor(text, value, name, kind, delimiter == ":" || delimiter == ":=", true) {
-			continue
-		}
-		if !value.quoted && (delimiter == ":=" || delimiter == "=>") && !isRussianValueLabel(name) {
+		value, ok := russianContextValue(text, end, name, kind, delimiter)
+		if !ok {
 			continue
 		}
 		matches = append(matches, contextMatch{value.start, value.end, kind})
 	}
 	return matches
+}
+
+func russianNameFromHeader(header string) (name, kind, delimiter string) {
+	delimiterAt, delimiter := russianDelimiterAt(header)
+	if delimiter == "" {
+		return "", "", ""
+	}
+	phrase := strings.Trim(header[:delimiterAt], "*_`\"'«»")
+	for word := range strings.FieldsSeq(phrase) {
+		wordKind, key, ok := russianSecretLabel(word)
+		if ok && (name == "" || name == "key" && !key) {
+			name, kind = word, wordKind
+		}
+	}
+	return name, kind, delimiter
+}
+
+func russianContextValue(text string, end int, name, kind, delimiter string) (contextValue, bool) {
+	value, ok := scanValue(text, end, delimiter == ":" || delimiter == ":=")
+	if !ok || valueIsStructure(text, value) ||
+		!valueIsValueFor(text, value, name, kind, delimiter == ":" || delimiter == ":=", true) {
+		return contextValue{}, false
+	}
+	if !value.quoted && (delimiter == ":=" || delimiter == "=>") && !isRussianValueLabel(name) {
+		return contextValue{}, false
+	}
+	return value, true
+}
+
+func russianDelimiterAt(header string) (int, string) {
+	for i := 0; i < len(header); i++ {
+		switch {
+		case strings.HasPrefix(header[i:], ":="):
+			return i, ":="
+		case strings.HasPrefix(header[i:], "=>"):
+			return i, "=>"
+		case header[i] == '=':
+			return i, "="
+		case header[i] == ':':
+			return i, ":"
+		case strings.HasPrefix(header[i:], "—"):
+			return i, "—"
+		case strings.HasPrefix(header[i:], "–"):
+			return i, "–"
+		case strings.HasPrefix(header[i:], " - "):
+			return i, " - "
+		}
+	}
+	return 0, ""
+}
+
+func russianNameBoundaryAt(text string, at int) bool {
+	if at == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(text[:at])
+	return !unicode.IsLetter(r) && !unicode.IsNumber(r) && r != 95
 }
 
 func isRussianValueLabel(name string) bool {
