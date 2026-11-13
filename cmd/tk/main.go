@@ -78,6 +78,7 @@ Flags:
   --status S     ls: show only status S
   --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
+  TK_NO_PARSE_CACHE=1 disables the ls parse cache.
   --note TEXT    review: add a review note to the journal
   --check TEXT   done: describe independent verification (required)
   --doer NAME    done: specify the executor of an older ticket
@@ -162,6 +163,35 @@ func (o options) planLimit() time.Duration {
 type task struct {
 	path, slug, status, prio, diff, title, body string
 	created, changed                            time.Time
+	facts                                       *taskFacts
+}
+
+type taskFacts struct {
+	Back, Why, Executor, Opener, Waits string
+	NoCheck, Journal                   bool
+	Checker, Check, CheckerSession     string
+	Plan                               []planJSON
+	Blocks, BlockedBy                  []string
+	Actors                             map[string]string
+}
+
+func factsFromBody(body string) *taskFacts {
+	checker, check, checkerSession := completion(body)
+	return &taskFacts{
+		Back: headerValue(body, "Заказчик: "), Why: lineValue(body, "Причина: "),
+		Executor: executor(body), Opener: opener(body), Waits: waiting(body),
+		NoCheck: noCheck(body), Journal: lineValue(body, "Вид: ") == "журнал",
+		Checker: checker, Check: check, CheckerSession: checkerSession,
+		Plan: planItems(body), Blocks: headerLinks(body, blocksPrefix),
+		BlockedBy: headerLinks(body, blockedPrefix), Actors: journalActors(body),
+	}
+}
+
+func factsForTask(t task) *taskFacts {
+	if t.facts != nil {
+		return t.facts
+	}
+	return factsFromBody(t.body)
 }
 
 func main() {
@@ -1987,11 +2017,49 @@ func ensureTaskExclude(main, commonDir string) error {
 	return nil
 }
 func fail(w io.Writer, e error) int { fmt.Fprintf(w, "tk: %v\n", e); return exitUsage }
+func loadCachedTasks(dir string) ([]task, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read task directory %s: %w", dir, err)
+	}
+	cachePath, _, err := parseCachePathFor(dir, filepath.Join(dir, "cache-index.md"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve ticket cache path: %w", err)
+	}
+	cache := readParseCacheEntries(cachePath)
+	var tasks []task
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := parseTaskName(entry.Name()); !ok {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		cached, err := loadCachedTaskFromEntries(path, true, cache)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, cached)
+	}
+	if err := writeParseCacheEntries(cachePath, cache); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
 func load(dir string) ([]task, error) {
 	return loadTasks(dir, false)
 }
 
 func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
+	return loadTasksMode(dir, tolerateUnknownStatus, false)
+}
+
+func loadTasksMode(dir string, tolerateUnknownStatus, useCache bool) ([]task, error) {
 	es, e := os.ReadDir(dir)
 	if errors.Is(e, os.ErrNotExist) {
 		return nil, nil
@@ -2009,6 +2077,14 @@ func loadTasks(dir string, tolerateUnknownStatus bool) ([]task, error) {
 			continue
 		}
 		p := filepath.Join(dir, en.Name())
+		if useCache {
+			t, loadErr := loadCachedTask(p, tolerateUnknownStatus)
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			ts = append(ts, t)
+			continue
+		}
 		b, e := os.ReadFile(p)
 		if e != nil {
 			return nil, e
@@ -2165,7 +2241,13 @@ func gatherTasks(root string, o options) ([]task, map[string]string, []string, e
 	var tasks []task
 	for _, repo := range repos {
 		dir := filepath.Join(repo, "docs/tasks")
-		loaded, err := loadTasks(dir, true)
+		var loaded []task
+		var err error
+		if o.json {
+			loaded, err = loadCachedTasks(dir)
+		} else {
+			loaded, err = loadTasks(dir, true)
+		}
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -2261,9 +2343,10 @@ func matchesListFilters(t task, o options) bool {
 		return false
 	}
 	if o.by != "" {
-		who := executor(t.body)
+		facts := factsForTask(t)
+		who := facts.Executor
 		if who == "" {
-			who = opener(t.body)
+			who = facts.Opener
 		}
 		if !strings.EqualFold(who, o.by) {
 			return false
@@ -2273,7 +2356,7 @@ func matchesListFilters(t task, o options) bool {
 		if t.status != "ждёт" {
 			return false
 		}
-		at, ok := timearg.Deadline(waiting(t.body), time.Now())
+		at, ok := timearg.Deadline(factsForTask(t).Waits, time.Now())
 		if !ok || at.After(time.Now()) {
 			return false
 		}
@@ -2295,7 +2378,7 @@ func printTask(out io.Writer, t task, label string, errout io.Writer) {
 	if label != "" {
 		label += " "
 	}
-	wait := waiting(t.body)
+	wait := factsForTask(t).Waits
 	if wait != "" {
 		shown := wait
 		if at, ok := timearg.Deadline(wait, time.Now()); ok {
@@ -4024,7 +4107,8 @@ func (p planJSON) label() string {
 }
 
 func taskObject(root string, t task, repo string, details bool) taskJSON {
-	waits := waiting(t.body)
+	facts := factsForTask(t)
+	waits := facts.Waits
 	overdue, due := false, ""
 	if t.status == "ждёт" {
 		if at, ok := timearg.Deadline(waits, time.Now()); ok {
@@ -4033,10 +4117,10 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 		}
 	}
 	prio := normalizePrio(t.prio)
-	journalEntry := isJournal(t)
-	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: headerValue(t.body, "Заказчик: "), Why: lineValue(t.body, "Причина: "), Title: t.title,
+	journalEntry := facts.Journal
+	obj := taskJSON{Repo: repo, Slug: t.slug, Status: t.status, Prio: prio, Diff: t.diff, Back: facts.Back, Why: facts.Why, Title: t.title,
 		Created: t.created.Format(time.RFC3339), Changed: t.changed.Format(time.RFC3339),
-		Path: relative(root, t.path), Executor: executor(t.body), Waits: waits, Overdue: overdue, Due: due, NoCheck: noCheck(t.body)}
+		Path: relative(root, t.path), Executor: facts.Executor, Waits: waits, Overdue: overdue, Due: due, NoCheck: facts.NoCheck}
 	if details {
 		obj.Journal = journalLines(t.body)
 		if journalEntry {
@@ -4045,11 +4129,11 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	} else if journalEntry {
 		obj.Journal = true
 	}
-	obj.Checker, obj.Check, obj.CheckerSession = completion(t.body)
-	obj.Plan = planItems(t.body)
-	obj.Blocks = headerLinks(t.body, blocksPrefix)
-	obj.BlockedBy = headerLinks(t.body, blockedPrefix)
-	obj.Actors = journalActors(t.body)
+	obj.Checker, obj.Check, obj.CheckerSession = facts.Checker, facts.Check, facts.CheckerSession
+	obj.Plan = facts.Plan
+	obj.Blocks = facts.Blocks
+	obj.BlockedBy = facts.BlockedBy
+	obj.Actors = facts.Actors
 	return obj
 }
 
@@ -4431,15 +4515,16 @@ func gateVisible(t task, gate queuegate.Scope) bool {
 }
 
 func eligibleForNext(t task, actor string) bool {
+	facts := factsForTask(t)
 	waitDueNow := false
 	if t.status == "ждёт" {
-		at, ok := timearg.Deadline(waiting(t.body), time.Now())
+		at, ok := timearg.Deadline(facts.Waits, time.Now())
 		waitDueNow = ok && !at.After(time.Now())
 	}
 	if isJournal(t) && !waitDueNow {
 		return false
 	}
-	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
+	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(facts.Executor, actor) {
 		return true
 	}
 	if t.status != "ждёт" {
@@ -4448,7 +4533,7 @@ func eligibleForNext(t task, actor string) bool {
 	return waitDueNow
 }
 
-func isJournal(t task) bool { return lineValue(t.body, "Вид: ") == "журнал" }
+func isJournal(t task) bool { return factsForTask(t).Journal }
 
 // nextGroup orders the queue. Work already begun under a closed pair stays in the
 // queue without pushing out CRIT and HIGH, and goes ahead of new work.
@@ -4460,7 +4545,7 @@ func nextGroup(t task, actor string, gate queuegate.Scope) int {
 	if t.status != "открыт" && !gate.Passes(t.prio, t.diff) {
 		return 3
 	}
-	if t.status == "в работе" && strings.EqualFold(executor(t.body), actor) {
+	if t.status == "в работе" && strings.EqualFold(factsForTask(t).Executor, actor) {
 		return 1
 	}
 	if prio == "HIGH" {
@@ -4495,7 +4580,7 @@ func orderedNextCandidates(tasks []task, actor string, gate queuegate.Scope) []t
 		}
 		visiting[t.slug] = true
 		maxDepth := 0
-		for _, ref := range headerLinks(t.body, blockedPrefix) {
+		for _, ref := range factsForTask(*t).BlockedBy {
 			target, found := bySlug[ref]
 			if strings.Contains(ref, "/") || !found {
 				if maxDepth < 1 && refBlockMark(taskProject(t.path), ref, io.Discard) != "" {
@@ -4593,7 +4678,7 @@ func writeListJSON(root string, ts []task, labels map[string]string, o options, 
 		if _, ok := projects[project]; ok {
 			continue
 		}
-		loaded, err := loadTasks(filepath.Join(project, "docs", "tasks"), true)
+		loaded, err := loadCachedTasks(filepath.Join(project, "docs", "tasks"))
 		if err != nil {
 			return fail(errout, err)
 		}
