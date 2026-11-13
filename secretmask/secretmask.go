@@ -1553,6 +1553,9 @@ func scanValue(text string, at int, colon bool) (contextValue, bool) {
 		return contextValue{}, false
 	}
 	if text[at] == '`' {
+		if !colon {
+			return contextValue{}, false
+		}
 		return scanBacktickValue(text, at)
 	}
 	quoteAt := at
@@ -1578,14 +1581,15 @@ func scanBacktickValue(text string, at int) (contextValue, bool) {
 	if end < 0 {
 		return contextValue{}, false
 	}
-	return contextValue{at + 1, end, true}, end > at+1 && !looksLikePath(text[at+1:end])
+	value := text[at+1 : end]
+	return contextValue{at + 1, end, true}, end > at+1 && !strings.ContainsAny(value, " \t") && !looksLikePath(value)
 }
 
 func scanQuotedValue(text string, quoteAt, slashes int) (contextValue, bool) {
 	if slashes == 0 && text[quoteAt] == '"' && quoteAt+1 < len(text) && text[quoteAt+1] == '`' {
 		end := closingQuote(text, quoteAt+1, 0)
 		if end > quoteAt+2 && end+1 < len(text) && text[end+1] == '"' {
-			if looksLikePath(text[quoteAt+2 : end]) {
+			if strings.ContainsAny(text[quoteAt+2:end], " \t") || looksLikePath(text[quoteAt+2:end]) {
 				return contextValue{}, false
 			}
 			return contextValue{quoteAt + 2, end, true}, true
@@ -1651,7 +1655,7 @@ func quotedIsValue(value string) bool {
 }
 
 func looksLikePath(value string) bool {
-	return strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\`) || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") || strings.HasPrefix(value, ".\\") ||
+	return strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\`) || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") || strings.HasPrefix(value, ".\\") ||
 		len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
 }
 
