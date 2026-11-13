@@ -32,7 +32,11 @@ func exitWithSignal(sig syscall.Signal) {
 		// The default action stops the process or does nothing: no death to copy.
 		exitSignalCode(128 + int(sig))
 	default:
-		restoreDefaultAction(sig)
+		if restoreDefaultAction(sig) != nil {
+			// The runtime still catches sig: sending it would dump stacks or
+			// do nothing, not end the process the way the child ended.
+			exitSignalCode(128 + int(sig))
+		}
 	}
 	if sendExitSignal(sig) == nil {
 		time.Sleep(100 * time.Millisecond)
@@ -45,17 +49,20 @@ func exitWithSignal(sig syscall.Signal) {
 // on this thread. The process dies on the very next delivery, so the runtime
 // never sees the change. It turns non-dumpable first: the crash, if the
 // signal dumps core, is the child's, and a second core record would be ours.
-// Errors only leave the fallback exit code in place.
-func restoreDefaultAction(sig syscall.Signal) {
-	_ = unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
+func restoreDefaultAction(sig syscall.Signal) error {
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		return err
+	}
 	// A zeroed kernel sigaction is SIG_DFL with no flags and an empty mask
 	// whatever the architecture's field order; the buffer is larger than any
 	// layout, and the kernel reads an 8-byte mask (sigsetsize 8).
 	var dfl [64]byte
-	_, _, _ = unix.RawSyscall6(unix.SYS_RT_SIGACTION, uintptr(sig), uintptr(unsafe.Pointer(&dfl)), 0, 8, 0, 0)
+	if _, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGACTION, uintptr(sig), uintptr(unsafe.Pointer(&dfl)), 0, 8, 0, 0); errno != 0 {
+		return errno
+	}
 	var set unix.Sigset_t
 	n := uint(sig - 1)
 	bits := uint(unsafe.Sizeof(set.Val[0])) * 8
 	set.Val[n/bits] |= 1 << (n % bits)
-	_ = unix.PthreadSigmask(unix.SIG_UNBLOCK, &set, nil)
+	return unix.PthreadSigmask(unix.SIG_UNBLOCK, &set, nil)
 }
