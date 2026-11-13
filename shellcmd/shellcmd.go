@@ -90,6 +90,7 @@ done
 elif
 else
 esac
+fi
 for
 function
 if
@@ -104,7 +105,10 @@ while
 `
 
 var bashBuiltinAndKeywordSet = literalWordSet(bashBuiltinAndKeywordNames)
-var literalBuiltinAllowSet = literalWordSet(`kill echo true false : test [ pwd exit wait`)
+
+// test и [ с -v вычисляют индекс массива в имени переменной (подстановка, присваивание);
+// wait -p присваивает переменную — они вне списка.
+var literalBuiltinAllowSet = literalWordSet(`kill echo true false : pwd exit`)
 
 func literalWordSet(words string) map[string]struct{} {
 	set := make(map[string]struct{})
@@ -140,10 +144,12 @@ type Call struct {
 // ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: все его
 // предложения — простые вызовы без присваиваний, перенаправлений, списков, составных команд
 // и нелитеральных слов. Имя вызова должно быть внешней командой либо builtin из списка
-// kill echo true false : test [ pwd exit wait. Список builtin и ключевых слов взят из
+// kill echo true false : pwd exit. Список builtin и ключевых слов взят из
 // GNU Bash 5.3.9 (`bash --version`, `compgen -b`, `compgen -k`). Вложенный скрипт разрешён
 // только как `bash/sh -c '…'` с литеральными дополнительными словами, один уровень.
-// `!` разрешён только в одинарных кавычках или как `\\!` вне кавычек; i должен быть [0, 32).
+// `!` разрешён только в одинарных кавычках или как `\!` вне кавычек; i должен быть [0, 32).
+// Управляющий байт в тексте скрипта, кроме перевода строки и табуляции, даёт false для всего
+// скрипта: парсер и bash по-разному читают `\r` (bash считает его литерой слова) и NUL.
 // Всё прочее даёт false. Не учитываются изменения извне: окружение (BASH_ENV, PATH,
 // экспортированные функции), rc-файлы и содержимое source-файлов.
 func (c Call) ArgLiteral(i int) bool {
@@ -403,7 +409,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 	}
 	info := walkInfo{
 		topLevelCalls: topLevelCalls,
-		literalSimple: true,
+		literalSimple: literalScriptText(src),
 		trackWork:     budget.trackWork,
 		hasInputRedir: strings.Contains(src, "<"),
 		timedCalls:    make(map[*syntax.CallExpr]bool),
@@ -1409,7 +1415,16 @@ func singleQuotedWord(word *syntax.Word) bool {
 	return ok && !quoted.Dollar
 }
 
+// literalScriptText отвергает управляющие байты, кроме перевода строки и табуляции: `\r` и NUL
+// парсер читает не так, как bash.
+func literalScriptText(src string) bool {
+	return !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' })
+}
+
 func literalScriptSimple(file *syntax.File, src string) bool {
+	if !literalScriptText(src) {
+		return false
+	}
 	simple := true
 	syntax.Walk(file, func(node syntax.Node) bool {
 		if simple && !literalScriptNodeSimple(node, src) {

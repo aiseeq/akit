@@ -57,6 +57,14 @@ func TestArgLiteralContract(t *testing.T) {
 		{"tilde", `kill ~`, "kill", 0, false},
 		{"glob star", `kill *`, "kill", 0, false},
 		{"escaped glob star", `kill \*`, "kill", 0, true},
+		{"test -v runs an array index", `test -v 'x[$(kill $X)]'; kill '$X'`, "kill", 0, false},
+		{"escaped bracket test -v", `\[ -v 'x[$(kill $X)]' \]; kill '$X'`, "kill", 0, false},
+		{"wait is not allowed", `wait; kill '$X'`, "kill", 0, false},
+		{"carriage return ends a comment only for the parser", "kill '$X'\r#$X", "kill", 0, false},
+		{"carriage return line continuation", "echo x\\\r\neval 'kill $X'", "echo", 1, false},
+		{"carriage return inside a shell script", "bash -c 'kill 1\r'", "kill", 0, false},
+		{"tab between words", "kill\t'$X'", "kill", 0, true},
+		{"newline between statements", "echo a\nkill '$X'", "kill", 0, true},
 
 		{"glob question", `kill ?`, "kill", 0, false},
 		{"glob bracket", `kill [a]`, "kill", 0, false},
@@ -153,9 +161,6 @@ func TestArgLiteralContract(t *testing.T) {
 	}
 	for name := range literalBuiltinAllowSet {
 		invocation := name + " x"
-		if name == "[" {
-			invocation = "'[' x ']'"
-		}
 		t.Run("allowed builtin "+name, func(t *testing.T) {
 			calls, err := Find(invocation+"; echo ok", name)
 			if err != nil {
