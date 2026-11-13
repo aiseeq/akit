@@ -12,7 +12,10 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 // internalSuffixes — имена, которых нет в публичном DNS: адрес такого хоста в архив не уходит.
@@ -107,6 +110,9 @@ func pdfText(ctx context.Context, body []byte) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, pdfTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "pdftotext", "-enc", "UTF-8", "-", "-")
+	if err := proc.CancelByStop(cmd, time.Second, syscall.SIGTERM); err != nil {
+		return "", fmt.Errorf("pdf: %w", err)
+	}
 	cmd.Stdin = bytes.NewReader(body)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

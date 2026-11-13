@@ -489,6 +489,9 @@ func (c *idleCond) check(ctx context.Context) (bool, error) {
 	if c.done == nil {
 		c.done = make(chan error, 1)
 		cmd := exec.CommandContext(ctx, c.graft, "exec", "--heavy", "--local", "--", "true")
+		if err := proc.CancelByStop(cmd, 2*time.Second, syscall.SIGTERM); err != nil {
+			return false, fmt.Errorf("idle: %w", err)
+		}
 		cmd.Stdout, cmd.Stderr = &c.out, &c.out
 		if err := cmd.Start(); err != nil {
 			return false, fmt.Errorf("idle: %w", err)

@@ -16,7 +16,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/aiseeq/akit/proc"
 )
 
 // Потолки раздела механизмов: строк на раздел и совпавших строк на карточку.
@@ -115,7 +118,12 @@ func syncCards(w io.Writer, inventory string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), inventoryWait)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, inventory, "-mechanisms", "-budget", "1s", "-q").CombinedOutput()
+	cmd := exec.CommandContext(ctx, inventory, "-mechanisms", "-budget", "1s", "-q")
+	if err := proc.CancelByStop(cmd, time.Second, syscall.SIGTERM); err != nil {
+		fmt.Fprintf(w, "(сверка карточек не запущена: %v)\n", err)
+		return
+	}
+	out, err := cmd.CombinedOutput()
 	for l := range strings.Lines(string(out)) {
 		fmt.Fprintln(w, cut(strings.TrimSuffix(l, "\n")))
 	}
