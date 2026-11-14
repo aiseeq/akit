@@ -27,6 +27,7 @@ import (
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/queuegate"
 	"github.com/aiseeq/akit/timearg"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 const usage = `tk — track repository tasks in docs/tasks.
@@ -1418,7 +1419,11 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 		if n > defaultShowJournalEntries {
 			ref := t.slug
 			if strings.Contains(o.id, "/") {
-				ref = o.id // a ticket of another repository is reached only by its qualified ID
+				// A ticket of another repository is reached only by its qualified ID; a repository name may need quoting.
+				ref = o.id
+				if quoted, err := syntax.Quote(o.id, syntax.LangBash); err == nil {
+					ref = quoted
+				}
 			}
 			fmt.Fprintf(out, "… ещё %d записей журнала: tk show %s --tail 0\n", n-defaultShowJournalEntries, ref)
 		}

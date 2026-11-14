@@ -288,4 +288,24 @@ func TestQualifiedShowJournalHintKeepsProject(t *testing.T) {
 	if code := runMain([]string{"show", "git/alpha/shared-key"}, time.Now(), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "tk show git/alpha/shared-key --tail 0") {
 		t.Fatalf("qualified show = code %d, stderr %q, output tail %q", code, stderr.String(), stdout.String()[max(0, stdout.Len()-200):])
 	}
+	spaced := filepath.Join(home, "git", "odd name")
+	if err := os.MkdirAll(filepath.Join(spaced, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(alpha, "docs", "tasks"), filepath.Join(spaced, "docs", "tasks")); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMain([]string{"show", "git/odd name/shared-key"}, time.Now(), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "tk show 'git/odd name/shared-key' --tail 0") {
+		t.Fatalf("qualified show with a space = code %d, stderr %q, output tail %q", code, stderr.String(), stdout.String()[max(0, stdout.Len()-200):])
+	}
+}
+
+func TestQualifiedReferenceRefusesPathRepositoryNames(t *testing.T) {
+	for _, ref := range []string{"git//shared-key", "git/./shared-key", "git/../shared-key"} {
+		if _, _, err := referenceLocation("", ref); err == nil {
+			t.Errorf("referenceLocation(%q) accepted a path form", ref)
+		}
+	}
 }
