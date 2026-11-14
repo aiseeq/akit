@@ -205,6 +205,73 @@ func TestUsageProviderColumns(t *testing.T) {
 	}
 }
 
+func TestUsageFutureRatesKeepProviderColumnsAndMissingSummary(t *testing.T) {
+	e := fakeHome(t)
+	e.configHome = t.TempDir()
+	ratesDir := filepath.Join(e.configHome, "akit")
+	if err := os.MkdirAll(ratesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ratesPath := filepath.Join(ratesDir, "rates.tsv")
+	content := "valid_from\tprovider\tplan\tplan_usd_month\tapi_usd_week\n" +
+		"2026-01-01\tanthropic\tmax\t200\t1000\n" +
+		"2099-01-01\tanthropic\tfuture\t200\t9000\n" +
+		"2099-01-01\topenai\tfuture\t100\t2000\n"
+	if err := os.WriteFile(ratesPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transcriptPath := filepath.Join(t.TempDir(), "future.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(usageRecord("a", "claude-opus-5-5", "a", 2_500_000, 0, 0, 1)+"\n"+
+		usageRecord("o", "gpt-6-luna", "o", 1_000_000, 0, 0, 1)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runTL(t, e, "--usage", transcriptPath)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	rows := strings.Split(strings.TrimSpace(out), "\n")
+	if !strings.Contains(rows[0], "pct100_anthropic\tpct100_openai\tusd_api") || !strings.Contains(rows[0], "pct100_openai") {
+		t.Fatalf("future-only provider column missing:\n%s", out)
+	}
+	if !strings.Contains(rows[3], "openai=missing") || !strings.Contains(rows[3], "anthropic=2026-01-01") {
+		t.Fatalf("future rates summary changed: %q", rows[3])
+	}
+	if !strings.Contains(out, "\t-\t") {
+		t.Fatalf("future-only provider did not show '-':\n%s", out)
+	}
+}
+
+func TestUsageRateErrorTextRemainsStable(t *testing.T) {
+	for _, tc := range []struct {
+		name, row, want string
+	}{
+		{"bad-date", "not-a-date\tanthropic\tmax\t200\t1000", ":3:valid_from: invalid date"},
+		{"bad-week", "2026-01-01\tanthropic\tmax\t200\tbad", ":3:api_usd_week: invalid value \"bad\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fakeHome(t)
+			e.configHome = t.TempDir()
+			ratesDir := filepath.Join(e.configHome, "akit")
+			if err := os.MkdirAll(ratesDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			ratesPath := filepath.Join(ratesDir, "rates.tsv")
+			body := "# synthetic\nvalid_from\tprovider\tplan\tplan_usd_month\tapi_usd_week\n" + tc.row + "\n"
+			if err := os.WriteFile(ratesPath, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			transcriptPath := filepath.Join(t.TempDir(), "reply.jsonl")
+			if err := os.WriteFile(transcriptPath, []byte(usageRecord("a", "claude-opus-5-5", "a", 2_500_000, 0, 0, 1)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, out, _ := runTL(t, e, "--usage", transcriptPath)
+			if !strings.Contains(out, ratesPath+tc.want) || strings.Contains(out, "parsing time") || strings.Contains(out, "ParseFloat") {
+				t.Fatalf("course error text changed: %q", out)
+			}
+		})
+	}
+}
+
 func TestUsageInvalidRateIsReportedAndNotUsed(t *testing.T) {
 	e := fakeHome(t)
 	configHome := t.TempDir()

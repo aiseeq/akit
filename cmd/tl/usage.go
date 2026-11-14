@@ -326,14 +326,10 @@ func readUsageRates(path string, now time.Time) (map[string]usageRate, error) {
 		return nil, err
 	}
 	selected := map[string]usageRate{}
-	providers := map[string]bool{}
-	for i := range table.Rows {
-		row := &table.Rows[i]
-		providers[row.Provider] = true
-	}
-	for provider := range providers {
+	for _, provider := range table.Providers {
 		row, ok := table.Latest(provider, "")
 		if !ok {
+			selected[provider] = usageRate{}
 			continue
 		}
 		var invalid string

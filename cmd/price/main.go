@@ -46,9 +46,9 @@ const (
 var errHelp = errors.New("help")
 
 type options struct {
-	amount                          float64
-	provider, plan, unit, ratesPath string
-	amountSet, providerSet, unitSet bool
+	amount                                      float64
+	amountText, provider, plan, unit, ratesPath string
+	amountSet, providerSet, unitSet             bool
 }
 
 type env struct{ home, configHome string }
@@ -77,6 +77,9 @@ func parseArgs(args []string) (options, error) {
 		arg := args[i]
 		if arg == "-h" || arg == "--help" {
 			return opts, errHelp
+		}
+		if !strings.HasPrefix(arg, "--") {
+			return opts, fmt.Errorf("unexpected argument %q", arg)
 		}
 		name, value, hasValue := strings.Cut(arg, "=")
 		if !hasValue {
@@ -107,7 +110,7 @@ func (opts *options) set(name, value string) error {
 		if err != nil || n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) {
 			return fmt.Errorf("--usd must be a positive number, got %q", value)
 		}
-		opts.amount, opts.amountSet = n, true
+		opts.amount, opts.amountText, opts.amountSet = n, value, true
 	case "--provider":
 		if opts.providerSet || value == "" {
 			return errors.New("--provider must be supplied once with a value")
@@ -191,11 +194,31 @@ func run(opts options, e env, now time.Time, out, errOut io.Writer) int {
 	if plan == "" {
 		plan = "(unspecified)"
 	}
+	amount := "$" + opts.amountText
+	formattedResult := significant(result)
 	if opts.unit == "usd" {
-		fmt.Fprintf(out, "$%.2f API = $%.2f subscription\n", opts.amount, result)
+		fmt.Fprintf(out, "%s API = $%s subscription\n", amount, formattedResult)
 	} else {
-		fmt.Fprintf(out, "$%.2f API = %.2f%% of one $100 subscription week\n", opts.amount, result)
+		fmt.Fprintf(out, "%s API = %s%% of one $100 %s subscription week\n", amount, formattedResult, opts.provider)
 	}
 	fmt.Fprintf(out, "rate: provider=%s plan=%s valid_from=%s (%s:%d)\n", opts.provider, plan, row.ValidFrom.Format(time.DateOnly), path, row.Line)
+	if opts.plan == "" {
+		plans := table.PlansAtLatest(opts.provider)
+		if len(plans) > 1 {
+			for i, p := range plans {
+				if p == "" {
+					plans[i] = "(unspecified)"
+				}
+			}
+			fmt.Fprintf(out, "note: multiple plans on %s: %s; use --plan to select one\n", row.ValidFrom.Format(time.DateOnly), strings.Join(plans, ","))
+		}
+	}
 	return 0
+}
+
+// significant prints three significant digits without an exponent: a run
+// costs hundredths of a percent, a week of work hundreds.
+func significant(v float64) string {
+	rounded, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'g', 3, 64), 64)
+	return strconv.FormatFloat(rounded, 'f', -1, 64)
 }

@@ -4,8 +4,10 @@ package rates
 import (
 	"bufio"
 	"fmt"
+	"maps"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,8 +27,9 @@ type Rate struct {
 
 // Table contains rows at or before now. Later rows are ignored.
 type Table struct {
-	Path string
-	Rows []Rate
+	Path      string
+	Rows      []Rate
+	Providers []string
 }
 
 // Read reads a tab separated rates file. Row selection is left to Latest,
@@ -40,6 +43,7 @@ func Read(path string, now time.Time) (Table, error) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	columns := map[string]int{}
+	providerSeen := map[string]bool{}
 	width := 0
 	table := Table{Path: path}
 	for lineNo := 1; scanner.Scan(); lineNo++ {
@@ -63,6 +67,11 @@ func Read(path string, now time.Time) (Table, error) {
 		if len(fields) != width {
 			return Table{}, fmt.Errorf("%s:%d: wrong number of columns", path, lineNo)
 		}
+		provider := fields[columns["provider"]]
+		if !providerSeen[provider] {
+			providerSeen[provider] = true
+			table.Providers = append(table.Providers, provider)
+		}
 		row, include, err := parseRow(path, lineNo, fields, columns, now)
 		if err != nil {
 			return Table{}, err
@@ -84,7 +93,7 @@ func Read(path string, now time.Time) (Table, error) {
 func parseRow(path string, lineNo int, fields []string, columns map[string]int, now time.Time) (Rate, bool, error) {
 	valid, err := parseDate(fields[columns["valid_from"]])
 	if err != nil {
-		return Rate{}, false, fmt.Errorf("%s:%d:valid_from: invalid date: %w", path, lineNo, err)
+		return Rate{}, false, fmt.Errorf("%s:%d:valid_from: invalid date", path, lineNo)
 	}
 	if valid.After(now) {
 		return Rate{}, false, nil
@@ -120,13 +129,30 @@ func (t Table) Latest(provider, plan string) (Rate, bool) {
 	return best, found
 }
 
+// PlansAtLatest returns the distinct plans represented by the provider's
+// selected latest date, in sorted order.
+func (t Table) PlansAtLatest(provider string) []string {
+	latest, ok := t.Latest(provider, "")
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	for i := range t.Rows {
+		row := &t.Rows[i]
+		if row.Provider == provider && row.ValidFrom.Equal(latest.ValidFrom) {
+			seen[row.Plan] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
 func rateNumber(path string, line int, column, value string) (float64, error) {
 	n, err := strconv.ParseFloat(value, 64)
 	if err != nil {
-		return n, fmt.Errorf("%s:%d:%s: invalid value %q: %w", path, line, column, value, err)
+		return n, fmt.Errorf("%s:%d:%s: invalid value %q", path, line, column, value)
 	}
 	if n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) {
-		return n, fmt.Errorf("%s:%d:%s: invalid value %q: number must be positive and finite", path, line, column, value)
+		return n, fmt.Errorf("%s:%d:%s: invalid value %q", path, line, column, value)
 	}
 	return n, nil
 }
