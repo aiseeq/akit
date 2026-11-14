@@ -464,7 +464,12 @@ func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) 
 	for range strings.Count(src, "\\\n") + strings.Count(src, "\\\r\n") + 1 {
 		file, parsedFull, err := parseShellVariant(working, true)
 		if err != nil {
-			return originalFile, originalFull, nil, originalErr
+			recovered, ok := retryCommentContinuationParse(working)
+			if !ok {
+				return originalFile, originalFull, nil, originalErr
+			}
+			working = recovered
+			continue
 		}
 		offsets := commentContinuations(file, working)
 		if len(offsets) == 0 {
@@ -481,6 +486,40 @@ func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) 
 	return originalFile, originalFull, nil, originalErr
 }
 
+func retryCommentContinuationParse(src string) (string, bool) {
+	for start := 0; start < len(src); {
+		slash := strings.IndexByte(src[start:], '\\')
+		if slash < 0 {
+			return "", false
+		}
+		slash += start
+		newline := slash + 1
+		for newline < len(src) && src[newline] == '\\' {
+			newline++
+		}
+		if newline < len(src) && src[newline] == '\r' {
+			newline++
+		}
+		if newline >= len(src) || src[newline] != '\n' || (newline-slash)%2 == 0 {
+			start = slash + 1
+			continue
+		}
+		data := []byte(src)
+		data[slash] = ' '
+		candidate := string(data)
+		file, _, err := parseShellVariant(candidate, true)
+		if err == nil {
+			for _, comment := range collectCommentNodes(file).comments {
+				if int(comment.Pos().Offset()) <= slash && slash < int(comment.End().Offset()) {
+					return candidate, true
+				}
+			}
+		}
+		start = slash + 1
+	}
+	return "", false
+}
+
 func parseShellVariant(src string, keepComments bool) (file *syntax.File, full string, err error) {
 	full = src
 	for range 8 {
@@ -495,7 +534,7 @@ func parseShellVariant(src string, keepComments bool) (file *syntax.File, full s
 		}
 		delim, ok := strings.CutPrefix(pe.Text, "unclosed here-document `")
 		if !ok {
-			return nil, full, err
+			return file, full, err
 		}
 		if trailing := len(full) - len(strings.TrimRight(full, `\\`)); trailing%2 == 1 {
 			full += "\n"

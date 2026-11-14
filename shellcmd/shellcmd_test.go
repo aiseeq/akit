@@ -3507,14 +3507,35 @@ func TestCommentContinuationReviewWitnesses(t *testing.T) {
 	}
 }
 
-// A continued comment that swallows a closing word breaks the parse of the original script;
-// until that case is handled, Find reports the parse error instead of a partial result.
-func TestCommentContinuationThatBreaksParseReportsError(t *testing.T) {
-	for _, src := range []string{"if true; then zz #\\\nfi; zk 1", "{ zz #\\\n}; zk 1"} {
-		if _, err := Find(src, "zk"); err == nil {
-			t.Errorf("%q: want a parse error", src)
-		}
+func TestFindCallsAfterCommentContinuationThatBreaksParse(t *testing.T) {
+	tests := []struct {
+		name, src string
+		offset    int
+	}{
+		{"if", "if true; then zz #\\\nfi; zk 1", 24},
+		{"group", "{ zz #\\\n}; zk 1", 11},
+		{"for", "for i in 1; do zz #\\\ndone; zk 1", 27},
+		{"function", "f() { zz #\\\n}; f; zk 1", 18},
+		{"test command", "[[ a == a ]] #\\\nzk 1", 16},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "zk")
+			if err != nil {
+				t.Fatalf("Find: %v", err)
+			}
+			if len(calls) != 1 || calls[0].Name != "zk" || !reflect.DeepEqual(calls[0].Args, []string{"1"}) || calls[0].Offset != tt.offset {
+				t.Fatalf("Find = %+v, want zk Args [1] Offset %d", calls, tt.offset)
+			}
+		})
+	}
+
+	t.Run("genuine bash syntax error remains an error", func(t *testing.T) {
+		src := "if true; then zz #\\\nfi; then zk 1"
+		if _, err := Find(src, "zk"); err == nil {
+			t.Fatal("Find succeeded for a genuine syntax error")
+		}
+	})
 }
 
 func TestCommentMarkerInsideHeredocData(t *testing.T) {
