@@ -566,6 +566,7 @@ type walkInfo struct {
 
 	errors               []error
 	scriptInputs         map[*syntax.CallExpr]bool
+	knownShellInputs     map[*syntax.CallExpr]*syntax.Redirect
 	pipedHeredocs        []pipedHeredoc
 	workNodes            int
 	processSubstitutions *processSubstitutionIndex
@@ -600,7 +601,8 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		shellHdocs:      make(map[*syntax.Redirect]bool),
 		localSubstHdocs: make(map[*syntax.Redirect]bool),
 
-		scriptInputs: make(map[*syntax.CallExpr]bool),
+		scriptInputs:     make(map[*syntax.CallExpr]bool),
+		knownShellInputs: make(map[*syntax.CallExpr]*syntax.Redirect),
 	}
 	if strings.Contains(src, "coproc") {
 		info.coprocCalls = make(map[*syntax.CallExpr]bool)
@@ -1097,8 +1099,15 @@ func collectScriptInput(stmt *syntax.Stmt, call *syntax.CallExpr, file *syntax.F
 	if info.stdinIndex != nil {
 		redirs = info.stdinIndex.redirsAt(offset)
 	}
-	if info.shellScriptInputCandidates && shellScriptInputForm(call, src, vars, redirs) && !knownPipedScriptInput(stmt, call, src, vars, info) && !knownShellScriptInput(file, stmt, call, src, vars, stdin, redirs) {
-		info.scriptInputs[call] = true
+	if info.shellScriptInputCandidates && shellScriptInputForm(call, src, vars, redirs) && !knownPipedScriptInput(stmt, call, src, vars, info) {
+		known, source := knownShellScriptInputState(file, stmt, call, src, vars, stdin, redirs)
+		if known {
+			if source != nil {
+				info.knownShellInputs[call] = source
+			}
+		} else {
+			info.scriptInputs[call] = true
+		}
 	}
 	if coproc {
 		readsCommand, err := coprocCommandReadsStdin(call, src, vars)
@@ -1162,6 +1171,20 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 		if !slices.Contains(shellVia, "ssh") && stdin.redir != nil && stdin.redir.Hdoc != nil {
 			info.shellHdocs[stdin.redir] = true
 			info.localSubstHdocs[stdin.redir] = true
+		}
+	}
+	if !input {
+		if redir := info.knownShellInputs[call]; redir != nil {
+			name, shellVia, input, err = shellInputName(stmt, src, vars, redir)
+			if err != nil {
+				info.errors = append(info.errors, err)
+			} else if input {
+				info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: redir, name: name, via: shellVia})
+				if !slices.Contains(shellVia, "ssh") && redir.Hdoc != nil {
+					info.shellHdocs[redir] = true
+					info.localSubstHdocs[redir] = true
+				}
+			}
 		}
 	}
 }
@@ -1620,37 +1643,53 @@ func redirectTarget(redir *syntax.Redirect) (string, bool) {
 }
 
 func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, stdin *syntax.Redirect, redirs []*syntax.Redirect) bool {
+	known, _ := knownShellScriptInputState(file, stmt, call, src, vars, stdin, redirs)
+	return known
+}
+
+func knownShellScriptInputState(file *syntax.File, stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, stdin *syntax.Redirect, redirs []*syntax.Redirect) (bool, *syntax.Redirect) {
 	args, _ := words(call.Args, src, vars)
 	_, targetArgs, ok := shellInputTargetArgs(args)
 	if !ok {
-		return false
+		return false, nil
 	}
 	operand, command, useStdin := shellArgs(targetArgs)
 	if command {
-		return false
+		return false, nil
 	}
 	fd := 0
 	if !useStdin && operand < len(targetArgs) {
 		fd = shellScriptInputFD(targetArgs[operand])
 		if fd < 0 {
-			return false
+			return false, nil
 		}
 	}
-	known, set := knownExecFDStates(file, int(stmt.Pos().Offset()))
+	known, set, sources := knownExecFDStates(file, int(stmt.Pos().Offset()))
 	if stdin != nil {
-		applyKnownInputRedirect(stdin, 0, known, set)
+		applyKnownInputRedirect(stdin, 0, known, set, sources)
 	}
+	var lastFDRedirect *syntax.Redirect
 	for _, redir := range redirs {
 		dest, valid := inputRedirFD(redir)
 		if valid {
-			applyKnownInputRedirect(redir, dest, known, set)
+			applyKnownInputRedirect(redir, dest, known, set, sources)
+			if dest == fd {
+				lastFDRedirect = redir
+			}
 		}
 	}
-	return set[fd] && known[fd]
+	if sources[fd] == nil && lastFDRedirect != nil && lastFDRedirect.Op.String() == "<&" {
+		target, literal := redirectTarget(lastFDRedirect)
+		if source, ok := shellFDNumber(target); literal && ok && sources[source] != nil {
+			sources[fd] = sources[source]
+			known[fd], set[fd] = true, true
+		}
+	}
+	return set[fd] && known[fd], sources[fd]
 }
 
-func knownExecFDStates(file *syntax.File, before int) (map[int]bool, map[int]bool) {
-	known, set := make(map[int]bool), make(map[int]bool)
+func knownExecFDStates(file *syntax.File, before int) (map[int]bool, map[int]bool, map[int]*syntax.Redirect) {
+	known, set, sources := make(map[int]bool), make(map[int]bool), make(map[int]*syntax.Redirect)
 	for _, stmt := range file.Stmts {
 		if int(stmt.Pos().Offset()) >= before {
 			break
@@ -1673,30 +1712,33 @@ func knownExecFDStates(file *syntax.File, before int) (map[int]bool, map[int]boo
 			if nestedExec {
 				clear(known)
 				clear(set)
+				clear(sources)
 			}
 			continue
 		}
 		for _, redir := range stmt.Redirs {
 			fd, valid := inputRedirFD(redir)
 			if valid {
-				applyKnownInputRedirect(redir, fd, known, set)
+				applyKnownInputRedirect(redir, fd, known, set, sources)
 			}
 		}
 	}
-	return known, set
+	return known, set, sources
 }
 
-func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[int]bool) {
+func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[int]bool, sources map[int]*syntax.Redirect) {
 	target, literal := redirectTarget(redir)
 	switch redir.Op.String() {
 	case "<<", "<<-", "<<<":
 		known[dest] = true
 		set[dest] = true
+		sources[dest] = redir
 	case "<", "<>":
 		if literal {
 			if source := shellScriptInputFD(target); source >= 0 {
 				known[dest] = set[source] && known[source]
 				set[dest] = true
+				sources[dest] = sources[source]
 				return
 			}
 		}
@@ -1704,10 +1746,16 @@ func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[in
 		// /dev/stdin or a descriptor path at run time.
 		known[dest] = literal && !strings.Contains(target, "<(") && !strings.Contains(target, ">(") && !strings.Contains(target, "/dev/fd/") && !strings.Contains(target, "/proc/")
 		set[dest] = true
+		sources[dest] = nil
 	case "<&", ">&":
 		source, ok := shellFDNumber(target)
 		known[dest] = literal && ok && set[source] && known[source]
 		set[dest] = true
+		if literal && ok {
+			sources[dest] = sources[source]
+		} else {
+			sources[dest] = nil
+		}
 	}
 }
 
@@ -2465,7 +2513,8 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 	if !hasHeredoc {
 		return "", nil, false
 	}
-	if shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args) {
+	input, _ := shellScriptInputArgs(args, name)
+	if shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args) || input {
 		return name, via, true
 	}
 	return "", nil, false

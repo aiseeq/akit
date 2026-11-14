@@ -2292,6 +2292,42 @@ func TestEvalEmptyArgsAndEchoCombinedOptions(t *testing.T) {
 	}
 }
 
+func TestHeredocScriptInputViaDescriptorPaths(t *testing.T) {
+	for _, tt := range []struct {
+		src string
+		via []string
+	}{
+		{"bash /dev/stdin <<'E'\nkill 1\nE", []string{"bash"}},
+		{"bash /dev/fd/0 <<'E'\nkill 1\nE", []string{"bash"}},
+		{"bash /proc/self/fd/0 <<'E'\nkill 1\nE", []string{"bash"}},
+		{"bash /dev/stdin <<< 'kill 1'", []string{"bash"}},
+		{"bash /dev/fd/3 3<<'E'\nkill 1\nE", []string{"bash"}},
+		{"bash 3<<<'kill 1' /dev/fd/3", []string{"bash"}},
+		{"bash <&3 3<<'E'\nkill 1\nE", []string{"bash"}},
+		{"bash 3<<'E' <&3\nkill 1\nE", []string{"bash"}},
+		{"exec 3<<'E'\nkill 1\nE\nbash <&3", []string{"bash"}},
+		{"exec 3<<'E'\nkill 1\nE\nbash /dev/fd/3", []string{"bash"}},
+		{"exec 3<<'E'\nkill 1\nE\nbash /dev/fd/4 4<&3", []string{"bash"}},
+		{"env bash /dev/stdin <<'E'\nkill 1\nE", []string{"env", "bash"}},
+		{"sudo bash /dev/fd/3 3<<'E'\nkill 1\nE", []string{"sudo", "bash"}},
+	} {
+		calls, err := Find(tt.src, "kill")
+		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, tt.via) {
+			t.Errorf("Find(%q) = %#v, %v; want kill Via %v", tt.src, calls, err, tt.via)
+		}
+	}
+	for _, src := range []string{
+		"bash /dev/stdin <<'E'\necho ok\nE",
+		"bash /dev/fd/3 3<<'E' 3</dev/null\nkill 1\nE",
+		"bash script.sh <<'E'\nkill 1\nE",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 0 {
+			t.Errorf("Find(%q) = %#v, %v; want no kill", src, calls, err)
+		}
+	}
+}
+
 func TestKillGuardGaps(t *testing.T) {
 	for _, tc := range []struct {
 		src       string
