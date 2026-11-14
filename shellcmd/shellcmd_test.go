@@ -2462,6 +2462,60 @@ func TestShellScriptInputRevisionCases(t *testing.T) {
 	}
 }
 
+func TestShellScriptInputRevisionThree(t *testing.T) {
+	tests := []struct {
+		src  string
+		want map[string]bool
+	}{
+		{`bash -c 'echo ok' <&3`, map[string]bool{"bash": false}},
+		{`bash script.sh <&3`, map[string]bool{"bash": false}},
+		{`env bash script.sh <&3`, map[string]bool{"env": false, "bash": false}},
+		{`bash <&3`, map[string]bool{"bash": true}},
+		{`bash -c x <&3`, map[string]bool{"bash": false}},
+		{"cat <<'EOF' | flock file bash --\necho HEREDOC\nEOF", map[string]bool{"flock": false, "bash": false}},
+		{"cat <<'EOF' | bash --\necho HEREDOC\nEOF", map[string]bool{"bash": false}},
+		{`exec 3</dev/null; exec 3>&0; bash <&3`, map[string]bool{"bash": true}},
+		{`exec 3</dev/null; exec 3<>/dev/stdin; bash <&3`, map[string]bool{"bash": true}},
+		{`bash /dev/fd/3 0</dev/null 3</dev/stdin`, map[string]bool{"bash": false}},
+		{`exec 3</dev/null; bash <&3`, map[string]bool{"bash": false}},
+		{`bash -s /dev/null`, map[string]bool{"bash": true}},
+		{`bash -s - /dev/null`, map[string]bool{"bash": true}},
+		{"bash -s <<'EOF'\necho KNOWN\nEOF", map[string]bool{"bash": false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, want := range tt.want {
+				found := false
+				for _, call := range calls {
+					if call.Name != name {
+						continue
+					}
+					found = true
+					if call.ScriptInput != want {
+						t.Errorf("%s ScriptInput=%t, want %t: %#v", name, call.ScriptInput, want, call)
+					}
+				}
+				if !found {
+					t.Errorf("call %q not found in %#v", name, calls)
+				}
+			}
+			if strings.Contains(tt.src, "HEREDOC") {
+				foundBody := false
+				for _, call := range calls {
+					foundBody = foundBody || call.Name == "echo" && strings.Contains(call.Raw, "HEREDOC") && !call.ScriptInput
+				}
+				if !foundBody {
+					t.Errorf("heredoc body not parsed through pipeline: %#v", calls)
+				}
+			}
+		})
+	}
+}
+
 func TestUnknownShellScriptInput(t *testing.T) {
 	for _, command := range []string{
 		`echo 'kill 1' | bash`,
