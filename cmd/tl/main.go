@@ -56,6 +56,11 @@ path (Claude Code or codex rollout).
                 summary names the transcripts read: runs that leave none
                 (claude -p --no-session-persistence) and codex rollouts
                 (their token counts are not read) are not in it
+  --worktime    union matching session activity; --gap defaults to 15m
+                events: user/agent messages, tool calls and results; a lone
+                event is 1m; splits at longer gaps; days use local time
+                Claude subagents use parent bounds; codex rollouts count separately
+  --gap D       activity split threshold (default 15m)
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
@@ -78,7 +83,7 @@ one. The value itself is not recoverable. The mask also hides some names that lo
 pk_test_… identifier): N tells whether it may be the name you expect, and the
 same TAG elsewhere shows where the same text recurs. Without the key the
 markers are [скрыто:KIND] and stderr says why.
-Exit: 0 events found, 1 none, 2 usage/IO error.
+Exit: 0 found, 1 none, 2 usage/IO error.
 `
 
 const (
@@ -101,6 +106,8 @@ type options struct {
 	max          int
 	width        int
 	usage        bool
+	worktime     bool
+	gap          time.Duration
 	waitProg     string
 	waitSub      string
 	q            int
@@ -159,7 +166,7 @@ type env struct {
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
-	opts := options{max: 100, width: 300, q: 50}
+	opts := options{max: 100, width: 300, q: 50, gap: defaultWorkGap}
 	opts.originalArgs = append([]string(nil), args...)
 	if err := setRoles(&opts, "user,ask,peer,agent"); err != nil {
 		return opts, err
@@ -216,6 +223,8 @@ func setSwitch(opts *options, name string) bool {
 		opts.subagents = true
 	case "--usage":
 		opts.usage = true
+	case "--worktime":
+		opts.worktime = true
 	case "--version":
 		opts.version = true
 	default:
@@ -226,8 +235,11 @@ func setSwitch(opts *options, name string) bool {
 
 // checkCombos отвергает флаги, которые не работают друг без друга или вместе.
 func checkCombos(opts options) error {
-	if opts.context > 0 && opts.grep == "" {
-		return errors.New("-C works with --grep")
+	if err := checkWorktimeCombos(opts); err != nil {
+		return err
+	}
+	if err := checkEventOutputCombos(opts); err != nil {
+		return err
 	}
 	if (opts.codex || opts.project != "" || opts.noSubagents) && !opts.all {
 		return errors.New("--codex, --project and --no-subagents work with --all")
@@ -248,16 +260,63 @@ func checkCombos(opts options) error {
 	return nil
 }
 
+func checkWorktimeCombos(opts options) error {
+	if opts.worktime && !opts.all {
+		return errors.New("--worktime works with --all")
+	}
+	if opts.worktime && opts.grep == "" {
+		return errors.New("--worktime needs --grep")
+	}
+	if opts.worktime && opts.usage {
+		return errors.New("--worktime and --usage cannot be used together")
+	}
+	if opts.worktime && opts.waitProg != "" {
+		return errors.New("--worktime and --wait cannot be used together")
+	}
+	if !opts.worktime && opts.gap != defaultWorkGap {
+		return errors.New("--gap works with --worktime")
+	}
+	return nil
+}
+
+func checkEventOutputCombos(opts options) error {
+	if opts.context > 0 && opts.grep == "" {
+		return errors.New("-C works with --grep")
+	}
+	return nil
+}
+
 func setFlag(opts *options, name, val string, now time.Time) error {
-	var err error
-	switch name {
-	case "--role":
+	if name == "--role" {
 		opts.rolesSet = true
 		return setRoles(opts, val)
-	case "--since":
-		opts.since, err = timearg.Parse(val, now)
-	case "--until":
-		opts.until, err = timearg.Parse(val, now)
+	}
+	if name == "--since" || name == "--until" {
+		parsed, err := timearg.Parse(val, now)
+		if name == "--since" {
+			opts.since = parsed
+		} else {
+			opts.until = parsed
+		}
+		return err
+	}
+	if name == "--gap" {
+		gap, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("--gap: %w", err)
+		}
+		if gap <= 0 {
+			return fmt.Errorf("--gap needs a duration > 0, got %q", val)
+		}
+		opts.gap = gap
+		return nil
+	}
+	return setOtherFlag(opts, name, val)
+}
+
+func setOtherFlag(opts *options, name, val string) error {
+	var err error
+	switch name {
 	case "--grep":
 		opts.grep = val
 	case "--raw":
@@ -424,6 +483,9 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "tl: %v\n", err)
 		}
 		return code
+	}
+	if opts.worktime {
+		return reportWorktime(sources, opts, stdout)
 	}
 	res, err := scan(sources, opts)
 	if err != nil {
