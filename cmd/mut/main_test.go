@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 		main()
 		os.Exit(0)
 	}
-	if !hasTestFlag(os.Args[1:]) {
+	if len(os.Args) > 1 && !hasTestFlag(os.Args[1:]) {
 		// Started as mut without the switch: running the tests again here
 		// would make every mut call spawn the whole suite.
 		fmt.Fprintln(os.Stderr, "mut test binary started without -test.* flags and without "+mutAsMain+"=1")
@@ -287,6 +287,16 @@ func TestKilledBesideRedTest(t *testing.T) {
 	}
 	f.unchanged(t)
 }
+
+// mut -h prints the usage and exits 0 as a process of its own.
+func TestHelpExitsZero(t *testing.T) {
+	f := newFixture(t, goodTest)
+	out, code := f.run(t, "-h")
+	if code != 0 || !strings.Contains(out, "mut [-F SPEC]") {
+		t.Fatalf("code %d, output %q", code, out)
+	}
+}
+
 func TestInterruptRestores(t *testing.T) {
 	test := `package calc
 import("os";"time";"testing")
