@@ -105,10 +105,54 @@ func find(arg, home string) (string, error) {
 	case 1:
 		return matches[0], nil
 	}
-	return "", fmt.Errorf("%q matches %d transcripts (%s, …): give more of the id", arg, len(matches), matches[0])
+	candidates := make([]string, 0, len(matches))
+	for _, path := range matches {
+		src, err := transcript.SourceAt(path)
+		if err != nil {
+			return "", fmt.Errorf("inspect matching transcript: %w", err)
+		}
+		candidates = append(candidates, sourceFullID(src))
+	}
+	return "", fmt.Errorf("%q is ambiguous; candidates: %s", arg, strings.Join(candidates, ", "))
 }
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)
+var sourceUUID = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+func sourceFullID(src source) string {
+	if id := sourceUUID.FindString(filepath.Base(src.Path)); id != "" {
+		return id
+	}
+	return src.ID
+}
+
+// sourceLinkIDs assigns the shortest unique UUID prefix (at least eight characters) per selected path.
+func sourceLinkIDs(sources []source) map[string]string {
+	fullIDs := make(map[string]string, len(sources))
+	prefixCounts := make(map[string]int)
+	for _, src := range sources {
+		id := sourceFullID(src)
+		fullIDs[src.Path] = id
+		if sourceUUID.MatchString(filepath.Base(src.Path)) {
+			for length := 8; length <= len(id); length++ {
+				prefixCounts[id[:length]]++
+			}
+		}
+	}
+	ids := make(map[string]string, len(sources))
+	for path, id := range fullIDs {
+		if !sourceUUID.MatchString(filepath.Base(path)) {
+			ids[path] = id
+			continue
+		}
+		length := min(8, len(id))
+		for length < len(id) && prefixCounts[id[:length]] > 1 {
+			length++
+		}
+		ids[path] = id[:length]
+	}
+	return ids
+}
 
 type eventRef struct {
 	id   string

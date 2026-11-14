@@ -102,10 +102,10 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 		}
 		key := cmp.Or(r.ID, r.RequestID)
 		if key == "" {
-			replies = append(replies, usageReply{h.src.ID, r})
+			replies = append(replies, usageReply{h.src.Path, r})
 			continue
 		}
-		key = h.src.ID + "\x00" + key
+		key = h.src.Path + "\x00" + key
 		if j, ok := last[key]; ok {
 			if r.Usage.Output > replies[j].r.Usage.Output {
 				replies[j].r = r
@@ -113,7 +113,7 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 			continue
 		}
 		last[key] = len(replies)
-		replies = append(replies, usageReply{h.src.ID, r})
+		replies = append(replies, usageReply{h.src.Path, r})
 	}
 	per := map[string]*tally{}
 	for _, rp := range replies {
@@ -151,9 +151,9 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 	hasPct := slices.ContainsFunc(ids, func(id string) bool { return len(per[id].week100Replies) > 0 })
 	slices.SortFunc(ids, func(a, b string) int {
 		if hasPct {
-			return cmp.Or(cmp.Compare(usageMaxPct(per[b], providers), usageMaxPct(per[a], providers)), cmp.Compare(a, b))
+			return cmp.Or(cmp.Compare(usageMaxPct(per[b], providers), usageMaxPct(per[a], providers)), cmp.Compare(res.linkIDs[a], res.linkIDs[b]))
 		}
-		return cmp.Or(cmp.Compare(per[b].usd, per[a].usd), cmp.Compare(a, b))
+		return cmp.Or(cmp.Compare(per[b].usd, per[a].usd), cmp.Compare(res.linkIDs[a], res.linkIDs[b]))
 	})
 	header := []string{"session", "replies", "input", "cache_write", "cache_read", "output"}
 	for _, provider := range providers {
@@ -165,7 +165,10 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 	for _, id := range ids {
 		t := per[id]
 		total.merge(t)
-		name := id
+		name := res.linkIDs[id]
+		if name == "" {
+			name = id
+		}
 		if n := res.names[id]; n != "" {
 			name += " " + n
 		}

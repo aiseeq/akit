@@ -29,6 +29,8 @@ Usage:
   tl REF [REF...]              events in full; REF is id:line from a listing
   tl --version                 print the build version
 
+  ID in a link may be longer than 8 characters when needed to distinguish sessions.
+
 SESSION is a live session name (main), a session id or its prefix, or a .jsonl
 path (Claude Code or codex rollout).
 

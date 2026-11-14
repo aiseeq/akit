@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"sort"
@@ -23,12 +24,13 @@ type hit struct {
 }
 
 type result struct {
-	hits  []hit
-	waits []time.Duration   // --wait: ожидания вывода, сведённые по ходу чтения файлов
-	names map[string]string // id → имя сессии
-	files int
-	errs  []error // файлы, которые не прочитались: их события не вошли
-	bad   int     // строк, которые не разобрать, по всем файлам
+	hits    []hit
+	waits   []time.Duration   // --wait: ожидания вывода, сведённые по ходу чтения файлов
+	names   map[string]string // path → имя сессии
+	linkIDs map[string]string // path → уникальный id для ссылок в этой выборке
+	files   int
+	errs    []error // файлы, которые не прочитались: их события не вошли
+	bad     int     // строк, которые не разобрать, по всем файлам
 	// firstBad — первая из них с id файла, чтобы было куда смотреть.
 	firstBad error
 }
@@ -722,7 +724,7 @@ func scan(sources []source, opts options) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	res := result{names: map[string]string{}, files: len(sources)}
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources), files: len(sources)}
 	type fileResult struct {
 		hits  []hit
 		waits []time.Duration
@@ -757,7 +759,7 @@ func scan(sources []source, opts options) (result, error) {
 			res.firstBad = fmt.Errorf("%s %w", src.ID, item.meta.FirstBad)
 		}
 		if item.meta.Name != "" {
-			res.names[src.ID] = item.meta.Name
+			res.names[src.Path] = item.meta.Name
 		}
 		if item.err != nil {
 			res.errs = append(res.errs, item.err)
@@ -806,13 +808,15 @@ func report(res result, opts options, e env, w io.Writer) int {
 	seen := map[string]bool{}
 	for i := range hits {
 		h := &hits[i]
-		if seen[h.src.ID] {
+		if seen[h.src.Path] {
 			continue
 		}
-		seen[h.src.ID] = true
-		name := res.names[h.src.ID]
+		seen[h.src.Path] = true
+		id := res.linkIDs[h.src.Path]
+		name := res.names[h.src.Path]
 		if h.src.ParentID != "" {
-			parentName := res.names[h.src.ParentID]
+			parentPath := strings.TrimSuffix(filepath.Dir(h.src.Path), string(filepath.Separator)+"subagents") + ".jsonl"
+			parentName := res.names[parentPath]
 			if parentName != "" {
 				parentName = " " + parentName
 			}
@@ -820,18 +824,20 @@ func report(res result, opts options, e env, w io.Writer) int {
 			if h.src.Description != "" {
 				description = fmt.Sprintf(" %q", h.src.Description)
 			}
-			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", h.src.ID, h.src.ParentID, parentName, description, tilde(h.src.Path, e.home))
+			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", id, h.src.ParentID, parentName, description, tilde(h.src.Path, e.home))
 			continue
 		}
 		if name != "" {
 			name += " "
 		}
 		if h.src.ID != h.src.Path {
-			fmt.Fprintf(w, "== %s %s%s\n", h.src.ID, name, tilde(h.src.Path, e.home))
+			fmt.Fprintf(w, "== %s %s%s\n", id, name, tilde(h.src.Path, e.home))
 		}
 	}
 	for i := range hits {
-		fmt.Fprintln(w, line(&hits[i], opts.width))
+		displayHit := hits[i]
+		displayHit.src.ID = res.linkIDs[displayHit.src.Path]
+		fmt.Fprintln(w, line(&displayHit, opts.width))
 	}
 	zone, _ := e.now.Zone()
 	summary := fmt.Sprintf("tl: %d event(s), times %s", len(hits), zone)
