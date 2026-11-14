@@ -319,6 +319,7 @@ func (b *nestedParseBudget) parseShell(src string) (*syntax.File, string, [][2]i
 type commentNodes struct {
 	comments   []*syntax.Comment
 	backquotes [][2]int
+	heredocs   [][2]int
 }
 
 func collectCommentNodes(file *syntax.File) commentNodes {
@@ -330,6 +331,10 @@ func collectCommentNodes(file *syntax.File) commentNodes {
 		case *syntax.CmdSubst:
 			if node.Backquotes {
 				nodes.backquotes = append(nodes.backquotes, [2]int{int(node.Pos().Offset()), int(node.End().Offset())})
+			}
+		case *syntax.Redirect:
+			if node.Hdoc != nil && !quotedHeredoc(node.Word) {
+				nodes.heredocs = append(nodes.heredocs, [2]int{int(node.Hdoc.Pos().Offset()), int(node.Hdoc.End().Offset())})
 			}
 		}
 		return true
@@ -345,13 +350,17 @@ func continuedCommentLine(src string, start, end int) (slash, continuedAt, comme
 		if src[newline] != '\n' {
 			continue
 		}
-		last := newline - 1
+		slashEnd := newline - 1
+		if slashEnd >= start && src[slashEnd] == '\r' {
+			slashEnd--
+		}
+		last := slashEnd
 		for last >= start && src[last] == '\\' {
 			last--
 		}
-		if (newline-1-last)%2 == 1 {
+		if (slashEnd-last)%2 == 1 {
 			if slash < 0 {
-				slash, continuedAt = newline-1, newline+1
+				slash, continuedAt = slashEnd, newline+1
 			}
 			continue
 		}
@@ -366,6 +375,9 @@ func commentContinuations(file *syntax.File, src string) []int {
 	var offsets []int
 	for _, comment := range nodes.comments {
 		start, end := int(comment.Pos().Offset()), int(comment.End().Offset())
+		if end < len(src) && end > 0 && src[end] == '\n' && src[end-1] == '\r' {
+			end++
+		}
 		if start < 0 || start >= len(src) {
 			continue
 		}
@@ -376,7 +388,7 @@ func commentContinuations(file *syntax.File, src string) []int {
 				break
 			}
 		}
-		if inBackquote {
+		if inBackquote || offsetInSpans(start, nodes.heredocs) {
 			continue
 		}
 		if slash, _, _ := continuedCommentLine(src, start, end); slash >= 0 {
@@ -386,19 +398,31 @@ func commentContinuations(file *syntax.File, src string) []int {
 	return offsets
 }
 
-func backquoteCommentCommands(file *syntax.File, src string) [][2]int {
+func offsetInSpans(offset int, spans [][2]int) bool {
+	for _, span := range spans {
+		if offset >= span[0] && offset < span[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func preprocessedCommentCommands(file *syntax.File, src string) [][2]int {
 	nodes := collectCommentNodes(file)
+	containers := make([][2]int, 0, len(nodes.backquotes)+len(nodes.heredocs))
+	containers = append(containers, nodes.backquotes...)
+	containers = append(containers, nodes.heredocs...)
 	var ignored [][2]int
 	for _, comment := range nodes.comments {
 		start := int(comment.Pos().Offset())
 		if start < 0 || start >= len(src) {
 			continue
 		}
-		for _, quote := range nodes.backquotes {
-			if start < quote[0] || start >= quote[1] {
+		for _, container := range containers {
+			if start < container[0] || start >= container[1] {
 				continue
 			}
-			_, continuedAt, end := continuedCommentLine(src, start, quote[1])
+			_, continuedAt, end := continuedCommentLine(src, start, container[1])
 			if continuedAt >= 0 && continuedAt < end {
 				ignored = append(ignored, [2]int{continuedAt, end})
 			}
@@ -412,14 +436,31 @@ func parseShell(src string) (*syntax.File, string, error) {
 	return file, full, err
 }
 
+func hasBackslashLineEnding(src string) bool {
+	for start := 0; start < len(src); {
+		next := strings.IndexByte(src[start:], '\\')
+		if next < 0 {
+			return false
+		}
+		index := start + next
+		if index+1 < len(src) {
+			if src[index+1] == '\n' || src[index+1] == '\r' && index+2 < len(src) && src[index+2] == '\n' {
+				return true
+			}
+		}
+		start = index + 1
+	}
+	return false
+}
+
 func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) {
-	if !strings.Contains(src, "\\\n") || !strings.Contains(src, "#") {
+	if !strings.Contains(src, "#") || !hasBackslashLineEnding(src) {
 		file, full, err := parseShellVariant(src, false)
 		return file, full, nil, err
 	}
 	originalFile, originalFull, originalErr := parseShellVariant(src, false)
 	working := src
-	for range strings.Count(src, "\\\n") + 1 {
+	for range strings.Count(src, "\\\n") + strings.Count(src, "\\\r\n") + 1 {
 		file, parsedFull, err := parseShellVariant(working, true)
 		if err != nil {
 			return originalFile, originalFull, nil, originalErr
@@ -427,13 +468,13 @@ func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) 
 		offsets := commentContinuations(file, working)
 		if len(offsets) == 0 {
 			if working == src {
-				return file, parsedFull, backquoteCommentCommands(file, working), nil
+				return file, parsedFull, preprocessedCommentCommands(file, working), nil
 			}
 			fixedFile, fixedFull, fixedErr := parseShellVariant(working, true)
 			if fixedErr != nil {
 				return originalFile, originalFull, nil, originalErr
 			}
-			return fixedFile, fixedFull, backquoteCommentCommands(fixedFile, working), nil
+			return fixedFile, fixedFull, preprocessedCommentCommands(fixedFile, working), nil
 		}
 		data := []byte(working)
 		for _, offset := range offsets {

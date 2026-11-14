@@ -2565,6 +2565,94 @@ zk 1)"`
 	})
 }
 
+func TestCommentContinuationCRLF(t *testing.T) {
+	tests := []struct {
+		name, src string
+		want      []Call
+	}{
+		{"comment with CRLF after slash", "zz x #c\\\r\nzk 1", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 2, Offset: 10}}},
+		{"two comments with mixed line endings", "zz x #\\\r\nzk 1\nzz y #\\\nzk 2", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 2, Offset: 9}, {Name: "zk", Args: []string{"2"}, Raw: "zk 2", Line: 4, Offset: 22}}},
+		{"nested shell comment with CRLF", "bash -c 'zz x #c\\\r\nzk 1'", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 1, Offset: -1, Via: []string{"bash", "-c"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "zk")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != len(tt.want) {
+				t.Fatalf("Find = %+v, want %+v", calls, tt.want)
+			}
+			for i, want := range tt.want {
+				got := calls[i]
+				if got.Offset != want.Offset || got.Line != want.Line || got.Raw != want.Raw || !reflect.DeepEqual(got.Args, want.Args) || !reflect.DeepEqual(got.Via, want.Via) {
+					t.Fatalf("call[%d] = %+v, want %+v", i, got, want)
+				}
+			}
+		})
+	}
+}
+func TestCommentContinuationInUnquotedHeredocExpansion(t *testing.T) {
+	tests := []struct{ name, src string }{
+		{"unquoted heredoc command substitution", "zc <<E\n$(zz # c \\\nzk 1\n)\nE\n"},
+		{"unquoted heredoc nested in parameter expansion", "zc <<E\n${x:-$(zz # c \\\nzk 1\n)}\nE\n"},
+		{"tab-stripped heredoc command substitution", "zc <<-E\n\t$(zz # c \\\n\tzk 1\n\t)\n\tE\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "zk")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) != 0 {
+				t.Fatalf("Find(zk) = %+v, want no expanded zk", calls)
+			}
+		})
+	}
+}
+
+func TestCommentContinuationReviewWitnesses(t *testing.T) {
+	tests := []struct {
+		name, src string
+		want      [][]string
+	}{
+		{"backtick comment leaves later command visible", ": `zz y # c \\\nzk 1\nzk 2`", [][]string{[]string{"2"}}},
+		{"backtick comment before terminator", ": `# c \\\n`;\\\nzk 1", [][]string{[]string{"1"}}},
+		{"consecutive comments", "zz # a \\\nzz # b \\\nzz # c \\\nzk 1", [][]string{[]string{"1"}}},
+		{"comment followed by backtick comment", "zz x #\\\nzk 1\n: `# c \\\nzk 2`", [][]string{[]string{"1"}}},
+		{"backtick comment hides command", ": `# c \\\nzk 1`", nil},
+		{"backtick next command after comment", ": `zz y # c \\\nzk 1\nzk 2\nzk 3`", [][]string{[]string{"2"}, []string{"3"}}},
+		{"multiple continued lines", "zz # c \\\n\\\n\\\nzk 1", [][]string{[]string{"1"}}},
+		{"comment after continued word", "zz a # c \\\nb \\\n# d \\\nzk 1", [][]string{[]string{"1"}}},
+		{"continued comments with blank segments", "zz # c \\\n\\\n# d \\\n\\\n# e \\\nzk 1", [][]string{[]string{"1"}}},
+		{"long continued comment chain", "zz # a \\\n\\\n# b \\\n\\\n# c \\\n\\\n# d \\\nzk 1", [][]string{[]string{"1"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Find(tt.src, "zk")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got [][]string
+			for _, call := range calls {
+				got = append(got, call.Args)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Find Args = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	src := "zz $(# c \\\nzk 1\n)"
+	calls, err := Calls(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := []string{"$(# c \\\nzk 1\n)"}
+	if len(calls) == 0 || calls[0].Raw != src || !reflect.DeepEqual(calls[0].Args, wantArgs) {
+		t.Fatalf("Calls = %+v", calls)
+	}
+}
+
 func TestCommentMarkerInsideHeredocData(t *testing.T) {
 	src := "zc <<E\n# c \\\nE\nit's\nE\n"
 	calls, err := Calls(src)
