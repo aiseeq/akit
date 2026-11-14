@@ -204,6 +204,22 @@ func TestUsageDeduplicatesCopiedMessagesAndKeepsSessionsDistinct(t *testing.T) {
 		}
 	})
 
+	t.Run("copied subagent message without request id", func(t *testing.T) {
+		e := reviewHome(t)
+		parents := []string{"55551111-0000-4000-8000-000000000001", "66662222-0000-4000-8000-000000000002"}
+		row := usageRecord("same-message", "claude-opus-5-5", "synthetic reply", 10, 0, 0, 20)
+		row = strings.ReplaceAll(row, "2026-10-25T10:00:00Z", e.now.Format(time.RFC3339Nano))
+		row = strings.ReplaceAll(row, `"requestId":"req-same-message",`, "")
+		for _, parent := range parents {
+			writeReviewClaude(t, e, "synthetic", parent, `{"type":"agent-name","agentName":"synthetic-parent"}`)
+			writeWorkFile(t, filepath.Join(e.home, ".claude", "projects", "synthetic", parent, "subagents", "agent-abcdef123456000001.jsonl"), []string{row})
+		}
+		code, out, stderr := runTL(t, e, "--usage", "--all", "--since", "2026-11-13T00:00:00Z")
+		if code != 0 || stderr != "" || !strings.Contains(out, "1 reply(ies)") {
+			t.Fatalf("copied reply without request id counted more than once: code %d, stderr %q, output:\n%s", code, stderr, out)
+		}
+	})
+
 	t.Run("same message id with different request ids", func(t *testing.T) {
 		e := reviewHome(t)
 		parents := []string{"33331111-0000-4000-8000-000000000001", "44442222-0000-4000-8000-000000000002"}
@@ -479,5 +495,20 @@ func TestSubagentSourceMetadataErrorIsReported(t *testing.T) {
 	code, _, stderr := runTL(t, e, "eeee2222:1")
 	if code != exitUsage || !strings.Contains(stderr, "metadata") {
 		t.Fatalf("subagent source metadata error was ignored: code %d, stderr %q", code, stderr)
+	}
+}
+
+func TestPartialSessionRegistryKeepsTranscriptsReadable(t *testing.T) {
+	e := reviewHome(t)
+	id := "77773333-0000-4000-8000-000000000001"
+	path := writeReviewClaude(t, e, "synthetic", id, `{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-11-14T08:00:00Z","message":{"role":"user","content":"X marker"}}`)
+	writeWorkFile(t, filepath.Join(e.home, ".claude", "sessions", "12345.json"), []string{"{"})
+	code, out, stderr := runTL(t, e, "--all", "--grep", "X", "--since", "2026-11-13T00:00:00Z")
+	if code != 0 || !strings.Contains(out, "X marker") || !strings.Contains(out, "live session names partly read") {
+		t.Fatalf("search failed on a registry record being written: code %d, stderr %q, output:\n%s", code, stderr, out)
+	}
+	code, out, stderr = runTL(t, e, path)
+	if code != 0 || !strings.Contains(out, "X marker") {
+		t.Fatalf("reading a transcript by path failed on a registry record being written: code %d, stderr %q, output:\n%s", code, stderr, out)
 	}
 }

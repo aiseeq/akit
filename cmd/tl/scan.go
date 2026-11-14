@@ -30,6 +30,7 @@ type result struct {
 	linkIDs     map[string]string // path → уникальный id для ссылок в этой выборке
 	searchPaths []string          // all transcript names reachable by find
 	liveNames   map[string]bool   // names that take precedence in find
+	liveErr     error             // registry records not read: links may coincide with their names
 	files       int
 	errs        []error // файлы, которые не прочитались: их события не вошли
 	bad         int     // строк, которые не разобрать, по всем файлам
@@ -730,11 +731,9 @@ func scan(sources []source, opts options, home string) (result, error) {
 	if err != nil {
 		return result{}, fmt.Errorf("list transcript names: %w", err)
 	}
-	liveNames, err := liveSessionNames(home)
-	if err != nil {
-		return result{}, fmt.Errorf("list live session names: %w", err)
-	}
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home, liveNames), searchPaths: allPaths, liveNames: liveNames, files: len(sources)}
+	// A record being written does not stop reading transcripts, as in find; the summary names it.
+	liveNames, liveErr := liveSessionNames(home)
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home, liveNames), searchPaths: allPaths, liveNames: liveNames, liveErr: liveErr, files: len(sources)}
 	type fileResult struct {
 		hits  []hit
 		waits []time.Duration
@@ -796,6 +795,9 @@ func (res result) problems() string {
 	}
 	if res.bad > 0 {
 		s += fmt.Sprintf("; %d unparsable line(s) skipped, first: %v", res.bad, res.firstBad)
+	}
+	if res.liveErr != nil {
+		s += fmt.Sprintf("; live session names partly read: %v", res.liveErr)
 	}
 	return s
 }

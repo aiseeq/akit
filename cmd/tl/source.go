@@ -165,6 +165,7 @@ func transcriptPaths(home string) ([]string, error) {
 	return paths, nil
 }
 
+// liveSessionNames returns the names readable now; the error names registry records skipped because they are being written.
 func liveSessionNames(home string) (map[string]bool, error) {
 	alive, err := session.ForHome(home).Alive()
 	names := make(map[string]bool, len(alive))

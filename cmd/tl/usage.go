@@ -195,7 +195,7 @@ func usageReplies(hits []hit) []usageReply {
 func copiedAgentReplyKey(path string, reply *transcript.Reply) string {
 	base := filepath.Base(path)
 	if !strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) ||
-		!strings.HasPrefix(base, "agent-") || reply.ID == "" || reply.RequestID == "" {
+		!strings.HasPrefix(base, "agent-") || (reply.ID == "" && reply.RequestID == "") {
 		return ""
 	}
 	return base + "\x00" + reply.ID + "\x00" + reply.RequestID
