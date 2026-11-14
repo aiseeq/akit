@@ -2462,6 +2462,53 @@ func TestShellScriptInputRevisionCases(t *testing.T) {
 	}
 }
 
+func TestShellScriptInputReviewRoundFour(t *testing.T) {
+	tests := []struct {
+		src  string
+		want map[string]bool
+	}{
+		{`exec 3</dev/null; exec >&3; bash -`, map[string]bool{"bash": true}},
+		{`exec 3</dev/null; exec 0>&3; bash -`, map[string]bool{"bash": false}},
+		{`exec 3</dev/null; exec 1>&3; bash -`, map[string]bool{"bash": true}},
+		{`exec <>/dev/null; bash -`, map[string]bool{"bash": false}},
+		{"cat <<'END' | bash -s arg <&3\necho PIPE\nEND", map[string]bool{"bash": true}},
+		{"cat <<'END' | bash <&3\necho PIPE\nEND", map[string]bool{"bash": true}},
+		{"cat <<'END' | bash\necho PIPE\nEND", map[string]bool{"bash": false}},
+		{"cat <<'END' | env bash -s arg <&3\necho PIPE\nEND", map[string]bool{"env": true, "bash": true}},
+		{`bash -s a < $((1))`, map[string]bool{"bash": false}},
+		{`bash < $((1))`, map[string]bool{"bash": false}},
+		{"bash -s $((1)) <<<`echo <(echo x)`", map[string]bool{"bash": false}},
+		{`while read l; do bash -s a; done < <(echo x)`, map[string]bool{"bash": false}},
+		{`while read l; do bash; done < <(echo x)`, map[string]bool{"bash": false}},
+		{`bash -n -s arg`, map[string]bool{"bash": false}},
+		{`bash -x`, map[string]bool{"bash": false}},
+		{`sh --noprofile --`, map[string]bool{"sh": false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, want := range tt.want {
+				found := false
+				for _, call := range calls {
+					if call.Name != name {
+						continue
+					}
+					found = true
+					if call.ScriptInput != want {
+						t.Errorf("%s ScriptInput=%t, want %t: %#v", name, call.ScriptInput, want, call)
+					}
+				}
+				if !found {
+					t.Errorf("call %q not found in %#v", name, calls)
+				}
+			}
+		})
+	}
+}
+
 func TestShellScriptInputRevisionThree(t *testing.T) {
 	tests := []struct {
 		src  string
