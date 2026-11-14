@@ -2761,6 +2761,12 @@ func TestSourceOfDescriptorAndDescriptorPathFromVariableRunUnreadScript(t *testi
 		{`source`, "source", false},
 		{`source < /dev/fd/3`, "source", false},
 		{`exec 3</dev/null; source /dev/fd/3`, "source", false},
+		// A copy of stdin made before the command's own heredoc is the pipe.
+		{"echo x | bash /dev/fd/4 4<&0 <<'E'\necho ok\nE", "bash", true},
+		{"echo x | source /dev/fd/4 4</dev/stdin <<'E'\necho ok\nE", "source", true},
+		// -p takes the search path, so the file is the next operand.
+		{"exec 3< <(echo x); source -p /dev/stdin /dev/fd/3 <<'E'\necho ok\nE", "source", true},
+		{"echo x | source -p /dev/fd/3 /dev/stdin 3<<'E'\necho ok\nE", "source", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.src, func(t *testing.T) {
@@ -2795,6 +2801,11 @@ func TestSourceOfHeredocThroughDescriptorPathParsesBody(t *testing.T) {
 		{"builtin source /dev/stdin <<<'kill 1'", []string{"builtin", "source"}},
 		{"command . /dev/fd/3 3<<'E'\nkill 1\nE", []string{"command", "."}},
 		{"source -- /dev/stdin <<'E'\nkill 1\nE", []string{"source"}},
+		{"source -p /x /dev/fd/3 3<<'E'\nkill 1\nE", []string{"source"}},
+		// The sourced file may run its arguments.
+		{"source x exec -- bash <<'E'\nkill 1\nE", []string{"source", "exec", "bash"}},
+		{". ./x exec -- sh <<<'kill 1'", []string{".", "exec", "sh"}},
+		{"source x exec -- sudo bash <<'E'\nkill 1\nE", []string{"source", "exec", "sudo", "bash"}},
 	} {
 		calls, err := Find(tt.src, "kill")
 		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, tt.via) {

@@ -1540,6 +1540,29 @@ func shellDoubleDashHasFileSemantics(args []string, shell string, operand int) b
 	return false
 }
 
+// shellScriptFD returns the descriptor a shell, source or . reads its script
+// from: 0 for stdin, N for a /dev/fd/N operand. A regular file, a command
+// string or no script at all is not a descriptor.
+func shellScriptFD(args []string, shell string) (int, bool) {
+	if isSourceBuiltin(shell) {
+		file, ok := sourceFileOperand(args)
+		if !ok {
+			return 0, false
+		}
+		fd := shellScriptInputFD(file)
+		return fd, fd >= 0
+	}
+	operand, command, useStdin := shellArgs(args)
+	if command {
+		return 0, false
+	}
+	if useStdin || operand >= len(args) {
+		return 0, true
+	}
+	fd := shellScriptInputFD(args[operand])
+	return fd, fd >= 0
+}
+
 func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 	if isSourceBuiltin(shell) {
 		file, ok := sourceFileOperand(args)
@@ -1716,23 +1739,18 @@ func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.Ca
 
 func knownShellScriptInputState(file *syntax.File, stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, stdin *syntax.Redirect, redirs []*syntax.Redirect) (bool, *syntax.Redirect) {
 	args, _ := words(call.Args, src, vars)
-	_, targetArgs, ok := shellInputTargetArgs(args)
+	shell, targetArgs, ok := shellInputTargetArgs(args)
 	if !ok {
 		return false, nil
 	}
-	operand, command, useStdin := shellArgs(targetArgs)
-	if command {
+	fd, ok := shellScriptFD(targetArgs, shell)
+	if !ok {
 		return false, nil
 	}
-	fd := 0
-	if !useStdin && operand < len(targetArgs) {
-		fd = shellScriptInputFD(targetArgs[operand])
-		if fd < 0 {
-			return false, nil
-		}
-	}
 	known, set, sources := knownExecFDStates(file, int(stmt.Pos().Offset()))
-	if stdin != nil {
+	// Stdin from an enclosing command or pipe is open before the command's own
+	// redirections; its own stdin redirection takes its place among them.
+	if stdin != nil && !slices.Contains(redirs, stdin) {
 		applyKnownInputRedirect(stdin, 0, known, set, sources)
 	}
 	// Redirections apply left to right: <&3 before 3<<E copies the earlier fd 3.
@@ -2495,10 +2513,14 @@ func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work
 		}
 		if isScriptInputShell(name) {
 			target, shellVia, ok := shellInputForShell(name, args, hasHeredoc, via)
-			if !ok {
+			if ok {
+				return target, shellVia, nil
+			}
+			// source FILE can run its arguments, as in source x exec -- bash:
+			// the exec scan below still applies.
+			if !isSourceBuiltin(name) {
 				return "", nil, nil
 			}
-			return target, shellVia, nil
 		}
 		var ok bool
 		name, args, via, ok = nextShellInputTarget(name, args, via, &scan)
