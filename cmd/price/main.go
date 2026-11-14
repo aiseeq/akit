@@ -219,6 +219,17 @@ func run(opts options, e env, now time.Time, out, errOut io.Writer) int {
 // significant prints three significant digits without an exponent: a run
 // costs hundredths of a percent, a week of work hundreds.
 func significant(v float64) string {
-	rounded, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'g', 3, 64), 64)
+	if v == 0 {
+		return "0"
+	}
+	exp := math.Floor(math.Log10(math.Abs(v)))
+	rounded := 0.0
+	if exp >= 2 {
+		unit := math.Pow(10, exp-2)
+		rounded = math.Round(v/unit) * unit
+	} else {
+		scale := math.Pow(10, 2-exp)
+		rounded = math.Round(v*scale) / scale
+	}
 	return strconv.FormatFloat(rounded, 'f', -1, 64)
 }
