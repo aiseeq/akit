@@ -29,11 +29,10 @@ const (
 type interval struct{ start, end time.Time }
 
 type sourceActivity struct {
-	src              source
-	events           []time.Time
-	keyTimes         []time.Time
-	loaded           bool
-	launchedInParent bool
+	src      source
+	events   []time.Time
+	keyTimes []time.Time
+	loaded   bool
 }
 
 func isActivityEvent(role transcript.Role) bool {
@@ -324,9 +323,6 @@ func collectActivities(sources []source, re *regexp.Regexp, literals []string, k
 		return nil, nil, err
 	}
 	parentWindows := matchedParentWindows(activities, matchedParent, keyGap)
-	if err := loadCodexWorkersInParentWindows(sources, activities, parentWindows); err != nil {
-		return nil, nil, err
-	}
 	return activities, parentWindows, nil
 }
 
@@ -430,60 +426,6 @@ func matchedParentWindows(activities map[string]sourceActivity, matched map[stri
 	return windows
 }
 
-const rolloutLaunchStamp = "2006-01-02T15-04-05"
-
-func rolloutLaunchTime(path string) (time.Time, bool) {
-	name := strings.TrimPrefix(filepath.Base(path), "rollout-")
-	if len(name) < len(rolloutLaunchStamp) {
-		return time.Time{}, false
-	}
-	at, err := time.ParseInLocation(rolloutLaunchStamp, name[:len(rolloutLaunchStamp)], time.Local)
-	return at, err == nil
-}
-
-func loadCodexWorkersInParentWindows(sources []source, activities map[string]sourceActivity, windows map[string][]interval) error {
-	var parents []source
-	for _, src := range sources {
-		if src.ParentID == "" && !isCodexRollout(src.Path) && len(windows[src.ID]) > 0 {
-			parents = append(parents, src)
-		}
-	}
-	for _, src := range sources {
-		if !isCodexRollout(src.Path) {
-			continue
-		}
-		launch, ok := rolloutLaunchTime(src.Path)
-		if !ok || parentWindowMatches(launch, parents, windows) != 1 {
-			continue
-		}
-		activity := activities[src.ID]
-		if !activity.loaded {
-			events, err := readActivityTimes(src)
-			if err != nil {
-				return fmt.Errorf("read activity %s: %w", src.Path, err)
-			}
-			activity.events, activity.loaded = events, true
-		}
-		if len(activity.events) > 0 && parentWindowMatches(firstTime(activity.events), parents, windows) == 1 {
-			activity.launchedInParent = true
-		}
-		activities[src.ID] = activity
-	}
-	return nil
-}
-
-func parentWindowMatches(at time.Time, parents []source, windows map[string][]interval) int {
-	matches := 0
-	for _, parent := range parents {
-		for _, window := range windows[parent.ID] {
-			if !at.Before(window.start) && !at.After(window.end) {
-				matches++
-			}
-		}
-	}
-	return matches
-}
-
 func worktimeIntervals(activities map[string]sourceActivity, windows map[string][]interval,
 	gap, keyGap time.Duration, timeWindow interval) ([]interval, bool) {
 	var intervals []interval
@@ -492,7 +434,7 @@ func worktimeIntervals(activities map[string]sourceActivity, windows map[string]
 		activity := activities[id]
 		ownWindows := keyWindows(activity, keyGap)
 		parentWindows := windows[activity.src.ParentID]
-		launchedInParent := activity.launchedInParent || containsTime(parentWindows, firstTime(activity.events))
+		launchedInParent := containsTime(parentWindows, firstTime(activity.events))
 		if len(ownWindows) == 0 && !launchedInParent {
 			continue
 		}

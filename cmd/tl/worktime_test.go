@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -479,41 +481,46 @@ func TestWorktimeChildCountsOnlyWhenStartedInsideKeyChunk(t *testing.T) {
 	}
 }
 
-func TestWorktimeCodexLaunchInsideUniqueParentChunkCountsFullActivity(t *testing.T) {
+func TestWorktimeCodexRolloutRequiresOwnKey(t *testing.T) {
 	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
-	parent := source{Path: "parent.jsonl", ID: "parent"}
-	var parentEvents []time.Time
-	for at := start; !at.After(start.Add(30 * time.Minute)); at = at.Add(5 * time.Minute) {
-		parentEvents = append(parentEvents, at)
-	}
-	parentActivity := sourceActivity{src: parent, events: parentEvents, keyTimes: []time.Time{start}, loaded: true}
-	inside := codexLaunchFixture(t, start.Add(20*time.Minute), start.Add(80*time.Minute))
-	outside := codexLaunchFixture(t, start.Add(time.Hour), start.Add(2*time.Hour))
-	activities := map[string]sourceActivity{parent.ID: parentActivity, "inside": {src: inside}, "outside": {src: outside}}
-	matched := map[string]bool{parent.ID: true}
-	windows := matchedParentWindows(activities, matched, 30*time.Minute)
-	if err := loadCodexWorkersInParentWindows([]source{parent, inside, outside}, activities, windows); err != nil {
+	parentPath := filepath.Join(t.TempDir(), "parent.jsonl")
+	writeWorkFile(t, parentPath, workRows(t, start, start.Add(30*time.Minute), 5*time.Minute, func(at time.Time) string {
+		if at.Equal(start) {
+			return workRecord(t, "user", at, "KEY-123", "human")
+		}
+		return workRecord(t, "agent", at, "parent work", "")
+	}))
+	parent := source{Path: parentPath, ID: "parent"}
+	keyless := codexLaunchFixture(t, start.Add(20*time.Minute), start.Add(80*time.Minute), "")
+	keyed := codexLaunchFixture(t, start.Add(2*time.Hour), start.Add(3*time.Hour), "brief KEY-123")
+	sources := []source{parent, keyless, keyed}
+	re := regexp.MustCompile(`(?i)\bKEY-123\b`)
+	activities, windows, err := collectActivities(sources, re, []string{"KEY-123"}, 30*time.Minute, io.Discard)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !activities[inside.ID].launchedInParent || activities[outside.ID].launchedInParent {
-		t.Fatalf("launch attribution: inside=%v outside=%v", activities[inside.ID].launchedInParent, activities[outside.ID].launchedInParent)
+	intervals, matched := worktimeIntervals(activities, windows, 15*time.Minute, 30*time.Minute,
+		interval{start.Add(-time.Minute), start.Add(4 * time.Hour)})
+	if !matched {
+		t.Fatal("matched key sessions were not reported")
 	}
-	intervals, _ := worktimeIntervals(activities, windows, 15*time.Minute, 30*time.Minute,
-		interval{start.Add(-time.Minute), start.Add(3 * time.Hour)})
 	var duration time.Duration
 	for _, span := range unionIntervals(intervals) {
 		duration += span.end.Sub(span.start)
 	}
-	if duration != 80*time.Minute {
-		t.Fatalf("union duration %s, want 80m", duration)
+	if duration != time.Hour {
+		t.Fatalf("union duration %s, want 1h (parent + keyed rollout only)", duration)
 	}
 }
 
-func codexLaunchFixture(t *testing.T, launch, end time.Time) source {
+func codexLaunchFixture(t *testing.T, launch, end time.Time, prompt string) source {
 	t.Helper()
-	stamp := launch.In(time.Local).Format(rolloutLaunchStamp)
+	stamp := launch.In(time.Local).Format("2006-01-02T15-04-05")
 	path := filepath.Join(t.TempDir(), "rollout-"+stamp+"-00000000-0000-4000-8000-000000000001.jsonl")
 	rows := []string{`{"timestamp":"` + launch.Format(time.RFC3339Nano) + `","type":"session_meta","payload":{"id":"synthetic"}}`}
+	if prompt != "" {
+		rows = append(rows, `{"timestamp":"`+launch.Format(time.RFC3339Nano)+`","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"`+prompt+`"}]}}`)
+	}
 	for at := launch.Add(5 * time.Minute); !at.After(end); at = at.Add(5 * time.Minute) {
 		rows = append(rows, `{"timestamp":"`+at.Format(time.RFC3339Nano)+`","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"worker work"}]}}`)
 	}
@@ -521,24 +528,6 @@ func codexLaunchFixture(t *testing.T, launch, end time.Time) source {
 		t.Fatal(err)
 	}
 	return source{Path: path, ID: "codex" + launch.Format("150405")}
-}
-
-func TestWorktimeCodexLaunchInOverlappingParentChunksIsSkipped(t *testing.T) {
-	base := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
-	first := source{Path: "first-parent.jsonl", ID: "first"}
-	second := source{Path: "second-parent.jsonl", ID: "second"}
-	codex := source{Path: filepath.Join(t.TempDir(), "rollout-"+base.Add(20*time.Minute).Format(rolloutLaunchStamp)+"-00000000-0000-4000-8000-000000000001.jsonl"), ID: "ambiguous"}
-	activities := map[string]sourceActivity{first.ID: {src: first}, second.ID: {src: second}, codex.ID: {src: codex}}
-	windows := map[string][]interval{
-		first.ID:  {{base, base.Add(30 * time.Minute)}},
-		second.ID: {{base.Add(10 * time.Minute), base.Add(40 * time.Minute)}},
-	}
-	if err := loadCodexWorkersInParentWindows([]source{first, second, codex}, activities, windows); err != nil {
-		t.Fatal(err)
-	}
-	if activities[codex.ID].loaded || activities[codex.ID].launchedInParent {
-		t.Fatalf("ambiguous rollout was attributed: %+v", activities[codex.ID])
-	}
 }
 
 func TestWorktimeBareKeyUsesWordBoundaries(t *testing.T) {

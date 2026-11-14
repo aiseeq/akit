@@ -63,10 +63,11 @@ path (Claude Code or codex rollout).
                 split activity (default 15m). Key roles: user, agent, cmd,
                 note/prompt, peer; out is not searched.
                 Bare --grep keys get \b boundaries only in --worktime; regex stays as written.
-                Activity is clipped to --since/--until. Subagents and Codex
-                fighters launched inside a parent key chunk count all their
-                activity; a brief with a key uses its own key chunks.
-                Codex fighters are omitted unless --codex is set. A lone event
+                Activity is clipped to --since/--until. Subagents launched
+                inside a parent key chunk count all their activity; a brief
+                with a key uses its own key chunks. Codex rollout without a key
+                in its own prompt, text or commands is not counted. Codex
+                fighters are omitted unless --codex is set. A lone event
                 is 1m. Midnight crossings split at local midnight; day rows
                 round up to 15m and total sums the rounded rows.
   --gap D       activity split threshold (default 15m)
