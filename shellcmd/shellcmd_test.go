@@ -2721,6 +2721,56 @@ func TestShellScriptInputFromStdinSetByEnclosingOrSubstitutedRedirect(t *testing
 	}
 }
 
+func TestSourceOfDescriptorAndDescriptorPathFromVariableRunUnreadScript(t *testing.T) {
+	tests := []struct {
+		src, name string
+		want      bool
+	}{
+		{`exec 3< <(echo x); source /dev/fd/3`, "source", true},
+		{`exec 3< <(echo x); . /dev/fd/3`, ".", true},
+		{`exec 3< <(echo x); source /proc/self/fd/3`, "source", true},
+		{`source /dev/fd/3 3< <(echo x)`, "source", true},
+		{`source /dev/stdin < <(echo x)`, "source", true},
+		{`echo x | source /dev/stdin`, "source", true},
+		{`echo x | . /dev/stdin`, ".", true},
+		{`echo x | source /proc/self/fd/0`, "source", true},
+		{`exec {fd}< <(echo x); bash /dev/fd/$fd`, "bash", true},
+		{`exec {fd}< <(echo x); bash /proc/self/fd/$fd`, "bash", true},
+		{`exec {fd}< <(echo x); source /dev/fd/$fd`, "source", true},
+		{`builtin source /dev/stdin`, "source", true},
+		{`command . /dev/fd/3`, ".", true},
+		// A known body that is not parsed as a nested script is still unread.
+		{"source /dev/stdin <<'E'\necho x\nE", "source", true},
+		{"exec 3<<'E'\necho x\nE\n. /dev/fd/3", ".", true},
+		{`source script.sh`, "source", false},
+		{`. ./env.sh`, ".", false},
+		{`source /dev/null`, "source", false},
+		{`source`, "source", false},
+		{`source < /dev/fd/3`, "source", false},
+		{`exec 3</dev/null; source /dev/fd/3`, "source", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name == tt.name {
+					found = true
+					if call.ScriptInput != tt.want {
+						t.Errorf("%s ScriptInput=%t, want %t", call.Name, call.ScriptInput, tt.want)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("no %s call in %#v", tt.name, calls)
+			}
+		})
+	}
+}
+
 func TestUnknownShellScriptInput(t *testing.T) {
 	for _, command := range []string{
 		`echo 'kill 1' | bash`,

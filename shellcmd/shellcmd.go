@@ -1181,6 +1181,10 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 			info.shellHdocs[script] = true
 			info.localSubstHdocs[script] = true
 		}
+	} else if info.knownShellInputs[call] != nil {
+		// The script is a known body that is not parsed as a nested script
+		// here: its calls stay unseen.
+		info.scriptInputs[call] = true
 	}
 }
 
@@ -1468,7 +1472,7 @@ func shellScriptInputFD(name string) int {
 	if name == "/dev/stdin" {
 		return 0
 	}
-	for _, prefix := range []string{"/dev/fd/", "/proc/self/fd/", "/proc/$$/fd/", "/proc/${$}/fd/"} {
+	for _, prefix := range descriptorPathPrefixes {
 		if after, ok := strings.CutPrefix(name, prefix); ok {
 			n, err := strconv.Atoi(after)
 			if err == nil && n >= 0 {
@@ -1477,6 +1481,26 @@ func shellScriptInputFD(name string) int {
 		}
 	}
 	return -1
+}
+
+var descriptorPathPrefixes = []string{"/dev/fd/", "/proc/self/fd/", "/proc/$$/fd/", "/proc/${$}/fd/"}
+
+// descriptorPathUnresolved reports a descriptor path whose number is a
+// substitution, such as /dev/fd/$fd after exec {fd}<: a descriptor of unknown
+// content.
+func descriptorPathUnresolved(name string) bool {
+	for _, prefix := range descriptorPathPrefixes {
+		if after, ok := strings.CutPrefix(name, prefix); ok && strings.ContainsAny(after, "$`") {
+			return true
+		}
+	}
+	return false
+}
+
+// isSourceBuiltin reports source and ., which run a file in the current
+// shell: the first operand is the script, stdin is not read for it.
+func isSourceBuiltin(name string) bool {
+	return name == "source" || name == "."
 }
 
 func shellDoubleDashHasFileSemantics(args []string, shell string, operand int) bool {
@@ -1492,6 +1516,13 @@ func shellDoubleDashHasFileSemantics(args []string, shell string, operand int) b
 }
 
 func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
+	if isSourceBuiltin(shell) {
+		if len(args) == 0 {
+			return false, false
+		}
+		fd := shellScriptInputFD(args[0])
+		return fd >= 0 || descriptorPathUnresolved(args[0]), fd == 0
+	}
 	operand, command, useStdin := shellArgs(args)
 	if command || shellNoExec(args) {
 		return false, false
@@ -1510,7 +1541,7 @@ func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 	}
 	if operand < len(args) {
 		fd := shellScriptInputFD(args[operand])
-		return fd >= 0, fd == 0
+		return fd >= 0 || descriptorPathUnresolved(args[operand]), fd == 0
 	}
 	if len(args) == 0 {
 		return false, true
@@ -1561,7 +1592,7 @@ func shellScriptInputDirectForm(call *syntax.CallExpr, src string, vars map[stri
 	}
 	args, _ := words(call.Args[1:], src, vars)
 	input, stdin := shellScriptInputArgs(args, shell)
-	return input || stdin || shellReadsImplicitStdin(args) && hasUnknownStdinRedir(redirs)
+	return input || stdin || shellReadsImplicitStdin(args, shell) && hasUnknownStdinRedir(redirs)
 }
 
 func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]string) (bool, error) {
@@ -1592,13 +1623,16 @@ func shellScriptInputWrappedForm(call *syntax.CallExpr, src string, vars map[str
 		return false
 	}
 	input, stdin := shellScriptInputArgs(args, shell)
-	return input || stdin || shellReadsImplicitStdin(args) && hasUnknownStdinRedir(redirs)
+	return input || stdin || shellReadsImplicitStdin(args, shell) && hasUnknownStdinRedir(redirs)
 }
 
 // shellReadsImplicitStdin reports a shell given only options, -s among them:
 // it reads its script from stdin without naming it, so only where stdin comes
 // from decides.
-func shellReadsImplicitStdin(args []string) bool {
+func shellReadsImplicitStdin(args []string, shell string) bool {
+	if isSourceBuiltin(shell) {
+		return false
+	}
 	operand, command, _ := shellArgs(args)
 	return !command && operand >= len(args) && !shellNoExec(args)
 }
@@ -2548,7 +2582,7 @@ func isShell(name string) bool {
 }
 
 func isScriptInputShell(name string) bool {
-	return isShell(name)
+	return isShell(name) || isSourceBuiltin(name)
 }
 
 // shellReadsHeredoc — оболочка читает heredoc как скрипт, если её stdin не заменён -c или файлом.
