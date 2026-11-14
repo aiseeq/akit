@@ -1163,30 +1163,37 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 		info.stdinInputs[call] = stdin.redir
 	}
 	collectScriptInput(stmt, call, file, src, vars, info, stdin.redir, offset)
-	name, shellVia, input, err := shellInputName(stmt, src, vars, stdin.redir)
+	// The body the shell runs: the source of its script descriptor when the
+	// descriptor state names one, else its stdin unless the script is read
+	// from another descriptor.
+	script := stdin.redir
+	if redir := info.knownShellInputs[call]; redir != nil {
+		script = redir
+	} else if script != nil && shellScriptFromOtherFD(call, src, vars) {
+		script = nil
+	}
+	name, shellVia, input, err := shellInputName(stmt, src, vars, script)
 	if err != nil {
 		info.errors = append(info.errors, err)
 	} else if input {
-		info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: stdin.redir, name: name, via: shellVia})
-		if !slices.Contains(shellVia, "ssh") && stdin.redir != nil && stdin.redir.Hdoc != nil {
-			info.shellHdocs[stdin.redir] = true
-			info.localSubstHdocs[stdin.redir] = true
+		info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: script, name: name, via: shellVia})
+		if !slices.Contains(shellVia, "ssh") && script != nil && script.Hdoc != nil {
+			info.shellHdocs[script] = true
+			info.localSubstHdocs[script] = true
 		}
 	}
-	if !input {
-		if redir := info.knownShellInputs[call]; redir != nil {
-			name, shellVia, input, err = shellInputName(stmt, src, vars, redir)
-			if err != nil {
-				info.errors = append(info.errors, err)
-			} else if input {
-				info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: redir, name: name, via: shellVia})
-				if !slices.Contains(shellVia, "ssh") && redir.Hdoc != nil {
-					info.shellHdocs[redir] = true
-					info.localSubstHdocs[redir] = true
-				}
-			}
-		}
+}
+
+// shellScriptFromOtherFD reports a shell whose script is a descriptor path
+// other than stdin, such as /dev/fd/3: its stdin is data, not the script.
+func shellScriptFromOtherFD(call *syntax.CallExpr, src string, vars map[string]string) bool {
+	args, _ := words(call.Args, src, vars)
+	shell, targetArgs, ok := shellInputTargetArgs(args)
+	if !ok {
+		return false
 	}
+	input, stdin := shellScriptInputArgs(targetArgs, shell)
+	return input && !stdin
 }
 
 func collectStmtProcessSubstitutionCandidate(stmt *syntax.Stmt, call *syntax.CallExpr, src string, info *walkInfo) {
@@ -1668,21 +1675,11 @@ func knownShellScriptInputState(file *syntax.File, stmt *syntax.Stmt, call *synt
 	if stdin != nil {
 		applyKnownInputRedirect(stdin, 0, known, set, sources)
 	}
-	var lastFDRedirect *syntax.Redirect
+	// Redirections apply left to right: <&3 before 3<<E copies the earlier fd 3.
 	for _, redir := range redirs {
 		dest, valid := inputRedirFD(redir)
 		if valid {
 			applyKnownInputRedirect(redir, dest, known, set, sources)
-			if dest == fd {
-				lastFDRedirect = redir
-			}
-		}
-	}
-	if sources[fd] == nil && lastFDRedirect != nil && lastFDRedirect.Op.String() == "<&" {
-		target, literal := redirectTarget(lastFDRedirect)
-		if source, ok := shellFDNumber(target); literal && ok && sources[source] != nil {
-			sources[fd] = sources[source]
-			known[fd], set[fd] = true, true
 		}
 	}
 	return set[fd] && known[fd], sources[fd]

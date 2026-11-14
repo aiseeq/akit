@@ -2303,8 +2303,8 @@ func TestHeredocScriptInputViaDescriptorPaths(t *testing.T) {
 		{"bash /dev/stdin <<< 'kill 1'", []string{"bash"}},
 		{"bash /dev/fd/3 3<<'E'\nkill 1\nE", []string{"bash"}},
 		{"bash 3<<<'kill 1' /dev/fd/3", []string{"bash"}},
-		{"bash <&3 3<<'E'\nkill 1\nE", []string{"bash"}},
 		{"bash 3<<'E' <&3\nkill 1\nE", []string{"bash"}},
+		{"bash /dev/fd/3 3<<<'kill 1' <<<'echo ok'", []string{"bash"}},
 		{"exec 3<<'E'\nkill 1\nE\nbash <&3", []string{"bash"}},
 		{"exec 3<<'E'\nkill 1\nE\nbash /dev/fd/3", []string{"bash"}},
 		{"exec 3<<'E'\nkill 1\nE\nbash /dev/fd/4 4<&3", []string{"bash"}},
@@ -2320,10 +2320,32 @@ func TestHeredocScriptInputViaDescriptorPaths(t *testing.T) {
 		"bash /dev/stdin <<'E'\necho ok\nE",
 		"bash /dev/fd/3 3<<'E' 3</dev/null\nkill 1\nE",
 		"bash script.sh <<'E'\nkill 1\nE",
+		"bash /dev/fd/3 3</dev/null <<'E'\nkill 1\nE",
 	} {
 		calls, err := Find(src, "kill")
 		if err != nil || len(calls) != 0 {
 			t.Errorf("Find(%q) = %#v, %v; want no kill", src, calls, err)
+		}
+	}
+	// Redirections apply left to right: <&3 before 3<<E copies the fd 3 open
+	// before the command, so the heredoc is not the script.
+	for _, src := range []string{
+		"bash <&3 3<<'E'\nkill 1\nE",
+		"exec 3< <(echo kill 1)\nbash <&3 3<<'E'\necho ok\nE",
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		marked := false
+		for _, call := range calls {
+			if call.Name == "kill" {
+				t.Errorf("Calls(%q) attributes the later heredoc: %#v", src, calls)
+			}
+			marked = marked || call.Name == "bash" && call.ScriptInput
+		}
+		if !marked {
+			t.Errorf("Calls(%q) bash lacks ScriptInput: %#v", src, calls)
 		}
 	}
 }
