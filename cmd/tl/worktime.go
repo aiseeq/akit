@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -22,17 +20,17 @@ import (
 const (
 	defaultWorkGap  = 15 * time.Minute
 	defaultKeyGap   = 30 * time.Minute
-	maxWorktimeLine = 256 << 20
 	maxWorktimeYear = 9999
 )
 
 type interval struct{ start, end time.Time }
 
 type sourceActivity struct {
-	src      source
-	events   []time.Time
-	keyTimes []time.Time
-	loaded   bool
+	src        source
+	parentPath string
+	events     []time.Time
+	keyTimes   []time.Time
+	loaded     bool
 }
 
 func isActivityEvent(role transcript.Role) bool {
@@ -134,20 +132,16 @@ func jiraDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm", hours, mins)
 }
 
-func rawLineMatches(raw []byte, re *regexp.Regexp, literals []string) bool {
-	if len(literals) > 0 && !strings.Contains(strings.Join(literals, ""), "\n") {
-		candidate := false
-		for _, literal := range literals {
-			if hasFolded(raw, literal) {
-				candidate = true
-				break
-			}
-		}
-		if !candidate {
-			return false
+func rawLineMatches(raw []byte, _ *regexp.Regexp, literals []string) bool {
+	if len(literals) == 0 || strings.Contains(strings.Join(literals, ""), "\n") {
+		return true
+	}
+	for _, literal := range literals {
+		if hasFolded(raw, literal) {
+			return true
 		}
 	}
-	return re.Match(raw)
+	return false
 }
 
 func readKeyTimes(src source, re *regexp.Regexp, literals []string) ([]time.Time, error) {
@@ -162,68 +156,14 @@ func readKeyTimes(src source, re *regexp.Regexp, literals []string) ([]time.Time
 	return times, err
 }
 
-func readActivityTimes(src source) ([]time.Time, error) {
-	if isCodexRollout(src.Path) {
-		var times []time.Time
-		_, err := transcript.ReadWithTools(src.Path, nil, func(ev transcript.Event) {
-			if !ev.Time.IsZero() && isActivityEvent(ev.Role) {
-				times = append(times, ev.Time)
-			}
-		})
-		return times, err
-	}
-	f, err := os.Open(src.Path)
-	if err != nil {
-		return nil, fmt.Errorf("open transcript: %w", err)
-	}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), maxWorktimeLine)
+func readActivityTimes(src source) ([]time.Time, transcript.Meta, error) {
 	var times []time.Time
-	line := 0
-	for scanner.Scan() {
-		line++
-		raw := scanner.Bytes()
-		var row struct {
-			Type      string `json:"type"`
-			Timestamp string `json:"timestamp"`
-			Message   struct {
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
+	meta, err := transcript.ReadWithTools(src.Path, nil, func(ev transcript.Event) {
+		if !ev.Time.IsZero() && isActivityEvent(ev.Role) {
+			times = append(times, ev.Time)
 		}
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return nil, fmt.Errorf("decode transcript line %d: %w", line, err)
-		}
-		active := row.Type == "user" && row.Timestamp != ""
-		if row.Type == "assistant" {
-			var parts []struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(row.Message.Content, &parts); err != nil {
-				return nil, fmt.Errorf("decode assistant content at line %d: %w", line, err)
-			}
-			for _, part := range parts {
-				if part.Type == "text" || part.Type == "tool_use" {
-					active = true
-					break
-				}
-			}
-		}
-		if active && row.Timestamp != "" {
-			at, parseErr := time.Parse(time.RFC3339Nano, row.Timestamp)
-			if parseErr != nil {
-				return nil, fmt.Errorf("parse timestamp at line %d: %w", line, parseErr)
-			}
-			times = append(times, at)
-		}
-	}
-	readErr, closeErr := scanner.Err(), f.Close()
-	if readErr != nil {
-		return nil, fmt.Errorf("scan transcript: %w", readErr)
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("close transcript: %w", closeErr)
-	}
-	return times, nil
+	})
+	return times, meta, err
 }
 
 func worktimePrefilter(pattern string) ([]string, error) {
@@ -305,6 +245,15 @@ func containsTime(windows []interval, at time.Time) bool {
 	return false
 }
 
+func childStartsInParentWindow(windows []interval, at time.Time) bool {
+	for _, window := range windows {
+		if !at.Before(window.start) && !at.After(window.end.Add(time.Minute)) {
+			return true
+		}
+	}
+	return false
+}
+
 func collectActivities(sources []source, re *regexp.Regexp, literals []string, keyGap time.Duration, stderr io.Writer) (map[string]sourceActivity, map[string][]interval, error) {
 	activities := make(map[string]sourceActivity, len(sources))
 	matchedParent := make(map[string]bool, len(sources))
@@ -313,17 +262,37 @@ func collectActivities(sources []source, re *regexp.Regexp, literals []string, k
 		if keyErrors[i] != nil {
 			return nil, nil, fmt.Errorf("read %s: %w", src.Path, keyErrors[i])
 		}
-		activities[src.ID] = sourceActivity{src: src, keyTimes: keyTimes[i]}
-		matchedParent[src.ID] = len(keyTimes[i]) > 0
+		parentPath := parentTranscriptPath(src, sources)
+		activities[src.Path] = sourceActivity{src: src, parentPath: parentPath, keyTimes: keyTimes[i]}
+		matchedParent[src.Path] = len(keyTimes[i]) > 0
 	}
 	if err := loadMissingParentKeys(sources, activities, matchedParent, re, literals, stderr); err != nil {
 		return nil, nil, err
 	}
-	if err := loadSelectedActivityEvents(sources, activities, matchedParent); err != nil {
+	if err := loadSelectedActivityEvents(sources, activities, matchedParent, stderr); err != nil {
 		return nil, nil, err
 	}
 	parentWindows := matchedParentWindows(activities, matchedParent, keyGap)
 	return activities, parentWindows, nil
+}
+
+func parentTranscriptPath(src source, sources []source) string {
+	if src.ParentID == "" {
+		return ""
+	}
+	if len(src.ParentID) > 8 {
+		for _, candidate := range sources {
+			if strings.TrimSuffix(filepath.Base(candidate.Path), ".jsonl") == src.ParentID {
+				return candidate.Path
+			}
+		}
+	}
+	parentDir := filepath.Dir(filepath.Dir(src.Path))
+	parentID := filepath.Base(parentDir)
+	if strings.HasPrefix(parentID, src.ParentID) || strings.HasPrefix(src.ParentID, parentID) {
+		return parentDir + ".jsonl"
+	}
+	return ""
 }
 
 func readKeyTimesParallel(sources []source, re *regexp.Regexp, literals []string) ([][]time.Time, []error) {
@@ -353,17 +322,15 @@ func loadMissingParentKeys(sources []source, activities map[string]sourceActivit
 	re *regexp.Regexp, literals []string, stderr io.Writer) error {
 	warned := map[string]bool{}
 	for _, src := range sources {
-		if src.ParentID == "" || len(activities[src.ID].keyTimes) == 0 {
+		child := activities[src.Path]
+		parentPath := child.parentPath
+		if parentPath == "" || len(child.keyTimes) == 0 {
 			continue
 		}
-		if _, present := activities[src.ParentID]; present {
+		if _, present := activities[parentPath]; present {
 			continue
 		}
-		parentPath := filepath.Dir(filepath.Dir(src.Path)) + ".jsonl"
 		parent := transcript.NewSource(parentPath)
-		if parent.ID != src.ParentID {
-			continue
-		}
 		if _, err := os.Stat(parentPath); err != nil {
 			if os.IsNotExist(err) {
 				if !warned[parentPath] {
@@ -379,36 +346,40 @@ func loadMissingParentKeys(sources []source, activities map[string]sourceActivit
 		if err != nil {
 			return fmt.Errorf("read parent %s: %w", parentPath, err)
 		}
-		activities[parent.ID] = sourceActivity{src: parentSrc, keyTimes: keyTimes}
-		matched[parent.ID] = len(keyTimes) > 0
+		activities[parentPath] = sourceActivity{src: parentSrc, keyTimes: keyTimes}
+		matched[parentPath] = len(keyTimes) > 0
 	}
 	return nil
 }
 
-func loadSelectedActivityEvents(sources []source, activities map[string]sourceActivity, matched map[string]bool) error {
-	load := func(id string) error {
-		activity := activities[id]
+func loadSelectedActivityEvents(sources []source, activities map[string]sourceActivity, matched map[string]bool, stderr io.Writer) error {
+	load := func(path string) error {
+		activity := activities[path]
 		if activity.loaded {
 			return nil
 		}
-		events, err := readActivityTimes(activity.src)
+		events, meta, err := readActivityTimes(activity.src)
 		if err != nil {
 			return fmt.Errorf("read activity %s: %w", activity.src.Path, err)
 		}
+		if meta.Bad > 0 {
+			fmt.Fprintf(stderr, "tl: warning: %s: skipped %d unparsable transcript line(s); first: %v\n", activity.src.Path, meta.Bad, meta.FirstBad)
+		}
 		activity.events, activity.loaded = events, true
-		activities[id] = activity
+		activities[path] = activity
 		return nil
 	}
 	for _, src := range sources {
-		if len(activities[src.ID].keyTimes) > 0 || matched[src.ParentID] {
-			if err := load(src.ID); err != nil {
+		activity := activities[src.Path]
+		if len(activity.keyTimes) > 0 || matched[activity.parentPath] {
+			if err := load(src.Path); err != nil {
 				return err
 			}
 		}
 	}
-	for id, hasKey := range matched {
+	for path, hasKey := range matched {
 		if hasKey {
-			if err := load(id); err != nil {
+			if err := load(path); err != nil {
 				return err
 			}
 		}
@@ -418,9 +389,9 @@ func loadSelectedActivityEvents(sources []source, activities map[string]sourceAc
 
 func matchedParentWindows(activities map[string]sourceActivity, matched map[string]bool, keyGap time.Duration) map[string][]interval {
 	windows := make(map[string][]interval)
-	for id, hasKey := range matched {
+	for path, hasKey := range matched {
 		if hasKey {
-			windows[id] = keyWindows(activities[id], keyGap)
+			windows[path] = keyWindows(activities[path], keyGap)
 		}
 	}
 	return windows
@@ -433,8 +404,8 @@ func worktimeIntervals(activities map[string]sourceActivity, windows map[string]
 	for _, id := range slices.Sorted(maps.Keys(activities)) {
 		activity := activities[id]
 		ownWindows := keyWindows(activity, keyGap)
-		parentWindows := windows[activity.src.ParentID]
-		launchedInParent := containsTime(parentWindows, firstTime(activity.events))
+		parentWindows := windows[activity.parentPath]
+		launchedInParent := childStartsInParentWindow(parentWindows, firstTime(activity.events))
 		if len(ownWindows) == 0 && !launchedInParent {
 			continue
 		}

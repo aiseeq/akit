@@ -63,9 +63,11 @@ path (Claude Code or codex rollout).
                 split activity (default 15m). Key roles: user, agent, cmd,
                 note/prompt, peer; out is not searched.
                 Bare --grep keys get \b boundaries only in --worktime; regex stays as written.
+                Key mentions in command arguments and probes count as events.
                 Activity is clipped to --since/--until. Subagents launched
-                inside a parent key chunk count all their activity; a brief
-                with a key uses its own key chunks. Codex rollout without a key
+                inside a parent key chunk (through one minute after its end)
+                count all activity; a brief with a key uses its own key chunks.
+                Codex rollout without a key
                 in its own prompt, text or commands is not counted. Codex
                 fighters are omitted unless --codex is set. A lone event
                 is 1m. Midnight crossings split at local midnight; day rows
@@ -300,14 +302,7 @@ func checkWorktimeCombos(opts options) error {
 }
 
 func worktimeOutputFlagSet(opts options) bool {
-	for _, arg := range opts.originalArgs {
-		name, _, _ := strings.Cut(arg, "=")
-		switch name {
-		case "--raw", "--max", "--width", "--role", "-C":
-			return true
-		}
-	}
-	return false
+	return opts.raw != "" || opts.maxSet || opts.widthSet || opts.rolesSet || opts.context > 0
 }
 
 func checkEventOutputCombos(opts options) error {

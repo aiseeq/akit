@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 func workRecord(t *testing.T, kind string, at time.Time, text, origin string) string {
@@ -201,6 +203,192 @@ func TestWorktimeReportsEachLocalDayAcrossMidnight(t *testing.T) {
 	}
 }
 
+func TestWorktimeHelpMentionsCommandArguments(t *testing.T) {
+	if !strings.Contains(usage, "Key mentions in command arguments and probes count as events.") {
+		t.Fatal("worktime help does not explain key mentions in command arguments and probes")
+	}
+}
+
+func TestWorktimeCollidingCodexIDsStayDistinct(t *testing.T) {
+	e, _ := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	workerDir := filepath.Join(e.home, ".local", "state", "worker", "w1", "codex", "sessions", "2026", "11", "10")
+	keyed := codexLaunchFixture(t, start, start.Add(25*time.Minute), "KEY-123")
+	keyless := codexLaunchFixture(t, start.Add(time.Minute), start.Add(25*time.Minute), "")
+	for i, fixture := range []source{keyed, keyless} {
+		name := "000000000001"
+		if i == 1 {
+			name = "000000000002"
+		}
+		path := filepath.Join(workerDir, "rollout-"+start.Add(time.Duration(i)*time.Minute).Format("2006-01-02T15-04-05")+"-00000000-0000-7000-8000-"+name+".jsonl")
+		data, err := os.ReadFile(fixture.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeWorkFile(t, path, strings.Split(strings.TrimSuffix(string(data), "\n"), "\n"))
+	}
+	code, out, stderr := runTL(t, e, "--all", "--codex", "--worktime", "--grep", "KEY-123", "--since", "2026-11-10T00:00:00+01:00")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t30m\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeRegexMatchesDecodedText(t *testing.T) {
+	for _, tc := range []struct{ name, content, pattern string }{
+		{"newline", "first line\nKEY-123", "KEY-123"},
+		{"tabbed", "item:\tKEY-123", "KEY-123"},
+		{"end anchor", "KEY-123", "KEY-123$"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, dir := workHome(t)
+			start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+			rows := []string{workRecord(t, "user", start, tc.content, "human"), workRecord(t, "agent", start.Add(10*time.Minute), "work", "")}
+			writeWorkFile(t, workParentPath(dir), rows)
+			code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", tc.pattern)
+			if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
+				t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+			}
+		})
+	}
+}
+
+func TestWorktimeSkipsMalformedTranscriptLines(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []string
+		bad  bool
+	}{
+		{name: "partial last line", bad: true},
+		{name: "string content"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, dir := workHome(t)
+			start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+			rows := []string{workRecord(t, "user", start, "KEY-123", "human"), workRecord(t, "agent", start.Add(10*time.Minute), "work", "")}
+			if tc.name == "partial last line" {
+				rows = append(rows, `{"type":"assistant","timestamp":"2026-11-10T09:15:00Z","message":{"role":"assistant"`)
+			} else {
+				rows = append(rows, `{"type":"assistant","timestamp":"2026-11-10T09:12:00Z","message":{"role":"assistant","content":"plain string"}}`)
+			}
+			writeWorkFile(t, workParentPath(dir), rows)
+			code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+			if code != 0 || !strings.Contains(out, "2026-11-10\t15m\n") || strings.Contains(out, "warning:") {
+				t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+			}
+			if strings.Contains(stderr, "warning:") != tc.bad {
+				t.Fatalf("stderr %q, warning expected %v", stderr, tc.bad)
+			}
+			if tc.bad && !strings.HasSuffix(stderr, "\n") {
+				t.Fatalf("warning is not newline-terminated: %q", stderr)
+			}
+		})
+	}
+}
+
+func TestWorktimeParentChildIsClippedToSinceUntil(t *testing.T) {
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	parent := []string{workRecord(t, "user", start, "KEY-123", "human"), workRecord(t, "cmd", start.Add(5*time.Minute), "Task", "")}
+	writeWorkFile(t, workParentPath(dir), parent)
+	child := workRows(t, start.Add(4*time.Minute), start.Add(40*time.Minute), 5*time.Minute,
+		func(at time.Time) string { return workRecord(t, "agent", at, "child", "") })
+	writeWorkFile(t, workChildPath(dir), child)
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123", "--since", "2026-11-10T10:10:00+01:00", "--until", "2026-11-10T10:20:00+01:00")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeChildBeforeParentChunkIsExcluded(t *testing.T) {
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	parent := []string{workRecord(t, "user", start.Add(10*time.Minute), "KEY-123", "human"), workRecord(t, "agent", start.Add(15*time.Minute), "parent", "")}
+	writeWorkFile(t, workParentPath(dir), parent)
+	child := workRows(t, start, start.Add(20*time.Minute), 5*time.Minute,
+		func(at time.Time) string { return workRecord(t, "agent", at, "child", "") })
+	writeWorkFile(t, workChildPath(dir), child)
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestContainsTimeRejectsEventsBeforeWindow(t *testing.T) {
+	base := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
+	if containsTime([]interval{{start: base, end: base.Add(time.Minute)}}, base.Add(-time.Second)) {
+		t.Fatal("event before interval start was accepted")
+	}
+}
+
+func TestParentTranscriptPathUsesProjectDirectoryForShortID(t *testing.T) {
+	parentID := "10000000-0000-4000-8000-000000000001"
+	parentPath := filepath.Join(t.TempDir(), "project", parentID+".jsonl")
+	childPath := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "subagents", "agent-a1b2c3d4e5f6.jsonl")
+	otherPath := filepath.Join(t.TempDir(), "other", "10000000.jsonl")
+	child := source{Path: childPath, ParentID: "10000000"}
+	got := parentTranscriptPath(child, []source{{Path: otherPath}, {Path: parentPath}})
+	if got != parentPath {
+		t.Fatalf("parent path = %q, want same-project path %q", got, parentPath)
+	}
+}
+
+func TestWorktimeUsesDefaultSevenDayWindow(t *testing.T) {
+	e, dir := workHome(t)
+	old := time.Date(2026, 11, 2, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	writeWorkFile(t, workParentPath(dir), []string{workRecord(t, "user", old, "KEY-123", "human"), workRecord(t, "agent", old.Add(10*time.Minute), "work", "")})
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+	if code != exitNone || stderr != "" || !strings.Contains(out, "no activity in the selected time window") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeActivityRolesIncludeToolCallsAndCodexResultRoles(t *testing.T) {
+	for _, role := range []transcript.Role{transcript.Note, transcript.Out} {
+		if !isActivityEvent(role) {
+			t.Errorf("isActivityEvent(%q) = false", role)
+		}
+	}
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	writeWorkFile(t, workParentPath(dir), []string{workRecord(t, "user", start, "KEY-123", "human"), workRecord(t, "cmd", start.Add(10*time.Minute), "echo work", "")})
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeMissingParentIDDoesNotUseAdjacentTranscript(t *testing.T) {
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
+	parentID := "10000000-0000-4000-8000-000000000001"
+	parentPath := filepath.Join(t.TempDir(), parentID+".jsonl")
+	writeWorkFile(t, parentPath, []string{workRecord(t, "user", start, "KEY-123", "human")})
+	childPath := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "subagents", "agent-a1b2c3d4e5f6.jsonl")
+	writeWorkFile(t, childPath, []string{workRecord(t, "agent", start.Add(time.Minute), "KEY-123 child", "")})
+	child := source{Path: childPath, ID: "a1b2c3d4", ParentID: "ffffffff"}
+	if got := parentTranscriptPath(child, []source{child}); got != "" {
+		t.Fatalf("parent path for unrelated id = %q", got)
+	}
+	activities := map[string]sourceActivity{child.Path: {src: child, keyTimes: []time.Time{start.Add(time.Minute)}}}
+	matched := map[string]bool{child.Path: true}
+	if err := loadMissingParentKeys([]source{child}, activities, matched, regexp.MustCompile(`KEY-123`), []string{"KEY-123"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if _, loaded := activities[parentPath]; loaded {
+		t.Fatal("adjacent transcript with a different parent ID was loaded")
+	}
+}
+
+func TestWorktimeKeyInCommandArgumentsCountsAsMention(t *testing.T) {
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	rows := []string{workRecord(t, "cmd", start, "tl --worktime --grep KEY-123", ""), workRecord(t, "agent", start.Add(10*time.Minute), "work", "")}
+	writeWorkFile(t, workParentPath(dir), rows)
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
 func TestWorktimeKeyWindowStartsAtFirstMention(t *testing.T) {
 	e, dir := workHome(t)
 	start := time.Date(2026, 11, 10, 9, 0, 0, 0, time.FixedZone("synthetic", 3600))
@@ -266,7 +454,7 @@ func TestWorktimeParentWaitsForChild(t *testing.T) {
 		workRecord(t, "out", start.Add(41*time.Minute), "done", ""),
 		workRecord(t, "agent", start.Add(42*time.Minute), "finished", "")}
 	writeWorkFile(t, workParentPath(dir), parent)
-	child := workRows(t, start.Add(time.Minute), start.Add(55*time.Minute), 5*time.Minute,
+	child := workRows(t, start.Add(time.Minute+58*time.Millisecond), start.Add(55*time.Minute), 5*time.Minute,
 		func(at time.Time) string { return workRecord(t, "agent", at, "child work", "") })
 	writeWorkFile(t, workChildPath(dir), child)
 	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
@@ -362,13 +550,16 @@ func TestWorktimeRejectsOtherOutputFlagsAndUnboundGap(t *testing.T) {
 		{"--all", "--worktime", "--grep", "KEY-123", "--max", "1"},
 		{"--all", "--worktime", "--grep", "KEY-123", "--width", "1"},
 		{"--all", "--worktime", "--grep", "KEY-123", "--role", "all"},
-		{"--all", "--worktime", "--grep", "KEY-123", "-C", "0"},
+		{"--all", "--worktime", "--grep", "KEY-123", "-C", "2"},
 		{"--all", "--worktime", "--grep", "KEY-123", "--usage"},
 		{"--all", "--worktime", "--grep", "KEY-123", "--wait", "x"},
 	} {
 		if _, err := parseArgs(args, now); err == nil {
 			t.Errorf("parseArgs(%q) accepted", args)
 		}
+	}
+	if opts, err := parseArgs([]string{"--all", "--worktime", "--grep", "-C"}, now); err != nil || opts.context != 0 {
+		t.Fatalf("grep value that resembles a flag: opts=%+v, err=%v", opts, err)
 	}
 	if _, err := parseArgs([]string{"--all", "--key-gap", "30m"}, now); err == nil || !strings.Contains(err.Error(), "works with --worktime") {
 		t.Fatalf("--key-gap without --worktime error = %v", err)
