@@ -78,6 +78,7 @@ Flags:
   --status S     ls: show only status S
   --slug PREFIX  ls: show only slugs starting with PREFIX (case-insensitive)
   --root DIR     ls/lint/archive: scan DIR and its first-level repositories
+  show accepts git/NAME/ID and work/NAME/ID; unprefixed IDs are searched only in this repository.
   TK_NO_PARSE_CACHE=1 disables the ls parse cache.
   --note TEXT    review: add a review note to the journal
   --check TEXT   done: describe independent verification (required)
@@ -796,7 +797,12 @@ func validateList(o *options, pos []string) error {
 }
 
 func validateTicketAction(o *options, pos []string) error {
-	if len(pos) != 1 || !validID(o.id) {
+	valid := validID(o.id)
+	if o.cmd == "show" && strings.Contains(o.id, "/") {
+		_, _, err := referenceLocation("", o.id)
+		valid = err == nil
+	}
+	if len(pos) != 1 || !valid {
 		return errors.New("ID is the ticket slug (e.g. graft-hooks) or its file name")
 	}
 	if err := validateActionIdentity(o); err != nil {
@@ -1182,6 +1188,17 @@ func destinationProject(name string) (string, error) {
 }
 
 func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
+	if o.cmd == "show" && strings.Contains(o.id, "/") {
+		taskDir, t, err := findReferenceLocked(root, o.id)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(errout, "tk: task %q not found in %s\n", o.id, taskDir)
+				return exitNone
+			}
+			return reportFindError(err, o.id, errout)
+		}
+		return showTask(root, t, o, out, errout)
+	}
 	release, err := lockForCommand(dir, o.cmd)
 	if err != nil {
 		return fail(errout, err)
@@ -1399,7 +1416,11 @@ func showTask(root string, t task, o options, out, errout io.Writer) int {
 	if largeDefault {
 		n := len(journalLines(t.body))
 		if n > defaultShowJournalEntries {
-			fmt.Fprintf(out, "… ещё %d записей журнала: tk show %s --tail 0\n", n-defaultShowJournalEntries, t.slug)
+			ref := t.slug
+			if strings.Contains(o.id, "/") {
+				ref = o.id // a ticket of another repository is reached only by its qualified ID
+			}
+			fmt.Fprintf(out, "… ещё %d записей журнала: tk show %s --tail 0\n", n-defaultShowJournalEntries, ref)
 		}
 	}
 	return 0

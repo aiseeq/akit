@@ -181,6 +181,10 @@ func referenceLocation(project, ref string) (string, string, error) {
 	parts := strings.Split(ref, "/")
 	id := ref
 	if len(parts) == 3 && (parts[0] == "git" || parts[0] == "work") {
+		// Only the path forms that leave the root are refused: links already written name repositories freely.
+		if parts[1] == "" || parts[1] == "." || parts[1] == ".." {
+			return "", "", fmt.Errorf("invalid project reference %s", ref)
+		}
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", "", fmt.Errorf("determine linked project root: %w", err)
@@ -190,7 +194,7 @@ func referenceLocation(project, ref string) (string, string, error) {
 	} else if len(parts) != 1 {
 		return "", "", fmt.Errorf("unresolved project reference %s", ref)
 	}
-	if !slugRE.MatchString(id) {
+	if !validID(id) {
 		return "", "", fmt.Errorf("invalid ticket reference %s", ref)
 	}
 	return filepath.Join(project, "docs/tasks"), id, nil
