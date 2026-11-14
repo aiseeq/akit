@@ -412,3 +412,25 @@ func TestPidfdUnavailableRefusesVerifiedHelpers(t *testing.T) {
 		})
 	}
 }
+
+// A signal the kernel refuses is reported as is: no grace period and no Kill.
+func TestStopCmdDirectReturnsSignalErrorWithoutKill(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	oldSignal, oldKill := directProcessSignal, directProcessKill
+	defer func() { directProcessSignal, directProcessKill = oldSignal, oldKill }()
+	directProcessSignal = func(*os.Process, syscall.Signal) error { return syscall.EPERM }
+	kills := 0
+	directProcessKill = func(*os.Process) error { kills++; return nil }
+	started := time.Now()
+	result, err := stopCmdDirect(cmd, 5*time.Second, syscall.SIGTERM, false)
+	if !errors.Is(err, syscall.EPERM) || result.Killed != 0 || kills != 0 {
+		t.Fatalf("stopCmdDirect = (%+v, %v), kills=%d; want the EPERM error and no Kill", result, err, kills)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("waited %s for grace after a refused signal", elapsed)
+	}
+}
