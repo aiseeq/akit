@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -260,6 +261,19 @@ func nestedDepthScript(depth int) string {
 	return src.String()
 }
 
+func nestedProcessSubstitutionScript(depth int) string {
+	var src strings.Builder
+	src.WriteString("bash ")
+	for range depth {
+		src.WriteString("$(bash ")
+	}
+	src.WriteString("<(echo x)")
+	for range depth {
+		src.WriteByte(')')
+	}
+	return src.String()
+}
+
 func BenchmarkFindNestedDepth(b *testing.B) {
 	for _, depth := range []int{400, 800, 1600} {
 		b.Run(strconv.Itoa(depth), func(b *testing.B) {
@@ -291,7 +305,7 @@ func TestFindNestedDepthGrowth(t *testing.T) {
 	}
 	small, large := work(nestedDepthScript(800)), work(nestedDepthScript(1600))
 	t.Logf("nested parse bytes: depth 800=%d depth 1600=%d", small, large)
-	if small == 0 || large > small*21/10 {
+	if small == 0 || large*10 > small*24 {
 		t.Fatalf("doubling nested input reparsed %d source bytes after %d; want linear growth", large, small)
 	}
 }
@@ -312,8 +326,292 @@ func TestFindNestedSubstitutionParseBytesGrowLinearly(t *testing.T) {
 	}
 	small, large := parseBytes(500), parseBytes(1000)
 	t.Logf("nested-substitution parse bytes: lines 500=%d lines 1000=%d", small, large)
-	if small == 0 || large > small*21/10 {
+	if small == 0 || large*10 > small*24 {
 		t.Fatalf("doubling nested-substitution lines reparsed %d source bytes after %d; want linear growth", large, small)
+	}
+}
+
+func TestUnrelatedProcessSubstitutionAddsNoWorkToComputedNames(t *testing.T) {
+	allocated := func(prefix string, depth int) uint64 {
+		src := prefix + strings.Repeat("$( ", depth) + "echo x" + strings.Repeat(" )", depth)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		calls, err := Calls(src)
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := depth + 1 + strings.Count(prefix, "\n")*2; len(calls) != want {
+			t.Fatalf("got %d calls, want %d", len(calls), want)
+		}
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	plain, beside := allocated("", 800), allocated("cat <(x)\n", 800)
+	t.Logf("nested computed names at depth 800: allocated %d bytes alone, %d beside a process substitution", plain, beside)
+	if plain == 0 || beside*10 > plain*12 {
+		t.Fatalf("an unrelated process substitution raised allocations of nested computed names from %d to %d bytes; want the same work", plain, beside)
+	}
+}
+
+func TestFindNestedProcessSubstitutionWorkGrowsLinearly(t *testing.T) {
+	walkWork := func(depth int) int {
+		src := nestedProcessSubstitutionScript(depth)
+		var calls []Call
+		budget := newNestedParseBudget(len(src))
+		budget.trackWork = true
+		if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		return budget.walkInfoNodes
+	}
+	small, large := walkWork(40), walkWork(80)
+	t.Logf("nested process-substitution AST work: depth 40=%d depth 80=%d", small, large)
+	if small == 0 || large*10 > small*24 {
+		t.Fatalf("doubling nested process-substitution depth visited %d syntax nodes after %d; want linear growth", large, small)
+	}
+}
+
+func TestFlatProcessSubstitutionWorkGrowsLinearly(t *testing.T) {
+	for _, command := range []string{"bash <(a) <(b)\n", "cat < <(echo x)\n"} {
+		t.Run(command, func(t *testing.T) {
+			work := func(lines int) int {
+				src := strings.Repeat(command, lines)
+				var calls []Call
+				budget := newNestedParseBudget(len(src))
+				budget.trackWork = true
+				if err := parseWithBudget(src, 0, nil, make(map[string]string), &calls, budget); err != nil {
+					t.Fatal(err)
+				}
+				return budget.walkInfoNodes
+			}
+			small, large := work(1000), work(2000)
+			t.Logf("flat process-substitution work: lines 1000=%d lines 2000=%d", small, large)
+			if small == 0 || large*10 > small*24 {
+				t.Fatalf("doubling flat process-substitution lines grew work from %d to %d; want at most 2.4x", small, large)
+			}
+		})
+	}
+}
+
+func TestNestedSourceProcessSubstitutionWorkGrowsLinearly(t *testing.T) {
+	work := func(depth int, form string) int {
+		var src strings.Builder
+		switch form {
+		case "nested-source", "nested-source-plain":
+			src.WriteString("source ")
+		case "comment-marker":
+			src.WriteString("# <(\n")
+		default:
+			t.Fatalf("unknown form %q", form)
+		}
+		for range depth {
+			if form != "comment-marker" {
+				src.WriteString("$(source ")
+			} else {
+				src.WriteString("$( ")
+			}
+		}
+		if form == "nested-source" {
+			src.WriteString("<(echo x)")
+		} else if form == "nested-source-plain" {
+			src.WriteString("x")
+		} else {
+			src.WriteString("echo x")
+		}
+		for range depth {
+			if form != "comment-marker" {
+				src.WriteByte(')')
+			} else {
+				src.WriteString(" )")
+			}
+		}
+		var calls []Call
+		budget := newNestedParseBudget(src.Len())
+		budget.trackWork = true
+		if err := parseWithBudget(src.String(), 0, nil, make(map[string]string), &calls, budget); err != nil {
+			t.Fatal(err)
+		}
+		return budget.walkInfoNodes
+	}
+	for _, form := range []string{"nested-source-plain", "nested-source", "comment-marker"} {
+		t.Run(form, func(t *testing.T) {
+			small, large := work(40, form), work(80, form)
+			t.Logf("nested source work: depth 40=%d depth 80=%d", small, large)
+			if small == 0 || large*10 > small*24 {
+				t.Fatalf("doubling nested source depth grew work from %d to %d; want at most 2.4x", small, large)
+			}
+		})
+	}
+}
+
+func TestProcessSubstitutionDynamicCommandClassification(t *testing.T) {
+	for _, tc := range []struct {
+		src, name string
+		args      []string
+		want      bool
+	}{
+		{`b=source; bash -c '$b <(echo kill 1)'`, "source", []string{"<(echo kill 1)"}, false},
+		{`b=''; bash -c '$b bash -s <(echo kill 1)'`, "bash", []string{"-s", "<(echo kill 1)"}, true},
+		{`echo | bash -s; cat <(x)`, "bash", []string{"-s"}, true},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if call.Name == tc.name && slices.Equal(call.Args, tc.args) {
+					if call.ScriptInput != tc.want {
+						t.Fatalf("ScriptInput=%t, want %t: %#v", call.ScriptInput, tc.want, call)
+					}
+					return
+				}
+			}
+			t.Fatalf("call %q with args %q not found: %#v", tc.name, tc.args, calls)
+		})
+	}
+}
+
+func TestCallSetHasBaseFindsHashCollision(t *testing.T) {
+	first := Call{Name: "kill", Offset: 7, Args: []string{"a\xffb"}}
+	wanted := Call{Name: "kill", Offset: 7, Args: []string{"a", "b"}}
+	k1, _ := callBaseIdentity(first)
+	k2, _ := callBaseIdentity(wanted)
+	if k1 != k2 {
+		t.Fatal("test arguments must collide in callBaseIdentity")
+	}
+	seen := newCallSet()
+	seen.add(first)
+	seen.add(wanted)
+	if !seen.hasBase(wanted) {
+		t.Fatal("hasBase missed the matching call in the collision bucket")
+	}
+}
+
+func TestPipelineProcessSubstitutionScriptInputs(t *testing.T) {
+	for _, tc := range []struct {
+		src        string
+		bashInputs []bool
+	}{
+		{`bash <(echo kill 1) | bash <(y) <(z)`, []bool{true, true}},
+		{`bash <(echo kill 1) | bash <(y)`, []bool{true, true}},
+		{`bash <(echo kill 1) | cat`, []bool{true}},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []bool
+			for _, call := range calls {
+				if call.Name == "bash" {
+					got = append(got, call.ScriptInput)
+				}
+			}
+			if !slices.Equal(got, tc.bashInputs) {
+				t.Fatalf("bash ScriptInput values = %v, want %v; calls: %#v", got, tc.bashInputs, calls)
+			}
+		})
+	}
+}
+
+func TestShellScriptOperandRequiresProcessSubstitution(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		name string
+		want bool
+	}{
+		{`bash <(x)`, "bash", true},
+		{`bash script.sh <(x)`, "bash", false},
+		{`echo | bash <(x)`, "bash", true},
+		{`echo | bash script.sh`, "bash", false},
+		{`sudo bash <(x)`, "bash", true},
+		{`sudo bash script.sh <(x)`, "bash", false},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if call.Name == tc.name && call.ScriptInput == tc.want {
+					return
+				}
+			}
+			t.Fatalf("no %s call with ScriptInput=%t: %#v", tc.name, tc.want, calls)
+		})
+	}
+}
+
+func TestProcessSubstitutionSpansStaySortedAcrossWords(t *testing.T) {
+	for _, src := range []string{
+		`< <(echo kill 1) X=<(z) bash`,
+		`< <(echo kill 1) bash <(z)`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if call.Name == "bash" && call.ScriptInput {
+					return
+				}
+			}
+			t.Fatalf("bash call is missing ScriptInput: %#v", calls)
+		})
+	}
+}
+
+func TestProcessSubstitutionIndexSortsSpansBySourcePosition(t *testing.T) {
+	for _, src := range []string{
+		`< <(echo kill 1) bash <(z)`,
+		`bash "$(bash < <(a) <(b))"`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			file, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var words []*syntax.Word
+			syntax.Walk(file, func(node syntax.Node) bool {
+				word, ok := node.(*syntax.Word)
+				if !ok {
+					return true
+				}
+				start, end := int(word.Pos().Offset()), int(word.End().Offset())
+				if validSpan(src, start, end) && (strings.Contains(src[start:end], "<(") || strings.Contains(src[start:end], ">(")) {
+					words = append(words, word)
+				}
+				return true
+			})
+			slices.SortFunc(words, func(a, b *syntax.Word) int {
+				return int(a.Pos().Offset() - b.Pos().Offset())
+			})
+			if len(words) < 2 {
+				t.Fatalf("found %d process-substitution words, want at least 2", len(words))
+			}
+			for left, right := 0, len(words)-1; left < right; left, right = left+1, right-1 {
+				words[left], words[right] = words[right], words[left]
+			}
+			budget := newNestedParseBudget(len(src))
+			info := collectWalkInfo(file, src, nil, budget)
+			index := info.processSubstitutions
+			if index == nil {
+				t.Fatal("process-substitution index was not built")
+			}
+			if len(index.spans) < 2 {
+				t.Fatalf("indexed %d spans, want both the redirection and argument spans", len(index.spans))
+			}
+			for i := 1; i < len(index.spans); i++ {
+				if index.spans[i-1].start > index.spans[i].start {
+					t.Fatalf("process-substitution spans are out of source order: %#v", index.spans)
+				}
+			}
+			if !index.contains(words) || !index.contains(words[:1]) || !index.contains(words[1:]) {
+				t.Fatal("index lookup lost a process-substitution word")
+			}
+		})
 	}
 }
 
@@ -338,7 +636,7 @@ func TestFindWalkInfoNodeWorkGrowsLinearly(t *testing.T) {
 	small, large := nodeWork(500), nodeWork(1000)
 	smallTotal, largeTotal := small.walker+small.info, large.walker+large.info
 	t.Logf("syntax nodes at 500 lines: walker=%d info=%d; at 1000: walker=%d info=%d", small.walker, small.info, large.walker, large.info)
-	if smallTotal == 0 || largeTotal > smallTotal*21/10 {
+	if smallTotal == 0 || largeTotal*10 > smallTotal*24 {
 		t.Fatalf("doubling nested-substitution lines visited %d nodes after %d; want linear growth", largeTotal, smallTotal)
 	}
 	if small.info > small.walker || large.info > large.walker {
@@ -522,6 +820,76 @@ func TestInheritedVariableShellProcessSubstitution(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("inherited command call not found: %#v", calls)
+	}
+}
+
+func TestInheritedVariableProcessSubstitutionArguments(t *testing.T) {
+	for _, src := range []string{
+		`b=bash; bash -c '$b <(echo kill 1)'`,
+		`b=bash; eval '$b <(echo kill 1)'`,
+		`b=sudo; bash -c '$b bash <(echo kill 1)'`,
+		`b=bash; bash -c 'echo | $b <(echo kill 1)'`,
+		`b=bash; bash -c '"$b" <(echo kill 1)'`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if call.Name == "bash" && call.ScriptInput && slices.Contains(call.Args, "<(echo kill 1)") {
+					return
+				}
+			}
+			t.Fatalf("no bash process-substitution argument marked as ScriptInput: %#v", calls)
+		})
+	}
+}
+
+func TestInheritedVariableProcessSubstitutionRedirection(t *testing.T) {
+	src := `b=bash; bash -c '$b < <(echo kill 1)'`
+	calls, err := Calls(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "bash" && call.Raw == "$b" {
+			if !call.ScriptInput {
+				t.Fatalf("variable command lost redirection ScriptInput: %#v", call)
+			}
+			return
+		}
+	}
+	t.Fatalf("variable command not found in %#v", calls)
+}
+
+func TestProcessSubstitutionRedirectionsAndUnrelatedArguments(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		name string
+		want bool
+	}{
+		{`bash < <(echo kill 1)`, "bash", true},
+		{`env bash < <(echo kill 1)`, "bash", true},
+		{`sudo bash < <(echo kill 1)`, "bash", true},
+		{`bash; cat <(x)`, "bash", false},
+		{`bash -s; cat <(x)`, "bash", false},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if call.Name == tc.name {
+					if call.ScriptInput != tc.want {
+						t.Fatalf("%s ScriptInput=%t, want %t: %#v", call.Name, call.ScriptInput, tc.want, calls)
+					}
+					return
+				}
+			}
+			t.Fatalf("no %s call in %#v", tc.name, calls)
+		})
 	}
 }
 

@@ -508,7 +508,7 @@ func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, 
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
 
-	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info, ignoredCalls: ignored}
+	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -545,6 +545,10 @@ type heredocShellInput struct {
 	via   []string
 }
 
+type pendingProcessSubstitutionCall struct {
+	call *syntax.CallExpr
+}
+
 type walkInfo struct {
 	topLevelCalls map[*syntax.CallExpr]bool
 	timedCalls    map[*syntax.CallExpr]bool
@@ -558,15 +562,17 @@ type walkInfo struct {
 	shellHdocs      map[*syntax.Redirect]bool
 	localSubstHdocs map[*syntax.Redirect]bool
 
-	errors        []error
-	scriptInputs  map[*syntax.CallExpr]bool
-	pipedHeredocs []pipedHeredoc
-	workNodes     int
-	trackWork     bool
-	stdinIndex    *stdinIndex
+	errors               []error
+	scriptInputs         map[*syntax.CallExpr]bool
+	pipedHeredocs        []pipedHeredoc
+	workNodes            int
+	processSubstitutions *processSubstitutionIndex
+	trackWork            bool
+	stdinIndex           *stdinIndex
 	// hasInputRedir says whether src holds any `<`; without one no call has stdin to resolve.
-	hasInputRedir bool
-	literalSimple bool
+	hasInputRedir              bool
+	hasProcessSubstitutionText bool
+	literalSimple              bool
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
@@ -576,11 +582,12 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		return info
 	}
 	info := walkInfo{
-		literalSimple: literalScriptText(src),
-		trackWork:     budget.trackWork,
-		hasInputRedir: strings.Contains(src, "<"),
-		timedCalls:    make(map[*syntax.CallExpr]bool),
-		redirs:        make(map[*syntax.CallExpr][]Redir),
+		literalSimple:              literalScriptText(src),
+		trackWork:                  budget.trackWork,
+		hasInputRedir:              strings.Contains(src, "<"),
+		hasProcessSubstitutionText: strings.Contains(src, "<(") || strings.Contains(src, ">("),
+		timedCalls:                 make(map[*syntax.CallExpr]bool),
+		redirs:                     make(map[*syntax.CallExpr][]Redir),
 
 		stdinInputs: make(map[*syntax.CallExpr]*syntax.Redirect),
 
@@ -592,17 +599,45 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		scriptInputs: make(map[*syntax.CallExpr]bool),
 	}
 	knownPipes := make(map[*syntax.BinaryCmd]bool)
-	syntax.Walk(file, func(node syntax.Node) bool {
-		if info.trackWork {
-			info.workNodes++
-		}
+	visit := func(node syntax.Node) {
 		collectWalkNode(node, file, src, vars, &info, knownPipes)
 		if info.literalSimple && !literalScriptNodeSimple(node, src) {
 			info.literalSimple = false
 		}
 		collectCallContextNode(node, &info)
-		return true
-	})
+	}
+	if info.trackWork {
+		syntax.Walk(file, func(node syntax.Node) bool {
+			info.workNodes++
+			visit(node)
+			return true
+		})
+	} else {
+		syntax.Walk(file, func(node syntax.Node) bool {
+			visit(node)
+			return true
+		})
+	}
+	if info.processSubstitutions != nil {
+		info.processSubstitutions.sort()
+		for _, call := range info.processSubstitutions.calls {
+			// collectCallWalkInfo acts only on a span inside the arguments; checking that first keeps
+			// computed names beside an unrelated process substitution from being expanded.
+			if !info.processSubstitutions.contains(call.call.Args) {
+				continue
+			}
+			source, relevant := processSubstitutionCallKind(call.call, src, vars)
+			if relevant {
+				collectCallWalkInfo(call.call, source, src, vars, &info)
+			}
+		}
+		for _, stmt := range info.processSubstitutions.stmts {
+			collectStmtProcessSubstitutionWalkInfo(stmt, src, vars, &info)
+		}
+		for _, stmt := range info.processSubstitutions.pipelines {
+			markPipeline(stmt, src, vars, &info)
+		}
+	}
 	info.collectTopLevelCalls(file)
 	if budget.trackWork {
 		budget.walkInfoNodes += info.workNodes
@@ -629,10 +664,17 @@ func (info *walkInfo) collectTopLevelCalls(file *syntax.File) {
 
 func collectWalkNode(node syntax.Node, file *syntax.File, src string, vars map[string]string, info *walkInfo, knownPipes map[*syntax.BinaryCmd]bool) {
 	switch n := node.(type) {
+	case *syntax.ProcSubst:
+		if info.hasProcessSubstitutionText {
+			info.ensureProcessSubstitutionIndex().add(n)
+		}
 	case *syntax.BinaryCmd:
 		collectPipelineWalkInfo(n, src, vars, info, knownPipes)
 	case *syntax.CallExpr:
-		collectCallWalkInfo(n, src, vars, info)
+		if info.hasProcessSubstitutionText {
+			index := info.ensureProcessSubstitutionIndex()
+			index.calls = append(index.calls, pendingProcessSubstitutionCall{call: n})
+		}
 	case *syntax.Stmt:
 		collectStmtWalkInfo(n, file, src, vars, info)
 	}
@@ -651,7 +693,23 @@ func collectPipelineWalkInfo(binary *syntax.BinaryCmd, src string, vars map[stri
 		knownPipes[binary] = true
 		return
 	}
-	markPipeline(binary.Y, src, vars, info.scriptInputs)
+	if info.hasProcessSubstitutionText {
+		index := info.ensureProcessSubstitutionIndex()
+		index.pipelines = append(index.pipelines, binary.Y)
+	} else {
+		markPipeline(binary.Y, src, vars, info)
+	}
+}
+
+func (info *walkInfo) ensureProcessSubstitutionIndex() *processSubstitutionIndex {
+	if info.processSubstitutions == nil {
+		index := &processSubstitutionIndex{}
+		if info.trackWork {
+			index.work = &info.workNodes
+		}
+		info.processSubstitutions = index
+	}
+	return info.processSubstitutions
 }
 
 func collectPipedLiteralWalkInfo(binary *syntax.BinaryCmd, src string, vars map[string]string, info *walkInfo) (bool, error) {
@@ -1009,26 +1067,25 @@ func collectPipedHeredocWalkInfo(binary *syntax.BinaryCmd, src string, vars map[
 	return found
 }
 
-func collectCallWalkInfo(call *syntax.CallExpr, src string, vars map[string]string, info *walkInfo) {
-	if len(call.Args) == 0 {
-		return
-	}
-	name, _ := wordValue(call.Args[0])
-	name = baseName(name)
-	if name == "source" || name == "." {
-		if hasProcessSubstitution(call.Args[1:], src) {
+func collectCallWalkInfo(call *syntax.CallExpr, source bool, src string, vars map[string]string, info *walkInfo) {
+	if source {
+		if info.hasProcessSubstitution(call.Args[1:]) {
 			info.scriptInputs[call] = true
 		}
 		return
 	}
-	if hasProcessSubstitution(call.Args, src) && shellInputTarget(call, src, vars) {
+	if info.hasProcessSubstitution(call.Args) && shellInputTargetWithIndex(call, src, vars, info.processSubstitutions) {
 		info.scriptInputs[call] = true
 	}
 }
 
 func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars map[string]string, info *walkInfo) {
 	call, ok := stmt.Cmd.(*syntax.CallExpr)
-	if !ok || len(call.Args) == 0 {
+	if !ok {
+		return
+	}
+	collectStmtProcessSubstitutionCandidate(stmt, call, src, info)
+	if len(call.Args) == 0 {
 		return
 	}
 	offset := int(call.Args[0].Pos().Offset())
@@ -1052,11 +1109,48 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 			info.localSubstHdocs[stdin.redir] = true
 		}
 	}
+}
+
+func collectStmtProcessSubstitutionCandidate(stmt *syntax.Stmt, call *syntax.CallExpr, src string, info *walkInfo) {
+	if !info.hasProcessSubstitutionText {
+		return
+	}
+	possibleShell := len(call.Args) == 0
+	if len(call.Args) > 0 {
+		first, literal := wordValue(call.Args[0])
+		if !literal {
+			possibleShell = true
+		} else {
+			name := commandName(first)
+			possibleShell = isShell(name) || wrappers[name]
+		}
+	}
+	if possibleShell {
+		for _, redir := range stmt.Redirs {
+			if redir.Op.String() != "<" {
+				continue
+			}
+			start, end := int(redir.Word.Pos().Offset()), int(redir.Word.End().Offset())
+			if !validSpan(src, start, end) || (!strings.Contains(src[start:end], "<(") && !strings.Contains(src[start:end], ">(")) {
+				continue
+			}
+			index := info.ensureProcessSubstitutionIndex()
+			index.stmts = append(index.stmts, stmt)
+			break
+		}
+	}
+}
+
+func collectStmtProcessSubstitutionWalkInfo(stmt *syntax.Stmt, src string, vars map[string]string, info *walkInfo) {
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	if !ok {
+		return
+	}
 	for _, redir := range stmt.Redirs {
-		if redir.Op.String() != "<" || !hasProcessSubstitution([]*syntax.Word{redir.Word}, src) {
+		if redir.Op.String() != "<" || !info.hasProcessSubstitution([]*syntax.Word{redir.Word}) {
 			continue
 		}
-		if shellInputTarget(call, src, vars) {
+		if shellInputTargetWithIndex(call, src, vars, info.processSubstitutions) {
 			info.scriptInputs[call] = true
 			return
 		}
@@ -1168,14 +1262,16 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 	}
 }
 
-func markPipeline(stmt *syntax.Stmt, src string, vars map[string]string, inputs map[*syntax.CallExpr]bool) {
+func markPipeline(stmt *syntax.Stmt, src string, vars map[string]string, info *walkInfo) {
 	if stmt == nil {
 		return
 	}
 	syntax.Walk(stmt, func(node syntax.Node) bool {
 		call, ok := node.(*syntax.CallExpr)
-		if ok && possibleShellInput(call) && shellInputTarget(call, src, vars) {
-			inputs[call] = true
+		if ok && possibleShellInput(call) {
+			if shellInputTargetWithIndex(call, src, vars, info.processSubstitutions) {
+				info.scriptInputs[call] = true
+			}
 		}
 		return true
 	})
@@ -1193,32 +1289,11 @@ func possibleShellInput(call *syntax.CallExpr) bool {
 	return isShell(name) || wrappers[name]
 }
 
-func hasProcessSubstitution(words []*syntax.Word, src string) bool {
-	for _, word := range words {
-		start, end := int(word.Pos().Offset()), int(word.End().Offset())
-		if !validSpan(src, start, end) || (!strings.Contains(src[start:end], "<(") && !strings.Contains(src[start:end], ">(")) {
-			continue
-		}
-		found := false
-		syntax.Walk(word, func(node syntax.Node) bool {
-			if _, ok := node.(*syntax.ProcSubst); ok {
-				found = true
-				return false
-			}
-			return true
-		})
-		if found {
-			return true
-		}
-	}
-	return false
+func shellInputTargetWithIndex(call *syntax.CallExpr, src string, vars map[string]string, processSubs *processSubstitutionIndex) bool {
+	return shellInputTargetWithIndexAndWork(call, src, vars, processSubs, nil)
 }
 
-func shellInputTarget(call *syntax.CallExpr, src string, vars map[string]string) bool {
-	return shellInputTargetWithWork(call, src, vars, nil)
-}
-
-func shellInputTargetWithWork(call *syntax.CallExpr, src string, vars map[string]string, work *int) bool {
+func shellInputTargetWithIndexAndWork(call *syntax.CallExpr, src string, vars map[string]string, processSubs *processSubstitutionIndex, work *int) bool {
 	if len(call.Args) == 0 {
 		return false
 	}
@@ -1241,7 +1316,7 @@ func shellInputTargetWithWork(call *syntax.CallExpr, src string, vars map[string
 			return true
 		}
 		if isShell(name) {
-			return shellInputForShellCall(call, args, argOffset, src)
+			return shellInputForShellCall(call, args, argOffset, processSubs)
 		}
 		var ok bool
 		name, args, argOffset, ok = shellInputNextTargetWithScan(name, args, argOffset, &scan)
@@ -1251,7 +1326,7 @@ func shellInputTargetWithWork(call *syntax.CallExpr, src string, vars map[string
 	}
 }
 
-func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int, src string) bool {
+func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int, processSubs *processSubstitutionIndex) bool {
 	operand, command, stdin := shellArgs(args)
 	if shellNoExec(args) || command {
 		return false
@@ -1260,7 +1335,7 @@ func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int,
 		return true
 	}
 	index := 1 + argOffset + operand
-	return operand < len(args) && index < len(call.Args) && hasProcessSubstitution(call.Args[index:index+1], src)
+	return operand < len(args) && index < len(call.Args) && processSubs.contains(call.Args[index:index+1])
 }
 
 func shellInputNextTarget(name string, args []string, argOffset int) (string, []string, int, bool) {
@@ -1295,7 +1370,7 @@ type callWalker struct {
 	inherited    []string
 	vars         map[string]string
 	calls        *[]Call
-	info         walkInfo
+	info         *walkInfo
 	seen         *callSet
 	budget       *nestedParseBudget
 	ignoredCalls [][2]int
@@ -1506,7 +1581,7 @@ func validSpan(src string, start, end int) bool {
 	return start >= 0 && end >= start && end <= len(src)
 }
 
-func setLiteralArgs(c *cmd, expr *syntax.CallExpr, src string, info walkInfo, budget *nestedParseBudget) {
+func setLiteralArgs(c *cmd, expr *syntax.CallExpr, src string, info *walkInfo, budget *nestedParseBudget) {
 	c.literalContext = info.literalSimple && literalCallContext(c, expr, info, budget)
 	if !c.literalContext || len(expr.Args) == 0 || !literalWord(expr.Args[0], src) {
 		return
@@ -1514,7 +1589,7 @@ func setLiteralArgs(c *cmd, expr *syntax.CallExpr, src string, info walkInfo, bu
 	c.call.literalArgs = literalArgsMask(expr.Args[1:], src)
 }
 
-func literalCallContext(c *cmd, expr *syntax.CallExpr, info walkInfo, budget *nestedParseBudget) bool {
+func literalCallContext(c *cmd, expr *syntax.CallExpr, info *walkInfo, budget *nestedParseBudget) bool {
 	if !info.topLevelCalls[expr] || len(c.call.Redirs) != 0 || c.call.Loop || c.call.Background || c.call.ScriptInput || info.timedCalls[expr] {
 		return false
 	}

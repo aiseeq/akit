@@ -131,6 +131,9 @@ func TestWrapperExecScanGrowth(t *testing.T) {
 		t.Run(route, func(t *testing.T) {
 			steps := func(n int) int {
 				src := strings.Repeat("nice ", n) + "bash -s"
+				if route == "process-substitution" {
+					src = strings.Repeat("nice ", n) + "bash <(x)"
+				}
 				file, err := syntax.NewParser().Parse(strings.NewReader(src), "")
 				if err != nil {
 					t.Fatal(err)
@@ -153,7 +156,13 @@ func TestWrapperExecScanGrowth(t *testing.T) {
 					}
 				case "process-substitution":
 					call := file.Stmts[0].Cmd.(*syntax.CallExpr)
-					if !shellInputTargetWithWork(call, src, nil, &work) {
+					budget := newNestedParseBudget(len(src))
+					info := collectWalkInfo(file, src, nil, budget)
+					index := info.processSubstitutions
+					if index == nil {
+						t.Fatal("process-substitution index was not built")
+					}
+					if !shellInputTargetWithIndexAndWork(call, src, nil, index, &work) {
 						t.Fatal("shell input missed")
 					}
 				}
