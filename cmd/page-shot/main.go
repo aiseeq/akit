@@ -42,9 +42,9 @@ func (v viewport) name() string {
 // десктопной раскладкой. Окно 390 CSS px даёт ту же раскладку, что на телефоне.
 // Числа таблицы — сами окна, имя каждому дал бы только повтор его размеров.
 var viewports = []viewport{
-	{1440, 900, 1},    //nolint:magic-number
-	{1536, 860, 1.25}, //nolint:magic-number
-	{1366, 768, 1},    //nolint:magic-number
+	{1440, 900, 1},    //nolint:magic-number // viewport size from the table above
+	{1536, 860, 1.25}, //nolint:magic-number // viewport size from the table above
+	{1366, 768, 1},    //nolint:magic-number // viewport size from the table above
 	{390, 844, 1},
 }
 
