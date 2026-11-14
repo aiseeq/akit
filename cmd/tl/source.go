@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,9 @@ func resolve(opts options, e env) ([]source, error) {
 
 // find — файл транскрипта по пути, имени живой сессии или id (префиксу id).
 func find(arg, home string) (string, error) {
+	if strings.HasPrefix(arg, "~/") {
+		arg = filepath.Join(home, arg[2:])
+	}
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		if _, err := os.Stat(arg); err != nil {
 			return "", fmt.Errorf("transcript %s: %w", arg, err)
@@ -80,21 +84,15 @@ func find(arg, home string) (string, error) {
 	if len(arg) < 6 || strings.ContainsAny(arg, "*?[") {
 		return "", fmt.Errorf("%q: not a live session name, and too short for a session id (6+ chars); find sessions with --grep or --all --project", arg)
 	}
-	matches, err := filepath.Glob(filepath.Join(projects, "*", arg+"*.jsonl"))
+	paths, err := transcriptPaths(home)
 	if err != nil {
 		return "", fmt.Errorf("find %s: %w", arg, err)
 	}
-	codex, err := filepath.Glob(filepath.Join(transcript.WorkerSessions(home), "*", "*", "*", "rollout-*"+arg+"*.jsonl"))
-	if err != nil {
-		return "", fmt.Errorf("find %s: %w", arg, err)
-	}
-	matches = append(matches, codex...)
-	if len(matches) == 0 {
-		subs, err := filepath.Glob(filepath.Join(projects, "*", "*", "subagents", "agent-"+arg+"*.jsonl"))
-		if err != nil {
-			return "", fmt.Errorf("find %s: %w", arg, err)
+	matches := make([]string, 0)
+	for _, path := range paths {
+		if strings.HasPrefix(sourceFullID(source{Path: path, ID: path}), arg) {
+			matches = append(matches, path)
 		}
-		matches = append(matches, subs...)
 	}
 	switch len(matches) {
 	case 0:
@@ -105,48 +103,97 @@ func find(arg, home string) (string, error) {
 	case 1:
 		return matches[0], nil
 	}
-	candidates := make([]string, 0, len(matches))
-	for _, path := range matches {
-		src, err := transcript.SourceAt(path)
-		if err != nil {
-			return "", fmt.Errorf("inspect matching transcript: %w", err)
-		}
-		candidates = append(candidates, sourceFullID(src))
+	ids := make([]string, len(matches))
+	counts := make(map[string]int, len(matches))
+	for i, path := range matches {
+		ids[i] = sourceFullID(source{Path: path, ID: path})
+		counts[ids[i]]++
 	}
-	return "", fmt.Errorf("%q is ambiguous; candidates: %s", arg, strings.Join(candidates, ", "))
+	const maxCandidates = 10
+	shown := make([]string, 0, min(len(matches), maxCandidates))
+	for i, path := range matches[:min(len(matches), maxCandidates)] {
+		candidate := ids[i]
+		if counts[candidate] > 1 {
+			candidate = tilde(path, home)
+		}
+		shown = append(shown, candidate)
+	}
+	more := len(matches) - len(shown)
+	if more > 0 {
+		shown = append(shown, fmt.Sprintf("… ещё %d", more))
+	}
+	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts (%s); give more of the id", arg, len(matches), strings.Join(shown, ", "))
 }
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)
 var sourceUUID = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
 func sourceFullID(src source) string {
-	if id := sourceUUID.FindString(filepath.Base(src.Path)); id != "" {
+	base := filepath.Base(src.Path)
+	if id := sourceUUID.FindString(base); id != "" {
+		return id
+	}
+	if id, ok := strings.CutPrefix(base, "agent-"); ok {
+		return strings.TrimSuffix(id, ".jsonl")
+	}
+	if src.ID != "" && src.ID != src.Path {
+		return src.ID
+	}
+	if id, ok := strings.CutSuffix(base, ".jsonl"); ok {
 		return id
 	}
 	return src.ID
 }
 
-// sourceLinkIDs assigns the shortest unique UUID prefix (at least eight characters) per selected path.
-func sourceLinkIDs(sources []source) map[string]string {
-	fullIDs := make(map[string]string, len(sources))
-	prefixCounts := make(map[string]int)
+// transcriptPaths lists only transcript names in the same roots searched by find.
+func transcriptPaths(home string) ([]string, error) {
+	projects := session.ProjectsDir(home)
+	patterns := []string{
+		filepath.Join(projects, "*", "*.jsonl"),
+		filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"),
+		filepath.Join(transcript.WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"),
+	}
+	var paths []string
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("glob transcript names: %w", err)
+		}
+		paths = append(paths, matches...)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+// sourceLinkIDs assigns each selected path the shortest prefix unique in find's full search area.
+func sourceLinkIDs(sources []source, allPaths []string, home string) map[string]string {
+	fullIDs := make(map[string]string, len(allPaths)+len(sources))
+	for _, path := range allPaths {
+		fullIDs[path] = sourceFullID(source{Path: path, ID: path})
+	}
 	for _, src := range sources {
-		id := sourceFullID(src)
-		fullIDs[src.Path] = id
-		if sourceUUID.MatchString(filepath.Base(src.Path)) {
-			for length := 8; length <= len(id); length++ {
-				prefixCounts[id[:length]]++
-			}
+		fullIDs[src.Path] = sourceFullID(src)
+	}
+	counts := make(map[string]int)
+	for _, id := range fullIDs {
+		for length := 1; length <= len(id); length++ {
+			counts[id[:length]]++
 		}
 	}
 	ids := make(map[string]string, len(sources))
-	for path, id := range fullIDs {
-		if !sourceUUID.MatchString(filepath.Base(path)) {
-			ids[path] = id
+	for _, src := range sources {
+		path, id := src.Path, fullIDs[src.Path]
+		base := filepath.Base(path)
+		if src.ID == path && !sourceUUID.MatchString(base) && !strings.HasPrefix(base, "agent-") {
+			ids[path] = tilde(path, home)
+			continue
+		}
+		if counts[id] > 1 {
+			ids[path] = tilde(path, home)
 			continue
 		}
 		length := min(8, len(id))
-		for length < len(id) && prefixCounts[id[:length]] > 1 {
+		for length < len(id) && counts[id[:length]] > 1 {
 			length++
 		}
 		ids[path] = id[:length]

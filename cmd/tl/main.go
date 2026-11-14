@@ -524,7 +524,7 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 	if opts.worktime {
 		return reportWorktime(sources, opts, e, stdout, stderr)
 	}
-	res, err := scan(sources, opts)
+	res, err := scan(sources, opts, e.home)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage

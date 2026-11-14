@@ -33,7 +33,7 @@ func TestReplyCacheMatchesOriginal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		original, err := scan(sources, opts)
+		original, err := scan(sources, opts, e.home)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -42,7 +42,7 @@ func TestReplyCacheMatchesOriginal(t *testing.T) {
 		cache := replycache.New()
 		opts.replyCache = cache
 		for i := range 2 {
-			got, err := scan(sources, opts)
+			got, err := scan(sources, opts, e.home)
 			if err != nil {
 				t.Fatal(err)
 			}

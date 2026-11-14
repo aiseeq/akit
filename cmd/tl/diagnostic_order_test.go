@@ -24,7 +24,7 @@ func TestScanDiagnosticOrder(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		got, err := scan(sources, opts)
+		got, err := scan(sources, opts, dir)
 		if err != nil || got.bad != 2 || got.firstBad == nil || !strings.HasPrefix(got.firstBad.Error(), "first line 1:") {
 			t.Fatalf("slowFirst=%v: result=%+v err=%v", slowFirst, got, err)
 		}
@@ -34,7 +34,7 @@ func TestScanDiagnosticOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := scan(sources, opts)
+	got, err := scan(sources, opts, dir)
 	if err != nil || len(got.errs) != 2 || !strings.Contains(got.errs[0].Error(), paths[0]) {
 		t.Fatalf("errors=%v err=%v", got.errs, err)
 	}

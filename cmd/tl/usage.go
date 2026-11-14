@@ -93,7 +93,7 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 	ratePath := usageRatesPath(e)
 	rates, rateErr := readUsageRates(ratePath, e.now)
 	var replies []usageReply
-	last := map[string]int{} // сессия и id ответа → индекс в replies
+	last := map[string]int{} // id ответа во всей выборке → индекс в replies
 	for i := range res.hits {
 		h := &res.hits[i]
 		r := h.ev.Reply
@@ -105,7 +105,6 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 			replies = append(replies, usageReply{h.src.Path, r})
 			continue
 		}
-		key = h.src.Path + "\x00" + key
 		if j, ok := last[key]; ok {
 			if r.Usage.Output > replies[j].r.Usage.Output {
 				replies[j].r = r

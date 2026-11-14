@@ -719,12 +719,16 @@ func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent) bool {
 }
 
 // scan читает файлы параллельно; ошибка одного файла не мешает остальным и уходит в итог (result.errs).
-func scan(sources []source, opts options) (result, error) {
+func scan(sources []source, opts options, home string) (result, error) {
 	f, err := newFilter(opts)
 	if err != nil {
 		return result{}, err
 	}
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources), files: len(sources)}
+	allPaths, err := transcriptPaths(home)
+	if err != nil {
+		return result{}, fmt.Errorf("list transcript names: %w", err)
+	}
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home), files: len(sources)}
 	type fileResult struct {
 		hits  []hit
 		waits []time.Duration
@@ -756,7 +760,7 @@ func scan(sources []source, opts options) (result, error) {
 		res.waits = append(res.waits, item.waits...)
 		res.bad += item.meta.Bad
 		if item.meta.FirstBad != nil && res.firstBad == nil {
-			res.firstBad = fmt.Errorf("%s %w", src.ID, item.meta.FirstBad)
+			res.firstBad = fmt.Errorf("%s %w", res.linkIDs[src.Path], item.meta.FirstBad)
 		}
 		if item.meta.Name != "" {
 			res.names[src.Path] = item.meta.Name
@@ -817,6 +821,10 @@ func report(res result, opts options, e env, w io.Writer) int {
 		if h.src.ParentID != "" {
 			parentPath := strings.TrimSuffix(filepath.Dir(h.src.Path), string(filepath.Separator)+"subagents") + ".jsonl"
 			parentName := res.names[parentPath]
+			parentID := res.linkIDs[parentPath]
+			if parentID == "" {
+				parentID = h.src.ParentID
+			}
 			if parentName != "" {
 				parentName = " " + parentName
 			}
@@ -824,7 +832,7 @@ func report(res result, opts options, e env, w io.Writer) int {
 			if h.src.Description != "" {
 				description = fmt.Sprintf(" %q", h.src.Description)
 			}
-			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", id, h.src.ParentID, parentName, description, tilde(h.src.Path, e.home))
+			fmt.Fprintf(w, "== %s sub of %s%s%s %s\n", id, parentID, parentName, description, tilde(h.src.Path, e.home))
 			continue
 		}
 		if name != "" {
@@ -927,8 +935,7 @@ func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	src, err := transcript.SourceAt(path)
-	if err != nil {
+	if _, err := transcript.SourceAt(path); err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
@@ -943,7 +950,7 @@ func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 		return exitUsage
 	}
 	if len(found) == 0 {
-		fmt.Fprintf(w, "tl: no event at %s:%d (service record, unparsable line or out of range)\n", src.ID, lineNo)
+		fmt.Fprintf(w, "tl: no event at %s:%d (service record, unparsable line or out of range)\n", ref, lineNo)
 		return exitNone
 	}
 	for i := range found {
@@ -956,7 +963,7 @@ func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 		if width > 0 && utf8.RuneCountInString(text) > width {
 			text = maskedShort(text, width)
 		}
-		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), src.ID, ev.Line, ev.Role, who, text)
+		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), ref, ev.Line, ev.Role, who, text)
 	}
 	return 0
 }
