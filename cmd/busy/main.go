@@ -46,6 +46,9 @@ configured runnable limit takes precedence. Disk, writeback and memory checks ke
 Half mode lasts until its deadline. The time is stored as one RFC3339 line in
 $XDG_STATE_HOME/akit/half-until (~/.local/state/akit/half-until). The adjacent half-until.note records
 who set it and why, and the busy line and graft wait explain CPU busy verdicts as "half until 14:45 (planner: call)".
+graft also gives a local heavy task started in half mode a CPU quota and GOMAXPROCS of half the threads;
+tasks already running keep theirs. Neither half nor quiet mode silences the watchdog's messages to
+sessions: that is "aguard quiet on".
 
 Quiet mode keeps the machine busy until a time, whatever it measures: heavy work waits while
 someone needs a responsive machine. The time is one RFC3339 line in $XDG_STATE_HOME/akit/quiet-until
