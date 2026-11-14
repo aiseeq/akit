@@ -1283,7 +1283,9 @@ func shellDashInputCandidate(src string) bool {
 }
 
 func needsWalkInfo(src string) bool {
-	if strings.ContainsAny(src, "<>&|") {
+	// A descriptor path is a script source even without a redirection:
+	// . /dev/stdin reads the stdin of the enclosing script.
+	if strings.ContainsAny(src, "<>&|") || strings.Contains(src, "/dev/") || strings.Contains(src, "/proc/") {
 		return true
 	}
 	for _, name := range []string{"bash", "zsh", "sh", "dash", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "for", "while", "until", "select"} {
@@ -1503,6 +1505,29 @@ func isSourceBuiltin(name string) bool {
 	return name == "source" || name == "."
 }
 
+// sourceFileOperand returns the file source and . run: options end at --,
+// and -p PATH (bash 5.3) names the search path, not the file. Another option
+// is an error, so nothing runs.
+func sourceFileOperand(args []string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--":
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", false
+		case arg == "-p":
+			i++
+		case strings.HasPrefix(arg, "-p"):
+		case len(arg) > 1 && arg[0] == '-':
+			return "", false
+		default:
+			return arg, true
+		}
+	}
+	return "", false
+}
+
 func shellDoubleDashHasFileSemantics(args []string, shell string, operand int) bool {
 	if (shell != "sh" && shell != "dash") || operand == 0 || args[operand-1] != "--" {
 		return false
@@ -1517,11 +1542,12 @@ func shellDoubleDashHasFileSemantics(args []string, shell string, operand int) b
 
 func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 	if isSourceBuiltin(shell) {
-		if len(args) == 0 {
+		file, ok := sourceFileOperand(args)
+		if !ok {
 			return false, false
 		}
-		fd := shellScriptInputFD(args[0])
-		return fd >= 0 || descriptorPathUnresolved(args[0]), fd == 0
+		fd := shellScriptInputFD(file)
+		return fd >= 0 || descriptorPathUnresolved(file), fd == 0
 	}
 	operand, command, useStdin := shellArgs(args)
 	if command || shellNoExec(args) {
@@ -2422,7 +2448,7 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdin
 	hasHeredoc := stdinInput != nil
 	if first, literal := wordValue(call.Args[0]); literal {
 		name := commandName(first)
-		if !isShell(name) && !wrappers[name] {
+		if !isScriptInputShell(name) && !wrappers[name] {
 			execTarget := false
 			execSeen := false
 			for _, arg := range call.Args[1:] {
@@ -2467,7 +2493,7 @@ func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work
 		if (name == "su" || name == "runuser") && hasHeredoc && suReadsShell(name, args) {
 			return "sh", append(via, name), nil
 		}
-		if isShell(name) {
+		if isScriptInputShell(name) {
 			target, shellVia, ok := shellInputForShell(name, args, hasHeredoc, via)
 			if !ok {
 				return "", nil, nil
@@ -2545,7 +2571,7 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 		return "", nil, false
 	}
 	input, _ := shellScriptInputArgs(args, name)
-	if shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args) || input {
+	if input || !isSourceBuiltin(name) && (shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args)) {
 		return name, via, true
 	}
 	return "", nil, false

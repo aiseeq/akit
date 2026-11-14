@@ -2739,9 +2739,22 @@ func TestSourceOfDescriptorAndDescriptorPathFromVariableRunUnreadScript(t *testi
 		{`exec {fd}< <(echo x); source /dev/fd/$fd`, "source", true},
 		{`builtin source /dev/stdin`, "source", true},
 		{`command . /dev/fd/3`, ".", true},
-		// A known body that is not parsed as a nested script is still unread.
-		{"source /dev/stdin <<'E'\necho x\nE", "source", true},
-		{"exec 3<<'E'\necho x\nE\n. /dev/fd/3", ".", true},
+		// A descriptor path alone, with no redirection in the script, reads
+		// the stdin or descriptor of the enclosing script.
+		{`. /dev/stdin`, ".", true},
+		{`. /dev/fd/3`, ".", true},
+		{`f() { . /dev/stdin; }; f`, ".", true},
+		{`eval '. /dev/stdin'`, ".", true},
+		{`bash -c '. /dev/stdin'`, ".", true},
+		// Options end at --, and -p names the search path, not the file.
+		{`echo x | source -- /dev/stdin`, "source", true},
+		{`. -- /dev/stdin`, ".", true},
+		{`source -p /tmp /dev/stdin`, "source", true},
+		{`source -p/tmp /dev/stdin`, "source", true},
+		{`source -p "$P" /dev/stdin`, "source", true},
+		{`source -x /dev/stdin`, "source", false},
+		{`source -- script.sh`, "source", false},
+		{`source -p /opt lib.sh`, "source", false},
 		{`source script.sh`, "source", false},
 		{`. ./env.sh`, ".", false},
 		{`source /dev/null`, "source", false},
@@ -2768,6 +2781,43 @@ func TestSourceOfDescriptorAndDescriptorPathFromVariableRunUnreadScript(t *testi
 				t.Errorf("no %s call in %#v", tt.name, calls)
 			}
 		})
+	}
+}
+
+func TestSourceOfHeredocThroughDescriptorPathParsesBody(t *testing.T) {
+	for _, tt := range []struct {
+		src string
+		via []string
+	}{
+		{"source /dev/stdin <<'E'\nkill 1\nE", []string{"source"}},
+		{". /dev/fd/3 3<<<'kill 1'", []string{"."}},
+		{"exec 3<<<'kill 1'; . /dev/fd/3", []string{"."}},
+		{"builtin source /dev/stdin <<<'kill 1'", []string{"builtin", "source"}},
+		{"command . /dev/fd/3 3<<'E'\nkill 1\nE", []string{"command", "."}},
+		{"source -- /dev/stdin <<'E'\nkill 1\nE", []string{"source"}},
+	} {
+		calls, err := Find(tt.src, "kill")
+		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, tt.via) {
+			t.Errorf("Find(%q) = %#v, %v; want kill Via %v", tt.src, calls, err, tt.via)
+		}
+	}
+	// The body is the script, so a harmless body leaves no unread input;
+	// without a file operand or with a regular file the heredoc is only data.
+	for _, src := range []string{
+		"source /dev/stdin <<'E'\necho ok\nE",
+		"exec 3<<'E'\necho ok\nE\n. /dev/fd/3",
+		"source <<'E'\nkill 1\nE",
+		"source script.sh <<'E'\nkill 1\nE",
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		for _, call := range calls {
+			if call.Name == "kill" || call.ScriptInput {
+				t.Errorf("Calls(%q) = %#v; want no kill and no ScriptInput", src, calls)
+			}
+		}
 	}
 }
 
