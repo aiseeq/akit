@@ -467,14 +467,7 @@ func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) 
 		}
 		offsets := commentContinuations(file, working)
 		if len(offsets) == 0 {
-			if working == src {
-				return file, parsedFull, preprocessedCommentCommands(file, working), nil
-			}
-			fixedFile, fixedFull, fixedErr := parseShellVariant(working, true)
-			if fixedErr != nil {
-				return originalFile, originalFull, nil, originalErr
-			}
-			return fixedFile, fixedFull, preprocessedCommentCommands(fixedFile, working), nil
+			return file, parsedFull, preprocessedCommentCommands(file, working), nil
 		}
 		data := []byte(working)
 		for _, offset := range offsets {

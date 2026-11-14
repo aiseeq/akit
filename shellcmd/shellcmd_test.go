@@ -2653,6 +2653,16 @@ func TestCommentContinuationReviewWitnesses(t *testing.T) {
 	}
 }
 
+// A continued comment that swallows a closing word breaks the parse of the original script;
+// until that case is handled, Find reports the parse error instead of a partial result.
+func TestCommentContinuationThatBreaksParseReportsError(t *testing.T) {
+	for _, src := range []string{"if true; then zz #\\\nfi; zk 1", "{ zz #\\\n}; zk 1"} {
+		if _, err := Find(src, "zk"); err == nil {
+			t.Errorf("%q: want a parse error", src)
+		}
+	}
+}
+
 func TestCommentMarkerInsideHeredocData(t *testing.T) {
 	src := "zc <<E\n# c \\\nE\nit's\nE\n"
 	calls, err := Calls(src)
