@@ -216,7 +216,7 @@ func Find(cmd string, names ...string) ([]Call, error) {
 		wanted[name] = true
 	}
 	all, err := Calls(cmd)
-	calls := make([]Call, 0, len(all))
+	calls := make([]Call, 0)
 	for _, call := range all {
 		if wanted[call.Name] {
 			calls = append(calls, call)
@@ -570,17 +570,12 @@ type walkInfo struct {
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
-	topLevelCalls := make(map[*syntax.CallExpr]bool)
-	for _, stmt := range file.Stmts {
-		if call, ok := stmt.Cmd.(*syntax.CallExpr); ok {
-			topLevelCalls[call] = true
-		}
-	}
 	if !needsWalkInfo(src) {
-		return walkInfo{topLevelCalls: topLevelCalls, redirs: make(map[*syntax.CallExpr][]Redir), literalSimple: literalScriptSimple(file, src)}
+		info := walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), literalSimple: literalScriptSimple(file, src)}
+		info.collectTopLevelCalls(file)
+		return info
 	}
 	info := walkInfo{
-		topLevelCalls: topLevelCalls,
 		literalSimple: literalScriptText(src),
 		trackWork:     budget.trackWork,
 		hasInputRedir: strings.Contains(src, "<"),
@@ -608,6 +603,7 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		collectCallContextNode(node, &info)
 		return true
 	})
+	info.collectTopLevelCalls(file)
 	if budget.trackWork {
 		budget.walkInfoNodes += info.workNodes
 		if info.stdinIndex != nil {
@@ -615,6 +611,20 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		}
 	}
 	return info
+}
+
+func (info *walkInfo) collectTopLevelCalls(file *syntax.File) {
+	// Этот индекс нужен только для ArgLiteral; сбор walkInfo занимал 6% памяти
+	// в профиле выделений на корпусе команд.
+	if !info.literalSimple {
+		return
+	}
+	info.topLevelCalls = make(map[*syntax.CallExpr]bool)
+	for _, stmt := range file.Stmts {
+		if call, ok := stmt.Cmd.(*syntax.CallExpr); ok {
+			info.topLevelCalls[call] = true
+		}
+	}
 }
 
 func collectWalkNode(node syntax.Node, file *syntax.File, src string, vars map[string]string, info *walkInfo, knownPipes map[*syntax.BinaryCmd]bool) {
@@ -3039,6 +3049,11 @@ var baselineValueOptions = map[string]map[string]bool{
 }
 
 func unwrapMain(name string, args []string) ([]string, []string, bool) {
+	// На вложенных подстановках построение неиспользуемых результатов без обёртки
+	// давало 13% всех выделенных объектов в профиле Find.
+	if !baselineWrapper(name) {
+		return nil, nil, false
+	}
 	var via [maxNestedScripts]string
 	count := 0
 	for baselineWrapper(name) {
@@ -4446,6 +4461,11 @@ func baseName(path string) string {
 }
 
 func unwrap(name string, args []string) ([]string, []string, bool) {
+	// Без обёртки результат игнорируется; его построение давало 8% объектов
+	// в профиле Find на вложенных подстановках.
+	if !wrappers[name] {
+		return nil, nil, false
+	}
 	var via []string
 	for wrappers[name] {
 		if !wrapperOptionsKnown(name, args) {

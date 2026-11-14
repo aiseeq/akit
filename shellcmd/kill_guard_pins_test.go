@@ -213,3 +213,23 @@ func TestUnwrapMainRejectsDeepChainWithoutAllocating(t *testing.T) {
 		t.Fatalf("deep rejected chain: %.0f allocations", allocs)
 	}
 }
+
+func TestUnwrapNonWrapperWithoutAllocating(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		unwrap func(string, []string) ([]string, []string, bool)
+	}{
+		{"current", unwrap},
+		{"compatible", unwrapMain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"one", "two"}
+			if _, _, ok := tc.unwrap("echo", args); ok {
+				t.Fatal("ordinary command treated as wrapper")
+			}
+			if allocs := testing.AllocsPerRun(10, func() { _, _, _ = tc.unwrap("echo", args) }); allocs != 0 {
+				t.Fatalf("ordinary command: %.0f allocations", allocs)
+			}
+		})
+	}
+}
