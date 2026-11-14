@@ -1108,8 +1108,13 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 	if info.shellScriptInputCandidates && shellScriptInputForm(stmt, call, src, vars) && !knownShellScriptInput(file, stmt, call, src, vars, stdin.redir) {
 		info.scriptInputs[call] = true
 	}
-	if info.coprocCalls[call] && shellInputTargetWithIndex(call, src, vars, info.processSubstitutions) && !knownShellScriptInput(file, stmt, call, src, vars, stdin.redir) {
-		info.scriptInputs[call] = true
+	if info.coprocCalls[call] {
+		readsCommand, err := coprocCommandReadsStdin(call, src, vars)
+		if err != nil {
+			info.errors = append(info.errors, err)
+		} else if (readsCommand || shellInputTargetWithIndex(call, src, vars, info.processSubstitutions)) && !knownShellScriptInput(file, stmt, call, src, vars, stdin.redir) {
+			info.scriptInputs[call] = true
+		}
 	}
 	name, shellVia, input, err := shellInputName(stmt, src, vars, stdin.redir)
 	if err != nil {
@@ -1170,46 +1175,34 @@ func collectStmtProcessSubstitutionWalkInfo(stmt *syntax.Stmt, src string, vars 
 }
 
 func hasShellScriptInputCandidate(src string) bool {
-	if strings.Contains(src, "/dev/stdin") || strings.Contains(src, "/dev/fd/") || strings.Contains(src, "/proc/self/fd/") || strings.Contains(src, "<&") {
+	if shellDashInputCandidate(src) {
 		return true
 	}
-	return shellDashInputCandidate(src)
+	if strings.Contains(src, "<&") {
+		return true
+	}
+	if !strings.Contains(src, "/dev/") {
+		return strings.Contains(src, "/proc/")
+	}
+	return strings.Contains(src, "/dev/stdin") || strings.Contains(src, "/dev/fd/") || strings.Contains(src, "/proc/")
 }
 
 func shellDashInputCandidate(src string) bool {
-	for from := 0; from < len(src); {
-		rel := strings.Index(src[from:], " -")
-		if rel < 0 {
-			return false
-		}
-		space := from + rel
-		dash := space + 1
-		from = dash + 1
-		if dash+1 < len(src) && !shellInputTokenDelimiter(src[dash+1]) {
-			continue
-		}
-		end := space
-		for end > 0 && (src[end-1] == ' ' || src[end-1] == '\t' || src[end-1] == '\n') {
-			end--
-		}
-		start := end
-		for start > 0 && !shellInputTokenDelimiter(src[start-1]) {
-			start--
-		}
-		token := src[start:end]
-		if shellInputCommandName(token) {
-			return true
-		}
-		if token == "--" {
-			end = start
-			for end > 0 && (src[end-1] == ' ' || src[end-1] == '\t' || src[end-1] == '\n') {
-				end--
+	if !strings.Contains(src, " -") && !strings.Contains(src, "\t-") && !strings.Contains(src, "\n-") {
+		return false
+	}
+	for _, name := range shellNames {
+		for from := 0; from < len(src); {
+			rel := strings.Index(src[from:], name)
+			if rel < 0 {
+				break
 			}
-			start = end
-			for start > 0 && !shellInputTokenDelimiter(src[start-1]) {
-				start--
+			end := from + rel + len(name)
+			from = end
+			for end < len(src) && (src[end] == ' ' || src[end] == '\t' || src[end] == '\n') {
+				end++
 			}
-			if shellInputCommandName(src[start:end]) {
+			if end < len(src) && src[end] == '-' {
 				return true
 			}
 		}
@@ -1217,22 +1210,11 @@ func shellDashInputCandidate(src string) bool {
 	return false
 }
 
-func shellInputCommandName(token string) bool {
-	return token == "bash" || token == "sh" || token == "dash" || token == "zsh" || strings.HasSuffix(token, "/bash") || strings.HasSuffix(token, "/sh") || strings.HasSuffix(token, "/dash") || strings.HasSuffix(token, "/zsh")
-}
-
-func shellInputTokenDelimiter(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || strings.ContainsRune(";|&(){}<>\\\"'", rune(b))
-}
-
 func needsWalkInfo(src string) bool {
 	if strings.ContainsAny(src, "<>&|") {
 		return true
 	}
-	if strings.Contains(src, "dash -") || strings.Contains(src, "/bin/dash -") {
-		return true
-	}
-	for _, name := range []string{"bash", "zsh", "sh", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "for", "while", "until", "select"} {
+	for _, name := range []string{"bash", "zsh", "sh", "dash", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "for", "while", "until", "select"} {
 		if strings.Contains(src, name) {
 			return true
 		}
@@ -1409,12 +1391,13 @@ func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int,
 	return operand < len(args) && index < len(call.Args) && processSubs.contains(call.Args[index:index+1])
 }
 
-// shellScriptInputFD возвращает дескриптор из операнда-источника скрипта или -1 для файла.
+// shellScriptInputFD классифицирует пути, являющиеся ссылкой на открытый дескриптор.
+// Обычный путь (включая имя файла "-") возвращает -1.
 func shellScriptInputFD(path string) int {
-	if path == "-" || path == "/dev/stdin" {
+	if path == "/dev/stdin" {
 		return 0
 	}
-	for _, prefix := range []string{"/dev/fd/", "/proc/self/fd/"} {
+	for _, prefix := range []string{"/dev/fd/", "/proc/self/fd/", "/proc/$$/fd/", "/proc/${$}/fd/"} {
 		if after, ok := strings.CutPrefix(path, prefix); ok {
 			n, err := strconv.Atoi(after)
 			if err == nil && n >= 0 {
@@ -1424,51 +1407,27 @@ func shellScriptInputFD(path string) int {
 	}
 	return -1
 }
-func shellScriptInputOperand(args []*syntax.Word) bool {
-	for i := 0; i < len(args); i++ {
-		value, literal := wordValue(args[i])
-		if !literal {
-			return false
-		}
-		if value == "--" {
-			if i+1 == len(args) {
-				return false
-			}
-			value, literal = wordValue(args[i+1])
-			return literal && shellScriptInputFD(value) >= 0
-		}
-		if value == "-" {
-			return true
-		}
-		option, takesValue, stdin, command := shellArgumentOption(value)
-		if !option {
-			return shellScriptInputFD(value) >= 0
-		}
-		if command || stdin || strings.HasPrefix(value, "-") && !strings.HasPrefix(value, "--") && strings.Contains(value[1:], "n") {
-			return false
-		}
-		if takesValue {
-			i++
-		}
-	}
-	return false
-}
 
-func shellScriptDashOperand(args []string) bool {
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--" {
-			return i+1 < len(args) && args[i+1] == "-"
-		}
-		if args[i] == "-" {
-			return true
-		}
-		isOption, takesValue, _, _ := shellArgumentOption(args[i])
-		if !isOption {
+func shellScriptInputArgs(args []string, shell string) bool {
+	operand, command, useStdin := shellArgs(args)
+	if command {
+		return false
+	}
+	if useStdin {
+		if operand != len(args) || operand == 0 || args[operand-1] != "-" && args[operand-1] != "--" {
 			return false
 		}
-		if takesValue {
-			i++
+		if (shell == "sh" || shell == "dash") && len(args) > 1 {
+			for _, arg := range args[:len(args)-1] {
+				if strings.HasPrefix(arg, "--") {
+					return false
+				}
+			}
 		}
+		return true
+	}
+	if operand < len(args) {
+		return shellScriptInputFD(args[operand]) >= 0
 	}
 	return false
 }
@@ -1483,7 +1442,7 @@ func shellScriptInputForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, 
 	}
 	name := commandName(first)
 	if isScriptInputShell(name) {
-		return shellScriptInputDirectForm(stmt, call)
+		return shellScriptInputDirectForm(stmt, call, src, vars, name)
 	}
 	if !wrappers[name] || !wrapperScriptInputCandidate(stmt, call, src) {
 		return false
@@ -1502,11 +1461,19 @@ func wrapperScriptInputCandidate(stmt *syntax.Stmt, call *syntax.CallExpr, src s
 			return true
 		}
 	}
-	return strings.Contains(raw, "/dev/") || strings.Contains(raw, "/proc/self/fd/") || strings.Contains(raw, " -")
+	return strings.Contains(raw, "/dev/") || strings.Contains(raw, "/proc/") || shellDashInputCandidate(raw)
 }
 
-func shellScriptInputDirectForm(stmt *syntax.Stmt, call *syntax.CallExpr) bool {
-	if shellScriptInputOperand(call.Args[1:]) {
+func shellScriptInputDirectForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, shell string) bool {
+	start, end := int(call.Pos().Offset()), int(call.End().Offset())
+	if validSpan(src, start, end) {
+		raw := src[start:end]
+		if !strings.Contains(raw, "/dev/") && !strings.Contains(raw, "/proc/") && !strings.Contains(raw, " -") && !strings.Contains(raw, "\t-") && !strings.Contains(raw, "\n-") && !hasUnknownFDInputRedir(stmt.Redirs) {
+			return false
+		}
+	}
+	args, _ := words(call.Args[1:], src, vars)
+	if shellScriptInputArgs(args, shell) {
 		return true
 	}
 	for _, redir := range stmt.Redirs {
@@ -1521,13 +1488,34 @@ func shellScriptInputDirectForm(stmt *syntax.Stmt, call *syntax.CallExpr) bool {
 	return false
 }
 
+func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]string) (bool, error) {
+	args, _ := words(call.Args, src, vars)
+	if len(args) < 3 || !isScriptInputShell(commandName(args[0])) {
+		return false, nil
+	}
+	operand, command, _ := shellArgs(args[1:])
+	if !command || operand >= len(args[1:]) {
+		return false, nil
+	}
+	inner, err := Calls(args[1:][operand])
+	if err != nil {
+		return false, err
+	}
+	read, eval := false, false
+	for _, nested := range inner {
+		read = read || nested.Name == "read" || nested.Name == "mapfile" || nested.Name == "readarray"
+		eval = eval || nested.Name == "eval"
+	}
+	return read && eval, nil
+}
+
 func shellScriptInputWrappedForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string) bool {
 	args, _ := words(call.Args, src, vars)
-	_, args, ok := shellInputTargetArgs(args)
+	shell, args, ok := shellInputTargetArgs(args)
 	if !ok {
 		return false
 	}
-	if shellScriptInputArgs(args) {
+	if shellScriptInputArgs(args, shell) {
 		return true
 	}
 	return hasUnknownFDInputRedir(stmt.Redirs)
@@ -1546,14 +1534,6 @@ func shellInputTargetArgs(args []string) (string, []string, bool) {
 		}
 	}
 	return name, args, isScriptInputShell(name)
-}
-
-func shellScriptInputArgs(args []string) bool {
-	operand, command, useStdin := shellArgs(args)
-	if command || useStdin {
-		return false
-	}
-	return operand < len(args) && shellScriptInputFD(args[operand]) >= 0 || shellScriptDashOperand(args)
 }
 
 func hasUnknownFDInputRedir(redirs []*syntax.Redirect) bool {
@@ -1586,74 +1566,83 @@ func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.Ca
 			return false
 		}
 	}
-	fd, resolved, known := knownCurrentScriptInput(stmt, stdin, fd)
-	if resolved {
-		return known
+	known, set := knownExecFDStates(file, int(stmt.Pos().Offset()))
+	if stdin != nil {
+		applyKnownInputRedirect(stdin, 0, known, set)
 	}
-	return knownExecFDInput(file, int(stmt.Pos().Offset()), fd)
-}
-
-func knownCurrentScriptInput(stmt *syntax.Stmt, stdin *syntax.Redirect, fd int) (int, bool, bool) {
-	if fd == 0 && stdin != nil {
-		nextFD, resolved, known := knownStdinRedirect(stdin, fd)
-		if resolved {
-			return nextFD, true, known
-		}
-		fd = nextFD
-	}
-	return knownStatementInputRedirs(stmt, fd)
-}
-
-func knownStdinRedirect(stdin *syntax.Redirect, fd int) (int, bool, bool) {
-	switch stdin.Op.String() {
-	case "<":
-		target, literal := wordValue(stdin.Word)
-		known := literal && !strings.Contains(target, "<(") && !strings.Contains(target, ">(")
-		return fd, true, known
-	case "<<", "<<-", "<<<", "<>":
-		return fd, true, true
-	case "<&":
-		target, ok := wordValue(stdin.Word)
-		if !ok || target == "-" {
-			return fd, true, false
-		}
-		if target == "0" {
-			return fd, true, true
-		}
-		next, ok := shellFDNumber(target)
-		if !ok {
-			return fd, true, false
-		}
-		return next, false, false
-	default:
-		return fd, true, false
-	}
-}
-
-func knownStatementInputRedirs(stmt *syntax.Stmt, fd int) (int, bool, bool) {
 	for _, redir := range stmt.Redirs {
-		redirFD, valid := inputRedirFD(redir)
-		if !valid || redirFD != fd {
+		dest, valid := inputRedirFD(redir)
+		if valid {
+			applyKnownInputRedirect(redir, dest, known, set)
+		}
+	}
+	if set[fd] {
+		return known[fd]
+	}
+	return false
+}
+
+func knownExecFDStates(file *syntax.File, before int) (map[int]bool, map[int]bool) {
+	known, set := make(map[int]bool), make(map[int]bool)
+	for _, stmt := range file.Stmts {
+		if int(stmt.Pos().Offset()) >= before {
+			break
+		}
+		directExec := false
+		if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(call.Args) > 0 {
+			name, literal := wordValue(call.Args[0])
+			directExec = literal && commandName(name) == "exec"
+		}
+		if !directExec {
+			nestedExec := false
+			syntax.Walk(stmt, func(node syntax.Node) bool {
+				call, ok := node.(*syntax.CallExpr)
+				if ok && len(call.Args) > 0 {
+					name, literal := wordValue(call.Args[0])
+					nestedExec = nestedExec || literal && commandName(name) == "exec"
+				}
+				return !nestedExec
+			})
+			if nestedExec {
+				clear(known)
+				clear(set)
+			}
 			continue
 		}
-		switch redir.Op.String() {
-		case "<", "<<", "<<-", "<<<", "<>":
-			target, literal := wordValue(redir.Word)
-			known := redir.Op.String() != "<" || literal && !strings.Contains(target, "<(") && !strings.Contains(target, ">(")
-			return fd, true, known
-		case "<&":
-			target, literal := wordValue(redir.Word)
-			if !literal || target == "-" {
-				return fd, true, false
+		for _, redir := range stmt.Redirs {
+			fd, valid := inputRedirFD(redir)
+			if valid {
+				applyKnownInputRedirect(redir, fd, known, set)
 			}
-			next, valid := shellFDNumber(target)
-			if !valid || next == fd {
-				return fd, true, false
-			}
-			fd = next
 		}
 	}
-	return fd, false, false
+	return known, set
+}
+
+func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[int]bool) {
+	target, literal := wordValue(redir.Word)
+	if !literal && redir.Word != nil {
+		var printed strings.Builder
+		if err := syntax.NewPrinter().Print(&printed, redir.Word); err == nil {
+			target = printed.String()
+		}
+	}
+	switch redir.Op.String() {
+	case "<", "<<", "<<-", "<<<", "<>":
+		if redir.Op.String() == "<" && literal {
+			if source := shellScriptInputFD(target); source >= 0 {
+				known[dest] = set[source] && known[source]
+				set[dest] = true
+				return
+			}
+		}
+		known[dest] = redir.Op.String() != "<" || literal && !strings.Contains(target, "<(") && !strings.Contains(target, ">(")
+		set[dest] = true
+	case "<&":
+		source, ok := shellFDNumber(target)
+		known[dest] = literal && ok && set[source] && known[source]
+		set[dest] = true
+	}
 }
 
 func inputRedirFD(redir *syntax.Redirect) (int, bool) {
@@ -1676,42 +1665,6 @@ func shellFDNumber(value string) (int, bool) {
 		number = number*10 + digit
 	}
 	return number, true
-}
-
-func knownExecFDInput(file *syntax.File, before, targetFD int) bool {
-	known := make(map[int]bool)
-	set := make(map[int]bool)
-	for _, stmt := range file.Stmts {
-		if int(stmt.Pos().Offset()) >= before {
-			break
-		}
-		call, ok := stmt.Cmd.(*syntax.CallExpr)
-		if !ok || len(call.Args) == 0 {
-			continue
-		}
-		name, literal := wordValue(call.Args[0])
-		if !literal || commandName(name) != "exec" {
-			continue
-		}
-		for _, redir := range stmt.Redirs {
-			fd, valid := inputRedirFD(redir)
-			if !valid {
-				continue
-			}
-			switch redir.Op.String() {
-			case "<", "<<", "<<-", "<<<", "<>":
-				target, literal := wordValue(redir.Word)
-				known[fd] = redir.Op.String() != "<" || literal && !strings.Contains(target, "<(") && !strings.Contains(target, ">(")
-				set[fd] = true
-			case "<&":
-				value, literal := wordValue(redir.Word)
-				sourceFD, err := strconv.Atoi(value)
-				known[fd] = literal && err == nil && set[sourceFD] && known[sourceFD]
-				set[fd] = true
-			}
-		}
-	}
-	return set[targetFD] && known[targetFD]
 }
 
 func shellInputNextTarget(name string, args []string, argOffset int) (string, []string, int, bool) {
@@ -2472,12 +2425,14 @@ func nextShellInputTarget(name string, args []string, via []string, scan *wrappe
 	return "", nil, nil, false
 }
 
+var shellNames = []string{"bash", "sh", "dash", "zsh"}
+
 func isShell(name string) bool {
-	return name == "bash" || name == "sh" || name == "zsh"
+	return slices.Contains(shellNames, name)
 }
 
 func isScriptInputShell(name string) bool {
-	return isShell(name) || name == "dash"
+	return isShell(name)
 }
 
 // shellReadsHeredoc — оболочка читает heredoc как скрипт, если её stdin не заменён -c или файлом.
@@ -2517,11 +2472,11 @@ func shellNoExec(args []string) bool {
 }
 
 // shellArgs разбирает `bash [опции] [-c СКРИПТ | -s | ФАЙЛ] [аргументы]`: operand — индекс первого
-// аргумента после опций (len(args) — его нет), command — есть -c, stdin — есть -s.
+// аргумента после опций (len(args) — его нет), command — есть -c, stdin — оболочка читает скрипт со stdin.
 func shellArgs(args []string) (operand int, command, stdin bool) {
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" || args[i] == "-" {
-			return i + 1, command, stdin
+			return i + 1, command, stdin || i+1 == len(args)
 		}
 		isOption, takesValue, readsStdin, readsCommand := shellArgumentOption(args[i])
 		if !isOption {
