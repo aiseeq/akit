@@ -4262,3 +4262,73 @@ func TestFindHereStringProcessSubstitutionRunsInOuterShell(t *testing.T) {
 		}
 	}
 }
+
+func TestDynamicSubstitutionReportedOnce(t *testing.T) {
+	for _, src := range []string{
+		"CMD=kill; bash <<EOF\necho $($CMD 101)\nEOF\n",
+		"CMD=kill; bash <<EOF\necho `$CMD 101`\nEOF\n",
+		"CMD=kill; bash <<EOF\necho ${X:-$($CMD 101)}\nEOF\n",
+		"CMD=kill; ssh host bash <<EOF\necho $($CMD 101)\nEOF\n",
+		"CMD=kill; bash <<< <($CMD 101)\n",
+		"CMD=kill; eval 'echo' $($CMD 101)\n",
+	} {
+		calls, err := Find(src, "kill")
+		if err != nil || len(calls) != 1 || len(calls[0].Via) != 0 || !slices.Equal(calls[0].Args, []string{"101"}) {
+			t.Errorf("%q: calls = %+v, err = %v; want one local kill", src, calls, err)
+		}
+	}
+}
+
+func TestProcessSubstitutionScriptNameUnknown(t *testing.T) {
+	for _, src := range []string{"bash <<< <(kill 101)", "eval <(kill 1)", "eval >(kill 1)"} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("%q: %v", src, err)
+		}
+		var unknown, local int
+		for _, call := range calls {
+			if strings.HasPrefix(call.Name, "<(") || strings.HasPrefix(call.Name, ">(") {
+				t.Errorf("%q: false name %+v", src, call)
+			}
+			if call.Name == "" && len(call.Via) == 1 {
+				unknown++
+			}
+			if call.Name == "kill" && len(call.Via) == 0 {
+				local++
+			}
+		}
+		if unknown != 1 || local != 1 {
+			t.Errorf("%q: calls = %+v", src, calls)
+		}
+	}
+}
+
+func TestQuotedProcessSubstitutionTextIsLiteralName(t *testing.T) {
+	calls, err := Calls("'<(literal)' arg")
+	if err != nil || len(calls) != 1 || calls[0].Name != "<(literal)" {
+		t.Fatalf("calls = %+v, err = %v", calls, err)
+	}
+}
+
+func TestMappedSubstitutionKeepsOtherCalls(t *testing.T) {
+	src := "CMD=kill; bash <<EOF\necho $($CMD 101)\nkill 202\nEOF\n"
+	calls, err := Find(src, "kill")
+	if err != nil || len(calls) != 2 || len(calls[0].Via) != 0 || !slices.Equal(calls[0].Args, []string{"101"}) || !slices.Equal(calls[1].Via, []string{"bash"}) || !slices.Equal(calls[1].Args, []string{"202"}) {
+		t.Fatalf("calls = %+v, err = %v", calls, err)
+	}
+}
+
+func TestStandaloneProcessSubstitutionNameUnchanged(t *testing.T) {
+	calls, err := Calls("<(kill 1)")
+	if err != nil || len(calls) != 2 || calls[0].Name != "<(kill 1)" {
+		t.Fatalf("calls = %+v, err = %v", calls, err)
+	}
+}
+
+func TestNestedShellInsideSubstitutionReportedOnce(t *testing.T) {
+	src := "CMD=kill; bash <<EOF\necho $(bash -c '$CMD 101')\nEOF\n"
+	calls, err := Find(src, "kill")
+	if err != nil || len(calls) != 1 || !slices.Equal(calls[0].Via, []string{"bash", "-c"}) {
+		t.Fatalf("calls = %+v, err = %v", calls, err)
+	}
+}

@@ -262,10 +262,10 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
-	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, budget)
+	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
 }
 
-func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, budget *nestedParseBudget) error {
+func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
@@ -274,7 +274,7 @@ func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inher
 	if len(full) > len(src) {
 		walkText = full
 	}
-	err := walkCalls(file, walkText, lineBase, inherited, vars, calls, ignored, budget)
+	err := walkCalls(file, walkText, lineBase, inherited, vars, calls, ignored, subst, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -504,11 +504,11 @@ func parseShellVariant(src string, keepComments bool) (file *syntax.File, full s
 	return nil, full, err
 }
 
-func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, budget *nestedParseBudget) error {
+func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
 
-	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored}
+	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored, subst: subst}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -1374,6 +1374,7 @@ type callWalker struct {
 	seen         *callSet
 	budget       *nestedParseBudget
 	ignoredCalls [][2]int
+	subst        *mapped
 	parseErr     error
 	nestedErrs   []error
 }
@@ -1385,6 +1386,12 @@ func (w *callWalker) visit(node syntax.Node) bool {
 
 	if w.parseErr != nil {
 		return false
+	}
+	switch node.(type) {
+	case *syntax.CmdSubst, *syntax.ProcSubst:
+		if w.outerSubstitution(node) {
+			return false
+		}
 	}
 	if redirect, ok := node.(*syntax.Redirect); ok {
 		w.visitRedirect(redirect)
@@ -1412,6 +1419,21 @@ func (w *callWalker) visit(node syntax.Node) bool {
 		}
 	}
 	return true
+}
+
+// outerSubstitution reports whether this node was already run by the outer shell.
+func (w *callWalker) outerSubstitution(node syntax.Node) bool {
+	if w.subst == nil {
+		return false
+	}
+	offset := outerOffset(int(node.Pos().Offset()), w.subst.pos)
+	i := sort.Search(len(w.subst.subst), func(i int) bool {
+		if w.budget.trackWork {
+			w.budget.substSteps++
+		}
+		return w.subst.subst[i][1] > offset
+	})
+	return i < len(w.subst.subst) && offset >= w.subst.subst[i][0]
 }
 
 func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
@@ -1498,6 +1520,12 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	}
 	ws := splitWords(words, split)
 	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
+	for _, part := range call.Args[0].Parts {
+		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
+			c.call.Name = ""
+			break
+		}
+	}
 	setLiteralArgs(&c, call, w.src, w.info, w.budget)
 	if err := emit(c, w.lineBase, w.vars, w.calls, w.seen); err != nil {
 		var nested *NestedError
@@ -1760,10 +1788,9 @@ func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inh
 			line = int(redir.Hdoc.Pos().Line()) + lineBase - 1
 		}
 		first := len(*calls)
-		if err := parseNestedWithBudget(body.String(), body.pos, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
+		if err := parseNestedMapped(body, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
 			nestedErrs = append(nestedErrs, err)
 		}
-		dropSubstCalls(calls, first, body, budget)
 		preserveMappedRaw(*calls, first, body, src)
 	}
 	return errors.Join(nestedErrs...)
@@ -2172,10 +2199,10 @@ func parseNested(src string, pos []int, lineBase int, via []string, inLoop, inBa
 }
 
 func parseNestedWithBudget(src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
-	return parseNestedFileWithBudget(nil, "", src, pos, lineBase, via, inLoop, inBackground, vars, calls, nil, budget)
+	return parseNestedFileWithBudget(nil, "", src, pos, lineBase, via, inLoop, inBackground, vars, calls, nil, nil, budget)
 }
 
-func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, ignored [][2]int, budget *nestedParseBudget) error {
+func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
 	if budget.depth >= maxNestedScripts {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script depth exceeds %d", maxNestedScripts)}
 	}
@@ -2192,10 +2219,15 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
 	var err error
-	if file == nil {
+	if file == nil && subst == nil {
 		err = parseWithBudget(src, lineBase, via, nestedVars, &nestedCalls, budget)
 	} else {
-		err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, ignored, budget)
+		if file == nil {
+			file, full, ignored, err = budget.parseShell(src)
+		}
+		if err == nil {
+			err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, ignored, subst, budget)
+		}
 	}
 	if err != nil {
 		var nestedErr *NestedError
@@ -3285,7 +3317,7 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 		return &NestedError{Script: remoteText, Err: fmt.Errorf("shellcmd: parse shell: %w", parseErr)}
 	}
 	first := len(*calls)
-	if err := parseNestedFileWithBudget(file, full, remoteText, remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, ignored, c.budget); err != nil {
+	if err := parseNestedFileWithBudget(file, full, remoteText, remote.pos, c.call.Line-1, c.via("ssh"), c.call.Loop, c.call.Background, vars, calls, ignored, nil, c.budget); err != nil {
 		return err
 	}
 	relocateNestedLines(c, first, calls)
@@ -3708,10 +3740,9 @@ func expandSSHStdin(c cmd, candidate *Call, input *syntax.Redirect, lineBase int
 		bodyLine = int(input.Word.Pos().Line()) - 1
 	}
 	first := len(*calls)
-	if err := parseNestedWithBudget(body.String(), body.pos, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
+	if err := parseNestedMapped(body, bodyLine, via, c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
 		return err
 	}
-	dropSubstCalls(calls, first, body, c.budget)
 	preserveMappedRaw(*calls, first, body, c.source)
 	return nil
 }
@@ -3924,27 +3955,14 @@ func (m mapped) stripLeadingTabs() mapped {
 	return out
 }
 
-// dropSubstCalls removes calls found inside the kept text of a substitution
-// the outer shell runs: the outer walk reports them already. The spans come
-// in source order and do not overlap, so each call is looked up by binary
-// search.
-func dropSubstCalls(calls *[]Call, first int, body mapped, budget *nestedParseBudget) {
+// parseNestedMapped skips substitutions already evaluated by the outer shell.
+// The node position is mapped to the outer source before checking the spans;
+// Call.Offset can be unknown even when the node has a source position.
+func parseNestedMapped(body mapped, line int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
 	if len(body.subst) == 0 {
-		return
+		return parseNestedWithBudget(body.String(), body.pos, line, via, inLoop, inBackground, vars, calls, budget)
 	}
-	kept := (*calls)[:first]
-	for _, call := range (*calls)[first:] {
-		i := sort.Search(len(body.subst), func(i int) bool {
-			if budget != nil && budget.trackWork {
-				budget.substSteps++
-			}
-			return body.subst[i][1] > call.Offset
-		})
-		if i == len(body.subst) || call.Offset < body.subst[i][0] {
-			kept = append(kept, call)
-		}
-	}
-	*calls = kept
+	return parseNestedFileWithBudget(nil, "", body.String(), body.pos, line, via, inLoop, inBackground, vars, calls, nil, &body, budget)
 }
 
 func relocateNestedLines(parent cmd, first int, calls *[]Call) {
@@ -4002,8 +4020,7 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 	c.budget.expansionUsed += len(script.text)
 	viaName := c.call.Name
 	first := len(*calls)
-	err := parseNestedWithBudget(script.String(), script.pos, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
-	dropSubstCalls(calls, first, script, c.budget)
+	err := parseNestedMapped(script, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
 	relocateNestedLines(c, first, calls)
 	return err
 }
