@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"syscall"
 	"time"
 )
@@ -20,15 +19,10 @@ var directProcessKill = func(process *os.Process) error { return process.Kill() 
 // has already finished with it.
 var probeCmdProcess = func(process *os.Process) error { return process.Signal(syscall.Signal(0)) }
 
-// cmdProcessWaited reports a probe result that means Wait already finished:
-// os.ErrProcessDone, and on Windows also EINVAL, because Wait there releases
-// the process handle instead of marking it done. On Unix EINVAL comes from the
-// kernel and says nothing about Wait.
+// cmdProcessWaited reports whether Wait already finished with the process.
 func cmdProcessWaited(err error) bool {
-	return errors.Is(err, os.ErrProcessDone) || (releasedProcessIsInvalid && errors.Is(err, syscall.EINVAL))
+	return errors.Is(err, os.ErrProcessDone)
 }
-
-var releasedProcessIsInvalid = runtime.GOOS == "windows"
 
 // validateCmdSignal never reads cmd.ProcessState: os/exec calls Cancel from its
 // own goroutine while Wait writes that field. os.Process records a completed
@@ -119,27 +113,21 @@ func stopCmdDirect(cmd *exec.Cmd, grace time.Duration, sig syscall.Signal, degra
 	if err != nil {
 		return StopResult{}, err
 	}
-	unsupported := false
 	if err := directProcessSignal(process, sig); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			return StopResult{AlreadyExited: true, Degraded: degraded}, nil
 		}
-		// Windows delivers only Kill; a gentler signal has no effect there, so
-		// waiting the grace period would only delay the Kill that follows.
-		if !errors.Is(err, errors.ErrUnsupported) || sig == syscall.SIGKILL {
-			return StopResult{Degraded: degraded}, err
-		}
-		unsupported = true
+		return StopResult{Degraded: degraded}, err
 	}
-	if grace > 0 && !unsupported {
+	if grace > 0 {
 		timer := time.NewTimer(grace)
 		<-timer.C
 	}
 	if err := directProcessKill(process); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
-			return StopResult{AlreadyExited: true, Degraded: degraded, SignalUnsupported: unsupported}, nil
+			return StopResult{AlreadyExited: true, Degraded: degraded}, nil
 		}
-		return StopResult{Degraded: degraded, SignalUnsupported: unsupported}, err
+		return StopResult{Degraded: degraded}, err
 	}
-	return StopResult{Killed: 1, Degraded: degraded, SignalUnsupported: unsupported}, nil
+	return StopResult{Killed: 1, Degraded: degraded}, nil
 }

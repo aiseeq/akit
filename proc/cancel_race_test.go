@@ -4,7 +4,6 @@ package proc
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -38,7 +37,8 @@ func TestCmdHelpersCalledFromCancelDoNotRaceWithWait(t *testing.T) {
 	}
 }
 
-func TestCmdHelpersTreatReleasedProcessAsWaited(t *testing.T) {
+// EINVAL from the probe comes from the kernel and says nothing about Wait.
+func TestCmdHelpersKeepSignalingWhenProbeSaysInvalid(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -47,38 +47,8 @@ func TestCmdHelpersTreatReleasedProcessAsWaited(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	oldProbe, oldSignal, oldWindows := probeCmdProcess, directProcessSignal, releasedProcessIsInvalid
-	t.Cleanup(func() {
-		probeCmdProcess, directProcessSignal, releasedProcessIsInvalid = oldProbe, oldSignal, oldWindows
-	})
-	releasedProcessIsInvalid = true
-	signals := 0
-	directProcessSignal = func(*os.Process, syscall.Signal) error { signals++; return nil }
-	// Windows Wait releases the handle, and a later Signal reports EINVAL.
-	probeCmdProcess = func(*os.Process) error { return syscall.EINVAL }
-	if err := SignalCmd(cmd, syscall.SIGTERM); !errors.Is(err, os.ErrProcessDone) {
-		t.Fatalf("SignalCmd on a released process = %v, want os.ErrProcessDone", err)
-	}
-	if _, err := StopCmd(cmd, 0, syscall.SIGTERM); !errors.Is(err, os.ErrProcessDone) {
-		t.Fatalf("StopCmd on a released process = %v, want os.ErrProcessDone", err)
-	}
-	if signals != 0 {
-		t.Fatalf("signals sent to a released process = %d, want 0", signals)
-	}
-}
-
-func TestCmdHelpersKeepSignalingWhenUnixProbeSaysInvalid(t *testing.T) {
-	cmd := exec.Command("sleep", "30")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-	oldProbe, oldWindows := probeCmdProcess, releasedProcessIsInvalid
-	t.Cleanup(func() { probeCmdProcess, releasedProcessIsInvalid = oldProbe, oldWindows })
-	releasedProcessIsInvalid = false
+	oldProbe := probeCmdProcess
+	t.Cleanup(func() { probeCmdProcess = oldProbe })
 	probeCmdProcess = func(*os.Process) error { return syscall.EINVAL }
 	if err := SignalCmd(cmd, syscall.SIGKILL); err != nil {
 		t.Fatalf("SignalCmd with a Unix EINVAL probe = %v, want the signal delivered", err)
