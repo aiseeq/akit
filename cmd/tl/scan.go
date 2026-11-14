@@ -24,13 +24,15 @@ type hit struct {
 }
 
 type result struct {
-	hits    []hit
-	waits   []time.Duration   // --wait: ожидания вывода, сведённые по ходу чтения файлов
-	names   map[string]string // path → имя сессии
-	linkIDs map[string]string // path → уникальный id для ссылок в этой выборке
-	files   int
-	errs    []error // файлы, которые не прочитались: их события не вошли
-	bad     int     // строк, которые не разобрать, по всем файлам
+	hits        []hit
+	waits       []time.Duration   // --wait: ожидания вывода, сведённые по ходу чтения файлов
+	names       map[string]string // path → имя сессии
+	linkIDs     map[string]string // path → уникальный id для ссылок в этой выборке
+	searchPaths []string          // all transcript names reachable by find
+	liveNames   map[string]bool   // names that take precedence in find
+	files       int
+	errs        []error // файлы, которые не прочитались: их события не вошли
+	bad         int     // строк, которые не разобрать, по всем файлам
 	// firstBad — первая из них с id файла, чтобы было куда смотреть.
 	firstBad error
 }
@@ -728,7 +730,11 @@ func scan(sources []source, opts options, home string) (result, error) {
 	if err != nil {
 		return result{}, fmt.Errorf("list transcript names: %w", err)
 	}
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home), files: len(sources)}
+	liveNames, err := liveSessionNames(home)
+	if err != nil {
+		return result{}, fmt.Errorf("list live session names: %w", err)
+	}
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home, liveNames), searchPaths: allPaths, liveNames: liveNames, files: len(sources)}
 	type fileResult struct {
 		hits  []hit
 		waits []time.Duration
@@ -823,7 +829,8 @@ func report(res result, opts options, e env, w io.Writer) int {
 			parentName := res.names[parentPath]
 			parentID := res.linkIDs[parentPath]
 			if parentID == "" {
-				parentID = h.src.ParentID
+				parent := source{Path: parentPath, ID: parentPath}
+				parentID = sourceLinkIDs([]source{parent}, res.searchPaths, e.home, res.liveNames)[parentPath]
 			}
 			if parentName != "" {
 				parentName = " " + parentName

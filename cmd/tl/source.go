@@ -165,10 +165,21 @@ func transcriptPaths(home string) ([]string, error) {
 	return paths, nil
 }
 
+func liveSessionNames(home string) (map[string]bool, error) {
+	alive, err := session.ForHome(home).Alive()
+	names := make(map[string]bool, len(alive))
+	for name := range alive {
+		names[name] = true
+	}
+	return names, err
+}
+
 // sourceLinkIDs assigns each selected path the shortest prefix unique in find's full search area.
-func sourceLinkIDs(sources []source, allPaths []string, home string) map[string]string {
+func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames map[string]bool) map[string]string {
 	fullIDs := make(map[string]string, len(allPaths)+len(sources))
+	searchable := make(map[string]bool, len(allPaths))
 	for _, path := range allPaths {
+		searchable[path] = true
 		fullIDs[path] = sourceFullID(source{Path: path, ID: path})
 	}
 	for _, src := range sources {
@@ -184,6 +195,10 @@ func sourceLinkIDs(sources []source, allPaths []string, home string) map[string]
 	for _, src := range sources {
 		path, id := src.Path, fullIDs[src.Path]
 		base := filepath.Base(path)
+		if !searchable[path] {
+			ids[path] = tilde(path, home)
+			continue
+		}
 		if src.ID == path && !sourceUUID.MatchString(base) && !strings.HasPrefix(base, "agent-") {
 			ids[path] = tilde(path, home)
 			continue
@@ -193,10 +208,14 @@ func sourceLinkIDs(sources []source, allPaths []string, home string) map[string]
 			continue
 		}
 		length := min(8, len(id))
-		for length < len(id) && counts[id[:length]] > 1 {
+		for length < len(id) && (counts[id[:length]] > 1 || liveNames[id[:length]]) {
 			length++
 		}
-		ids[path] = id[:length]
+		if liveNames[id[:length]] {
+			ids[path] = tilde(path, home)
+		} else {
+			ids[path] = id[:length]
+		}
 	}
 	return ids
 }

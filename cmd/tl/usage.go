@@ -92,28 +92,7 @@ func (t *tally) merge(o *tally) {
 func reportUsage(res result, sources []source, opts options, e env, w io.Writer) int {
 	ratePath := usageRatesPath(e)
 	rates, rateErr := readUsageRates(ratePath, e.now)
-	var replies []usageReply
-	last := map[string]int{} // id ответа во всей выборке → индекс в replies
-	for i := range res.hits {
-		h := &res.hits[i]
-		r := h.ev.Reply
-		if r == nil || r.Usage == nil {
-			continue
-		}
-		key := cmp.Or(r.ID, r.RequestID)
-		if key == "" {
-			replies = append(replies, usageReply{h.src.Path, r})
-			continue
-		}
-		if j, ok := last[key]; ok {
-			if r.Usage.Output > replies[j].r.Usage.Output {
-				replies[j].r = r
-			}
-			continue
-		}
-		last[key] = len(replies)
-		replies = append(replies, usageReply{h.src.Path, r})
-	}
+	replies := usageReplies(res.hits)
 	per := map[string]*tally{}
 	for _, rp := range replies {
 		t := per[rp.session]
@@ -176,6 +155,56 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 	fmt.Fprintln(w, usageRow("total", &total, providers))
 	fmt.Fprintln(w, usageSummary(total, replies, len(ids), ratePath, rates, rateErr, sources, opts, e, res))
 	return 0
+}
+
+func usageReplies(hits []hit) []usageReply {
+	var replies []usageReply
+	last := map[string]int{}   // id ответа в сессии → индекс в replies
+	copies := map[string]int{} // один agent transcript под разными родителями → индекс в replies
+	for i := range hits {
+		h := &hits[i]
+		r := h.ev.Reply
+		if r == nil || r.Usage == nil {
+			continue
+		}
+		key := cmp.Or(r.ID, r.RequestID)
+		if key == "" {
+			replies = append(replies, usageReply{h.src.Path, r})
+			continue
+		}
+		localKey := h.src.Path + "\x00" + key
+		if j, ok := last[localKey]; ok {
+			keepLargestReply(replies, j, r)
+			continue
+		}
+		copyKey := copiedAgentReplyKey(h.src.Path, r)
+		if copyKey != "" {
+			if j, ok := copies[copyKey]; ok {
+				last[localKey] = j
+				keepLargestReply(replies, j, r)
+				continue
+			}
+			copies[copyKey] = len(replies)
+		}
+		last[localKey] = len(replies)
+		replies = append(replies, usageReply{h.src.Path, r})
+	}
+	return replies
+}
+
+func copiedAgentReplyKey(path string, reply *transcript.Reply) string {
+	base := filepath.Base(path)
+	if !strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) ||
+		!strings.HasPrefix(base, "agent-") || reply.ID == "" || reply.RequestID == "" {
+		return ""
+	}
+	return base + "\x00" + reply.ID + "\x00" + reply.RequestID
+}
+
+func keepLargestReply(replies []usageReply, index int, reply *transcript.Reply) {
+	if reply.Usage.Output > replies[index].r.Usage.Output {
+		replies[index].r = reply
+	}
 }
 
 func usageSummary(total tally, replies []usageReply, sessionCount int, ratePath string, rates map[string]usageRate, rateErr error, sources []source, opts options, e env, res result) string {
