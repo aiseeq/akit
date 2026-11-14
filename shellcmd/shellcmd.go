@@ -1086,6 +1086,30 @@ func collectCallWalkInfo(call *syntax.CallExpr, source bool, src string, vars ma
 	}
 }
 
+// collectScriptInput marks a shell call that runs a script shellcmd has not
+// read: from stdin, a descriptor, or as a coprocess.
+func collectScriptInput(stmt *syntax.Stmt, call *syntax.CallExpr, file *syntax.File, src string, vars map[string]string, info *walkInfo, stdin *syntax.Redirect, offset int) {
+	coproc := info.coprocCalls[call]
+	if !info.shellScriptInputCandidates && !coproc {
+		return
+	}
+	redirs := stmt.Redirs
+	if info.stdinIndex != nil {
+		redirs = info.stdinIndex.redirsAt(offset)
+	}
+	if info.shellScriptInputCandidates && shellScriptInputForm(call, src, vars, redirs) && !knownPipedScriptInput(stmt, call, src, vars, info) && !knownShellScriptInput(file, stmt, call, src, vars, stdin, redirs) {
+		info.scriptInputs[call] = true
+	}
+	if coproc {
+		readsCommand, err := coprocCommandReadsStdin(call, src, vars)
+		if err != nil {
+			info.errors = append(info.errors, err)
+		} else if (readsCommand || shellInputTargetWithIndex(call, src, vars, info.processSubstitutions)) && !knownShellScriptInput(file, stmt, call, src, vars, stdin, redirs) {
+			info.scriptInputs[call] = true
+		}
+	}
+}
+
 func knownPipedScriptInput(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, info *walkInfo) bool {
 	args, _ := words(call.Args, src, vars)
 	_, targetArgs, ok := shellInputTargetArgs(args)
@@ -1129,17 +1153,7 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 	if stdin.redir != nil {
 		info.stdinInputs[call] = stdin.redir
 	}
-	if info.shellScriptInputCandidates && shellScriptInputForm(stmt, call, src, vars) && !knownPipedScriptInput(stmt, call, src, vars, info) && !knownShellScriptInput(file, stmt, call, src, vars, stdin.redir) {
-		info.scriptInputs[call] = true
-	}
-	if info.coprocCalls[call] {
-		readsCommand, err := coprocCommandReadsStdin(call, src, vars)
-		if err != nil {
-			info.errors = append(info.errors, err)
-		} else if (readsCommand || shellInputTargetWithIndex(call, src, vars, info.processSubstitutions)) && !knownShellScriptInput(file, stmt, call, src, vars, stdin.redir) {
-			info.scriptInputs[call] = true
-		}
-	}
+	collectScriptInput(stmt, call, file, src, vars, info, stdin.redir, offset)
 	name, shellVia, input, err := shellInputName(stmt, src, vars, stdin.redir)
 	if err != nil {
 		info.errors = append(info.errors, err)
@@ -1474,7 +1488,10 @@ func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 	return false, false
 }
 
-func shellScriptInputForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string) bool {
+// shellScriptInputForm reports a shell that reads its script from stdin or a
+// descriptor; redirs are the redirections that set up its input, those of the
+// enclosing statements first.
+func shellScriptInputForm(call *syntax.CallExpr, src string, vars map[string]string, redirs []*syntax.Redirect) bool {
 	if len(call.Args) == 0 {
 		return false
 	}
@@ -1484,37 +1501,37 @@ func shellScriptInputForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, 
 	}
 	name := commandName(first)
 	if isScriptInputShell(name) {
-		return shellScriptInputDirectForm(stmt, call, src, vars, name)
+		return shellScriptInputDirectForm(call, src, vars, name, redirs)
 	}
-	if !wrappers[name] || !wrapperScriptInputCandidate(stmt, call, src, vars) {
+	if !wrappers[name] || !wrapperScriptInputCandidate(call, src, redirs) {
 		return false
 	}
-	return shellScriptInputWrappedForm(stmt, call, src, vars)
+	return shellScriptInputWrappedForm(call, src, vars, redirs)
 }
 
-func wrapperScriptInputCandidate(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string) bool {
+func wrapperScriptInputCandidate(call *syntax.CallExpr, src string, redirs []*syntax.Redirect) bool {
 	start, end := int(call.Pos().Offset()), int(call.End().Offset())
 	if !validSpan(src, start, end) {
 		return false
 	}
 	raw := src[start:end]
-	if hasUnknownStdinRedir(stmt.Redirs, src, vars) {
+	if hasUnknownStdinRedir(redirs) {
 		return true
 	}
 	return strings.Contains(raw, "/dev/") || strings.Contains(raw, "/proc/") || shellDashInputCandidate(raw)
 }
 
-func shellScriptInputDirectForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, shell string) bool {
+func shellScriptInputDirectForm(call *syntax.CallExpr, src string, vars map[string]string, shell string, redirs []*syntax.Redirect) bool {
 	start, end := int(call.Pos().Offset()), int(call.End().Offset())
 	if validSpan(src, start, end) {
 		raw := src[start:end]
-		if !strings.Contains(raw, "/dev/") && !strings.Contains(raw, "/proc/") && !strings.Contains(raw, " -") && !strings.Contains(raw, "\t-") && !strings.Contains(raw, "\n-") && !hasUnknownStdinRedir(stmt.Redirs, src, vars) {
+		if !strings.Contains(raw, "/dev/") && !strings.Contains(raw, "/proc/") && !strings.Contains(raw, " -") && !strings.Contains(raw, "\t-") && !strings.Contains(raw, "\n-") && !hasUnknownStdinRedir(redirs) {
 			return false
 		}
 	}
 	args, _ := words(call.Args[1:], src, vars)
 	input, stdin := shellScriptInputArgs(args, shell)
-	return input || stdin || shellReadsImplicitStdin(args) && hasUnknownStdinRedir(stmt.Redirs, src, vars)
+	return input || stdin || shellReadsImplicitStdin(args) && hasUnknownStdinRedir(redirs)
 }
 
 func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]string) (bool, error) {
@@ -1538,21 +1555,22 @@ func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]
 	return read && eval, nil
 }
 
-func shellScriptInputWrappedForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string) bool {
+func shellScriptInputWrappedForm(call *syntax.CallExpr, src string, vars map[string]string, redirs []*syntax.Redirect) bool {
 	args, _ := words(call.Args, src, vars)
 	shell, args, ok := shellInputTargetArgs(args)
 	if !ok {
 		return false
 	}
 	input, stdin := shellScriptInputArgs(args, shell)
-	return input || stdin || shellReadsImplicitStdin(args) && hasUnknownStdinRedir(stmt.Redirs, src, vars)
+	return input || stdin || shellReadsImplicitStdin(args) && hasUnknownStdinRedir(redirs)
 }
 
-// shellReadsImplicitStdin reports a shell given only options: it reads its
-// script from stdin without naming it, so only where stdin comes from decides.
+// shellReadsImplicitStdin reports a shell given only options, -s among them:
+// it reads its script from stdin without naming it, so only where stdin comes
+// from decides.
 func shellReadsImplicitStdin(args []string) bool {
-	operand, command, useStdin := shellArgs(args)
-	return !command && !useStdin && operand >= len(args) && !shellNoExec(args)
+	operand, command, _ := shellArgs(args)
+	return !command && operand >= len(args) && !shellNoExec(args)
 }
 
 func shellInputTargetArgs(args []string) (string, []string, bool) {
@@ -1570,38 +1588,38 @@ func shellInputTargetArgs(args []string) (string, []string, bool) {
 	return name, args, isScriptInputShell(name)
 }
 
-// hasUnknownStdinRedir reports a stdin redirection from another descriptor:
-// <&N, or a descriptor path such as /dev/fd/N. A descriptor named by a
-// substitution that cannot be resolved counts as unknown; a file name does not.
-func hasUnknownStdinRedir(redirs []*syntax.Redirect, src string, vars map[string]string) bool {
+// hasUnknownStdinRedir reports a stdin redirection from another descriptor
+// (<&N, /dev/fd/N) or from a name known only at run time, which may be one;
+// a literal file name is not unknown. Whether a later redirection or an
+// earlier exec makes stdin known is decided by knownShellScriptInput.
+func hasUnknownStdinRedir(redirs []*syntax.Redirect) bool {
 	for _, redir := range redirs {
-		if fd, valid := inputRedirFD(redir); !valid || fd != 0 || redir.Word == nil {
+		if fd, valid := inputRedirFD(redir); !valid || fd != 0 {
 			continue
 		}
-		op := redir.Op.String()
-		if op != "<&" && op != "<" && op != "<>" {
-			continue
-		}
-		values, _ := words([]*syntax.Word{redir.Word}, src, vars)
-		target := ""
-		if len(values) == 1 {
-			target = values[0]
-		}
-		resolved := target != "" && !strings.ContainsAny(target, "$`")
-		if op == "<&" {
-			if !resolved || target != "0" && target != "-" {
+		target, literal := redirectTarget(redir)
+		switch redir.Op.String() {
+		case "<&":
+			if !literal || target != "0" && target != "-" {
 				return true
 			}
-			continue
-		}
-		if resolved && shellScriptInputFD(target) > 0 {
-			return true
+		case "<", "<>":
+			if !literal || shellScriptInputFD(target) > 0 {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, stdin *syntax.Redirect) bool {
+// redirectTarget returns a redirection word and whether it is literal: a
+// substitution, a glob and a leading tilde are expanded at run time.
+func redirectTarget(redir *syntax.Redirect) (string, bool) {
+	target, literal := wordValue(redir.Word)
+	return target, literal && !strings.ContainsAny(target, "*?[") && !strings.HasPrefix(target, "~")
+}
+
+func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, stdin *syntax.Redirect, redirs []*syntax.Redirect) bool {
 	args, _ := words(call.Args, src, vars)
 	_, targetArgs, ok := shellInputTargetArgs(args)
 	if !ok {
@@ -1622,7 +1640,7 @@ func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.Ca
 	if stdin != nil {
 		applyKnownInputRedirect(stdin, 0, known, set)
 	}
-	for _, redir := range stmt.Redirs {
+	for _, redir := range redirs {
 		dest, valid := inputRedirFD(redir)
 		if valid {
 			applyKnownInputRedirect(redir, dest, known, set)
@@ -1669,9 +1687,7 @@ func knownExecFDStates(file *syntax.File, before int) (map[int]bool, map[int]boo
 }
 
 func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[int]bool) {
-	target, literal := wordValue(redir.Word)
-	// Globs and a leading tilde are expanded in a redirection word.
-	literal = literal && !strings.ContainsAny(target, "*?[") && !strings.HasPrefix(target, "~")
+	target, literal := redirectTarget(redir)
 	switch redir.Op.String() {
 	case "<<", "<<-", "<<<":
 		known[dest] = true
@@ -4052,6 +4068,20 @@ func resolveStdinAt(index *stdinIndex, offset int, initial stdinValue) stdinValu
 		initial = entry.input
 	}
 	return index.resolveContexts(offset, initial)
+}
+
+// redirsAt returns the redirections of every statement holding offset,
+// outermost first, so later ones override earlier ones for the same descriptor.
+func (index *stdinIndex) redirsAt(offset int) []*syntax.Redirect {
+	ids := index.stmts.containing(offset)
+	if len(ids) == 1 {
+		return index.redirs[ids[0]]
+	}
+	var redirs []*syntax.Redirect
+	for _, id := range ids {
+		redirs = append(redirs, index.redirs[id]...)
+	}
+	return redirs
 }
 
 // functionEntry is the stdin a function body starts with: that of its last

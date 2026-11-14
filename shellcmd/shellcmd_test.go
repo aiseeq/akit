@@ -2600,6 +2600,69 @@ func TestShellScriptInputRevisionThree(t *testing.T) {
 	}
 }
 
+func TestShellScriptInputFromStdinSetByEnclosingOrSubstitutedRedirect(t *testing.T) {
+	tests := []struct {
+		src  string
+		want bool
+	}{
+		// -s with no operand reads the script from stdin like a shell given only options.
+		{`bash -s <&3`, true},
+		{`bash -es <&3`, true},
+		{`bash -s -e <&3`, true},
+		{`bash -s < /dev/fd/3`, true},
+		{`sh -s <&3`, true},
+		{`env bash -s <&3`, true},
+		{`bash -s`, false},
+		{`bash -s <&0`, false},
+		// A descriptor path through $$ names the shell's own descriptors.
+		{`bash -e < /proc/$$/fd/3`, true},
+		{`bash -e < /proc/${$}/fd/3`, true},
+		// A name expanded at run time may be a descriptor path.
+		{`f=/dev/fd/3; bash -e < $f`, true},
+		{`bash -e < /dev/fd/[3]`, true},
+		{`bash -e < $(echo /dev/fd/3)`, true},
+		{`bash -s a < /dev/stdi*`, true},
+		// The input of an enclosing compound command is the shell's stdin.
+		{`{ bash -e; } <&3`, true},
+		{`( bash -e ) <&3`, true},
+		{`{ bash; } <&3`, true},
+		{`while true; do bash -e; done <&3`, true},
+		{`if true; then bash -e; fi <&3`, true},
+		{`{ bash -e; } < /dev/fd/3`, true},
+		{`{ bash -e; } 3< file <&3`, false},
+		{`exec 3</dev/null; { bash -e; } <&3`, false},
+		{`{ bash -e < file; } <&3`, false},
+		{`{ bash -e; } < file`, false},
+		// Not a script read from stdin, or stdin left as it is.
+		{`bash -n <&3`, false},
+		{`bash -c <&3`, false},
+		{`bash -e 4<&3`, false},
+		{`bash -e <&-`, false},
+		{`bash -e < /dev/stdin`, false},
+		{`bash -e < file`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name == "bash" || call.Name == "sh" {
+					found = true
+					if call.ScriptInput != tt.want {
+						t.Errorf("%s ScriptInput=%t, want %t", call.Name, call.ScriptInput, tt.want)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("no shell call in %#v", calls)
+			}
+		})
+	}
+}
+
 func TestUnknownShellScriptInput(t *testing.T) {
 	for _, command := range []string{
 		`echo 'kill 1' | bash`,
