@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"cmp"
 	"fmt"
 	"io"
 	"maps"
 	"math"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -15,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/price"
+	"github.com/aiseeq/akit/rates"
 	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
 )
@@ -322,91 +321,31 @@ func usageRatesPath(e env) string {
 }
 
 func readUsageRates(path string, now time.Time) (map[string]usageRate, error) {
-	f, err := os.Open(path)
+	table, err := rates.Read(path, now)
 	if err != nil {
-		return nil, fmt.Errorf("open rates %s: %w", path, err)
+		return nil, err
 	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	columns := map[string]int{}
-	width := 0
-	rates := map[string]usageRate{}
-	for lineNo := 1; scanner.Scan(); lineNo++ {
-		line := strings.TrimRight(scanner.Text(), "\r")
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+	selected := map[string]usageRate{}
+	providers := map[string]bool{}
+	for i := range table.Rows {
+		row := &table.Rows[i]
+		providers[row.Provider] = true
+	}
+	for provider := range providers {
+		row, ok := table.Latest(provider, "")
+		if !ok {
 			continue
 		}
-		fields := strings.Split(line, "\t")
-		if width == 0 {
-			width = len(fields)
-			for i, name := range fields {
-				columns[name] = i
-			}
-			for _, name := range []string{"valid_from", "provider", "plan_usd_month", "api_usd_week"} {
-				if _, ok := columns[name]; !ok {
-					return nil, fmt.Errorf("%s: header missing %s", path, name)
-				}
-			}
-			continue
+		var invalid string
+		if row.InvalidPlan != nil {
+			invalid = row.InvalidPlan.Error()
+		} else if row.InvalidWeek != nil {
+			invalid = row.InvalidWeek.Error()
 		}
-		if len(fields) != width {
-			return nil, fmt.Errorf("%s:%d: wrong number of columns", path, lineNo)
-		}
-		provider, rate, future, err := parseUsageRateRow(path, lineNo, fields, columns, now)
-		if err != nil {
-			return nil, err
-		}
-		if future {
-			if _, exists := rates[provider]; !exists {
-				rates[provider] = usageRate{}
-			}
-			continue
-		}
-		old, exists := rates[provider]
-		if !exists || old.validFrom.IsZero() || rate.validFrom.After(old.validFrom) || rate.validFrom.Equal(old.validFrom) {
-			rates[provider] = rate
-		}
+		selected[provider] = usageRate{apiWeek: row.APIUSDWeek, planMonth: row.PlanUSDMonth,
+			validFrom: row.ValidFrom, line: row.Line, invalid: invalid}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read rates %s: %w", path, err)
-	}
-	if width == 0 {
-		return nil, fmt.Errorf("%s: no header", path)
-	}
-	return rates, nil
-}
-
-func parseUsageRateRow(path string, lineNo int, fields []string, columns map[string]int, now time.Time) (string, usageRate, bool, error) {
-	provider := fields[columns["provider"]]
-	valid, err := parseUsageValidFrom(fields[columns["valid_from"]])
-	if err != nil {
-		return "", usageRate{}, false, fmt.Errorf("%s:%d:valid_from: invalid date", path, lineNo)
-	}
-	if valid.After(now) {
-		return provider, usageRate{validFrom: valid}, true, nil
-	}
-	week, weekErr := strconv.ParseFloat(fields[columns["api_usd_week"]], 64)
-	plan, planErr := strconv.ParseFloat(fields[columns["plan_usd_month"]], 64)
-	rate := usageRate{apiWeek: week, planMonth: plan, validFrom: valid, line: lineNo}
-	switch {
-	case planErr != nil || !validRateNumber(plan):
-		rate.invalid = fmt.Sprintf("%s:%d:plan_usd_month: invalid value %q", path, lineNo, fields[columns["plan_usd_month"]])
-	case weekErr != nil || !validRateNumber(week):
-		rate.invalid = fmt.Sprintf("%s:%d:api_usd_week: invalid value %q", path, lineNo, fields[columns["api_usd_week"]])
-	}
-	return provider, rate, false, nil
-}
-
-func validRateNumber(value float64) bool {
-	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
-}
-
-func parseUsageValidFrom(value string) (time.Time, error) {
-	if date, err := time.ParseInLocation(time.DateOnly, value, time.Local); err == nil {
-		return date, nil
-	}
-	return time.Parse(time.RFC3339, value)
+	return selected, nil
 }
 
 func usageProvider(model string) string {
