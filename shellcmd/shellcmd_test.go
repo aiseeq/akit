@@ -3517,6 +3517,10 @@ func TestFindCallsAfterCommentContinuationThatBreaksParse(t *testing.T) {
 		{"for", "for i in 1; do zz #\\\ndone; zk 1", 27},
 		{"function", "f() { zz #\\\n}; f; zk 1", 18},
 		{"test command", "[[ a == a ]] #\\\nzk 1", 16},
+		{"group crlf", "{ zz #\\\r\n}; zk 1", 12},
+		{"if crlf", "if true; then zz #\\\r\nfi; zk 1", 25},
+		{"three backslashes", "{ zz #\\\\\\\n}; zk 1", 13},
+		{"backquoted even run", "x=`{ zz 1 #\\\\\n}; f `\nzk 1", 21},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3530,12 +3534,30 @@ func TestFindCallsAfterCommentContinuationThatBreaksParse(t *testing.T) {
 		})
 	}
 
-	t.Run("genuine bash syntax error remains an error", func(t *testing.T) {
-		src := "if true; then zz #\\\nfi; then zk 1"
-		if _, err := Find(src, "zk"); err == nil {
-			t.Fatal("Find succeeded for a genuine syntax error")
-		}
-	})
+	for _, src := range []string{
+		"if true; then zz #\\\nfi; then zk 1",
+		// The backslash is outside the comment: bash joins the lines too.
+		"{ zz \\\n}; zk 1 #",
+	} {
+		t.Run("bash syntax error remains: "+src, func(t *testing.T) {
+			if _, err := Find(src, "zk"); err == nil {
+				t.Fatal("Find succeeded for a bash syntax error")
+			}
+		})
+	}
+}
+
+// A script with a real syntax error and many continued comments costs a
+// bounded number of reparses, not one per continuation.
+func TestCommentContinuationRetryOnSyntaxErrorIsBounded(t *testing.T) {
+	src := strings.Repeat("zz 1 # c \\\nzz 2\n", 2000) + "if then fi\n"
+	start := time.Now()
+	if _, err := Find(src, "zk"); err == nil {
+		t.Fatal("Find succeeded for a syntax error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Find took %v on a %d-byte script with a syntax error", elapsed, len(src))
+	}
 }
 
 func TestCommentMarkerInsideHeredocData(t *testing.T) {

@@ -461,10 +461,11 @@ func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) 
 	}
 	originalFile, originalFull, originalErr := parseShellVariant(src, false)
 	working := src
+	retries := commentRetryLimit
 	for range strings.Count(src, "\\\n") + strings.Count(src, "\\\r\n") + 1 {
 		file, parsedFull, err := parseShellVariant(working, true)
 		if err != nil {
-			recovered, ok := retryCommentContinuationParse(working)
+			recovered, ok := retryCommentContinuation(working, &retries)
 			if !ok {
 				return originalFile, originalFull, nil, originalErr
 			}
@@ -486,38 +487,76 @@ func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) 
 	return originalFile, originalFull, nil, originalErr
 }
 
-func retryCommentContinuationParse(src string) (string, bool) {
+// commentRetryLimit bounds the reparses spent on a script that fails to
+// parse: each one blanks a single backslash, so a large script with a real
+// syntax error and many line continuations costs a few parses, not one per
+// continuation.
+const commentRetryLimit = 16
+
+// retryCommentContinuation blanks one backslash that ends a line after a #
+// on the same line, when the reparse succeeds and puts the backslash inside a
+// comment: bash ends a comment at the newline, the parser continues it.
+func retryCommentContinuation(src string, budget *int) (string, bool) {
+	for _, pos := range commentBackslashCandidates(src) {
+		if *budget <= 0 {
+			break
+		}
+		*budget--
+		data := []byte(src)
+		data[pos] = ' '
+		candidate := string(data)
+		// A failed reparse only means this backslash is not the cause.
+		if file, _, err := parseShellVariant(candidate, true); err == nil && insideComment(file, pos) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// commentBackslashCandidates lists the backslashes of runs that end a line
+// after a # on the same line, each leaving an odd number of backslashes from
+// it to the newline: one continues the line at the top level, and inside
+// backquotes \\ becomes \, so an even run continues it there.
+func commentBackslashCandidates(src string) []int {
+	var candidates []int
 	for start := 0; start < len(src); {
 		slash := strings.IndexByte(src[start:], '\\')
 		if slash < 0 {
-			return "", false
+			break
 		}
 		slash += start
-		newline := slash + 1
-		for newline < len(src) && src[newline] == '\\' {
-			newline++
+		end := slash
+		for end < len(src) && src[end] == '\\' {
+			end++
 		}
+		start = end
+		newline := end
 		if newline < len(src) && src[newline] == '\r' {
 			newline++
 		}
-		if newline >= len(src) || src[newline] != '\n' || (newline-slash)%2 == 0 {
-			start = slash + 1
+		if newline >= len(src) || src[newline] != '\n' {
 			continue
 		}
-		data := []byte(src)
-		data[slash] = ' '
-		candidate := string(data)
-		file, _, err := parseShellVariant(candidate, true)
-		if err == nil {
-			for _, comment := range collectCommentNodes(file).comments {
-				if int(comment.Pos().Offset()) <= slash && slash < int(comment.End().Offset()) {
-					return candidate, true
-				}
+		lineStart := strings.LastIndexByte(src[:slash], '\n') + 1
+		if !strings.Contains(src[lineStart:slash], "#") {
+			continue
+		}
+		for pos := slash; pos < end; pos++ {
+			if (end-pos)%2 == 1 {
+				candidates = append(candidates, pos)
 			}
 		}
-		start = slash + 1
 	}
-	return "", false
+	return candidates
+}
+
+func insideComment(file *syntax.File, offset int) bool {
+	for _, comment := range collectCommentNodes(file).comments {
+		if int(comment.Pos().Offset()) <= offset && offset < int(comment.End().Offset()) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseShellVariant(src string, keepComments bool) (file *syntax.File, full string, err error) {
@@ -534,7 +573,7 @@ func parseShellVariant(src string, keepComments bool) (file *syntax.File, full s
 		}
 		delim, ok := strings.CutPrefix(pe.Text, "unclosed here-document `")
 		if !ok {
-			return file, full, err
+			return nil, full, err
 		}
 		if trailing := len(full) - len(strings.TrimRight(full, `\\`)); trailing%2 == 1 {
 			full += "\n"
