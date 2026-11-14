@@ -2806,6 +2806,9 @@ func TestSourceOfHeredocThroughDescriptorPathParsesBody(t *testing.T) {
 		{"source x exec -- bash <<'E'\nkill 1\nE", []string{"source", "exec", "bash"}},
 		{". ./x exec -- sh <<<'kill 1'", []string{".", "exec", "sh"}},
 		{"source x exec -- sudo bash <<'E'\nkill 1\nE", []string{"source", "exec", "sudo", "bash"}},
+		// The script is fd 3; the stdin heredoc goes to the shell in its arguments.
+		{"source /dev/fd/3 exec -- bash 3<<'E' <<'F'\n\"$@\"\nE\nkill 1\nF", []string{"source", "exec", "bash"}},
+		{". /dev/fd/3 exec -- bash 3<<'E' <<<'kill 1'\n\"$@\"\nE", []string{".", "exec", "bash"}},
 	} {
 		calls, err := Find(tt.src, "kill")
 		if err != nil || len(calls) != 1 || !reflect.DeepEqual(calls[0].Via, tt.via) {

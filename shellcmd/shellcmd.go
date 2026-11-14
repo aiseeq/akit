@@ -1176,15 +1176,28 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 	if err != nil {
 		info.errors = append(info.errors, err)
 	} else if input {
-		info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: script, name: name, via: shellVia})
-		if !slices.Contains(shellVia, "ssh") && script != nil && script.Hdoc != nil {
-			info.shellHdocs[script] = true
-			info.localSubstHdocs[script] = true
-		}
+		info.addShellInput(stmt, script, name, shellVia)
 	} else if info.knownShellInputs[call] != nil {
 		// The script is a known body that is not parsed as a nested script
 		// here: its calls stay unseen.
 		info.scriptInputs[call] = true
+	}
+	if stdin.redir != nil && script != stdin.redir {
+		name, shellVia, input, err := sourceArgsShellInput(stmt, src, vars, stdin.redir)
+		if err != nil {
+			info.errors = append(info.errors, err)
+		} else if input {
+			info.addShellInput(stmt, stdin.redir, name, shellVia)
+		}
+	}
+}
+
+// addShellInput records redir as the script of the shell that stmt runs.
+func (info *walkInfo) addShellInput(stmt *syntax.Stmt, redir *syntax.Redirect, name string, via []string) {
+	info.shellInputs = append(info.shellInputs, heredocShellInput{stmt: stmt, redir: redir, name: name, via: via})
+	if !slices.Contains(via, "ssh") && redir != nil && redir.Hdoc != nil {
+		info.shellHdocs[redir] = true
+		info.localSubstHdocs[redir] = true
 	}
 }
 
@@ -2456,6 +2469,17 @@ func heredocText(redir *syntax.Redirect, src string) string {
 }
 
 func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect) (string, []string, bool, error) {
+	return shellInputNameFrom(stmt, src, vars, stdinInput, false)
+}
+
+// sourceArgsShellInput finds the shell that reads stdin among the arguments
+// of source or . whose own script is another descriptor: the sourced file may
+// run them, as in source /dev/fd/3 exec -- bash <<E.
+func sourceArgsShellInput(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect) (string, []string, bool, error) {
+	return shellInputNameFrom(stmt, src, vars, stdinInput, true)
+}
+
+func shellInputNameFrom(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect, sourceArgs bool) (string, []string, bool, error) {
 	if stdinInput == nil {
 		return "", nil, false, nil
 	}
@@ -2493,15 +2517,11 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdin
 	if name == "ssh" {
 		return "", nil, false, nil
 	}
-	target, shellVia, err := resolveShellInput(name, args[1:], hasHeredoc)
+	target, shellVia, err := resolveShellInputWithWork(name, args[1:], hasHeredoc, nil, sourceArgs)
 	return target, shellVia, target != "", err
 }
 
-func resolveShellInput(name string, args []string, hasHeredoc bool) (string, []string, error) {
-	return resolveShellInputWithWork(name, args, hasHeredoc, nil)
-}
-
-func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work *int) (string, []string, error) {
+func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work *int, sourceArgs bool) (string, []string, error) {
 	var via []string
 	scan := wrapperExecScan{work: work}
 	for {
@@ -2512,8 +2532,13 @@ func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work
 			return "sh", append(via, name), nil
 		}
 		if isScriptInputShell(name) {
-			target, shellVia, ok := shellInputForShell(name, args, hasHeredoc, via)
-			if ok {
+			if sourceArgs {
+				// Only the arguments of the first source or . are searched.
+				if !isSourceBuiltin(name) {
+					return "", nil, nil
+				}
+				sourceArgs = false
+			} else if target, shellVia, ok := shellInputForShell(name, args, hasHeredoc, via); ok {
 				return target, shellVia, nil
 			}
 			// source FILE can run its arguments, as in source x exec -- bash:

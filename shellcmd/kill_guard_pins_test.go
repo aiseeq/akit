@@ -146,7 +146,7 @@ func TestWrapperExecScanGrowth(t *testing.T) {
 					}
 				case "heredoc":
 					args := append(strings.Fields(strings.Repeat("nice ", n-1)), "bash", "-s")
-					name, _, err := resolveShellInputWithWork("nice", args, true, &work)
+					name, _, err := resolveShellInputWithWork("nice", args, true, &work, false)
 					if err != nil || name != "bash" {
 						t.Fatalf("name=%q err=%v", name, err)
 					}
