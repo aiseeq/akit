@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -40,12 +41,27 @@ func TestMain(m *testing.M) {
 		main()
 		os.Exit(0)
 	}
+	if !hasTestFlag(os.Args[1:]) {
+		// Started as mut without the switch: running the tests again here
+		// would make every mut call spawn the whole suite.
+		fmt.Fprintln(os.Stderr, "mut test binary started without -test.* flags and without "+mutAsMain+"=1")
+		os.Exit(2)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		panic(err)
 	}
 	mutBinary = exe
 	os.Exit(m.Run())
+}
+
+func hasTestFlag(args []string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-test.") {
+			return true
+		}
+	}
+	return false
 }
 
 type fixture struct {
@@ -75,7 +91,10 @@ func newFixture(t *testing.T, test string) *fixture {
 	}
 	graft := filepath.Join(graftDir, "graft")
 	// Как настоящий graft --heavy: справочная строка о потолке на каждом прогоне — не упор в него.
-	script := "#!/bin/sh\necho 'graft: exec: moved to graft-heavy-1.scope (memory ceiling 10 GiB: 34% of RAM, the default)' >&2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
+	script := "#!/bin/sh\n" +
+		// The switch that makes the test binary act as mut must not reach the commands mut runs.
+		"if [ -n \"${" + mutAsMain + "+set}\" ]; then echo '" + mutAsMain + " reached the test command' >&2; exit 99; fi\n" +
+		"echo 'graft: exec: moved to graft-heavy-1.scope (memory ceiling 10 GiB: 34% of RAM, the default)' >&2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
 	if err := os.WriteFile(graft, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
