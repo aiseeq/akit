@@ -2349,6 +2349,63 @@ func TestKillGuardGaps(t *testing.T) {
 	})
 }
 
+func TestShellScriptInputFileDescriptorsAndCoproc(t *testing.T) {
+	tests := []struct {
+		src  string
+		want bool
+	}{
+		{`echo x | bash /dev/stdin`, true},
+		{`bash -`, true},
+		{`bash -- -`, true},
+		{`bash -o -`, false},
+		{`bash /dev/fd/3 3< <(echo x)`, true},
+		{`bash /proc/self/fd/3 3< <(echo x)`, true},
+		{`exec 3< <(echo x); bash <&3`, true},
+		{`exec 3<file; bash <&3`, false},
+		{`exec 3<file; bash /dev/fd/3`, false},
+		{"exec 3<<'EOF'\nbody\nEOF\nbash /dev/fd/3", false},
+		{`coproc bash; echo x >&${COPROC[1]}`, true},
+		{`coproc NAME { bash; }`, true},
+		{`bash script.sh`, false},
+		{"bash /dev/stdin <<'EOF'\nbody\nEOF", false},
+		{`bash <&0`, false},
+		{`coproc cat`, false},
+		{`bash /dev/fd/3 3<file`, false},
+		{`bash <&3 3<file`, false},
+		{`bash 0<&3 3<file`, false},
+		{`bash < file`, false},
+		{"bash /dev/fd/3 3<<'EOF'\nbody\nEOF", false},
+		{`bash -s`, false},
+		{`bash -- /dev/stdin`, true},
+		{`sudo bash /dev/stdin`, true},
+		{`env bash /dev/fd/3 3<file`, false},
+		{`bash /dev/fd/0`, true},
+		{`bash <&3`, true},
+		{`bash 0<&3`, true},
+		{`coproc bash -c 'echo'`, false},
+		{`sh /dev/stdin`, true},
+		{`dash /dev/stdin`, true},
+		{`zsh /dev/stdin`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if IsShell(call.Name) || call.Name == "dash" || tt.src == "coproc cat" && call.Name == "cat" {
+					if call.ScriptInput != tt.want {
+						t.Fatalf("%s ScriptInput=%t, want %t: %#v", call.Name, call.ScriptInput, tt.want, call)
+					}
+					return
+				}
+			}
+			t.Fatalf("shell call not found: %#v", calls)
+		})
+	}
+}
+
 func TestUnknownShellScriptInput(t *testing.T) {
 	for _, command := range []string{
 		`echo 'kill 1' | bash`,
