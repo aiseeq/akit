@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -17,7 +16,11 @@ import (
 	"github.com/aiseeq/akit/proc"
 )
 
+// mutBinary is the test binary itself: with mutAsMain set it runs mut's main
+// instead of the tests, so no separate build and no build directory to clean.
 var mutBinary string
+
+const mutAsMain = "MUT_TEST_AS_MAIN"
 
 func TestLoadForeignSpec(t *testing.T) {
 	o := opts{testArgs: []string{"go", "test"}}
@@ -31,19 +34,18 @@ func TestLoadForeignSpec(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "mut-test-bin-")
+	if os.Getenv(mutAsMain) == "1" {
+		// The test commands mut runs must not start as mut themselves.
+		_ = os.Unsetenv(mutAsMain)
+		main()
+		os.Exit(0)
+	}
+	exe, err := os.Executable()
 	if err != nil {
 		panic(err)
 	}
-	mutBinary = filepath.Join(dir, "mut")
-	build := exec.Command("go", "build", "-o", mutBinary, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		fmt.Fprintln(os.Stderr, string(out))
-		os.Exit(2)
-	}
-	code := m.Run()
-	_ = os.RemoveAll(dir)
-	os.Exit(code)
+	mutBinary = exe
+	os.Exit(m.Run())
 }
 
 type fixture struct {
@@ -125,7 +127,7 @@ func mutEnv(t *testing.T, bin string) []string {
 		}
 		env = append(env, value)
 	}
-	return append(env, "PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+t.TempDir())
+	return append(env, "PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+t.TempDir(), mutAsMain+"=1")
 }
 func (f *fixture) unchanged(t *testing.T) {
 	t.Helper()
@@ -327,7 +329,8 @@ func TestSignalWaitsForGraftButNotItsDetachedChild(t *testing.T) {
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSignalWaitsForGraftButNotItsDetachedChild$")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = append(os.Environ(), "MUT_SIGNAL_HELPER=1", "MUT_FAKE_GRAFT="+fakeGraft, "MUT_READY="+ready, "MUT_SLEEP_PID="+pidFile)
+	helperTmp := t.TempDir()
+	cmd.Env = append(os.Environ(), "MUT_SIGNAL_HELPER=1", "MUT_FAKE_GRAFT="+fakeGraft, "MUT_READY="+ready, "MUT_SLEEP_PID="+pidFile, "TMPDIR="+helperTmp)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +363,23 @@ func TestSignalWaitsForGraftButNotItsDetachedChild(t *testing.T) {
 	stat, err := proc.ReadStat("/proc", pid)
 	if err != nil || stat.State == "Z" || stat.State == "X" {
 		t.Fatalf("detached child was not left for group cleanup: stat=%+v err=%v", stat, err)
+	}
+	noLeftovers(t, helperTmp)
+}
+
+// noLeftovers fails when a process that ran with TMPDIR=dir left anything there.
+func noLeftovers(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) > 0 {
+		t.Fatalf("left in TMPDIR: %v", names)
 	}
 }
 
