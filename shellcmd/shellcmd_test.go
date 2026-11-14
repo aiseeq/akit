@@ -2356,7 +2356,7 @@ func TestShellScriptInputFileDescriptorsAndCoproc(t *testing.T) {
 	}{
 		{`echo x | bash /dev/stdin`, true},
 		{`bash -`, true},
-		{`bash -- -`, true},
+		{`bash -- -`, false},
 		{`bash -o -`, false},
 		{`bash /dev/fd/3 3< <(echo x)`, true},
 		{`bash /proc/self/fd/3 3< <(echo x)`, true},
@@ -2371,8 +2371,8 @@ func TestShellScriptInputFileDescriptorsAndCoproc(t *testing.T) {
 		{`bash <&0`, false},
 		{`coproc cat`, false},
 		{`bash /dev/fd/3 3<file`, false},
-		{`bash <&3 3<file`, false},
-		{`bash 0<&3 3<file`, false},
+		{`bash <&3 3<file`, true},
+		{`bash 0<&3 3<file`, true},
 		{`bash < file`, false},
 		{"bash /dev/fd/3 3<<'EOF'\nbody\nEOF", false},
 		{`bash -s`, false},
@@ -2397,6 +2397,62 @@ func TestShellScriptInputFileDescriptorsAndCoproc(t *testing.T) {
 				if IsShell(call.Name) || call.Name == "dash" || tt.src == "coproc cat" && call.Name == "cat" {
 					if call.ScriptInput != tt.want {
 						t.Fatalf("%s ScriptInput=%t, want %t: %#v", call.Name, call.ScriptInput, tt.want, call)
+					}
+					return
+				}
+			}
+			t.Fatalf("shell call not found: %#v", calls)
+		})
+	}
+}
+
+func TestShellScriptInputRevisionCases(t *testing.T) {
+	tests := []struct {
+		src  string
+		want bool
+	}{
+		{`bash - /dev/null`, false},
+		{`sh - file`, false},
+		{`bash -`, true},
+		{`bash -- -`, false},
+		{`bash -e -`, true},
+		{"bash\t-", true},
+		{`bash /dev/fd/3 3</dev/null 3<&0`, true},
+		{`exec 3<&0; bash <&3 3</dev/null`, true},
+		{`bash /dev/fd/3 3<&0 0</dev/null`, true},
+		{`bash /dev/fd/3 3<&0 3</dev/null`, false},
+		{`bash /dev/stdin < /dev/stdin`, true},
+		{`bash /dev/fd/3 3< /dev/stdin`, true},
+		{`exec 3< /dev/stdin; bash /dev/fd/3`, true},
+		{`exec 3</dev/null; if true; then exec 3<&0; fi; bash <&3`, true},
+		{`exec 3</dev/null; for x in a; do exec 3<&0; done; bash <&3`, true},
+		{`exec 3</dev/null; f() { exec 3<&0; }; f; bash <&3`, true},
+		{`bash /proc/$$/fd/3`, true},
+		{`bash /proc/${$}/fd/3`, true},
+		{`coproc dash`, true},
+		{`coproc bash -c 'read x; eval "$x"'`, true},
+		{`bash /dev/fd/3 3</proc/$$/fd/0`, true},
+		{`bash /dev/fd/3 3</proc/${$}/fd/0`, true},
+		{`exec 3</proc/$$/fd/0; bash /dev/fd/3`, true},
+		{`exec 3</dev/null; case x in x) exec 3<&0 ;; esac; bash <&3`, true},
+		{`exec 3</dev/null; { exec 3<&0; }; bash <&3`, true},
+		{`exec 3</dev/null; ( exec 3<&0 ); bash <&3`, true},
+		{`bash -o -`, false},
+		{`bash -c 'echo ok' -`, false},
+		{`bash script.sh -`, false},
+		{`echo - | bash script.sh`, false},
+		{`coproc bash -c 'echo'`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if IsShell(call.Name) || call.Name == "dash" {
+					if call.ScriptInput != tt.want {
+						t.Errorf("%s ScriptInput=%t, want %t: %#v", call.Name, call.ScriptInput, tt.want, call)
 					}
 					return
 				}
