@@ -91,7 +91,7 @@ func TestUnitUSDDoesNotRoundSmallAmount(t *testing.T) {
 	path := writeRates(t, "valid_from\tprovider\tplan\tplan_usd_month\tapi_usd_week\tcents_per_api_usd\tcaution\n"+
 		"2026-01-01\tanthropic\tmax\t200\t1000\t3.03\t1\n")
 	code, out, errOut := invoke(t, "--usd=1.000", "--provider=anthropic", "--unit=usd", "--rates="+path)
-	if code != 0 || !strings.HasPrefix(out, "$1.000 API = $0.0303 subscription\n") {
+	if code != 0 || !strings.HasPrefix(out, "$1 API = $0.0303 subscription\n") {
 		t.Fatalf("code=%d out=%q err=%q", code, out, errOut)
 	}
 }

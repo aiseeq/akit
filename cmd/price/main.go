@@ -25,7 +25,10 @@ Usage:
 Default unit week: percent of one week of a $100 subscription, using
 AMOUNT / (api_usd_week × 100 / plan_usd_month) × 100. Without --plan the
 latest row for the provider across all plans is used. Equal dates use the
-last row in rates.tsv. The chosen plan and date are printed below the result.
+last row in rates.tsv. The chosen plan and date are printed below the result;
+when several plans share the latest date, a note names them.
+
+The result has three significant digits, without an exponent.
 
 Unit usd converts API dollars to subscription dollars with
 AMOUNT × cents_per_api_usd / 100 × caution. The rates.tsv header defines
@@ -46,9 +49,9 @@ const (
 var errHelp = errors.New("help")
 
 type options struct {
-	amount                                      float64
-	amountText, provider, plan, unit, ratesPath string
-	amountSet, providerSet, unitSet             bool
+	amount                          float64
+	provider, plan, unit, ratesPath string
+	amountSet, providerSet, unitSet bool
 }
 
 type env struct{ home, configHome string }
@@ -110,7 +113,7 @@ func (opts *options) set(name, value string) error {
 		if err != nil || n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) {
 			return fmt.Errorf("--usd must be a positive number, got %q", value)
 		}
-		opts.amount, opts.amountText, opts.amountSet = n, value, true
+		opts.amount, opts.amountSet = n, true
 	case "--provider":
 		if opts.providerSet || value == "" {
 			return errors.New("--provider must be supplied once with a value")
@@ -194,7 +197,7 @@ func run(opts options, e env, now time.Time, out, errOut io.Writer) int {
 	if plan == "" {
 		plan = "(unspecified)"
 	}
-	amount := "$" + opts.amountText
+	amount := "$" + strconv.FormatFloat(opts.amount, 'f', -1, 64)
 	formattedResult := significant(result)
 	if opts.unit == "usd" {
 		fmt.Fprintf(out, "%s API = $%s subscription\n", amount, formattedResult)
