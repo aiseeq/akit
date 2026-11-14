@@ -614,8 +614,8 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 }
 
 func (info *walkInfo) collectTopLevelCalls(file *syntax.File) {
-	// Этот индекс нужен только для ArgLiteral; сбор walkInfo занимал 6% памяти
-	// в профиле выделений на корпусе команд.
+	// Этот индекс нужен только для ArgLiteral; на корпусе команд он давал около 1,4%
+	// выделенной памяти Find.
 	if !info.literalSimple {
 		return
 	}
