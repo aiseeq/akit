@@ -1095,6 +1095,11 @@ func knownPipedScriptInput(stmt *syntax.Stmt, call *syntax.CallExpr, src string,
 	if command || !useStdin && operand < len(targetArgs) {
 		return false
 	}
+	for _, redir := range stmt.Redirs {
+		if fd, valid := inputRedirFD(redir); valid && fd == 0 {
+			return false
+		}
+	}
 	for _, piped := range info.pipedHeredocs {
 		if piped.shell == stmt {
 			return true
@@ -1445,13 +1450,13 @@ func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 	}
 	if useStdin {
 		if operand < len(args) {
-			return true, true
+			return false, true
 		}
 		if operand > 0 && (args[operand-1] == "-" || args[operand-1] == "--") {
 			if shellDoubleDashHasFileSemantics(args, shell, operand) {
 				return false, false
 			}
-			return true, true
+			return false, true
 		}
 		return false, false
 	}
@@ -1459,7 +1464,10 @@ func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 		fd := shellScriptInputFD(args[operand])
 		return fd >= 0, fd == 0
 	}
-	return false, true
+	if len(args) == 0 {
+		return false, true
+	}
+	return false, false
 }
 
 func shellScriptInputForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string) bool {
@@ -1477,7 +1485,7 @@ func shellScriptInputForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, 
 	if !wrappers[name] || !wrapperScriptInputCandidate(stmt, call, src) {
 		return false
 	}
-	return shellScriptInputWrappedForm(stmt, call, src, vars)
+	return shellScriptInputWrappedForm(call, src, vars)
 }
 
 func wrapperScriptInputCandidate(stmt *syntax.Stmt, call *syntax.CallExpr, src string) bool {
@@ -1507,10 +1515,7 @@ func shellScriptInputDirectForm(stmt *syntax.Stmt, call *syntax.CallExpr, src st
 	if input {
 		return true
 	}
-	if stdin && hasUnknownFDInputRedir(stmt.Redirs) {
-		return true
-	}
-	return false
+	return stdin
 }
 
 func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]string) (bool, error) {
@@ -1534,17 +1539,14 @@ func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]
 	return read && eval, nil
 }
 
-func shellScriptInputWrappedForm(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string) bool {
+func shellScriptInputWrappedForm(call *syntax.CallExpr, src string, vars map[string]string) bool {
 	args, _ := words(call.Args, src, vars)
 	shell, args, ok := shellInputTargetArgs(args)
 	if !ok {
 		return false
 	}
 	input, stdin := shellScriptInputArgs(args, shell)
-	if input {
-		return true
-	}
-	return stdin && hasUnknownFDInputRedir(stmt.Redirs)
+	return input || stdin
 }
 
 func shellInputTargetArgs(args []string) (string, []string, bool) {
@@ -1575,6 +1577,68 @@ func hasUnknownFDInputRedir(redirs []*syntax.Redirect) bool {
 	return false
 }
 
+func knownSingleLineEchoInput(redir *syntax.Redirect, src string, vars map[string]string) bool {
+	if redir.Op.String() != "<" || redir.Word == nil {
+		return false
+	}
+	var proc *syntax.ProcSubst
+	count := 0
+	syntax.Walk(redir.Word, func(node syntax.Node) bool {
+		if candidate, ok := node.(*syntax.ProcSubst); ok {
+			proc = candidate
+			count++
+		}
+		return true
+	})
+	if count != 1 || len(proc.Stmts) != 1 || len(proc.Stmts[0].Redirs) != 0 {
+		return false
+	}
+	inner, ok := proc.Stmts[0].Cmd.(*syntax.CallExpr)
+	if !ok || len(inner.Args) != 2 {
+		return false
+	}
+	args, _ := words(inner.Args, src, vars)
+	name, nameOK := wordValue(inner.Args[0])
+	value, valueOK := wordValue(inner.Args[1])
+	return len(args) == 2 && nameOK && commandName(name) == "echo" && valueOK && !strings.HasPrefix(value, "-") && !strings.ContainsAny(value, "\r\n")
+}
+
+func loopReadsCall(loop *syntax.WhileClause, call *syntax.CallExpr) bool {
+	bodyHasCall, conditionReads := false, false
+	for _, body := range loop.Do {
+		syntax.Walk(body, func(child syntax.Node) bool {
+			bodyHasCall = bodyHasCall || child == call
+			return !bodyHasCall
+		})
+	}
+	for _, condition := range loop.Cond {
+		if inner, ok := condition.Cmd.(*syntax.CallExpr); ok && len(inner.Args) > 0 {
+			name, literal := wordValue(inner.Args[0])
+			conditionReads = conditionReads || literal && commandName(name) == "read"
+		}
+	}
+	return bodyHasCall && conditionReads
+}
+
+func knownLoopReadStdin(file *syntax.File, call *syntax.CallExpr, src string, vars map[string]string) bool {
+	known := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok {
+			return true
+		}
+		loop, ok := stmt.Cmd.(*syntax.WhileClause)
+		if !ok || !loopReadsCall(loop, call) {
+			return true
+		}
+		for _, redir := range stmt.Redirs {
+			known = known || knownSingleLineEchoInput(redir, src, vars)
+		}
+		return !known
+	})
+	return known
+}
+
 func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, stdin *syntax.Redirect) bool {
 	args, _ := words(call.Args, src, vars)
 	_, targetArgs, ok := shellInputTargetArgs(args)
@@ -1602,10 +1666,15 @@ func knownShellScriptInput(file *syntax.File, stmt *syntax.Stmt, call *syntax.Ca
 			applyKnownInputRedirect(redir, dest, known, set)
 		}
 	}
-	if set[fd] {
-		return known[fd]
+	if set[fd] && known[fd] {
+		return true
 	}
-	return false
+	for _, redir := range stmt.Redirs {
+		if dest, valid := inputRedirFD(redir); valid && dest == 0 {
+			return false
+		}
+	}
+	return fd == 0 && knownLoopReadStdin(file, call, src, vars)
 }
 
 func knownExecFDStates(file *syntax.File, before int) (map[int]bool, map[int]bool) {
@@ -1654,15 +1723,18 @@ func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[in
 		}
 	}
 	switch redir.Op.String() {
-	case "<", "<<", "<<-", "<<<", "<>":
-		if (redir.Op.String() == "<" || redir.Op.String() == "<>") && literal {
+	case "<<", "<<-", "<<<":
+		known[dest] = true
+		set[dest] = true
+	case "<", "<>":
+		if literal {
 			if source := shellScriptInputFD(target); source >= 0 {
 				known[dest] = set[source] && known[source]
 				set[dest] = true
 				return
 			}
 		}
-		known[dest] = redir.Op.String() != "<" || literal && !strings.Contains(target, "<(") && !strings.Contains(target, ">(")
+		known[dest] = !strings.Contains(target, "<(") && !strings.Contains(target, ">(") && !strings.Contains(target, "/dev/fd/") && !strings.Contains(target, "/proc/")
 		set[dest] = true
 	case "<&", ">&":
 		source, ok := shellFDNumber(target)
@@ -1673,6 +1745,10 @@ func applyKnownInputRedirect(redir *syntax.Redirect, dest int, known, set map[in
 
 func inputRedirFD(redir *syntax.Redirect) (int, bool) {
 	if redir.N == nil || redir.N.Value == "" {
+		switch redir.Op.String() {
+		case ">", ">&", ">>", ">|", "&>", "&>>":
+			return 1, true
+		}
 		return 0, true
 	}
 	return shellFDNumber(redir.N.Value)
