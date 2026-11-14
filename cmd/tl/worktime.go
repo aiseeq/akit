@@ -1,30 +1,57 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
 	"math"
+	"os"
 	"path/filepath"
 	"regexp"
+	"regexp/syntax"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
 )
 
-const defaultWorkGap = 15 * time.Minute
+const (
+	defaultWorkGap  = 15 * time.Minute
+	maxWorktimeLine = 256 << 20
+	maxWorktimeYear = 9999
+)
 
 type interval struct{ start, end time.Time }
 
 type sourceActivity struct {
-	src     source
-	times   []time.Time
-	matched bool
+	src      source
+	events   []time.Time
+	keyTimes []time.Time
+	loaded   bool
 }
 
-// activitySegments closes each burst at its last event. A single event represents
-// one minute of activity so an isolated short burst remains measurable.
+func isActivityEvent(role transcript.Role) bool {
+	switch role {
+	case transcript.User, transcript.Ask, transcript.Peer, transcript.Agent, transcript.Cmd, transcript.Out, transcript.Note:
+		return true
+	default:
+		return false
+	}
+}
+
+func isKeyEvent(role transcript.Role) bool {
+	switch role {
+	case transcript.User, transcript.Agent, transcript.Cmd, transcript.Note, transcript.Peer:
+		return true
+	default:
+		return false
+	}
+}
+
+// activitySegments bounds each burst by its event times and gives every burst at least one minute.
 func activitySegments(events []time.Time, gap time.Duration) []interval {
 	slices.SortFunc(events, func(a, b time.Time) int { return a.Compare(b) })
 	if len(events) == 0 {
@@ -32,22 +59,22 @@ func activitySegments(events []time.Time, gap time.Duration) []interval {
 	}
 	segments := make([]interval, 0, len(events))
 	start, last := events[0], events[0]
+	closeSegment := func() {
+		end := last
+		if end.Sub(start) < time.Minute {
+			end = start.Add(time.Minute)
+		}
+		segments = append(segments, interval{start, end})
+	}
 	for _, at := range events[1:] {
 		if at.Sub(last) > gap {
-			end := last
-			if end.Equal(start) {
-				end = end.Add(time.Minute)
-			}
-			segments = append(segments, interval{start, end})
+			closeSegment()
 			start = at
 		}
 		last = at
 	}
-	end := last
-	if end.Equal(start) {
-		end = end.Add(time.Minute)
-	}
-	return append(segments, interval{start, end})
+	closeSegment()
+	return segments
 }
 
 func unionIntervals(in []interval) []interval {
@@ -105,33 +132,128 @@ func jiraDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm", hours, mins)
 }
 
-func worktimeEvents(src source, opts options, re *regexp.Regexp) ([]time.Time, bool, error) {
-	var times []time.Time
-	matched := false
-	_, err := transcript.ReadWithTools(src.Path, nil, func(ev transcript.Event) {
-		if ev.Time.IsZero() || (!opts.since.IsZero() && ev.Time.Before(opts.since)) ||
-			(!opts.until.IsZero() && ev.Time.After(opts.until)) {
-			return
+func rawLineMatches(raw []byte, re *regexp.Regexp, literals []string) bool {
+	if len(literals) > 0 && !strings.Contains(strings.Join(literals, ""), "\n") {
+		candidate := false
+		for _, literal := range literals {
+			if hasFolded(raw, literal) {
+				candidate = true
+				break
+			}
 		}
-		switch ev.Role {
-		case transcript.User, transcript.Agent, transcript.Cmd, transcript.Out:
-		default:
-			return
+		if !candidate {
+			return false
 		}
-		if re.MatchString(ev.Who + " " + ev.Shown()) {
-			matched = true
-		}
-		times = append(times, ev.Time)
-	})
-	return times, matched, err
+	}
+	return re.Match(raw)
 }
 
-func eventBounds(events []time.Time) (interval, bool) {
-	if len(events) == 0 {
+func readKeyTimes(src source, re *regexp.Regexp, literals []string) ([]time.Time, error) {
+	var times []time.Time
+	_, err := transcript.ReadWithTools(src.Path, func(raw []byte, _ transcript.ToolNames) bool {
+		return rawLineMatches(raw, re, literals)
+	}, func(ev transcript.Event) {
+		if !ev.Time.IsZero() && isKeyEvent(ev.Role) && re.MatchString(ev.Who+" "+ev.Shown()) {
+			times = append(times, ev.Time)
+		}
+	})
+	return times, err
+}
+
+func readActivityTimes(src source) ([]time.Time, error) {
+	if isCodexRollout(src.Path) {
+		var times []time.Time
+		_, err := transcript.ReadWithTools(src.Path, nil, func(ev transcript.Event) {
+			if !ev.Time.IsZero() && isActivityEvent(ev.Role) {
+				times = append(times, ev.Time)
+			}
+		})
+		return times, err
+	}
+	f, err := os.Open(src.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open transcript: %w", err)
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxWorktimeLine)
+	var times []time.Time
+	line := 0
+	for scanner.Scan() {
+		line++
+		raw := scanner.Bytes()
+		var row struct {
+			Type      string `json:"type"`
+			Timestamp string `json:"timestamp"`
+			Message   struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, fmt.Errorf("decode transcript line %d: %w", line, err)
+		}
+		active := row.Type == "user" && row.Timestamp != ""
+		if row.Type == "assistant" {
+			var parts []struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(row.Message.Content, &parts); err != nil {
+				return nil, fmt.Errorf("decode assistant content at line %d: %w", line, err)
+			}
+			for _, part := range parts {
+				if part.Type == "text" || part.Type == "tool_use" {
+					active = true
+					break
+				}
+			}
+		}
+		if active && row.Timestamp != "" {
+			at, parseErr := time.Parse(time.RFC3339Nano, row.Timestamp)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse timestamp at line %d: %w", line, parseErr)
+			}
+			times = append(times, at)
+		}
+	}
+	readErr, closeErr := scanner.Err(), f.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("scan transcript: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close transcript: %w", closeErr)
+	}
+	return times, nil
+}
+
+func worktimePrefilter(pattern string) ([]string, error) {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, fmt.Errorf("parse regexp syntax: %w", err)
+	}
+	var best []string
+	bestMin := 0
+	for _, group := range requiredLiterals(parsed) {
+		if len(group) == 0 {
+			continue
+		}
+		shortest := len(group[0])
+		for _, literal := range group[1:] {
+			if len(literal) < shortest {
+				shortest = len(literal)
+			}
+		}
+		if shortest > bestMin {
+			best, bestMin = group, shortest
+		}
+	}
+	return best, nil
+}
+
+func keyWindow(activity sourceActivity, gap time.Duration) (interval, bool) {
+	if len(activity.keyTimes) == 0 {
 		return interval{}, false
 	}
-	start, end := events[0], events[0]
-	for _, at := range events[1:] {
+	start, end := activity.keyTimes[0], activity.keyTimes[0]
+	for _, at := range activity.keyTimes[1:] {
 		if at.Before(start) {
 			start = at
 		}
@@ -139,76 +261,178 @@ func eventBounds(events []time.Time) (interval, bool) {
 			end = at
 		}
 	}
-	return interval{start, end.Add(time.Nanosecond)}, true
+	if end.Equal(start) {
+		segments := activitySegments(append([]time.Time(nil), activity.events...), gap)
+		if len(segments) > 0 {
+			end = segments[len(segments)-1].end
+		} else {
+			end = start.Add(time.Minute)
+		}
+	}
+	if end.Before(start) {
+		end = start
+	}
+	return interval{start, end}, true
 }
 
-func collectActivities(sources []source, opts options, re *regexp.Regexp) ([]sourceActivity, map[string]interval, error) {
-	activities := make([]sourceActivity, 0, len(sources))
-	windows := map[string]interval{}
+func collectActivities(sources []source, re *regexp.Regexp, literals []string, gap time.Duration, stderr io.Writer) (map[string]sourceActivity, map[string]interval, error) {
+	activities := make(map[string]sourceActivity, len(sources))
+	matchedParent := make(map[string]bool, len(sources))
 	for _, src := range sources {
-		events, hasKey, readErr := worktimeEvents(src, opts, re)
-		if readErr != nil {
-			return nil, nil, fmt.Errorf("read %s: %w", src.Path, readErr)
+		keyTimes, err := readKeyTimes(src, re, literals)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read %s: %w", src.Path, err)
 		}
-		if bounds, ok := eventBounds(events); ok {
-			windows[src.ID] = bounds
-		}
-		activities = append(activities, sourceActivity{src: src, times: events, matched: hasKey})
+		activities[src.ID] = sourceActivity{src: src, keyTimes: keyTimes}
+		matchedParent[src.ID] = len(keyTimes) > 0
 	}
-	for _, activity := range activities {
-		if activity.src.ParentID == "" {
-			continue
-		}
-		if _, ok := windows[activity.src.ParentID]; ok {
-			continue
-		}
-		parentPath := filepath.Dir(filepath.Dir(activity.src.Path)) + ".jsonl"
-		parent := transcript.NewSource(parentPath)
-		if parent.ID != activity.src.ParentID {
-			continue
-		}
-		events, _, readErr := worktimeEvents(source{Path: parentPath, ID: parent.ID}, opts, re)
-		if readErr != nil {
-			return nil, nil, fmt.Errorf("read parent %s: %w", parentPath, readErr)
-		}
-		if bounds, ok := eventBounds(events); ok {
-			windows[parent.ID] = bounds
-		}
+	if err := loadMissingParentKeys(sources, activities, matchedParent, re, literals, stderr); err != nil {
+		return nil, nil, err
 	}
-	return activities, windows, nil
+	if err := loadSelectedActivityEvents(sources, activities, matchedParent); err != nil {
+		return nil, nil, err
+	}
+	parentWindows := matchedParentWindows(activities, matchedParent, gap)
+	return activities, parentWindows, nil
 }
 
-func worktimeIntervals(activities []sourceActivity, windows map[string]interval, gap time.Duration) ([]interval, bool) {
+func loadMissingParentKeys(sources []source, activities map[string]sourceActivity, matched map[string]bool,
+	re *regexp.Regexp, literals []string, stderr io.Writer) error {
+	warned := map[string]bool{}
+	for _, src := range sources {
+		if src.ParentID == "" || len(activities[src.ID].keyTimes) == 0 {
+			continue
+		}
+		if _, present := activities[src.ParentID]; present {
+			continue
+		}
+		parentPath := filepath.Dir(filepath.Dir(src.Path)) + ".jsonl"
+		parent := transcript.NewSource(parentPath)
+		if parent.ID != src.ParentID {
+			continue
+		}
+		if _, err := os.Stat(parentPath); err != nil {
+			if os.IsNotExist(err) {
+				if !warned[parentPath] {
+					fmt.Fprintf(stderr, "tl: warning: parent transcript %s is missing; subagent uses its own key window\n", parentPath)
+					warned[parentPath] = true
+				}
+				continue
+			}
+			return fmt.Errorf("stat parent %s: %w", parentPath, err)
+		}
+		parentSrc := source{Path: parentPath, ID: parent.ID}
+		keyTimes, err := readKeyTimes(parentSrc, re, literals)
+		if err != nil {
+			return fmt.Errorf("read parent %s: %w", parentPath, err)
+		}
+		activities[parent.ID] = sourceActivity{src: parentSrc, keyTimes: keyTimes}
+		matched[parent.ID] = len(keyTimes) > 0
+	}
+	return nil
+}
+
+func loadSelectedActivityEvents(sources []source, activities map[string]sourceActivity, matched map[string]bool) error {
+	load := func(id string) error {
+		activity := activities[id]
+		if activity.loaded {
+			return nil
+		}
+		events, err := readActivityTimes(activity.src)
+		if err != nil {
+			return fmt.Errorf("read activity %s: %w", activity.src.Path, err)
+		}
+		activity.events, activity.loaded = events, true
+		activities[id] = activity
+		return nil
+	}
+	for _, src := range sources {
+		if len(activities[src.ID].keyTimes) > 0 || matched[src.ParentID] {
+			if err := load(src.ID); err != nil {
+				return err
+			}
+		}
+	}
+	for id, hasKey := range matched {
+		if hasKey {
+			if err := load(id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func matchedParentWindows(activities map[string]sourceActivity, matched map[string]bool, gap time.Duration) map[string]interval {
+	windows := make(map[string]interval)
+	for id, hasKey := range matched {
+		if !hasKey {
+			continue
+		}
+		if window, ok := keyWindow(activities[id], gap); ok {
+			windows[id] = window
+		}
+	}
+	return windows
+}
+
+func worktimeIntervals(activities map[string]sourceActivity, windows map[string]interval, sources []source,
+	gap time.Duration, timeWindow interval) ([]interval, bool) {
+	children := map[string]bool{}
+	for _, src := range sources {
+		if src.ParentID != "" {
+			children[src.ParentID] = true
+		}
+	}
 	var intervals []interval
 	matched := false
-	for _, activity := range activities {
-		if !activity.matched {
+	for _, id := range slices.Sorted(maps.Keys(activities)) {
+		activity := activities[id]
+		ownWindow, ownMatch := keyWindow(activity, gap)
+		parentWindow, parentMatch := windows[activity.src.ParentID]
+		if !ownMatch && !parentMatch {
 			continue
 		}
 		matched = true
-		segments := activitySegments(activity.times, gap)
-		if activity.src.ParentID != "" {
-			if window, ok := windows[activity.src.ParentID]; ok {
-				segments = clipIntervals(segments, window)
+		segments := activitySegments(activity.events, gap)
+		if ownMatch {
+			own := clipIntervals(segments, ownWindow)
+			intervals = append(intervals, clipIntervals(own, timeWindow)...)
+		}
+		if children[id] {
+			if context, ok := windows[id]; ok {
+				parentActivity := clipIntervals(segments, context)
+				intervals = append(intervals, clipIntervals(parentActivity, timeWindow)...)
 			}
 		}
-		intervals = append(intervals, segments...)
+		if parentMatch {
+			child := clipIntervals(segments, parentWindow)
+			intervals = append(intervals, clipIntervals(child, timeWindow)...)
+		}
 	}
 	return intervals, matched
 }
 
-func reportWorktime(sources []source, opts options, w io.Writer) int {
-	re, err := regexp.Compile("(?i)" + opts.grep)
+func reportWorktime(sources []source, opts options, e env, re *regexp.Regexp, w, stderr io.Writer) int {
+	literals, err := worktimePrefilter(opts.grep)
 	if err != nil {
-		fmt.Fprintf(w, "tl: --grep: %v\n", err)
+		fmt.Fprintf(stderr, "tl: parse --grep for prefilter: %v\n", err)
 		return exitUsage
 	}
-	activities, windows, err := collectActivities(sources, opts, re)
+	activities, parentWindows, err := collectActivities(sources, re, literals, opts.gap, stderr)
 	if err != nil {
-		fmt.Fprintf(w, "tl: %v\n", err)
+		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	intervals, matched := worktimeIntervals(activities, windows, opts.gap)
+	since := opts.since
+	if since.IsZero() {
+		since = e.now.Add(-sinceDefault)
+	}
+	until := opts.until
+	if until.IsZero() {
+		until = time.Date(maxWorktimeYear, time.December, 31, 23, 59, 59, 999999999, time.Local)
+	}
+	intervals, matched := worktimeIntervals(activities, parentWindows, sources, opts.gap, interval{since, until})
 	if !matched {
 		fmt.Fprintln(w, "tl: no sessions with matching key")
 		return exitNone
@@ -221,8 +445,9 @@ func reportWorktime(sources []source, opts options, w io.Writer) int {
 	byDay := map[string]time.Duration{}
 	for _, span := range merged {
 		for at := span.start; at.Before(span.end); {
-			day := at.In(time.Local).Format(time.DateOnly)
-			midnight := time.Date(at.In(time.Local).Year(), at.In(time.Local).Month(), at.In(time.Local).Day()+1, 0, 0, 0, 0, time.Local)
+			local := at.In(time.Local)
+			day := local.Format(time.DateOnly)
+			midnight := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, time.Local)
 			end := span.end
 			if midnight.Before(end) {
 				end = midnight
@@ -231,14 +456,13 @@ func reportWorktime(sources []source, opts options, w io.Writer) int {
 			at = end
 		}
 	}
-	var sum time.Duration
-	for _, duration := range byDay {
-		sum += duration
-	}
-	fmt.Fprintf(w, "total\t%s\n", jiraDuration(sum))
 	days := slices.Sorted(maps.Keys(byDay))
+	var total time.Duration
 	for _, day := range days {
+		daily := roundedWork(byDay[day])
+		total += daily
 		fmt.Fprintf(w, "%s\t%s\n", day, jiraDuration(byDay[day]))
 	}
+	fmt.Fprintf(w, "total\t%s\n", jiraDuration(total))
 	return 0
 }

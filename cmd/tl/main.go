@@ -37,7 +37,7 @@ path (Claude Code or codex rollout).
                 (default user,ask,peer,agent: the conversation)
   --since T     from time T: 12:05, 25.10, "25.10 12:05", 2026-10-25T10:05,
                 2026-10-25T10:05:00, 2026-10-25T10:05:00Z, 2026-10-25T10:05:00+01:00,
-                or ago: 30m 2h 3d
+                or ago: 30m 2h 3d (default --all window: 7d)
   --until T     up to time T, same forms
   --grep RE     events whose text matches RE (case-insensitive)
                 Unparsable line counts include only lines retained for parsing.
@@ -56,10 +56,19 @@ path (Claude Code or codex rollout).
                 summary names the transcripts read: runs that leave none
                 (claude -p --no-session-persistence) and codex rollouts
                 (their token counts are not read) are not in it
-  --worktime    union matching session activity; --gap defaults to 15m
-                events: user/agent messages, tool calls and results; a lone
-                event is 1m; splits at longer gaps; days use local time
-                Claude subagents use parent bounds; codex rollouts count separately
+  --worktime    Jira worktime for --grep; per session, the window starts at the
+                first match in the whole file; multiple matches end at the last
+                match, one match keeps the window open through last activity.
+                Activity events: user/peer messages, agent text, tool calls and
+                results. Activity is clipped to --since/--until. Key roles:
+                user, agent, cmd, note/prompt, peer;
+                --grep is a case-insensitive regexp, e.g. --grep '\bKEY-123\b';
+                KEY-12 also matches KEY-123 without word boundaries.
+                out is not searched. Subagents use the parent's key window;
+                Codex fighters are omitted unless --codex is set.
+                A lone event is 1m; gaps > --gap split activity (default 15m).
+                Intervals crossing midnight split at local midnight. Day rows
+                round up to 15m; total sums the rounded day rows.
   --gap D       activity split threshold (default 15m)
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
@@ -108,6 +117,7 @@ type options struct {
 	usage        bool
 	worktime     bool
 	gap          time.Duration
+	gapSet       bool
 	waitProg     string
 	waitSub      string
 	q            int
@@ -273,10 +283,24 @@ func checkWorktimeCombos(opts options) error {
 	if opts.worktime && opts.waitProg != "" {
 		return errors.New("--worktime and --wait cannot be used together")
 	}
-	if !opts.worktime && opts.gap != defaultWorkGap {
+	if !opts.worktime && opts.gapSet {
 		return errors.New("--gap works with --worktime")
 	}
+	if opts.worktime && worktimeOutputFlagSet(opts) {
+		return errors.New("--worktime cannot be used with --raw, --max, --width, --role or -C")
+	}
 	return nil
+}
+
+func worktimeOutputFlagSet(opts options) bool {
+	for _, arg := range opts.originalArgs {
+		name, _, _ := strings.Cut(arg, "=")
+		switch name {
+		case "--raw", "--max", "--width", "--role", "-C":
+			return true
+		}
+	}
+	return false
 }
 
 func checkEventOutputCombos(opts options) error {
@@ -301,6 +325,7 @@ func setFlag(opts *options, name, val string, now time.Time) error {
 		return err
 	}
 	if name == "--gap" {
+		opts.gapSet = true
 		gap, err := time.ParseDuration(val)
 		if err != nil {
 			return fmt.Errorf("--gap: %w", err)
@@ -485,7 +510,7 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		return code
 	}
 	if opts.worktime {
-		return reportWorktime(sources, opts, stdout)
+		return reportWorktime(sources, opts, e, f.re, stdout, stderr)
 	}
 	res, err := scan(sources, opts)
 	if err != nil {
