@@ -56,20 +56,21 @@ path (Claude Code or codex rollout).
                 summary names the transcripts read: runs that leave none
                 (claude -p --no-session-persistence) and codex rollouts
                 (their token counts are not read) are not in it
-  --worktime    Jira worktime for --grep; per session, the window starts at the
-                first match in the whole file; multiple matches end at the last
-                match, one match keeps the window open through last activity.
-                Activity events: user/peer messages, agent text, tool calls and
-                results. Activity is clipped to --since/--until. Key roles:
-                user, agent, cmd, note/prompt, peer;
-                --grep is a case-insensitive regexp, e.g. --grep '\bKEY-123\b';
-                KEY-12 also matches KEY-123 without word boundaries.
-                out is not searched. Subagents use the parent's key window;
-                Codex fighters are omitted unless --codex is set.
-                A lone event is 1m; gaps > --gap split activity (default 15m).
-                Intervals crossing midnight split at local midnight. Day rows
-                round up to 15m; total sums the rounded day rows.
+  --worktime    Jira worktime for --grep; a key chunk starts at a key event
+                and ends at the last activity within --key-gap after the last
+                key match (inclusive; default 30m). Activity events: user/peer
+                messages, agent text, tool calls and results; gaps > --gap
+                split activity (default 15m). Key roles: user, agent, cmd,
+                note/prompt, peer; out is not searched.
+                Bare --grep keys get \b boundaries only in --worktime; regex stays as written.
+                Activity is clipped to --since/--until. Subagents and Codex
+                fighters launched inside a parent key chunk count all their
+                activity; a brief with a key uses its own key chunks.
+                Codex fighters are omitted unless --codex is set. A lone event
+                is 1m. Midnight crossings split at local midnight; day rows
+                round up to 15m and total sums the rounded rows.
   --gap D       activity split threshold (default 15m)
+  --key-gap D   maximum time after a key match to keep a key chunk open (default 30m)
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
@@ -118,6 +119,8 @@ type options struct {
 	worktime     bool
 	gap          time.Duration
 	gapSet       bool
+	keyGap       time.Duration
+	keyGapSet    bool
 	waitProg     string
 	waitSub      string
 	q            int
@@ -176,7 +179,7 @@ type env struct {
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
-	opts := options{max: 100, width: 300, q: 50, gap: defaultWorkGap}
+	opts := options{max: 100, width: 300, q: 50, gap: defaultWorkGap, keyGap: defaultKeyGap}
 	opts.originalArgs = append([]string(nil), args...)
 	if err := setRoles(&opts, "user,ask,peer,agent"); err != nil {
 		return opts, err
@@ -286,6 +289,9 @@ func checkWorktimeCombos(opts options) error {
 	if !opts.worktime && opts.gapSet {
 		return errors.New("--gap works with --worktime")
 	}
+	if !opts.worktime && opts.keyGapSet {
+		return errors.New("--key-gap works with --worktime")
+	}
 	if opts.worktime && worktimeOutputFlagSet(opts) {
 		return errors.New("--worktime cannot be used with --raw, --max, --width, --role or -C")
 	}
@@ -324,16 +330,24 @@ func setFlag(opts *options, name, val string, now time.Time) error {
 		}
 		return err
 	}
-	if name == "--gap" {
-		opts.gapSet = true
+	if name == "--gap" || name == "--key-gap" {
+		if name == "--gap" {
+			opts.gapSet = true
+		} else {
+			opts.keyGapSet = true
+		}
 		gap, err := time.ParseDuration(val)
 		if err != nil {
-			return fmt.Errorf("--gap: %w", err)
+			return fmt.Errorf("%s: %w", name, err)
 		}
 		if gap <= 0 {
-			return fmt.Errorf("--gap needs a duration > 0, got %q", val)
+			return fmt.Errorf("%s needs a duration > 0, got %q", name, val)
 		}
-		opts.gap = gap
+		if name == "--gap" {
+			opts.gap = gap
+		} else {
+			opts.keyGap = gap
+		}
 		return nil
 	}
 	return setOtherFlag(opts, name, val)
@@ -510,7 +524,7 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		return code
 	}
 	if opts.worktime {
-		return reportWorktime(sources, opts, e, f.re, stdout, stderr)
+		return reportWorktime(sources, opts, e, stdout, stderr)
 	}
 	res, err := scan(sources, opts)
 	if err != nil {

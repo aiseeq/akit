@@ -145,14 +145,14 @@ func TestWorktimeUnionsMatchingSessionsAndIgnoresOthers(t *testing.T) {
 	var a, b, other []string
 	for minute := 0; minute <= 60; minute += 10 {
 		key := "ongoing work"
-		if minute == 0 || minute == 60 {
+		if minute%30 == 0 {
 			key += " KEY-123"
 		}
 		a = append(a, row(base.Add(time.Duration(minute)*time.Minute), key))
 	}
 	for minute := 30; minute <= 90; minute += 10 {
 		key := "parallel work"
-		if minute == 30 || minute == 90 {
+		if minute%30 == 0 {
 			key += " KEY-123"
 		}
 		b = append(b, row(base.Add(time.Duration(minute)*time.Minute), key))
@@ -210,7 +210,7 @@ func TestWorktimeKeyWindowStartsAtFirstMention(t *testing.T) {
 	})
 	writeWorkFile(t, workParentPath(dir), rows)
 	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", `\bKEY-123\b`)
-	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t4h\n") {
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t30m\n") {
 		t.Fatalf("code %d, stderr %q, output:\n%s", code, stderr, out)
 	}
 }
@@ -268,12 +268,12 @@ func TestWorktimeParentWaitsForChild(t *testing.T) {
 		func(at time.Time) string { return workRecord(t, "agent", at, "child work", "") })
 	writeWorkFile(t, workChildPath(dir), child)
 	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
-	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t45m\n") {
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t1h\n") {
 		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
 	}
 }
 
-func TestWorktimeKeyBeforeWindowStillCountsCurrentActivity(t *testing.T) {
+func TestWorktimeKeyGapDoesNotCarryActivityFromPreviousDay(t *testing.T) {
 	e, dir := workHome(t)
 	prev := time.Date(2026, 11, 9, 22, 0, 0, 0, time.FixedZone("synthetic", 3600))
 	today := time.Date(2026, 11, 10, 9, 0, 0, 0, time.FixedZone("synthetic", 3600))
@@ -282,7 +282,23 @@ func TestWorktimeKeyBeforeWindowStillCountsCurrentActivity(t *testing.T) {
 		func(at time.Time) string { return workRecord(t, "agent", at, "continuing", "") })...)
 	writeWorkFile(t, workParentPath(dir), rows)
 	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", `\bKEY-123\b`, "--since", "2026-11-10T10:00:00+01:00")
-	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t1h\n") {
+	if code != exitNone || stderr != "" || !strings.Contains(out, "no activity in the selected time window") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeFindsKeyBeforeSinceAndClipsItsChunk(t *testing.T) {
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 9, 40, 0, 0, time.FixedZone("synthetic", 3600))
+	rows := workRows(t, start, start.Add(40*time.Minute), 5*time.Minute, func(at time.Time) string {
+		if at.Equal(start) {
+			return workRecord(t, "user", at, "KEY-123", "human")
+		}
+		return workRecord(t, "agent", at, "work", "")
+	})
+	writeWorkFile(t, workParentPath(dir), rows)
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123", "--since", "2026-11-10T10:00:00+01:00")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
 		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
 	}
 }
@@ -298,7 +314,7 @@ func TestWorktimeClipsActivityAtUntil(t *testing.T) {
 	})
 	writeWorkFile(t, workParentPath(dir), rows)
 	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123", "--until", "2026-11-10T10:00:00+01:00")
-	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t1h\n") {
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t30m\n") {
 		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
 	}
 }
@@ -307,10 +323,10 @@ func TestWorktimeDayRowsAreRoundedAndSummed(t *testing.T) {
 	e, dir := workHome(t)
 	start := time.Date(2026, 11, 10, 9, 0, 0, 0, time.FixedZone("synthetic", 3600))
 	rows := []string{workRecord(t, "user", start, "KEY-123", "human"),
-		workRecord(t, "agent", start.Add(2*time.Hour), "work", ""),
-		workRecord(t, "agent", start.Add(4*time.Hour), "work", ""),
-		workRecord(t, "agent", start.Add(14*time.Hour+55*time.Minute), "work", ""),
-		workRecord(t, "agent", start.Add(15*time.Hour+5*time.Minute), "work", "")}
+		workRecord(t, "user", start.Add(2*time.Hour), "KEY-123", "human"),
+		workRecord(t, "user", start.Add(4*time.Hour), "KEY-123", "human"),
+		workRecord(t, "user", start.Add(14*time.Hour+55*time.Minute), "KEY-123", "human"),
+		workRecord(t, "user", start.Add(15*time.Hour+5*time.Minute), "KEY-123", "human")}
 	writeWorkFile(t, workParentPath(dir), rows)
 	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
 	want := "2026-11-10\t15m\n2026-11-11\t15m\ntotal\t30m\n"
@@ -334,24 +350,41 @@ func TestWorktimeMissingParentWarnsAndKeepsChild(t *testing.T) {
 func TestWorktimeRejectsOtherOutputFlagsAndUnboundGap(t *testing.T) {
 	now := time.Now()
 	for _, args := range [][]string{
-		{"--worktime", "--grep", "KEY"},
+		{"--worktime", "--grep", "KEY-123"},
 		{"--all", "--worktime"},
 		{"--all", "--gap", "15m"},
-		{"--all", "--worktime", "--grep", "KEY", "--gap", "bad"},
-		{"--all", "--worktime", "--grep", "KEY", "--gap", "0s"},
-		{"--all", "--worktime", "--grep", "KEY", "--raw", "x"},
-		{"--all", "--worktime", "--grep", "KEY", "--max", "1"},
-		{"--all", "--worktime", "--grep", "KEY", "--width", "1"},
-		{"--all", "--worktime", "--grep", "KEY", "--role", "all"},
-		{"--all", "--worktime", "--grep", "KEY", "-C", "0"},
-		{"--all", "--worktime", "--grep", "KEY", "--usage"},
-		{"--all", "--worktime", "--grep", "KEY", "--wait", "x"},
+		{"--all", "--key-gap", "30m"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--gap", "bad"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--gap", "0s"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--raw", "x"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--max", "1"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--width", "1"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--role", "all"},
+		{"--all", "--worktime", "--grep", "KEY-123", "-C", "0"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--usage"},
+		{"--all", "--worktime", "--grep", "KEY-123", "--wait", "x"},
 	} {
 		if _, err := parseArgs(args, now); err == nil {
 			t.Errorf("parseArgs(%q) accepted", args)
 		}
 	}
-	if _, err := parseArgs([]string{"--all", "--worktime", "--grep", "KEY", "--gap", "15m"}, now); err != nil {
+	if _, err := parseArgs([]string{"--all", "--key-gap", "30m"}, now); err == nil || !strings.Contains(err.Error(), "works with --worktime") {
+		t.Fatalf("--key-gap without --worktime error = %v", err)
+	}
+	defaults, err := parseArgs([]string{"--all", "--worktime", "--grep", "KEY-123"}, now)
+	if err != nil || defaults.keyGap != 30*time.Minute {
+		t.Fatalf("default --key-gap = %s, err %v; want 30m", defaults.keyGap, err)
+	}
+	if _, err := parseArgs([]string{"--all", "--worktime", "--grep", "KEY-123", "--key-gap", "30m"}, now); err != nil {
+		t.Fatalf("--key-gap with --worktime rejected: %v", err)
+	}
+	if _, err := parseArgs([]string{"--all", "--worktime", "--grep", "KEY-123", "--key-gap", "bad"}, now); err == nil {
+		t.Fatal("invalid --key-gap accepted")
+	}
+	if _, err := parseArgs([]string{"--all", "--worktime", "--grep", "KEY-123", "--key-gap", "0s"}, now); err == nil {
+		t.Fatal("zero --key-gap accepted")
+	}
+	if _, err := parseArgs([]string{"--all", "--worktime", "--grep", "KEY-123", "--gap", "15m"}, now); err != nil {
 		t.Fatalf("explicit default gap rejected with --worktime: %v", err)
 	}
 }
@@ -361,8 +394,8 @@ func TestWorktimeComboErrorsAreSpecific(t *testing.T) {
 		opts options
 		want string
 	}{
-		{options{worktime: true, all: true, grep: "KEY", usage: true}, "--worktime and --usage"},
-		{options{worktime: true, all: true, grep: "KEY", waitProg: "cmd"}, "--worktime and --wait"},
+		{options{worktime: true, all: true, grep: "KEY-123", usage: true}, "--worktime and --usage"},
+		{options{worktime: true, all: true, grep: "KEY-123", waitProg: "cmd"}, "--worktime and --wait"},
 	} {
 		err := checkWorktimeCombos(tc.opts)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -372,9 +405,165 @@ func TestWorktimeComboErrorsAreSpecific(t *testing.T) {
 }
 
 func TestWorktimeGapParsingReportsInvalidDuration(t *testing.T) {
-	var opts options
-	err := setFlag(&opts, "--gap", "invalid", time.Now())
-	if err == nil || !strings.Contains(err.Error(), "--gap:") {
-		t.Fatalf("setFlag invalid gap = %v, want a parse error for --gap", err)
+	for _, flag := range []string{"--gap", "--key-gap"} {
+		var opts options
+		err := setFlag(&opts, flag, "invalid", time.Now())
+		if err == nil || !strings.Contains(err.Error(), flag+":") || !strings.Contains(err.Error(), "invalid duration") {
+			t.Errorf("setFlag invalid %s = %v, want a duration parse error", flag, err)
+		}
 	}
+}
+
+func TestKeyWindowsGiveSingleMatchMinimumMinute(t *testing.T) {
+	base := time.Date(2026, 4, 5, 10, 0, 0, 0, time.Local)
+	got := keyWindows(sourceActivity{keyTimes: []time.Time{base}, events: []time.Time{base}}, 30*time.Minute)
+	if len(got) != 1 || !got[0].end.Equal(base.Add(time.Minute)) {
+		t.Fatalf("single-match key window = %+v, want one minute", got)
+	}
+}
+
+func TestKeyWindowsIncludeActivityAtExactKeyGapBoundary(t *testing.T) {
+	base := time.Date(2026, 4, 5, 10, 0, 0, 0, time.Local)
+	activity := sourceActivity{keyTimes: []time.Time{base}, events: []time.Time{base, base.Add(30 * time.Minute), base.Add(30*time.Minute + time.Second)}}
+	got := keyWindows(activity, 30*time.Minute)
+	if len(got) != 1 || !got[0].start.Equal(base) || !got[0].end.Equal(base.Add(30*time.Minute)) {
+		t.Fatalf("key windows = %+v, want inclusive 30m edge", got)
+	}
+}
+
+func TestKeyMatchesAtExactKeyGapStayInOneChunk(t *testing.T) {
+	base := time.Date(2026, 4, 5, 10, 0, 0, 0, time.Local)
+	activity := sourceActivity{keyTimes: []time.Time{base, base.Add(30 * time.Minute)},
+		events: []time.Time{base, base.Add(30 * time.Minute), base.Add(time.Hour)}}
+	got := keyWindows(activity, 30*time.Minute)
+	if len(got) != 1 || !got[0].end.Equal(base.Add(time.Hour)) {
+		t.Fatalf("key windows = %+v, want one chunk including exact key-gap edge", got)
+	}
+}
+
+func TestWorktimeKeyGapSplitsContinuousSession(t *testing.T) {
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	rows := workRows(t, start, start.Add(8*time.Hour+30*time.Minute), 5*time.Minute, func(at time.Time) string {
+		if at.Equal(start) || at.Equal(start.Add(8*time.Hour)) {
+			return workRecord(t, "user", at, "KEY-123", "human")
+		}
+		return workRecord(t, "agent", at, "other ticket", "")
+	})
+	writeWorkFile(t, workParentPath(dir), rows)
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t1h\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeChildCountsOnlyWhenStartedInsideKeyChunk(t *testing.T) {
+	e, dir := workHome(t)
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+	parent := workRows(t, start, start.Add(30*time.Minute), 5*time.Minute, func(at time.Time) string {
+		if at.Equal(start) {
+			return workRecord(t, "user", at, "KEY-123", "human")
+		}
+		return workRecord(t, "agent", at, "work", "")
+	})
+	writeWorkFile(t, workParentPath(dir), parent)
+	inside := workRows(t, start.Add(20*time.Minute), start.Add(80*time.Minute), 5*time.Minute,
+		func(at time.Time) string { return workRecord(t, "agent", at, "inside work", "") })
+	outside := workRows(t, start.Add(time.Hour), start.Add(2*time.Hour), 5*time.Minute,
+		func(at time.Time) string { return workRecord(t, "agent", at, "outside work", "") })
+	writeWorkFile(t, workChildPath(dir), inside)
+	writeWorkFile(t, filepath.Join(dir, workParentID, "subagents", "agent-b2c3d4e5f6a7b8c.jsonl"), outside)
+	code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-123")
+	if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t1h 30m\n") {
+		t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+	}
+}
+
+func TestWorktimeCodexLaunchInsideUniqueParentChunkCountsFullActivity(t *testing.T) {
+	start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
+	parent := source{Path: "parent.jsonl", ID: "parent"}
+	var parentEvents []time.Time
+	for at := start; !at.After(start.Add(30 * time.Minute)); at = at.Add(5 * time.Minute) {
+		parentEvents = append(parentEvents, at)
+	}
+	parentActivity := sourceActivity{src: parent, events: parentEvents, keyTimes: []time.Time{start}, loaded: true}
+	inside := codexLaunchFixture(t, start.Add(20*time.Minute), start.Add(80*time.Minute))
+	outside := codexLaunchFixture(t, start.Add(time.Hour), start.Add(2*time.Hour))
+	activities := map[string]sourceActivity{parent.ID: parentActivity, "inside": {src: inside}, "outside": {src: outside}}
+	matched := map[string]bool{parent.ID: true}
+	windows := matchedParentWindows(activities, matched, 30*time.Minute)
+	if err := loadCodexWorkersInParentWindows([]source{parent, inside, outside}, activities, windows); err != nil {
+		t.Fatal(err)
+	}
+	if !activities[inside.ID].launchedInParent || activities[outside.ID].launchedInParent {
+		t.Fatalf("launch attribution: inside=%v outside=%v", activities[inside.ID].launchedInParent, activities[outside.ID].launchedInParent)
+	}
+	intervals, _ := worktimeIntervals(activities, windows, 15*time.Minute, 30*time.Minute,
+		interval{start.Add(-time.Minute), start.Add(3 * time.Hour)})
+	var duration time.Duration
+	for _, span := range unionIntervals(intervals) {
+		duration += span.end.Sub(span.start)
+	}
+	if duration != 80*time.Minute {
+		t.Fatalf("union duration %s, want 80m", duration)
+	}
+}
+
+func codexLaunchFixture(t *testing.T, launch, end time.Time) source {
+	t.Helper()
+	stamp := launch.In(time.Local).Format(rolloutLaunchStamp)
+	path := filepath.Join(t.TempDir(), "rollout-"+stamp+"-00000000-0000-4000-8000-000000000001.jsonl")
+	rows := []string{`{"timestamp":"` + launch.Format(time.RFC3339Nano) + `","type":"session_meta","payload":{"id":"synthetic"}}`}
+	for at := launch.Add(5 * time.Minute); !at.After(end); at = at.Add(5 * time.Minute) {
+		rows = append(rows, `{"timestamp":"`+at.Format(time.RFC3339Nano)+`","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"worker work"}]}}`)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return source{Path: path, ID: "codex" + launch.Format("150405")}
+}
+
+func TestWorktimeCodexLaunchInOverlappingParentChunksIsSkipped(t *testing.T) {
+	base := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
+	first := source{Path: "first-parent.jsonl", ID: "first"}
+	second := source{Path: "second-parent.jsonl", ID: "second"}
+	codex := source{Path: filepath.Join(t.TempDir(), "rollout-"+base.Add(20*time.Minute).Format(rolloutLaunchStamp)+"-00000000-0000-4000-8000-000000000001.jsonl"), ID: "ambiguous"}
+	activities := map[string]sourceActivity{first.ID: {src: first}, second.ID: {src: second}, codex.ID: {src: codex}}
+	windows := map[string][]interval{
+		first.ID:  {{base, base.Add(30 * time.Minute)}},
+		second.ID: {{base.Add(10 * time.Minute), base.Add(40 * time.Minute)}},
+	}
+	if err := loadCodexWorkersInParentWindows([]source{first, second, codex}, activities, windows); err != nil {
+		t.Fatal(err)
+	}
+	if activities[codex.ID].loaded || activities[codex.ID].launchedInParent {
+		t.Fatalf("ambiguous rollout was attributed: %+v", activities[codex.ID])
+	}
+}
+
+func TestWorktimeBareKeyUsesWordBoundaries(t *testing.T) {
+	t.Run("longer key does not match", func(t *testing.T) {
+		e, dir := workHome(t)
+		start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+		rows := []string{workRecord(t, "user", start, "KEY-123", "human"), workRecord(t, "agent", start.Add(20*time.Minute), "work", "")}
+		writeWorkFile(t, workParentPath(dir), rows)
+		code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-12")
+		if code != exitNone || stderr != "" || !strings.Contains(out, "no sessions with matching key") {
+			t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+		}
+		code, out, stderr = runTL(t, e, "--all", "--grep", "KEY-12")
+		if code != 0 || stderr != "" || !strings.Contains(out, "KEY-123") {
+			t.Fatalf("plain grep changed: code %d, output %q, stderr %q", code, out, stderr)
+		}
+	})
+	t.Run("parenthesized literal matches", func(t *testing.T) {
+		e, dir := workHome(t)
+		start := time.Date(2026, 11, 10, 10, 0, 0, 0, time.FixedZone("synthetic", 3600))
+		rows := []string{workRecord(t, "user", start, "please work on (KEY-12)", "human"), workRecord(t, "agent", start.Add(20*time.Minute), "work", "")}
+		writeWorkFile(t, workParentPath(dir), rows)
+		code, out, stderr := runTL(t, e, "--all", "--worktime", "--grep", "KEY-12")
+		if code != 0 || stderr != "" || !strings.Contains(out, "2026-11-10\t15m\n") {
+			t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
+		}
+	})
 }

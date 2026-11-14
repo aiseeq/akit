@@ -13,6 +13,7 @@ import (
 	"regexp/syntax"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
@@ -20,6 +21,7 @@ import (
 
 const (
 	defaultWorkGap  = 15 * time.Minute
+	defaultKeyGap   = 30 * time.Minute
 	maxWorktimeLine = 256 << 20
 	maxWorktimeYear = 9999
 )
@@ -27,10 +29,11 @@ const (
 type interval struct{ start, end time.Time }
 
 type sourceActivity struct {
-	src      source
-	events   []time.Time
-	keyTimes []time.Time
-	loaded   bool
+	src              source
+	events           []time.Time
+	keyTimes         []time.Time
+	loaded           bool
+	launchedInParent bool
 }
 
 func isActivityEvent(role transcript.Role) bool {
@@ -248,43 +251,71 @@ func worktimePrefilter(pattern string) ([]string, error) {
 	return best, nil
 }
 
-func keyWindow(activity sourceActivity, gap time.Duration) (interval, bool) {
-	if len(activity.keyTimes) == 0 {
-		return interval{}, false
+func worktimePattern(pattern string) string {
+	if strings.ContainsAny(pattern, `.+*?()|[]{}^$\\`) {
+		return pattern
 	}
-	start, end := activity.keyTimes[0], activity.keyTimes[0]
-	for _, at := range activity.keyTimes[1:] {
-		if at.Before(start) {
-			start = at
-		}
-		if at.After(end) {
-			end = at
-		}
-	}
-	if end.Equal(start) {
-		segments := activitySegments(append([]time.Time(nil), activity.events...), gap)
-		if len(segments) > 0 {
-			end = segments[len(segments)-1].end
-		} else {
-			end = start.Add(time.Minute)
-		}
-	}
-	if end.Before(start) {
-		end = start
-	}
-	return interval{start, end}, true
+	return `\b` + pattern + `\b`
 }
 
-func collectActivities(sources []source, re *regexp.Regexp, literals []string, gap time.Duration, stderr io.Writer) (map[string]sourceActivity, map[string]interval, error) {
+func keyWindows(activity sourceActivity, keyGap time.Duration) []interval {
+	if len(activity.keyTimes) == 0 {
+		return nil
+	}
+	keys := append([]time.Time(nil), activity.keyTimes...)
+	events := append([]time.Time(nil), activity.events...)
+	slices.SortFunc(keys, func(a, b time.Time) int { return a.Compare(b) })
+	slices.SortFunc(events, func(a, b time.Time) int { return a.Compare(b) })
+	var windows []interval
+	eventIndex := 0
+	start, lastKey := keys[0], keys[0]
+	appendWindow := func(from, through time.Time) {
+		limit := through.Add(keyGap)
+		for eventIndex < len(events) && events[eventIndex].Before(from) {
+			eventIndex++
+		}
+		lastActivity := from
+		for eventIndex < len(events) && !events[eventIndex].After(limit) {
+			lastActivity = events[eventIndex]
+			eventIndex++
+		}
+		end := lastActivity
+		if end.Equal(from) {
+			end = from.Add(time.Minute)
+		}
+		windows = append(windows, interval{from, end})
+	}
+	for _, at := range keys[1:] {
+		if at.Sub(lastKey) > keyGap {
+			appendWindow(start, lastKey)
+			start = at
+		}
+		lastKey = at
+	}
+	appendWindow(start, lastKey)
+
+	return windows
+}
+
+func containsTime(windows []interval, at time.Time) bool {
+	for _, window := range windows {
+		if !at.Before(window.start) && !at.After(window.end) {
+			return true
+		}
+	}
+	return false
+}
+
+func collectActivities(sources []source, re *regexp.Regexp, literals []string, keyGap time.Duration, stderr io.Writer) (map[string]sourceActivity, map[string][]interval, error) {
 	activities := make(map[string]sourceActivity, len(sources))
 	matchedParent := make(map[string]bool, len(sources))
-	for _, src := range sources {
-		keyTimes, err := readKeyTimes(src, re, literals)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read %s: %w", src.Path, err)
+	keyTimes, keyErrors := readKeyTimesParallel(sources, re, literals)
+	for i, src := range sources {
+		if keyErrors[i] != nil {
+			return nil, nil, fmt.Errorf("read %s: %w", src.Path, keyErrors[i])
 		}
-		activities[src.ID] = sourceActivity{src: src, keyTimes: keyTimes}
-		matchedParent[src.ID] = len(keyTimes) > 0
+		activities[src.ID] = sourceActivity{src: src, keyTimes: keyTimes[i]}
+		matchedParent[src.ID] = len(keyTimes[i]) > 0
 	}
 	if err := loadMissingParentKeys(sources, activities, matchedParent, re, literals, stderr); err != nil {
 		return nil, nil, err
@@ -292,8 +323,34 @@ func collectActivities(sources []source, re *regexp.Regexp, literals []string, g
 	if err := loadSelectedActivityEvents(sources, activities, matchedParent); err != nil {
 		return nil, nil, err
 	}
-	parentWindows := matchedParentWindows(activities, matchedParent, gap)
+	parentWindows := matchedParentWindows(activities, matchedParent, keyGap)
+	if err := loadCodexWorkersInParentWindows(sources, activities, parentWindows); err != nil {
+		return nil, nil, err
+	}
 	return activities, parentWindows, nil
+}
+
+func readKeyTimesParallel(sources []source, re *regexp.Regexp, literals []string) ([][]time.Time, []error) {
+	times := make([][]time.Time, len(sources))
+	errs := make([]error, len(sources))
+	if len(sources) == 0 {
+		return times, errs
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range min(scanWorkerCount(), len(sources)) {
+		wg.Go(func() {
+			for i := range jobs {
+				times[i], errs[i] = readKeyTimes(sources[i], re, literals)
+			}
+		})
+	}
+	for i := range sources {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return times, errs
 }
 
 func loadMissingParentKeys(sources []source, activities map[string]sourceActivity, matched map[string]bool,
@@ -363,63 +420,121 @@ func loadSelectedActivityEvents(sources []source, activities map[string]sourceAc
 	return nil
 }
 
-func matchedParentWindows(activities map[string]sourceActivity, matched map[string]bool, gap time.Duration) map[string]interval {
-	windows := make(map[string]interval)
+func matchedParentWindows(activities map[string]sourceActivity, matched map[string]bool, keyGap time.Duration) map[string][]interval {
+	windows := make(map[string][]interval)
 	for id, hasKey := range matched {
-		if !hasKey {
-			continue
-		}
-		if window, ok := keyWindow(activities[id], gap); ok {
-			windows[id] = window
+		if hasKey {
+			windows[id] = keyWindows(activities[id], keyGap)
 		}
 	}
 	return windows
 }
 
-func worktimeIntervals(activities map[string]sourceActivity, windows map[string]interval, sources []source,
-	gap time.Duration, timeWindow interval) ([]interval, bool) {
-	children := map[string]bool{}
+const rolloutLaunchStamp = "2006-01-02T15-04-05"
+
+func rolloutLaunchTime(path string) (time.Time, bool) {
+	name := strings.TrimPrefix(filepath.Base(path), "rollout-")
+	if len(name) < len(rolloutLaunchStamp) {
+		return time.Time{}, false
+	}
+	at, err := time.ParseInLocation(rolloutLaunchStamp, name[:len(rolloutLaunchStamp)], time.Local)
+	return at, err == nil
+}
+
+func loadCodexWorkersInParentWindows(sources []source, activities map[string]sourceActivity, windows map[string][]interval) error {
+	var parents []source
 	for _, src := range sources {
-		if src.ParentID != "" {
-			children[src.ParentID] = true
+		if src.ParentID == "" && !isCodexRollout(src.Path) && len(windows[src.ID]) > 0 {
+			parents = append(parents, src)
 		}
 	}
+	for _, src := range sources {
+		if !isCodexRollout(src.Path) {
+			continue
+		}
+		launch, ok := rolloutLaunchTime(src.Path)
+		if !ok || parentWindowMatches(launch, parents, windows) != 1 {
+			continue
+		}
+		activity := activities[src.ID]
+		if !activity.loaded {
+			events, err := readActivityTimes(src)
+			if err != nil {
+				return fmt.Errorf("read activity %s: %w", src.Path, err)
+			}
+			activity.events, activity.loaded = events, true
+		}
+		if len(activity.events) > 0 && parentWindowMatches(firstTime(activity.events), parents, windows) == 1 {
+			activity.launchedInParent = true
+		}
+		activities[src.ID] = activity
+	}
+	return nil
+}
+
+func parentWindowMatches(at time.Time, parents []source, windows map[string][]interval) int {
+	matches := 0
+	for _, parent := range parents {
+		for _, window := range windows[parent.ID] {
+			if !at.Before(window.start) && !at.After(window.end) {
+				matches++
+			}
+		}
+	}
+	return matches
+}
+
+func worktimeIntervals(activities map[string]sourceActivity, windows map[string][]interval,
+	gap, keyGap time.Duration, timeWindow interval) ([]interval, bool) {
 	var intervals []interval
 	matched := false
 	for _, id := range slices.Sorted(maps.Keys(activities)) {
 		activity := activities[id]
-		ownWindow, ownMatch := keyWindow(activity, gap)
-		parentWindow, parentMatch := windows[activity.src.ParentID]
-		if !ownMatch && !parentMatch {
+		ownWindows := keyWindows(activity, keyGap)
+		parentWindows := windows[activity.src.ParentID]
+		launchedInParent := activity.launchedInParent || containsTime(parentWindows, firstTime(activity.events))
+		if len(ownWindows) == 0 && !launchedInParent {
 			continue
 		}
 		matched = true
-		segments := activitySegments(activity.events, gap)
-		if ownMatch {
-			own := clipIntervals(segments, ownWindow)
-			intervals = append(intervals, clipIntervals(own, timeWindow)...)
-		}
-		if children[id] {
-			if context, ok := windows[id]; ok {
-				parentActivity := clipIntervals(segments, context)
-				intervals = append(intervals, clipIntervals(parentActivity, timeWindow)...)
+		segments := activitySegments(append([]time.Time(nil), activity.events...), gap)
+		if len(ownWindows) > 0 {
+			for _, ownWindow := range ownWindows {
+				intervals = append(intervals, clipIntervals(clipIntervals(segments, ownWindow), timeWindow)...)
 			}
 		}
-		if parentMatch {
-			child := clipIntervals(segments, parentWindow)
-			intervals = append(intervals, clipIntervals(child, timeWindow)...)
+		if launchedInParent && len(activity.events) > 0 {
+			intervals = append(intervals, clipIntervals(segments, timeWindow)...)
 		}
 	}
 	return intervals, matched
 }
 
-func reportWorktime(sources []source, opts options, e env, re *regexp.Regexp, w, stderr io.Writer) int {
-	literals, err := worktimePrefilter(opts.grep)
+func firstTime(events []time.Time) time.Time {
+	if len(events) == 0 {
+		return time.Time{}
+	}
+	first := events[0]
+	for _, at := range events[1:] {
+		if at.Before(first) {
+			first = at
+		}
+	}
+	return first
+}
+
+func reportWorktime(sources []source, opts options, e env, w, stderr io.Writer) int {
+	workRE, err := regexp.Compile("(?i)" + worktimePattern(opts.grep))
+	if err != nil {
+		fmt.Fprintf(stderr, "tl: --grep: %v\n", err)
+		return exitUsage
+	}
+	literals, err := worktimePrefilter(worktimePattern(opts.grep))
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: parse --grep for prefilter: %v\n", err)
 		return exitUsage
 	}
-	activities, parentWindows, err := collectActivities(sources, re, literals, opts.gap, stderr)
+	activities, parentWindows, err := collectActivities(sources, workRE, literals, opts.keyGap, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
@@ -432,7 +547,7 @@ func reportWorktime(sources []source, opts options, e env, re *regexp.Regexp, w,
 	if until.IsZero() {
 		until = time.Date(maxWorktimeYear, time.December, 31, 23, 59, 59, 999999999, time.Local)
 	}
-	intervals, matched := worktimeIntervals(activities, parentWindows, sources, opts.gap, interval{since, until})
+	intervals, matched := worktimeIntervals(activities, parentWindows, opts.gap, opts.keyGap, interval{since, until})
 	if !matched {
 		fmt.Fprintln(w, "tl: no sessions with matching key")
 		return exitNone
