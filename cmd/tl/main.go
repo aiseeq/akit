@@ -58,18 +58,18 @@ path (Claude Code or codex rollout).
                 (their token counts are not read) are not in it
   --worktime    Jira worktime for --grep; a key chunk starts at a key event
                 and ends at the last activity within --key-gap after the last
-                key match (inclusive; default 30m). Activity events: user/peer
-                messages, agent text, tool calls and results; gaps > --gap
+                key match (inclusive; default 30m). Activity events: messages
+                (user, ask, peer, agent, notes), tool calls and results; gaps > --gap
                 split activity (default 15m). Key roles: user, agent, cmd,
                 note/prompt, peer; out is not searched.
-                Bare --grep keys get \b boundaries only in --worktime; regex stays as written.
+                A bare --grep key matches as a whole word (any script) only in
+                --worktime; a key with regex characters stays as written.
                 Key mentions in command arguments and probes count as events.
                 Activity is clipped to --since/--until. Subagents launched
                 inside a parent key chunk (through one minute after its end)
                 count all activity; a brief with a key uses its own key chunks.
-                Codex rollout without a key
-                in its own prompt, text or commands is not counted. Codex
-                fighters are omitted unless --codex is set. A lone event
+                A codex rollout without a key in its own prompt, text or
+                commands is not counted; codex rollouts need --codex. A lone event
                 is 1m. Midnight crossings split at local midnight; day rows
                 round up to 15m and total sums the rounded rows.
   --gap D       activity split threshold (default 15m)

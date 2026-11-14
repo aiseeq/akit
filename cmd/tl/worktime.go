@@ -132,7 +132,7 @@ func jiraDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm", hours, mins)
 }
 
-func rawLineMatches(raw []byte, _ *regexp.Regexp, literals []string) bool {
+func rawLineMatches(raw []byte, literals []string) bool {
 	if len(literals) == 0 || strings.Contains(strings.Join(literals, ""), "\n") {
 		return true
 	}
@@ -147,7 +147,7 @@ func rawLineMatches(raw []byte, _ *regexp.Regexp, literals []string) bool {
 func readKeyTimes(src source, re *regexp.Regexp, literals []string) ([]time.Time, error) {
 	var times []time.Time
 	_, err := transcript.ReadWithTools(src.Path, func(raw []byte, _ transcript.ToolNames) bool {
-		return rawLineMatches(raw, re, literals)
+		return rawLineMatches(raw, literals)
 	}, func(ev transcript.Event) {
 		if !ev.Time.IsZero() && isKeyEvent(ev.Role) && re.MatchString(ev.Who+" "+ev.Shown()) {
 			times = append(times, ev.Time)
@@ -194,7 +194,8 @@ func worktimePattern(pattern string) string {
 	if strings.ContainsAny(pattern, `.+*?()|[]{}^$\\`) {
 		return pattern
 	}
-	return `\b` + pattern + `\b`
+	// \b in RE2 knows only ASCII word characters; a key in another script needs Unicode letter and digit classes.
+	return `(?:^|[^\p{L}\p{N}_])` + pattern + `(?:$|[^\p{L}\p{N}_])`
 }
 
 func keyWindows(activity sourceActivity, keyGap time.Duration) []interval {
@@ -236,15 +237,6 @@ func keyWindows(activity sourceActivity, keyGap time.Duration) []interval {
 	return windows
 }
 
-func containsTime(windows []interval, at time.Time) bool {
-	for _, window := range windows {
-		if !at.Before(window.start) && !at.After(window.end) {
-			return true
-		}
-	}
-	return false
-}
-
 func childStartsInParentWindow(windows []interval, at time.Time) bool {
 	for _, window := range windows {
 		if !at.Before(window.start) && !at.After(window.end.Add(time.Minute)) {
@@ -262,7 +254,7 @@ func collectActivities(sources []source, re *regexp.Regexp, literals []string, k
 		if keyErrors[i] != nil {
 			return nil, nil, fmt.Errorf("read %s: %w", src.Path, keyErrors[i])
 		}
-		parentPath := parentTranscriptPath(src, sources)
+		parentPath := parentTranscriptPath(src)
 		activities[src.Path] = sourceActivity{src: src, parentPath: parentPath, keyTimes: keyTimes[i]}
 		matchedParent[src.Path] = len(keyTimes[i]) > 0
 	}
@@ -276,16 +268,10 @@ func collectActivities(sources []source, re *regexp.Regexp, literals []string, k
 	return activities, parentWindows, nil
 }
 
-func parentTranscriptPath(src source, sources []source) string {
+func parentTranscriptPath(src source) string {
+	// A subagent lies in <parent id>/subagents/, and its short ParentID comes from that directory.
 	if src.ParentID == "" {
 		return ""
-	}
-	if len(src.ParentID) > 8 {
-		for _, candidate := range sources {
-			if strings.TrimSuffix(filepath.Base(candidate.Path), ".jsonl") == src.ParentID {
-				return candidate.Path
-			}
-		}
 	}
 	parentDir := filepath.Dir(filepath.Dir(src.Path))
 	parentID := filepath.Base(parentDir)

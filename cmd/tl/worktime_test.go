@@ -313,10 +313,14 @@ func TestWorktimeChildBeforeParentChunkIsExcluded(t *testing.T) {
 	}
 }
 
-func TestContainsTimeRejectsEventsBeforeWindow(t *testing.T) {
+func TestChildStartBeforeParentWindowIsNotCounted(t *testing.T) {
 	base := time.Date(2026, 11, 10, 10, 0, 0, 0, time.Local)
-	if containsTime([]interval{{start: base, end: base.Add(time.Minute)}}, base.Add(-time.Second)) {
-		t.Fatal("event before interval start was accepted")
+	windows := []interval{{start: base, end: base.Add(time.Minute)}}
+	if childStartsInParentWindow(windows, base.Add(-time.Second)) {
+		t.Fatal("child started before the parent window was counted")
+	}
+	if !childStartsInParentWindow(windows, base.Add(2*time.Minute)) || childStartsInParentWindow(windows, base.Add(2*time.Minute+time.Second)) {
+		t.Fatal("child start tolerance is not one minute after the window end")
 	}
 }
 
@@ -324,9 +328,8 @@ func TestParentTranscriptPathUsesProjectDirectoryForShortID(t *testing.T) {
 	parentID := "10000000-0000-4000-8000-000000000001"
 	parentPath := filepath.Join(t.TempDir(), "project", parentID+".jsonl")
 	childPath := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "subagents", "agent-a1b2c3d4e5f6.jsonl")
-	otherPath := filepath.Join(t.TempDir(), "other", "10000000.jsonl")
 	child := source{Path: childPath, ParentID: "10000000"}
-	got := parentTranscriptPath(child, []source{{Path: otherPath}, {Path: parentPath}})
+	got := parentTranscriptPath(child)
 	if got != parentPath {
 		t.Fatalf("parent path = %q, want same-project path %q", got, parentPath)
 	}
@@ -365,7 +368,7 @@ func TestWorktimeMissingParentIDDoesNotUseAdjacentTranscript(t *testing.T) {
 	childPath := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "subagents", "agent-a1b2c3d4e5f6.jsonl")
 	writeWorkFile(t, childPath, []string{workRecord(t, "agent", start.Add(time.Minute), "KEY-123 child", "")})
 	child := source{Path: childPath, ID: "a1b2c3d4", ParentID: "ffffffff"}
-	if got := parentTranscriptPath(child, []source{child}); got != "" {
+	if got := parentTranscriptPath(child); got != "" {
 		t.Fatalf("parent path for unrelated id = %q", got)
 	}
 	activities := map[string]sourceActivity{child.Path: {src: child, keyTimes: []time.Time{start.Add(time.Minute)}}}
@@ -746,4 +749,13 @@ func TestWorktimeBareKeyUsesWordBoundaries(t *testing.T) {
 			t.Fatalf("code %d, output %q, stderr %q", code, out, stderr)
 		}
 	})
+}
+
+func TestWorktimeBareKeyMatchesWholeWordInAnyScript(t *testing.T) {
+	re := regexp.MustCompile("(?i)" + worktimePattern("ключ-7"))
+	for text, want := range map[string]bool{"сделал ключ-7 сегодня": true, "(КЛЮЧ-7)": true, "ключ-7": true, "ключ-70": false, "суперключ-7": false, "KEY ключ-7_x": false} {
+		if got := re.MatchString(text); got != want {
+			t.Errorf("match %q = %v; want %v", text, got, want)
+		}
+	}
 }
