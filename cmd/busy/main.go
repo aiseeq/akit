@@ -100,6 +100,9 @@ type options struct {
 
 var errHelp = errors.New("help")
 
+// errUnknownFlag — флаг, которого нет в set.
+var errUnknownFlag = errors.New("unknown flag")
+
 func main() {
 	opts, err := parseArgs(os.Args[1:], time.Now())
 	if errors.Is(err, errHelp) {
@@ -132,6 +135,11 @@ func parseArgs(args []string, now time.Time) (options, error) {
 		name, value, ok := strings.Cut(a, "=")
 		if !ok {
 			if i+1 >= len(args) {
+				// Пробный разбор на копии отличает неизвестный флаг от известного без значения: список флагов один, в set.
+				probe := opts
+				if err := probe.set(name, "", now); errors.Is(err, errUnknownFlag) {
+					return opts, err
+				}
 				return opts, fmt.Errorf("%s needs a value", a)
 			}
 			i++
@@ -225,7 +233,7 @@ func (opts *options) set(name, value string, now time.Time) error {
 	case "--half-until", "--half":
 		opts.half, err = parseModeUntil(name, value, now)
 	default:
-		return fmt.Errorf("unknown flag %s", name)
+		return fmt.Errorf("%w %s", errUnknownFlag, name)
 	}
 	if err != nil {
 		return fmt.Errorf("%s %q: %w", name, value, err)

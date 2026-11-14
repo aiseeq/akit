@@ -307,3 +307,13 @@ func TestParseQuiet(t *testing.T) {
 		}
 	}
 }
+
+// Неизвестный флаг последним аргументом называется неизвестным, а не флагом без значения.
+func TestParseArgsUnknownLastFlag(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for args, want := range map[string]string{"--version": "unknown flag --version", "--runnable": "--runnable needs a value", "--why": "--why needs a value"} {
+		if _, err := parseArgs(strings.Fields(args), time.Now()); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("parseArgs(%q) = %v; ждали %q", args, err, want)
+		}
+	}
+}
