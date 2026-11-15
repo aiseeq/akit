@@ -3426,7 +3426,7 @@ func TestCommentContinuationCRLF(t *testing.T) {
 	}{
 		{"comment with CRLF after slash", "zz x #c\\\r\nzk 1", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 2, Offset: 10}}},
 		{"two comments with mixed line endings", "zz x #\\\r\nzk 1\nzz y #\\\nzk 2", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 2, Offset: 9}, {Name: "zk", Args: []string{"2"}, Raw: "zk 2", Line: 4, Offset: 22}}},
-		{"nested shell comment with CRLF", "bash -c 'zz x #c\\\r\nzk 1'", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 1, Offset: -1, Via: []string{"bash", "-c"}}}},
+		{"nested shell comment with CRLF", "bash -c 'zz x #c\\\r\nzk 1'", []Call{{Name: "zk", Args: []string{"1"}, Raw: "zk 1", Line: 2, Offset: 19, Via: []string{"bash", "-c"}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

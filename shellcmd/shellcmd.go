@@ -389,7 +389,27 @@ func commentContinuations(file *syntax.File, src string) []int {
 				break
 			}
 		}
-		if inBackquote || offsetInSpans(start, nodes.heredocs) {
+		if offsetInSpans(start, nodes.heredocs) {
+			continue
+		}
+		if inBackquote {
+			// End positions in backquotes omit removed escapes. Find the
+			// newline from the original comment start instead.
+			if !strings.HasSuffix(comment.Text, "\\\n") {
+				continue
+			}
+			newline := strings.IndexByte(src[start:], '\n')
+			if newline <= 0 {
+				continue
+			}
+			last := start + newline - 1
+			first := last
+			for first > start && src[first-1] == '\\' {
+				first--
+			}
+			if (last-first+1)%2 == 0 {
+				offsets = append(offsets, last)
+			}
 			continue
 		}
 		if slash, _, _ := continuedCommentLine(src, start, end); slash >= 0 {
@@ -444,10 +464,8 @@ func hasBackslashLineEnding(src string) bool {
 			return false
 		}
 		index := start + next
-		if index+1 < len(src) {
-			if src[index+1] == '\n' || src[index+1] == '\r' && index+2 < len(src) && src[index+2] == '\n' {
-				return true
-			}
+		if index+1 < len(src) && (src[index+1] == '\n' || src[index+1] == '\r' && index+2 < len(src) && src[index+2] == '\n') {
+			return true
 		}
 		start = index + 1
 	}
@@ -455,6 +473,82 @@ func hasBackslashLineEnding(src string) bool {
 }
 
 func parseShellWithMetadata(src string) (*syntax.File, string, [][2]int, error) {
+	if strings.ContainsRune(src, '\r') {
+		return parseShellCarriageReturns(src)
+	}
+	return parseShellEncoded(src)
+}
+
+func parseShellCarriageReturns(src string) (*syntax.File, string, [][2]int, error) {
+	// A CR escaped by an odd run of backslashes must not be parsed as
+	// whitespace or as part of a CRLF line continuation. Preserve offsets.
+	var positions []int
+	for i := 0; i < len(src); {
+		n := strings.Index(src[i:], "\\\r")
+		if n < 0 {
+			break
+		}
+		cr := i + n + 1
+		start := cr - 1
+		for start > 0 && src[start-1] == '\\' {
+			start--
+		}
+		if (cr-start)%2 == 1 {
+			positions = append(positions, cr)
+		}
+		i = cr + 1
+	}
+	if len(positions) == 0 {
+		return parseShellEncoded(src)
+	}
+	for marker := byte(1); marker < 32; marker++ {
+		if marker == '\n' || marker == '\r' || marker == '\t' || strings.IndexByte(src, marker) >= 0 {
+			continue
+		}
+		encoded := []byte(src)
+		for _, pos := range positions {
+			encoded[pos] = marker
+		}
+		file, full, ignored, err := parseCarriageReturnEncoded(string(encoded), marker)
+		if err == nil && len(full) > len(src) {
+			_, originalFull, _, originalErr := parseShellEncoded(src)
+			if originalErr == nil && len(originalFull) == len(src) {
+				return nil, src, nil, fmt.Errorf("shellcmd: inconsistent here-document termination")
+			}
+		}
+		var pe syntax.ParseError
+		if errors.As(err, &pe) {
+			err = restoreCarriageReturnParseError(pe, marker)
+		}
+		return file, strings.ReplaceAll(full, string(marker), "\r"), ignored, err
+	}
+	return nil, src, nil, fmt.Errorf("shellcmd: cannot represent carriage return in shell input")
+}
+
+func parseCarriageReturnEncoded(encoded string, marker byte) (*syntax.File, string, [][2]int, error) {
+	file, full, ignored, err := parseShellEncoded(encoded)
+	if file != nil {
+		syntax.Walk(file, func(node syntax.Node) bool {
+			switch node := node.(type) {
+			case *syntax.Lit:
+				node.Value = strings.ReplaceAll(node.Value, string(marker), "\r")
+			case *syntax.SglQuoted:
+				node.Value = strings.ReplaceAll(node.Value, string(marker), "\r")
+			}
+			return true
+		})
+	}
+	return file, full, ignored, err
+}
+
+func restoreCarriageReturnParseError(pe syntax.ParseError, marker byte) syntax.ParseError {
+	quoted := strconv.Quote(string(marker))
+	pe.Text = strings.ReplaceAll(pe.Text, quoted[1:len(quoted)-1], `\r`)
+	pe.Text = strings.ReplaceAll(pe.Text, string(marker), "\r")
+	return pe
+}
+
+func parseShellEncoded(src string) (*syntax.File, string, [][2]int, error) {
 	if !strings.Contains(src, "#") || !hasBackslashLineEnding(src) {
 		file, full, err := parseShellVariant(src, false)
 		return file, full, nil, err
@@ -560,6 +654,25 @@ func insideComment(file *syntax.File, offset int) bool {
 }
 
 func parseShellVariant(src string, keepComments bool) (file *syntax.File, full string, err error) {
+	options := []syntax.ParserOption{syntax.Variant(syntax.LangBash)}
+	if keepComments {
+		options = append(options, syntax.KeepComments(true))
+	}
+	file, err = syntax.NewParser(options...).Parse(strings.NewReader(src), "")
+	if err == nil {
+		return file, src, nil
+	}
+	var pe syntax.ParseError
+	if !errors.As(err, &pe) {
+		return file, src, err
+	}
+	if !strings.HasPrefix(pe.Text, "unclosed here-document ") {
+		return nil, src, err
+	}
+	return recoverUnclosedHeredocs(src, keepComments)
+}
+
+func recoverUnclosedHeredocs(src string, keepComments bool) (file *syntax.File, full string, err error) {
 	full = src
 	for range 8 {
 		options := []syntax.ParserOption{syntax.Variant(syntax.LangBash)}
@@ -571,16 +684,25 @@ func parseShellVariant(src string, keepComments bool) (file *syntax.File, full s
 		if !errors.As(err, &pe) {
 			return file, full, err
 		}
-		delim, ok := strings.CutPrefix(pe.Text, "unclosed here-document `")
+		delim, ok := unclosedHeredocDelimiter(pe.Text)
 		if !ok {
 			return nil, full, err
 		}
 		if trailing := len(full) - len(strings.TrimRight(full, `\\`)); trailing%2 == 1 {
 			full += "\n"
 		}
-		full += "\n" + strings.TrimSuffix(delim, "`") + "\n"
+		full += "\n" + delim + "\n"
 	}
 	return nil, full, err
+}
+
+func unclosedHeredocDelimiter(text string) (string, bool) {
+	quoted, ok := strings.CutPrefix(text, "unclosed here-document ")
+	if !ok {
+		return "", false
+	}
+	delim, err := strconv.Unquote(quoted)
+	return delim, err == nil
 }
 
 func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
@@ -5464,13 +5586,13 @@ func optionValue(wrapper, option string) bool {
 // ShadowedByFunction сообщает, объявлена ли в cmd до вызова функция оболочки с именем программы
 // вызова: тогда вызов идёт в функцию, а не в программу. Ошибка — cmd не разбирается.
 func (c Call) ShadowedByFunction(cmd string) (bool, error) {
-	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	file, _, err := parseShell(cmd)
 	if err != nil {
 		return false, fmt.Errorf("parse shell functions: %w", err)
 	}
 	shadowed := false
 	syntax.Walk(file, func(n syntax.Node) bool {
-		if fn, ok := n.(*syntax.FuncDecl); ok && fn.Name.Value == c.Name && int(fn.Pos().Offset()) < c.Offset {
+		if fn, ok := n.(*syntax.FuncDecl); ok && unescapeBare(fn.Name.Value) == c.Name && int(fn.Pos().Offset()) < c.Offset {
 			shadowed = true
 		}
 		return !shadowed
