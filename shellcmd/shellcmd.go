@@ -1321,11 +1321,11 @@ func collectScriptInput(stmt *syntax.Stmt, call *syntax.CallExpr, file *syntax.F
 
 func knownPipedScriptInput(stmt *syntax.Stmt, call *syntax.CallExpr, src string, vars map[string]string, info *walkInfo) bool {
 	args, _ := words(call.Args, src, vars)
-	_, targetArgs, ok := shellInputTargetArgs(args)
+	shell, targetArgs, ok := shellInputTargetArgs(args)
 	if !ok {
 		return false
 	}
-	operand, command, useStdin := shellArgs(targetArgs)
+	operand, command, useStdin := shellArgs(shell, targetArgs)
 	if command || !useStdin && operand < len(targetArgs) {
 		return false
 	}
@@ -1572,8 +1572,8 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 	scan := wrapperExecScan{work: work}
 	for {
 		if isShell(name) {
-			operand, command, stdin := shellArgs(args)
-			return name, via, !shellNoExec(args) && !command && (stdin || operand == len(args))
+			operand, command, stdin := shellArgs(name, args)
+			return name, via, !shellNoExec(name, args) && !command && (stdin || operand == len(args))
 		}
 		if target, ok := scan.find(execScanArgs(name, args)); ok {
 			via = append(via, name, "exec")
@@ -1656,7 +1656,7 @@ func shellInputTargetWithIndexAndWork(call *syntax.CallExpr, src string, vars ma
 			return true
 		}
 		if isShell(name) {
-			return shellInputForShellCall(call, args, argOffset, processSubs)
+			return shellInputForShellCall(call, name, args, argOffset, processSubs)
 		}
 		var ok bool
 		name, args, argOffset, ok = shellInputNextTargetWithScan(name, args, argOffset, &scan)
@@ -1666,9 +1666,9 @@ func shellInputTargetWithIndexAndWork(call *syntax.CallExpr, src string, vars ma
 	}
 }
 
-func shellInputForShellCall(call *syntax.CallExpr, args []string, argOffset int, processSubs *processSubstitutionIndex) bool {
-	operand, command, stdin := shellArgs(args)
-	if shellNoExec(args) || command {
+func shellInputForShellCall(call *syntax.CallExpr, shell string, args []string, argOffset int, processSubs *processSubstitutionIndex) bool {
+	operand, command, stdin := shellArgs(shell, args)
+	if shellNoExec(shell, args) || command {
 		return false
 	}
 	if stdin || operand == len(args) {
@@ -1765,7 +1765,7 @@ func shellScriptFD(args []string, shell string) (int, bool) {
 		fd := shellScriptInputFD(file)
 		return fd, fd >= 0
 	}
-	operand, command, useStdin := shellArgs(args)
+	operand, command, useStdin := shellArgs(shell, args)
 	if command {
 		return 0, false
 	}
@@ -1785,8 +1785,8 @@ func shellScriptInputArgs(args []string, shell string) (input, stdin bool) {
 		fd := shellScriptInputFD(file)
 		return fd >= 0 || descriptorPathUnresolved(file), fd == 0
 	}
-	operand, command, useStdin := shellArgs(args)
-	if command || shellNoExec(args) {
+	operand, command, useStdin := shellArgs(shell, args)
+	if command || shellNoExec(shell, args) {
 		return false, false
 	}
 	if useStdin {
@@ -1862,7 +1862,7 @@ func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]
 	if len(args) < 3 || !isScriptInputShell(commandName(args[0])) {
 		return false, nil
 	}
-	operand, command, _ := shellArgs(args[1:])
+	operand, command, _ := shellArgs(commandName(args[0]), args[1:])
 	if !command || operand >= len(args[1:]) {
 		return false, nil
 	}
@@ -1895,8 +1895,8 @@ func shellReadsImplicitStdin(args []string, shell string) bool {
 	if isSourceBuiltin(shell) {
 		return false
 	}
-	operand, command, _ := shellArgs(args)
-	return !command && operand >= len(args) && !shellNoExec(args)
+	operand, command, _ := shellArgs(shell, args)
+	return !command && operand >= len(args) && !shellNoExec(shell, args)
 }
 
 func shellInputTargetArgs(args []string) (string, []string, bool) {
@@ -2818,7 +2818,7 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 		return "", nil, false
 	}
 	input, _ := shellScriptInputArgs(args, name)
-	if input || !isSourceBuiltin(name) && (shellReadsHeredoc(args) || mainCompatibleNoExecHeredoc(args)) {
+	if input || !isSourceBuiltin(name) && (shellReadsHeredoc(name, args) || mainCompatibleNoExecHeredoc(name, args)) {
 		return name, via, true
 	}
 	return "", nil, false
@@ -2831,7 +2831,7 @@ func nextShellInputTarget(name string, args []string, via []string, scan *wrappe
 	if wrappers[name] {
 		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
 			if !isShell(commandName(wrapped[0])) {
-				if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(target[1:]) {
+				if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(baseName(target[0]), target[1:]) {
 					return baseName(target[0]), target[1:], append(via, fallbackVia...), true
 				}
 			}
@@ -2842,7 +2842,7 @@ func nextShellInputTarget(name string, args []string, via []string, scan *wrappe
 	if ok {
 		return commandName(wrapped[0]), wrapped[1:], append(via, wrapperVia...), true
 	}
-	if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(target[1:]) {
+	if target, fallbackVia, fallbackOK := unwrapMain(name, args); fallbackOK && len(target) > 0 && isShell(baseName(target[0])) && shellReadsHeredoc(baseName(target[0]), target[1:]) {
 		return baseName(target[0]), target[1:], append(via, fallbackVia...), true
 	}
 	return "", nil, nil, false
@@ -2859,69 +2859,65 @@ func isScriptInputShell(name string) bool {
 }
 
 // shellReadsHeredoc — оболочка читает heredoc как скрипт, если её stdin не заменён -c или файлом.
-func shellReadsHeredoc(args []string) bool {
-	if shellNoExec(args) {
+func shellReadsHeredoc(shell string, args []string) bool {
+	if shellNoExec(shell, args) {
 		return false
 	}
-	operand, command, stdin := shellArgs(args)
+	operand, command, stdin := shellArgs(shell, args)
 	return !command && (stdin || operand == len(args))
 }
 
-func mainCompatibleNoExecHeredoc(args []string) bool {
-	if !shellNoExec(args) || !hasOption("bash", args, "-E") {
+func mainCompatibleNoExecHeredoc(shell string, args []string) bool {
+	if !shellNoExec(shell, args) || !hasOption("bash", args, "-E") {
 		return false
 	}
-	operand, command, stdin := shellArgs(args)
+	operand, command, stdin := shellArgs(shell, args)
 	return !command && (stdin || operand == len(args))
 }
 
-func shellNoExec(args []string) bool {
+func shellNoExec(shell string, args []string) bool {
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" || args[i] == "-" {
 			return false
 		}
-		option, takesValue, _, _ := shellArgumentOption(args[i])
+		option, values, _, _, noExec := shellArgumentOption(shell, args[i])
 		if !option {
 			return false
 		}
-		if strings.HasPrefix(args[i], "-") && !strings.HasPrefix(args[i], "--") && strings.Contains(args[i][1:], "n") {
+		if noExec {
 			return true
 		}
-		if takesValue {
-			i++
-		}
+		i += values
 	}
 	return false
 }
 
 // shellArgs разбирает `bash [опции] [-c СКРИПТ | -s | ФАЙЛ] [аргументы]`: operand — индекс первого
 // аргумента после опций (len(args) — его нет), command — есть -c, stdin — оболочка читает скрипт со stdin.
-func shellArgs(args []string) (operand int, command, stdin bool) {
+func shellArgs(shell string, args []string) (operand int, command, stdin bool) {
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" || args[i] == "-" {
 			return i + 1, command, stdin || i+1 == len(args)
 		}
-		isOption, takesValue, readsStdin, readsCommand := shellArgumentOption(args[i])
+		isOption, values, readsStdin, readsCommand, _ := shellArgumentOption(shell, args[i])
 		if !isOption {
 			return i, command, stdin
 		}
 		stdin, command = stdin || readsStdin, command || readsCommand
-		if takesValue {
-			i++
-		}
+		i += values
 	}
 	return len(args), command, stdin
 }
 
-func shellArgumentOption(arg string) (option, takesValue, stdin, command bool) {
+func shellArgumentOption(shell, arg string) (option bool, values int, stdin, command, noExec bool) {
 	if arg == "--rcfile" || arg == "--init-file" {
-		return true, true, false, false
+		return true, 1, false, false, false
 	}
 	if strings.HasPrefix(arg, "--") {
-		return true, false, false, false
+		return true, 0, false, false, false
 	}
 	if len(arg) < 2 || (arg[0] != '-' && arg[0] != '+') {
-		return false, false, false, false
+		return false, 0, false, false, false
 	}
 	for j := 1; j < len(arg); j++ {
 		switch arg[j] {
@@ -2929,12 +2925,24 @@ func shellArgumentOption(arg string) (option, takesValue, stdin, command bool) {
 			command = true
 		case 's':
 			stdin = true
-		case 'o', 'O':
-			takesValue = j == len(arg)-1
-			return true, takesValue, stdin, command
+		case 'o':
+			if shell == "zsh" {
+				if j+1 < len(arg) {
+					return true, values, stdin, command, noExec
+				}
+				values++
+			} else {
+				values++
+			}
+		case 'O':
+			if shell != "zsh" {
+				values++
+			}
+		case 'n':
+			noExec = arg[0] == '-'
 		}
 	}
-	return true, false, stdin, command
+	return true, values, stdin, command, noExec
 }
 
 // IsShell сообщает, входит ли команда в список поддерживаемых оболочек.
@@ -4019,7 +4027,7 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 	}
 	switch {
 	case isShell(name):
-		operand, command, _ := shellArgs(args)
+		operand, command, _ := shellArgs(name, args)
 		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
 			script := c.words[operand+1]
 			first := len(*calls)
@@ -4104,7 +4112,7 @@ func remoteStdinReader(c cmd, file *syntax.File, src string, pos []int, remoteCa
 		}()
 	}
 	for _, call := range remoteCalls {
-		if !isShell(call.Name) || !shellReadsHeredoc(call.Args) {
+		if !isShell(call.Name) || !shellReadsHeredoc(call.Name, call.Args) {
 			continue
 		}
 		if reader == nil {

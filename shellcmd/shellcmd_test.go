@@ -2464,6 +2464,206 @@ func TestShellScriptInputFileDescriptorsAndCoproc(t *testing.T) {
 	}
 }
 
+func TestShellOptionValuesInClusters(t *testing.T) {
+	tests := []struct {
+		src       string
+		wantKill  bool
+		wantInput bool
+	}{
+		{`bash -oc pipefail 'kill 1'`, true, false},
+		{`bash -Oc extglob 'kill 1'`, true, false},
+		{`bash -oe pipefail <&3`, false, true},
+		{`bash -Oe extglob <&3`, false, true},
+		{`bash +n <&3`, false, true},
+		{`bash -o <&3`, false, true},
+		{`bash +o <&3`, false, true},
+		{`bash -O <&3`, false, true},
+		{`bash +O <&3`, false, true},
+		{`bash -oO pipefail extglob -c 'kill 1'`, true, false},
+		{`bash -Oo extglob pipefail -c 'kill 1'`, true, false},
+		{`bash +oc pipefail 'kill 1'`, true, false},
+		{`bash +Oc extglob 'kill 1'`, true, false},
+		{`bash -co pipefail 'kill 1'`, true, false},
+		{`bash -c 'kill 1'`, true, false},
+		{`bash -o pipefail -c 'kill 1'`, true, false},
+		{`bash -o pipefail -- -c 'kill 1'`, false, false},
+		{`bash -o -c 'kill 1'`, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundKill := false
+			for _, call := range calls {
+				if call.Name == "kill" {
+					foundKill = true
+					if len(call.Via) == 0 || call.Via[0] != "bash" {
+						t.Errorf("kill Via = %q, want prefix [bash]", call.Via)
+					}
+				}
+				if call.Name == "bash" && call.ScriptInput != tt.wantInput {
+					t.Errorf("bash ScriptInput=%t, want %t: %#v", call.ScriptInput, tt.wantInput, call)
+				}
+			}
+			if foundKill != tt.wantKill {
+				t.Errorf("kill found=%t, want %t: %#v", foundKill, tt.wantKill, calls)
+			}
+		})
+	}
+}
+
+func TestZshOptionValuesAndFlagsInClusters(t *testing.T) {
+	if operand, command, stdin := shellArgs("zsh", []string{"-o", "errexit", "-c", "kill 1"}); operand != 3 || !command || stdin {
+		t.Fatalf("zsh shell args = (%d, %t, %t), want (3, true, false)", operand, command, stdin)
+	}
+	tests := []struct {
+		src       string
+		wantCall  string
+		wantArgs  []string
+		wantInput bool
+	}{
+		{`zsh -oerrexit -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh -o errexit -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh -xo errexit -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh -opipefail -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh -Ox -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh -Oe -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh +OO -c 'kill 1'`, "kill", []string{"1"}, false},
+		{`zsh -Oc cmdA x`, "cmdA", []string{}, false},
+		{`zsh -oxtrace <&3`, "", nil, true},
+		{`zsh -oxtrace -s cmdA <&3`, "", nil, true},
+		{`zsh -opipefail -s cmdA <&3`, "", nil, true},
+		{`zsh -onoglob <&3`, "", nil, true},
+		{`zsh -noerrexit <&3`, "", nil, false},
+		{`zsh -nopipefail -s <&3`, "", nil, false},
+		{`zsh -noxtrace <&3`, "", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := tt.wantCall == ""
+			foundShell := false
+			for _, call := range calls {
+				if call.Name == "zsh" {
+					foundShell = true
+					if call.ScriptInput != tt.wantInput {
+						t.Errorf("zsh ScriptInput=%t, want %t: %#v", call.ScriptInput, tt.wantInput, call)
+					}
+				}
+				if call.Name == tt.wantCall && tt.wantCall != "" {
+					found = true
+					if !reflect.DeepEqual(call.Args, tt.wantArgs) || len(call.Via) == 0 || call.Via[0] != "zsh" {
+						t.Errorf("call = %#v, want args %q via prefix [zsh]", call, tt.wantArgs)
+					}
+				}
+			}
+			if !foundShell {
+				t.Fatalf("zsh call not found: %#v", calls)
+			}
+			if !found {
+				t.Errorf("call %q not found: %#v", tt.wantCall, calls)
+			}
+		})
+	}
+}
+
+func TestDashAndBusyboxOptionValuesInClusters(t *testing.T) {
+	tests := []struct {
+		src       string
+		shell     string
+		wantCall  bool
+		wantInput bool
+	}{
+		{`dash -oc pipefail 'kill 1'`, "dash", true, false},
+		{`dash -oe pipefail <&3`, "dash", false, true},
+		{`busybox sh -oc pipefail 'kill 1'`, "busybox", true, false},
+		{`busybox sh -oe pipefail <&3`, "busybox", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundCall, foundShell := false, false
+			for _, call := range calls {
+				if call.Name == "kill" {
+					foundCall = true
+					if len(call.Via) == 0 || call.Via[0] != tt.shell {
+						t.Errorf("kill Via=%q, want prefix [%s]", call.Via, tt.shell)
+					}
+				}
+				if call.Name == tt.shell || tt.shell == "dash" && call.Name == "sh" {
+					foundShell = true
+					if call.ScriptInput != tt.wantInput {
+						t.Errorf("%s ScriptInput=%t, want %t: %#v", call.Name, call.ScriptInput, tt.wantInput, call)
+					}
+				}
+			}
+			if foundCall != tt.wantCall {
+				t.Errorf("kill found=%t, want %t: %#v", foundCall, tt.wantCall, calls)
+			}
+			if !foundShell {
+				t.Errorf("%s shell call not found: %#v", tt.shell, calls)
+			}
+		})
+	}
+}
+
+func TestShellNoExecSkipsAllConsumedOptionValues(t *testing.T) {
+	for _, args := range [][]string{
+		{"-o", "-n", "-c", "script"},
+		{"-oO", "pipefail", "-n", "-c", "script"},
+	} {
+		if shellNoExec("bash", args) {
+			t.Errorf("shellNoExec(%q) = true; -n is consumed as an option value", args)
+		}
+	}
+}
+
+func TestCoprocCommandUsesNamedShellOptionRules(t *testing.T) {
+	tests := []struct {
+		src      string
+		wantKill bool
+		wantRead bool
+	}{
+		{`coproc zsh -oerrexit -c 'kill 1'`, true, false},
+		{`coproc zsh -oerrexit -c 'read x; eval "$x"'`, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundKill, foundRead := false, false
+			for _, call := range calls {
+				if call.Name == "kill" {
+					foundKill = true
+					foundZsh := false
+					for _, via := range call.Via {
+						foundZsh = foundZsh || via == "zsh"
+					}
+					if !foundZsh {
+						t.Errorf("kill Via=%q, want zsh: %#v", call.Via, calls)
+					}
+				}
+				if call.Name == "zsh" && call.ScriptInput {
+					foundRead = true
+				}
+			}
+			if foundKill != tt.wantKill || foundRead != tt.wantRead {
+				t.Errorf("kill found=%t, zsh ScriptInput=%t; want kill=%t, ScriptInput=%t: %#v", foundKill, foundRead, tt.wantKill, tt.wantRead, calls)
+			}
+		})
+	}
+}
+
 func TestShellScriptInputRevisionCases(t *testing.T) {
 	tests := []struct {
 		src  string
