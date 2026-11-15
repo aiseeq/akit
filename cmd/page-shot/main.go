@@ -86,6 +86,8 @@ func run() error {
 		fmt.Fprintln(fs.Output(), "--element: только окно 1536x860@1.25, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.")
 		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, значок не выровнен с текстом или нет разметки Gazette; подробности в stderr.")
 		fmt.Fprintln(fs.Output(), "Подсказки title= (и <title> в SVG) - предупреждение в stderr с числом и первыми 5, код выхода не меняют: их рисует браузер цветами системы.")
+		fmt.Fprintf(fs.Output(), "Тёмные кадры снимаются при признаках тёмной темы; пузыри проверяются только в выбранной теме (до %d наведений на окно), предупреждения не меняют код выхода.\n", maxHoverCandidates)
+		fmt.Fprintln(fs.Output(), "Открытые shadowRoot проверяются; iframe и закрытые shadowRoot не обходятся.")
 	}
 	at := fs.String("at", "1s", "моменты съёмки после загрузки через запятую (анимация - несколько)")
 	out := fs.String("out", "", "папка кадров (по умолчанию <файл>-shots рядом со страницей)")
@@ -148,17 +150,23 @@ func shootViewports(allocCtx context.Context, target, dir string, moments []time
 		if i == 0 && lay.titles != nil {
 			fmt.Fprint(os.Stderr, lay.titles.report())
 		}
-		if lay.overflow != nil {
-			fmt.Fprint(os.Stderr, lay.overflow.report(vp.name()))
-			overflowed = append(overflowed, vp.name())
-		}
-		if lay.overlap != nil {
-			fmt.Fprint(os.Stderr, lay.overlap.report(vp.name()))
-			overlapped = append(overlapped, vp.name())
-		}
-		if lay.align != nil {
-			fmt.Fprint(os.Stderr, lay.align.report(vp.name()))
-			misaligned = append(misaligned, vp.name())
+		for _, theme := range lay.themes {
+			window := vp.name()
+			if theme.theme == "dark" {
+				window += "-dark"
+			}
+			if theme.overflow != nil {
+				fmt.Fprint(os.Stderr, theme.overflow.report(window))
+				overflowed = append(overflowed, window)
+			}
+			if theme.overlap != nil {
+				fmt.Fprint(os.Stderr, theme.overlap.report(window))
+				overlapped = append(overlapped, window)
+			}
+			if theme.align != nil {
+				fmt.Fprint(os.Stderr, theme.align.report(window))
+				misaligned = append(misaligned, window)
+			}
 		}
 		gazetteMissing = gazetteMissing || lay.gazetteMissing
 	}
@@ -178,11 +186,18 @@ func shootViewports(allocCtx context.Context, target, dir string, moments []time
 	return errors.Join(errs...)
 }
 
-// layout - находки раскладки на окне.
-type layout struct {
+// themeLayout - находки раскладки окна в одной теме.
+type themeLayout struct {
+	theme          string
 	overflow       *overflow
 	overlap        *overlapResult
 	align          *alignResult
+	gazetteMissing bool
+}
+
+// layout preserves separate findings for each color scheme.
+type layout struct {
+	themes         []themeLayout
 	titles         *titleTips
 	gazetteMissing bool
 }
@@ -196,52 +211,154 @@ func shoot(allocCtx context.Context, target, dir string, vp viewport, moments []
 	if err := chromedp.Do(tabCtx, emulate, chromedp.Navigate(target)); err != nil {
 		return layout{}, fmt.Errorf("открыть страницу: %w", err)
 	}
-	var lay layout
-	var elapsed time.Duration
-	for i, m := range moments {
-		if err := chromedp.Do(tabCtx, chromedp.Sleep(m-elapsed)); err != nil {
-			return layout{}, fmt.Errorf("ожидание до %s: %w", m, err)
-		}
-		elapsed = m
-		suffix := ""
-		if len(moments) > 1 {
-			suffix = "-" + m.String()
-		}
-		buf, err := chromedp.Run(tabCtx, chromedp.CaptureScreenshot())
-		if err != nil {
-			return layout{}, fmt.Errorf("кадр %s: %w", m, err)
-		}
-		if err := save(filepath.Join(dir, vp.name()+suffix+".png"), buf); err != nil {
+	if err := captureThemeFrames(tabCtx, dir, vp, moments, "light"); err != nil {
+		return layout{}, err
+	}
+	light, titles, err := finishTheme(tabCtx, dir, vp, "light")
+	if err != nil {
+		return layout{}, err
+	}
+	combined := layout{themes: []themeLayout{light}, titles: titles, gazetteMissing: light.gazetteMissing}
+	// Theme inspection runs after the light capture and checks so the light path
+	// keeps the same timing and side effects as the original screenshot pass.
+	needsDark, err := hasDarkTheme(tabCtx)
+	if err != nil {
+		return layout{}, err
+	}
+	if !needsDark {
+		if err := reportHoverWarnings(tabCtx, dir, vp, "light"); err != nil {
 			return layout{}, err
 		}
-		// Полная высота - один раз, в последний момент, когда страница уже дорисована.
-		// Качество 100 - PNG.
-		if i == len(moments)-1 {
-			if lay.gazetteMissing, err = checkGazette(tabCtx); err != nil {
-				return layout{}, err
-			}
-			if lay.overflow, err = checkOverflow(tabCtx); err != nil {
-				return layout{}, err
-			}
-			if lay.overlap, err = checkOverlap(tabCtx); err != nil {
-				return layout{}, err
-			}
-			if lay.align, err = checkAlign(tabCtx); err != nil {
-				return layout{}, err
-			}
-			if lay.titles, err = checkTitles(tabCtx); err != nil {
-				return layout{}, err
-			}
-			buf, err := chromedp.Run(tabCtx, chromedp.FullScreenshot(100))
-			if err != nil {
-				return layout{}, fmt.Errorf("кадр полной высоты: %w", err)
-			}
-			if err := save(filepath.Join(dir, vp.name()+"-full.png"), buf); err != nil {
-				return layout{}, err
-			}
+		return combined, nil
+	}
+	dark, err := shootDarkTheme(allocCtx, target, dir, vp, moments)
+	if err != nil {
+		return layout{}, err
+	}
+	combined.themes = append(combined.themes, dark)
+	return combined, nil
+}
+
+func captureThemeFrames(ctx context.Context, dir string, vp viewport, moments []time.Duration, theme string) error {
+	var elapsed time.Duration
+	for i, m := range moments {
+		if err := chromedp.Do(ctx, chromedp.Sleep(m-elapsed)); err != nil {
+			return fmt.Errorf("ожидание до %s: %w", m, err)
+		}
+		elapsed = m
+		frame, err := chromedp.Run(ctx, chromedp.CaptureScreenshot())
+		if err != nil {
+			return fmt.Errorf("кадр %s: %w", m, err)
+		}
+		if err := save(filepath.Join(dir, frameName(vp, moments, i, theme)), frame); err != nil {
+			return err
 		}
 	}
-	return lay, nil
+	return nil
+}
+
+func shootDarkTheme(allocCtx context.Context, target, dir string, vp viewport, moments []time.Duration) (themeLayout, error) {
+	darkCtx, cancelDark := chromedp.NewContext(allocCtx)
+	defer cancelDark()
+	emulate := chromedp.EmulateViewport(vp.width, vp.height, chromedp.EmulateScale(vp.scale))
+	if err := chromedp.Do(darkCtx, emulate); err != nil {
+		return themeLayout{}, fmt.Errorf("тёмное окно %s: %w", vp.name(), err)
+	}
+	if err := setColorScheme(darkCtx, "dark"); err != nil {
+		return themeLayout{}, err
+	}
+	if err := chromedp.Do(darkCtx, chromedp.Navigate(target)); err != nil {
+		return themeLayout{}, fmt.Errorf("открыть страницу в тёмной теме: %w", err)
+	}
+	if err := captureThemeFrames(darkCtx, dir, vp, moments, "dark"); err != nil {
+		return themeLayout{}, err
+	}
+	dark, _, err := finishTheme(darkCtx, dir, vp, "dark")
+	if err != nil {
+		return themeLayout{}, err
+	}
+	if err := reportHoverWarnings(darkCtx, dir, vp, "dark"); err != nil {
+		return themeLayout{}, err
+	}
+	return dark, nil
+}
+
+func hasDarkTheme(ctx context.Context) (bool, error) {
+	detected, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => {
+  const media=/prefers-color-scheme\s*:\s*(dark|light)/i;
+  const rules=rules=>{for(const rule of rules){if(rule.conditionText&&media.test(rule.conditionText))return true;try{if(rule.cssRules&&rules(rule.cssRules))return true;}catch(_){}}return false;};
+  for(const sheet of document.styleSheets){try{if(rules(sheet.cssRules||[]))return true;}catch(_){}}
+  const scheme=getComputedStyle(document.documentElement).colorScheme;
+  const meta=[...document.querySelectorAll('meta[name="color-scheme" i]')].some(m=>/\b(dark|light)\b/i.test(m.content));
+  const script=[...document.scripts].map(s=>s.textContent).join('\n');
+  return scheme!=='normal'||meta||/matchMedia\s*\([^)]*prefers-color-scheme|prefers-color-scheme[^\n]{0,80}dark/i.test(script);
+})()`))
+	if err != nil {
+		return false, fmt.Errorf("проверка признаков тёмной темы: %w", err)
+	}
+	return detected, nil
+}
+
+func frameName(vp viewport, moments []time.Duration, index int, theme string) string {
+	suffix := ""
+	if len(moments) > 1 {
+		suffix = "-" + moments[index].String()
+	}
+	if theme == "dark" {
+		suffix += "-dark"
+	}
+	return vp.name() + suffix + ".png"
+}
+
+func finishTheme(ctx context.Context, dir string, vp viewport, theme string) (themeLayout, *titleTips, error) {
+	lay := themeLayout{theme: theme}
+	var err error
+	if theme == "light" {
+		if lay.gazetteMissing, err = checkGazette(ctx); err != nil {
+			return themeLayout{}, nil, err
+		}
+	}
+	if lay.overflow, err = checkOverflow(ctx); err != nil {
+		return themeLayout{}, nil, err
+	}
+	if lay.overlap, err = checkOverlap(ctx); err != nil {
+		return themeLayout{}, nil, err
+	}
+	if lay.align, err = checkAlign(ctx); err != nil {
+		return themeLayout{}, nil, err
+	}
+	var titles *titleTips
+	if theme == "light" {
+		if titles, err = checkTitles(ctx); err != nil {
+			return themeLayout{}, nil, err
+		}
+		buf, err := chromedp.Run(ctx, chromedp.FullScreenshot(100))
+		if err != nil {
+			return themeLayout{}, nil, fmt.Errorf("кадр полной высоты: %w", err)
+		}
+		if err := save(filepath.Join(dir, vp.name()+"-full.png"), buf); err != nil {
+			return themeLayout{}, nil, err
+		}
+	}
+	return lay, titles, nil
+}
+
+func reportHoverWarnings(ctx context.Context, dir string, vp viewport, theme string) error {
+	if vp.width != 1440 && vp.width != 390 {
+		return nil
+	}
+	frameBase := vp.name()
+	if theme == "dark" {
+		frameBase += "-dark"
+	}
+	warnings, err := checkHoverBubbles(ctx, theme, float64(vp.height), filepath.Join(dir, frameBase+"-hover.png"))
+	if err != nil {
+		return err
+	}
+	for i := range warnings {
+		fmt.Fprint(os.Stderr, warnings[i].report())
+	}
+	return nil
 }
 
 func checkGazette(ctx context.Context) (bool, error) {

@@ -2,14 +2,26 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/chromedp/chromedp"
+)
+
+var (
+	sharedTestAllocator context.Context
+	sharedTestBrowser   context.Context
+	sharedTestCancel    context.CancelFunc
+	sharedAllocCancel   context.CancelFunc
+	sharedRootCancel    context.CancelFunc
+	sharedChromeErr     error
+	sharedTestOnce      sync.Once
 )
 
 type layoutTestCase struct {
@@ -18,9 +30,17 @@ type layoutTestCase struct {
 	contains   string
 }
 
-// newTestAllocator starts Chrome for a test, or skips it where there is none.
-func newTestAllocator(t *testing.T) context.Context {
-	t.Helper()
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if sharedTestCancel != nil {
+		sharedTestCancel()
+		sharedAllocCancel()
+		sharedRootCancel()
+	}
+	os.Exit(code)
+}
+
+func startSharedTestBrowser() {
 	chrome := ""
 	for _, name := range []string{"google-chrome", "chromium-browser", "/usr/bin/google-chrome"} {
 		if path, err := exec.LookPath(name); err == nil {
@@ -29,27 +49,36 @@ func newTestAllocator(t *testing.T) context.Context {
 		}
 	}
 	if chrome == "" {
-		t.Skip("нет Chrome для headless-съёмки")
+		sharedChromeErr = fmt.Errorf("нет Chrome для headless-съёмки")
+	} else {
+		base, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		sharedRootCancel = cancel
+		sharedTestAllocator, sharedAllocCancel = chromedp.NewExecAllocator(base, append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.NoSandbox)...)
+		sharedTestBrowser, sharedTestCancel = chromedp.NewContext(sharedTestAllocator)
+		if err := chromedp.Do(sharedTestBrowser); err != nil {
+			sharedChromeErr = fmt.Errorf("запустить Chrome: %w", err)
+			sharedTestCancel()
+			sharedAllocCancel()
+			sharedRootCancel()
+			sharedTestBrowser, sharedTestAllocator = nil, nil
+		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	t.Cleanup(cancel)
-	// The pages are synthetic files of the test; without Chrome's own sandbox it also runs inside
-	// a sandbox that forbids new user namespaces.
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.NoSandbox)...)
-	t.Cleanup(cancelAlloc)
-	return allocCtx
 }
 
-// newLayoutTestBrowser is one browser for the test: each case opens a tab in it instead of
-// starting its own Chrome.
+// All browser tests share one Chrome process; each scenario opens an isolated tab.
+func newTestAllocator(t *testing.T) context.Context {
+	t.Helper()
+	sharedTestOnce.Do(startSharedTestBrowser)
+	if sharedChromeErr != nil {
+		t.Fatalf("Chrome test setup: %v", sharedChromeErr)
+	}
+	return sharedTestAllocator
+}
+
 func newLayoutTestBrowser(t *testing.T) context.Context {
 	t.Helper()
-	browserCtx, cancelBrowser := chromedp.NewContext(newTestAllocator(t))
-	t.Cleanup(cancelBrowser)
-	if err := chromedp.Do(browserCtx); err != nil {
-		t.Fatalf("start Chrome: %v", err)
-	}
-	return browserCtx
+	newTestAllocator(t)
+	return sharedTestBrowser
 }
 
 func TestCheckGazette(t *testing.T) {
