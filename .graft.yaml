@@ -32,7 +32,7 @@ tasks:
 # Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок high и critical (low и medium гейт пропускает, их не пускает tk done).
 gate:
   # Папки с точкой (.pc — песочница PC в worktree) пропускаются, как в ./... у go.
-  - sh: 'out=$(find . -mindepth 1 -name ".*" -prune -o -name "*.go" -print0 | xargs -0 -r gofmt -l) && test -z "$out" || { echo "$out"; exit 1; }'
+  - sh: 'out=$(find . -mindepth 1 -name ".*" -prune -o -name "*.go" -exec gofmt -l {} +) && test -z "$out" || { echo "$out"; exit 1; }'
   - task: test
   # glint падает кодом выхода на находке high и выше (умолчание fail_on); остальные проверяет tk done.
   - task: glint
