@@ -4394,7 +4394,11 @@ func wrapperOptionsKnown(name string, args []string) bool {
 	if name == "command" && commandIsLookup(args) {
 		return true
 	}
-	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-"; {
+	for i := 0; i < len(args) && wrapperOptionWord(name, args[i]); {
+		if sudoEnvWord(name, args[i]) {
+			i++
+			continue
+		}
 		next, unknown := wrapperOptionStep(name, args, i)
 		if unknown {
 			return false
@@ -4663,7 +4667,7 @@ func unwrapMain(name string, args []string) ([]string, []string, bool) {
 			return nil, nil, false
 		}
 		i := 0
-		for i < len(args) && strings.HasPrefix(args[i], "-") {
+		for i < len(args) && (strings.HasPrefix(args[i], "-") || sudoEnvWord(name, args[i])) {
 			if args[i] == "--" {
 				i++
 				break
@@ -4677,8 +4681,8 @@ func unwrapMain(name string, args []string) ([]string, []string, bool) {
 		if name == "timeout" && i < len(args) && args[i] != "--" {
 			i++
 		}
-		for name == "env" && i < len(args) && (strings.Contains(args[i], "=") || args[i] == "-i") {
-			i++
+		if name == "env" {
+			i = envCommandStart(args, i)
 		}
 		if i >= len(args) {
 			return nil, nil, false
@@ -5985,10 +5989,26 @@ func tmuxScriptArgs(args []string) []scriptArg {
 
 func wrapperOptionEnd(name string, args []string, start int) int {
 	i := start
-	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" {
+	for i < len(args) && wrapperOptionWord(name, args[i]) {
+		if args[i] == "--" {
+			return i + 1
+		}
 		i = optionNext(name, args, i)
 	}
 	return i
+}
+
+// wrapperOptionWord — слово, которое обёртка разбирает до своей команды: ключ или,
+// у sudo, присваивание окружения между ключами.
+func wrapperOptionWord(name, arg string) bool {
+	return strings.HasPrefix(arg, "-") && arg != "-" || sudoEnvWord(name, arg)
+}
+
+// sudoEnvWord — VAR=value среди ключей sudo: слово с '=' не первым символом sudo кладёт
+// в окружение команды и продолжает разбор ключей; слово с '/' первым sudo запускает как путь
+// к команде, а после `--` любое такое слово уже команда.
+func sudoEnvWord(name, arg string) bool {
+	return name == "sudo" && strings.IndexByte(arg, '=') > 0 && arg[0] != '-' && arg[0] != '/'
 }
 
 func optionNext(name string, args []string, i int) int {
@@ -5997,6 +6017,9 @@ func optionNext(name string, args []string, i int) int {
 	}
 	arg := args[i]
 	if arg == "--" {
+		return i + 1
+	}
+	if sudoEnvWord(name, arg) {
 		return i + 1
 	}
 	if !strings.HasPrefix(arg, "-") || arg == "-" {
@@ -6267,13 +6290,28 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 	if name == "timeout" && i < len(args) && args[i] != "--" {
 		i++
 	}
-	for name == "env" && i < len(args) && (strings.Contains(args[i], "=") || args[i] == "-i" || args[i] == "-" && i+1 < len(args)) {
-		i++
+	if name == "env" {
+		i = envCommandStart(args, i)
 	}
 	if i >= len(args) {
 		return nil, false
 	}
 	return args[i:], true
+}
+
+// envCommandStart пропускает присваивания env и -i или - перед ними: GNU env заканчивает
+// ключи на первом присваивании, и -i или - после него — уже команда.
+func envCommandStart(args []string, i int) int {
+	for assigned := false; i < len(args); i++ {
+		if strings.Contains(args[i], "=") {
+			assigned = true
+			continue
+		}
+		if assigned || args[i] != "-i" && (args[i] != "-" || i+1 == len(args)) {
+			break
+		}
+	}
+	return i
 }
 
 func setsidExitsWithoutCommand(args []string) bool {
@@ -6307,7 +6345,14 @@ func wrapperStart(name string, args []string) int {
 }
 
 func hasOption(name string, args []string, options ...string) bool {
-	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-"; {
+	for i := 0; i < len(args) && wrapperOptionWord(name, args[i]); {
+		if args[i] == "--" {
+			return false
+		}
+		if sudoEnvWord(name, args[i]) {
+			i++
+			continue
+		}
 		for _, option := range options {
 			if optionMatches(name, args[i], option) {
 				return true
