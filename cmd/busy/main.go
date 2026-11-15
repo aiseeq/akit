@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/pressure"
 	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/timearg"
@@ -99,6 +100,12 @@ type options struct {
 }
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+var machineHelp = func() clihelp.Help {
+	help := clihelp.NewRoot("busy", []string{"-h", "--help", "--help-json", "--runnable", "--mem-some", "--io-full", "--dirty-mb", "--window", "--proc", "--half-until", "--half", "--half-off", "--quiet-until", "--quiet", "--why", "--quiet-off", "--ignore-quiet"}, []string{"--runnable", "--mem-some", "--io-full", "--dirty-mb", "--window", "--proc", "--half-until", "--half", "--quiet-until", "--quiet", "--why"}, "none", "is the machine busy by the shared rule (akit/pressure), in one line")
+	help.Commands[0].NoDashdash = true
+	return help
+}()
 
 // errUnknownFlag — флаг, которого нет в set.
 var errUnknownFlag = errors.New("unknown flag")
@@ -107,6 +114,13 @@ func main() {
 	opts, err := parseArgs(os.Args[1:], time.Now())
 	if errors.Is(err, errHelp) {
 		fmt.Print(usage)
+		return
+	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
+			fmt.Fprintf(os.Stderr, "busy: write help: %v\n", err)
+			os.Exit(exitUsage)
+		}
 		return
 	}
 	if err != nil {
@@ -120,6 +134,9 @@ func parseArgs(args []string, now time.Time) (options, error) {
 	opts := options{procRoot: "/proc"}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--help-json" {
+			return opts, errHelpJSON
+		}
 		if a == "-h" || a == "--help" {
 			return opts, errHelp
 		}

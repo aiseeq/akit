@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/edit"
 )
 
@@ -63,6 +64,13 @@ func main() {
 		fmt.Print(usage + edit.SpecHelp + "\n" + subSpecHelp)
 		return
 	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
+			fmt.Fprintf(os.Stderr, "sub: write help: %v\n", err)
+			os.Exit(exitUsage)
+		}
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sub: %v\n(sub -h for usage)\n", err)
 		os.Exit(exitUsage)
@@ -71,6 +79,13 @@ func main() {
 }
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+
+var machineHelp = func() clihelp.Help {
+	help := clihelp.NewRoot("sub", []string{"-h", "--help", "--help-json", "--dry-run", "-n", "-F"}, []string{"-n", "-F"}, "args", "exact-text replace with an expected match count; all or nothing")
+	help.Commands[0].DashArgs = true
+	return help
+}()
 
 // parseArgs разбирает флаги в любом месте до «--»: агенты ставят -n и после файлов.
 func parseArgs(args []string) (options, error) {
@@ -83,6 +98,8 @@ func parseArgs(args []string) (options, error) {
 		}
 		name, val, hasVal := strings.Cut(a, "=")
 		switch name {
+		case "--help-json":
+			return opts, errHelpJSON
 		case "-h", "--help":
 			return opts, errHelp
 		case "--dry-run":

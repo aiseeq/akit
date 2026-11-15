@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/proc"
 )
 
@@ -80,6 +81,12 @@ type options struct {
 }
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+var machineHelp = func() clihelp.Help {
+	help := clihelp.NewRoot("timeit", []string{"-h", "--help", "--help-json", "--instructions", "--runs", "--budget", "--limit", "--ok-exit", "--fail-on-stderr", "--stdin"}, []string{"--runs", "--budget", "--limit", "--ok-exit", "--fail-on-stderr", "--stdin"}, "only-after-dashdash", "measure a command's median runtime within a time budget")
+	help.Commands[0].NoEquals = true
+	return help
+}()
 
 func main() {
 	if err := proc.BecomeChildSubreaper(); err != nil && !errors.Is(err, errors.ErrUnsupported) {
@@ -89,6 +96,13 @@ func main() {
 	opts, err := parseArgs(os.Args[1:])
 	if errors.Is(err, errHelp) {
 		fmt.Print(usage)
+		return
+	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
+			fmt.Fprintf(os.Stderr, "timeit: write help: %v\n", err)
+			os.Exit(exitError)
+		}
 		return
 	}
 	if err != nil {
@@ -186,6 +200,9 @@ func parseArgs(args []string) (options, error) {
 	opts := options{runs: defaultRuns, budget: defaultBudget, limit: defaultLimit, okExit: map[int]bool{0: true}}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--help-json" {
+			return options{}, errHelpJSON
+		}
 		if a == "--" {
 			if i+1 == len(args) {
 				return options{}, errors.New("missing command after --")

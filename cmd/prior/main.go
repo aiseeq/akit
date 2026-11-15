@@ -17,6 +17,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/aiseeq/akit/clihelp"
 )
 
 const usage = `prior — было ли это уже и что у нас уже есть: решения, механизмы, артефакты, память, пробы, бэклог,
@@ -36,11 +38,25 @@ usage: prior <слово> [слово…] - слова темы, любое из
 const exitUsage = 2
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+var machineHelp = func() clihelp.Help {
+	help := clihelp.NewRoot("prior", []string{"-h", "--help", "--help-json", "-i", "--ignore-case"}, []string{}, "args", "search prior decisions, mechanisms, artifacts, memory, experiments, backlog and replies")
+	help.Commands[0].NoDashdash = true
+	help.Commands[0].NoEquals = true
+	return help
+}()
 
 func main() {
 	words, err := parseArgs(os.Args[1:])
 	if errors.Is(err, errHelp) {
 		fmt.Print(usage)
+		return
+	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
+			fmt.Fprintf(os.Stderr, "prior: write help: %v\n", err)
+			os.Exit(exitUsage)
+		}
 		return
 	}
 	if err != nil {
@@ -64,6 +80,8 @@ func parseArgs(args []string) ([]string, error) {
 	var words []string
 	for _, a := range args {
 		switch {
+		case a == "--help-json":
+			return nil, errHelpJSON
 		case a == "-h" || a == "--help":
 			return nil, errHelp
 		case a == "-i" || a == "--ignore-case":
