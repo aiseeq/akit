@@ -254,13 +254,13 @@ func scanStage(dir string) ([]entry, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("export: %w", err)
+		return nil, fmt.Errorf("export stage %s: %w", dir, err)
 	}
 	return entries, nil
 }
 
 // describe — запись по пути rel: тип, права, владелец и группа, размер, sha256 файла, текст ссылки, xattr,
-// устройство и inode.
+// устройство, файловая система и inode.
 func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), readlink func() (string, error), rel string) (entry, error) {
 	if err := checkEntryPath(rel); err != nil {
 		return entry{}, err
@@ -293,6 +293,9 @@ func describe(lstat func() (fs.FileInfo, error), open func() (*os.File, error), 
 	}
 	defer func() { _ = f.Close() }()
 	fd := int(f.Fd())
+	if e.FSID, err = filesystemID(fd); err != nil {
+		return entry{}, fmt.Errorf("%s: %w", rel, err)
+	}
 	if e.Xattr, err = xattrSum(func(b []byte) (int, error) { return unix.Flistxattr(fd, b) },
 		func(name string, b []byte) (int, error) { return unix.Fgetxattr(fd, name, b) }); err != nil {
 		return entry{}, fmt.Errorf("%s: %w", rel, err)
@@ -352,19 +355,26 @@ func same(have, want *entry) bool {
 		return have.Kind == "l" && have.Link == want.Link
 	}
 	h, w := *have, *want
-	// st_dev can be reassigned when a filesystem is mounted. Older lists have no fsid;
-	// accept them using their remaining identity fields and refresh them on this export.
+	// st_dev can be reassigned when a filesystem is mounted.
 	h.Dev, w.Dev = 0, 0
+	// Older lists have no fsid: accept them using their remaining identity fields and refresh them on this export.
 	if w.FSID == "" {
 		h.FSID = ""
 	}
 	return h == w
 }
 
+var fstatfs = unix.Fstatfs
+
+var openOut = func(root *os.Root, name string) (*os.File, error) { return root.Open(name) }
+
 func filesystemID(fd int) (string, error) {
 	var st unix.Statfs_t
-	if err := unix.Fstatfs(fd, &st); err != nil {
+	if err := fstatfs(fd, &st); err != nil {
 		return "", fmt.Errorf("statfs: %w", err)
+	}
+	if st.Fsid.Val[0] == 0 && st.Fsid.Val[1] == 0 {
+		return "", fmt.Errorf("statfs: file system gives a zero id")
 	}
 	return fmt.Sprintf("%08x%08x", uint32(st.Fsid.Val[0]), uint32(st.Fsid.Val[1])), nil
 }
@@ -445,7 +455,7 @@ func verifyOut(root *os.Root, known []entry) error {
 	}
 	var walk func(dir string) error
 	walk = func(dir string) error {
-		f, err := root.Open(dir)
+		f, err := openOut(root, dir)
 		if err != nil {
 			return fmt.Errorf("OUT_DIR: %w", err)
 		}
@@ -461,23 +471,16 @@ func verifyOut(root *os.Root, known []entry) error {
 			}
 			rel := path.Join(dir, name)
 			have, err := describe(func() (fs.FileInfo, error) { return root.Lstat(rel) },
-				func() (*os.File, error) { return root.Open(rel) },
+				func() (*os.File, error) { return openOut(root, rel) },
 				func() (string, error) { return root.Readlink(rel) }, rel)
 			if err != nil {
 				return fmt.Errorf("OUT_DIR: %w", err)
 			}
-			fsPath := rel
 			if have.Kind == "l" {
-				fsPath = path.Dir(rel)
-			}
-			fsFile, err := root.Open(fsPath)
-			if err != nil {
-				return fmt.Errorf("OUT_DIR: %w", err)
-			}
-			have.FSID, err = filesystemID(int(fsFile.Fd()))
-			_ = fsFile.Close()
-			if err != nil {
-				return fmt.Errorf("OUT_DIR: %w", err)
+				have.FSID, err = filesystemID(int(f.Fd()))
+				if err != nil {
+					return fmt.Errorf("OUT_DIR: %w", err)
+				}
 			}
 			if have.Birth, err = birthAt(int(f.Fd()), name, 0); err != nil {
 				return fmt.Errorf("OUT_DIR: %w", err)
@@ -771,6 +774,14 @@ func replaceExport(out, stage string) error {
 		return fmt.Errorf("OUT_DIR: %w", err)
 	}
 	defer func() { _ = root.Close() }()
+	outDir, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("OUT_DIR: %w", err)
+	}
+	defer func() { _ = outDir.Close() }()
+	if _, err := filesystemID(int(outDir.Fd())); err != nil {
+		return fmt.Errorf("OUT_DIR: %w", err)
+	}
 	if err := verifyOut(root, old); err != nil {
 		return err
 	}

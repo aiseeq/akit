@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,205 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestDescribeGetsFilesystemIDFromOpenedFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalFstatfs := fstatfs
+	t.Cleanup(func() { fstatfs = originalFstatfs })
+	var openedFD int
+	fstatfs = func(fd int, st *unix.Statfs_t) error {
+		if fd != openedFD {
+			t.Fatalf("fstatfs fd %d, describe opened fd %d", fd, openedFD)
+		}
+		return unix.Fstatfs(fd, st)
+	}
+	described, err := describe(
+		func() (fs.FileInfo, error) { return os.Lstat(file) },
+		func() (*os.File, error) {
+			f, err := os.Open(file)
+			if err == nil {
+				openedFD = int(f.Fd())
+			}
+			return f, err
+		},
+		func() (string, error) { return os.Readlink(file) }, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if described.FSID == "" {
+		t.Fatal("describe returned an empty filesystem id")
+	}
+}
+
+func TestDescribeRejectsZeroFilesystemID(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalFstatfs := fstatfs
+	t.Cleanup(func() { fstatfs = originalFstatfs })
+	fstatfs = func(_ int, st *unix.Statfs_t) error {
+		st.Fsid.Val = [2]int32{}
+		return nil
+	}
+	_, err := describe(
+		func() (fs.FileInfo, error) { return os.Lstat(file) },
+		func() (*os.File, error) { return os.Open(file) },
+		func() (string, error) { return os.Readlink(file) }, "file")
+	if err == nil || !strings.Contains(err.Error(), "zero id") {
+		t.Fatalf("expected zero filesystem id error, got %v", err)
+	}
+}
+
+func TestVerifyOutGetsLinkFilesystemIDFromDirectoryDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	parent, err := root.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// describe intentionally does not open links; populate the fields writeOther records from their parent.
+	e, err := describe(
+		func() (fs.FileInfo, error) { return root.Lstat("link") },
+		func() (*os.File, error) { return nil, errors.New("unused") },
+		func() (string, error) { return root.Readlink("link") }, "link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.FSID, err = filesystemID(int(parent.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	if e.Birth, err = birthAt(int(parent.Fd()), "link", 0); err != nil {
+		t.Fatal(err)
+	}
+	if e.Xattr, err = linkXattr(int(parent.Fd()), "link"); err != nil {
+		t.Fatal(err)
+	}
+	_ = parent.Close()
+
+	originalOpenOut, originalFstatfs := openOut, fstatfs
+	t.Cleanup(func() { openOut, fstatfs = originalOpenOut, originalFstatfs })
+	var verifyDirFD, statfsCalls int
+	openOut = func(root *os.Root, name string) (*os.File, error) {
+		f, err := root.Open(name)
+		if err == nil && name == "." {
+			verifyDirFD = int(f.Fd())
+		}
+		return f, err
+	}
+	fstatfs = func(fd int, st *unix.Statfs_t) error {
+		statfsCalls++
+		if fd != verifyDirFD {
+			t.Fatalf("fstatfs used fd %d, directory descriptor is %d", fd, verifyDirFD)
+		}
+		return unix.Fstatfs(fd, st)
+	}
+	if err := verifyOut(root, []entry{e}); err != nil {
+		t.Fatal(err)
+	}
+	if statfsCalls != 1 {
+		t.Fatalf("fstatfs calls %d, want one from the walked directory", statfsCalls)
+	}
+}
+
+func TestScanStageNamesStateFolderOnZeroFilesystemID(t *testing.T) {
+	stage := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stage, "file"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalFstatfs := fstatfs
+	t.Cleanup(func() { fstatfs = originalFstatfs })
+	fstatfs = func(_ int, st *unix.Statfs_t) error {
+		st.Fsid.Val = [2]int32{}
+		return nil
+	}
+	if _, err := scanStage(stage); err == nil || !strings.Contains(err.Error(), stage) {
+		t.Fatalf("expected error naming stage folder %q, got %v", stage, err)
+	}
+}
+
+func TestExportRefusesZeroFilesystemIDOnFirstRunBeforeWriting(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outStat unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &outStat); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	originalFstatfs := fstatfs
+	t.Cleanup(func() { fstatfs = originalFstatfs })
+	fstatfs = func(fd int, st *unix.Statfs_t) error {
+		if err := unix.Fstatfs(fd, st); err != nil {
+			return err
+		}
+		var got unix.Stat_t
+		if err := unix.Fstat(fd, &got); err != nil {
+			return err
+		}
+		if got.Ino == outStat.Ino && got.Dev == outStat.Dev {
+			st.Fsid.Val = [2]int32{}
+		}
+		return nil
+	}
+	code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+	entries, readErr := os.ReadDir(out)
+	if code != exitUsage || !strings.Contains(stderr, "zero id") || readErr != nil || len(entries) != 0 {
+		t.Fatalf("code %d, entries %v, read error %v, stderr %q", code, entries, readErr, stderr)
+	}
+}
+
+func TestExportRefusesChangedLinkFilesystemID(t *testing.T) {
+	src, rules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != 0 {
+		t.Fatalf("first run: code %d %q", code, stderr)
+	}
+	file, err := listFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := loadList(file, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	links := 0
+	for i := range entries {
+		if entries[i].Kind == "l" {
+			entries[i].FSID += "1"
+			links++
+		}
+	}
+	if links == 0 {
+		t.Fatal("fixture has no links")
+	}
+	if err := saveList(file, out, entries); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, out)
+	if code, _, stderr := runExport(t, "--src-home", src, "--rules", rules, out); code != exitUsage {
+		t.Fatalf("code %d %q", code, stderr)
+	}
+	if snapshot(t, out) != before {
+		t.Fatal("OUT_DIR changed after rejecting link filesystem id")
+	}
+}
 
 // Повторный прогон удаляет только записи прошлого, которые не менялись: любая правка, чужой файл или копия того же
 // содержимого — отказ до очистки, OUT_DIR цел.
@@ -713,5 +913,57 @@ func TestLinkXattrMatchesPath(t *testing.T) {
 	got, err := linkXattr(int(d.Fd()), "l")
 	if err != nil || got != want || got == "" {
 		t.Errorf("linkXattr = %q, %v; want %q", got, err, want)
+	}
+}
+
+func TestVerifyOutGetsFileFilesystemIDFromItsOpenedDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "file"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	e, err := describe(
+		func() (fs.FileInfo, error) { return root.Lstat("file") },
+		func() (*os.File, error) { return root.Open("file") },
+		func() (string, error) { return root.Readlink("file") }, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := root.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Birth, err = birthAt(int(parent.Fd()), "file", 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = parent.Close()
+
+	originalOpenOut, originalFstatfs := openOut, fstatfs
+	t.Cleanup(func() { openOut, fstatfs = originalOpenOut, originalFstatfs })
+	fileFD := -1
+	openOut = func(root *os.Root, name string) (*os.File, error) {
+		f, err := root.Open(name)
+		if err == nil && name == "file" {
+			fileFD = int(f.Fd())
+		}
+		return f, err
+	}
+	var statfsCalls int
+	fstatfs = func(fd int, st *unix.Statfs_t) error {
+		statfsCalls++
+		if fd != fileFD {
+			t.Fatalf("fstatfs used fd %d, the file's descriptor from openOut is %d", fd, fileFD)
+		}
+		return unix.Fstatfs(fd, st)
+	}
+	if err := verifyOut(root, []entry{e}); err != nil {
+		t.Fatal(err)
+	}
+	if statfsCalls != 1 {
+		t.Fatalf("fstatfs calls %d, want one from the file's own descriptor", statfsCalls)
 	}
 }
