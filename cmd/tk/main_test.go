@@ -3084,7 +3084,10 @@ func TestNewRejectsInvalidCommandFlagsAndBack(t *testing.T) {
 			}
 		})
 	}
-	for _, args := range [][]string{{"new", "task", "--prio", "HIGH"}, {"new", "task", "--diff", "NOPE"}} {
+	if _, err := parseArgs([]string{"new", "task", "--prio", "HIGH"}); err != nil {
+		t.Errorf("high priority without a reason should be allowed: %v", err)
+	}
+	for _, args := range [][]string{{"new", "task", "--diff", "NOPE"}} {
 		if _, err := parseArgs(args); err == nil {
 			t.Errorf("parseArgs(%q) succeeded", args)
 		}
@@ -3122,7 +3125,7 @@ func TestSetAndStartInsertWhyWithoutStatus(t *testing.T) {
 	}
 }
 
-func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
+func TestSetAndStartRecordMissingPromotionReason(t *testing.T) {
 	for _, command := range []string{"set", "start"} {
 		for _, tc := range []struct {
 			name, oldPrio, newPrio, diff string
@@ -3131,7 +3134,7 @@ func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
 			{name: "same priority", oldPrio: "HIGH", newPrio: "HIGH"},
 			{name: "diff only", oldPrio: "HIGH", newPrio: "HIGH", diff: "DO"},
 			{name: "downgrade", oldPrio: "HIGH", newPrio: "LOW"},
-			{name: "promotion requires reason", oldPrio: "MED", newPrio: "HIGH", wantCode: exitUsage},
+			{name: "promotion without reason succeeds", oldPrio: "MED", newPrio: "HIGH"},
 		} {
 			t.Run(command+"/"+tc.name, func(t *testing.T) {
 				dir := t.TempDir()
@@ -3143,7 +3146,8 @@ func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
 				if err := os.WriteFile(oldPath, []byte(body), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				o := options{cmd: command, prio: tc.newPrio, diff: tc.diff, by: "actor"}
+				facts := &timeHintFacts{}
+				o := options{cmd: command, prio: tc.newPrio, diff: tc.diff, by: "actor", hintFacts: facts}
 				var out, errout bytes.Buffer
 				ticket := task{path: oldPath, slug: "ticket", prio: tc.oldPrio, status: "открыт", body: body}
 				var code int
@@ -3155,9 +3159,10 @@ func TestSetAndStartRequireWhyOnlyForPriorityPromotion(t *testing.T) {
 				if code != tc.wantCode {
 					t.Fatalf("code=%d, want %d; stderr=%q", code, tc.wantCode, errout.String())
 				}
-				if tc.wantCode != 0 {
-					if _, err := os.Stat(oldPath); err != nil {
-						t.Fatalf("refused promotion changed ticket name: %v", err)
+				if tc.name == "promotion without reason succeeds" {
+					updatedPath := filepath.Join(dir, "20261105-1000-"+tc.newPrio+"-ticket.md")
+					if !strings.Contains(read(t, updatedPath), "без причины") || formatTimeHint(*facts) == "" {
+						t.Fatalf("promotion lacks journal marker or hint; facts=%+v", *facts)
 					}
 				}
 			})
@@ -3767,10 +3772,12 @@ func TestNewAndStartNameNextStep(t *testing.T) {
 			}
 			out.Reset()
 			errOut.Reset()
-			code := transition(tasks[0], options{cmd: "start", id: "sample", by: "me"}, &out, &errOut)
+			facts := &timeHintFacts{}
+			code := transition(tasks[0], options{cmd: "start", id: "sample", by: "me", hintFacts: facts}, &out, &errOut)
 			if tc.name == "empty ticket" {
-				if code != exitNone || !strings.Contains(errOut.String(), "Приёмка") || !strings.Contains(errOut.String(), "tk set sample --text") {
-					t.Fatalf("empty start = %d: %s", code, errOut.String())
+				updated, err := os.ReadFile(tasks[0].path)
+				if code != 0 || !strings.Contains(string(updated), "старт без приёмки") || !strings.Contains(formatTimeHint(*facts), "tk set sample --text") {
+					t.Fatalf("empty start = %d: body=%s hint=%+v err=%v", code, updated, *facts, err)
 				}
 				return
 			}
@@ -3823,6 +3830,163 @@ func TestRepeatedStartNamesNextStep(t *testing.T) {
 	code, done := guardStart(task{path: path, slug: "again", status: "в работе", body: body}, options{cmd: "start", by: "me"}, &out, &errOut)
 	if code != 0 || !done || strings.TrimSpace(out.String()) != "again в работе" || !strings.Contains(errOut.String(), "tk done again") {
 		t.Fatalf("repeat start = %d %v %q %q", code, done, out.String(), errOut.String())
+	}
+}
+
+func TestStartAssignedToOtherExplainsTakeRiskAndFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "20261104-1000-MED-owned.md")
+	body := "# T\n\nСтатус: в работе\nИсполнитель: other\n\n## Приёмка\n- check\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code, handled := guardStart(task{path: path, slug: "owned", status: "в работе", body: body}, options{cmd: "start", by: "tester"}, &out, &errOut)
+	updated, err := os.ReadFile(path)
+	if err != nil || code == 0 || !handled || !strings.Contains(errOut.String(), "--take") || string(updated) != body {
+		t.Fatalf("take refusal = %d handled=%v err=%q ticket changed=%v readErr=%v", code, handled, errOut.String(), string(updated) != body, err)
+	}
+}
+
+func TestNewHighWithoutWhySucceedsWithJournalMarkerAndHint(t *testing.T) {
+	root := t.TempDir()
+	facts := &timeHintFacts{}
+	var out, errOut bytes.Buffer
+	if code := create(root, filepath.Join(root, "docs", "tasks"), options{cmd: "new", id: "urgent", prio: "HIGH", by: "tester", hintFacts: facts}, &out, &errOut); code != 0 {
+		t.Fatalf("new code=%d stderr=%q", code, errOut.String())
+	}
+	files, err := os.ReadDir(filepath.Join(root, "docs", "tasks"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("tickets=%v err=%v", files, err)
+	}
+	updated, err := os.ReadFile(filepath.Join(root, "docs", "tasks", files[0].Name()))
+	if err != nil || !strings.Contains(string(updated), "без причины") || !strings.Contains(formatTimeHint(*facts), "tk set urgent --why TEXT") {
+		t.Fatalf("new marker/hint: %s facts=%+v err=%v", updated, *facts, err)
+	}
+}
+
+func TestRunMainNonDangerousRefusalsSucceedWithLastLineHints(t *testing.T) {
+	t.Run("start without acceptance", func(t *testing.T) {
+		_, dir := testRunMainRoot(t)
+		path := writeRunMainTask(t, dir, "20261115-1000-MED-empty.md", "# Empty\n\nСтатус: открыт\n\n## Приёмка\n\n## Журнал\n")
+		var out, errOut bytes.Buffer
+		if code := runMain([]string{"start", "empty", "--by", "tester"}, time.Now(), &out, &errOut); code != 0 {
+			t.Fatalf("start code=%d stderr=%q", code, errOut.String())
+		}
+		updated, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(updated), "Статус: в работе") || !strings.Contains(string(updated), "старт без приёмки") {
+			t.Fatalf("start update=%s err=%v", updated, err)
+		}
+		requireHintParts(t, errOut.String(), "Приёмка", "tk set empty --text")
+	})
+	t.Run("high without reason", func(t *testing.T) {
+		_, dir := testRunMainRoot(t)
+		writeRunMainTask(t, dir, "20261115-1000-MED-promote.md", "# Promote\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+		var out, errOut bytes.Buffer
+		if code := runMain([]string{"set", "promote", "--prio", "HIGH", "--by", "tester"}, time.Now(), &out, &errOut); code != 0 {
+			t.Fatalf("set code=%d stderr=%q", code, errOut.String())
+		}
+		files, err := filepath.Glob(filepath.Join(dir, "*-HIGH-promote.md"))
+		if err != nil || len(files) != 1 || !strings.Contains(read(t, files[0]), "note — tester: без причины") {
+			t.Fatalf("set journal files=%v err=%v", files, err)
+		}
+		requireHintParts(t, errOut.String(), "HIGH", "tk set promote --why TEXT")
+	})
+	t.Run("new high without reason", func(t *testing.T) {
+		_, dir := testRunMainRoot(t)
+		var out, errOut bytes.Buffer
+		if code := runMain([]string{"new", "urgent", "--prio", "HIGH", "--by", "tester"}, time.Now(), &out, &errOut); code != 0 {
+			t.Fatalf("new code=%d stderr=%q", code, errOut.String())
+		}
+		files, err := filepath.Glob(filepath.Join(dir, "*-HIGH-urgent.md"))
+		if err != nil || len(files) != 1 || !strings.Contains(read(t, files[0]), "note — tester: без причины") {
+			t.Fatalf("new journal files=%v err=%v", files, err)
+		}
+		requireHintParts(t, errOut.String(), "HIGH", "tk set urgent --why TEXT")
+	})
+	t.Run("lower below blocker", func(t *testing.T) {
+		_, dir := testRunMainRoot(t)
+		writeRunMainTask(t, dir, "20261115-1000-HIGH-lower.md", "# Lower\n\nСтатус: открыт\nБлокирует: blocker\nПричина: synthetic\n\n## Приёмка\n- check\n\n## Журнал\n")
+		writeRunMainTask(t, dir, "20261115-1001-HIGH-blocker.md", "# Blocker\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+		var out, errOut bytes.Buffer
+		if code := runMain([]string{"set", "lower", "--prio", "LOW", "--why", "lower", "--by", "tester"}, time.Now(), &out, &errOut); code != 0 {
+			t.Fatalf("set code=%d stderr=%q", code, errOut.String())
+		}
+		files, err := filepath.Glob(filepath.Join(dir, "*-LOW-lower.md"))
+		if err != nil || len(files) != 1 || !strings.Contains(read(t, files[0]), "Причина: lower") {
+			t.Fatalf("lowered ticket files=%v err=%v", files, err)
+		}
+		requireHintParts(t, errOut.String(), "lowered below blocking ticket blocker", "--unblocks blocker")
+	})
+}
+
+func TestRunMainCombinesPriorityAndGuessedTimeHints(t *testing.T) {
+	t.Run("priority floor and why time", func(t *testing.T) {
+		_, dir := testRunMainRoot(t)
+		writeRunMainTask(t, dir, "20261115-1000-HIGH-lower3.md", "# Lower\n\nСтатус: открыт\nБлокирует: blocker3\nПричина: synthetic\n\n## Приёмка\n- check\n\n## Журнал\n")
+		writeRunMainTask(t, dir, "20261115-1001-HIGH-blocker3.md", "# Blocker\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+		var out, errOut bytes.Buffer
+		args := []string{"set", "lower3", "--prio", "LOW", "--why", "06:4x decided", "--by", "tester"}
+		if code := runMain(args, time.Now(), &out, &errOut); code != 0 {
+			t.Fatalf("set code=%d stderr=%q", code, errOut.String())
+		}
+		requireHintParts(t, errOut.String(), "--unblocks blocker3", "«06:4x»")
+	})
+	t.Run("start acceptance and why time", func(t *testing.T) {
+		_, dir := testRunMainRoot(t)
+		writeRunMainTask(t, dir, "20261115-1000-MED-e3.md", "# E3\n\nСтатус: открыт\n\n## Приёмка\n\n## Журнал\n")
+		var out, errOut bytes.Buffer
+		args := []string{"start", "e3", "--why", "06:4x decided", "--by", "tester"}
+		if code := runMain(args, time.Now(), &out, &errOut); code != 0 {
+			t.Fatalf("start code=%d stderr=%q", code, errOut.String())
+		}
+		requireHintParts(t, errOut.String(), "tk set e3 --text", "«06:4x»")
+	})
+}
+
+func TestRunMainDoesNotMarkPriorityWithAnExistingReason(t *testing.T) {
+	tests := []struct {
+		name, command  string
+		why, headerWhy string
+	}{
+		{name: "new with --why", command: "new", why: "synthetic"},
+		{name: "set with --why", command: "set", why: "synthetic"},
+		{name: "set with Причина", command: "set", headerWhy: "existing"},
+		{name: "start with --why", command: "start", why: "synthetic"},
+		{name: "start with Причина", command: "start", headerWhy: "existing"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, dir := testRunMainRoot(t)
+			var args []string
+			slug := "reason"
+			if tc.command == "new" {
+				args = []string{"new", slug, "--prio", "HIGH"}
+			} else {
+				body := "# Reason\n\nСтатус: открыт\n"
+				if tc.headerWhy != "" {
+					body += "Причина: " + tc.headerWhy + "\n"
+				}
+				body += "\n## Приёмка\n- check\n\n## Журнал\n"
+				writeRunMainTask(t, dir, "20261115-1000-MED-"+slug+".md", body)
+				args = []string{tc.command, slug, "--prio", "HIGH"}
+			}
+			if tc.why != "" {
+				args = append(args, "--why", tc.why)
+			}
+			args = append(args, "--by", "tester")
+			var out, errOut bytes.Buffer
+			if code := runMain(args, time.Now(), &out, &errOut); code != 0 {
+				t.Fatalf("command code=%d stderr=%q", code, errOut.String())
+			}
+			files, err := filepath.Glob(filepath.Join(dir, "*-HIGH-"+slug+".md"))
+			if err != nil || len(files) != 1 {
+				t.Fatalf("updated tickets=%v err=%v", files, err)
+			}
+			updated := read(t, files[0])
+			if strings.Contains(updated, "без причины") || strings.Contains(errOut.String(), "установлен без причины") || strings.Contains(errOut.String(), "создан без причины") {
+				t.Fatalf("reason was marked missing: ticket=%s stderr=%q", updated, errOut.String())
+			}
+		})
 	}
 }
 

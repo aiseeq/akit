@@ -719,19 +719,25 @@ func TestCloseBlockRelationsRepeatIsSilent(t *testing.T) {
 func TestManualPriorityFloorAndSameCommandUnblock(t *testing.T) {
 	root, dir := blockTestProject(t)
 	path := filepath.Join(dir, "20260101-0000-HIGH-x.md")
-	if err := os.WriteFile(path, []byte("# x\n\nСтатус: открыт\nБлокирует: t\nПричина: r\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("# x\n\nСтатус: открыт\nБлокирует: t\nПричина: r\n\n## Приёмка\n- check\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	blockTestWrite(t, dir, "t", "HIGH", "# t\n\nСтатус: открыт\n")
 	for _, args := range [][]string{{"set", "x", "--prio", "LOW", "--why", "lower"}, {"start", "x", "--prio", "LOW", "--why", "lower"}} {
+		_ = os.Remove(filepath.Join(dir, "20260101-0000-LOW-x.md"))
+		if err := os.WriteFile(path, []byte("# x\n\nСтатус: открыт\nБлокирует: t\nПричина: r\n\n## Приёмка\n- check\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
 		o, err := parseArgs(args)
 		if err != nil {
 			t.Fatal(err)
 		}
 		o.by = "tester"
+		facts := &timeHintFacts{}
+		o.hintFacts = facts
 		var out, errout bytes.Buffer
-		if code := runAtBase(root, dir, o, &out, &errout); code == 0 || !strings.Contains(errout.String(), "t") || !strings.Contains(errout.String(), "HIGH") {
-			t.Fatalf("downgrade not rejected for %v: code=%d stderr=%q", args, code, errout.String())
+		if code := runAtBase(root, dir, o, &out, &errout); code != 0 || !strings.Contains(formatTimeHint(*facts), "use --unblocks t") || !strings.Contains(formatTimeHint(*facts), "HIGH") {
+			t.Fatalf("downgrade advice for %v: code=%d stderr=%q facts=%+v", args, code, errout.String(), *facts)
 		}
 	}
 	o, err := parseArgs([]string{"set", "x", "--prio", "LOW", "--why", "lower", "--unblocks", "t", "--by", "tester"})

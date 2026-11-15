@@ -59,7 +59,7 @@ Usage:
 Flags:
   --prio P       new/set/start: CRIT, HIGH, MED, MEDIUM, or LOW (new default MED)
   --diff D       new/set/start: difficulty DO, HUNT, or ARCH
-  --why TEXT     new: required for CRIT/HIGH; set/start: required when promoting to CRIT/HIGH; reject/release: reason
+  --why TEXT     new: record a reason for CRIT/HIGH; set/start: record one when promoting to CRIT/HIGH; reject/release: reason
   --to PROJECT   new: create in PROJECT/docs/tasks; absolute path or project name
   --journal      new/set: mark the ticket as a journal entry, hidden from next unless a wait is due
   --parent KEY   transfer: parent item key passed to the transfer command
@@ -237,6 +237,15 @@ func runMain(args []string, now time.Time, out, errout io.Writer) int {
 	}
 	return code
 }
+
+func recordAdvice(o options, advice string) {
+	if o.hintFacts != nil {
+		if o.hintFacts.advice != "" {
+			o.hintFacts.advice += "; "
+		}
+		o.hintFacts.advice += advice
+	}
+}
 func parseArgs(a []string) (options, error) {
 	if len(a) == 0 {
 		return options{}, errors.New("need a command")
@@ -279,14 +288,19 @@ func validateOneLine(o options) error {
 
 type timeHintFacts struct {
 	field, value, suspect, kind string
+	advice                      string
 	marked, header              bool
 	deadline                    time.Time
 	hasDeadline                 bool
 }
 
 func formatTimeHint(facts timeHintFacts) string {
+	var hints []string
+	if facts.advice != "" {
+		hints = append(hints, facts.advice)
+	}
 	if facts.suspect == "" {
-		return ""
+		return strings.Join(hints, "; ")
 	}
 	if facts.field == "--until" {
 		mark := "строка журнала записана без пометки"
@@ -297,15 +311,17 @@ func formatTimeHint(facts timeHintFacts) string {
 		if facts.hasDeadline {
 			deadline = "срок распознан: " + facts.deadline.Format(time.RFC3339)
 		}
-		return fmt.Sprintf("tk: «%s» в %s %s; %s, %s", facts.suspect, facts.field, facts.kind, mark, deadline)
+		hints = append(hints, fmt.Sprintf("tk: «%s» в %s %s; %s, %s", facts.suspect, facts.field, facts.kind, mark, deadline))
+		return strings.Join(hints, "; ")
 	}
 	if facts.header {
-		return fmt.Sprintf("tk: «%s» в %s %s; значение «Причина:» записано без пометки", facts.suspect, facts.field, facts.kind)
+		hints = append(hints, fmt.Sprintf("tk: «%s» в %s %s; значение «Причина:» записано без пометки", facts.suspect, facts.field, facts.kind))
+		return strings.Join(hints, "; ")
 	}
 	if facts.marked {
-		return fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]». Время записи — её метка, точное время можно взять из date", facts.suspect, facts.field, facts.kind)
+		hints = append(hints, fmt.Sprintf("tk: «%s» в %s %s; строка журнала дополнена пометкой «[время требует проверки]». Время записи — её метка, точное время можно взять из date", facts.suspect, facts.field, facts.kind))
 	}
-	return ""
+	return strings.Join(hints, "; ")
 }
 
 func journalTimeCandidate(o options, value string) (string, string) {
@@ -322,7 +338,7 @@ func recordTimeHint(o options, fact timeHintFacts) {
 	if o.hintFacts != nil {
 		*o.hintFacts = timeHintFacts{
 			field: fact.field, value: fact.value, suspect: fact.suspect, kind: fact.kind, marked: fact.marked, header: fact.header,
-			deadline: o.hintFacts.deadline, hasDeadline: o.hintFacts.hasDeadline,
+			advice: o.hintFacts.advice, deadline: o.hintFacts.deadline, hasDeadline: o.hintFacts.hasDeadline,
 		}
 	}
 }
@@ -768,9 +784,6 @@ func validateNew(o *options, pos []string) error {
 	}
 	if !validDiff(o.diff) {
 		return errors.New("--diff must be DO, HUNT, or ARCH")
-	}
-	if requiresWhyForPromotion("LOW", o.prio) && strings.TrimSpace(o.why) == "" {
-		return errors.New("--prio CRIT/HIGH requires --why")
 	}
 	if o.by != "" && !nameRE.MatchString(o.by) {
 		return errors.New("--by must be a name without spaces; use --by NAME")
@@ -1846,6 +1859,10 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	}
 	body := fmt.Sprintf("# %s\n\nСтатус: открыт\n%s\n## Что сделать\n\n## Приёмка\n\n## Журнал\n- %s открыт — %s\n",
 		title, meta, now.Format("2006-01-02 15:04"), o.by)
+	missingWhy := requiresWhyForPromotion("LOW", o.prio) && strings.TrimSpace(o.why) == ""
+	if missingWhy {
+		body = journal(body, "- "+now.Format("2006-01-02 15:04")+" note — "+o.by+": без причины")
+	}
 	if o.text != "" {
 		body = fillTicket(body, o.text)
 	}
@@ -1859,6 +1876,9 @@ func create(root, dir string, o options, out, errout io.Writer) int {
 	p := filepath.Join(dir, name+o.id+".md")
 	if e = writeTask(p, body); e != nil {
 		return fail(errout, e)
+	}
+	if missingWhy {
+		recordAdvice(o, "tk: приоритет "+o.prio+" создан без причины; добавь причину через tk set "+o.id+" --why TEXT")
 	}
 	recordUnmarkedHeader(o, o.why)
 	createdPath := relative(root, p)
@@ -3654,11 +3674,6 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return setTask(t, o, out, errout)
 	}
 	if o.cmd == "start" {
-		_, acceptanceFilled := checkSections(t.body)
-		if !isJournal(t) && !acceptanceFilled {
-			fmt.Fprintln(errout, "tk: нужен непустой раздел «Приёмка» или «Чем проверить»; добавь или заполни его через tk set "+t.slug+" --text FILE|-")
-			return exitNone
-		}
 		if code := refuseFrozenStart(o, errout); code != 0 {
 			return code
 		}
@@ -3687,7 +3702,21 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "start" && !hadStatus {
 		body = moveMetadataAfterStatus(body)
 	}
-	body = journal(body, transitionJournal(o, next, glintFindings))
+	return commitTransition(t, o, next, body, glintFindings, out, errout)
+}
+
+func commitTransition(t task, o options, next, body string, glintFindings int, out, errout io.Writer) int {
+	entry := transitionJournal(o, next, glintFindings)
+	_, acceptanceFilled := checkSections(t.body)
+	missingAcceptance := o.cmd == "start" && !isJournal(t) && !acceptanceFilled
+	missingWhy := o.cmd == "start" && o.prio != "" && requiresWhyForPromotion(t.prio, o.prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == ""
+	if missingAcceptance {
+		entry += " — старт без приёмки"
+	}
+	if missingWhy {
+		entry += " — без причины"
+	}
+	body = journal(body, entry)
 	newPath, err := transitionPath(&t, o)
 	if err != nil {
 		return fail(errout, err)
@@ -3705,6 +3734,12 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if o.cmd == "start" {
 		fmt.Fprintln(errout, hintAfterStart(t, body, newPath))
 	}
+	if missingAcceptance {
+		recordAdvice(o, "tk: нужен непустой раздел «Приёмка» или «Чем проверить»; добавь или заполни его через tk set "+t.slug+" --text FILE|-")
+	}
+	if missingWhy {
+		recordAdvice(o, "tk: приоритет "+o.prio+" установлен без причины; добавь причину через tk set "+t.slug+" --why TEXT")
+	}
 	return 0
 }
 
@@ -3719,23 +3754,13 @@ func guardStart(t task, o options, out, errout io.Writer) (int, bool) {
 		return 0, true
 	}
 	if owner != "" && !strings.EqualFold(owner, o.by) && !o.take {
-		fmt.Fprintf(errout, "tk: ticket is assigned to %s\n", owner)
+		fmt.Fprintf(errout, "tk: ticket is assigned to %s; to take it over: tk start %s --take\n", owner, t.slug)
 		return exitNone, true
 	}
 	return 0, false
 }
 
 func prepareTransition(t task, o options, errout io.Writer) (int, func(), int) {
-	if o.cmd == "start" && (o.prio != "" || o.diff != "" || o.why != "") {
-		prio := t.prio
-		if o.prio != "" {
-			prio = o.prio
-		}
-		if requiresWhyForPromotion(t.prio, prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == "" {
-			fmt.Fprintln(errout, "tk: --prio CRIT/HIGH requires --why or an existing Причина")
-			return 0, nil, exitUsage
-		}
-	}
 	if o.cmd != "done" {
 		return 0, nil, 0
 	}
@@ -3954,13 +3979,13 @@ func setTask(t task, o options, out, errout io.Writer) int {
 	if o.prio != "" {
 		prio = o.prio
 	}
-	if requiresWhyForPromotion(t.prio, prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == "" {
-		fmt.Fprintln(errout, "tk: --prio CRIT/HIGH requires --why or an existing Причина")
-		return exitUsage
-	}
+	missingWhy := requiresWhyForPromotion(t.prio, prio) && strings.TrimSpace(o.why) == "" && lineValue(t.body, "Причина: ") == ""
 	body, err := applySetFields(t, o)
 	if err != nil {
 		return fail(errout, err)
+	}
+	if missingWhy {
+		body = journal(body, "- "+time.Now().Format("2006-01-02 15:04")+" note — "+o.by+": без причины")
 	}
 	if o.text != "" {
 		body, err = replaceExistingTicketSections(body, o.text)
@@ -4006,6 +4031,9 @@ func setTask(t task, o options, out, errout io.Writer) int {
 		return fail(errout, err)
 	}
 	fmt.Fprintln(out, newName)
+	if missingWhy {
+		recordAdvice(o, "tk: приоритет "+prio+" установлен без причины; добавь причину через tk set "+t.slug+" --why TEXT")
+	}
 	return 0
 }
 

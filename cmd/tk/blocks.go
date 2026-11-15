@@ -826,8 +826,8 @@ func validatePriorityFloor(t task, o options, errout io.Writer) int {
 			continue
 		}
 		if blockPrioRank(o.prio) > blockPrioRank(target.prio) {
-			fmt.Fprintf(errout, "tk: cannot lower priority below blocking ticket %s (%s); use --unblocks %s or lower that ticket first\n", ref, normalizePrio(target.prio), ref)
-			return exitUsage
+			recordAdvice(o, fmt.Sprintf("tk: lowered below blocking ticket %s (%s); use --unblocks %s or lower that ticket first", ref, normalizePrio(target.prio), ref))
+			return 0
 		}
 	}
 	return 0
