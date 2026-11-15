@@ -2987,7 +2987,7 @@ func nextShellInputTarget(name string, args []string, via []string, scan *wrappe
 	return "", nil, nil, false
 }
 
-var shellNames = []string{"bash", "sh", "dash", "zsh"}
+var shellNames = []string{"bash", "sh", "dash", "zsh", "ksh", "mksh", "ksh93", "lksh", "rksh", "rksh93", "pdksh", "fish"}
 
 func isShell(name string) bool {
 	return slices.Contains(shellNames, name)
@@ -3015,6 +3015,9 @@ func mainCompatibleNoExecHeredoc(shell string, args []string) bool {
 }
 
 func shellNoExec(shell string, args []string) bool {
+	if shell == "fish" || isKornShell(shell) {
+		return false
+	}
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" || args[i] == "-" {
 			return false
@@ -3034,7 +3037,13 @@ func shellNoExec(shell string, args []string) bool {
 // shellArgs разбирает `bash [опции] [-c СКРИПТ | -s | ФАЙЛ] [аргументы]`: operand — индекс первого
 // аргумента после опций (len(args) — его нет), command — есть -c, stdin — оболочка читает скрипт со stdin.
 func shellArgs(shell string, args []string) (operand int, command, stdin bool) {
+	if shell == "fish" {
+		return fishShellArgs(args)
+	}
 	for i := 0; i < len(args); i++ {
+		if shell == "fish" && strings.HasPrefix(args[i], "--command=") {
+			return i, true, stdin
+		}
 		if args[i] == "--" || args[i] == "-" {
 			return i + 1, command, stdin || i+1 == len(args)
 		}
@@ -3043,12 +3052,48 @@ func shellArgs(shell string, args []string) (operand int, command, stdin bool) {
 			return i, command, stdin
 		}
 		stdin, command = stdin || readsStdin, command || readsCommand
+		values = shellOptionValueCount(shell, args, i, values)
 		i += values
 	}
 	return len(args), command, stdin
 }
 
+func fishShellArgs(args []string) (operand int, command, stdin bool) {
+	scripts, _, file, valid := fishInvocationOptions(args)
+	if !valid {
+		return len(args), false, false
+	}
+	for _, script := range scripts {
+		if script.command {
+			return script.index, true, false
+		}
+	}
+	return file, false, file == len(args) || file < len(args) && args[file] == "-"
+}
+
+func shellOptionValueCount(shell string, args []string, index, values int) int {
+	if !isKornShell(shell) {
+		return values
+	}
+	arg := args[index]
+	if (arg == "-o" || arg == "+o") && index+1 < len(args) && !strings.HasPrefix(args[index+1], "-") && !strings.HasPrefix(args[index+1], "+") {
+		return 1
+	}
+	if shell == "mksh" && arg == "-T" {
+		return 1
+	}
+	return values
+}
+
 func shellArgumentOption(shell, arg string) (option bool, values int, stdin, command, noExec bool) {
+	if shell == "fish" {
+		if fishOpt, fishValues, fishCommand, fishNoExec, ok := fishArgumentOption(arg); ok {
+			return fishOpt, fishValues, false, fishCommand, fishNoExec
+		}
+	}
+	if isKornShell(shell) {
+		return kornArgumentOption(shell, arg)
+	}
 	if arg == "--rcfile" || arg == "--init-file" {
 		return true, 1, false, false, false
 	}
@@ -3063,7 +3108,7 @@ func shellArgumentOption(shell, arg string) (option bool, values int, stdin, com
 		case 'c':
 			command = true
 		case 's':
-			stdin = true
+			stdin = shell != "fish"
 		case 'o':
 			if shell == "zsh" {
 				if j+1 < len(arg) {
@@ -3082,6 +3127,287 @@ func shellArgumentOption(shell, arg string) (option bool, values int, stdin, com
 		}
 	}
 	return true, values, stdin, command, noExec
+}
+
+type fishScriptArg struct {
+	index   int
+	offset  int
+	command bool
+	option  string
+}
+
+type fishLongOptionSpec struct {
+	name    string
+	value   bool
+	command bool
+}
+
+var fishLongOptions = []fishLongOptionSpec{
+	{name: "--command", value: true, command: true}, {name: "--init-command", value: true, command: true},
+	{name: "--debug", value: true}, {name: "--debug-output", value: true}, {name: "--profile", value: true},
+	{name: "--profile-startup", value: true}, {name: "--features", value: true},
+	{name: "--interactive"}, {name: "--login"}, {name: "--no-config"},
+	{name: "--no-execute"}, {name: "--private"}, {name: "--print-rusage-self"},
+	{name: "--print-debug-categories"}, {name: "--version"}, {name: "--help"},
+}
+
+func fishLongOption(prefix string) (fishLongOptionSpec, bool) {
+	if prefix == "--init-cmd" {
+		prefix = "--init-command"
+	}
+	if prefix == "--co" || prefix == "--c" {
+		prefix = "--command"
+	} // fish accepts these command abbreviations.
+	match := fishLongOptionSpec{}
+	for _, option := range fishLongOptions {
+		if option.name == prefix {
+			return option, true
+		}
+		if strings.HasPrefix(option.name, prefix) {
+			if match.name != "" {
+				return fishLongOptionSpec{}, false
+			}
+			match = option
+		}
+	}
+	return match, match.name != ""
+}
+
+func fishArgumentOption(arg string) (option bool, values int, command, noExec, ok bool) {
+	if strings.HasPrefix(arg, "--") {
+		key, _, attached := strings.Cut(arg, "=")
+		long, found := fishLongOption(key)
+		if !found || attached && !long.value {
+			return false, 0, false, false, false
+		}
+		return true, boolInt(long.value && !attached), long.name == "--command", false, true
+	}
+	if arg == "-" || len(arg) < 2 || arg[0] != '-' {
+		return false, 0, false, false, false
+	}
+	for i := 1; i < len(arg); i++ {
+		switch arg[i] {
+		case 'c', 'C', 'd', 'o', 'p', 'f':
+			return true, boolInt(i == len(arg)-1), arg[i] == 'c', false, true
+		case 'i', 'l', 'N', 'P', 'n', 'v', 'h':
+		default:
+			return false, 0, false, false, false
+		}
+	}
+	return true, 0, false, false, true
+}
+
+func fishInvocationOptions(args []string) (scripts []fishScriptArg, noExec bool, file int, valid bool) {
+	file, valid = len(args), true
+	sawFile := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if !sawFile && !fishHasCommandScript(scripts) && i+1 < len(args) {
+				file, sawFile = i+1, true
+			}
+			break
+		}
+		if arg == "" || !strings.HasPrefix(arg, "-") || arg == "-" {
+			if !sawFile && !fishHasCommandScript(scripts) {
+				file, sawFile = i, true
+			}
+			continue
+		}
+		parsed, consumed, ok := fishInvocationOption(args, i)
+		if !ok {
+			return nil, false, file, false
+		}
+		scripts = append(scripts, parsed.scripts...)
+		i += consumed
+	}
+	return scripts, noExec, file, valid
+}
+
+func fishHasCommandScript(scripts []fishScriptArg) bool {
+	for _, script := range scripts {
+		if script.command {
+			return true
+		}
+	}
+	return false
+}
+
+type fishOptionResult struct {
+	scripts []fishScriptArg
+}
+
+func fishInvocationOption(args []string, i int) (fishOptionResult, int, bool) {
+	if strings.HasPrefix(args[i], "--") {
+		return fishLongInvocationOption(args, i)
+	}
+	return fishShortInvocationOption(args, i)
+}
+
+func fishLongInvocationOption(args []string, i int) (fishOptionResult, int, bool) {
+	key, _, attached := strings.Cut(args[i], "=")
+	option, ok := fishLongOption(key)
+	if !ok || attached && !option.value {
+		return fishOptionResult{}, 0, false
+	}
+	if option.value {
+		index, offset, consumed, ok := fishOptionValue(args, i, len(key)+1, attached)
+		if !ok {
+			return fishOptionResult{}, 0, false
+		}
+		result := fishOptionResult{}
+		if option.command {
+			result.scripts = append(result.scripts, fishScriptArg{index: index, offset: offset, command: option.name == "--command", option: option.name})
+		}
+		return result, consumed, true
+	}
+	return fishOptionResult{}, 0, true
+}
+
+func fishShortInvocationOption(args []string, i int) (fishOptionResult, int, bool) {
+	arg := args[i]
+	result := fishOptionResult{}
+	for j := 1; j < len(arg); j++ {
+		ch := arg[j]
+		switch ch {
+		case 'c', 'C', 'd', 'o', 'p', 'f':
+			index, offset, consumed, ok := fishOptionValue(args, i, j+1, j+1 < len(arg))
+			if !ok {
+				return fishOptionResult{}, 0, false
+			}
+			if ch == 'c' || ch == 'C' {
+				result.scripts = append(result.scripts, fishScriptArg{index: index, offset: offset, command: ch == 'c', option: "-" + string(ch)})
+			}
+			return result, consumed, true
+		case 'i':
+		case 'n', 'v', 'h':
+		case 'l', 'N', 'P':
+		default:
+			return fishOptionResult{}, 0, false
+		}
+	}
+	return result, 0, true
+}
+
+func fishOptionValue(args []string, i, offset int, attached bool) (index, valueOffset, consumed int, ok bool) {
+	if attached {
+		return i, offset, 0, true
+	}
+	if i+1 >= len(args) {
+		return 0, 0, 0, false
+	}
+	return i + 1, 0, 1, true
+}
+
+func isKornShell(shell string) bool {
+	switch shell {
+	case "ksh", "mksh", "ksh93", "lksh", "rksh", "rksh93", "pdksh":
+		return true
+	default:
+		return false
+	}
+}
+
+func kornArgumentOption(shell, arg string) (option bool, values int, stdin, command, noExec bool) {
+	if shell == "mksh" && arg == "-T" {
+		return true, 1, false, false, false
+	}
+	if len(arg) < 2 || (arg[0] != '-' && arg[0] != '+') {
+		return false, 0, false, false, false
+	}
+	for j := 1; j < len(arg); j++ {
+		if arg[j] == 'c' {
+			command = true
+		}
+		if arg[j] == 's' {
+			stdin = true
+		}
+	}
+	return true, 0, stdin, command, false
+}
+
+func kornInvocation(args []string, shell string) (operand int, command, stdin, valid bool) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || arg == "-" {
+			return i + 1, command, stdin || i+1 == len(args), false
+		}
+		if !isKornOption(arg) {
+			return i, command, stdin, true
+		}
+		next, readsCommand, readsStdin, ok := kornOption(args, i, shell)
+		if !ok {
+			return i, command, stdin, false
+		}
+		command, stdin = command || readsCommand, stdin || readsStdin
+		i = next
+	}
+	return len(args), command, stdin, true
+}
+
+func isKornOption(arg string) bool { return len(arg) > 1 && (arg[0] == '-' || arg[0] == '+') }
+
+func kornOption(args []string, index int, shell string) (next int, command, stdin, valid bool) {
+	arg := args[index]
+	if next, handled, valid := kornValueOption(args, index, shell); handled {
+		return next, false, false, valid
+	}
+	return kornFlagCluster(args, arg, index, shell)
+}
+
+func kornValueOption(args []string, index int, shell string) (next int, handled, valid bool) {
+	arg := args[index]
+	if strings.HasPrefix(arg, "--") {
+		return index, true, false
+	}
+	if arg == "-o" || arg == "+o" {
+		if index+1 >= len(args) || strings.HasPrefix(args[index+1], "-") || strings.HasPrefix(args[index+1], "+") {
+			return index, true, false
+		}
+		return index + 1, true, true
+	}
+	if strings.ContainsRune(arg[1:], 'o') {
+		return index, true, false
+	}
+	if shell == "mksh" {
+		if strings.ContainsRune(arg[1:], 'T') {
+			if arg != "-T" || index+1 >= len(args) {
+				return index, true, false
+			}
+			return index + 1, true, true
+		}
+	}
+	return index, false, false
+}
+
+func kornFlagCluster(args []string, arg string, index int, shell string) (next int, command, stdin, valid bool) {
+	allowed := "abcefhiklmnprstuvxBCDEGH"
+	if shell == "mksh" {
+		allowed = "abCefhiklmnprUuvXxcs"
+	}
+	for j := 1; j < len(arg); j++ {
+		ch := arg[j]
+		if !strings.ContainsRune(allowed, rune(ch)) {
+			return index, command, stdin, false
+		}
+		if ch == 's' {
+			stdin = true
+		}
+		if ch == 'c' {
+			if j != len(arg)-1 || index+1 >= len(args) {
+				return index, command, stdin, false
+			}
+			return index + 1, true, stdin, true
+		}
+	}
+	return index, false, stdin, true
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // IsShell сообщает, входит ли команда в список поддерживаемых оболочек.
@@ -3109,7 +3435,231 @@ func parseNestedWithBudget(src string, pos []int, lineBase int, via []string, in
 	return parseNestedFileWithBudget(nil, "", src, pos, lineBase, via, inLoop, inBackground, vars, calls, nil, nil, budget)
 }
 
+var fishSafeCommands = set("echo", "printf", "cd", "pwd", "true", "false", "test", "count", "contains", "string", "math", "path", "realpath", "type", "ls", "grep", "kill")
+
+func fishScriptUnsupported(src string) bool {
+	if !fishScriptCharactersSupported(src) || fishScriptUsesUnsupportedCommand(src) {
+		return true
+	}
+	return false
+}
+
+func fishScriptCharactersSupported(src string) bool {
+	quote := byte(0)
+	for i := 0; i < len(src); i++ {
+		ch := src[i]
+		if quote == '\'' {
+			if ch == '\\' {
+				return false
+			}
+			if ch == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			if ch == '\\' || ch == '$' || ch == '(' {
+				return false
+			}
+			if ch == '"' {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == ';' {
+			continue
+		}
+		if fishSupportedScriptByte(ch) {
+			continue
+		}
+		return false
+	}
+	return quote == 0
+}
+
+func fishSupportedScriptByte(ch byte) bool {
+	return ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || strings.ContainsRune("_./=:,+@%-", rune(ch))
+}
+
+func fishScriptUsesUnsupportedCommand(src string) bool {
+	builtins := literalWordSet(fishBuiltinNames)
+	functions := literalWordSet(fishFunctionNames)
+	command := true
+	var word strings.Builder
+	quotedWord := false
+	check := func() bool {
+		value := word.String()
+		word.Reset()
+		wasQuoted := quotedWord
+		quotedWord = false
+		if value == "" {
+			return false
+		}
+		if !command {
+			return false
+		}
+		if fishAssignmentWord(value) && !wasQuoted {
+			return false
+		}
+		if strings.Contains(value, "=") {
+			return true
+		}
+		command = false
+		if fishSafeCommands[value] {
+			return false
+		}
+		_, builtin := builtins[value]
+		_, function := functions[value]
+		return builtin || function
+	}
+	quote := byte(0)
+	for i := 0; i < len(src); i++ {
+		ch := src[i]
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			} else {
+				word.WriteByte(ch)
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quotedWord = true
+			quote = ch
+			continue
+		}
+		if ch == ';' || ch == '\n' {
+			if check() {
+				return true
+			}
+			command = true
+			continue
+		}
+		if ch == ' ' || ch == '\t' {
+			if check() {
+				return true
+			}
+			continue
+		}
+		word.WriteByte(ch)
+	}
+	return check()
+}
+
+func fishAssignmentWord(word string) bool {
+	key, _, ok := strings.Cut(word, "=")
+	if !ok || key == "" {
+		return false
+	}
+	for i, r := range key {
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func viaUsesKornShell(via []string) bool {
+	for i := len(via) - 1; i >= 0; i-- {
+		if isShell(via[i]) {
+			return isKornShell(via[i])
+		}
+	}
+	return false
+}
+
+func viaUsesFishShell(via []string) bool {
+	for i := len(via) - 1; i >= 0; i-- {
+		if isShell(via[i]) {
+			return via[i] == "fish"
+		}
+	}
+	return false
+}
+
+func kornScriptUsesAlias(src string) bool {
+	for start := 0; start < len(src); {
+		rel := strings.Index(src[start:], "alias")
+		if rel < 0 {
+			return false
+		}
+		i := start + rel
+		left := i == 0 || !isShellWordByte(src[i-1])
+		end := i + len("alias")
+		right := end == len(src) || !isShellWordByte(src[end])
+		if left && right {
+			return true
+		}
+		start = end
+	}
+	return false
+}
+
+func isShellWordByte(ch byte) bool {
+	return ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9'
+}
+
+func kornCommandNameHasSubstitution(src string) bool {
+	for offset := 0; offset < len(src); {
+		rel := strings.IndexAny(src[offset:], "$`")
+		if rel < 0 {
+			return false
+		}
+		index := offset + rel
+		start := index
+		for start > 0 && !strings.ContainsRune(";|&\n", rune(src[start-1])) {
+			start--
+		}
+		if kornSubstitutionAtCommand(src, start, index) {
+			return true
+		}
+		offset = index + 2
+	}
+	return false
+}
+
+func kornSubstitutionAtCommand(src string, start, index int) bool {
+	wordStart := index
+	for wordStart > start && src[wordStart-1] != ' ' && src[wordStart-1] != '\t' && src[wordStart-1] != '\n' {
+		wordStart--
+	}
+	if fishAssignmentWord(src[wordStart:index]) {
+		return false
+	}
+	fields := strings.Fields(src[start:index])
+	for len(fields) > 0 && fishAssignmentWord(fields[0]) {
+		fields = fields[1:]
+	}
+	inline := index > 0 && src[index-1] != ' ' && src[index-1] != '\t' && src[index-1] != '\n'
+	if inline {
+		return len(fields) <= 1
+	}
+	if len(fields) == 0 {
+		return true
+	}
+	return len(fields) == 1 && slices.Contains([]string{"time", "command", "builtin", "exec", "nice", "env"}, fields[0])
+}
+
 func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, lineBase int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
+	if viaUsesFishShell(via) {
+		unsupported := fishScriptUnsupported(src)
+		if unsupported {
+			return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: fish script outside the supported subset")}
+		}
+	}
+	if viaUsesKornShell(via) {
+		unsupported := kornScriptUsesAlias(src)
+		if unsupported {
+			return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: ksh alias expansion is not modeled")}
+		}
+		if kornCommandNameHasSubstitution(src) {
+			return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: dynamic ksh command name is not modeled")}
+		}
+	}
 	if budget.depth >= maxNestedScripts {
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested script depth exceeds %d", maxNestedScripts)}
 	}
@@ -3678,12 +4228,20 @@ func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *call
 	if c.expansionDepth > maxNestedScripts {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: command expansion depth exceeds %d", maxNestedScripts)}
 	}
+	if c.call.Name == "setsid" && setsidDynamicTarget(c.call.Args) {
+		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: dynamic setsid command is not modeled")}
+	}
 	appendCall(seen, calls, c.call)
 
 	if err := emitExpanded(c, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
 	return emitCompatibleRoutes(c, lineBase, vars, calls, seen)
+}
+
+func setsidDynamicTarget(args []string) bool {
+	index := wrapperStart("setsid", args)
+	return index < len(args) && strings.ContainsAny(args[index], "$`")
 }
 
 func emitExpanded(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
@@ -3863,6 +4421,9 @@ func wrapperOptionStep(name string, args []string, i int) (int, bool) {
 
 func longWrapperOptionStep(name string, args []string, i int) (int, bool) {
 	key, _, attached := strings.Cut(args[i], "=")
+	if name == "setsid" {
+		key = setsidLongOption(key)
+	}
 	if !valueOptions[name][key] && !flagOptions[name][key] {
 		return i, true
 	}
@@ -3870,6 +4431,28 @@ func longWrapperOptionStep(name string, args []string, i int) (int, bool) {
 		return i + 2, false
 	}
 	return i + 1, false
+}
+
+func setsidLongOption(key string) string {
+	if key == "--" || !strings.HasPrefix(key, "--") {
+		return key
+	}
+	if flagOptions["setsid"][key] {
+		return key
+	}
+	match := ""
+	for option := range flagOptions["setsid"] {
+		if strings.HasPrefix(option, key) {
+			if match != "" {
+				return key
+			}
+			match = option
+		}
+	}
+	if match == "" {
+		return key
+	}
+	return match
 }
 
 func shortWrapperOptionStep(name string, args []string, i int) (int, bool) {
@@ -4166,20 +4749,7 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 	}
 	switch {
 	case isShell(name):
-		operand, command, _ := shellArgs(name, args)
-		if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
-			script := c.words[operand+1]
-			first := len(*calls)
-			previousLiteralShell := c.budget.literalShell
-			if literalShellScript(c, name, operand) {
-				c.budget.literalShell = name
-			}
-			err := parseNestedWithBudget(script.script, script.pos, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
-			c.budget.literalShell = previousLiteralShell
-			relocateNestedLines(c, first, calls)
-			return err
-		}
-		return nil
+		return expandShell(c, name, args, vars, calls)
 	case name == "ssh":
 		return expandSSH(c, lineBase, vars, calls)
 	case name == "find":
@@ -4189,6 +4759,125 @@ func expand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *ca
 
 	}
 	return nil
+}
+
+func expandShell(c cmd, name string, args []string, vars map[string]string, calls *[]Call) error {
+	if name == "fish" {
+		return expandFishShell(c, args, vars, calls)
+	}
+	if isKornShell(name) {
+		_, _, _, valid := kornInvocation(args, name)
+		if !valid {
+			return &NestedError{Script: strings.Join(args, " "), Err: fmt.Errorf("shellcmd: unsupported or ambiguous %s option", name)}
+		}
+	}
+	operand, command, _ := shellArgs(name, args)
+	if isKornShell(name) && command && operand < len(args) && kornCommandNameHasSubstitution(args[operand]) {
+		return &NestedError{Script: args[operand], Err: fmt.Errorf("shellcmd: dynamic ksh command name is not modeled")}
+	}
+	if !command || operand >= len(args) || operand+1 >= len(c.words) || c.words[operand+1].script == "" {
+		return nil
+	}
+	return expandShellCommand(c, name, operand, vars, calls)
+}
+
+func expandFishShell(c cmd, args []string, vars map[string]string, calls *[]Call) error {
+	scripts, _, file, valid := fishInvocationOptions(args)
+	if !valid {
+		return &NestedError{Script: strings.Join(args, " "), Err: fmt.Errorf("shellcmd: unsupported or ambiguous fish option")}
+	}
+	for _, invocation := range scripts {
+		text := args[invocation.index]
+		if invocation.offset > 0 && invocation.offset <= len(text) {
+			text = text[invocation.offset:]
+		}
+		unsupported := fishScriptUnsupported(text)
+		if unsupported {
+			return &NestedError{Script: text, Err: fmt.Errorf("shellcmd: fish script outside the supported subset")}
+		}
+	}
+	var nestedErrs []error
+	for _, invocation := range scripts {
+		script, ok := mappedScriptWords(c, []scriptArg{{index: invocation.index, offset: invocation.offset}})
+		if !ok || len(script.text) == 0 {
+			continue
+		}
+		first := len(*calls)
+		viaFlag := invocation.option
+		if viaFlag == "" {
+			viaFlag = "-c"
+		}
+		if err := parseNestedWithBudget(script.String(), script.pos, c.call.Line-1, c.via("fish", viaFlag), c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
+			nestedErrs = append(nestedErrs, err)
+		}
+		relocateNestedLines(c, first, calls)
+	}
+	if c.call.ScriptInput && c.stdinInput == nil {
+		if body, ok, err := fishEchoPipeInput(c); err != nil {
+			nestedErrs = append(nestedErrs, &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: parse fish pipe input: %w", err)})
+		} else if ok {
+			first := len(*calls)
+			if err := parseNestedWithBudget(body, nil, c.call.Line-1, c.via("pipe", "fish"), c.call.Loop, c.call.Background, vars, calls, c.budget); err != nil {
+				nestedErrs = append(nestedErrs, err)
+			}
+			relocateNestedLines(c, first, calls)
+		} else {
+			nestedErrs = append(nestedErrs, &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: fish script input is not available for parsing")})
+		}
+	}
+	_ = file // File scripts are covered when their contents enter the shared nested-input path.
+	return errors.Join(nestedErrs...)
+}
+
+func fishEchoPipeInput(c cmd) (string, bool, error) {
+	end := c.call.Offset
+	if end < 0 || end > len(c.source) {
+		return "", false, nil
+	}
+	pipe := strings.LastIndex(c.source[:end], "|")
+	if pipe < 0 {
+		return "", false, nil
+	}
+	start := strings.LastIndexAny(c.source[:pipe], "\n;") + 1
+	left := strings.TrimSpace(c.source[start:pipe])
+	file, _, err := parseShell(left)
+	if err != nil {
+		return "", false, err
+	}
+	if len(file.Stmts) != 1 || len(file.Stmts[0].Redirs) != 0 || file.Stmts[0].Background {
+		return "", false, nil
+	}
+	call, ok := file.Stmts[0].Cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return "", false, nil
+	}
+	name, ok := wordValue(call.Args[0])
+	if !ok || name != "echo" {
+		return "", false, nil
+	}
+	values := make([]string, len(call.Args)-1)
+	for i, word := range call.Args[1:] {
+		value, literal := wordValue(word)
+		if !literal {
+			return "", false, nil
+		}
+		values[i] = value
+	}
+	return strings.Join(values, " ") + "\n", true, nil
+}
+
+func expandShellCommand(c cmd, name string, operand int, vars map[string]string, calls *[]Call) error {
+	script := c.words[operand+1]
+	body, positions := script.script, script.pos
+	first := len(*calls)
+	previousLiteralShell := c.budget.literalShell
+	if literalShellScript(c, name, operand) {
+		c.budget.literalShell = name
+	}
+	err := parseNestedWithBudget(body, positions, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+	c.budget.literalShell = previousLiteralShell
+	relocateNestedLines(c, first, calls)
+	return err
 }
 
 func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
@@ -5555,6 +6244,9 @@ func wrapperRunsScript(name string, args []string) bool {
 }
 
 func unwrapOnce(name string, args []string) ([]string, bool) {
+	if name == "setsid" && setsidExitsWithoutCommand(args) {
+		return nil, false
+	}
 	if name == "parallel" {
 		start, ok := parallelCommandStart(args)
 		if !ok {
@@ -5582,6 +6274,18 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 		return nil, false
 	}
 	return args[i:], true
+}
+
+func setsidExitsWithoutCommand(args []string) bool {
+	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-"; {
+		arg, _, _ := strings.Cut(args[i], "=")
+		arg = setsidLongOption(arg)
+		if arg == "-h" || arg == "--help" || arg == "-V" || arg == "--version" {
+			return true
+		}
+		i = optionNext("setsid", args, i)
+	}
+	return false
 }
 
 func wrapperStart(name string, args []string) int {
@@ -5652,7 +6356,7 @@ func commandIsLookup(args []string) bool {
 }
 
 // wrappers — программы, которые запускают программу из своих аргументов.
-var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "taskset", "chrt", "strace", "setpriv", "unshare", "flock", "busybox", "systemd-run", "parallel", "runuser", "doas", "su")
+var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "taskset", "chrt", "strace", "setpriv", "unshare", "flock", "busybox", "systemd-run", "parallel", "runuser", "doas", "su", "setsid")
 
 // valueOptions — опции обёрток и ssh, следующее слово после которых — их значение, а не программа.
 var valueOptions = map[string]map[string]bool{
@@ -5667,6 +6371,7 @@ var valueOptions = map[string]map[string]bool{
 	"xargs":       set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"),
 	"ssh":         set("-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"),
 	"taskset":     set("-c", "--cpu-list", "-p", "--pid"),
+	"setsid":      set(),
 	"chrt":        set("-p", "--pid", "-P", "-T", "-D", "--sched-period", "--sched-runtime", "--sched-deadline"),
 	"strace":      set("-o", "--output", "-e", "-p", "-u", "-s", "-O", "-I", "-E", "-P", "-a", "-S", "-X", "-b", "-U", "--argv0", "--trace", "--trace-fds", "--trace-path", "--abbrev", "--verbose", "--qualify", "--signal", "--status", "--inject", "--fault", "--syscall-limit", "--read", "--write", "--user", "--string-limit", "--env", "--columns", "--const-print-style"),
 	"setpriv":     set("--reuid", "--ruid", "--euid", "--regid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig", "--ptracer", "--landlock-access", "--landlock-rule", "--landlock-restrict", "--seccomp-filter"),
@@ -5687,6 +6392,7 @@ var flagOptions = map[string]map[string]bool{
 	"sudo":        set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet"),
 	"timeout":     set("--foreground", "--preserve-status", "-v", "--verbose"),
 	"taskset":     set("-a", "--all-tasks"),
+	"setsid":      set("-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V", "--version"),
 	"chrt":        set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks"),
 	"strace":      set("-f", "-ff", "-c", "-q", "-qq", "-T", "-tt", "-y", "-yy", "-D", "-d", "-k", "-r", "-t", "-v", "-x", "-xx", "-z", "-Z", "--follow-forks", "--daemonize", "--summary-only", "--quiet", "--absolute-timestamps", "--decode-fds", "--secontext", "--kill-on-exit", "--output-separately", "--seccomp-bpf"),
 	"unshare":     set("-r", "--map-root-user", "-U", "--user", "-f", "--fork", "-m", "--mount", "-p", "--pid", "-n", "--net", "-i", "--ipc", "-u", "--uts", "-C", "--cgroup", "--mount-proc", "--kill-child", "--time", "--cgroup-namespace"),
