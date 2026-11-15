@@ -20,6 +20,210 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
+func TestHeredocPartlyQuoted(t *testing.T) {
+	cases := []struct{ name, src string }{
+		{"double prefix", "zr <<\"E\"x\nb \\\nEx\nzk 6"},
+		{"single prefix", "zr <<'E'x\nb \\\nEx\nzk 6"},
+		{"double suffix", "zr <<E\"x\"\nb \\\nEx\nzk 6"},
+		{"escaped", "zr <<\\Ex\nb \\\nEx\nzk 6"},
+		{"tabs", "zr <<-\"E\"x\n\tb \\\n\tEx\nzk 6"},
+		{"empty", "zr <<\"\"\nb \\\n\nzk 6"},
+		{"substitution", "zr <<\"E\"x\n$(\nEx\nzk 6\n)"},
+		{"backticks", "zr <<\"E\"x\n`\nEx\nzk 6\n`"},
+		{"parameter", "zr <<\"E\"x\n${x:-\nEx\nzk 6\n}"},
+		{"group", "{ zr <<\"E\"x\nb \\\nEx\nzk 6\n}"},
+		{"function", "f() { zr <<\"E\"x\nb \\\nEx\nzk 6\n}; f"},
+		{"pipeline", "zr <<\"E\"x | zr\nb \\\nEx\nzk 6"},
+		{"multiple", "zr <<\"E\"x <<'G'\nb \\\nEx\nc\nG\nzk 6"},
+		{"quoted escaped quote", "zr <<\"E\\\"x\"\nb\nE\"x\nzk 6"},
+		{"plain", "zr <<\"E\"x\nb\nEx\nzk 6"},
+		{"unquoted continuation", "zr <<E\n\\\nE\nzk 6"},
+		{"unquoted tabs", "zr <<-E\n\t\\\n\tE\nzk 6"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				return
+			}
+			for _, call := range calls {
+				if call.Name == "zk" && len(call.Args) == 1 && call.Args[0] == "6" {
+					return
+				}
+			}
+			t.Fatalf("missing zk 6: %+v", calls)
+		})
+	}
+}
+
+func TestHeredocPartlyQuotedBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		wantErr   bool
+	}{
+		{"quoted continuation", "zr <<\"E\"x\nb \\\nEx\nzk 6", true},
+		{"quoted expansion", "zr <<\"E\"x\n$(\nEx\nzk 6\n)", true},
+		{"quoted dash expansion", "zr <<-\"E\"x\n$(\n\tEx\nzk 6\n)", true},
+		{"unquoted continuation", "zr <<E\n\\\nE\nzk 6", true},
+		{"unquoted dash continuation", "zr <<-E\n\t\\\n\tE\nzk 6", false},
+		{"unquoted dash joined body", "zr <<-E\n\tb \\\n\tE\nzk 6", true},
+		{"unquoted text continuation", "zr <<E\nb \\\nE\nzk 6\nE\nzk 7", false},
+		{"quoted complete", "zr <<\"E\"x\nbody\nEx\nzk 6", false},
+		{"unquoted complete", "zr <<E\nbody\nE\nzk 6", false},
+		{"empty complete", "zr <<\"\"\nbody\n\nzk 6", false},
+		{"tabs are significant", "zr <<\"E\"x\nb \\\n\tEx\nEx\nzk 6", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Calls(tc.src)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Calls error = %v, want error %t", err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "heredoc delimiter occurs inside parsed body") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestHeredocPartlyQuotedReview(t *testing.T) {
+	for _, tc := range []struct {
+		name, src, wantErr string
+		want               []string
+	}{
+		{"ansi escape swallowed", "zr <<$'\\x45'x\nb \\\nEx\nzk 6\nzk 99", "3:1:", nil},
+		{"ansi raw line", "zr <<$'\\x45'x\nb \\\n\\x45x\nzk 6\nzk 99", "", []string{"zr"}},
+		{"joined continuation", "zr <<E\na\\\n\\\nE\nzk 6\nE\nzk 7", "", []string{"zr", "zk 7"}},
+		{"split delimiter", "zr <<Ex\nE\\\nx\nzk 6\nzk 99", "", []string{"zr", "zk 6", "zk 99"}},
+		{"split empty", "zr <<E\nE\\\n\nzk 6\nzk 99", "", []string{"zr", "zk 6", "zk 99"}},
+		{"split dash", "zr <<-Ex\n\tE\\\nx\nzk 6\nzk 99", "", []string{"zr", "zk 6", "zk 99"}},
+		{"middle continuation", "zr <<E\nb\n\\\nE\nzk 6", "4:1:", nil},
+		{"previous dash", "zr <<A <<-E\nA\n\t\\\nE\nzk 6", "4:1:", nil},
+		{"even slashes dash", "zr <<-E\n\tb \\\\\n\tE\nzk 6", "", []string{"zr", "zk 6"}},
+		{"quoted eof", "zr <<\"E\"x\nb \\\nEx", "", []string{"zr"}},
+		{"offset column", "zr <<-\"E\"x\n$(\n\tEx\nzk 6\n)", "3:2:", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want position %s", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				if strings.HasPrefix(tc.name, "split ") {
+					return
+				}
+				t.Fatal(err)
+			}
+			var got []string
+			for _, c := range calls {
+				if c.Name == "zr" || c.Name == "zk" {
+					got = append(got, strings.TrimSpace(c.Name+" "+strings.Join(c.Args, " ")))
+				}
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("calls = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHeredocPartlyQuotedScanStart(t *testing.T) {
+	src := "A\n\t\\\nE\n"
+	redirect := &syntax.Redirect{Op: syntax.DashHdoc}
+	if got := heredocScanStart(redirect, src, 5, false); got != 2 {
+		t.Fatalf("scan start = %d, want 2", got)
+	}
+}
+
+func TestHeredocPartlyQuotedReviewTwo(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		wantErr   bool
+		want      []string
+	}{
+		{"control A", "zr <<$'E\\cA'x\nb \\\nE\x01\x01x\nzk 6\nzk 99", true, nil},
+		{"hex control", "zr <<$'E\\x01'x\nb \\\nE\x01\x01x\nzk 6\nzk 99", true, nil},
+		{"delete", "zr <<$'E\\x7f'x\nb \\\nE\x01\x7fx\nzk 6\nzk 99", true, nil},
+		{"control fully quoted", "zr <<$'E\\cA'\nb\nE\x01\x01\nzk 6\nzk 99", true, nil},
+		{"unicode escape", "zr <<$'E\\u00e9'x\nb \\\nE\\u00e9x\nzk 6\nzk 99", true, nil},
+		{"unicode upper escape", "zr <<$'E\\U000000e9'x\nb \\\nE\\U000000e9x\nzk 6\nzk 99", true, nil},
+		{"dash tabs joined", "zr <<-Ex\n\tE\\\n\tx\nzk 6\nEx\nzk 7", false, []string{"zr", "zk 7"}},
+		{"dash tabs joined no initial tab", "zr <<-Ex\nE\\\n\tx\nzk 6\nEx\nzk 7", false, []string{"zr", "zk 7"}},
+		{"quoted eof newline", "zr <<\"E\"x\nb \\\nEx\n", false, []string{"zr"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected parse error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, c := range calls {
+				if c.Name == "zr" || c.Name == "zk" {
+					got = append(got, strings.TrimSpace(c.Name+" "+strings.Join(c.Args, " ")))
+				}
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("calls = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHeredocPartlyQuotedPositionsAndContinuation(t *testing.T) {
+	makeRedirect := func(src, delim string, start int, startLine uint) *syntax.Redirect {
+		return &syntax.Redirect{
+			Word: &syntax.Word{Parts: []syntax.WordPart{&syntax.Lit{Value: delim}}},
+			Hdoc: &syntax.Word{Parts: []syntax.WordPart{&syntax.Lit{
+				ValuePos: syntax.NewPos(uint(start), startLine, 1),
+				ValueEnd: syntax.NewPos(uint(len(src)), startLine+2, 1),
+			}}},
+		}
+	}
+	t.Run("previous line position", func(t *testing.T) {
+		src := "\\\nE\nzk 6"
+		line, col, err := swallowedHeredocDelimiter(makeRedirect(src, "E", 2, 2), src, false)
+		if err != nil || line != 2 || col != 1 {
+			t.Fatalf("position = %d:%d, %v", line, col, err)
+		}
+	})
+	t.Run("last line backslash", func(t *testing.T) {
+		src := "b\\\nE\\"
+		line, col, err := swallowedHeredocDelimiter(makeRedirect(src, `E\\`, 0, 1), src, false)
+		if err != nil || line != 2 || col != 1 {
+			t.Fatalf("position = %d:%d, %v", line, col, err)
+		}
+	})
+	t.Run("mismatched prefix", func(t *testing.T) {
+		src := "a\\\n\\\nE\nE"
+		line, col, err := swallowedHeredocDelimiter(makeRedirect(src, "E", 0, 1), src, false)
+		if err != nil || line != 0 || col != 0 {
+			t.Fatalf("position = %d:%d, %v", line, col, err)
+		}
+	})
+	t.Run("line base", func(t *testing.T) {
+		var calls []Call
+		err := parse("zr <<\"E\"x\nb \\\nEx\nzk 6", 10, nil, nil, &calls)
+		if err == nil || !strings.Contains(err.Error(), "13:1:") {
+			t.Fatalf("error = %v, want 13:1", err)
+		}
+	})
+	t.Run("delimiter policy position", func(t *testing.T) {
+		var calls []Call
+		err := parse("zr\nzr; zq <<$'E\\cA'x\nb\nE\x01\x01x\nzk 6", 10, nil, nil, &calls)
+		if err == nil || !strings.Contains(err.Error(), "12:8: heredoc delimiter: ambiguous") {
+			t.Fatalf("error = %v, want 12:8 ambiguous", err)
+		}
+	})
+}
+
 func TestArgLiteralContract(t *testing.T) {
 	tests := []struct {
 		name, src, call string

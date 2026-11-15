@@ -275,7 +275,7 @@ func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inher
 	if len(full) > len(src) {
 		walkText = full
 	}
-	err := walkCalls(file, walkText, lineBase, inherited, vars, calls, ignored, subst, budget)
+	err := walkCalls(file, walkText, len(src), lineBase, inherited, vars, calls, ignored, subst, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -705,11 +705,11 @@ func unclosedHeredocDelimiter(text string) (string, bool) {
 	return delim, err == nil
 }
 
-func walkCalls(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
+func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
 
-	walker := callWalker{src: src, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored, subst: subst}
+	walker := callWalker{src: src, sourceLen: sourceLen, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored, subst: subst}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -2101,6 +2101,7 @@ func shellInputNextTargetWithScan(name string, args []string, argOffset int, sca
 
 type callWalker struct {
 	src          string
+	sourceLen    int
 	lineBase     int
 	inherited    []string
 	vars         map[string]string
@@ -2172,6 +2173,18 @@ func (w *callWalker) outerSubstitution(node syntax.Node) bool {
 }
 
 func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
+	if redirect.Hdoc != nil && redirect.Word != nil {
+		quoted := quotedHeredoc(redirect.Word) || strings.Contains(nodeText(redirect.Word, w.src), `\`)
+		line, column, err := swallowedHeredocDelimiter(redirect, w.src[:w.sourceLen], quoted)
+		if err != nil {
+			w.parseErr = fmt.Errorf("%d:%d: heredoc delimiter: %w", line+w.lineBase, column, err)
+			return
+		}
+		if line > 0 {
+			w.parseErr = fmt.Errorf("%d:%d: heredoc delimiter occurs inside parsed body", line+w.lineBase, column)
+			return
+		}
+	}
 	// Цель перенаправления выполняется, тело heredoc — данные, пока оно не передано оболочке.
 	if redirect.Word != nil {
 		syntax.Walk(redirect.Word, w.visit)
@@ -2306,6 +2319,132 @@ func collectCallContextNode(node syntax.Node, info *walkInfo) {
 			mark(stmt, info.loopCalls)
 		}
 	}
+}
+
+// swallowedHeredocDelimiter compares the parser's body with Bash delimiter lines.
+func swallowedHeredocDelimiter(redirect *syntax.Redirect, src string, quoted bool) (int, int, error) {
+	delim, err := heredocDelimiter(redirect.Word)
+	if err != nil {
+		return int(redirect.Pos().Line()), int(redirect.Pos().Col()), err
+	}
+	start, end := int(redirect.Hdoc.Pos().Offset()), min(int(redirect.Hdoc.End().Offset()), len(src))
+	if !validSpan(src, start, end) {
+		return 0, 0, nil
+	}
+	start = heredocScanStart(redirect, src, start, quoted)
+	body := src[start:end]
+	if !quoted && !strings.Contains(body, "\\\n") {
+		return 0, 0, nil
+	}
+	line := int(redirect.Hdoc.Pos().Line())
+	if start < int(redirect.Hdoc.Pos().Offset()) {
+		line--
+	}
+	match := delimMatch{delim: delim, possible: true}
+	dash := redirect.Op == syntax.DashHdoc
+	joining := false
+	for offset := start; offset < end; line++ {
+		text, rest, found := strings.Cut(src[offset:end], "\n")
+		lineEnd := offset + len(text)
+		text, column := match.trimLine(text, dash, joining)
+		continued := !quoted && found && oddTrailingBackslashes(text)
+		if continued {
+			match.add(text[:len(text)-1])
+		} else {
+			match.add(text)
+			if delimiterLineDisagrees(match.complete(), text, delim, dash && joining, lineEnd == end, found && lineEnd+1 == len(src)) {
+				return line, column, nil
+			}
+			match.reset()
+		}
+		joining = continued
+		if !found {
+			break
+		}
+		offset = end - len(rest)
+	}
+	return 0, 0, nil
+}
+
+// delimMatch follows Bash's comparison of a joined body line with the heredoc delimiter.
+type delimMatch struct {
+	delim    string
+	matched  int
+	possible bool
+}
+
+func (m *delimMatch) add(fragment string) {
+	if m.possible && m.matched+len(fragment) <= len(m.delim) && m.delim[m.matched:m.matched+len(fragment)] == fragment {
+		m.matched += len(fragment)
+		return
+	}
+	m.possible = false
+}
+
+func (m *delimMatch) complete() bool { return m.possible && m.matched == len(m.delim) }
+
+func (m *delimMatch) reset() { m.matched, m.possible = 0, true }
+
+// trimLine drops leading tabs for <<- where Bash does: at the start of a joined line, and after a continuation that matched nothing yet.
+func (m *delimMatch) trimLine(text string, dash, joining bool) (string, int) {
+	if !dash || joining && !(m.possible && m.matched == 0) {
+		return text, 1
+	}
+	trimmed := strings.TrimLeft(text, "\t")
+	return trimmed, 1 + len(text) - len(trimmed)
+}
+
+func oddTrailingBackslashes(text string) bool {
+	return (len(text)-len(strings.TrimRight(text, `\`)))%2 == 1
+}
+
+// delimiterLineDisagrees reports whether Bash and the parser disagree on whether a complete body line ends the heredoc.
+func delimiterLineDisagrees(bashDelimiter bool, text, delim string, trimTabs, bodyEnd, lastLine bool) bool {
+	if trimTabs {
+		text = strings.TrimLeft(text, "\t")
+	}
+	parserDelimiter := bodyEnd && text == delim
+	return bashDelimiter != parserDelimiter && !(bashDelimiter && lastLine)
+}
+
+func heredocScanStart(redirect *syntax.Redirect, src string, start int, quoted bool) int {
+	if !quoted && start > 0 && src[start-1] == '\n' {
+		previous := strings.LastIndexByte(src[:start-1], '\n') + 1
+		text := src[previous : start-1]
+		if redirect.Op == syntax.DashHdoc {
+			text = strings.TrimLeft(text, "\t")
+		}
+		if text == `\` {
+			start = previous
+		}
+	}
+	return start
+}
+
+func heredocDelimiter(word *syntax.Word) (string, error) {
+	var value strings.Builder
+	for _, part := range word.Parts {
+		if quoted, ok := part.(*syntax.SglQuoted); ok && quoted.Dollar {
+			if strings.Contains(quoted.Value, `\u`) || strings.Contains(quoted.Value, `\U`) {
+				return "", fmt.Errorf("locale-dependent ANSI-C heredoc delimiter")
+			}
+			var decoded mapped
+			if err := decoded.unescapeANSI(quoted.Value, -1); err != nil {
+				return "", err
+			}
+			if strings.ContainsAny(decoded.String(), "\x01\x7f") {
+				return "", fmt.Errorf("ambiguous ANSI-C heredoc delimiter")
+			}
+			value.WriteString(decoded.String())
+			continue
+		}
+		piece, ok := wordValue(&syntax.Word{Parts: []syntax.WordPart{part}})
+		if !ok {
+			return "", fmt.Errorf("unsupported heredoc delimiter")
+		}
+		value.WriteString(piece)
+	}
+	return value.String(), nil
 }
 
 func quotedHeredoc(word *syntax.Word) bool {
