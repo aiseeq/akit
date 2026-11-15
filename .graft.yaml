@@ -50,3 +50,6 @@ checks:
 
 lock:
   scope: worktree
+
+worktree:
+  disposable: [/.pc/] # PC sandbox runs of review and acceptance; results are kept outside the tree
