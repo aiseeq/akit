@@ -79,16 +79,7 @@ func main() {
 
 func run() error {
 	fs := flag.NewFlagSet("page-shot", flag.ContinueOnError)
-	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: page-shot [--at 2s,6s] [--out DIR] [--element CSS] <file.html|URL>")
-		fmt.Fprintln(fs.Output(), "Проверяет разметку Gazette; с --element проверки раскладки и Gazette не выполняются.")
-		fs.PrintDefaults()
-		fmt.Fprintln(fs.Output(), "--element: только окно 1536x860@1.25, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.")
-		fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, значок не выровнен с текстом или нет разметки Gazette; подробности в stderr.")
-		fmt.Fprintln(fs.Output(), "Подсказки title= (и <title> в SVG) - предупреждение в stderr с числом и первыми 5, код выхода не меняют: их рисует браузер цветами системы.")
-		fmt.Fprintf(fs.Output(), "Тёмные кадры снимаются при признаках тёмной темы; пузыри проверяются только в выбранной теме (до %d наведений на окно), предупреждения не меняют код выхода.\n", maxHoverCandidates)
-		fmt.Fprintln(fs.Output(), "Открытые shadowRoot проверяются; iframe и закрытые shadowRoot не обходятся.")
-	}
+	fs.Usage = func() { printUsage(fs) }
 	at := fs.String("at", "1s", "моменты съёмки после загрузки через запятую (анимация - несколько)")
 	out := fs.String("out", "", "папка кадров (по умолчанию <файл>-shots рядом со страницей)")
 	timeout := fs.Duration("timeout", 2*time.Minute, "общий таймаут")
@@ -96,7 +87,9 @@ func run() error {
 	// flag останавливается на первом позиционном аргументе, а флаги пишут и после файла.
 	var positional []string
 	for args := os.Args[1:]; ; {
-		if err := fs.Parse(args); err != nil {
+		if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
+			return nil
+		} else if err != nil {
 			return fmt.Errorf("аргументы: %w", err)
 		}
 		if fs.NArg() == 0 {
@@ -504,4 +497,27 @@ func (o *overflow) report(name string) string {
 		fmt.Fprintf(&b, "  %s right=%g\n", c.Selector, c.Right)
 	}
 	return b.String()
+}
+
+// printUsage печатает справку page-shot -h в fs.Output().
+func printUsage(fs *flag.FlagSet) {
+	fmt.Fprintln(fs.Output(), "usage: page-shot [--at 2s,6s] [--out DIR] [--element CSS] <file.html|URL>")
+	fmt.Fprintln(fs.Output(), "Проверяет разметку Gazette; с --element проверки раскладки и Gazette не выполняются.")
+	fs.PrintDefaults()
+	fmt.Fprintln(fs.Output(), windowsHelp())
+	fmt.Fprintf(fs.Output(), "--element: только окно %s, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.\n", elementViewport.name())
+	fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, значок не выровнен с текстом или нет разметки Gazette; подробности в stderr.")
+	fmt.Fprintln(fs.Output(), "Подсказки title= (и <title> в SVG) - предупреждение в stderr с числом и первыми 5, код выхода не меняют: их рисует браузер цветами системы.")
+	fmt.Fprintf(fs.Output(), "Тёмные кадры снимаются при признаках тёмной темы; пузыри проверяются только в выбранной теме (до %d наведений на окно), предупреждения не меняют код выхода.\n", maxHoverCandidates)
+	fmt.Fprintln(fs.Output(), "Открытые shadowRoot проверяются; iframe и закрытые shadowRoot не обходятся.")
+}
+
+// windowsHelp - строка справки с окнами съёмки из viewports: справка и кадры не расходятся.
+func windowsHelp() string {
+	names := make([]string, len(viewports))
+	for i, vp := range viewports {
+		names[i] = vp.name()
+	}
+	return "Окна (CSS px, @ - масштаб экрана): " + strings.Join(names, ", ") +
+		"; на каждом кадры моментов --at (<окно>.png, при нескольких моментах <окно>-<момент>.png) и <окно>-full.png полной высоты, при признаках тёмной темы ещё кадры моментов с суффиксом -dark."
 }
