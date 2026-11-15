@@ -1,10 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
-	"os"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -39,24 +36,5 @@ func TestMachineHelp(t *testing.T) {
 		}
 		return err
 	})
-	checkBusyHelpJSON(t)
-}
-
-func checkBusyHelpJSON(t *testing.T) {
-	t.Helper()
-	if os.Getenv("AKIT_HELP_JSON_CHILD") == "busy" {
-		os.Args = []string{"busy", "--help-json"}
-		main()
-		os.Exit(0)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMachineHelp$")
-	cmd.Env = append(os.Environ(), "AKIT_HELP_JSON_CHILD=busy")
-	raw, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("--help-json: %v", err)
-	}
-	var got clihelp.Help
-	if err := json.Unmarshal(raw, &got); err != nil || got.Tool != "busy" {
-		t.Fatalf("--help-json = %q, tool %q, error %v", raw, got.Tool, err)
-	}
+	clihelp.CheckHelpJSON(t, "busy", main)
 }

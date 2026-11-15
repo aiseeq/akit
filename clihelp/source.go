@@ -150,7 +150,11 @@ func inspectParserFunction(fn *ast.FuncDecl, keys, usedValues map[string]bool, f
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		collectParserNode(n, keys, usedValues)
 		if id, ok := n.(*ast.Ident); ok {
-			usedValues[id.Name] = true
+			// Help text is not parser input. Ignore references encountered when
+			// checking main functions that print usage or machine-readable help.
+			if id.Name != "usage" && id.Name != "machineHelp" {
+				usedValues[id.Name] = true
+			}
 		}
 		call, ok := n.(*ast.CallExpr)
 		if !ok {

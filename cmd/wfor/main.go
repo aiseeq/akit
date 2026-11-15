@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/timearg"
 )
@@ -48,6 +49,7 @@ Flags:
   --any           done when one condition is met
   --new           line: only lines appended after the start count (not one begun before it)
   --after N       line: only lines after line N count (to continue a wait)
+  --help-json     print machine-readable help
 
 Exit: 0 done, 1 not yet (timeout), 2 usage error or a check failed (no access, bad file).
 `
@@ -71,6 +73,10 @@ type options struct {
 }
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+var machineHelp = clihelp.NewRoot("wfor", []string{"-h", "--help", "--help-json", "--timeout", "--every", "--any", "--new", "--after"}, []string{"--timeout", "--every", "--after"}, "args", "wait for positional conditions; all conditions are required unless --any is set")
+
+func init() { machineHelp.Commands[0].NoEquals = true; machineHelp.Commands[0].NoDashdash = true }
 
 func main() {
 	if err := proc.BecomeChildSubreaper(); err != nil && !errors.Is(err, errors.ErrUnsupported) {
@@ -80,6 +86,13 @@ func main() {
 	opts, err := parseArgs(os.Args[1:], time.Now)
 	if errors.Is(err, errHelp) {
 		fmt.Print(usage)
+		return
+	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
+			fmt.Fprintf(os.Stderr, "wfor: write help: %v\n", err)
+			os.Exit(exitUsage)
+		}
 		return
 	}
 	if err != nil {
@@ -123,6 +136,13 @@ func parseArgs(args []string, now func() time.Time) (options, error) {
 	return p.opts, nil
 }
 
+func helpError(arg string) error {
+	if arg == "--help-json" {
+		return errHelpJSON
+	}
+	return errHelp
+}
+
 // arg разбирает аргумент i и возвращает, сколько следующих аргументов он съел.
 func (p *parsed) arg(args []string, i int) (int, error) {
 	a := args[i]
@@ -133,8 +153,8 @@ func (p *parsed) arg(args []string, i int) (int, error) {
 		return args[i+1], nil
 	}
 	switch a {
-	case "-h", "--help":
-		return 0, errHelp
+	case "-h", "--help", "--help-json":
+		return 0, helpError(a)
 	case "--any":
 		p.opts.any = true
 		return 0, nil

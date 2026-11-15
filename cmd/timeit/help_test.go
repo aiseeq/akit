@@ -1,10 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
-	"os"
-	"os/exec"
 	"testing"
 
 	"github.com/aiseeq/akit/clihelp"
@@ -45,24 +42,5 @@ func TestMachineHelp(t *testing.T) {
 		}
 		return err
 	})
-	checkTimeitHelpJSON(t)
-}
-
-func checkTimeitHelpJSON(t *testing.T) {
-	t.Helper()
-	if os.Getenv("AKIT_HELP_JSON_CHILD") == "timeit" {
-		os.Args = []string{"timeit", "--help-json"}
-		main()
-		os.Exit(0)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMachineHelp$")
-	cmd.Env = append(os.Environ(), "AKIT_HELP_JSON_CHILD=timeit")
-	raw, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("--help-json: %v", err)
-	}
-	var got clihelp.Help
-	if err := json.Unmarshal(raw, &got); err != nil || got.Tool != "timeit" {
-		t.Fatalf("--help-json = %q, tool %q, error %v", raw, got.Tool, err)
-	}
+	clihelp.CheckHelpJSON(t, "timeit", main)
 }

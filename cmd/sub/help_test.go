@@ -1,12 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
-	"github.com/aiseeq/akit/clihelp"
-	"os"
-	"os/exec"
 	"testing"
+
+	"github.com/aiseeq/akit/clihelp"
 )
 
 func TestMachineHelp(t *testing.T) {
@@ -40,24 +38,5 @@ func TestMachineHelp(t *testing.T) {
 		}
 		return err
 	})
-	checkHelpJSON(t, "sub")
-}
-
-func checkHelpJSON(t *testing.T, name string) {
-	t.Helper()
-	if os.Getenv("AKIT_HELP_JSON_CHILD") == name {
-		os.Args = []string{name, "--help-json"}
-		main()
-		os.Exit(0)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMachineHelp$")
-	cmd.Env = append(os.Environ(), "AKIT_HELP_JSON_CHILD="+name)
-	raw, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("--help-json: %v", err)
-	}
-	var got clihelp.Help
-	if err := json.Unmarshal(raw, &got); err != nil || got.Tool != name {
-		t.Fatalf("--help-json = %q, tool %q, error %v", raw, got.Tool, err)
-	}
+	clihelp.CheckHelpJSON(t, "sub", main)
 }

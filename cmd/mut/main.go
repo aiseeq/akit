@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/proc"
 
 	"github.com/aiseeq/akit/edit"
@@ -38,12 +39,13 @@ The mutated file is restored with its original bytes, mode, and modification tim
 If it changed during the run, mut reverts its change when that is unambiguous.
 Vet errors are reported as build failed (exit 2); a mutant outside the test packages survives.
 
-  -F SPEC    read blocks from SPEC; "-" or no -F reads stdin when it is not a terminal
-  --test-db  tests need the project's test database: run them as graft exec --heavy --test-db,
-             which raises the database of the graft test_db section and passes its DSN
-  --env NAME pass the caller's variable NAME to the tests (repeatable): graft exec --heavy --env NAME,
-             since a run moved to another machine gets only the variables named this way
-  -h         show this help
+  -F SPEC       read blocks from SPEC; "-" or no -F reads stdin when it is not a terminal
+  --test-db     tests need the project's test database: run them as graft exec --heavy --test-db,
+                which raises the database of the graft test_db section and passes its DSN
+  --env NAME    pass the caller's variable NAME to the tests (repeatable): graft exec --heavy --env NAME,
+                since a run moved to another machine gets only the variables named this way
+  -h            show this help
+  --help-json   print machine-readable help
 
 ` + edit.SpecHelp
 
@@ -84,6 +86,13 @@ func main() {
 		fmt.Print(usage)
 		return
 	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
+			fmt.Fprintf(os.Stderr, "mut: write help: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mut: %v\n(mut -h for usage)\n", err)
 		os.Exit(2)
@@ -92,7 +101,19 @@ func main() {
 }
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+var machineHelp = func() clihelp.Help {
+	help := clihelp.NewRoot("mut", []string{"-h", "--help", "--help-json", "-F", "--test-db", "--env"}, []string{"-F", "--env"}, "args", "run Go tests against source mutations")
+	return help
+}()
 var errFileChanged = errors.New("file content differs")
+
+func mutHelpError(arg string) error {
+	if arg == "--help-json" {
+		return errHelpJSON
+	}
+	return errHelp
+}
 
 func parseArgs(args []string) (opts, error) {
 	var o opts
@@ -103,8 +124,8 @@ func parseArgs(args []string) (opts, error) {
 			break
 		}
 		switch a {
-		case "-h", "--help":
-			return o, errHelp
+		case "-h", "--help", "--help-json":
+			return o, mutHelpError(a)
 		case "--test-db":
 			o.testDB = true
 		case "--env":

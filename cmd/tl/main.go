@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/buildversion"
+	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 	"github.com/aiseeq/akit/transcript/replycache"
@@ -28,6 +29,7 @@ Usage:
   tl --all [flags]            all Claude Code transcripts (default --since 7d)
   tl REF [REF...]              events in full; REF is id:line from a listing
   tl --version                 print the build version
+  tl --help-json               print machine-readable help
 
   ID in a link may be longer than 8 characters when needed to distinguish sessions.
 
@@ -141,6 +143,12 @@ type options struct {
 }
 
 var errHelp = errors.New("help")
+var errHelpJSON = errors.New("help json")
+var machineHelp = func() clihelp.Help {
+	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --no-subagents --subagents --usage --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
+	help.Commands[0].NoDashdash = true
+	return help
+}()
 
 func main() {
 	os.Exit(start(os.Args[1:], time.Now(), os.Stdout, os.Stderr))
@@ -152,6 +160,13 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	opts, err := parseArgs(args, now)
 	if errors.Is(err, errHelp) {
 		printMasked(stdout, usage)
+		return 0
+	}
+	if errors.Is(err, errHelpJSON) {
+		if err := clihelp.Print(stdout, machineHelp); err != nil {
+			fmt.Fprintf(stderr, "tl: write help: %v\n", err)
+			return exitUsage
+		}
 		return 0
 	}
 	if err != nil {
@@ -195,6 +210,9 @@ func parseArgs(args []string, now time.Time) (options, error) {
 		if !strings.HasPrefix(a, "-") || a == "-" {
 			opts.args = append(opts.args, a)
 			continue
+		}
+		if name == "--help-json" {
+			return opts, errHelpJSON
 		}
 		if name == "-h" || name == "--help" {
 			return opts, errHelp
