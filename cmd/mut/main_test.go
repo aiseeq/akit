@@ -94,6 +94,7 @@ func newFixture(t *testing.T, test string) *fixture {
 	script := "#!/bin/sh\n" +
 		// The switch that makes the test binary act as mut must not reach the commands mut runs.
 		"if [ -n \"${" + mutAsMain + "+set}\" ]; then echo '" + mutAsMain + " reached the test command' >&2; exit 99; fi\n" +
+		"if [ -n \"${MUT_CAPTURE_ENV-}\" ]; then if [ \"${GRAFT_ADMITTED+x}\" = x ]; then printf 'admitted:%s\\n' \"$GRAFT_ADMITTED\"; else printf 'admitted:unset\\n'; fi >> \"$MUT_CAPTURE_ENV\"; printf 'priority:%s\\n' \"${GRAFT_PRIORITY-}\" >> \"$MUT_CAPTURE_ENV\"; fi\n" +
 		"echo 'graft: exec: moved to graft-heavy-1.scope (memory ceiling 10 GiB: 34% of RAM, the default)' >&2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
 	if err := os.WriteFile(graft, []byte(script), 0755); err != nil {
 		t.Fatal(err)
@@ -115,10 +116,18 @@ func (f *fixture) stamp(t *testing.T) {
 	f.mtime = st.ModTime()
 }
 func (f *fixture) run(t *testing.T, args ...string) (string, int) {
+	out, er, code := f.runWithEnv(t, nil, args...)
+	if er != "" {
+		t.Logf("stderr: %s", er)
+	}
+	return out, code
+}
+
+func (f *fixture) runWithEnv(t *testing.T, extraEnv []string, args ...string) (string, string, int) {
 	t.Helper()
 	cmd := exec.Command(mutBinary, args...)
 	cmd.Dir = f.dir
-	cmd.Env = mutEnv(t, f.bin)
+	cmd.Env = append(mutEnv(t, f.bin), extraEnv...)
 	var out, er bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &er
@@ -131,17 +140,16 @@ func (f *fixture) run(t *testing.T, args ...string) (string, int) {
 			t.Fatal(err)
 		}
 	}
-	if er.Len() > 0 {
-		t.Logf("stderr: %s", er.String())
-	}
-	return strings.TrimSpace(out.String()), code
+	return strings.TrimSpace(out.String()), er.String(), code
 }
 
 func mutEnv(t *testing.T, bin string) []string {
 	t.Helper()
 	var env []string
 	for _, value := range os.Environ() {
-		if strings.HasPrefix(value, "PATH=") || strings.HasPrefix(value, "TMPDIR=") {
+		if strings.HasPrefix(value, "PATH=") || strings.HasPrefix(value, "TMPDIR=") ||
+			strings.HasPrefix(value, "GRAFT_ADMITTED=") || strings.HasPrefix(value, "GRAFT_PRIORITY=") ||
+			strings.HasPrefix(value, "MUT_CAPTURE_ENV=") {
 			continue
 		}
 		env = append(env, value)
@@ -167,6 +175,45 @@ func (f *fixture) unchanged(t *testing.T) {
 }
 
 const goodTest = "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T){if Add(2,3)!=5{t.Fatalf(\"got %d\",Add(2,3))}}\n"
+
+func TestGraftAdmitted(t *testing.T) {
+	f := newFixture(t, goodTest)
+	spec := filepath.Join(f.dir, "spec")
+	body := "calc.go\n<<<<<<< SEARCH\na + b\n=======\na - b\n>>>>>>> REPLACE\n\ncalc.go\n<<<<<<< SEARCH\na + b\n=======\nb + a\n>>>>>>> REPLACE\n"
+	if err := os.WriteFile(spec, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	capture := filepath.Join(f.dir, "graft-env")
+	baseOut, baseErr, baseCode := f.runWithEnv(t, nil, "-F", spec, "--", "./...")
+	wrappedOut, wrappedErr, wrappedCode := f.runWithEnv(t, []string{
+		"GRAFT_ADMITTED=1", "GRAFT_PRIORITY=x", "MUT_CAPTURE_ENV=" + capture,
+	}, "-F", spec, "--", "./...")
+	if baseOut != wrappedOut || baseCode != wrappedCode {
+		t.Fatalf("admitted changed result: baseline (%d, %q), admitted (%d, %q)", baseCode, baseOut, wrappedCode, wrappedOut)
+	}
+	const warning = "mut: outer graft exec --heavy is unnecessary; mut queues each test run\n"
+	if strings.Count(wrappedErr, warning) != 1 {
+		t.Fatalf("warning count = %d, stderr %q", strings.Count(wrappedErr, warning), wrappedErr)
+	}
+	if strings.Contains(baseErr, warning) {
+		t.Fatalf("warning without GRAFT_ADMITTED: %q", baseErr)
+	}
+	// graft treats an empty value as not admitted, so mut stays quiet about it.
+	if _, emptyErr, _ := f.runWithEnv(t, []string{"GRAFT_ADMITTED="}, "-F", spec, "--", "./..."); strings.Contains(emptyErr, warning) {
+		t.Fatalf("warning with empty GRAFT_ADMITTED: %q", emptyErr)
+	}
+	if strings.Replace(wrappedErr, warning, "", 1) != baseErr {
+		t.Fatalf("stderr differs beyond warning: baseline %q, admitted %q", baseErr, wrappedErr)
+	}
+	gotEnv, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotEnv) != "admitted:unset\npriority:x\nadmitted:unset\npriority:x\nadmitted:unset\npriority:x\n" {
+		t.Fatalf("child graft environment = %q", gotEnv)
+	}
+	f.unchanged(t)
+}
 
 func TestKilled(t *testing.T) {
 	f := newFixture(t, goodTest)

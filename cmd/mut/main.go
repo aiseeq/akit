@@ -204,6 +204,10 @@ func run(o opts, stdin io.Reader, stdout io.Writer) int {
 		fmt.Fprintf(stdout, "error: graft not found: %v\n", err)
 		return 2
 	}
+	// graft treats only a non-empty value as admitted (tasks.AdmittedEnv).
+	if os.Getenv("GRAFT_ADMITTED") != "" {
+		fmt.Fprintln(os.Stderr, "mut: outer graft exec --heavy is unnecessary; mut queues each test run")
+	}
 	graft := []string{graftPath, "exec", "--heavy"}
 	if o.testDB {
 		graft = append(graft, "--test-db")
@@ -487,6 +491,7 @@ func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 	}
 	argv := append(append(slices.Clone(graft[1:]), "--", "go", "test"), args...)
 	cmd := exec.Command(graft[0], argv...)
+	cmd.Env = withoutAdmitted(os.Environ())
 	cmd.Stdin = nil
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -547,6 +552,12 @@ func runTests(graft []string, args []string, sigc <-chan os.Signal) verdict {
 	}
 	_ = err
 	return classify(events, stderr.String(), cmd.ProcessState.ExitCode())
+}
+
+func withoutAdmitted(env []string) []string {
+	return slices.DeleteFunc(slices.Clone(env), func(value string) bool {
+		return strings.HasPrefix(value, "GRAFT_ADMITTED=")
+	})
 }
 
 func signalStatus(sig os.Signal) int {
