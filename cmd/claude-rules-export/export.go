@@ -70,16 +70,18 @@ func export(opts options, stdout io.Writer) (err error) {
 	readme := filepath.Join(stage, "README.md")
 	matches, err := rewriteFiles(files, readme, m)
 	if err != nil {
+		printReplaceWarnings(stdout, m, matches)
 		return err
 	}
-	hits, err := findPII(stage, files, m.pii)
+	hits, err := scanPII(stage, files, m.pii)
 	if err != nil {
-		return err
-	}
-	if err := replaceExport(out, stage); err != nil {
+		printReplaceWarnings(stdout, m, matches)
 		return err
 	}
 	printReplaceWarnings(stdout, m, matches)
+	if err := replaceExport(out, stage); err != nil {
+		return err
+	}
 	for _, h := range hits {
 		fmt.Fprintln(stdout, h)
 	}
@@ -242,6 +244,8 @@ func findPII(root string, files []string, pii []piiRule) ([]string, error) {
 	}
 	return hits, nil
 }
+
+var scanPII = findPII
 
 // under — путь p относительно dir, если p совпадает с dir или лежит внутри него, по тексту.
 func under(p, dir string) (string, bool) {

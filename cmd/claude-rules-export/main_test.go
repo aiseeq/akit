@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -272,6 +273,44 @@ func TestExportWarnsAboutUnmatchedReplacement(t *testing.T) {
 	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(t.TempDir(), "out"))
 	if code != 0 || !strings.Contains(stdout+stderr, "replace.tsv") || !strings.Contains(stdout+stderr, "not-present") {
 		t.Fatalf("code %d, output %q %q", code, stdout, stderr)
+	}
+}
+
+func TestExportWarnsBeforeRefusedReplacement(t *testing.T) {
+	src, rules := fixture(t)
+	write(t, filepath.Join(rules, "manifest/replace.tsv"), "me@corp.example\t<твоя почта>\nnot-present\treplaced\n", 0o644)
+	out := filepath.Join(t.TempDir(), "out")
+	write(t, filepath.Join(out, "foreign.txt"), "untouched\n", 0o644)
+	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, out)
+	warning := "warning: replace.tsv: no match for \"not-present\""
+	if code != exitUsage || strings.Count(stdout+stderr, warning) != 1 {
+		t.Fatalf("code %d, warning count %d, output %q %q", code, strings.Count(stdout+stderr, warning), stdout, stderr)
+	}
+}
+
+func TestExportWarnsWhenDropLineIsMissing(t *testing.T) {
+	src, rules := fixture(t)
+	write(t, filepath.Join(rules, "manifest/replace.tsv"), "me@corp.example\t<твоя почта>\nnot-present\treplaced\n", 0o644)
+	write(t, filepath.Join(rules, "manifest/drop-lines.txt"), "личное:\nabsent-line\n", 0o644)
+	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(t.TempDir(), "out"))
+	warning := "warning: replace.tsv: no match for \"not-present\""
+	if code != exitDirty || strings.Count(stdout, warning) != 1 || !strings.Contains(stderr, "absent-line") {
+		t.Fatalf("code %d, warning count %d, output %q %q", code, strings.Count(stdout, warning), stdout, stderr)
+	}
+}
+
+func TestExportWarnsWhenPIIScanFails(t *testing.T) {
+	src, rules := fixture(t)
+	write(t, filepath.Join(rules, "manifest/replace.tsv"), "me@corp.example\t<твоя почта>\nnot-present\treplaced\n", 0o644)
+	originalScanPII := scanPII
+	scanPII = func(string, []string, []piiRule) ([]string, error) {
+		return nil, errors.New("synthetic PII scan failure")
+	}
+	t.Cleanup(func() { scanPII = originalScanPII })
+	code, stdout, stderr := runExport(t, "--src-home", src, "--rules", rules, filepath.Join(t.TempDir(), "out"))
+	warning := "warning: replace.tsv: no match for \"not-present\""
+	if code != exitUsage || strings.Count(stdout, warning) != 1 || !strings.Contains(stderr, "synthetic PII scan failure") {
+		t.Fatalf("code %d, warning count %d, output %q %q", code, strings.Count(stdout, warning), stdout, stderr)
 	}
 }
 
