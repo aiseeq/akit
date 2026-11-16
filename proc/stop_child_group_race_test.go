@@ -3,9 +3,12 @@
 package proc
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -152,18 +155,20 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 	if testing.Short() {
 		iterations = 8
 	}
-	dir := t.TempDir()
-	var called atomic.Int32
-	var checked atomic.Int32
+	var racedCancel, leaderFirst, guaranteed atomic.Int32
 	jobs := make(chan int)
 	workers := min(40, iterations)
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Go(func() {
 			for i := range jobs {
-				pidFile := filepath.Join(dir, strconv.Itoa(i)+".pid")
 				ctx, cancel := context.WithCancel(context.Background())
-				cmd := exec.CommandContext(ctx, "sh", "-c", `sh -c 'trap "" TERM; exec sleep 30' </dev/null >/dev/null 2>&1 & echo $! > "$1"; sleep 0.03`, "sh", pidFile)
+				isGuaranteed := i%4 == 0
+				leaderDelay := fmt.Sprintf("0.%03d", 10+rand.IntN(21))
+				if isGuaranteed {
+					leaderDelay = "30"
+				}
+				cmd := exec.CommandContext(ctx, "sh", "-c", `sh -c 'trap "" TERM; exec sleep 30' </dev/null >/dev/null 2>&1 & echo $!; exec sleep "$1"`, "sh", leaderDelay)
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 				var mu sync.Mutex
 				var cancelCalled bool
@@ -176,43 +181,75 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 					return err
 				}
 				cmd.WaitDelay = time.Second
+				stdout, err := cmd.StdoutPipe()
+				if err != nil {
+					cancel()
+					t.Errorf("iteration %d: stdout pipe: %v", i, err)
+					continue
+				}
 				if err := cmd.Start(); err != nil {
 					cancel()
 					t.Errorf("iteration %d: start command: %v", i, err)
 					continue
 				}
-				timer := time.AfterFunc(15*time.Millisecond, cancel)
+				raw, readErr := bufio.NewReader(stdout).ReadString('\n')
+				pid, parseErr := strconv.Atoi(strings.TrimSpace(raw))
+				if readErr != nil || parseErr != nil || pid <= 1 {
+					t.Errorf("iteration %d: invalid member PID %q: read=%v parse=%v", i, raw, readErr, parseErr)
+					cancel()
+					_ = cmd.Wait()
+					continue
+				}
+				// Pin the test's member before the cancel timer starts: until then nothing stops it, even if the leader has already exited.
+				fd, err := unix.PidfdOpen(pid, 0)
+				if err != nil {
+					t.Errorf("iteration %d: open member pidfd: %v", i, err)
+					cancel()
+					_ = cmd.Wait()
+					continue
+				}
+				delay := time.Duration(rand.IntN(16)) * time.Millisecond
+				timer := time.AfterFunc(delay, cancel)
 				_ = cmd.Wait()
 				timer.Stop()
 				cancel()
 				mu.Lock()
 				wasCalled, stopErr := cancelCalled, cancelErr
 				mu.Unlock()
+				if isGuaranteed {
+					guaranteed.Add(1)
+					if !wasCalled {
+						t.Errorf("iteration %d: guaranteed Cancel was not called", i)
+					}
+				} else if wasCalled {
+					racedCancel.Add(1)
+				} else {
+					leaderFirst.Add(1)
+				}
 				if wasCalled {
-					called.Add(1)
 					if stopErr != nil {
 						t.Errorf("iteration %d: Cancel returned %v", i, stopErr)
 					}
-					raw, err := os.ReadFile(pidFile)
-					if err != nil {
-						t.Errorf("iteration %d: read member PID: %v", i, err)
-					} else {
-						pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
-						if parseErr != nil || pid <= 1 {
-							t.Errorf("iteration %d: invalid member PID %q: %v", i, raw, parseErr)
-						} else {
-							checked.Add(1)
-							if !groupMemberGone(pid, time.Second) {
-								t.Errorf("iteration %d: group member %d survived Cancel", i, pid)
-							}
-						}
+					if !groupMemberGone(pid, time.Second) {
+						t.Errorf("iteration %d: group member %d survived Cancel", i, pid)
+					}
+				} else {
+					alive, err := processAlive(&trackedProcess{fd: fd})
+					if err != nil || !alive {
+						t.Errorf("iteration %d: member should survive leader exit: alive=%v err=%v", i, alive, err)
 					}
 				}
-				if cmd.Process != nil {
-					if _, err := StopChildGroup(cmd, 0, syscall.SIGKILL); err != nil {
-						t.Errorf("iteration %d: cleanup own process group: %v", i, err)
-					}
+				if err := signalProcess(pid, &trackedProcess{fd: fd}, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+					t.Errorf("iteration %d: cleanup member: %v", i, err)
 				}
+				if !groupMemberGone(pid, time.Second) {
+					t.Errorf("iteration %d: member %d survived cleanup", i, pid)
+				}
+				// TestMain is a subreaper: collect this member if it was adopted.
+				if _, err := unix.Wait4(pid, nil, unix.WNOHANG, nil); err != nil && !errors.Is(err, unix.ECHILD) {
+					t.Errorf("iteration %d: reap member: %v", i, err)
+				}
+				_ = unix.Close(fd)
 			}
 		})
 	}
@@ -221,13 +258,7 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 	}
 	close(jobs)
 	wg.Wait()
-	if int(called.Load()) < iterations*2/3 {
-		t.Fatalf("Cancel ran in only %d of %d iterations", called.Load(), iterations)
-	}
-	if checked.Load() != called.Load() {
-		t.Fatalf("Cancel calls=%d, participants checked=%d", called.Load(), checked.Load())
-	}
-	t.Logf("Cancel calls=%d, participants checked=%d", called.Load(), checked.Load())
+	t.Logf("race Cancel=%d, leader first=%d, guaranteed=%d, total=%d", racedCancel.Load(), leaderFirst.Load(), guaranteed.Load(), iterations)
 }
 
 func startRaceGroup(t *testing.T) (*exec.Cmd, int) {
