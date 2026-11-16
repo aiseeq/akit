@@ -32,10 +32,6 @@ categories:
               The shell snippets are cases of the parser's tests handed to
               shellcmd.Calls; the file runs fish only with fixed `builtin -n`
               and `functions -an` to list its names.
-          - file: "shellcmd/sudo_assign_test.go"
-            reason: >-
-              The shell snippets are cases of the parser's tests handed to
-              shellcmd.Calls; the file runs nothing.
   typesafety: {enabled: true}
   security: {enabled: true}
   deadcode: {enabled: true}
