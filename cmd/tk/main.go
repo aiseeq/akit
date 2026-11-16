@@ -47,6 +47,7 @@ Usage:
   tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take]
   tk next [--by NAME] [--json]
   tk external --json   the project's whole task source, no gates and no local tickets
+  tk guide             краткая справка по зависимостям и ожиданию
   tk transfer ID [--parent KEY] [--by NAME]
   tk wait ID --until TEXT [--by NAME]
   tk review ID [--by NAME] [--note TEXT]
@@ -686,6 +687,11 @@ func validateSimpleCommand(o *options, pos []string) error {
 		o.id = pos[0]
 	}
 	switch o.cmd {
+	case "guide":
+		if len(pos) != 0 {
+			return errors.New("guide takes no arguments")
+		}
+		return nil
 	case "new":
 		return validateNew(o, pos)
 	case "ls":
@@ -933,6 +939,10 @@ func validStatus(s string) bool {
 	return false
 }
 func run(o options, out, errout io.Writer) int {
+	if o.cmd == "guide" {
+		fmt.Fprint(out, guideText)
+		return 0
+	}
 	if code := prepareActor(&o, errout); code != 0 {
 		return code
 	}
@@ -971,6 +981,32 @@ func run(o options, out, errout io.Writer) int {
 	}
 	return runAtBase(root, dir, o, out, errout)
 }
+
+const guideText = `Зависимости
+  tk new A --blocks B или tk set A --blocks B — A блокирует B;
+  tk set A --unblocks B снимает связь A → B. Флаги можно повторять.
+  Ссылка: slug в этом проекте; ИМЯ/slug (проект с таким именем в git или work);
+  git/ИМЯ/slug или work/ИМЯ/slug.
+  Если A ниже B по приоритету, связь поднимет A до уровня B; B не меняется.
+  tk ls помечает заблокированный тикет; tk show показывает свою сторону связи
+  у каждого тикета: «Блокирует» или «Заблокирован». В tk next блокеры влияют
+  на порядок только внутри группы приоритета; заблокированные задачи остаются
+  в выдаче, и задача с более высоким приоритетом может идти первой.
+
+Ожидание
+  tk wait ID --until "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём" переводит задачу в «ждёт».
+  Другие формы даты: ДД.ММ[ ЧЧ:ММ[:СС]] и ГГГГ-ММ-ДД[ ЧЧ:ММ[:СС]];
+  прошедший день в ДД.ММ переносится на следующий год. Также принимаются ISO
+  с T и RFC3339. Без зоны время местное; после часов понимаются только UTC и Z.
+  Другая зона через пробел молча отбрасывается, время местное; зона, приклеенная
+  к часам (07:30+03:00), отбрасывает и часы — срок станет полуночью. Смещение
+  принимается только в RFC3339 с секундами, например
+  2026-11-17T06:40:00+03:00.
+  Нераспознанное время, невозможная дата и относительное «2h» сохраняются как
+  условие без срока: tk ls --due их не покажет. Когда срок наступил, tk next
+  выдаёт задачу, а tk ls --due показывает её; прошедший срок уже наступил.
+  tk start ID снимает ожидание.
+`
 
 // externalAtBase needs no ticket folder: a project without docs/tasks can have
 // a source. Worktrees read it for the main tree, as tk next does.
@@ -1011,6 +1047,9 @@ func runAtBase(root, dir string, o options, out, errout io.Writer) int {
 
 func runBaseCommand(root, dir string, o options, out, errout io.Writer) (int, bool) {
 	switch o.cmd {
+	case "guide":
+		fmt.Fprint(out, guideText)
+		return 0, true
 	case "new":
 		return createAtBase(root, dir, o, out, errout), true
 	case "ls":
