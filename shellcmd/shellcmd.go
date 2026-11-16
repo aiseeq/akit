@@ -2511,12 +2511,18 @@ func collectAssignments(call *syntax.CallExpr, src string, vars map[string]strin
 		if assign.Name == nil || assign.Value == nil {
 			continue
 		}
-		value, literal := wordValue(assign.Value)
-		if !literal {
-			value = unquotedText(assign.Value, src)
-		}
-		vars[assign.Name.Value] = value
+		vars[assign.Name.Value] = assignValue(assign, src)
 	}
+}
+
+// assignValue is the literal value of an assignment, or its source text without quotes
+// when the value has an expansion.
+func assignValue(assign *syntax.Assign, src string) string {
+	value, literal := wordValue(assign.Value)
+	if !literal {
+		value = unquotedText(assign.Value, src)
+	}
+	return value
 }
 
 func commandName(name string) string {

@@ -56,6 +56,12 @@ Scripts are expanded from `bash -c` (also under an unknown program), a shell her
 the remote command of `ssh` (`Via` names the way in). A shell heredoc is not treated as a script when
 the shell has `-c` or a script file. `Calls` and `Find` return calls found outside a malformed nested
 script with a `NestedError` that identifies the script and unwraps its parse error.
+`Assigns` returns the assignments of a command (`S=x;`, `export`, `declare`, `typeset`, `readonly`,
+`local` in a function) in text order with their byte offsets, a mark for `+=` and the innermost
+subshell, substitution, pipeline part, background job or function body that holds each one;
+`Assign.VisibleAt` tells whether a value may be set at a given offset, so a caller resolves `$S`
+before a call. Prefix assignments (`S=x cmd`) are left out. The check is static: branches and
+loop bodies count as run, a function call is not followed.
 
 ## busy
 
