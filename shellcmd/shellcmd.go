@@ -6336,7 +6336,11 @@ func wrapperStart(name string, args []string) int {
 		if !hasOption(name, args, "-c", "--cpu-list") && i < len(args) {
 			i++
 		}
-	case "chrt", "flock":
+	case "flock":
+		if i < len(args) {
+			i++
+		}
+	case "chrt":
 		if i < len(args) && args[i] != "--" {
 			i++
 		}

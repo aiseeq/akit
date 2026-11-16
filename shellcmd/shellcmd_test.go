@@ -1592,6 +1592,49 @@ E`, "kill", []string{"1"}, []string{"bash"}},
 	}
 }
 
+func TestFlockDashDash(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{`flock -- -- /usr/bin/kill -9 1`, true},
+		{`flock -- -x kill 1`, true},
+		{`flock -x -- f kill 1`, true},
+		{`flock -- f -c 'kill 1'`, true},
+		{`flock -- f --command 'kill 1'`, true},
+		{`flock -- 9 kill 1`, true},
+		{`flock -w 5 -- f kill 1`, true},
+		{`flock -E 3 -- f -c 'kill 1'`, true},
+		{`flock --timeout=5 f kill 1`, true},
+		{`flock -- f`, false},
+		{`flock -- 9`, false},
+		{`flock -- f -c`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found []Call
+			for _, call := range calls {
+				if call.Name == "kill" {
+					found = append(found, call)
+				}
+			}
+			if !tt.want {
+				if len(found) != 0 {
+					t.Fatalf("kill calls = %#v; want none", found)
+				}
+				return
+			}
+			if len(found) != 1 || !reflect.DeepEqual(found[0].Via, []string{"flock"}) {
+				t.Fatalf("kill calls = %#v (all %#v); want one call via flock", found, calls)
+			}
+		})
+	}
+}
+
 func TestWrapperOptionAndProgressRegressions(t *testing.T) {
 	tests := []struct {
 		command string
