@@ -263,6 +263,35 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if err != nil {
 		return fmt.Errorf("shellcmd: parse shell: %w", err)
 	}
+	var optionErr error
+	syntax.Walk(file, func(node syntax.Node) bool {
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || optionErr != nil || len(call.Args) == 0 {
+			return true
+		}
+		command, literal := wordValue(call.Args[0])
+		name := baseName(command)
+		if !literal || name != "flock" && name != "setsid" {
+			return true
+		}
+		values, _ := words(call.Args, full, vars)
+		if len(values) == 0 {
+			return true
+		}
+		args := values[1:]
+		for i := 0; wrappers[name] && i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" && args[i] != "--"; {
+			key, _, _ := strings.Cut(args[i], "=")
+			if wrapperLongOptionAmbiguous(name, key) {
+				optionErr = fmt.Errorf("shellcmd: ambiguous %s option %q", name, key)
+				return false
+			}
+			i = optionNext(name, args, i)
+		}
+		return true
+	})
+	if optionErr != nil {
+		return optionErr
+	}
 	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
 }
 
@@ -4256,6 +4285,14 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 	if err := emitShellInputTarget(c, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
+	if name == "flock" && flockVerboseOption(args) {
+		lock := wrapperOptionEnd(name, args, 0)
+		if lock < len(args) {
+			if err := emit(c.sub(lock+1, c.via("flock")), lineBase, vars, calls, seen); err != nil {
+				return err
+			}
+		}
+	}
 
 	exact, exactVia, exactOK := unwrap(name, args)
 	exactStart := -1
@@ -4273,6 +4310,20 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 		return err
 	}
 	return emitMainTarget(c, main, mainVia, mainOK, lineBase, vars, calls, seen)
+}
+
+func flockVerboseOption(args []string) bool {
+	for i := 0; i < len(args) && wrapperOptionWord("flock", args[i]); {
+		if args[i] == "--" {
+			return false
+		}
+		key, _, _ := strings.Cut(args[i], "=")
+		if wrapperLongOption("flock", key) == "--verbose" {
+			return true
+		}
+		i = optionNext("flock", args, i)
+	}
+	return false
 }
 
 func emitShellInputTarget(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
@@ -4425,9 +4476,7 @@ func wrapperOptionStep(name string, args []string, i int) (int, bool) {
 
 func longWrapperOptionStep(name string, args []string, i int) (int, bool) {
 	key, _, attached := strings.Cut(args[i], "=")
-	if name == "setsid" {
-		key = setsidLongOption(key)
-	}
+	key = wrapperLongOption(name, key)
 	if !valueOptions[name][key] && !flagOptions[name][key] {
 		return i, true
 	}
@@ -4437,26 +4486,43 @@ func longWrapperOptionStep(name string, args []string, i int) (int, bool) {
 	return i + 1, false
 }
 
-func setsidLongOption(key string) string {
+func wrapperLongOption(name, key string) string {
 	if key == "--" || !strings.HasPrefix(key, "--") {
 		return key
 	}
-	if flagOptions["setsid"][key] {
+	if valueOptions[name][key] || flagOptions[name][key] {
 		return key
 	}
 	match := ""
-	for option := range flagOptions["setsid"] {
-		if strings.HasPrefix(option, key) {
-			if match != "" {
-				return key
+	for _, options := range []map[string]bool{valueOptions[name], flagOptions[name]} {
+		for option := range options {
+			if strings.HasPrefix(option, key) {
+				if match != "" {
+					return key
+				}
+				match = option
 			}
-			match = option
 		}
 	}
 	if match == "" {
 		return key
 	}
 	return match
+}
+
+func wrapperLongOptionAmbiguous(name, key string) bool {
+	if key == "--" || !strings.HasPrefix(key, "--") || valueOptions[name][key] || flagOptions[name][key] {
+		return false
+	}
+	matches := 0
+	for _, options := range []map[string]bool{valueOptions[name], flagOptions[name]} {
+		for option := range options {
+			if strings.HasPrefix(option, key) {
+				matches++
+			}
+		}
+	}
+	return matches > 1
 }
 
 func shortWrapperOptionStep(name string, args []string, i int) (int, bool) {
@@ -6027,6 +6093,7 @@ func optionNext(name string, args []string, i int) int {
 	}
 	if strings.HasPrefix(arg, "--") {
 		key, _, hasValue := strings.Cut(arg, "=")
+		key = wrapperLongOption(name, key)
 		if !hasValue && valueOptions[name][key] && i+1 < len(args) {
 			return i + 2
 		}
@@ -6267,7 +6334,7 @@ func wrapperRunsScript(name string, args []string) bool {
 }
 
 func unwrapOnce(name string, args []string) ([]string, bool) {
-	if name == "setsid" && setsidExitsWithoutCommand(args) {
+	if (name == "setsid" || name == "flock") && wrapperExitsWithoutCommand(name, args) {
 		return nil, false
 	}
 	if name == "parallel" {
@@ -6314,14 +6381,14 @@ func envCommandStart(args []string, i int) int {
 	return i
 }
 
-func setsidExitsWithoutCommand(args []string) bool {
+func wrapperExitsWithoutCommand(name string, args []string) bool {
 	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-"; {
 		arg, _, _ := strings.Cut(args[i], "=")
-		arg = setsidLongOption(arg)
+		arg = wrapperLongOption(name, arg)
 		if arg == "-h" || arg == "--help" || arg == "-V" || arg == "--version" {
 			return true
 		}
-		i = optionNext("setsid", args, i)
+		i = optionNext(name, args, i)
 	}
 	return false
 }
@@ -6448,7 +6515,7 @@ var flagOptions = map[string]map[string]bool{
 	"setpriv":     set("--init-groups", "--clear-groups", "--no-new-privs", "--keep-caps", "--dump", "--list-caps"),
 	"watch":       set("-d", "--differences", "-t", "--no-title", "-c", "--color", "-g", "--chgexit", "-e", "--errexit", "-b", "--beep", "-p", "--precise", "-x", "--exec"),
 	"parallel":    set("-k", "--keep-order", "--tag", "-q", "--quote", "--ungroup", "--group", "--line-buffer", "--tagstring"),
-	"flock":       set("-x", "--exclusive", "-s", "--shared", "-u", "--unlock", "-n", "--nonblock", "-o", "--close", "-F", "--no-fork"),
+	"flock":       set("-x", "--exclusive", "-s", "--shared", "-u", "--unlock", "-n", "--nonblocking", "--nb", "-o", "--close", "-F", "--no-fork", "--fcntl", "--verbose", "-h", "--help", "-V", "--version"),
 	"systemd-run": set("-q", "--quiet", "-t", "--pty", "-P", "--pipe", "-G", "--collect", "-d", "--remain-after-exit", "--user", "--scope", "--wait", "--system", "--same-dir", "--send-sighup", "--background", "--expand-environment", "--on-clock-change", "--on-timezone-change"),
 	"doas":        set("-n", "--non-interactive", "-s", "-L", "--"),
 	"ionice":      set("-t", "--ignore"),

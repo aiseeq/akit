@@ -1635,6 +1635,124 @@ func TestFlockDashDash(t *testing.T) {
 	}
 }
 
+func TestFlockLongOptionRouting(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{`flock --verbose f kill 1`, true},
+		{`flock --verbose -- kill 1`, true},
+		{`flock --fcntl -- -- kill 1`, true},
+		{`flock --time 5 f kill 1`, true},
+		{`flock --co 3 f kill 1`, true},
+		{`flock --nb f kill 1`, true},
+		{`flock --nonblocking f kill 1`, true},
+		{`flock --nonblock f kill 1`, true},
+		{`flock --nb --fcntl -- -- kill 1`, true},
+		{`flock --nonblocking --verbose 9 kill 1`, true},
+		{`flock --nonblocking 9 kill 1`, true},
+		{`flock --verb f kill 1`, true},
+		{`flock --help f kill 1`, false},
+		{`flock --version f kill 1`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found []Call
+			for _, call := range calls {
+				if call.Name == "kill" {
+					found = append(found, call)
+				}
+			}
+			if !tt.want {
+				if len(found) != 0 {
+					t.Fatalf("kill calls = %#v; want none", found)
+				}
+				return
+			}
+			if len(found) != 1 || !reflect.DeepEqual(found[0].Via, []string{"flock"}) {
+				t.Fatalf("kill calls = %#v (all %#v); want one call via flock", found, calls)
+			}
+		})
+	}
+	if _, err := Calls(`flock --ver f kill 1`); err == nil {
+		t.Fatal("ambiguous --ver abbreviation parsed without error")
+	}
+	if _, err := Calls(`flock --c 3 f kill 1`); err == nil {
+		t.Fatal("ambiguous --c abbreviation parsed without error")
+	}
+	if calls, err := Calls(`flock --co 3 f kill 1`); err != nil || !hasCallVia(calls, "kill", "flock") {
+		t.Fatalf("flock --co 3 f kill 1: calls=%#v err=%v; want kill via flock", calls, err)
+	}
+	if _, err := Calls(`flock -- --c f cmd`); err != nil {
+		t.Fatalf("--c lock path after --: %v", err)
+	}
+	for _, option := range []string{"--nonblocking", "--nb", "--fcntl", "--verbose", "--help", "--version", "-h", "-V"} {
+		if !flagOptions["flock"][option] {
+			t.Errorf("flock flagOptions missing %q", option)
+		}
+	}
+	for _, option := range []string{"-c", "--command"} {
+		if valueOptions["flock"][option] {
+			t.Errorf("flock valueOptions must not contain %q", option)
+		}
+	}
+	if flagOptions["flock"]["--nonblock"] {
+		t.Error("--nonblock should resolve as an abbreviation, not a table key")
+	}
+	for _, command := range []string{`flock -c 'echo zk' l`, `flock --command 'echo zk' l`} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("%s: %v", command, err)
+		}
+		for _, call := range calls {
+			if call.Name == "echo" {
+				t.Fatalf("%s parsed rejected pre-lock option as a command: %#v", command, calls)
+			}
+		}
+	}
+}
+
+func hasCallVia(calls []Call, name, via string) bool {
+	for _, call := range calls {
+		if call.Name == name && slices.Contains(call.Via, via) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWrapperLongOptionHyphenStops(t *testing.T) {
+	tests := []struct {
+		command string
+		name    string
+		args    []string
+	}{
+		{`flock - f echo zk`, "flock", []string{"-", "f", "echo", "zk"}},
+		{`setsid - echo zk`, "setsid", []string{"-", "echo", "zk"}},
+		{`flock -x - echo zk`, "flock", []string{"-x", "-", "echo", "zk"}},
+		{`flock -- - echo zk`, "flock", []string{"--", "-", "echo", "zk"}},
+	}
+	for _, tt := range tests {
+		calls, err := Calls(tt.command)
+		if err != nil {
+			t.Fatalf("%s: %v", tt.command, err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == tt.name && reflect.DeepEqual(call.Args, tt.args) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s calls = %#v; want %s %q", tt.command, calls, tt.name, tt.args)
+		}
+	}
+}
+
 func TestWrapperOptionAndProgressRegressions(t *testing.T) {
 	tests := []struct {
 		command string
@@ -1652,6 +1770,7 @@ func TestWrapperOptionAndProgressRegressions(t *testing.T) {
 		{command: `unshare --fork --pid --mount-proc kill 1`, name: "kill", args: []string{"1"}, via: []string{"unshare"}},
 		{command: `flock --timeout 5 /tmp/x -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"flock"}},
 		{command: `flock --conflict-exit-code 3 /tmp/x kill 1`, name: "kill", args: []string{"1"}, via: []string{"flock"}},
+		{command: `strace --trace process echo zk`, name: "echo", args: []string{"zk"}, via: []string{"strace"}},
 		{command: `strace --output /tmp/x -U name --trace=process kill 1`, name: "kill", args: []string{"1"}, via: []string{"strace"}},
 		{command: `systemd-run --on-active 5 --on-calendar '*-*-* 00:00' --machine m kill 1`, name: "kill", args: []string{"1"}, via: []string{"systemd-run"}},
 		{command: `setpriv --ruid 1 --euid 2 --rgid 3 --egid 4 kill 1`, name: "kill", args: []string{"1"}, via: []string{"setpriv"}},
