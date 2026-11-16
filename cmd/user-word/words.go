@@ -2640,7 +2640,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings, recordDays: collector.recordDays}
 }
 
-func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line, shownForQuote ...map[string]bool) []line {
+func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line, shownForQuote map[string]bool) []line {
 	out := make([]line, 0, briefLater+2)
 	if agent != nil {
 		out = append(out, *agent)
@@ -2651,11 +2651,7 @@ func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agen
 			continue
 		}
 		if !l.t.Equal(targetTime) {
-			shown := l.contextHuman
-			if len(shownForQuote) > 0 {
-				shown = shownForQuote[0][l.t.Format(time.RFC3339Nano)]
-			}
-			if !shown {
+			if !shownForQuote[l.t.Format(time.RFC3339Nano)] {
 				continue
 			}
 		}
