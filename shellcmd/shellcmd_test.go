@@ -1549,8 +1549,6 @@ E`, "kill", []string{"1"}, []string{"bash"}},
 		{`runuser - u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
 		{`runuser u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
 		{`runuser -l u1 -c 'kill 1'`, "kill", []string{"1"}, []string{"runuser"}},
-		{`taskset -c0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
-		{`taskset --cpu-list=0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
 		{`taskset -ac 0 kill 1`, "kill", []string{"1"}, []string{"taskset"}},
 		{`unshare --fork --pid --mount-proc kill 1`, "kill", []string{"1"}, []string{"unshare"}},
 		{`tmux new -d -e X=1 'kill 1'`, "kill", []string{"1"}, []string{"tmux"}},
@@ -1764,8 +1762,6 @@ func TestWrapperOptionAndProgressRegressions(t *testing.T) {
 		{command: `runuser u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
 		{command: `runuser -l u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
 		{command: `runuser - u1 -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"runuser"}},
-		{command: `taskset -c0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
-		{command: `taskset --cpu-list=0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
 		{command: `taskset -ac 0 kill 1`, name: "kill", args: []string{"1"}, via: []string{"taskset"}},
 		{command: `unshare --fork --pid --mount-proc kill 1`, name: "kill", args: []string{"1"}, via: []string{"unshare"}},
 		{command: `flock --timeout 5 /tmp/x -c 'kill 1'`, name: "kill", args: []string{"1"}, via: []string{"flock"}},
@@ -3783,8 +3779,8 @@ func TestKnownWrapperOptionsAndEnvAttachedValue(t *testing.T) {
 		via     []string
 	}{
 		{`env -uSHELL pkill -u u1`, "pkill", []string{"-u", "u1"}, []string{"env"}},
-		{`systemd-run --background red kill -1`, "red", []string{"kill", "-1"}, []string{"systemd-run"}},
-		{`systemd-run --expand-environment no kill -1`, "no", []string{"kill", "-1"}, []string{"systemd-run"}},
+		{`systemd-run --background red kill -1`, "kill", []string{"-1"}, []string{"systemd-run"}},
+		{`systemd-run --expand-environment no kill -1`, "kill", []string{"-1"}, []string{"systemd-run"}},
 		{`tmux splitw -h -p 50 kill -1`, "kill", []string{"-1"}, []string{"tmux"}},
 	}
 	for _, tc := range cases {

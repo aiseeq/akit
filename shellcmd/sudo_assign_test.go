@@ -164,6 +164,58 @@ func TestSudoAssignmentBeforeStdinShell(t *testing.T) {
 	}
 }
 
+func TestLegacyNiceAdjustmentKeepsStdinShell(t *testing.T) {
+	calls, err := Calls("echo 'kill 1' | nice -5 sudo X=1 bash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsCallName(calls, "kill") {
+		t.Fatalf("calls %+v, want kill from stdin shell", calls)
+	}
+}
+
+func TestChrtVerboseAndFlockExclusiveOptions(t *testing.T) {
+	for _, src := range []string{
+		`chrt -v -f 10 kill 1`,
+		`chrt -v -f 10 sudo X=1 kill 1`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Errorf("%s: %v", src, err)
+			continue
+		}
+		if !containsCallName(calls, "kill") {
+			t.Errorf("%s: calls %+v, want kill", src, calls)
+		}
+	}
+	calls, err := Calls(`flock -e /dev/null echo zk`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsCallName(calls, "echo") {
+		t.Fatalf("flock -e calls %+v, want echo", calls)
+	}
+}
+
+func TestXargsOptionalArgumentsKeepWrappedCommand(t *testing.T) {
+	for _, src := range []string{
+		`xargs -l echo zk`,
+		`xargs -l2 echo zk`,
+		`xargs -i echo zk`,
+		`xargs -i{} echo zk`,
+		`xargs --eof echo zk`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Errorf("%s: %v", src, err)
+			continue
+		}
+		if !hasCallVia(calls, "echo", "xargs") {
+			t.Errorf("%s: calls %+v, want echo via xargs", src, calls)
+		}
+	}
+}
+
 func TestSudoSlashWordIsCommand(t *testing.T) {
 	for _, tc := range []struct{ src, name string }{
 		{`sudo -u root /opt/x=1/kill -9 1`, "kill"},
