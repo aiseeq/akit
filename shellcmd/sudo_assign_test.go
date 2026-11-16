@@ -105,14 +105,15 @@ func TestEnvOptionsEndAtAssignment(t *testing.T) {
 	}
 }
 
-// The exact set of program names: after `--` sudo takes no more options or
-// assignments, and a lone assignment is no shell option.
+// The exact set of program names retains the command sudo runs after `--` and
+// adds a protective route to the program behind an assignment word.
 func TestSudoAssignmentCallNamesExact(t *testing.T) {
 	for _, tc := range []struct {
 		src   string
 		names []string
 	}{
-		{`sudo X=1 -- Y=2 kill 1`, []string{"sudo", "Y=2"}},
+		{`sudo X=1 -- Y=2 kill 1`, []string{"sudo", "Y=2", "kill"}},
+		{`sudo -- X=1 kill -9 -1`, []string{"sudo", "X=1", "kill"}},
 		{`sudo -- -u kill 1`, []string{"sudo", "-u"}},
 		{"echo 'zk 1' | sudo X=s", []string{"echo", "sudo"}},
 		{"echo 'zk 1' | sudo X=i", []string{"echo", "sudo"}},
@@ -190,4 +191,93 @@ func TestEnvEqualsFirstWordIsAssignment(t *testing.T) {
 	if !containsCallName(calls, "kill") {
 		t.Fatalf("calls %+v, want kill", calls)
 	}
+}
+
+// After `--` the program behind VAR=value words is an additional protective
+// route; the actual VAR=value command remains represented as well.
+func TestSudoDashDashAssignmentKeepsProgram(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		args []string
+	}{
+		{`sudo -- X=1 kill -9 1`, []string{"-9", "1"}},
+		{`sudo -u root -- X=a/b kill 1`, []string{"1"}},
+		{`sudo -E -- A=1 B=2 kill 1`, []string{"1"}},
+		{`sudo X=1 -- Y=2 kill 1`, []string{"1"}},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range calls {
+				if c.Name == "kill" && slices.Equal(c.Args, tc.args) && slices.Contains(c.Via, "sudo") {
+					return
+				}
+			}
+			t.Fatalf("calls %+v, want kill %v via sudo", calls, tc.args)
+		})
+	}
+}
+
+func TestSudoDashDashAssignmentRoutes(t *testing.T) {
+	for _, src := range []string{
+		`nice sudo -- X=1 kill -9 1`,
+		`timeout 5 sudo -- X=1 kill -9 1`,
+		`env sudo -- X=1 kill -9 1`,
+		`exec sudo -- X=1 kill -9 1`,
+		`command sudo -- X=1 kill -9 1`,
+		`nohup sudo -- X=1 kill -9 1`,
+		`setsid sudo -- X=1 kill -9 1`,
+		`bash -c 'timeout 5 sudo -- X=1 kill -9 1'`,
+		`sudo -- X=1 bash <<< 'kill -9 1'`,
+		`sudo -- X=1 bash 0<<< 'kill -9 1'`,
+		`sudo -- X=1 sh -s <<< 'kill -9 1'`,
+		`echo 'kill -9 1' | sudo -- X=1 bash`,
+		`echo 'kill -9 1' | sudo -u root -- X=1 bash`,
+		"sudo -- X=1 bash <<'EOF'\nkill -9 1\nEOF",
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				return
+			}
+			for _, c := range calls {
+				if c.Name == "kill" && slices.Contains(c.Via, "sudo") {
+					return
+				}
+			}
+			t.Fatalf("calls %+v, want kill via sudo or parse error", calls)
+		})
+	}
+}
+
+func TestSudoDashDashVariableNameMatchesWithoutDashDash(t *testing.T) {
+	for _, tc := range []struct{ withDash, withoutDash string }{
+		{`K=kill; sudo -- X=1 $K -9 1`, `K=kill; sudo X=1 $K -9 1`},
+		{`a=(kill); sudo -- X=1 "${a[@]}" -9 1`, `a=(kill); sudo X=1 "${a[@]}" -9 1`},
+	} {
+		withCalls, withErr := Calls(tc.withDash)
+		withoutCalls, withoutErr := Calls(tc.withoutDash)
+		if (withErr != nil) != (withoutErr != nil) || !sameNamedCalls(withCalls, withoutCalls, "kill") {
+			t.Fatalf("with --: calls=%+v err=%v; without --: calls=%+v err=%v", withCalls, withErr, withoutCalls, withoutErr)
+		}
+	}
+}
+
+func sameNamedCalls(left, right []Call, name string) bool {
+	var l, r []Call
+	for _, c := range left {
+		if c.Name == name {
+			l = append(l, c)
+		}
+	}
+	for _, c := range right {
+		if c.Name == name {
+			r = append(r, c)
+		}
+	}
+	return slices.EqualFunc(l, r, func(a, b Call) bool {
+		return slices.Equal(a.Args, b.Args) && slices.Equal(a.Via, b.Via)
+	}) && len(l) == len(r)
 }

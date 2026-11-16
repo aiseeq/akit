@@ -1612,6 +1612,11 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 		if name == "sudo" && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), true
 		}
+		if start, ok := sudoDashDashAssignmentStart(name, args); ok {
+			via = append(via, name)
+			name, args = commandName(args[start]), args[start+1:]
+			continue
+		}
 		if wrappers[name] {
 			if !wrapperOptionsKnown(name, args) {
 				return "", nil, false
@@ -2110,6 +2115,10 @@ func shellInputNextTargetWithScan(name string, args []string, argOffset int, sca
 	if target, ok := scan.find(execScanArgs(name, args)); ok {
 		argOffset += len(args) - len(target) + 1
 		return commandName(target[0]), target[1:], argOffset, true
+	}
+	if start, ok := sudoDashDashAssignmentStart(name, args); ok {
+		argOffset += start + 1
+		return commandName(args[start]), args[start+1:], argOffset, true
 	}
 	if wrappers[name] {
 		if !wrapperOptionsKnown(name, args) {
@@ -2995,6 +3004,9 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 func nextShellInputTarget(name string, args []string, via []string, scan *wrapperExecScan) (string, []string, []string, bool) {
 	if target, ok := scan.find(execScanArgs(name, args)); ok {
 		return commandName(target[0]), target[1:], append(via, name, "exec"), true
+	}
+	if target, routeVia, _, ok := sudoDashDashRoute(name, args); ok && len(target) > 0 {
+		return commandName(target[0]), target[1:], append(via, routeVia...), true
 	}
 	if wrappers[name] {
 		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
@@ -4293,6 +4305,9 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 			}
 		}
 	}
+	if err := emitSudoDashDashRoute(c, name, args, lineBase, vars, calls, seen); err != nil {
+		return err
+	}
 
 	exact, exactVia, exactOK := unwrap(name, args)
 	exactStart := -1
@@ -4337,6 +4352,27 @@ func emitShellInputTarget(c cmd, lineBase int, vars map[string]string, calls *[]
 	return emit(target, lineBase, vars, calls, seen)
 }
 
+func emitSudoDashDashRoute(c cmd, name string, args []string, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
+	if assignment, via, start, ok := sudoDashDashAssignmentRoute(name, args); ok {
+		candidate := c.sub(start, c.via(via...))
+		candidate.call.Name = commandName(assignment[0])
+		candidate.call.Args = slices.Clone(assignment[1:])
+		candidate.words = c.words[start:]
+		if err := emit(candidate, lineBase, vars, calls, seen); err != nil {
+			return err
+		}
+	}
+	_, via, start, ok := sudoDashDashRoute(name, args)
+	if !ok {
+		return nil
+	}
+	candidate := c.sub(start, c.via(via...))
+	if seen.hasBase(candidate.call) {
+		return nil
+	}
+	return emit(candidate, lineBase, vars, calls, seen)
+}
+
 func emitGenericShellTarget(c cmd, name string, args []string, exactStart, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
 	route, ok := genericShellTarget(c, name, args, exactStart)
 	if !ok {
@@ -4362,10 +4398,12 @@ func emitMainTarget(c cmd, main []string, via []string, ok bool, lineBase int, v
 	}
 	start := len(c.words) - len(main)
 	candidate := c.sub(start, c.via(via...))
-	if seen.hasBase(candidate.call) {
-		return nil
+	if !seen.hasBase(candidate.call) {
+		if err := emit(candidate, lineBase, vars, calls, seen); err != nil {
+			return err
+		}
 	}
-	return emit(candidate, lineBase, vars, calls, seen)
+	return nil
 }
 
 func appendCall(seen *callSet, calls *[]Call, call Call) {
@@ -4715,6 +4753,128 @@ var baselineValueOptions = map[string]map[string]bool{
 	"xargs":   set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"),
 }
 
+func sudoDashDashAssignmentStart(name string, args []string) (int, bool) {
+	_, end, ok := sudoDashDashAssignmentBounds(name, args)
+	return end, ok
+}
+
+func sudoDashDashAssignmentWord(name string, args []string) (int, bool) {
+	start, _, ok := sudoDashDashAssignmentBounds(name, args)
+	return start, ok
+}
+
+func sudoDashDashAssignmentBounds(name string, args []string) (int, int, bool) {
+	if name != "sudo" {
+		return 0, 0, false
+	}
+	for i := 0; i < len(args); {
+		if args[i] == "--" {
+			start := i + 1
+			end := start
+			for end < len(args) && sudoEnvWord(name, args[end]) {
+				end++
+			}
+			return start, end, end > start && end < len(args)
+		}
+		if sudoEnvWord(name, args[i]) {
+			i++
+		} else if strings.HasPrefix(args[i], "-") {
+			next := optionNext(name, args, i)
+			if next <= i {
+				i++
+			} else {
+				i = next
+			}
+		} else {
+			return 0, 0, false
+		}
+	}
+	return 0, 0, false
+}
+
+// sudoDashDashRoute finds the command behind VAR=value words after sudo --,
+// following the same wrapper chain used by regular unwrapping.
+func sudoDashDashRoute(name string, args []string) ([]string, []string, int, bool) {
+	var via []string
+	wordStart := 1
+	for range maxNestedScripts {
+		if start, ok := sudoDashDashAssignmentStart(name, args); ok {
+			return args[start:], append(via, name), wordStart + start, true
+		}
+		start, nextName, ok := sudoRouteNext(name, args)
+		if !ok {
+			return nil, nil, 0, false
+		}
+		wordStart += start + 1
+		via = append(via, name)
+		name, args = nextName, args[start+1:]
+	}
+	return nil, nil, 0, false
+}
+
+func sudoDashDashAssignmentRoute(name string, args []string) ([]string, []string, int, bool) {
+	var via []string
+	wordStart := 1
+	for range maxNestedScripts {
+		if start, ok := sudoDashDashAssignmentWord(name, args); ok {
+			return args[start:], append(via, name), wordStart + start, true
+		}
+		start, nextName, ok := sudoRouteNext(name, args)
+		if !ok {
+			return nil, nil, 0, false
+		}
+		wordStart += start + 1
+		via = append(via, name)
+		name, args = nextName, args[start+1:]
+	}
+	return nil, nil, 0, false
+}
+
+func sudoRouteNext(name string, args []string) (int, string, bool) {
+	if wrappers[name] && wrapperOptionsKnown(name, args) {
+		wrapped, ok := unwrapOnce(name, args)
+		if ok && len(wrapped) > 0 {
+			return len(args) - len(wrapped), commandName(wrapped[0]), true
+		}
+		return 0, "", false
+	}
+	if !baselineWrapper(name) {
+		return 0, "", false
+	}
+	start, ok := mainUnwrapStart(name, args)
+	if !ok {
+		return 0, "", false
+	}
+	return start, baseName(args[start]), true
+}
+
+// mainUnwrapStart mirrors the permissive option scan used by unwrapMain and
+// returns the wrapped command's index in args.
+func mainUnwrapStart(name string, args []string) (int, bool) {
+	if !baselineWrapper(name) || name == "command" && commandIsLookup(args) {
+		return 0, false
+	}
+	i := 0
+	for i < len(args) && (strings.HasPrefix(args[i], "-") || sudoEnvWord(name, args[i])) {
+		if args[i] == "--" {
+			i++
+			break
+		}
+		if baselineOptionValue(name, args[i]) && i+1 < len(args) {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	if name == "timeout" && i < len(args) && args[i] != "--" {
+		i++
+	}
+	if name == "env" {
+		i = envCommandStart(args, i)
+	}
+	return i, i < len(args)
+}
+
 func unwrapMain(name string, args []string) ([]string, []string, bool) {
 	// На вложенных подстановках построение неиспользуемых результатов без обёртки
 	// давало 13% всех выделенных объектов в профиле Find.
@@ -4729,28 +4889,8 @@ func unwrapMain(name string, args []string) ([]string, []string, bool) {
 		}
 		via[count] = name
 		count++
-		if name == "command" && commandIsLookup(args) {
-			return nil, nil, false
-		}
-		i := 0
-		for i < len(args) && (strings.HasPrefix(args[i], "-") || sudoEnvWord(name, args[i])) {
-			if args[i] == "--" {
-				i++
-				break
-			}
-			if baselineOptionValue(name, args[i]) && i+1 < len(args) {
-				i += 2
-			} else {
-				i++
-			}
-		}
-		if name == "timeout" && i < len(args) && args[i] != "--" {
-			i++
-		}
-		if name == "env" {
-			i = envCommandStart(args, i)
-		}
-		if i >= len(args) {
+		i, ok := mainUnwrapStart(name, args)
+		if !ok {
 			return nil, nil, false
 		}
 		name, args = baseName(args[i]), args[i+1:]
