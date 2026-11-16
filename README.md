@@ -59,9 +59,21 @@ script with a `NestedError` that identifies the script and unwraps its parse err
 `Assigns` returns the assignments of a command (`S=x;`, `export`, `declare`, `typeset`, `readonly`,
 `local` in a function) in text order with their byte offsets, a mark for `+=` and the innermost
 subshell, substitution, pipeline part, background job or function body that holds each one;
-`Assign.VisibleAt` tells whether a value may be set at a given offset, so a caller resolves `$S`
-before a call. Prefix assignments (`S=x cmd`) are left out. The check is static: branches and
-loop bodies count as run, a function call is not followed.
+array and element assignments, `for` variables, and literal calls to functions that may change
+variables are returned with `Unknown` set, an empty value and `Append` false. Ordinary assignments
+in function bodies are also returned in the function body's scope. `Assign.VisibleAt` tells whether
+an assignment may affect a value at a given offset, so a caller resolves `$S` in text order and
+treats it as unknown until a later visible ordinary assignment. Prefix assignments (`S=x cmd`)
+are left out. Function names are recognized after removing shell quotes and escapes. For `eval`,
+literal arguments are scanned for function names bounded by whitespace, `;`, `&`, `|`, parentheses
+or quotes; the `eval` string is not fully parsed. An argument substitution to `eval` is treated as
+possibly calling any function that may change variables. A dynamic command word is treated the same
+way. `builtin eval f` and `command eval f` are recognized; `command f` and `builtin f` do not call
+`f`. Possible assignments in branches and loops are included. A `local` declaration shadows later
+writes only when its command necessarily runs in the function shell; an `if` or `while` condition
+runs, while branch and loop bodies may not. Writes through `read`, `printf -v`, `mapfile`,
+`${S:=…}`, arithmetic assignment, `let`, `source` or `.`, aliases, namerefs, eval assignment
+strings, and `unset` are not tracked.
 
 ## busy
 

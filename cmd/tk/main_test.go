@@ -1714,11 +1714,14 @@ func TestWaitDatesBareClockAndWarnsOnCondition(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
+	before := time.Now()
 	if code := transition(task{path: path, slug: "clock", body: body}, options{cmd: "wait", by: "worker", until: "23:59 итог"}, &out, &errOut); code != 0 {
 		t.Fatalf("wait %d: %s", code, errOut.String())
 	}
 	data, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(data), "Ждёт: 2026-11-16 23:59 итог") {
+	// The bare clock takes today's date; a run that crosses midnight may see the next day.
+	today, next := "Ждёт: "+before.Format("2006-01-02")+" 23:59 итог", "Ждёт: "+before.AddDate(0, 0, 1).Format("2006-01-02")+" 23:59 итог"
+	if err != nil || !strings.Contains(string(data), today) && !strings.Contains(string(data), next) {
 		t.Fatalf("время без даты изменило текст: %s, %v", data, err)
 	}
 	if errOut.Len() != 0 {
