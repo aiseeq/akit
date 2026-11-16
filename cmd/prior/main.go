@@ -30,7 +30,7 @@ usage: prior <слово> [слово…] - слова темы, любое из
        аргумент в кавычках ищется одной фразой целиком: слова темы - отдельными аргументами
 
 Порядок вывода - по весу источника: журнал решений, сказанное пользователем (правила, решения и обещания дословно),
-снятые правила (архив разбора: место, причина, текст), механизмы (карточки наших инструментов), опубликованные артефакты claude.ai (по названию), память пространств,
+снятые правила (архив разбора: место, причина, текст), механизмы (карточки наших инструментов), опубликованные артефакты claude.ai (по названию), память пространств (архив),
 пробы и очереди ночного разбора, его отчёты, реплики (свежие внизу). Сначала разделы с находками, затем разделы
 с одними пометками (источник не прочитан), пустые - одной строкой «== пусто: …» в конце.
 
@@ -229,7 +229,7 @@ func run(q query, home string, w io.Writer) {
 	removed(r.section(fmt.Sprintf("снятые правила (архив разбора, ~/.claude/improve/state/removed-rules.md): место, причина, текст, до %d", maxRemoved)), q, s.removed)
 	mechanisms(r.section("механизмы: что у нас уже есть (~/.claude/improve/mechanisms), до 40 строк"), q, s)
 	artifacts(r.section(fmt.Sprintf("артефакты claude.ai по названию (~/.claude/improve/state/artifacts.tsv), до %d", maxArtifacts)), q, s.artifacts)
-	memories(r.section(fmt.Sprintf("память пространств (~/.claude/projects/*/memory), до %d файлов", maxMemories)), q, s.projects)
+	memories(r.section(fmt.Sprintf("память пространств (~/.claude/projects/*/memory) - архив, не действует без записи в инструкциях, до %d файлов", maxMemories)), q, s.projects)
 	b = r.section("пробы и очереди ночного разбора (~/.claude/improve/state)")
 	found := false
 	for _, f := range stateFiles {

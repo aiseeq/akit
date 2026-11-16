@@ -44,9 +44,9 @@ func TestMemories(t *testing.T) {
 	write(t, filepath.Join(p, "-home-user-work/memory/MEMORY.md"), "- [Demo](demo.md) — инструкция оператора\n")
 	got := sectionOf(runPrior(t, home, "инструкция", "Demo", "оператор"), "память")
 	want := []string{
-		"-home-user-work/memory/demo-operator-guide-artifact.md: Инструкция подключения оператора Demo - Artifact",
+		"архив: -home-user-work/memory/demo-operator-guide-artifact.md: Инструкция подключения оператора Demo - Artifact",
 		"  Пошаговая инструкция для нового оператора Demo.",
-		"-home-user-git-x/memory/demo-stand.md: стенд",
+		"архив: -home-user-git-x/memory/demo-stand.md: стенд",
 		"  Demo стенд",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {

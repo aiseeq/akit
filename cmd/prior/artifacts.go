@@ -81,8 +81,8 @@ type memory struct {
 }
 
 // memories — память пространств (~/.claude/projects/*/memory, кроме оглавлений MEMORY.md). Слова ищутся в имени файла,
-// описании и тексте, без служебных полей шапки. Порядок: больше разных слов, потом больше строк. На файл — путь,
-// описание и строка текста с наибольшим числом слов.
+// описании и тексте, без служебных полей шапки. Порядок: больше разных слов, потом больше строк. На файл — пометка
+// «архив» (память не действует без записи в инструкциях), путь, описание и строка текста с наибольшим числом слов.
 func memories(w io.Writer, q query, projects string) {
 	files, err := filepath.Glob(filepath.Join(projects, "*", "memory", "*.md"))
 	if err != nil || len(files) == 0 {
@@ -110,7 +110,7 @@ func memories(w io.Writer, q query, projects string) {
 	}
 	slices.SortStableFunc(hits, func(a, b memory) int { return cmp.Or(b.words-a.words, b.hits-a.hits) })
 	for _, m := range hits[:min(len(hits), maxMemories)] {
-		fmt.Fprintln(w, cut(m.file+": "+m.description))
+		fmt.Fprintln(w, cut("архив: "+m.file+": "+m.description))
 		if m.hit != "" {
 			fmt.Fprintln(w, cut("  "+m.hit))
 		}
