@@ -400,7 +400,7 @@ func markedGuessedTime(o options, value string) string {
 
 func futureApproxTime(value string, now time.Time) string {
 	found := approxTime.FindAllStringSubmatchIndex(value, -1)
-	if ix := leadingTime.FindStringSubmatchIndex(value); ix != nil && !timeRange.MatchString(value[ix[1]:]) {
+	if ix := timearg.LeadingClockMatch(value); ix != nil && !timeRange.MatchString(strings.TrimLeft(timearg.NormalizeSpaces(value[ix[1]:]), " ")) {
 		found = append(found, ix)
 	}
 	for _, ix := range found {
@@ -445,11 +445,10 @@ func futureTime(flag, value string, ix []int, now time.Time) error {
 // approxTime — «~ЧЧ:ММ», приблизительное время в тексте, с датой перед ним, если она есть («31.10 ~03:00»).
 var approxTime = regexp.MustCompile(`(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)\s+)?~\s?([01]\d|2[0-3]):([0-5]\d)`)
 
-// leadingTime — время в начале текста, с датой перед ним, если она есть («02.11 03:12: …»).
-var leadingTime = regexp.MustCompile(`^[\s\p{Zs}]*(?:(\d\d\.\d\d|\d{4}-\d\d-\d\d)[\s\p{Zs}]+)?([01]\d|2[0-3]):([0-5]\d)`)
-
 // timeRange — продолжение промежутка после времени: «-18:00», « – 18:00».
-var timeRange = regexp.MustCompile(`^[\s\p{Zs}]*[-–—][\s\p{Zs}]*([01]?\d|2[0-3]):[0-5]\d(?:$|\D)`)
+var timeRange = regexp.MustCompile(`^[-–—]\s*([01]?\d|2[0-3]):[0-5]\d(?:$|\D)`)
+var waitClockRange = regexp.MustCompile(`^-([0-9]{1,2}):([0-9]{2})`)
+var ambiguousRangeHour = regexp.MustCompile(`^-[0-9]{1,2}(?:$|[^0-9:]|:(?:$|[^0-9]))`)
 
 func parseMultiValueOption(args []string, i *int, v string, o *options) error {
 	if *i+1 == len(args) || strings.HasPrefix(args[*i+1], "--") || strings.TrimSpace(args[*i+1]) == "" {
@@ -996,12 +995,28 @@ const guideText = `Зависимости
 Ожидание
   tk wait ID --until "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём" переводит задачу в «ждёт».
   Другие формы даты: ДД.ММ[ ЧЧ:ММ[:СС]] и ГГГГ-ММ-ДД[ ЧЧ:ММ[:СС]];
-  прошедший день в ДД.ММ переносится на следующий год. Также принимаются ISO
-  с T и RFC3339. Без зоны время местное; после часов понимаются только UTC и Z.
-  Другая зона через пробел молча отбрасывается, время местное; зона, приклеенная
-  к часам (07:30+03:00), отбрасывает и часы — срок станет полуночью. Смещение
-  принимается только в RFC3339 с секундами, например
-  2026-11-17T06:40:00+03:00.
+  прошедший день в ДД.ММ переносится на следующий год. ISO с T принимается
+  со смещением или без него; T можно писать и после ДД.ММ. RFC3339 принимается
+  с целыми секундами; дробные секунды дают ошибку. Без зоны время местное;
+  Z, UTC и GMT задают UTC, CET —
+  +01:00, CEST — +02:00. Числовые смещения до ±14:00 слитно допускают +Ч,
+  +ЧЧ, +ЧЧММ, +Ч:ММ и +ЧЧ:ММ; через пробел — +ЧЧ, +ЧЧММ, +Ч:ММ и +ЧЧ:ММ.
+  Например, 07:30+3 означает +03:00. UTC/GMT со смещением пишутся слитно;
+  пробел перед смещением после UTC/GMT даёт ошибку. Неизвестный слитный
+  суффикс и неподдерживаемая прописная аббревиатура зоны дают ошибку.
+  После пробела +Ч без минут — текст; строчные и смешанные слова и обычные
+  слова со слэшем тоже остаются текстом. Зоны можно обрамлять (), [], кавычками
+  или «ёлочками».
+  Слитный диапазон ЧЧ:ММ-ЧЧ:ММ, например 10:00-11:00, читается по правилам
+  его начала; всё до и после него обрабатывается как у одиночного времени.
+  Зона или смещение у конца диапазона относится ко всему диапазону.
+  Слитное тире после времени (10:00–11:00, 10:00—11:00) даёт ошибку;
+  тире через пробелы (10:00 - 11:00) остаётся текстом после времени.
+  Слитное -12 без минут неоднозначно: укажите смещение -05:00 или
+  диапазон 10:00-12:00.
+  «МСК» и «мск» в любом регистре дают ошибку. Ошибку также дают имена зон из
+  областей Africa, America, Antarctica, Arctic, Asia, Atlantic, Australia,
+  Europe, Indian, Pacific, Etc, US, Canada, Mexico, Brazil и Chile.
   Нераспознанное время, невозможная дата и относительное «2h» сохраняются как
   условие без срока: tk ls --due их не покажет. Когда срок наступил, tk next
   выдаёт задачу, а tk ls --due показывает её; прошедший срок уже наступил.
@@ -2475,7 +2490,7 @@ func matchesListFilters(t task, o options) bool {
 		if t.status != "ждёт" {
 			return false
 		}
-		at, ok := timearg.Deadline(factsForTask(t).Waits, time.Now())
+		at, ok := waitTimeDeadline(factsForTask(t).Waits, time.Now())
 		if !ok || at.After(time.Now()) {
 			return false
 		}
@@ -2500,7 +2515,7 @@ func printTask(out io.Writer, t task, label string, errout io.Writer) {
 	wait := factsForTask(t).Waits
 	if wait != "" {
 		shown := wait
-		if at, ok := timearg.Deadline(wait, time.Now()); ok {
+		if at, ok := waitTimeDeadline(wait, time.Now()); ok {
 			shown = "до " + at.Local().Format("2006-01-02 15:04")
 			if !at.After(time.Now()) {
 				shown += " overdue"
@@ -2519,21 +2534,21 @@ func waiting(s string) string {
 	return lineValue(s, "Ждёт: ")
 }
 
-// waitClock — ведущее время без даты: «12:00» в строке ожидания значит день, когда её записали.
-var waitClock = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$`)
-
 // datedBadClock — в начале дата (ДД.ММ или ГГГГ-ММ-ДД) и слово-часы: срок не разобран, потому что такой даты
 // или таких часов нет.
 var datedBadClock = regexp.MustCompile(`^\s*(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[,:;]\s*|\s+)[0-9]{1,2}:[0-9]{1,2}`)
 
 // datedWait записывает год у ожидания ДД.ММ, чтобы срок не сдвигался после Нового года.
 func datedWait(wait string, now time.Time) string {
-	f := strings.Fields(wait)
-	if len(f) > 0 && waitClock.MatchString(f[0]) {
-		return now.Format("2006-01-02 ") + strings.TrimSpace(wait)
-	}
-	parsed, ok := timearg.ParseDayMonth(wait)
+	wait = strings.TrimSpace(wait)
+	deadlineText, _, _ := waitDeadlineText(wait)
+	parsed, ok := timearg.ParseDayMonth(deadlineText)
 	if !ok {
+		if !timearg.HasLeadingDate(wait) {
+			if _, _, hasClock := timearg.LeadingClockSpan(wait); hasClock {
+				return now.Format("2006-01-02 ") + wait
+			}
+		}
 		return wait
 	}
 	dayMonth, valid := parsed.At(2000, now.Location())
@@ -2546,14 +2561,66 @@ func datedWait(wait string, now time.Time) string {
 	}
 	for ; year <= now.Year()+8; year++ {
 		if candidate, ok := parsed.At(year, now.Location()); ok {
-			value := candidate.Format("2006-01-02")
-			if parsed.Clock != "" {
-				value += " " + parsed.Clock
-			}
-			return value + parsed.Rest
+			date := candidate.Format("2006-01-02")
+			return date + wait[len(parsed.Date):]
 		}
 	}
 	return wait
+}
+
+// waitDeadlineText reduces a clock range to its start and leaves its suffix for the ordinary deadline parser.
+func waitDeadlineText(value string) (string, bool, bool) {
+	value = timearg.NormalizeSpaces(value)
+	clockStart, clockEnd, ok := timearg.LeadingClockSpan(value)
+	if !ok {
+		return value, false, false
+	}
+	if strings.Count(value[clockStart:clockEnd], ":") > 1 {
+		return value, false, false
+	}
+	if clockStart > 0 && (value[clockStart-1] == 'T' || value[clockStart-1] == 't') {
+		return value, false, false
+	}
+	rest := value[clockEnd:]
+	if match := waitClockRange.FindStringSubmatchIndex(rest); match != nil {
+		hour, minute := rest[match[2]:match[3]], rest[match[4]:match[5]]
+		if len(hour) == 2 && hour > "23" || minute > "59" {
+			return value, false, true
+		}
+		tail := rest[match[1]:]
+		if strings.HasPrefix(tail, ":") && len(tail) > 1 && tail[1] >= '0' && tail[1] <= '9' {
+			tail = " " + tail
+		}
+		return value[:clockEnd] + tail, true, false
+	}
+	if ambiguousRangeHour.MatchString(rest) {
+		return value, false, true
+	}
+	return value, false, false
+}
+
+func invalidWaitRangeEnd(value string) bool {
+	clockStart, clockEnd, ok := timearg.LeadingClockSpan(value)
+	if !ok {
+		return false
+	}
+	if strings.Count(value[clockStart:clockEnd], ":") > 1 {
+		return false
+	}
+	if clockStart > 0 && (value[clockStart-1] == 'T' || value[clockStart-1] == 't') {
+		return false
+	}
+	match := waitClockRange.FindStringSubmatchIndex(value[clockEnd:])
+	if match == nil {
+		return false
+	}
+	hour, minute := value[clockEnd+match[2]:clockEnd+match[3]], value[clockEnd+match[4]:clockEnd+match[5]]
+	return len(hour) == 2 && hour > "23" || minute > "59"
+}
+
+func waitTimeDeadline(value string, now time.Time) (time.Time, bool) {
+	deadlineText, _, _ := waitDeadlineText(value)
+	return timearg.Deadline(deadlineText, now)
 }
 
 func setWaiting(s, value string) string {
@@ -3835,18 +3902,35 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 		body = removeExecutor(body)
 	}
 	if o.cmd == "wait" {
+		if invalidWaitRangeEnd(o.until) {
+			return "", errors.New("--until has an invalid range end; use an end time from 00:00 to 23:59")
+		}
+		deadlineText, _, ambiguousRange := waitDeadlineText(o.until)
+		if ambiguousRange {
+			return "", errors.New("--until is ambiguous: смещение пиши -05:00, диапазон — 10:00-12:00")
+		}
+		if zoneError := timearg.ZoneError(deadlineText); zoneError != "" {
+			if zoneError == "fractional-seconds" {
+				return "", errors.New("--until does not support fractional seconds")
+			}
+			if zoneError == "utc-space" {
+				return "", errors.New("--until has a UTC/GMT offset separated by a space; write UTC+3 without a space")
+			}
+			return "", errors.New("--until has an unsupported or invalid time zone; supported zones are Z, UTC, GMT, CET, CEST, and numeric offsets such as +03:00")
+		}
 		now := o.timeNow
 		if now.IsZero() {
 			now = time.Now()
 		}
 		o.until = datedWait(o.until, now)
-		deadline, hasDeadline := timearg.Deadline(o.until, now)
+		deadlineText = datedWait(deadlineText, now)
+		deadline, hasDeadline := timearg.Deadline(deadlineText, now)
 		if o.hintFacts != nil {
 			o.hintFacts.deadline, o.hintFacts.hasDeadline = deadline, hasDeadline
 		}
 		_, hasGuessed := timearg.GuessedClock(o.until)
 		if !hasDeadline && !hasGuessed {
-			if datedBadClock.MatchString(o.until) {
+			if datedBadClock.MatchString(timearg.NormalizeSpaces(o.until)) {
 				fmt.Fprintln(errout, "tk: --until starts with a date and time that do not exist: no deadline, tk ls --due will not show it")
 			} else {
 				fmt.Fprintln(errout, "tk: --until has no time at the start: a condition, tk ls --due will not show it")
@@ -4238,7 +4322,7 @@ func taskObject(root string, t task, repo string, details bool) taskJSON {
 	waits := facts.Waits
 	overdue, due := false, ""
 	if t.status == "ждёт" {
-		if at, ok := timearg.Deadline(waits, time.Now()); ok {
+		if at, ok := waitTimeDeadline(waits, time.Now()); ok {
 			due = at.Format(time.RFC3339)
 			overdue = !at.After(time.Now())
 		}
@@ -4645,7 +4729,7 @@ func eligibleForNext(t task, actor string) bool {
 	facts := factsForTask(t)
 	waitDueNow := false
 	if t.status == "ждёт" {
-		at, ok := timearg.Deadline(facts.Waits, time.Now())
+		at, ok := waitTimeDeadline(facts.Waits, time.Now())
 		waitDueNow = ok && !at.After(time.Now())
 	}
 	if isJournal(t) && !waitDueNow {

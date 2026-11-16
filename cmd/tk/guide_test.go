@@ -21,7 +21,14 @@ func TestGuidePrintsBothSections(t *testing.T) {
 		"Зависимости", "tk new A --blocks B", "tk set A --unblocks B",
 		"уровня B", "внутри группы приоритета", "Блокирует", "Заблокирован",
 		"Ожидание", "tk wait ID --until", "прошедший день в ДД.ММ",
-		"RFC3339 с секундами", "2026-11-17T06:40:00+03:00", "«2h»",
+		"ISO с T принимается", "со смещением или без него", "T можно писать и после ДД.ММ", "RFC3339 принимается",
+		"с целыми секундами; дробные секунды дают ошибку",
+		"07:30+3 означает +03:00", "CET —", "UTC/GMT со смещением",
+		"строчные и смешанные слова", "«ёлочками»", "«2h»",
+		"Слитный диапазон ЧЧ:ММ-ЧЧ:ММ", "тире через пробелы (10:00 - 11:00)",
+		"Слитное тире после времени", "10:00–11:00, 10:00—11:00", "тире через пробелы (10:00 - 11:00)",
+		"Слитное -12 без минут неоднозначно", "областей Africa",
+		"Etc, US, Canada, Mexico, Brazil и Chile", "«МСК» и «мск» в любом регистре",
 		"tk ls --due", "tk start ID",
 	} {
 		if !strings.Contains(out.String(), text) {
@@ -259,17 +266,19 @@ func TestGuideWaitDateAndZoneExamples(t *testing.T) {
 		t.Fatal(err)
 	}
 	spaceDeadline, ok := timearg.Deadline(waiting(spaceOffsetTask.body), now)
-	wantLocal := time.Date(2026, 11, 17, 6, 40, 0, 0, now.Location())
-	if !ok || !spaceDeadline.Equal(wantLocal) {
-		t.Fatalf("space-separated offset was applied as a zone: deadline=%v ok=%v want local %v", spaceDeadline, ok, wantLocal)
+	wantSpaceOffset := time.Date(2026, 11, 17, 6, 40, 0, 0, time.FixedZone("+03:00", 3*3600))
+	if !ok || !spaceDeadline.Equal(wantSpaceOffset) {
+		t.Fatalf("space-separated offset deadline=%v ok=%v want %v", spaceDeadline, ok, wantSpaceOffset)
 	}
 	call([]string{"wait", "short", "--until", "2026-11-17T06:40+03:00 проверка", "--by", "tester"}, now)
 	shortTask, err := find(dir, "short")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := timearg.Deadline(waiting(shortTask.body), now); ok {
-		t.Fatalf("RFC3339 offset without seconds unexpectedly had a deadline: %q", waiting(shortTask.body))
+	shortDeadline, ok := timearg.Deadline(waiting(shortTask.body), now)
+	wantShort := time.Date(2026, 11, 17, 6, 40, 0, 0, time.FixedZone("+03:00", 3*3600))
+	if !ok || !shortDeadline.Equal(wantShort) {
+		t.Fatalf("RFC3339 offset without seconds deadline=%v ok=%v want %v", shortDeadline, ok, wantShort)
 	}
 	call([]string{"wait", "impossible", "--until", "2026-02-30 10:00 проверка", "--by", "tester"}, now)
 	impossibleTask, err := find(dir, "impossible")

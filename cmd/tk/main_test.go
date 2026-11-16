@@ -1662,7 +1662,7 @@ func TestWaitDueForms(t *testing.T) {
 		{"2026-10-31 12:00", at(10, 31, 12), true},
 		{"2026-10-31T12:00", at(10, 31, 12), true},
 		{"2026-10-31 12:00 итог замера", at(10, 31, 12), true},
-		{"2026-11-02 09:00 CET (выходные)", at(11, 2, 9), true},
+		{"2026-11-02 09:00 CET (выходные)", time.Date(2026, 11, 2, 9, 0, 0, 0, time.FixedZone("CET", 3600)), true},
 		{"2026-11-01 09:00 - ночь 01.11: шаг прошёл", at(11, 1, 9), true},
 		{"31.10 12:00 после замера", at(10, 31, 12), true},
 		{"2026-11-01 (днём)", at(11, 1, 0), true},
@@ -1718,8 +1718,8 @@ func TestWaitDatesBareClockAndWarnsOnCondition(t *testing.T) {
 		t.Fatalf("wait %d: %s", code, errOut.String())
 	}
 	data, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(data), "Ждёт: "+time.Now().Format("2006-01-02")+" 23:59 итог") {
-		t.Fatalf("часы без даты не получили дату: %s, %v", data, err)
+	if err != nil || !strings.Contains(string(data), "Ждёт: 2026-11-16 23:59 итог") {
+		t.Fatalf("время без даты изменило текст: %s, %v", data, err)
 	}
 	if errOut.Len() != 0 {
 		t.Errorf("лишнее предупреждение: %q", errOut.String())
@@ -2330,12 +2330,23 @@ func TestJournalTextMarksApproxFutureTime(t *testing.T) {
 		{"03:00 - 04:00 окно", false},
 		{"сдано ~03:00-04:00", true},
 		{" 03:00 проверка", true},
+		{now.Format("02.01") + " " + now.Add(5*time.Minute).Format("15:04") + " сдано", true},
+		{now.Format("02.01") + "\t" + now.Add(5*time.Minute).Format("15:04") + " сдано", true},
+		{" " + now.Format("02.01") + " " + now.Add(5*time.Minute).Format("15:04") + " сдано", true},
+		{now.Format("2006-01-02") + " " + now.Add(5*time.Minute).Format("15:04") + " сдано", true},
+		{" " + now.Format("2006-01-02") + " 03:00 проверка", true},
+		{now.Format("02.01") + ", " + now.Add(5*time.Minute).Format("15:04") + " сдано", true},
+		{now.Format("2006-01-02") + ", " + now.Add(5*time.Minute).Format("15:04") + " сдано", true},
 		{"2026-11-02 03:00 проверка", true},
 		{"03:00 — сдано", true},
 		{"03:00 — 2 проверки", true},
 		{"03:00 - 99:99 проверка", true},
 		{"03:00 - 04:001 проверка", true},
 		{"03:00-4:30 окно", false},
+		{now.Format("02.01") + " " + now.Add(5*time.Minute).Format("15:04") + " - " + now.Add(10*time.Minute).Format("15:04") + " сдано", false},
+		{now.Add(5*time.Minute).Format("15:04") + "　—　" + now.Add(10*time.Minute).Format("15:04") + " сдано", false},
+		{now.Add(5*time.Minute).Format("15:04") + "\t-\t" + now.Add(10*time.Minute).Format("15:04") + " сдано", false},
+		{now.Format("02.01") + " " + now.Add(5*time.Minute).Format("15:04") + "\t-\t" + now.Add(10*time.Minute).Format("15:04") + " сдано", false},
 		{"ждёт до 03:00", false},
 		{"03:001", false},
 	} {
