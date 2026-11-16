@@ -2,12 +2,17 @@ package main
 
 import (
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/aiseeq/akit/clihelp"
 )
 
 func TestMachineHelp(t *testing.T) {
+	if !strings.Contains(usage, "Exit: 0") || !strings.Contains(usage, strconv.Itoa(exitUsage)+" ошибка") {
+		t.Fatalf("usage is missing the exit codes: %q", usage)
+	}
 	clihelp.CheckSource(t, ".", machineHelp, []string{"parseArgs"}, map[string]string{"-": "prefix used to reject unrecognized leading-dash words"})
 	if !machineHelp.Commands[0].NoDashdash {
 		t.Fatal("help does not describe -- as an ordinary search word")

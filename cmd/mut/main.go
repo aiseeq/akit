@@ -30,6 +30,7 @@ Usage:
   mut [-F SPEC] -- <go test arguments>
 
 Each SEARCH/REPLACE block is an independent mutant based on the original file.
+The baseline run and each mutant test run go under graft exec --heavy, so mut itself needs no outer graft exec.
 Output: killed (the mutant fails a test), survived (tests pass; skipped ones are
 named, and a survivor whose only passes were parents of skipped subtests says so),
 or error (also when every test that ran was skipped, with the reason).

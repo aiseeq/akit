@@ -224,6 +224,38 @@ func TestSyntheticClaudeAndCodexTranscripts(t *testing.T) {
 	}
 }
 
+func TestSyntheticMutAndPstopCounts(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	since := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	session := filepath.Join(home, ".claude", "projects", "demo", "session.jsonl")
+	writeTranscript(t, session, `{"parentUuid":null,"type":"user","timestamp":"2026-10-31T12:00:00Z","message":{"role":"user","content":"run utilities"}}`+"\n"+
+		`{"parentUuid":"a","type":"assistant","timestamp":"2026-10-31T12:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"m1","name":"Bash","input":{"command":"mut OLD NEW file.go -- -run TestSynthetic"}}]}}`+"\n"+
+		`{"parentUuid":"b","type":"user","timestamp":"2026-10-31T12:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"m1","content":"mut: killed"}]}}`+"\n"+
+		`{"parentUuid":"c","type":"assistant","timestamp":"2026-10-31T12:00:03Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"p1","name":"Bash","input":{"command":"pstop"}}]}}`+"\n"+
+		`{"parentUuid":"d","type":"user","timestamp":"2026-10-31T12:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"p1","content":"pstop: stopped 0"}]}}`)
+	if err := os.Chtimes(session, until, until); err != nil {
+		t.Fatal(err)
+	}
+	u := newRun(since, until, 20261025, filepath.Join(root, "out"), home)
+	if err := u.runUptake(since, until); err != nil {
+		t.Fatal(err)
+	}
+	report, err := os.ReadFile(filepath.Join(u.outputDir, "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range []string{"mut", "pstop"} {
+		if !strings.Contains(string(report), "| "+tool+" |") {
+			t.Errorf("report does not include utility row %s:\n%s", tool, report)
+		}
+		if got := u.countToolCalls(tool); got != 1 {
+			t.Errorf("%s call count = %d, want 1", tool, got)
+		}
+	}
+}
+
 func writeTranscript(t *testing.T, path, data string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

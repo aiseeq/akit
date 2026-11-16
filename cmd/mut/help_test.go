@@ -2,12 +2,17 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aiseeq/akit/clihelp"
 )
 
 func TestMachineHelp(t *testing.T) {
+	description := strings.Split(usage, "Exit:")[0]
+	if !strings.Contains(description, "graft exec --heavy") {
+		t.Fatal("general help description does not mention graft exec --heavy")
+	}
 	clihelp.CheckSource(t, ".", machineHelp, []string{"main", "parseArgs"}, map[string]string{"--": "ends option parsing and begins go test args", "-": "prefix used to reject unknown flags", "-count": "internal go test argument normalization", "-json": "internal go test JSON output mode", "--heavy": "internal graft command argument", "--- SKIP": "go test output marker, not a mut flag"})
 	if machineHelp.Commands[0].Rest != "args" || machineHelp.Commands[0].DashArgs {
 		t.Fatal("help does not describe positional and test arguments")
