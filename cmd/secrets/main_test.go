@@ -179,7 +179,7 @@ func TestAddPEMCertificateKeyPairAndMismatchAreAtomic(t *testing.T) {
 		t.Fatalf("pair add: code=%d out=%q err=%q", code, out, err)
 	}
 	b := readTestFile(t, filepath.Join(root, "LEDGER.md"))
-	if !strings.Contains(string(b), "serial 23C6") || !strings.Contains(string(b), time.Now().Add(400*24*time.Hour).Format(time.DateOnly)) || !strings.Contains(string(b), "sha256 публичного ключа") {
+	if !strings.Contains(string(b), "serial 23C6") || !strings.Contains(string(b), time.Now().Add(400*24*time.Hour).UTC().Format(time.DateOnly)) || !strings.Contains(string(b), "sha256 публичного ключа") {
 		t.Fatalf("missing certificate/key checks: %s", b)
 	}
 	before := string(b)
