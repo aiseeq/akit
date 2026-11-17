@@ -32,6 +32,45 @@ type Assign struct {
 	ScopeStart, ScopeEnd int
 }
 
+// ScopeKind identifies a shell command region whose assignments do not reach
+// the shell running the command. Trap, mapfile -C, aliases and lastpipe behavior
+// are not modeled here; consumers can combine Scopes with their own shell rules.
+type ScopeKind int
+
+const (
+	// ScopeFunctionBody is a declared function's body.
+	ScopeFunctionBody ScopeKind = iota
+	// ScopeSubshell is a parenthesized command.
+	ScopeSubshell
+	// ScopeCmdSubst is a command substitution.
+	ScopeCmdSubst
+	// ScopeProcSubst is a process substitution.
+	ScopeProcSubst
+	// ScopeCoproc is a coprocess command.
+	ScopeCoproc
+	// ScopePipePart is one pipeline command.
+	ScopePipePart
+	// ScopeBackground is a background command.
+	ScopeBackground
+)
+
+func (k ScopeKind) String() string {
+	return [...]string{"FunctionBody", "Subshell", "CmdSubst", "ProcSubst", "Coproc", "PipePart", "Background"}[k]
+}
+
+// Scope bounds a command region in which assignments do not reach the shell
+// running the command. Function bodies include their name and declaration offset;
+// other kinds have an empty Name and DeclOffset of -1. Trap, mapfile -C, aliases
+// and lastpipe behavior are left to consumers to infer from these regions.
+type Scope struct {
+	Start, End int
+	Kind       ScopeKind
+	Name       string
+	DeclOffset int
+	Isolated   bool
+	Last       bool
+}
+
 // VisibleAt reports whether the assignment may be set for a word at byte offset off: it comes
 // before off and is made by the shell running the command, or off is inside its scope.
 // The check is static: a branch or a loop body that does not run, or a function that is
@@ -56,13 +95,19 @@ func (a Assign) VisibleAt(off int) bool {
 // word (`command export S=x`) are not read. `command f` and `builtin f` are treated as calls to
 // those command names, not as calls to f. Writes through `read`, `printf -v`, `mapfile`, `${S:=…}`,
 // `(( S=1 ))`, `let`, `source` or `.`, aliases, namerefs, eval assignment strings, and `unset` are
-// not tracked.
+// not tracked. Trap, mapfile -C, aliases and lastpipe are left to consumers of
+// Scopes, which reports the command regions and their kinds.
 func Assigns(cmd string) ([]Assign, error) {
 	file, full, err := parseShellVariant(cmd, false)
 	if err != nil {
 		return nil, err
 	}
-	scopes, functions := assignScopes(file)
+	regions := commandScopes(file)
+	scopes := make([]span, len(regions.scopes))
+	for i, scope := range regions.scopes {
+		scopes[i] = span{scope.Start, scope.End}
+	}
+	functions := regions.functions
 	functionChanges := assignFunctionChanges(file, scopes)
 	var out []Assign
 	add := func(assigns []*syntax.Assign) {
@@ -112,6 +157,17 @@ func Assigns(cmd string) ([]Assign, error) {
 	})
 	slices.SortStableFunc(out, func(a, b Assign) int { return a.Offset - b.Offset })
 	return out, nil
+}
+
+// Scopes returns regions whose assignments do not reach the shell running cmd.
+// Trap, mapfile -C, aliases and lastpipe are left to consumers to infer from the
+// returned kinds and bounds.
+func Scopes(cmd string) ([]Scope, error) {
+	file, _, err := parseShellVariant(cmd, false)
+	if err != nil {
+		return nil, err
+	}
+	return commandScopes(file).scopes, nil
 }
 
 // assignFunction contains statically inferred shell-visible writes and known function calls.
@@ -174,7 +230,7 @@ func assignFunctionDecls(file *syntax.File) map[string]*assignFunction {
 				function = &assignFunction{vars: make(map[string]bool)}
 				funcs[name.Value] = function
 			}
-			function.definitions = append(function.definitions, assignDefinition{body: f.Body, span: span{int(f.Body.Pos().Offset()), int(f.Body.End().Offset())}, isolated: isolated})
+			function.definitions = append(function.definitions, assignDefinition{body: f.Body, span: functionBodySpan(f.Body), isolated: isolated})
 		}
 		return true
 	})
@@ -444,31 +500,140 @@ func declHasGlobal(decl *syntax.DeclClause) bool {
 
 type span struct{ start, end int }
 
-// assignScopes collects the spans whose assignments do not reach the shell running the command,
-// and the function bodies among them.
-func assignScopes(file *syntax.File) (scopes, functions []span) {
-	of := func(n syntax.Node) span { return span{int(n.Pos().Offset()), int(n.End().Offset())} }
+type scopeSet struct {
+	scopes    []Scope
+	functions []span
+}
+
+// commandScopes collects all assignment scopes once for both Scopes and Assigns.
+func commandScopes(file *syntax.File) scopeSet {
+	var out scopeSet
+	functionSubshells := isolatedFunctionSubshells(file)
+	pipeChildren := nestedPipelineNodes(file)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		binary, ok := node.(*syntax.BinaryCmd)
+		if ok && isPipeline(binary) && !pipeChildren[binary] {
+			out.scopes = append(out.scopes, pipelineScopes(binary)...)
+		}
+		return true
+	})
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch n := node.(type) {
-		case *syntax.Subshell, *syntax.CmdSubst, *syntax.ProcSubst, *syntax.CoprocClause:
-			scopes = append(scopes, of(n))
-		case *syntax.FuncDecl:
-			if n.Body != nil {
-				scopes = append(scopes, of(n.Body))
-				functions = append(functions, of(n.Body))
+		case *syntax.Subshell:
+			if !functionSubshells[n] {
+				out.scopes = append(out.scopes, nodeScope(n, ScopeSubshell))
 			}
-		case *syntax.BinaryCmd:
-			if n.Op == syntax.Pipe || n.Op == syntax.PipeAll {
-				scopes = append(scopes, of(n.X), of(n.Y))
+		case *syntax.CmdSubst:
+			out.scopes = append(out.scopes, nodeScope(n, ScopeCmdSubst))
+		case *syntax.ProcSubst:
+			out.scopes = append(out.scopes, nodeScope(n, ScopeProcSubst))
+		case *syntax.CoprocClause:
+			out.scopes = append(out.scopes, nodeScope(n, ScopeCoproc))
+		case *syntax.FuncDecl:
+			body, scopes := functionScopes(n)
+			if body != nil {
+				out.functions = append(out.functions, *scopes)
+				out.scopes = append(out.scopes, body...)
 			}
 		case *syntax.Stmt:
-			if n.Background || n.Coprocess || n.Disown {
-				scopes = append(scopes, of(n))
+			if n.Background {
+				out.scopes = append(out.scopes, nodeScope(n, ScopeBackground))
 			}
 		}
 		return true
 	})
-	return scopes, functions
+	sortScopes(out.scopes)
+	return out
+}
+
+func nodeScope(node syntax.Node, kind ScopeKind) Scope {
+	return Scope{Start: int(node.Pos().Offset()), End: int(node.End().Offset()), Kind: kind, DeclOffset: -1}
+}
+
+func isPipeline(binary *syntax.BinaryCmd) bool {
+	return binary.Op == syntax.Pipe || binary.Op == syntax.PipeAll
+}
+
+func nestedPipelineNodes(file *syntax.File) map[*syntax.BinaryCmd]bool {
+	children := make(map[*syntax.BinaryCmd]bool)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		binary, ok := node.(*syntax.BinaryCmd)
+		if !ok || !isPipeline(binary) {
+			return true
+		}
+		for _, stmt := range []*syntax.Stmt{binary.X, binary.Y} {
+			if child, ok := stmt.Cmd.(*syntax.BinaryCmd); ok && isPipeline(child) {
+				children[child] = true
+			}
+		}
+		return true
+	})
+	return children
+}
+
+func isolatedFunctionSubshells(file *syntax.File) map[*syntax.Subshell]bool {
+	isolated := make(map[*syntax.Subshell]bool)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		function, ok := node.(*syntax.FuncDecl)
+		if ok && function.Body != nil {
+			if subshell, ok := function.Body.Cmd.(*syntax.Subshell); ok {
+				isolated[subshell] = true
+			}
+		}
+		return true
+	})
+	return isolated
+}
+
+func functionScopes(function *syntax.FuncDecl) ([]Scope, *span) {
+	if function.Body == nil || function.Body.Cmd == nil {
+		return nil, nil
+	}
+	body := functionBodySpan(function.Body)
+	names := function.Names
+	if function.Name != nil {
+		names = []*syntax.Lit{function.Name}
+	}
+	decl := int(function.Pos().Offset())
+	_, isolated := function.Body.Cmd.(*syntax.Subshell)
+	scopes := make([]Scope, 0, len(names))
+	for _, name := range names {
+		scopes = append(scopes, Scope{Start: body.start, End: body.end, Kind: ScopeFunctionBody, Name: name.Value, DeclOffset: decl, Isolated: isolated})
+	}
+	return scopes, &body
+}
+
+func functionBodySpan(body *syntax.Stmt) span {
+	return span{int(body.Cmd.Pos().Offset()), int(body.Cmd.End().Offset())}
+}
+
+func pipelineScopes(binary *syntax.BinaryCmd) []Scope {
+	var parts []*syntax.Stmt
+	appendPipelineParts(binary, &parts)
+	scopes := make([]Scope, 0, len(parts))
+	for i, part := range parts {
+		scopes = append(scopes, Scope{Start: int(part.Pos().Offset()), End: int(part.End().Offset()), Kind: ScopePipePart, DeclOffset: -1, Last: i == len(parts)-1})
+	}
+	return scopes
+}
+
+func appendPipelineParts(binary *syntax.BinaryCmd, parts *[]*syntax.Stmt) {
+	for _, stmt := range []*syntax.Stmt{binary.X, binary.Y} {
+		if child, ok := stmt.Cmd.(*syntax.BinaryCmd); ok && isPipeline(child) {
+			appendPipelineParts(child, parts)
+			continue
+		}
+		*parts = append(*parts, stmt)
+	}
+}
+
+func sortScopes(scopes []Scope) {
+	slices.SortStableFunc(scopes, func(a, b Scope) int {
+		if a.Start != b.Start {
+			return a.Start - b.Start
+		}
+		return b.End - a.End
+	})
 }
 
 // innermostSpan is the smallest span holding off, or -1, -1 when none does.

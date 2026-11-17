@@ -56,6 +56,8 @@ Scripts are expanded from `bash -c` (also under an unknown program), a shell her
 the remote command of `ssh` (`Via` names the way in). A shell heredoc is not treated as a script when
 the shell has `-c` or a script file. `Calls` and `Find` return calls found outside a malformed nested
 script with a `NestedError` that identifies the script and unwraps its parse error.
+`Scopes` returns function bodies, subshells, substitutions, coprocesses, pipeline parts and background
+jobs with byte bounds and kinds; consumers use these to apply trap, `mapfile -C`, alias and `lastpipe` rules.
 `Assigns` returns the assignments of a command (`S=x;`, `export`, `declare`, `typeset`, `readonly`,
 `local` in a function) in text order with their byte offsets, a mark for `+=` and the innermost
 subshell, substitution, pipeline part, background job or function body that holds each one;
