@@ -40,6 +40,7 @@ type call struct {
 	command, agent, tool, output string
 	code                         int
 	ordinal                      int
+	fault                        string
 }
 type taskWrite struct {
 	agent, file, key, source, op string
@@ -530,64 +531,15 @@ func (u *run) isPriorSearch(c shellcmd.Call, joined string) bool {
 }
 
 func (u *run) commandHasTruncator(cmd string) bool {
-	calls, err := shellcmd.Calls(cmd)
-	if err != nil {
-		slog.Debug("parse command for truncators", "error", err)
-		return false
-	}
-	for _, c := range calls {
-		if c.Name == "head" || c.Name == "tail" || c.Name == "cut" {
-			return true
-		}
-	}
-	return false
-}
-
-// lastCall — утилита стоит последней командой цепочки, и код всей команды — её код.
-func (u *run) lastCall(tool, cmd string) bool {
-	calls, err := shellcmd.Calls(cmd)
-	if err != nil {
-		slog.Debug("parse utility command", "error", err)
-		return false
-	}
-	return len(calls) > 0 && calls[len(calls)-1].Name == tool
-}
-
-func (u *run) singleUtilityCommand(tool, cmd string) bool {
-	calls, err := shellcmd.Calls(cmd)
-	if err != nil {
-		slog.Debug("parse utility command", "error", err)
-		return false
-	}
-	return len(calls) == 1 && calls[0].Name == tool
+	return hasOutputFilterPipeline(cmd)
 }
 
 func (u *run) toolFault(tool, out string, code int, cmd string, ordinal int) string {
-	ownError, toolFaultLines, usageMarkers := u.toolOutputFlags(tool, out)
-	framesAkit := regexp.MustCompile(`(?m)^\s+[^\n]*github\.com/aiseeq/akit/[^\n]*\.go:\d+`).MatchString(out)
-	trimmed := strings.TrimSpace(out)
-	startsPanic := strings.HasPrefix(trimmed, "panic:") || strings.HasPrefix(trimmed, "fatal error:")
-	if ordinal < toolFaultLines || ordinal == 0 && startsPanic && framesAkit {
-		return "crash"
+	commandCode := headerExitCode(out)
+	if commandCode < 0 {
+		commandCode = code
 	}
-	if ordinal < usageMarkers {
-		return "call-error"
-	}
-	if code == 2 && ownError && u.singleUtilityCommand(tool, cmd) {
-		return "call-error"
-	}
-	if code >= 128 && u.singleUtilityCommand(tool, cmd) && tool != "tk" {
-		return "killed"
-	}
-	if !u.singleUtilityCommand(tool, cmd) {
-		return ""
-	}
-	// Код неизвестен (общий вывод скрипта): строка «утилита: » бывает и сообщением успешного вызова, отказ —
-	// только по явным словам отказа.
-	if code > 0 && ownError || code < 0 && u.explicitRefusal(tool, out) {
-		return "refusal"
-	}
-	return ""
+	return u.attributeUtility(tool, cmd, out, commandCode, ordinal).fault
 }
 
 func (u *run) toolOutputFlags(tool, out string) (bool, int, int) {
@@ -632,16 +584,19 @@ func (u *run) outcome(tool, out string, code int) string {
 		if strings.Contains(out, "sub: dry run, would make") {
 			return "dry-run"
 		}
-		if regexp.MustCompile(`(?m)^sub: \d+ replacements? in \d+ files?`).MatchString(out) {
-			return "success"
-		}
-		if regexp.MustCompile(`expected \d+, found [1-9]\d*`).MatchString(out) {
-			return "mismatch"
-		}
-		if regexp.MustCompile(`expected \d+, found 0`).MatchString(out) {
+		success := regexp.MustCompile(`(?m)^sub: \d+ replacements? in \d+ files?`).MatchString(out)
+		notFound := regexp.MustCompile(`expected \d+, found 0`).MatchString(out)
+		mismatch := regexp.MustCompile(`expected \d+, found [1-9]\d*|(?m)^sub: nothing changed: .*mismatched`).MatchString(out)
+		if notFound {
 			return "not-found"
 		}
-		if code == 2 && regexp.MustCompile(`(?m)^sub: (?:need |FILE given|unknown flag|line \d+:|.*(?:invalid|usage|cannot))`).MatchString(out) {
+		if mismatch {
+			return "mismatch"
+		}
+		if success {
+			return "success"
+		}
+		if code == 2 && regexp.MustCompile(`(?m)^sub: (?:need |FILE given|unknown flag|line \d+:|.*(?:invalid|usage|cannot)|OLD is empty)`).MatchString(out) {
 			return "error"
 		}
 		return "unknown"
@@ -692,12 +647,26 @@ func (u *run) eventExitCode(e transcript.Event) int {
 		}
 		return 1
 	}
-	// Скрипт exec codex («Script completed») сообщает только, что скрипт дошёл до конца: код его команд в шапке
-	// не пишется, и успех команды из этого не следует.
+	// Обычный результат завершённого вызова без ошибки означает успешный код.
+	// Вывод exec-скрипта Codex сообщает статус скрипта, но не его отдельных команд.
 	if (e.UUID != "" || e.CallID != "") && !e.Error && !codexScriptOutput(e.Raw) {
 		return 0
 	}
 	return -1
+}
+
+func codexScriptOutput(raw json.RawMessage) bool {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.HasPrefix(text, "Script ")
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) == 0 {
+		return false
+	}
+	return strings.HasPrefix(parts[0].Text, "Script ")
 }
 
 func (u *run) findIsError(raw json.RawMessage) (bool, bool) {
@@ -731,50 +700,12 @@ func (u *run) findIsError(raw json.RawMessage) (bool, bool) {
 }
 
 func (u *run) utilityCode(e transcript.Event, tool, cmd, out string) (int, error) {
-	code := u.eventExitCode(e)
-	success := u.explicitSuccess(tool, out)
-	if success || u.explicitRefusal(tool, out) {
-		// Код команды — код утилиты, только когда она последняя в цепочке: иначе это код следующего шага
-		// (тесты после «&&», head в конвейере), а исход утилиты — её собственные слова.
-		if code >= 0 && u.lastCall(tool, cmd) {
-			return code, nil
-		}
-		if success {
-			return 0, nil
-		}
-		return 1, nil
-	}
-	cs, err := shellcmd.Calls(cmd)
-	if err != nil {
-		return 0, fmt.Errorf("parse shell command: %w", err)
-	}
-	positions := []int{}
-	for i, c := range cs {
-		if c.Name == tool {
-			positions = append(positions, i)
-		}
-	}
-	if len(positions) == 0 {
-		return -1, nil
-	}
-	last := positions[len(positions)-1]
-	single := true
-	for i, c := range cs {
-		if i == positions[0] {
-			continue
-		}
-		if (c.Name == "head" || c.Name == "tail" || c.Name == "cut") && i > positions[0] {
-			continue
-		}
-		single = false
-	}
-	if single || last == len(cs)-1 {
-		return code, nil
-	}
-	if code == 0 && strings.Contains(cmd, "&&") {
-		return 0, nil
-	}
-	return -1, nil
+	return u.utilityCodeAt(e, tool, cmd, out, -1)
+}
+
+func (u *run) utilityCodeAt(e transcript.Event, tool, cmd, out string, ordinal int) (int, error) {
+	result := u.attributeUtility(tool, cmd, out, u.eventExitCode(e), ordinal)
+	return result.code, nil
 }
 
 func (u *run) findExitCode(v any) int {
@@ -886,19 +817,8 @@ func (u *run) scanProcessEvents(path string, isClaude bool, models map[int]strin
 
 func (u *run) resolveCallCodes(calls []call, outs map[string]transcript.Event) {
 	for i := range calls {
-		calls[i].code = -1
-		o, ok := outs[calls[i].ev.CallID]
-		if ok {
-			calls[i].output = o.Text
-			code, codeErr := u.utilityCode(o, calls[i].tool, calls[i].command, o.Text)
-			if codeErr != nil {
-				slog.Debug("determine utility exit code", "error", codeErr)
-				continue
-			}
-			calls[i].code = code
-			if strings.Contains(o.Text, "expected ") && strings.Contains(o.Text, "found ") || strings.Contains(o.Text, "nothing changed") {
-				calls[i].code = 1
-			}
+		if _, ok := outs[calls[i].ev.CallID]; !ok {
+			calls[i].code = -1
 		}
 	}
 }
@@ -924,7 +844,7 @@ func (u *run) recordOneProcessCall(path string, evs []transcript.Event, models m
 	oc := u.outcome(c.tool, c.output, c.code)
 	if c.tool == "sub" || c.tool == "tl" {
 		metric := oc
-		if oc == "unknown" && u.commandHasTruncator(c.command) {
+		if oc == "unknown" && u.callHasTruncator(c.tool, c.command, c.ordinal) {
 			metric = "truncated"
 		}
 		u.inc(d, c.agent, c.tool, metric, 1)
@@ -985,7 +905,7 @@ func (u *run) updateNewEmptyReason(path string, line, code int) {
 }
 
 func (u *run) recordCallFault(path, dayName string, c *call) {
-	fault := u.toolFault(c.tool, c.output, c.code, c.command, c.ordinal)
+	fault := c.fault
 	if fault == "" {
 		return
 	}
@@ -1010,7 +930,7 @@ func (u *run) recordUnknownProbe(path, outcome string, c *call) {
 	if c.code >= 0 {
 		reason = fmt.Sprintf("код выхода %d; итог утилиты не распознан", c.code)
 	}
-	if u.commandHasTruncator(c.command) {
+	if u.callHasTruncator(c.tool, c.command, c.ordinal) {
 		reason = "команда обрезает поток через head/tail/cut"
 	}
 	u.unknownProbes = append(u.unknownProbes, example{kind: "unknown-" + c.tool, ref: fmt.Sprintf("%s:%d", path, c.ev.Line), agent: c.agent, command: c.command, output: c.output, reason: reason})
@@ -1043,19 +963,12 @@ func (u *run) collectCommandCalls(path string, isClaude bool, models map[int]str
 		if f.Offset < 0 {
 			continue
 		}
-		c := call{ev: e, command: cmd, agent: agent, tool: f.Name, ordinal: toolOrdinal[f.Name]}
+		c := call{ev: e, command: cmd, agent: agent, tool: f.Name, ordinal: toolOrdinal[f.Name], code: -1}
 		toolOrdinal[f.Name]++
 		if o, ok := outs[e.CallID]; ok {
-			c.output = o.Text
-			code, codeErr := u.utilityCode(o, f.Name, cmd, o.Text)
-			if codeErr != nil {
-				slog.Debug("determine utility exit code", "error", codeErr)
-				continue
-			}
-			c.code = code
-			if strings.Contains(o.Text, "expected ") && strings.Contains(o.Text, "found ") {
-				c.code = 1
-			}
+			commandCode := u.eventExitCode(o)
+			result := u.attributeUtility(f.Name, cmd, o.Text, commandCode, c.ordinal)
+			c.output, c.code, c.fault = result.output, result.code, result.fault
 		}
 		*calls = append(*calls, c)
 		if f.Name == "tk" {
@@ -1924,16 +1837,4 @@ func headerExitCode(text string) int {
 		return n
 	}
 	return -1
-}
-
-// codexScriptOutput — вывод exec codex: первая часть начинается шапкой «Script completed», «Script failed» или
-// «Script running».
-func codexScriptOutput(raw json.RawMessage) bool {
-	var parts []struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) == 0 {
-		return false
-	}
-	return strings.HasPrefix(parts[0].Text, "Script ")
 }

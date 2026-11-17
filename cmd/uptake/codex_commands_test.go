@@ -126,8 +126,8 @@ func TestExplicitOutcomeOwnsChainCode(t *testing.T) {
 		e               transcript.Event
 		want            int
 	}{
-		{"success, then failing tests", "sub", "sub -F spec.txt && bash tests/run.sh", out(1, "sub: 1 replacement in 1 file: a.sh 1 (line 3)\nFAIL\n"), 0},
-		{"refusal piped to head", "tl", "tl --grep x abcd | head -5", out(0, "tl: no events in 1 transcript(s)\n"), 1},
+		{"success, then failing tests", "sub", "sub -F spec.txt && bash tests/run.sh", out(1, "sub: 1 replacement in 1 file: a.sh 1 (line 3)\nFAIL\n"), -1},
+		{"refusal piped to head", "tl", "tl --grep x abcd | head -5", out(0, "tl: no events in 1 transcript(s)\n"), -1},
 		{"refusal as the last step", "sub", "cd /src && sub a b f.go", out(1, "sub: nothing changed: expected 1, found 0\n"), 1},
 		{"success alone", "sub", "sub a b f.go", out(0, "sub: 1 replacement in 1 file: f.go 1 (line 2)\n"), 0},
 	} {

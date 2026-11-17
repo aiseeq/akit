@@ -95,18 +95,46 @@ func (u *run) explicitSuccess(tool, out string) bool {
 }
 
 func (u *run) explicitRefusal(tool, out string) bool {
+	return u.explicitRefusalArgs(tool, out, nil)
+}
+
+func (u *run) explicitRefusalArgs(tool, out string, args []string) bool {
 	for line := range strings.SplitSeq(out, "\n") {
 		if !strings.HasPrefix(line, tool+": ") {
 			continue
 		}
-		l := strings.ToLower(line)
-		for _, word := range []string{"nothing changed", "expected ", "no events", "not yet after", "empty ", "error", "invalid", "unknown", "failed", "refused", "blocked", "panic", "fatal"} {
-			if strings.Contains(l, word) {
+		if tool == "tl" && strings.Contains(line, "tl: no events") {
+			continue
+		}
+		if u.explicitSuccess(tool, line) {
+			continue
+		}
+		l := line
+		for _, arg := range args {
+			if arg != "" {
+				l = stripArgumentText(l, arg)
+			}
+		}
+		l = strings.ToLower(l)
+		for _, word := range []string{"nothing changed", "expected", "no events", "no such", "not yet after", "empty", "error", "invalid", "unknown", "failed", "refused", "blocked", "panic", "fatal"} {
+			pattern := `(^|[^[:alnum:]_.-])` + regexp.QuoteMeta(word) + `($|[^[:alnum:]_.-])`
+			if regexp.MustCompile(pattern).MatchString(l) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func stripArgumentText(message, arg string) string {
+	if arg == "" {
+		return message
+	}
+	for _, quote := range []string{"'", `"`, "`"} {
+		pattern := regexp.QuoteMeta(quote) + regexp.QuoteMeta(arg) + regexp.QuoteMeta(quote)
+		message = regexp.MustCompile(pattern).ReplaceAllString(message, "")
+	}
+	return message
 }
 
 func (u *run) shellWays(cmd string) map[string]bool {

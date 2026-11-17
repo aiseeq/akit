@@ -1,0 +1,85 @@
+1	timeout 90 tl x	tl: invalid input\n
+1	graft exec --heavy -- tl x	tl: invalid input\n
+1	cd /a && sub A B f	sub: nothing changed: expected 1, found 0\n
+0	tl a; tl b	tl: invalid ref a\n
+1	tl a && tl b	tl: invalid ref a\n
+0	tl a | head	tl: invalid ref a\n
+1	tl a; tl b	tl: invalid ref b\n
+0	tl a || tl b	tl: 3 event(s)\n
+1	tl a || tl b	tl: invalid ref a\ntl: invalid ref b\n
+1	set -o pipefail; tl a | head	tl: invalid ref a\n
+1	echo x | tl a	tl: invalid input\n
+1	cd /a; tl x	tl: invalid input\n
+1	export A=1 && tl x	tl: invalid input\n
+1	A=1 && tl x	tl: invalid input\n
+1	(cd /a && tl x)	tl: invalid input\n
+1	bash -c 'cd /a && tl x'	tl: invalid input\n
+1	cd /a && tl x; echo done	tl: invalid input\ndone\n
+0	cd /a && tl x || true	tl: invalid input\n
+1	tl x && cd /b	tl: invalid input\n
+0	tl x &	tl: invalid input\n
+0	! tl x	tl: invalid input\n
+1	! tl x	tl: 3 event(s)\n
+0	if tl x; then :; fi	tl: invalid input\n
+1	tl a "$(tl b)"	tl: invalid ref a\n
+0	tl a "$(tl b)"	tl: 3 event(s)\n
+0	echo "$(tl a)"	tl: invalid ref a\n
+1	X=$(tl a) && tl b	tl: invalid ref a\n
+255	ssh h tl x	ssh: connect to host h port 22: Connection refused\n
+255	ssh h 'cd /a && tl x'	ssh: connect to host h port 22: Connection refused\n
+124	timeout 5 tl x	tl: 3 event(s)\n
+1	sudo -u u tl x	sudo: a password is required\n
+0	tl a; tl b	tl: no events\n
+0	tl a & tl b	tl: invalid ref a\n
+0	tl a; tl b &	tl: invalid ref a\n
+1	cd /a && tl x	bash: line 1: cd: /a: No such file or directory\n
+2	cd /a && tl x	tl: unknown flag -z (tl -h for usage)\n
+2	timeout 9 tl -z	tl: unknown flag -z\n
+137	graft exec -- tl x	tl: 3 event(s)\n
+1	tl a; tl b	tl: 3 event(s)\ntl: 2 event(s)\n
+1	sub A B f && sub C D g	sub: 1 replacement in 1 file\nsub: nothing changed: expected 1, found 0\n
+1	sub A B f; sub C D g	sub: nothing changed: expected 1, found 0\nsub: 1 replacement in 1 file\n
+1	cd /a && sub A B f | head	sub: nothing changed: expected 1, found 0\n
+-	cd /a && tl a; tl b	tl: invalid ref a\n
+1	$(echo cd) /a && tl x	tl: invalid input\n
+1	cd /a; X='&&'; tl x	tl: invalid input\n
+1	xargs tl < f	tl: invalid input\n
+123	xargs tl < f	tl: invalid input\n
+1	for f in a b; do tl $f; done	tl: invalid ref a\n
+1	tl a	tl: no events\n
+0	tl a	tl: no events\n
+0	tl a; tl b	tl: no events\ntl: 3 event(s)\n
+0	echo 'tl: invalid x'; tl a; tl b	tl: invalid x\ntl: 3 event(s)\ntl: 2 event(s)\n
+0	grep 'tl: ' notes.md; tl a; tl b	tl: invalid ref was fixed\ntl: 3 event(s)\ntl: 2 event(s)\n
+0	echo 'tl: invalid x' && tl a	tl: invalid x\ntl: 3 event(s)\n
+0	tl a | head; tl b | head	tl: invalid ref a\n
+0	tl a | head	tl: invalid ref a\n
+1	timeout 9 tl a; timeout 9 tl b	tl: invalid ref b\n
+1	bash -c $'tl a'; tl b	tl: invalid ref b\n
+1	cd /a && cd /b && tl x	tl: invalid input\n
+1	pushd /a && tl x	tl: invalid input\n
+1	cd /a && tl x | cat	tl: invalid input\n
+124	timeout 5 tl x	tl: invalid input\n
+2	graft exec --heavy -- tl x	graft: exec: unknown flag\ntl: 3 event(s)\n
+125	graft exec --heavy -- tl x	tl: 3 event(s)\ngraft: exec: interrupted\n
+125	graft exec --heavy -- sub A B f	sub: 1 replacement in 1 file\ngraft: exec: memory limit\n
+0	sub A B f && sub C D g	sub: 1 replacement in 1 file\nsub: 1 replacement in 1 file\n
+1	graft exec --heavy -- tl x	graft: exec: heavy, on this machine: GRAFT_HEAVY=local (--local)\ntl: invalid input\n
+0	graft exec --heavy -- tl x	graft: exec: heavy, on this machine: GRAFT_HEAVY=local (--local)\ntl: 3 event(s)\n
+0	bash -c 'tl x; echo done'	tl: invalid input\ndone\n
+1	bash -c 'tl x || true; false'	tl: 3 event(s)\n
+0	ssh h 'tl x; echo done'	tl: invalid input\ndone\n
+1	sub A B f	sub: nothing changed: 1 of 1 edits mismatched\n  OLD: expected 1, found 0 in f\n
+1	sub A B f	sub: nothing changed: 1 of 1 edits mismatched\n  OLD: expected 1, found 2 at f:3,9\n
+0	sub A B f && go test ./x 2>&1 | tail -3	sub: 1 replacement in 1 file: f 1 (line 3)\nok x 0.1s\n
+0	sub A B f; cat f	sub: 1 replacement in 1 file: f 1 (line 3)\nbody\n
+0	tl a && tl b	tl: 3 event(s)\ntl: 2 event(s)\n
+0	cd /a && tl x && echo ok	tl: 3 event(s)\nok\n
+1	cd /a && tl x && echo ok	tl: invalid input\n
+0	set -o pipefail; echo x | tl a	tl: 3 event(s)\n
+1	set -o pipefail; cat f | tl a	cat: f: No such file or directory\n
+0	tl a b	tl: no events in 3 transcript(s)\n
+1	tl a b	tl: no events in 3 transcript(s)\n
+0	{ tl a; } 2>&1	tl: invalid ref a\n
+1	tl a; tl b	tl: invalid ref b\ntl: invalid ref a\n
+1	sub A B f.go; sub C D g.go	sub: 1 replacement in 1 file: f.go 1 (line 3)\nsub: nothing changed: 1 of 1 edits mismatched\n

@@ -462,8 +462,11 @@ func TestRunAnalysisHelpers(t *testing.T) {
 	if got := u.utilityHabit("uptime"); len(got) == 0 || got[0] != "busy" {
 		t.Errorf("utilityHabit = %v", got)
 	}
-	if !u.singleUtilityCommand("busy", "busy") || u.singleUtilityCommand("busy", "busy && echo x") {
-		t.Error("singleUtilityCommand")
+	if got := u.attributeUtility("busy", "busy", "busy: invalid input", 2, 0); got.code != 2 {
+		t.Errorf("single-command attribution = %+v", got)
+	}
+	if got := u.attributeUtility("busy", "busy; echo x", "busy: invalid input", 2, 0); got.code != -1 {
+		t.Errorf("attribution after command chain = %+v", got)
 	}
 	if got := u.toolFault("busy", "busy: invalid input", 2, "busy", 0); got != "call-error" {
 		t.Errorf("toolFault = %q", got)
