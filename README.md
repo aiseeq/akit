@@ -225,6 +225,16 @@ Tests that need the project test database run with `--test-db`: mut then calls `
 
 A heavy run can move to another machine, which gets only the variables named with graft's `--env`; `mut --env NAME` (repeatable) passes each name on, so a test that reads the variable runs there as it does here.
 
+## secrets
+
+`secrets` searches and checks the Markdown secrets registry at `$HOME/secrets/LEDGER.md` by default; `--root DIR` selects an alternate registry root and may follow subcommand arguments.
+
+    secrets find WORD [--root DIR]
+    secrets add FILE… --section NAME --what TEXT --from SOURCE --where LOCATION [--root DIR]
+    secrets check [--root DIR]
+
+The table columns are `Место | Что | Откуда | Проверка | Где ещё | Статус`. `add` accepts only files under the root; relative file paths start at the current directory. It sets file and parent directory modes to 600 and 700, then adds a row with status `действует` without printing file contents. It computes a file hash, certificate serial and expiry, or private key public key hash. Encrypted keys retain the file hash and are marked as encrypted. A certificate and key in one file are checked as a pair; a CA certificate can be added alongside a separate matching key and client certificate. `find` searches every row case insensitively, including `инвентаризация`. `check` reports files without rows, rows without files, overly broad permissions, unreadable files and directories, and certificates expiring within 30 days. A registry containing a lone CR line ending is rejected with the offending line number.
+
 ## tk
 
 `tk new` and `tk set` can link tickets with repeatable `--blocks` flags; `tk set --unblocks` removes a link. A ticket that blocks other work inherits at least its priority, so work hidden by queue gates can rise with the ticket it blocks. Links can point across projects under `$HOME/git` and `$HOME/work` using `git/PROJECT/SLUG` or `work/PROJECT/SLUG`.
