@@ -21,7 +21,7 @@ import (
 	"github.com/aiseeq/akit/clihelp"
 )
 
-const usage = `prior — было ли это уже и что у нас уже есть: решения, механизмы, артефакты, память, пробы, бэклог,
+const usage = `prior — было ли это уже и что у нас уже есть: решения, инструкции, механизмы, артефакты, память, пробы, бэклог,
 отчёты ночного разбора и реплики.
 Запускать перед вопросом или предложением пользователю; итог - в строку «Искал: …».
 
@@ -29,7 +29,7 @@ usage: prior <слово> [слово…] - слова темы, любое из
        берите разные формы и синонимы: prior компак compact 'окн[оа] сжатия' '300 ?тыс';
        аргумент в кавычках ищется одной фразой целиком: слова темы - отдельными аргументами
 
-Порядок вывода - по весу источника: журнал решений, сказанное пользователем (правила, решения и обещания дословно),
+Порядок вывода - по весу источника: журнал решений, сказанное пользователем (правила, решения и обещания дословно), инструкции (CLAUDE.md, AGENTS.md, скиллы, .claude/rules и codex/frag),
 снятые правила (архив разбора: место, причина, текст), механизмы (карточки наших инструментов), опубликованные артефакты claude.ai (по названию), память пространств (архив),
 пробы и очереди ночного разбора, его отчёты, реплики (свежие внизу). Сначала разделы с находками, затем разделы
 с одними пометками (источник не прочитан), пустые - одной строкой «== пусто: …» в конце.
@@ -42,7 +42,7 @@ const exitUsage = 2
 var errHelp = errors.New("help")
 var errHelpJSON = errors.New("help json")
 var machineHelp = func() clihelp.Help {
-	help := clihelp.NewRoot("prior", []string{"-h", "--help", "--help-json", "-i", "--ignore-case"}, []string{}, "args", "search prior decisions, mechanisms, artifacts, memory, experiments, backlog and replies")
+	help := clihelp.NewRoot("prior", []string{"-h", "--help", "--help-json", "-i", "--ignore-case"}, []string{}, "args", "search prior decisions, instructions, mechanisms, artifacts, memory, experiments, backlog and replies")
 	help.Commands[0].NoDashdash = true
 	help.Commands[0].NoEquals = true
 	return help
@@ -226,6 +226,7 @@ func run(q query, home string, w io.Writer) {
 		fmt.Fprintln(b, "(нет)")
 	}
 	said(r.section("сказанное пользователем (~/.claude/said.tsv): правила, решения, обещания дословно, до 10"), q, s.said)
+	instructions(r.section(fmt.Sprintf("инструкции (CLAUDE.md, AGENTS.md, скиллы, .claude/rules и уникальные фрагменты), до %d строк", maxInstructionLines)), q, s.instructionRoots, home, s.instructionNotes)
 	removed(r.section(fmt.Sprintf("снятые правила (архив разбора, ~/.claude/improve/state/removed-rules.md): место, причина, текст, до %d", maxRemoved)), q, s.removed)
 	mechanisms(r.section("механизмы: что у нас уже есть (~/.claude/improve/mechanisms), до 40 строк"), q, s)
 	artifacts(r.section(fmt.Sprintf("артефакты claude.ai по названию (~/.claude/improve/state/artifacts.tsv), до %d", maxArtifacts)), q, s.artifacts)
@@ -250,22 +251,29 @@ type paths struct {
 	decisions, said, removed, mechanisms, state, runs, replies string
 	artifacts, projects                                        string
 	inventory, daydigest                                       string
+	instructionRoots                                           []instructionRoot
+	instructionNotes                                           []string
 }
+
+const maxInstructionLines = 40
 
 func sources(home string) paths {
 	c := home + "/.claude"
+	roots, instructionNotes := instructionRoots(home)
 	return paths{
-		decisions:  c + "/decisions.md",
-		said:       c + "/said.tsv",
-		removed:    c + "/improve/state/removed-rules.md",
-		mechanisms: c + "/improve/mechanisms",
-		state:      c + "/improve/state",
-		runs:       c + "/improve/runs",
-		replies:    c + "/user-replies.md",
-		artifacts:  c + "/improve/state/artifacts.tsv",
-		projects:   c + "/projects",
-		inventory:  c + "/improve/bin/inventory",
-		daydigest:  c + "/improve/bin/daydigest",
+		decisions:        c + "/decisions.md",
+		said:             c + "/said.tsv",
+		removed:          c + "/improve/state/removed-rules.md",
+		mechanisms:       c + "/improve/mechanisms",
+		state:            c + "/improve/state",
+		runs:             c + "/improve/runs",
+		replies:          c + "/user-replies.md",
+		artifacts:        c + "/improve/state/artifacts.tsv",
+		projects:         c + "/projects",
+		instructionRoots: roots,
+		instructionNotes: instructionNotes,
+		inventory:        c + "/improve/bin/inventory",
+		daydigest:        c + "/improve/bin/daydigest",
 	}
 }
 
@@ -290,12 +298,31 @@ func grepFile(w io.Writer, q query, path, prefix string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("не прочитался: %w", err)
 	}
-	found := false
-	for i, l := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
-		if q.any.MatchString(l) {
-			found = true
-			fmt.Fprintln(w, cut(fmt.Sprintf("%s%d:%s", prefix, i+1, l)))
+	matches := matchingLines(q, data, nil)
+	for _, match := range matches {
+		fmt.Fprintln(w, cut(fmt.Sprintf("%s%d:%s", prefix, match.number, match.text)))
+	}
+	return len(matches) > 0, nil
+}
+
+type queryLine struct {
+	number int
+	text   string
+}
+
+// matchingLines is the shared file prefilter, line prefilter, and query matcher.
+func matchingLines(q query, data []byte, filter []runNeedle) []queryLine {
+	if len(filter) > 0 && !runMayMatch(data, filter) {
+		return nil
+	}
+	var matches []queryLine
+	number := 0
+	for line := range strings.Lines(string(data)) {
+		number++
+		line = strings.TrimSuffix(line, "\n")
+		if (len(filter) == 0 || runMayMatch([]byte(line), filter)) && q.any.MatchString(line) {
+			matches = append(matches, queryLine{number: number, text: line})
 		}
 	}
-	return found, nil
+	return matches
 }

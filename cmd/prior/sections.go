@@ -326,14 +326,8 @@ func firstMatchFiltered(q query, path string, filter []runNeedle) (string, error
 	if err != nil {
 		return "", fmt.Errorf("отчёт не прочитался: %w", err)
 	}
-	if len(filter) > 0 && !runMayMatch(data, filter) {
-		return "", nil
-	}
-	for l := range strings.Lines(string(data)) {
-		l = strings.TrimSuffix(l, "\n")
-		if (len(filter) == 0 || runMayMatch([]byte(l), filter)) && q.any.MatchString(l) {
-			return l, nil
-		}
+	if matches := matchingLines(q, data, filter); len(matches) > 0 {
+		return matches[0].text, nil
 	}
 	return "", nil
 }
