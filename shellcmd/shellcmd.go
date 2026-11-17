@@ -175,6 +175,9 @@ type cmd struct {
 type word struct {
 	singleQuoted bool
 	raw          string
+	sourceText   string // исходный текст слова, включая кавычки
+	name         string // unquotedText, используемый для имени команды
+	ansiQuoted   bool
 	offset       int    // смещение в исходной команде; -1 — слово не литерал
 	script       string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
 	pos          []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
@@ -2312,7 +2315,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		}
 	}
 	ws := splitWords(words, split)
-	c := cmd{call: Call{Name: commandName(args[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
+	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
 	for _, part := range call.Args[0].Parts {
 		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
 			c.call.Name = ""
@@ -2530,6 +2533,16 @@ func commandName(name string) string {
 		return ""
 	}
 	return baseName(name)
+}
+
+// commandWordName uses the same unquoted word text as wordValues. An already
+// expanded value takes precedence, except for ANSI-C quotes, which are decoded
+// consistently regardless of the remaining arguments.
+func commandWordName(value string, parsed word) string {
+	if parsed.sourceText == value || parsed.ansiQuoted {
+		value = parsed.name
+	}
+	return commandName(value)
 }
 
 func validSpan(src string, start, end int) bool {
@@ -3824,6 +3837,16 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) ([
 	for i, arg := range args {
 		ws[i].offset = -1
 		ws[i].singleQuoted = singleQuotedWord(arg)
+		ws[i].sourceText = nodeText(arg, src)
+		ws[i].name = unquotedText(arg, src)
+		if len(arg.Parts) == 1 && isANSICQuoted(arg.Parts[0]) {
+			ws[i].ansiQuoted = true
+			var err error
+			ws[i].name, _, err = wordScript(arg, src, false)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if i == 0 {
 			start, end := int(arg.Pos().Offset()), int(arg.End().Offset())
 			if validSpan(src, start, end) {
@@ -4268,7 +4291,7 @@ func wordValue(w *syntax.Word) (string, bool) {
 
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
-	return cmd{call: Call{Name: commandName(c.call.Args[i-1]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
+	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
 		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1}
 }
@@ -5037,7 +5060,7 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 		args = append(args, parallelArgs[i])
 		words = append(words, c.words[parallelOffset+i+1])
 	}
-	child := cmd{call: Call{Name: commandName(parallelArgs[start]), Args: args, Raw: c.call.Raw, Line: c.call.Line,
+	child := cmd{call: Call{Name: commandWordName(parallelArgs[start], commandWord), Args: args, Raw: c.call.Raw, Line: c.call.Line,
 		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed}
@@ -5217,11 +5240,12 @@ func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error
 		return nil
 	}
 	var remote mapped
-	for i, w := range c.words[start+1:] {
+	for i := start + 1; i < len(c.words); i++ {
+		w := &c.words[i]
 		if w.script == "" {
 			return nil
 		}
-		if i > 0 {
+		if i > start+1 {
 			remote.add(" ", -1)
 		}
 		remote.text = append(remote.text, w.script...)

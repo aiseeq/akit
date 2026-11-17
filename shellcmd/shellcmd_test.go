@@ -1442,6 +1442,117 @@ func TestCallDetails(t *testing.T) {
 	}
 }
 
+func TestWrappedQuotedCommandName(t *testing.T) {
+	tests := []struct {
+		command string
+		name    string
+		via     []string
+	}{
+		{`nice "$HOME/bin/kill" 455274`, "kill", []string{"nice"}},
+		{`sudo "$HOME/bin/kill" 455274`, "kill", []string{"sudo"}},
+		{`env "$HOME/bin/kill" 455274`, "kill", []string{"env"}},
+		{`timeout 5 "$HOME/bin/kill" 455274`, "kill", []string{"timeout"}},
+		{`systemd-run --user "$HOME/bin/kill" 455274`, "kill", []string{"systemd-run"}},
+		{`sudo nice "$HOME/bin/kill" 455274`, "kill", []string{"sudo", "nice"}},
+		{`nice $HOME/bin/"kill" 1`, "kill", []string{"nice"}},
+		{`sudo nice $HOME/bin/"kill" 1`, "kill", []string{"sudo", "nice"}},
+		{`nice "$HOME/bin/"kill 1`, "kill", []string{"nice"}},
+		{`nice "$HOME/bin/k"ill 1`, "kill", []string{"nice"}},
+		{`nice ${HOME}/bin/'kill' 1`, "kill", []string{"nice"}},
+		{`nice "$HOME"/bin/'kill' 1`, "kill", []string{"nice"}},
+		{`nice "$HOME/bin/kill"'' 1`, "kill", []string{"nice"}},
+		{`C='sudo nice'; $C $HOME/bin/"kill" 1`, "kill", []string{"sudo", "nice"}},
+		{`nice "$X" 1`, "$X", []string{"nice"}},
+		{`parallel "$HOME/bin/kill" ::: 1`, "kill", []string{"parallel"}},
+		{`nice parallel "$HOME/bin/kill" ::: 1`, "kill", []string{"nice", "parallel"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if reflect.DeepEqual(call.Via, tt.via) {
+					if call.Name != tt.name {
+						t.Fatalf("wrapped call name = %q, want %q; call = %#v", call.Name, tt.name, call)
+					}
+					return
+				}
+			}
+			t.Fatalf("wrapped call via %#v not found: %#v", tt.via, calls)
+		})
+	}
+}
+
+func TestANSIQuotedCommandNameDoesNotDependOnArguments(t *testing.T) {
+	for _, command := range []string{`$'\x6bill' 1`, `$'\x6bill' bash -c x`} {
+		calls, err := Calls(command)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", command, err)
+		}
+		if len(calls) == 0 || calls[0].Name != "kill" {
+			t.Errorf("Calls(%q) name = %#v, want kill", command, calls)
+		}
+	}
+}
+
+func TestEmptyCommandWordShiftsParsedCommandName(t *testing.T) {
+	tests := []struct {
+		command string
+		via     []string
+	}{
+		{`E=''; $E "$HOME/bin/kill" 1`, nil},
+		{`E=''; $E $HOME/bin/"kill" 1`, nil},
+		{`E=''; $E $'\x6bill' 1`, nil},
+		{`E=''; $E nice "$HOME/bin/kill" 1`, []string{"nice"}},
+		{`E=''; $E nice $HOME/bin/"kill" 1`, []string{"nice"}},
+		{`E=''; $E nice $'\x6bill' 1`, []string{"nice"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			calls, err := Calls(tt.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if reflect.DeepEqual(call.Via, tt.via) && reflect.DeepEqual(call.Args, []string{"1"}) {
+					if call.Name != "kill" {
+						t.Fatalf("shifted command name = %q, want kill; call = %#v", call.Name, call)
+					}
+					return
+				}
+			}
+			t.Fatalf("shifted kill call via %#v not found: %#v", tt.via, calls)
+		})
+	}
+}
+
+func TestEmptyCommandWordShiftsParallelChildName(t *testing.T) {
+	for _, tt := range []struct {
+		command string
+		via     []string
+	}{
+		{`E=''; $E parallel "$HOME/bin/kill" ::: 1`, []string{"parallel"}},
+		{`E=''; $E nice parallel "$HOME/bin/kill" ::: 1`, []string{"nice", "parallel"}},
+	} {
+		calls, err := Calls(tt.command)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", tt.command, err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == "kill" && reflect.DeepEqual(call.Via, tt.via) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Calls(%q) has no kill call via %#v: %#v", tt.command, tt.via, calls)
+		}
+	}
+}
+
 func TestKillGuardForms(t *testing.T) {
 	tests := []struct {
 		command, name string
