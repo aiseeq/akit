@@ -346,6 +346,7 @@ all projects. Reads Claude Code transcripts, their subagents and codex rollouts.
     tl 1a2b3c4d:7759                       # one event in full
     tl --all --since 1d --usage            # tokens and API cost per session, TSV
     tl --all --since 24h --wait 'tk done' --q 95  # 95th percentile wait for output, ms
+    tl --open-questions backend            # agent questions and reply status
 
 Roles: `user` typed by the human, `ask` answers in a question dialog, `peer` messages from other
 sessions, `agent`, `think` the agent's thinking, `cmd` tool calls, `out` tool output, `attach`
@@ -356,6 +357,18 @@ all flags.
 The `--usage` summary names the transcripts it read. Runs that write no transcript, such as
 `claude -p --no-session-persistence`, are not counted, nor are codex rollouts: `--usage` does not
 read their token counts.
+
+`--open-questions SESSION` prints one row for each question sentence, with its time, `открыт` or
+`закрыт` status, the time of the first user reply for a closed question, an excerpt ending at `?`,
+and a link to the event. Questions are sentences with `?` in the last prose paragraph of a main-session
+agent message, and the `question` fields of `AskUserQuestion` calls. A declined or unshown
+`AskUserQuestion` window is skipped. Human messages typed or queued in the session and answers in an
+`AskUserQuestion` dialog count as replies; the first one after the question in file order closes it.
+Tool output, messages from other sessions, reminder-only messages and subagent messages do not count.
+Question marks that are part of URLs, code and quoted text are ignored. Fenced code blocks are skipped, including
+blank lines inside them; if a message ends with a code block, the prose paragraph before it is the last
+paragraph. An empty list is successful (exit 0). This is a hint about the conversation, not a restriction
+on what to do next.
 
 Large transcript reads wait for machine capacity through graft's heavy queue; smaller ones run at once on two
 threads.

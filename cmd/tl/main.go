@@ -60,6 +60,14 @@ path (Claude Code or codex rollout).
                 summary names the transcripts read: runs that leave none
                 (claude -p --no-session-persistence) and codex rollouts
                 (their token counts are not read) are not in it
+  --open-questions  list question sentences and whether the user replied (SESSION only)
+                One row per sentence with '?', linked to its event. Replies are
+                matched by file order. AskUserQuestion calls whose window was
+                declined or not shown are skipped. '?' inside URLs, code and quotes
+                does not count. Fenced code is skipped; the last paragraph is
+                the prose before a trailing code fence. Tool output, peer and
+                subagent messages and reminder-only messages do not count.
+                No questions is an empty successful result (exit 0).
   --worktime    Jira worktime for --grep; a key chunk starts at a key event
                 and ends at the last activity within --key-gap after the last
                 key match (inclusive; default 30m). Activity events: messages
@@ -109,43 +117,44 @@ const (
 )
 
 type options struct {
-	roles        map[transcript.Role]bool
-	since        time.Time
-	until        time.Time
-	grep         string
-	raw          string
-	context      int
-	all          bool
-	codex        bool
-	noSubagents  bool
-	subagents    bool
-	project      string
-	max          int
-	width        int
-	usage        bool
-	worktime     bool
-	gap          time.Duration
-	gapSet       bool
-	keyGap       time.Duration
-	keyGapSet    bool
-	waitProg     string
-	waitSub      string
-	q            int
-	qSet         bool
-	maxSet       bool
-	widthSet     bool
-	rolesSet     bool
-	version      bool
-	args         []string
-	originalArgs []string
-	waitCache    *waitCache
-	replyCache   *replycache.Cache
+	roles         map[transcript.Role]bool
+	since         time.Time
+	until         time.Time
+	grep          string
+	raw           string
+	context       int
+	all           bool
+	codex         bool
+	noSubagents   bool
+	subagents     bool
+	project       string
+	max           int
+	width         int
+	usage         bool
+	openQuestions bool
+	worktime      bool
+	gap           time.Duration
+	gapSet        bool
+	keyGap        time.Duration
+	keyGapSet     bool
+	waitProg      string
+	waitSub       string
+	q             int
+	qSet          bool
+	maxSet        bool
+	widthSet      bool
+	rolesSet      bool
+	version       bool
+	args          []string
+	originalArgs  []string
+	waitCache     *waitCache
+	replyCache    *replycache.Cache
 }
 
 var errHelp = errors.New("help")
 var errHelpJSON = errors.New("help json")
 var machineHelp = func() clihelp.Help {
-	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --no-subagents --subagents --usage --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
+	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --no-subagents --subagents --usage --open-questions --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
 	help.Commands[0].NoDashdash = true
 	return help
 }()
@@ -259,6 +268,8 @@ func setSwitch(opts *options, name string) bool {
 		opts.subagents = true
 	case "--usage":
 		opts.usage = true
+	case "--open-questions":
+		opts.openQuestions = true
 	case "--worktime":
 		opts.worktime = true
 	case "--version":
@@ -293,7 +304,23 @@ func checkCombos(opts options) error {
 	} else if opts.qSet {
 		return errors.New("--q works with --wait")
 	}
+	if err := checkOpenQuestionsCombos(opts); err != nil {
+		return err
+	}
 	return nil
+}
+
+func checkOpenQuestionsCombos(opts options) error {
+	if opts.openQuestions && openQuestionsOutputOptionsSet(opts) {
+		return errors.New("--open-questions works with SESSION, not event output options")
+	}
+	return nil
+}
+
+func openQuestionsOutputOptionsSet(opts options) bool {
+	return opts.all || opts.subagents || opts.usage || opts.worktime || opts.waitProg != "" || opts.qSet ||
+		opts.rolesSet || !opts.since.IsZero() || !opts.until.IsZero() || opts.grep != "" || opts.raw != "" ||
+		opts.maxSet || opts.widthSet
 }
 
 func checkWorktimeCombos(opts options) error {
@@ -503,6 +530,10 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
+	if opts.openQuestions && len(refs) > 0 {
+		fmt.Fprintln(stderr, "tl: --open-questions needs a SESSION, not an event reference")
+		return exitUsage
+	}
 	if len(refs) > 0 {
 		// REF — событие целиком; режет его только явный --width, не ширина списка по умолчанию.
 		width := 0
@@ -541,6 +572,9 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 	}
 	if opts.worktime {
 		return reportWorktime(sources, opts, e, stdout, stderr)
+	}
+	if opts.openQuestions {
+		return reportOpenQuestions(sources, stdout, stderr)
 	}
 	res, err := scan(sources, opts, e.home)
 	if err != nil {
