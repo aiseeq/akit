@@ -190,6 +190,20 @@ f"`, "S", true},
 	}
 }
 
+func TestFunctionChangesIgnoreCallsOutsideFunctionBody(t *testing.T) {
+	const src = `S=good; f() { :; }; g() { S=bad; }; f; (g); : "$S"`
+	call := strings.Index(src, "f;")
+	assigns, err := Assigns(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, assignment := range assigns {
+		if assignment.Name == "S" && assignment.Unknown && assignment.Offset == call {
+			t.Fatalf("call outside f's body was attributed to f: %+v", assigns)
+		}
+	}
+}
+
 func TestAssignsLocalOnlyShadowsWhenDeclarationMustRun(t *testing.T) {
 	for _, tc := range []struct {
 		body string

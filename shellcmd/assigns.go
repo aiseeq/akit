@@ -3,6 +3,7 @@ package shellcmd
 import (
 	"maps"
 	"slices"
+	"sort"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -33,8 +34,9 @@ type Assign struct {
 }
 
 // ScopeKind identifies a shell command region whose assignments do not reach
-// the shell running the command. Trap, mapfile -C, aliases and lastpipe behavior
-// are not modeled here; consumers can combine Scopes with their own shell rules.
+// the shell running the command. Bash's ${ ...; } command substitutions execute
+// in the current shell; local declarations inside them are tracked separately.
+// Trap, mapfile -C, aliases and lastpipe behavior are not modeled here.
 type ScopeKind int
 
 const (
@@ -59,9 +61,12 @@ func (k ScopeKind) String() string {
 }
 
 // Scope bounds a command region in which assignments do not reach the shell
-// running the command. Function bodies include their name and declaration offset;
-// other kinds have an empty Name and DeclOffset of -1. Trap, mapfile -C, aliases
-// and lastpipe behavior are left to consumers to infer from these regions.
+// running the command. Pipeline, background, and coprocess scopes also include
+// separate ranges for their here-document bodies. Function bodies include their
+// name and declaration offset; other kinds have an empty Name and DeclOffset of
+// -1. Bash funsubs have no general assignment scope, though local declarations
+// inside them are tracked by Assigns. Trap, mapfile -C, aliases and lastpipe
+// behavior are left to consumers to infer from these regions.
 type Scope struct {
 	Start, End int
 	Kind       ScopeKind
@@ -75,7 +80,8 @@ type Scope struct {
 // before off and is made by the shell running the command, or off is inside its scope.
 // The check is static: a branch or a loop body that does not run, or a function that is
 // called later, is not followed except for recognized function calls. A here-document body
-// counts at its place in the text, not when its command runs.
+// counts at its place in the text, not when its command runs. Bodies expanded by an external
+// command outside a pipeline, background job, or coprocess cannot be modeled precisely.
 func (a Assign) VisibleAt(off int) bool {
 	if a.Offset >= off {
 		return false
@@ -103,60 +109,192 @@ func Assigns(cmd string) ([]Assign, error) {
 		return nil, err
 	}
 	regions := commandScopes(file)
-	scopes := make([]span, len(regions.scopes))
-	for i, scope := range regions.scopes {
-		scopes[i] = span{scope.Start, scope.End}
-	}
-	functions := regions.functions
-	functionChanges := assignFunctionChanges(file, scopes)
+	ctx := newAssignContext(file, regions)
 	var out []Assign
-	add := func(assigns []*syntax.Assign) {
-		for _, a := range assigns {
-			if a.Name == nil || a.Naked {
-				continue
-			}
-			if a.Index != nil || a.Array != nil {
-				off := int(a.Pos().Offset())
-				start, end := innermostSpan(scopes, off)
-				out = append(out, Assign{Name: a.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end})
-				continue
-			}
-			value := ""
-			if a.Value != nil {
-				value = assignValue(a, full)
-			}
-			off := int(a.Pos().Offset())
-			start, end := innermostSpan(scopes, off)
-			out = append(out, Assign{Name: a.Name.Value, Value: value, Append: a.Append, Offset: off, ScopeStart: start, ScopeEnd: end})
-		}
-	}
 	syntax.Walk(file, func(node syntax.Node) bool {
-		switch n := node.(type) {
-		case *syntax.CallExpr:
-			if len(n.Args) == 0 {
-				add(n.Assigns)
-			} else {
-				for _, variable := range calledFunctionChanges(n.Args, functionChanges) {
-					off := int(n.Args[0].Pos().Offset())
-					start, end := innermostSpan(scopes, off)
-					out = append(out, Assign{Name: variable, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end})
-				}
-			}
-		case *syntax.DeclClause:
-			if n.Variant.Value != "local" || insideSpan(functions, int(n.Pos().Offset())) {
-				add(n.Args)
-			}
-		case *syntax.ForClause:
-			if loop, ok := n.Loop.(*syntax.WordIter); ok && loop.Name != nil {
-				off := int(loop.Name.Pos().Offset())
-				start, end := innermostSpan(scopes, off)
-				out = append(out, Assign{Name: loop.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end})
-			}
-		}
+		out = append(out, assignmentsForNode(node, full, ctx)...)
 		return true
 	})
 	slices.SortStableFunc(out, func(a, b Assign) int { return a.Offset - b.Offset })
 	return out, nil
+}
+
+type assignContext struct {
+	scopes            []span
+	scopeIndex        spanIndex
+	functionIndex     spanIndex
+	funsubs           []span
+	funsubLocals      []localBinding
+	replySubs         []span
+	functionChanges   map[string][]string
+	functionDefs      map[string][]assignDefinition
+	functionNames     []string
+	functionNameSet   map[string]bool
+	functionDocIndex  spanIndex
+	functionDocBySpan map[span]functionDocScope
+	deferredIndex     spanIndex
+}
+
+func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
+	rawScopes := make([]span, len(regions.scopes))
+	for i, scope := range regions.scopes {
+		rawScopes[i] = span{scope.Start, scope.End}
+	}
+	docBodies := make(map[span]bool, len(regions.functionDocs))
+	for _, doc := range regions.functionDocs {
+		if doc.owner.start <= doc.doc.start && doc.doc.end <= doc.owner.end {
+			docBodies[doc.doc] = true
+		}
+	}
+	scopes := make([]span, 0, len(regions.scopes))
+	for _, scope := range regions.scopes {
+		if scope.Kind == ScopeFunctionBody && docBodies[span{scope.Start, scope.End}] {
+			continue
+		}
+		scopes = append(scopes, span{scope.Start, scope.End})
+	}
+	functionChanges, functionDefs := assignFunctionChanges(regions, rawScopes)
+	scopeIndex := newSpanIndex(scopes)
+	ctx := assignContext{
+		scopes:            scopes,
+		scopeIndex:        scopeIndex,
+		functionIndex:     newSpanIndex(regions.functions),
+		funsubs:           funsubSpans(file),
+		funsubLocals:      funsubLocalBindings(file, scopeIndex),
+		functionChanges:   functionChanges,
+		functionDefs:      functionDefs,
+		functionNames:     slices.Sorted(maps.Keys(functionChanges)),
+		functionNameSet:   functionNameSet(functionChanges),
+		deferredIndex:     newSpanIndex(regions.index.deferredCalls),
+		functionDocBySpan: make(map[span]functionDocScope, len(regions.functionDocs)),
+	}
+	for _, doc := range regions.functionDocs {
+		ctx.functionDocBySpan[doc.doc] = doc
+		ctx.functionDocIndex.spans = append(ctx.functionDocIndex.spans, doc.doc)
+	}
+	ctx.functionDocIndex = newSpanIndex(ctx.functionDocIndex.spans)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if subst, ok := node.(*syntax.CmdSubst); ok && subst.ReplyVar {
+			ctx.replySubs = append(ctx.replySubs, span{int(subst.Pos().Offset()), int(subst.End().Offset())})
+		}
+		return true
+	})
+	return ctx
+}
+
+func assignmentsForNode(node syntax.Node, full string, ctx assignContext) []Assign {
+	switch n := node.(type) {
+	case *syntax.CallExpr:
+		if len(n.Args) == 0 {
+			return assignmentsFromSyntax(n.Assigns, full, ctx, false)
+		}
+		return unknownFunctionAssignments(n, ctx)
+	case *syntax.DeclClause:
+		declOff := int(n.Pos().Offset())
+		if n.Variant.Value == "local" && !ctx.functionIndex.contains(declOff) && !insideAny(ctx.funsubs, declOff) {
+			return nil
+		}
+		return assignmentsFromSyntax(n.Args, full, ctx, declHasGlobal(n))
+	case *syntax.ForClause:
+		return unknownLoopAssignment(n, ctx)
+	}
+	return nil
+}
+
+func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignContext, forceGlobal bool) []Assign {
+	var out []Assign
+	for _, a := range assigns {
+		if a.Name == nil || a.Naked {
+			continue
+		}
+		off := int(a.Pos().Offset())
+		start, end := assignmentScope(ctx, a.Name.Value, off, forceGlobal)
+		if a.Index != nil || a.Array != nil {
+			out = append(out, Assign{Name: a.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end})
+			continue
+		}
+		value := ""
+		if a.Value != nil {
+			value = assignValue(a, full)
+		}
+		assignment := Assign{Name: a.Name.Value, Value: value, Append: a.Append, Offset: off, ScopeStart: start, ScopeEnd: end}
+		out = append(out, assignment)
+		if execution, ok := functionDocExecution(assignment, off, ctx); ok {
+			out = append(out, execution)
+		}
+	}
+	return out
+}
+
+func assignmentScope(ctx assignContext, name string, off int, forceGlobal bool) (int, int) {
+	start, end := ctx.scopeIndex.innermost(off)
+	if localScope, ok := funsubBinding(ctx.funsubLocals, ctx.replySubs, name, off, true); ok && !forceGlobal {
+		// A funsub-local binding applies only when the funsub itself performs
+		// the assignment. Preserve any narrower execution scope nested inside it.
+		if start < localScope.start || end > localScope.end {
+			start, end = localScope.start, localScope.end
+		}
+	}
+	return start, end
+}
+
+func unknownFunctionAssignments(call *syntax.CallExpr, ctx assignContext) []Assign {
+	if len(call.Args) == 0 {
+		return nil
+	}
+	off := int(call.Args[0].Pos().Offset())
+	possibleNames := calledFunctionNames(call.Args, ctx.functionNames, ctx.functionNameSet)
+	deferred := ctx.deferredIndex.contains(off)
+	knownFunction := false
+	for _, name := range possibleNames {
+		definitions := ctx.functionDefs[name]
+		if sort.Search(len(definitions), func(i int) bool { return definitions[i].declOffset > off }) > 0 {
+			knownFunction = true
+			break
+		}
+	}
+	if !knownFunction && !deferred {
+		return nil
+	}
+	var out []Assign
+	for _, variable := range calledFunctionChangesAt(call.Args, ctx.functionNames, ctx.functionNameSet, ctx.functionChanges) {
+		start, end := assignmentScope(ctx, variable, off, false)
+		assignment := Assign{Name: variable, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end}
+		out = append(out, assignment)
+		if execution, ok := functionDocExecution(assignment, off, ctx); ok {
+			out = append(out, execution)
+		}
+	}
+	return out
+}
+
+func functionDocExecution(assignment Assign, off int, ctx assignContext) (Assign, bool) {
+	doc, ok := ctx.functionDocContaining(off)
+	if !ok || !doc.functionCommandRedirect {
+		return Assign{}, false
+	}
+	assignment.Offset = doc.owner.start
+	assignment.ScopeStart, assignment.ScopeEnd = doc.owner.start, doc.owner.end
+	return assignment, true
+}
+
+func (ctx assignContext) functionDocContaining(off int) (functionDocScope, bool) {
+	start, end := ctx.functionDocIndex.innermost(off)
+	if start < 0 {
+		return functionDocScope{}, false
+	}
+	doc, ok := ctx.functionDocBySpan[span{start, end}]
+	return doc, ok
+}
+
+func unknownLoopAssignment(loop *syntax.ForClause, ctx assignContext) []Assign {
+	words, ok := loop.Loop.(*syntax.WordIter)
+	if !ok || words.Name == nil {
+		return nil
+	}
+	off := int(words.Name.Pos().Offset())
+	start, end := assignmentScope(ctx, words.Name.Value, off, false)
+	return []Assign{{Name: words.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end}}
 }
 
 // Scopes returns regions whose assignments do not reach the shell running cmd.
@@ -178,27 +316,48 @@ type assignFunction struct {
 }
 
 type assignDefinition struct {
-	body     *syntax.Stmt
-	span     span
-	isolated bool
+	body       *syntax.Stmt
+	span       span
+	shells     []functionShell
+	isolated   bool
+	declOffset int
+	vars       []string
+	calls      []string
+}
+
+type functionShell struct {
+	span span
+	node syntax.Node
+}
+
+type functionDocScope struct {
+	redir                   *syntax.Redirect
+	hdoc                    *syntax.Word
+	doc                     span
+	owner                   span
+	functionCommandRedirect bool
+	statementOwned          bool
+	noCommand               bool
 }
 
 type localBinding struct {
 	name   string
 	offset int
+	start  int
+	end    int
 }
 
 // assignFunctionChanges returns variables that each function can change in its caller. Calls
 // between functions are resolved to a fixed point so a caller inherits its callees' changes.
-func assignFunctionChanges(file *syntax.File, scopes []span) map[string][]string {
-	funcs := assignFunctionDecls(file)
-	for _, name := range slices.Sorted(maps.Keys(funcs)) {
+func assignFunctionChanges(regions scopeSet, scopes []span) (map[string][]string, map[string][]assignDefinition) {
+	scopeIndex := newSpanIndex(scopes)
+	funcs := assignFunctionDecls(regions, scopeIndex)
+	functionNames := slices.Sorted(maps.Keys(funcs))
+	functionSet := functionNameSet(funcs)
+	for _, name := range functionNames {
 		f := funcs[name]
 		for i := range f.definitions {
-			definition := &f.definitions[i]
-			if !definition.isolated {
-				collectFunctionChanges(f, definition, funcs, functionLocals(definition.body, definition.span, scopes), scopes)
-			}
+			collectDefinitionChanges(f, &f.definitions[i], functionNames, functionSet, scopeIndex)
 		}
 	}
 	propagateFunctionChanges(funcs)
@@ -209,15 +368,54 @@ func assignFunctionChanges(file *syntax.File, scopes []span) map[string][]string
 		}
 		slices.Sort(out[name])
 	}
-	return out
+	definitions := make(map[string][]assignDefinition, len(funcs))
+	for name, function := range funcs {
+		definitions[name] = function.definitions
+	}
+	return out, definitions
 }
 
-func assignFunctionDecls(file *syntax.File) map[string]*assignFunction {
+func collectDefinitionChanges(function *assignFunction, definition *assignDefinition, functionNames []string, functionSet map[string]bool, scopes spanIndex) {
+	if definition.isolated {
+		return
+	}
+	locals := functionLocals(definition.body, definition.span, scopes)
+	for _, shell := range definition.shells {
+		scopedDefinition := *definition
+		scopedDefinition.span = shell.span
+		shellLocals := locals
+		if shell.node != definition.body {
+			// Here-doc expansion order relative to local declarations is not
+			// statically reliable. Keep possible writes as unknown at the caller.
+			shellLocals = nil
+		}
+		changes := &assignFunction{vars: make(map[string]bool)}
+		collectFunctionChanges(shell.node, changes, &scopedDefinition, functionNames, functionSet, shellLocals, scopes)
+		mergeDefinitionChanges(function, definition, changes)
+	}
+	sortUnique(&definition.vars)
+	sortUnique(&definition.calls)
+}
+
+func mergeDefinitionChanges(function *assignFunction, definition *assignDefinition, changes *assignFunction) {
+	for variable := range changes.vars {
+		definition.vars = append(definition.vars, variable)
+		function.vars[variable] = true
+	}
+	definition.calls = append(definition.calls, changes.calls...)
+	function.calls = append(function.calls, changes.calls...)
+}
+
+func sortUnique(values *[]string) {
+	slices.Sort(*values)
+	*values = slices.Compact(*values)
+}
+
+func assignFunctionDecls(regions scopeSet, scopes spanIndex) map[string]*assignFunction {
 	funcs := make(map[string]*assignFunction)
-	syntax.Walk(file, func(node syntax.Node) bool {
-		f, ok := node.(*syntax.FuncDecl)
-		if !ok || f.Body == nil {
-			return true
+	for _, f := range regions.index.functions {
+		if f.Body == nil {
+			continue
 		}
 		names := append([]*syntax.Lit(nil), f.Names...)
 		if f.Name != nil {
@@ -230,20 +428,23 @@ func assignFunctionDecls(file *syntax.File) map[string]*assignFunction {
 				function = &assignFunction{vars: make(map[string]bool)}
 				funcs[name.Value] = function
 			}
-			function.definitions = append(function.definitions, assignDefinition{body: f.Body, span: functionBodySpan(f.Body), isolated: isolated})
+			bodySpan := functionBodySpan(f.Body)
+			shells := append([]functionShell{{span: bodySpan, node: f.Body}}, functionHereDocShells(regions.functionDocsByFunction[f], scopes)...)
+			function.definitions = append(function.definitions, assignDefinition{
+				body: f.Body, span: bodySpan, shells: shells, isolated: isolated, declOffset: int(f.Pos().Offset()),
+			})
 		}
-		return true
-	})
+	}
 	return funcs
 }
 
-func functionLocals(body *syntax.Stmt, fn span, scopes []span) []localBinding {
+func functionLocals(body *syntax.Stmt, fn span, scopes spanIndex) []localBinding {
 	var locals []localBinding
 	collectExecutedLocals(body, true, fn, scopes, &locals)
-	return locals
+	return append(locals, funsubLocalBindingsInFunction(body, fn, scopes)...)
 }
 
-func collectExecutedLocals(stmt *syntax.Stmt, executes bool, fn span, scopes []span, locals *[]localBinding) {
+func collectExecutedLocals(stmt *syntax.Stmt, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
 	if stmt == nil || !executes {
 		return
 	}
@@ -265,41 +466,41 @@ func collectExecutedLocals(stmt *syntax.Stmt, executes bool, fn span, scopes []s
 	}
 }
 
-func collectLocalDeclaration(decl *syntax.DeclClause, fn span, scopes []span, locals *[]localBinding) {
+func collectLocalDeclaration(decl *syntax.DeclClause, fn span, scopes spanIndex, locals *[]localBinding) {
 	if !isLocalDeclaration(decl) || declHasGlobal(decl) || !inFunctionShell(scopes, fn, int(decl.Pos().Offset())) {
 		return
 	}
 	for _, a := range decl.Args {
 		if a.Name != nil {
-			*locals = append(*locals, localBinding{name: a.Name.Value, offset: int(a.Pos().Offset())})
+			*locals = append(*locals, localBinding{name: a.Name.Value, offset: int(a.Pos().Offset()), start: fn.start, end: fn.end})
 		}
 	}
 }
 
-func collectBinaryLocals(cmd *syntax.BinaryCmd, executes bool, fn span, scopes []span, locals *[]localBinding) {
+func collectBinaryLocals(cmd *syntax.BinaryCmd, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
 	if cmd.Op == syntax.AndStmt || cmd.Op == syntax.OrStmt {
 		collectExecutedLocals(cmd.X, executes, fn, scopes, locals)
 		collectExecutedLocals(cmd.Y, false, fn, scopes, locals)
 	}
 }
 
-func collectIfLocals(cmd *syntax.IfClause, executes bool, fn span, scopes []span, locals *[]localBinding) {
+func collectIfLocals(cmd *syntax.IfClause, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
 	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, locals)
 	collectExecutedLocalsIn(cmd.Then, false, fn, scopes, locals)
 }
 
-func collectWhileLocals(cmd *syntax.WhileClause, executes bool, fn span, scopes []span, locals *[]localBinding) {
+func collectWhileLocals(cmd *syntax.WhileClause, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
 	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, locals)
 	collectExecutedLocalsIn(cmd.Do, false, fn, scopes, locals)
 }
 
-func collectCaseLocals(cmd *syntax.CaseClause, fn span, scopes []span, locals *[]localBinding) {
+func collectCaseLocals(cmd *syntax.CaseClause, fn span, scopes spanIndex, locals *[]localBinding) {
 	for _, item := range cmd.Items {
 		collectExecutedLocalsIn(item.Stmts, false, fn, scopes, locals)
 	}
 }
 
-func collectExecutedLocalsIn(stmts []*syntax.Stmt, executes bool, fn span, scopes []span, locals *[]localBinding) {
+func collectExecutedLocalsIn(stmts []*syntax.Stmt, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
 	for _, stmt := range stmts {
 		collectExecutedLocals(stmt, executes, fn, scopes, locals)
 	}
@@ -307,7 +508,126 @@ func collectExecutedLocalsIn(stmts []*syntax.Stmt, executes bool, fn span, scope
 
 func localShadows(locals []localBinding, name string, offset int) bool {
 	for _, local := range locals {
-		if local.name == name && local.offset < offset {
+		if local.name == name && local.offset < offset && local.start <= offset && offset < local.end {
+			return true
+		}
+	}
+	return false
+}
+
+func funsubSpans(node syntax.Node) []span {
+	var spans []span
+	syntax.Walk(node, func(node syntax.Node) bool {
+		cmd, ok := node.(*syntax.CmdSubst)
+		if ok && (cmd.TempFile || cmd.ReplyVar) {
+			spans = append(spans, span{start: int(cmd.Pos().Offset()), end: int(cmd.End().Offset())})
+		}
+		return true
+	})
+	return spans
+}
+
+func funsubLocalBindings(node syntax.Node, scopes spanIndex) []localBinding {
+	return funsubLocalBindingsInFunction(node, span{-1, -1}, scopes)
+}
+
+func funsubLocalBindingsInFunction(node syntax.Node, fn span, scopes spanIndex) []localBinding {
+	var funsubs []span
+	var declarations []*syntax.DeclClause
+	syntax.Walk(node, func(node syntax.Node) bool {
+		return collectFunsubLocalNode(node, fn, &funsubs, &declarations)
+	})
+	return bindFunsubLocalDeclarations(funsubs, declarations, scopes)
+}
+
+func collectFunsubLocalNode(node syntax.Node, fn span, funsubs *[]span, declarations *[]*syntax.DeclClause) bool {
+	if function, ok := node.(*syntax.FuncDecl); ok && fn.start >= 0 {
+		off := int(function.Pos().Offset())
+		if fn.start <= off && off < fn.end {
+			return false
+		}
+	}
+	switch n := node.(type) {
+	case *syntax.CmdSubst:
+		if n.TempFile || n.ReplyVar {
+			*funsubs = append(*funsubs, span{start: int(n.Pos().Offset()), end: int(n.End().Offset())})
+		}
+	case *syntax.DeclClause:
+		if isLocalDeclaration(n) && !declHasGlobal(n) {
+			*declarations = append(*declarations, n)
+		}
+	}
+	return true
+}
+
+func bindFunsubLocalDeclarations(funsubs []span, declarations []*syntax.DeclClause, scopes spanIndex) []localBinding {
+	slices.SortFunc(funsubs, func(a, b span) int {
+		if a.start != b.start {
+			return a.start - b.start
+		}
+		return b.end - a.end
+	})
+	slices.SortFunc(declarations, func(a, b *syntax.DeclClause) int {
+		return int(a.Pos().Offset()) - int(b.Pos().Offset())
+	})
+	var locals []localBinding
+	active := make([]span, 0, len(funsubs))
+	nextFunsub := 0
+	for _, decl := range declarations {
+		off := int(decl.Pos().Offset())
+		for len(active) > 0 && active[len(active)-1].end <= off {
+			active = active[:len(active)-1]
+		}
+		for nextFunsub < len(funsubs) && funsubs[nextFunsub].start <= off {
+			active = append(active, funsubs[nextFunsub])
+			nextFunsub++
+		}
+		for len(active) > 0 && active[len(active)-1].end <= off {
+			active = active[:len(active)-1]
+		}
+		if len(active) == 0 {
+			continue
+		}
+		fn := active[len(active)-1]
+		scopeStart, scopeEnd := scopes.innermost(off)
+		if scopeStart >= fn.start && scopeEnd <= fn.end {
+			continue
+		}
+		for _, a := range decl.Args {
+			if a.Name != nil {
+				locals = append(locals, localBinding{name: a.Name.Value, offset: int(a.Pos().Offset()), start: fn.start, end: fn.end})
+			}
+		}
+	}
+	return locals
+}
+
+func funsubBinding(locals []localBinding, replySubs []span, name string, offset int, includeDeclaration bool) (span, bool) {
+	var found span
+	for _, local := range locals {
+		atOrAfter := local.offset < offset || includeDeclaration && local.offset == offset
+		if local.name == name && atOrAfter && local.start <= offset && offset < local.end && local.end-local.start > 0 &&
+			(found.end == 0 || local.end-local.start < found.end-found.start) {
+			found = span{start: local.start, end: local.end}
+		}
+	}
+	if name == "REPLY" {
+		for _, reply := range replySubs {
+			if reply.start <= offset && offset < reply.end &&
+				(found.end == 0 || reply.end-reply.start < found.end-found.start) {
+				found = reply
+			}
+		}
+	}
+	if found.end != 0 {
+		return found, true
+	}
+	return span{}, false
+}
+
+func insideAny(spans []span, off int) bool {
+	for _, s := range spans {
+		if s.start <= off && off < s.end {
 			return true
 		}
 	}
@@ -318,19 +638,25 @@ func isLocalDeclaration(decl *syntax.DeclClause) bool {
 	return decl.Variant.Value == "local" || decl.Variant.Value == "declare" || decl.Variant.Value == "typeset"
 }
 
-func nestedFunctionOf(node syntax.Node, body *syntax.Stmt) bool {
+func nestedFunctionOf(node syntax.Node, definition *assignDefinition) bool {
 	nested, ok := node.(*syntax.FuncDecl)
-	return ok && nested.Body != nil && nested.Body != body
+	if !ok || nested.Body == nil || nested.Body == definition.body {
+		return false
+	}
+	off := int(nested.Pos().Offset())
+	return definition.span.start <= off && off < definition.span.end
 }
 
-func collectFunctionChanges(f *assignFunction, definition *assignDefinition, funcs map[string]*assignFunction, locals []localBinding, scopes []span) {
-	syntax.Walk(definition.body, func(node syntax.Node) bool {
-		if nestedFunctionOf(node, definition.body) {
+func collectFunctionChanges(root syntax.Node, f *assignFunction, definition *assignDefinition, functionNames []string, functionSet map[string]bool, locals []localBinding, scopes spanIndex) {
+	syntax.Walk(root, func(node syntax.Node) bool {
+		if nestedFunctionOf(node, definition) {
 			return false
 		}
 		switch n := node.(type) {
 		case *syntax.CallExpr:
-			collectCallChanges(f, definition, n, funcs, locals, scopes)
+			if inFunctionShell(scopes, definition.span, int(n.Pos().Offset())) {
+				collectCallChanges(f, definition, n, functionNames, functionSet, locals, scopes)
+			}
 		case *syntax.DeclClause:
 			collectDeclChanges(f, definition, n, locals, scopes)
 		case *syntax.ForClause:
@@ -340,7 +666,7 @@ func collectFunctionChanges(f *assignFunction, definition *assignDefinition, fun
 	})
 }
 
-func collectCallChanges(f *assignFunction, definition *assignDefinition, call *syntax.CallExpr, funcs map[string]*assignFunction, locals []localBinding, scopes []span) {
+func collectCallChanges(f *assignFunction, definition *assignDefinition, call *syntax.CallExpr, functionNames []string, functionSet map[string]bool, locals []localBinding, scopes spanIndex) {
 	if len(call.Args) == 0 {
 		for _, a := range call.Assigns {
 			if a.Name != nil && !a.Naked && !localShadows(locals, a.Name.Value, int(a.Pos().Offset())) && inFunctionShell(scopes, definition.span, int(a.Pos().Offset())) {
@@ -349,20 +675,20 @@ func collectCallChanges(f *assignFunction, definition *assignDefinition, call *s
 		}
 		return
 	}
-	f.calls = append(f.calls, calledFunctionNames(call.Args, slices.Sorted(maps.Keys(funcs)))...)
+	f.calls = append(f.calls, calledFunctionNames(call.Args, functionNames, functionSet)...)
 }
 
-func calledFunctionChanges(args []*syntax.Word, changes map[string][]string) []string {
+func calledFunctionChangesAt(args []*syntax.Word, functionNames []string, functionSet map[string]bool, changes map[string][]string) []string {
 	variables := make(map[string]bool)
-	for _, function := range calledFunctionNames(args, slices.Sorted(maps.Keys(changes))) {
-		for _, variable := range changes[function] {
+	for _, name := range calledFunctionNames(args, functionNames, functionSet) {
+		for _, variable := range changes[name] {
 			variables[variable] = true
 		}
 	}
 	return slices.Sorted(maps.Keys(variables))
 }
 
-func calledFunctionNames(args []*syntax.Word, functions []string) []string {
+func calledFunctionNames(args []*syntax.Word, functions []string, functionSet map[string]bool) []string {
 	if len(args) == 0 {
 		return nil
 	}
@@ -379,10 +705,18 @@ func calledFunctionNames(args []*syntax.Word, functions []string) []string {
 		}
 		return evalFunctionNames(evalArgs, functions)
 	}
-	if slices.Contains(functions, name) {
+	if functionSet[name] {
 		return []string{name}
 	}
 	return nil
+}
+
+func functionNameSet[V any](functions map[string]V) map[string]bool {
+	set := make(map[string]bool, len(functions))
+	for name := range functions {
+		set[name] = true
+	}
+	return set
 }
 
 func evalArguments(args []*syntax.Word, name string) ([]*syntax.Word, bool) {
@@ -430,7 +764,7 @@ func evalDelimiter(char byte) bool {
 	return char <= ' ' || strings.ContainsRune(";&|()'\"", rune(char))
 }
 
-func collectDeclChanges(f *assignFunction, definition *assignDefinition, decl *syntax.DeclClause, locals []localBinding, scopes []span) {
+func collectDeclChanges(f *assignFunction, definition *assignDefinition, decl *syntax.DeclClause, locals []localBinding, scopes spanIndex) {
 	global := declHasGlobal(decl)
 	for _, a := range decl.Args {
 		if a.Name == nil || a.Naked || localShadows(locals, a.Name.Value, int(a.Pos().Offset())) && !global || !inFunctionShell(scopes, definition.span, int(a.Pos().Offset())) {
@@ -443,7 +777,7 @@ func collectDeclChanges(f *assignFunction, definition *assignDefinition, decl *s
 	}
 }
 
-func collectLoopChanges(f *assignFunction, definition *assignDefinition, loop *syntax.ForClause, locals []localBinding, scopes []span) {
+func collectLoopChanges(f *assignFunction, definition *assignDefinition, loop *syntax.ForClause, locals []localBinding, scopes spanIndex) {
 	words, ok := loop.Loop.(*syntax.WordIter)
 	if ok && words.Name != nil && !localShadows(locals, words.Name.Value, int(words.Name.Pos().Offset())) && inFunctionShell(scopes, definition.span, int(words.Name.Pos().Offset())) {
 		f.vars[words.Name.Value] = true
@@ -475,8 +809,8 @@ func mergeFunctionChanges(target, source *assignFunction) bool {
 	return changed
 }
 
-func inFunctionShell(scopes []span, fn span, off int) bool {
-	start, end := innermostSpan(scopes, off)
+func inFunctionShell(scopes spanIndex, fn span, off int) bool {
+	start, end := scopes.innermost(off)
 	return start == fn.start && end == fn.end
 }
 
@@ -500,54 +834,396 @@ func declHasGlobal(decl *syntax.DeclClause) bool {
 
 type span struct{ start, end int }
 
+type spanIndex struct {
+	spans        []span
+	prefixMaxEnd []int
+}
+
+func newSpanIndex(spans []span) spanIndex {
+	ordered := slices.Clone(spans)
+	slices.SortFunc(ordered, func(a, b span) int {
+		if a.start != b.start {
+			return a.start - b.start
+		}
+		return b.end - a.end
+	})
+	index := spanIndex{spans: ordered, prefixMaxEnd: make([]int, len(ordered))}
+	for i, current := range ordered {
+		index.prefixMaxEnd[i] = current.end
+		if i > 0 && index.prefixMaxEnd[i-1] > index.prefixMaxEnd[i] {
+			index.prefixMaxEnd[i] = index.prefixMaxEnd[i-1]
+		}
+	}
+	return index
+}
+
+func (index spanIndex) innermost(off int) (start, end int) {
+	start, end = -1, -1
+	for i := sort.Search(len(index.spans), func(i int) bool { return index.spans[i].start > off }) - 1; i >= 0 && index.prefixMaxEnd[i] > off; i-- {
+		candidate := index.spans[i]
+		if candidate.end > off && (start < 0 || candidate.end-candidate.start < end-start) {
+			start, end = candidate.start, candidate.end
+		}
+	}
+	return start, end
+}
+
+func (index spanIndex) contains(off int) bool {
+	for i := sort.Search(len(index.spans), func(i int) bool { return index.spans[i].start > off }) - 1; i >= 0 && index.prefixMaxEnd[i] > off; i-- {
+		if index.spans[i].end > off {
+			return true
+		}
+	}
+	return false
+}
+
 type scopeSet struct {
-	scopes    []Scope
-	functions []span
+	scopes                 []Scope
+	functions              []span
+	functionDocs           []functionDocScope
+	functionDocsByFunction map[*syntax.FuncDecl][]functionDocScope
+	index                  *syntaxIndex
+}
+
+type syntaxIndex struct {
+	functions         []*syntax.FuncDecl
+	redirects         []*syntax.Redirect
+	stmts             map[syntax.Command][]*syntax.Stmt
+	noCommand         map[*syntax.Redirect]bool
+	functionRedirects map[*syntax.FuncDecl]map[*syntax.Redirect]bool
+	deferredCalls     []span
+}
+
+func indexSyntax(file *syntax.File) *syntaxIndex {
+	index := &syntaxIndex{
+		stmts:     make(map[syntax.Command][]*syntax.Stmt),
+		noCommand: make(map[*syntax.Redirect]bool),
+	}
+	seenRedirs := make(map[*syntax.Redirect]bool)
+	addRedirect := func(redir *syntax.Redirect) {
+		if redir != nil && !seenRedirs[redir] {
+			seenRedirs[redir] = true
+			index.redirects = append(index.redirects, redir)
+		}
+	}
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.FuncDecl:
+			index.functions = append(index.functions, n)
+			if n.Body != nil && n.Body.Cmd != nil {
+				index.deferredCalls = append(index.deferredCalls, functionBodySpan(n.Body))
+			}
+		case *syntax.ForClause, *syntax.WhileClause:
+			index.deferredCalls = append(index.deferredCalls, span{int(n.Pos().Offset()), int(n.End().Offset())})
+		case *syntax.Redirect:
+			addRedirect(n)
+		case *syntax.Stmt:
+			if n.Cmd != nil {
+				index.stmts[n.Cmd] = append(index.stmts[n.Cmd], n)
+			}
+			for _, redir := range n.Redirs {
+				addRedirect(redir)
+				if stmtHasNoCommand(n) {
+					index.noCommand[redir] = true
+				}
+			}
+		}
+		return true
+	})
+	slices.SortFunc(index.redirects, func(a, b *syntax.Redirect) int {
+		return int(a.Pos().Offset()) - int(b.Pos().Offset())
+	})
+	slices.SortFunc(index.functions, func(a, b *syntax.FuncDecl) int {
+		return int(a.Pos().Offset()) - int(b.Pos().Offset())
+	})
+	index.functionRedirects = make(map[*syntax.FuncDecl]map[*syntax.Redirect]bool, len(index.functions))
+	for _, function := range index.functions {
+		all := make(map[*syntax.Redirect]bool)
+		addStmtRedirs := func(stmts []*syntax.Stmt) {
+			for _, stmt := range stmts {
+				for _, redir := range stmt.Redirs {
+					all[redir] = true
+				}
+			}
+		}
+		addStmtRedirs(index.stmts[function])
+		if function.Body != nil && function.Body.Cmd != nil {
+			addStmtRedirs(index.stmts[function.Body.Cmd])
+		}
+		index.functionRedirects[function] = all
+	}
+	return index
 }
 
 // commandScopes collects all assignment scopes once for both Scopes and Assigns.
 func commandScopes(file *syntax.File) scopeSet {
-	var out scopeSet
-	functionSubshells := isolatedFunctionSubshells(file)
-	pipeChildren := nestedPipelineNodes(file)
-	syntax.Walk(file, func(node syntax.Node) bool {
-		binary, ok := node.(*syntax.BinaryCmd)
-		if ok && isPipeline(binary) && !pipeChildren[binary] {
-			out.scopes = append(out.scopes, pipelineScopes(binary)...)
-		}
-		return true
-	})
-	syntax.Walk(file, func(node syntax.Node) bool {
-		switch n := node.(type) {
-		case *syntax.Subshell:
-			if !functionSubshells[n] {
-				out.scopes = append(out.scopes, nodeScope(n, ScopeSubshell))
-			}
-		case *syntax.CmdSubst:
-			out.scopes = append(out.scopes, nodeScope(n, ScopeCmdSubst))
-		case *syntax.ProcSubst:
-			out.scopes = append(out.scopes, nodeScope(n, ScopeProcSubst))
-		case *syntax.CoprocClause:
-			out.scopes = append(out.scopes, nodeScope(n, ScopeCoproc))
-		case *syntax.FuncDecl:
-			body, scopes := functionScopes(n)
-			if body != nil {
-				out.functions = append(out.functions, *scopes)
-				out.scopes = append(out.scopes, body...)
-			}
-		case *syntax.Stmt:
-			if n.Background {
-				out.scopes = append(out.scopes, nodeScope(n, ScopeBackground))
-			}
-		}
-		return true
-	})
+	index := indexSyntax(file)
+	out := scopeSet{index: index, functionDocsByFunction: make(map[*syntax.FuncDecl][]functionDocScope)}
+	collectPipelineScopes(file, &out)
+	collectExecutionScopes(file, &out, index)
+	collectFunctionDocScopes(&out, index)
 	sortScopes(out.scopes)
 	return out
 }
 
+func collectPipelineScopes(file *syntax.File, out *scopeSet) {
+	pipeChildren := nestedPipelineNodes(file)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		binary, ok := node.(*syntax.BinaryCmd)
+		if ok && isPipeline(binary) && !pipeChildren[binary] {
+			out.scopes = append(out.scopes, pipelineScopes(binary, out.index)...)
+		}
+		return true
+	})
+}
+
+func collectExecutionScopes(file *syntax.File, out *scopeSet, index *syntaxIndex) {
+	functionSubshells := isolatedFunctionSubshells(index.functions)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		appendExecutionScope(out, index, node, functionSubshells)
+		return true
+	})
+}
+
+func appendExecutionScope(out *scopeSet, index *syntaxIndex, node syntax.Node, functionSubshells map[*syntax.Subshell]bool) {
+	switch n := node.(type) {
+	case *syntax.Subshell:
+		if !functionSubshells[n] {
+			out.scopes = appendScopeAndParentHereDocs(out.scopes, index, n, nodeScope(n, ScopeSubshell))
+		}
+	case *syntax.CmdSubst:
+		if !n.TempFile && !n.ReplyVar {
+			out.scopes = appendScopeAndHereDocs(out.scopes, index, n, nodeScope(n, ScopeCmdSubst))
+		}
+	case *syntax.ProcSubst:
+		out.scopes = appendScopeAndHereDocs(out.scopes, index, n, nodeScope(n, ScopeProcSubst))
+	case *syntax.CoprocClause:
+		out.scopes = appendScopeAndHereDocs(out.scopes, index, n, scopeWithEnd(n, ScopeCoproc, statementEnd(n.Stmt)))
+	case *syntax.FuncDecl:
+		body, scopes := functionScopes(n)
+		if body != nil {
+			out.functions = append(out.functions, *scopes)
+			out.scopes = append(out.scopes, body...)
+		}
+	case *syntax.Stmt:
+		appendStatementScopes(out, n)
+	}
+}
+
+func appendStatementScopes(out *scopeSet, stmt *syntax.Stmt) {
+	if stmtHasNoCommand(stmt) {
+		out.scopes = appendDirectStmtHereDocRanges(out.scopes, stmt, Scope{Kind: ScopeSubshell, DeclOffset: -1})
+	}
+	if stmt.Background {
+		out.scopes = appendScopeAndHereDocs(out.scopes, out.index, stmt, scopeWithEnd(stmt, ScopeBackground, statementEnd(stmt)))
+	}
+}
+
+func collectFunctionDocScopes(out *scopeSet, index *syntaxIndex) {
+	type functionBody struct {
+		function *syntax.FuncDecl
+		span     span
+		scopes   []Scope
+	}
+	bodies := make([]functionBody, 0, len(index.functions))
+	bodyByFunction := make(map[*syntax.FuncDecl]functionBody, len(index.functions))
+	directOwners := make(map[*syntax.Redirect]*syntax.FuncDecl)
+	for _, function := range index.functions {
+		for redir := range index.functionRedirects[function] {
+			directOwners[redir] = function
+		}
+		if function.Body == nil || function.Body.Cmd == nil {
+			continue
+		}
+		body, _ := functionScopes(function)
+		info := functionBody{function: function, span: functionBodySpan(function.Body), scopes: body}
+		bodies = append(bodies, info)
+		bodyByFunction[function] = info
+	}
+	slices.SortFunc(bodies, func(a, b functionBody) int {
+		if a.span.start != b.span.start {
+			return a.span.start - b.span.start
+		}
+		return b.span.end - a.span.end
+	})
+	var active []functionBody
+	nextBody := 0
+	for _, redir := range index.redirects {
+		if redir.Hdoc == nil {
+			continue
+		}
+		pos := int(redir.Pos().Offset())
+		function := directOwners[redir]
+		direct := function != nil
+		if !direct {
+			for len(active) > 0 && active[len(active)-1].span.end <= pos {
+				active = active[:len(active)-1]
+			}
+			for nextBody < len(bodies) && bodies[nextBody].span.start <= pos {
+				active = append(active, bodies[nextBody])
+				nextBody++
+			}
+			for len(active) > 0 && active[len(active)-1].span.end <= pos {
+				active = active[:len(active)-1]
+			}
+			if len(active) == 0 {
+				continue
+			}
+			function = active[len(active)-1].function
+		}
+		info := bodyByFunction[function]
+		owner, body := info.span, info.scopes
+		doc := span{int(redir.Hdoc.Pos().Offset()), int(redir.Hdoc.End().Offset())}
+		docInfo := functionDocScope{
+			redir: redir, hdoc: redir.Hdoc, doc: doc, owner: owner,
+			functionCommandRedirect: direct,
+			statementOwned:          direct,
+			noCommand:               index.noCommand[redir],
+		}
+		out.functionDocsByFunction[function] = append(out.functionDocsByFunction[function], docInfo)
+		out.functionDocs = append(out.functionDocs, docInfo)
+		if direct {
+			index.deferredCalls = append(index.deferredCalls, doc)
+		}
+		for _, scope := range body {
+			docScope := scope
+			docScope.Start, docScope.End = doc.start, doc.end
+			out.scopes = append(out.scopes, docScope)
+		}
+	}
+}
+
+func appendScopeAndHereDocs(scopes []Scope, index *syntaxIndex, node syntax.Node, scope Scope) []Scope {
+	scopes = append(scopes, scope)
+	return appendHereDocRanges(scopes, index, node, scope)
+}
+
+func appendScopeAndParentHereDocs(scopes []Scope, index *syntaxIndex, node syntax.Node, scope Scope) []Scope {
+	scopes = appendScopeAndHereDocs(scopes, index, node, scope)
+	return appendParentStmtHereDocs(scopes, index, node, scope)
+}
+
+func appendParentStmtHereDocs(scopes []Scope, index *syntaxIndex, node syntax.Node, scope Scope) []Scope {
+	command, ok := node.(syntax.Command)
+	if !ok {
+		return scopes
+	}
+	for _, stmt := range index.stmts[command] {
+		scopes = appendDirectStmtHereDocRanges(scopes, stmt, scope)
+	}
+	return scopes
+}
+
+func stmtHasNoCommand(stmt *syntax.Stmt) bool {
+	if stmt.Cmd == nil {
+		return true
+	}
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	return ok && len(call.Args) == 0
+}
+
+func functionHereDocShells(docs []functionDocScope, scopes spanIndex) []functionShell {
+	var shells []functionShell
+	for _, doc := range docs {
+		if doc.noCommand || doc.hdoc == nil || doc.redir == nil {
+			continue
+		}
+		pos := int(doc.redir.Pos().Offset())
+		if pos < doc.owner.start || pos >= doc.owner.end {
+			if doc.statementOwned {
+				shells = append(shells, functionShell{span: doc.doc, node: doc.hdoc})
+			}
+			continue
+		}
+		if start, end := scopes.innermost(pos); start == doc.owner.start && end == doc.owner.end {
+			shells = append(shells, functionShell{span: doc.doc, node: doc.hdoc})
+		}
+	}
+	return shells
+}
+
+func appendStmtHereDocRanges(scopes []Scope, stmt *syntax.Stmt, scope Scope) []Scope {
+	syntax.Walk(stmt, func(node syntax.Node) bool {
+		child, ok := node.(*syntax.Stmt)
+		if !ok {
+			return true
+		}
+		for _, redir := range child.Redirs {
+			scopes = appendHereDocScope(scopes, redir, scope)
+		}
+		return true
+	})
+	return scopes
+}
+
+func appendDirectStmtHereDocRanges(scopes []Scope, stmt *syntax.Stmt, scope Scope) []Scope {
+	for _, redir := range stmt.Redirs {
+		scopes = appendHereDocScope(scopes, redir, scope)
+	}
+	return scopes
+}
+
+func appendHereDocScope(scopes []Scope, redir *syntax.Redirect, scope Scope) []Scope {
+	if redir.Hdoc == nil {
+		return scopes
+	}
+	body := scope
+	body.Start = int(redir.Hdoc.Pos().Offset())
+	body.End = int(redir.Hdoc.End().Offset())
+	return append(scopes, body)
+}
+
+func appendHereDocRanges(scopes []Scope, index *syntaxIndex, node syntax.Node, scope Scope) []Scope {
+	if stmt, ok := node.(*syntax.Stmt); ok {
+		return appendStmtHereDocRanges(scopes, stmt, scope)
+	}
+	start, end := int(node.Pos().Offset()), int(node.End().Offset())
+	lo := sort.Search(len(index.redirects), func(i int) bool {
+		return int(index.redirects[i].Pos().Offset()) >= start
+	})
+	for i := lo; i < len(index.redirects); i++ {
+		redir := index.redirects[i]
+		if int(redir.Pos().Offset()) >= end {
+			break
+		}
+		if redir.Hdoc == nil {
+			continue
+		}
+		scopes = appendHereDocScope(scopes, redir, scope)
+	}
+	return scopes
+}
+
 func nodeScope(node syntax.Node, kind ScopeKind) Scope {
 	return Scope{Start: int(node.Pos().Offset()), End: int(node.End().Offset()), Kind: kind, DeclOffset: -1}
+}
+
+func scopeWithEnd(node syntax.Node, kind ScopeKind, end int) Scope {
+	return Scope{Start: int(node.Pos().Offset()), End: end, Kind: kind, DeclOffset: -1}
+}
+
+// statementEnd returns the source end of a statement's command syntax, excluding
+// here-document bodies. mvdan includes those bodies in Redirect.End and hence in
+// Stmt.End when the statement has no trailing control operator.
+func statementEnd(stmt *syntax.Stmt) int {
+	if stmt.Semicolon.IsValid() {
+		return int(stmt.End().Offset())
+	}
+	end := int(stmt.Position.Offset())
+	if stmt.Negated {
+		end++
+	}
+	if stmt.Cmd != nil {
+		end = max(end, int(stmt.Cmd.End().Offset()))
+	}
+	for _, redir := range stmt.Redirs {
+		redirEnd := redir.End()
+		if redir.Hdoc != nil && redir.Word != nil {
+			redirEnd = redir.Word.End()
+		}
+		end = max(end, int(redirEnd.Offset()))
+	}
+	return end
 }
 
 func isPipeline(binary *syntax.BinaryCmd) bool {
@@ -571,17 +1247,15 @@ func nestedPipelineNodes(file *syntax.File) map[*syntax.BinaryCmd]bool {
 	return children
 }
 
-func isolatedFunctionSubshells(file *syntax.File) map[*syntax.Subshell]bool {
+func isolatedFunctionSubshells(functions []*syntax.FuncDecl) map[*syntax.Subshell]bool {
 	isolated := make(map[*syntax.Subshell]bool)
-	syntax.Walk(file, func(node syntax.Node) bool {
-		function, ok := node.(*syntax.FuncDecl)
-		if ok && function.Body != nil {
+	for _, function := range functions {
+		if function.Body != nil {
 			if subshell, ok := function.Body.Cmd.(*syntax.Subshell); ok {
 				isolated[subshell] = true
 			}
 		}
-		return true
-	})
+	}
 	return isolated
 }
 
@@ -607,12 +1281,13 @@ func functionBodySpan(body *syntax.Stmt) span {
 	return span{int(body.Cmd.Pos().Offset()), int(body.Cmd.End().Offset())}
 }
 
-func pipelineScopes(binary *syntax.BinaryCmd) []Scope {
+func pipelineScopes(binary *syntax.BinaryCmd, index *syntaxIndex) []Scope {
 	var parts []*syntax.Stmt
 	appendPipelineParts(binary, &parts)
 	scopes := make([]Scope, 0, len(parts))
 	for i, part := range parts {
-		scopes = append(scopes, Scope{Start: int(part.Pos().Offset()), End: int(part.End().Offset()), Kind: ScopePipePart, DeclOffset: -1, Last: i == len(parts)-1})
+		scope := Scope{Start: int(part.Pos().Offset()), End: statementEnd(part), Kind: ScopePipePart, DeclOffset: -1, Last: i == len(parts)-1}
+		scopes = appendScopeAndHereDocs(scopes, index, part, scope)
 	}
 	return scopes
 }
@@ -634,20 +1309,4 @@ func sortScopes(scopes []Scope) {
 		}
 		return b.End - a.End
 	})
-}
-
-// innermostSpan is the smallest span holding off, or -1, -1 when none does.
-func innermostSpan(spans []span, off int) (start, end int) {
-	start, end = -1, -1
-	for _, s := range spans {
-		if s.start <= off && off < s.end && (start < 0 || s.end-s.start < end-start) {
-			start, end = s.start, s.end
-		}
-	}
-	return start, end
-}
-
-func insideSpan(spans []span, off int) bool {
-	start, _ := innermostSpan(spans, off)
-	return start >= 0
 }
