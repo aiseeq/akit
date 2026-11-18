@@ -18,6 +18,10 @@ type Assign struct {
 	// text without quotes (`"$S/x"` gives `$S/x`). An empty assignment (`S=`) gives "".
 	// A tilde is kept as written, quoted or not, and `$'…'` escapes are not decoded.
 	Value string
+	// Tilde marks expansion at the start of Value and after each unquoted colon,
+	// or in each array element. Bash applies this to declaration values and S+= values,
+	// including in POSIX mode.
+	Tilde Tilde
 	// Append marks `S+=x`: Value is added to the previous value.
 	Append bool
 	// Unknown marks a possible assignment whose value cannot be determined statically, such as
@@ -110,6 +114,8 @@ func Assigns(cmd string) ([]Assign, error) {
 	}
 	regions := commandScopes(file)
 	ctx := newAssignContext(file, regions)
+	ctx.assignmentModes = assignmentShellModes(file, full)
+	ctx.declarations = declarationAssignments(file)
 	var out []Assign
 	syntax.Walk(file, func(node syntax.Node) bool {
 		out = append(out, assignmentsForNode(node, full, ctx)...)
@@ -133,6 +139,10 @@ type assignContext struct {
 	functionDocIndex  spanIndex
 	functionDocBySpan map[span]functionDocScope
 	deferredIndex     spanIndex
+	// assignmentModes and declarations give the tilde mark of a value: the
+	// shell modes at the assignment and whether a declaration command makes it.
+	assignmentModes map[*syntax.Assign]shellModes
+	declarations    map[*syntax.Assign]bool
 }
 
 func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
@@ -209,15 +219,25 @@ func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignCont
 		}
 		off := int(a.Pos().Offset())
 		start, end := assignmentScope(ctx, a.Name.Value, off, forceGlobal)
+		mode, ok := ctx.assignmentModes[a]
+		if !ok {
+			mode.brace = true
+		}
 		if a.Index != nil || a.Array != nil {
-			out = append(out, Assign{Name: a.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end})
+			var tilde Tilde
+			if a.Array != nil {
+				tilde = arrayAssignmentTilde(a.Array, full, mode)
+			}
+			out = append(out, Assign{Name: a.Name.Value, Tilde: tilde, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end})
 			continue
 		}
 		value := ""
+		var tilde Tilde
 		if a.Value != nil {
 			value = assignValue(a, full)
+			tilde = assignmentValueTilde(a, full, mode, ctx.declarations[a])
 		}
-		assignment := Assign{Name: a.Name.Value, Value: value, Append: a.Append, Offset: off, ScopeStart: start, ScopeEnd: end}
+		assignment := Assign{Name: a.Name.Value, Value: value, Tilde: tilde, Append: a.Append, Offset: off, ScopeStart: start, ScopeEnd: end}
 		out = append(out, assignment)
 		if execution, ok := functionDocExecution(assignment, off, ctx); ok {
 			out = append(out, execution)
@@ -295,6 +315,44 @@ func unknownLoopAssignment(loop *syntax.ForClause, ctx assignContext) []Assign {
 	off := int(words.Name.Pos().Offset())
 	start, end := assignmentScope(ctx, words.Name.Value, off, false)
 	return []Assign{{Name: words.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end}}
+}
+
+func declarationAssignments(file *syntax.File) map[*syntax.Assign]bool {
+	declarations := make(map[*syntax.Assign]bool)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		decl, ok := node.(*syntax.DeclClause)
+		if ok && decl.Variant != nil && slices.Contains(declarationCommands[:], decl.Variant.Value) {
+			for _, assign := range decl.Args {
+				declarations[assign] = true
+			}
+		}
+		return true
+	})
+	return declarations
+}
+
+// assignmentValueTilde marks the tilde expansion of a scalar value in the
+// shell modes at the assignment; a declaration command also brace-expands it.
+func assignmentValueTilde(a *syntax.Assign, full string, mode shellModes, declaration bool) Tilde {
+	tilde := wordTildeWithMode(a.Value, full, true, false, mode.posix, mode.brace, mode.posixUnknown, mode.braceUnknown)
+	if declaration && assignmentTildeInsideBrace(a.Value, full) {
+		if mode.brace && !mode.braceUnknown {
+			tilde = 0
+		} else if mode.braceUnknown {
+			tilde |= TildeModeUnknown
+		}
+	}
+	return tilde
+}
+
+func arrayAssignmentTilde(array *syntax.ArrayExpr, src string, mode shellModes) Tilde {
+	var marks Tilde
+	for _, elem := range array.Elems {
+		if elem.Value != nil {
+			marks |= wordTildeWithMode(elem.Value, src, false, false, mode.posix, mode.brace, mode.posixUnknown, mode.braceUnknown)
+		}
+	}
+	return marks
 }
 
 // Scopes returns regions whose assignments do not reach the shell running cmd.

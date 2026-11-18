@@ -243,8 +243,8 @@ func (u *run) habitType(cmd string) string {
 	if err != nil { //nolint:fallback-return,silent-error-handling // nested scripts can fail after yielding usable outer calls
 		slog.Debug("parse shell habit", "error", err)
 	}
-	for _, c := range calls {
-		if habit := u.habitForCall(c, cmd); habit != "" {
+	for i := range calls {
+		if habit := u.habitForCall(calls[i], cmd); habit != "" {
 			return habit
 		}
 	}
@@ -465,8 +465,8 @@ func directEditOwnsCode(cmd string) bool {
 		slog.Debug("parse command for direct edit ownership", "error", err)
 	}
 	n := 0
-	for _, c := range calls {
-		if directEditCall(c) {
+	for i := range calls {
+		if directEditCall(calls[i]) {
 			n++
 		}
 	}
@@ -497,8 +497,8 @@ func (u *run) utilityHabit(cmd string) []string {
 	if err != nil { //nolint:fallback-return,silent-error-handling // nested scripts can fail after yielding usable outer calls
 		slog.Debug("parse utility habits", "error", err)
 	}
-	for _, c := range calls {
-		for _, name := range u.utilityHabitsForCall(c, cmd) {
+	for i := range calls {
+		for _, name := range u.utilityHabitsForCall(calls[i], cmd) {
 			found[name] = true
 		}
 
@@ -959,7 +959,8 @@ func (u *run) collectCommandCalls(path string, isClaude bool, models map[int]str
 		return cmd, agent, true
 	}
 	toolOrdinal := map[string]int{}
-	for _, f := range found {
+	for i := range found {
+		f := &found[i]
 		if f.Offset < 0 {
 			continue
 		}
@@ -984,7 +985,8 @@ func (u *run) recordTKCommandWrites(cmd, agent string, e transcript.Event, outEv
 		slog.Debug("parse command for task writes", "error", err)
 		return
 	}
-	for _, tc := range parsed {
+	for i := range parsed {
+		tc := &parsed[i]
 		if len(tc.Args) < 2 || !u.validTaskOperation(tc.Args[0]) {
 			continue
 		}

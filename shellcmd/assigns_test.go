@@ -14,7 +14,7 @@ func TestAssignsOrderValuesAndOffsets(t *testing.T) {
 	top := func(name, value string, off int) Assign {
 		return Assign{Name: name, Value: value, Offset: off, ScopeStart: -1, ScopeEnd: -1}
 	}
-	want := []Assign{top("S", "/a", 0), top("T", "~/b", 13), top("S", "/z", 40)}
+	want := []Assign{top("S", "/a", 0), {Name: "T", Value: "~/b", Tilde: TildeHome, Offset: 13, ScopeStart: -1, ScopeEnd: -1}, top("S", "/z", 40)}
 	if len(got) != len(want) {
 		t.Fatalf("Assigns = %+v, want %+v", got, want)
 	}

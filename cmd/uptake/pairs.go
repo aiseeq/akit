@@ -725,9 +725,12 @@ func hardwareInventory(cmd string) bool {
 	if err != nil { //nolint:fallback-return,silent-error-handling // Calls before a parsing error are still useful.
 		slog.Debug("parse hardware inventory", "error", err)
 	}
-	return slices.ContainsFunc(calls, func(c shellcmd.Call) bool {
-		return c.Name == "lscpu" || c.Name == "lshw" || c.Name == "dmidecode"
-	})
+	for i := range calls {
+		if calls[i].Name == "lscpu" || calls[i].Name == "lshw" || calls[i].Name == "dmidecode" {
+			return true
+		}
+	}
+	return false
 }
 
 func (u *run) oldBusyGoal(evs []transcript.Event, at int, cmd string, probe shellcmd.Call) string {
@@ -757,7 +760,8 @@ func (u *run) executedHeavyGoals(cmd string, probeOffset int) (string, string) {
 		slog.Debug("parse heavy command", "error", err)
 	}
 	before, after := "", ""
-	for _, c := range calls {
+	for i := range calls {
+		c := &calls[i]
 		if c.Offset < 0 || !slices.Contains([]string{"graft", "go", "make", "docker", "podman", "worker", "npm", "pnpm", "yarn"}, c.Name) {
 			continue
 		}
@@ -931,7 +935,8 @@ func debuggingRunOutput(c shellcmd.Call, cmd string) bool {
 	if err != nil { //nolint:fallback-return,silent-error-handling // Parsed prefix calls still identify source inspection.
 		slog.Debug("parse source inspection", "error", err)
 	}
-	for _, before := range calls {
+	for i := range calls {
+		before := &calls[i]
 		if before.Offset < 0 || before.Offset >= c.Offset || !slices.Contains([]string{"cat", "sed", "head", "tail"}, before.Name) {
 			continue
 		}
@@ -1187,7 +1192,12 @@ func invokesUserWord(cmd string) bool {
 	if err != nil { //nolint:fallback-return,silent-error-handling // Parsed calls remain useful after a nested error.
 		slog.Debug("parse user-word call", "error", err)
 	}
-	return slices.ContainsFunc(calls, func(c shellcmd.Call) bool { return c.Name == "user-word" })
+	for i := range calls {
+		if calls[i].Name == "user-word" {
+			return true
+		}
+	}
+	return false
 }
 
 var diagnosticPhrase = regexp.MustCompile(`(?i)\b(?:error|exception|failed|exit\s+(?:code|status))\b`)
@@ -1254,7 +1264,8 @@ func (u *run) waitPairGoal(c shellcmd.Call, cmd string) string {
 	if err != nil { //nolint:fallback-return,silent-error-handling // A parsed prefix still identifies a preceding request.
 		slog.Debug("parse preceding request", "error", err)
 	}
-	for _, check := range calls {
+	for i := range calls {
+		check := &calls[i]
 		if check.Name != "curl" || u.waitGoal(check.Raw) != goal {
 			continue
 		}
@@ -1337,8 +1348,8 @@ func (u *run) embeddedWaitGoal(c shellcmd.Call) string {
 			if err != nil { //nolint:fallback-return,silent-error-handling // A valid prefix may contain the complete loop.
 				slog.Debug("parse shell script fragment", "error", err)
 			}
-			for _, nested := range calls {
-				if goal := u.waitPairGoal(nested, script); goal != "" {
+			for i := range calls {
+				if goal := u.waitPairGoal(calls[i], script); goal != "" {
 					return goal
 				}
 			}
@@ -1723,7 +1734,11 @@ func (u *run) isBusyProbeCall(cmd string) bool {
 	if err != nil { //nolint:fallback-return,silent-error-handling // Preserve detector results parsed before a nested shell error.
 		slog.Debug("parse busy candidate", "error", err)
 	}
-	return slices.ContainsFunc(cs, u.isPairBusyProbe)
+	busy := false
+	for i := range cs {
+		busy = u.isPairBusyProbe(cs[i]) || busy
+	}
+	return busy
 }
 func (u *run) oldPairCandidate(tool, cmd string) bool {
 	cs, err := shellcmd.Calls(cmd)

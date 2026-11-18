@@ -2,6 +2,7 @@
 package shellcmd
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -134,12 +135,54 @@ type Call struct {
 	// Redirs — перенаправления простой команды по порядку (у снятой обёртки — те же, что у неё).
 	Redirs      []Redir
 	literalArgs uint32
+	tildeArgs   []Tilde
 	// Loop — вызов в теле цикла while, until, for или select (и во вложенном скрипте такого тела).
 	Loop bool
 	// Background — вызов в задании, чей оператор или объемлющий оператор заканчивается `&`.
 	Background bool
 	// ScriptInput сообщает, что оболочка исполняет неизвестный текст из stdin или process substitution.
 	ScriptInput bool
+}
+
+// Tilde describes Bash tilde expansion in a word. Bash expands an unquoted
+// tilde-prefix at the start of a word, or after an unquoted colon in assignment
+// values, to $HOME (`~`, `~/path`) or another directory (`~user`, `~+`, `~-`).
+// A colon ends a tilde-prefix. In Bash mode, an argument that is a valid
+// `name=value` assignment word, including `name+=value` and indexed names,
+// follows assignment-value rules; Bash POSIX mode disables this for argument
+// words. TildeOther is a syntactic mark: Bash can leave `~user`, `~+N`, `~-N`,
+// or `~N` unchanged when the user or directory-stack entry does not exist.
+// TildeModeUnknown means braceexpand or POSIX mode may have changed in a way the
+// analysis cannot resolve. The mode is followed only along commands that run in
+// order; a change inside a loop, a trap action, a function called in more than
+// one mode or a deferred eval text makes the words it may reach unknown, and so
+// does an eval text nested more than eight levels deep. When that bit is set,
+// Home and Other describe the shell's default mode.
+type Tilde uint8
+
+var declarationCommands = [...]string{"export", "readonly", "declare", "typeset", "local"}
+
+const (
+	// TildeHome marks expansion of `~`, `~/path`, or the prefix before `:` to $HOME.
+	TildeHome Tilde = 1
+	// TildeOther marks a `~user`, `~+`, `~-`, or `~N` prefix. It is syntactic:
+	// Bash can leave it unchanged when the user is missing or the directory stack
+	// has no such entry.
+	TildeOther Tilde = 2
+	// TildeModeUnknown marks a word whose result can change with runtime shell options.
+	TildeModeUnknown Tilde = 4
+)
+
+// ArgTilde reports Bash tilde expansion in Args[i], including nested script words.
+// Out-of-range indices return zero.
+func (c Call) ArgTilde(i int) Tilde {
+	if i < 0 || i >= len(c.Args) {
+		return 0
+	}
+	if i >= len(c.tildeArgs) {
+		return 0
+	}
+	return c.tildeArgs[i]
 }
 
 // ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: все его
@@ -161,6 +204,9 @@ func (c Call) ArgLiteral(i int) bool {
 // cmd — вызов вместе со словами его командной строки: words[0] — argv0, дальше — Args по порядку.
 type cmd struct {
 	call           Call
+	posixEnv       bool
+	mode           shellModes
+	argv0          string
 	literalContext bool
 	words          []word
 	budget         *nestedParseBudget
@@ -174,6 +220,7 @@ type cmd struct {
 // word — место слова в исходной команде и его текст как скрипта.
 type word struct {
 	singleQuoted bool
+	tilde        Tilde
 	raw          string
 	sourceText   string // исходный текст слова, включая кавычки
 	name         string // unquotedText, используемый для имени команды
@@ -189,7 +236,10 @@ type Redir struct {
 	Op     string // оператор: >, >>, <, <<, <<-, <<<, &>, >& …
 	N      string // номер дескриптора перед оператором ("2" в 2>), пусто — по умолчанию
 	Target string // цель: значение литерального слова, иначе его исходный текст; у heredoc — ограничитель
-	Body   string // тело heredoc как в исходном тексте
+	// Tilde reports Bash tilde expansion in the redirection word. Here-document
+	// delimiters are not expanded; here-strings also recognize prefixes after `:`.
+	Tilde Tilde
+	Body  string // тело heredoc как в исходном тексте
 	// BodyStart, BodyEnd — байтовые границы тела heredoc в исходной команде, без строки ограничителя;
 	// -1 — heredoc нет, тело пустое или его края не в исходном тексте ($'…'). Во вложенном скрипте
 	// (`bash -c "…"`) диапазон охватывает тело, но текст в нём может отличаться от Body кавычками и
@@ -221,9 +271,9 @@ func Find(cmd string, names ...string) ([]Call, error) {
 	}
 	all, err := Calls(cmd)
 	calls := make([]Call, 0)
-	for _, call := range all {
-		if wanted[call.Name] {
-			calls = append(calls, call)
+	for i := range all {
+		if wanted[all[i].Name] {
+			calls = append(calls, all[i])
 		}
 	}
 	var nested *NestedError
@@ -234,24 +284,30 @@ func Find(cmd string, names ...string) ([]Call, error) {
 }
 
 type nestedParseBudget struct {
-	used           int
-	depth          int
-	expansionUsed  int
-	expansionLimit int
-	limit          int
-	parsedBytes    int
-	visitedNodes   int
-	walkInfoNodes  int
-	stdinSteps     int
-	substSteps     int
-	trackWork      bool
-	literalShell   string
-	parsedShells   map[string]int
+	used                int
+	depth               int
+	expansionUsed       int
+	expansionLimit      int
+	limit               int
+	parsedBytes         int
+	visitedNodes        int
+	walkInfoNodes       int
+	stdinSteps          int
+	substSteps          int
+	trackWork           bool
+	literalShell        string
+	initialPosix        bool
+	initialBrace        bool
+	initialPosixUnknown bool
+	initialBraceUnknown bool
+	parsedShells        map[string]int
+	// modeTexts are the eval and trap texts the mode walks of all scripts read.
+	modeTexts *modeTexts
 }
 
 func newNestedParseBudget(inputSize int) *nestedParseBudget {
 	limit := max(inputSize*(maxNestedScripts+1), 4096)
-	return &nestedParseBudget{limit: limit, expansionLimit: max(inputSize*2, 4096)}
+	return &nestedParseBudget{limit: limit, expansionLimit: max(inputSize*2, 4096), initialBrace: true}
 }
 
 func parse(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call) error {
@@ -318,7 +374,8 @@ func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inher
 // `\` в конце строки он склеивается с ней) выпадают, тело дочитанного heredoc кончается на конце src.
 func trimAppended(calls []Call, src string) []Call {
 	kept := calls[:0]
-	for _, c := range calls {
+	for i := range calls {
+		c := &calls[i]
 		if c.Offset >= len(src) {
 			continue
 		}
@@ -332,7 +389,7 @@ func trimAppended(calls []Call, src string) []Call {
 				r.BodyEnd, r.Body = len(src), src[r.BodyStart:]
 			}
 		}
-		kept = append(kept, c)
+		kept = append(kept, *c)
 	}
 	return kept
 }
@@ -760,7 +817,8 @@ func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited
 func dedupeCalls(calls []Call, seen *callSet) []Call {
 	seen.clear()
 	write := 0
-	for _, call := range calls {
+	for i := range calls {
+		call := calls[i]
 		if seen.hasExact(call) {
 			continue
 		}
@@ -785,6 +843,10 @@ type pendingProcessSubstitutionCall struct {
 type walkInfo struct {
 	topLevelCalls map[*syntax.CallExpr]bool
 	timedCalls    map[*syntax.CallExpr]bool
+	posixCalls    map[*syntax.CallExpr]bool
+	braceCalls    map[*syntax.CallExpr]bool
+	unknownPosix  map[*syntax.CallExpr]bool
+	unknownBrace  map[*syntax.CallExpr]bool
 	redirs        map[*syntax.CallExpr][]Redir
 
 	stdinInputs map[*syntax.CallExpr]*syntax.Redirect
@@ -812,12 +874,21 @@ type walkInfo struct {
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
+	initial := shellModes{posix: budget.initialPosix, posixUnknown: budget.initialPosixUnknown, brace: budget.initialBrace, braceUnknown: budget.initialBraceUnknown}
+	if budget.modeTexts == nil {
+		budget.modeTexts = newModeTexts()
+	}
+	posixCalls, unknownPosix, braceCalls, unknownBrace := parsedShellModes(file, src, initial, budget.modeTexts)
 	if !needsWalkInfo(src) {
-		info := walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), literalSimple: literalScriptSimple(file, src)}
+		info := walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), posixCalls: posixCalls, braceCalls: braceCalls, unknownPosix: unknownPosix, unknownBrace: unknownBrace, literalSimple: literalScriptSimple(file, src)}
 		info.collectTopLevelCalls(file)
 		return info
 	}
 	info := walkInfo{
+		posixCalls:                 posixCalls,
+		braceCalls:                 braceCalls,
+		unknownPosix:               unknownPosix,
+		unknownBrace:               unknownBrace,
 		literalSimple:              literalScriptText(src),
 		trackWork:                  budget.trackWork,
 		hasInputRedir:              strings.Contains(src, "<"),
@@ -887,6 +958,1304 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		}
 	}
 	return info
+}
+
+type shellModes struct {
+	posix, posixUnknown bool
+	brace, braceUnknown bool
+}
+
+func parsedShellModes(file *syntax.File, src string, initial shellModes, texts *modeTexts) (map[*syntax.CallExpr]bool, map[*syntax.CallExpr]bool, map[*syntax.CallExpr]bool, map[*syntax.CallExpr]bool) {
+	w := newShellModeWalker(src, texts)
+	w.indexFunctions(file, src)
+	w.list(file.Stmts, initial, false, 0)
+	anyChange := w.dynamicModeRisk || w.anyModeChange
+	for _, call := range w.trapCalls {
+		// A trap action runs at a time the parser does not know: with a mode
+		// change anywhere in the script, subshells and trap actions included,
+		// its words get an unknown mode.
+		if !anyChange {
+			continue
+		}
+		mode := shellModes{posix: initial.posix, brace: initial.brace, posixUnknown: true, braceUnknown: true}
+		w.record(call, mode)
+		w.markTrapFunctionsUnknown(call, mode)
+	}
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if call, ok := node.(*syntax.CallExpr); ok {
+			if _, exists := w.posix[call]; !exists {
+				w.posix[call], w.brace[call] = initial.posix, initial.brace
+				w.posixUnknown[call], w.braceUnknown[call] = initial.posixUnknown, initial.braceUnknown
+			}
+		}
+		return true
+	})
+	return w.posix, w.posixUnknown, w.brace, w.braceUnknown
+}
+
+// markTrapFunctionsUnknown gives an unknown mode to the bodies of the functions a
+// trap action names and of the functions they call.
+func (w *shellModeWalker) markTrapFunctionsUnknown(call *syntax.CallExpr, mode shellModes) {
+	action, ok := trapAction(call)
+	if !ok || action == "" {
+		return
+	}
+	if file, _, err := w.texts.parse(action); err == nil {
+		w.markUnknown(file, mode)
+	}
+}
+
+type shellModeWalker struct {
+	src                 string
+	posix, posixUnknown map[*syntax.CallExpr]bool
+	brace, braceUnknown map[*syntax.CallExpr]bool
+	assignmentModes     map[*syntax.Assign]shellModes
+	// evalDepth is how many literal eval texts hold the walked text.
+	evalDepth int
+	*shellFunctions
+}
+
+// shellFunctions is the state a walker shares with the walkers of literal eval
+// texts: a function defined in one is called from the other, and a trap set in
+// either runs at the end.
+type shellFunctions struct {
+	trapCalls []*syntax.CallExpr
+	functions map[string]*syntax.Stmt
+	// functionSrc is the source the offsets of a body refer to.
+	functionSrc map[*syntax.Stmt]string
+	// functionCallers lists, by name, the functions whose bodies call it.
+	functionCallers map[string][]string
+	// functionEffects holds, by name and over all its definitions, the modes a
+	// call may change through its body or the functions it reaches. A new
+	// definition only adds to it, so it is kept up to date as bodies appear.
+	functionEffects map[string]shellModes
+	// functionSeen is the mode a body was walked or marked with.
+	functionSeen map[*syntax.Stmt]shellModes
+	// dynamicCallModes are the modes all functions were walked with for a
+	// command with a computed name.
+	dynamicCallModes map[shellModes]bool
+	dynamicModeRisk  bool
+	// anyModeChange reports a mode change anywhere in the file, subshells included.
+	anyModeChange bool
+	texts         *modeTexts
+}
+
+func newShellModeWalker(src string, texts *modeTexts) shellModeWalker {
+	return shellModeWalker{
+		src: src, posix: make(map[*syntax.CallExpr]bool), posixUnknown: make(map[*syntax.CallExpr]bool),
+		brace: make(map[*syntax.CallExpr]bool), braceUnknown: make(map[*syntax.CallExpr]bool),
+		assignmentModes: make(map[*syntax.Assign]shellModes),
+		shellFunctions: &shellFunctions{
+			functions: make(map[string]*syntax.Stmt), functionSrc: make(map[*syntax.Stmt]string),
+			functionCallers: make(map[string][]string), functionEffects: make(map[string]shellModes),
+			functionSeen: make(map[*syntax.Stmt]shellModes), dynamicCallModes: make(map[shellModes]bool),
+			texts: texts,
+		},
+	}
+}
+
+// nested returns a walker for a literal eval text that records into the same maps.
+func (w *shellModeWalker) nested(src string) *shellModeWalker {
+	return &shellModeWalker{src: src, posix: w.posix, posixUnknown: w.posixUnknown, brace: w.brace, braceUnknown: w.braceUnknown, assignmentModes: w.assignmentModes, shellFunctions: w.shellFunctions}
+}
+
+// forFunction returns the walker for the source a function body comes from.
+func (w *shellModeWalker) forFunction(body *syntax.Stmt) *shellModeWalker {
+	if src, ok := w.functionSrc[body]; ok && src != w.src {
+		return w.nested(src)
+	}
+	return w
+}
+
+// indexFunctions defines every function of the file before the walk, so a call
+// placed before the definition in the text still sees its mode changes.
+func (w *shellModeWalker) indexFunctions(file *syntax.File, src string) {
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if fn, ok := node.(*syntax.FuncDecl); ok {
+			w.defineFunction(fn, src)
+		}
+		return true
+	})
+	w.dynamicModeRisk = w.dynamicModeRisk || w.texts.shellModeChanges(file.Stmts, src).any()
+	w.anyModeChange = w.dynamicModeRisk || w.texts.shellModeChangesAnywhere(file, src)
+}
+
+// definesDeferredCode reports a function definition or a trap command in a
+// literal eval text: code that runs after the eval, in the mode of that time.
+func definesDeferredCode(file *syntax.File) bool {
+	found := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.FuncDecl:
+			found = true
+		case *syntax.CallExpr:
+			if len(n.Args) > 0 {
+				if name, literal := wordValue(n.Args[0]); !literal || commandName(name) == "trap" {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// defineFunction makes a body the current one for its name. A body defined
+// while walking, such as one from a literal eval, adds its mode changes to the
+// name and to the functions that call it.
+func (w *shellModeWalker) defineFunction(fn *syntax.FuncDecl, src string) {
+	name := fn.Name.Value
+	w.functions[name] = fn.Body
+	if _, known := w.functionSrc[fn.Body]; known {
+		return
+	}
+	w.functionSrc[fn.Body] = src
+	mutation := w.texts.functionModeMutation(fn.Body, src)
+	callees, err := functionCallees(fn.Body)
+	mutation = mergeShellModes(mutation, unknownModesForParseError(err))
+	w.dynamicModeRisk = w.dynamicModeRisk || mutation.any()
+	gain := shellModes{posixUnknown: mutation.posixUnknown, braceUnknown: mutation.braceUnknown}
+	for _, callee := range callees {
+		w.functionCallers[callee] = append(w.functionCallers[callee], name)
+		effect := w.functionEffects[callee]
+		gain.posixUnknown = gain.posixUnknown || effect.posixUnknown
+		gain.braceUnknown = gain.braceUnknown || effect.braceUnknown
+	}
+	w.spreadFunctionEffect(name, gain)
+}
+
+// spreadFunctionEffect adds the modes to a function and to its callers, over
+// any depth of calls. A function takes each mode once, so all definitions
+// together cost time linear in the call graph.
+func (f *shellFunctions) spreadFunctionEffect(name string, gain shellModes) {
+	type pending struct {
+		name string
+		gain shellModes
+	}
+	queue := []pending{{name, gain}}
+	for len(queue) > 0 {
+		next := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		have := f.functionEffects[next.name]
+		added := shellModes{
+			posixUnknown: next.gain.posixUnknown && !have.posixUnknown,
+			braceUnknown: next.gain.braceUnknown && !have.braceUnknown,
+		}
+		if !added.any() {
+			continue
+		}
+		have.posixUnknown = have.posixUnknown || added.posixUnknown
+		have.braceUnknown = have.braceUnknown || added.braceUnknown
+		f.functionEffects[next.name] = have
+		for _, caller := range f.functionCallers[next.name] {
+			queue = append(queue, pending{caller, added})
+		}
+	}
+}
+
+// trapCommand reports a trap command, also behind builtin or command.
+func trapCommand(call *syntax.CallExpr) bool {
+	for _, arg := range call.Args {
+		name, literal := wordValue(arg)
+		if !literal {
+			return false
+		}
+		switch commandName(name) {
+		case "trap":
+			return true
+		case "builtin", "command", "-p", "--":
+			continue
+		}
+		return false
+	}
+	return false
+}
+
+// functionCallees lists the literal command names a body runs in the calling
+// shell, the functions of its trap actions included. The error is the first
+// trap action that does not parse.
+func functionCallees(body syntax.Node) ([]string, error) {
+	var names []string
+	var traps []*syntax.CallExpr
+	syntax.Walk(body, func(node syntax.Node) bool {
+		if !walkShellModeNode(node) {
+			return false
+		}
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		first, literal := wordValue(call.Args[0])
+		if !literal {
+			return true
+		}
+		names = append(names, commandName(first))
+		if trapCommand(call) {
+			traps = append(traps, call)
+		}
+		return true
+	})
+	var firstErr error
+	for _, call := range traps {
+		nested, err := trapActionCallees(call)
+		names = append(names, nested...)
+		firstErr = cmp.Or(firstErr, err)
+	}
+	return names, firstErr
+}
+
+func trapActionCallees(call *syntax.CallExpr) ([]string, error) {
+	action, ok := trapAction(call)
+	if !ok || action == "" {
+		return nil, nil
+	}
+	file, _, err := parseShell(action)
+	if err != nil {
+		return nil, err
+	}
+	return functionCallees(file)
+}
+
+func (w *shellModeWalker) record(call *syntax.CallExpr, mode shellModes) {
+	if _, seen := w.posix[call]; seen {
+		previous := shellModes{
+			posix:        w.posix[call],
+			posixUnknown: w.posixUnknown[call],
+			brace:        w.brace[call],
+			braceUnknown: w.braceUnknown[call],
+		}
+		mode = mergeShellModes(previous, mode)
+	}
+	w.posix[call], w.posixUnknown[call] = mode.posix, mode.posixUnknown
+	w.brace[call], w.braceUnknown[call] = mode.brace, mode.braceUnknown
+}
+
+func (w *shellModeWalker) list(body []*syntax.Stmt, mode shellModes, conditional bool, depth int) shellModes {
+	if len(body) == 0 {
+		return mode
+	}
+	if depth > 128 {
+		mode.posixUnknown, mode.braceUnknown = true, true
+		for _, item := range body {
+			w.markUnknown(item, mode)
+		}
+		return mode
+	}
+	for _, item := range body {
+		mode = w.stmt(item, mode, conditional, depth+1)
+	}
+	return mode
+}
+
+func (w *shellModeWalker) stmt(item *syntax.Stmt, mode shellModes, conditional bool, depth int) shellModes {
+	if item == nil {
+		return mode
+	}
+	if depth > 128 {
+		mode.posixUnknown, mode.braceUnknown = true, true
+		w.markUnknown(item, mode)
+		return mode
+	}
+	for _, redir := range item.Redirs {
+		w.visitNestedSubstitutions(redir, mode, conditional, depth+1)
+	}
+	if item.Background {
+		w.stmt(&syntax.Stmt{Cmd: item.Cmd, Redirs: item.Redirs}, mode, conditional, depth+1)
+		return mode
+	}
+	return w.compoundStmt(item, mode, conditional, depth)
+}
+
+// markUnknown records an unknown mode for every call and assignment under node
+// and for the bodies of the functions those calls name.
+func (w *shellModeWalker) markUnknown(node syntax.Node, mode shellModes) {
+	syntax.Walk(node, func(child syntax.Node) bool {
+		switch n := child.(type) {
+		case *syntax.CallExpr:
+			w.record(n, mode)
+			if len(n.Args) > 0 {
+				if name, literal := wordValue(n.Args[0]); literal {
+					if body := w.functions[commandName(name)]; body != nil {
+						w.markFunctionUnknown(body, mode)
+					}
+				}
+			}
+		case *syntax.Assign:
+			w.assignmentModes[n] = mode
+		}
+		return true
+	})
+}
+
+func (w *shellModeWalker) compoundStmt(item *syntax.Stmt, mode shellModes, conditional bool, depth int) shellModes {
+	switch node := item.Cmd.(type) {
+	case *syntax.CallExpr:
+		return w.callStmt(node, mode, conditional, depth)
+	case *syntax.DeclClause:
+		w.visitNestedSubstitutions(node, mode, conditional, depth+1)
+		for _, assign := range node.Args {
+			w.assignmentModes[assign] = mode
+		}
+		return declarationMode(node, mode, conditional)
+	case *syntax.FuncDecl:
+		w.defineFunction(node, w.src)
+	case *syntax.Block:
+		return w.list(node.Stmts, mode, conditional, depth+1)
+	case *syntax.Subshell:
+		w.list(node.Stmts, mode, conditional, depth+1)
+	case *syntax.IfClause:
+		return w.ifMode(node, mode, conditional, depth)
+	case *syntax.WhileClause:
+		return w.walkLoop(node.Cond, node.Do, mode, conditional, depth)
+	case *syntax.ForClause:
+		return w.forMode(node, mode, conditional, depth)
+	case *syntax.CaseClause:
+		return w.caseMode(node, mode, conditional, depth)
+	case *syntax.TimeClause:
+		if node.Stmt != nil {
+			return w.stmt(node.Stmt, mode, conditional, depth+1)
+		}
+	case *syntax.CoprocClause:
+		if node.Stmt != nil {
+			w.stmt(node.Stmt, mode, conditional, depth+1)
+		}
+	case *syntax.TestClause, *syntax.ArithmCmd, *syntax.LetClause:
+		w.visitNestedSubstitutions(node, mode, conditional, depth+1)
+	case *syntax.BinaryCmd:
+		return w.binaryMode(node, mode, conditional, depth)
+	}
+	return mode
+}
+
+func (w *shellModeWalker) caseMode(node *syntax.CaseClause, mode shellModes, conditional bool, depth int) shellModes {
+	w.visitNestedSubstitutions(node.Word, mode, conditional, depth+1)
+	out := mode
+	changed := false
+	for _, candidate := range node.Items {
+		for _, pattern := range candidate.Patterns {
+			w.visitNestedSubstitutions(pattern, mode, conditional, depth+1)
+		}
+		armMode := w.list(candidate.Stmts, mode, conditional, depth+1)
+		changed = changed || armMode != mode
+		out = mergeShellModes(out, armMode)
+	}
+	if changed {
+		all := make([]*syntax.Stmt, 0)
+		for _, candidate := range node.Items {
+			all = append(all, candidate.Stmts...)
+		}
+		changes := w.modeChanges(all)
+		out.posixUnknown = out.posixUnknown || changes.posixUnknown
+		out.braceUnknown = out.braceUnknown || changes.braceUnknown
+	}
+	return out
+}
+
+func (w *shellModeWalker) forMode(node *syntax.ForClause, mode shellModes, conditional bool, depth int) shellModes {
+	if loop, ok := node.Loop.(*syntax.WordIter); ok {
+		for _, word := range loop.Items {
+			w.visitNestedSubstitutions(word, mode, conditional, depth+1)
+		}
+	}
+	changes := w.loopChanges(node.Do, mode)
+	bodyMode := mode
+	bodyMode.posixUnknown = bodyMode.posixUnknown || changes.posixUnknown
+	bodyMode.braceUnknown = bodyMode.braceUnknown || changes.braceUnknown
+	w.list(node.Do, bodyMode, conditional, depth+1)
+	mode.posixUnknown = mode.posixUnknown || changes.posixUnknown
+	mode.braceUnknown = mode.braceUnknown || changes.braceUnknown
+	return mode
+}
+
+func (w *shellModeWalker) callStmt(call *syntax.CallExpr, mode shellModes, conditional bool, depth int) shellModes {
+	w.visitCallInputs(call, mode, conditional, depth)
+	args, _, _ := wordValues(call.Args, w.src, nil, false)
+	if len(call.Args) == 1 && commandWordIsModeOnlySubstitution(call.Args[0], w.src) {
+		return mode
+	}
+	if len(args) == 0 {
+		for _, assign := range call.Assigns {
+			if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+				mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, true, conditional)
+			}
+		}
+		return mode
+	}
+	if len(args) == 1 && args[0] == "" {
+		return mode
+	}
+	w.record(call, mode)
+	return w.applyCallCommand(call, args, mode, conditional, depth)
+}
+
+func (w *shellModeWalker) visitCallInputs(call *syntax.CallExpr, mode shellModes, conditional bool, depth int) {
+	for _, arg := range call.Args {
+		w.visitNestedSubstitutions(arg, mode, conditional, depth+1)
+	}
+	for _, assign := range call.Assigns {
+		w.visitNestedSubstitutions(assign, mode, conditional, depth+1)
+		w.assignmentModes[assign] = mode
+	}
+}
+
+func (w *shellModeWalker) applyCallCommand(call *syntax.CallExpr, args []string, mode shellModes, conditional bool, depth int) shellModes {
+	name, rest := unwrapSetCommand(args)
+	if name == "trap" {
+		w.trapCalls = append(w.trapCalls, call)
+	}
+	if !literalCommandName(call.Args[0]) && w.dynamicModeRisk {
+		if !w.dynamicCallModes[mode] {
+			w.dynamicCallModes[mode] = true
+			for _, body := range w.functions {
+				w.callFunction(body, mode, conditional, depth)
+			}
+		}
+		mode.posixUnknown, mode.braceUnknown = true, true
+		return mode
+	}
+	functionName := commandName(args[0])
+	if body := w.functions[functionName]; body != nil {
+		w.callFunction(body, mode, conditional, depth)
+		risk := w.functionMutationEffects(functionName)
+		mode.posixUnknown = mode.posixUnknown || risk.posixUnknown
+		mode.braceUnknown = mode.braceUnknown || risk.braceUnknown
+		return mode
+	}
+	if hasPosixEnvironment(call) && posixPrefixAffectsShell(name) {
+		if len(args) > 0 && args[0] == "command" {
+			mode.posixUnknown = true
+		} else {
+			mode.posix, mode.posixUnknown = true, false
+		}
+	}
+	mode = w.applyModeCommand(name, rest, call, mode, conditional, depth)
+	mode = applyPosixAssignmentMode(name, rest, call, mode, conditional)
+	if !literalCommandName(call.Args[0]) && w.dynamicModeRisk {
+		mode.posixUnknown, mode.braceUnknown = true, true
+	}
+	return mode
+}
+
+func commandWordIsModeOnlySubstitution(word *syntax.Word, src string) bool {
+	if word == nil || len(word.Parts) != 1 {
+		return false
+	}
+	sub, ok := word.Parts[0].(*syntax.CmdSubst)
+	if !ok || len(sub.Stmts) == 0 {
+		return false
+	}
+	for _, stmt := range sub.Stmts {
+		call, ok := stmt.Cmd.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return false
+		}
+		args, _, _ := wordValues(call.Args, src, nil, false)
+		name, _ := unwrapSetCommand(args)
+		if name != "set" && name != "shopt" {
+			return false
+		}
+	}
+	return true
+}
+
+func posixPrefixAffectsShell(name string) bool {
+	return slices.Contains([]string{":", "break", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift", "times", "trap", "unset", ".", "source"}, name)
+}
+
+func literalCommandName(word *syntax.Word) bool {
+	_, ok := wordValue(word)
+	return ok
+}
+
+func (w *shellModeWalker) applyModeCommand(name string, rest []string, call *syntax.CallExpr, mode shellModes, conditional bool, depth int) shellModes {
+	dynamic := dynamicModeArgs(name, call)
+	mode.posixUnknown = mode.posixUnknown || dynamic.posixUnknown
+	mode.braceUnknown = mode.braceUnknown || dynamic.braceUnknown
+	switch name {
+	case "set":
+		mode = applySetModes(rest, mode, conditional)
+	case "shopt":
+		mode = applyShoptModes(rest, mode, conditional)
+	case "unset":
+		if unsetPosixVariable(rest) {
+			mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, false, conditional)
+		}
+	case "eval":
+		mode = w.evalMode(call, mode, conditional, depth)
+	}
+	if name == "exec" && len(rest) > 0 || name == "source" || name == "." {
+		mode.posixUnknown, mode.braceUnknown = true, true
+	}
+	if name == "trap" && trapMayChangeBeforeNextCommand(rest) {
+		mode.posixUnknown, mode.braceUnknown = true, true
+	}
+	if name == "trap" {
+		changes, err := trapActionMayChangeMode(call, w)
+		if err != nil || changes {
+			mode.posixUnknown, mode.braceUnknown = true, true
+		}
+	}
+	return mode
+}
+
+// evalMode walks a literal eval text in the mode of the call; any other text,
+// or one nested deeper than maxModeTextDepth, leaves the mode unknown.
+func (w *shellModeWalker) evalMode(call *syntax.CallExpr, mode shellModes, conditional bool, depth int) shellModes {
+	literal, ok := literalEvalText(call.Args)
+	if !ok || w.evalDepth >= maxModeTextDepth {
+		mode.posixUnknown, mode.braceUnknown = true, true
+		return mode
+	}
+	file, full, err := w.texts.parse(literal)
+	if err != nil {
+		return mergeShellModes(mode, unknownModesForParseError(err))
+	}
+	before := mode
+	inner := w.nested(full)
+	inner.evalDepth = w.evalDepth + 1
+	mode = inner.list(file.Stmts, mode, conditional, depth+1)
+	if (w.dynamicModeRisk || w.anyModeChange) && definesDeferredCode(file) {
+		// The words of the text are read from the mode of the eval call; a body
+		// or trap action that runs later does not have it.
+		before.posixUnknown, before.braceUnknown = true, true
+		w.record(call, before)
+	}
+	return mode
+}
+
+func trapActionMayChangeMode(call *syntax.CallExpr, w *shellModeWalker) (bool, error) {
+	action, ok := trapAction(call)
+	if !ok {
+		return true, nil
+	}
+	if action == "" {
+		return false, nil
+	}
+	file, full, err := w.texts.parse(action)
+	if err != nil {
+		return false, err
+	}
+	if w.texts.shellModeChanges(file.Stmts, full).any() {
+		return true, nil
+	}
+	mutates := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if c, ok := node.(*syntax.CallExpr); ok && len(c.Args) > 0 {
+			name, literal := wordValue(c.Args[0])
+			if literal && w.functionMutationEffects(commandName(name)).any() {
+				mutates = true
+			}
+		}
+		return !mutates
+	})
+	return mutates, nil
+}
+
+func trapMayChangeBeforeNextCommand(args []string) bool {
+	if len(args) == 0 || args[0] == "-p" || args[0] == "-l" {
+		return false
+	}
+	for _, signal := range args[1:] {
+		if signal != "EXIT" && signal != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+func applyPosixAssignmentMode(name string, rest []string, call *syntax.CallExpr, mode shellModes, conditional bool) shellModes {
+	if name == "set" {
+		for _, assign := range call.Assigns {
+			if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+				mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, true, conditional)
+			}
+		}
+		return mode
+	}
+	if name != "eval" && !slices.Contains(declarationCommands[:], name) {
+		return mode
+	}
+	for _, assign := range call.Assigns {
+		if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+			if name == "eval" {
+				mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, true, conditional)
+			} else {
+				mode.posix, mode.posixUnknown = false, true
+			}
+		}
+	}
+	for _, arg := range rest {
+		if slices.Contains(declarationCommands[:], name) && (arg == "POSIXLY_CORRECT" || strings.HasPrefix(arg, "POSIXLY_CORRECT=")) {
+			if strings.HasPrefix(arg, "POSIXLY_CORRECT=") {
+				mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, true, conditional)
+			} else {
+				mode.posix, mode.posixUnknown = false, true
+			}
+		}
+	}
+	return mode
+}
+
+func assignmentShellModes(file *syntax.File, src string) map[*syntax.Assign]shellModes {
+	w := newShellModeWalker(src, newModeTexts())
+	w.indexFunctions(file, src)
+	w.list(file.Stmts, shellModes{brace: true}, false, 0)
+	return w.assignmentModes
+}
+
+func literalEvalText(args []*syntax.Word) (string, bool) {
+	if len(args) < 2 {
+		return "", false
+	}
+	values := make([]string, len(args)-1)
+	for i, arg := range args[1:] {
+		value, ok := wordValue(arg)
+		if !ok {
+			return "", false
+		}
+		values[i] = value
+	}
+	return strings.Join(values, " "), true
+}
+
+func (w *shellModeWalker) visitNestedSubstitutions(node syntax.Node, mode shellModes, conditional bool, depth int) {
+	syntax.Walk(node, func(n syntax.Node) bool {
+		switch sub := n.(type) {
+		case *syntax.CmdSubst:
+			w.list(sub.Stmts, mode, conditional, depth+1)
+			return false
+		case *syntax.ProcSubst:
+			w.list(sub.Stmts, mode, conditional, depth+1)
+			return false
+		}
+		return true
+	})
+}
+
+func declarationMode(node *syntax.DeclClause, mode shellModes, conditional bool) shellModes {
+	if node.Variant == nil || !slices.Contains(declarationCommands[:], node.Variant.Value) {
+		return mode
+	}
+	for _, assign := range node.Args {
+		if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+			if assign.Value == nil {
+				mode.posix, mode.posixUnknown = false, true
+			} else {
+				mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, true, conditional)
+			}
+		}
+	}
+	return mode
+}
+
+// callFunction walks a body once; a call in another mode marks the body and the
+// functions it calls unknown instead of walking it again.
+func (w *shellModeWalker) callFunction(body *syntax.Stmt, mode shellModes, conditional bool, depth int) {
+	if previous, seen := w.functionSeen[body]; seen {
+		if previous != mode {
+			w.markFunctionUnknown(body, mergeShellModes(previous, mode))
+		}
+		return
+	}
+	w.functionSeen[body] = mode
+	w.forFunction(body).stmt(body, mode, conditional, depth+1)
+}
+
+// markFunctionUnknown gives an unknown mode to the calls of a body and of the
+// functions it calls. A body already marked with that mode is skipped, so each
+// body is marked a bounded number of times.
+func (w *shellModeWalker) markFunctionUnknown(body *syntax.Stmt, mode shellModes) {
+	previous, seen := w.functionSeen[body]
+	if seen {
+		mode = mergeShellModes(previous, mode)
+	}
+	mode.posixUnknown, mode.braceUnknown = true, true
+	if seen && previous == mode {
+		return
+	}
+	w.functionSeen[body] = mode
+	w.forFunction(body).markUnknown(body, mode)
+}
+
+// functionMutationEffects reports the modes a call of the function may change,
+// through its own body or the functions it calls, recursion included.
+func (w *shellModeWalker) functionMutationEffects(name string) shellModes {
+	return w.functionEffects[name]
+}
+
+func (w *shellModeWalker) ifMode(node *syntax.IfClause, mode shellModes, conditional bool, depth int) shellModes {
+	condition := w.list(node.Cond, mode, conditional, depth+1)
+	thenMode, elseMode := w.list(node.Then, condition, false, depth+1), condition
+	if node.Else != nil {
+		elseMode = w.list(node.Else.Then, condition, false, depth+1)
+	}
+	out := mergeShellModes(thenMode, elseMode)
+	conditionChanges := w.modeChanges(node.Cond)
+	out.posixUnknown = out.posixUnknown || conditionChanges.posixUnknown
+	out.braceUnknown = out.braceUnknown || conditionChanges.braceUnknown
+	return out
+}
+
+// walkLoop gives the condition and the body the mode before the loop when the
+// loop changes no mode, and an unknown mode otherwise: the condition runs again
+// after the body, and which pass a word sees depends on the run.
+func (w *shellModeWalker) walkLoop(cond, body []*syntax.Stmt, mode shellModes, conditional bool, depth int) shellModes {
+	changes := w.loopChanges(append(slices.Clone(cond), body...), mode)
+	mode.posixUnknown = mode.posixUnknown || changes.posixUnknown
+	mode.braceUnknown = mode.braceUnknown || changes.braceUnknown
+	w.list(cond, mode, conditional, depth+1)
+	w.list(body, mode, conditional, depth+1)
+	return mode
+}
+
+func (w *shellModeWalker) loopChanges(stmts []*syntax.Stmt, initial shellModes) shellModes {
+	mode := initial
+	var changes shellModes
+	for _, stmt := range stmts {
+		call, ok := stmt.Cmd.(*syntax.CallExpr)
+		if !ok {
+			other := w.modeChanges([]*syntax.Stmt{stmt})
+			changes.posixUnknown = changes.posixUnknown || other.posixUnknown
+			changes.braceUnknown = changes.braceUnknown || other.braceUnknown
+			mode.posixUnknown = mode.posixUnknown || other.posixUnknown
+			mode.braceUnknown = mode.braceUnknown || other.braceUnknown
+			continue
+		}
+		args, _, _ := wordValues(call.Args, w.src, nil, false)
+		if len(args) == 0 {
+			changes.posixUnknown = changes.posixUnknown || hasPosixEnvironment(call)
+			continue
+		}
+		name, rest := unwrapSetCommand(args)
+		before := mode
+		mode = w.applyModeCommand(name, rest, call, mode, false, 0)
+		mode = applyPosixAssignmentMode(name, rest, call, mode, false)
+		changes.posixUnknown = changes.posixUnknown || before.posix != mode.posix || before.posixUnknown != mode.posixUnknown
+		changes.braceUnknown = changes.braceUnknown || before.brace != mode.brace || before.braceUnknown != mode.braceUnknown
+		if body := w.functions[commandName(args[0])]; body != nil {
+			effect := w.functionMutationEffects(commandName(args[0]))
+			changes.posixUnknown = changes.posixUnknown || effect.posixUnknown
+			changes.braceUnknown = changes.braceUnknown || effect.braceUnknown
+		}
+	}
+	return changes
+}
+
+func setShellMode(current, currentUnknown, enable, conditional bool) (bool, bool) {
+	if !conditional {
+		return enable, false
+	}
+	return enable, currentUnknown || current != enable
+}
+
+func (w *shellModeWalker) binaryMode(node *syntax.BinaryCmd, mode shellModes, conditional bool, depth int) shellModes {
+	if node.Op == syntax.Pipe || node.Op == syntax.PipeAll {
+		w.stmt(node.Y, mode, conditional, depth+1)
+		w.stmt(node.X, mode, conditional, depth+1)
+		return mode
+	}
+	left := w.stmt(node.X, mode, conditional, depth+1)
+	rightEntry := left
+	leftChanges := w.modeChanges([]*syntax.Stmt{node.X})
+	rightEntry.posixUnknown = rightEntry.posixUnknown || leftChanges.posixUnknown
+	rightEntry.braceUnknown = rightEntry.braceUnknown || leftChanges.braceUnknown
+	w.stmt(node.Y, rightEntry, false, depth+1)
+	out := mode
+	changes := w.modeChanges([]*syntax.Stmt{node.X, node.Y})
+	out.posixUnknown = out.posixUnknown || changes.posixUnknown
+	out.braceUnknown = out.braceUnknown || changes.braceUnknown
+	return out
+}
+
+func mergeShellModes(a, b shellModes) shellModes {
+	out := shellModes{posix: a.posix, brace: a.brace}
+	if a.posixUnknown || b.posixUnknown || a.posix != b.posix {
+		out.posix, out.posixUnknown = false, true
+	} else {
+		out.posix = a.posix
+	}
+	if a.braceUnknown || b.braceUnknown || a.brace != b.brace {
+		out.brace, out.braceUnknown = true, true
+	} else {
+		out.brace = a.brace
+	}
+	return out
+}
+
+func walkShellModeNode(node syntax.Node) bool {
+	switch n := node.(type) {
+	case *syntax.FuncDecl, *syntax.Subshell, *syntax.CmdSubst, *syntax.ProcSubst, *syntax.CoprocClause:
+		return false
+	case *syntax.Stmt:
+		return !n.Background
+	case *syntax.BinaryCmd:
+		return n.Op != syntax.Pipe && n.Op != syntax.PipeAll
+	default:
+		return true
+	}
+}
+
+func (t *modeTexts) functionModeMutation(body *syntax.Stmt, src string) shellModes {
+	var changes shellModes
+	syntax.Walk(body, func(node syntax.Node) bool {
+		if !walkShellModeNode(node) {
+			return false
+		}
+		if decl, ok := node.(*syntax.DeclClause); ok {
+			changes.posixUnknown = changes.posixUnknown || declarationSetsPosix(decl)
+			if decl.Variant != nil && decl.Variant.Value == "local" && localRestoresOptions(decl, src) {
+				changes.posixUnknown, changes.braceUnknown = true, true
+			}
+			return true
+		}
+		call, ok := node.(*syntax.CallExpr)
+		if !ok {
+			return true
+		}
+		mutation := t.callModeMutation(call, src)
+		changes.posixUnknown = changes.posixUnknown || mutation.posixUnknown
+		changes.braceUnknown = changes.braceUnknown || mutation.braceUnknown
+		return true
+	})
+	return changes
+}
+
+func localRestoresOptions(decl *syntax.DeclClause, src string) bool {
+	for _, assign := range decl.Args {
+		if assign.Naked && assign.Value != nil {
+			if value, ok := wordValue(assign.Value); ok && value == "-" {
+				return true
+			}
+			if unquotedText(assign.Value, src) == "-" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (t *modeTexts) shellModeChanges(stmts []*syntax.Stmt, src string) shellModes {
+	return t.shellModeChangesAt(stmts, src, 0)
+}
+
+// shellModeChangesAt is shellModeChanges for a text nested depth levels deep
+// in eval and trap texts.
+func (t *modeTexts) shellModeChangesAt(stmts []*syntax.Stmt, src string, depth int) shellModes {
+	var changes shellModes
+	for _, stmt := range stmts {
+		syntax.Walk(stmt, func(node syntax.Node) bool {
+			if !walkShellModeNode(node) {
+				return false
+			}
+			switch n := node.(type) {
+			case *syntax.CallExpr:
+				m := t.callModeMutationAt(n, src, depth)
+				changes.posixUnknown = changes.posixUnknown || m.posixUnknown
+				changes.braceUnknown = changes.braceUnknown || m.braceUnknown
+			case *syntax.DeclClause:
+				if declarationSetsPosix(n) {
+					changes.posixUnknown = true
+				}
+			}
+			return true
+		})
+	}
+	return changes
+}
+
+// shellModeChangesAnywhere reports a mode change in any part of the file,
+// subshells, substitutions and function bodies included.
+func (t *modeTexts) shellModeChangesAnywhere(file *syntax.File, src string) bool {
+	changed := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.CallExpr:
+			changed = changed || t.callModeMutation(n, src).any()
+		case *syntax.DeclClause:
+			changed = changed || declarationNamesPosix(n)
+		}
+		return !changed
+	})
+	return changed
+}
+
+func (w *shellModeWalker) modeChanges(stmts []*syntax.Stmt) shellModes {
+	changes := w.texts.shellModeChanges(stmts, w.src)
+	for _, stmt := range stmts {
+		syntax.Walk(stmt, func(node syntax.Node) bool {
+			if !walkShellModeNode(node) {
+				return false
+			}
+			call, ok := node.(*syntax.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			args, _, _ := wordValues(call.Args, w.src, nil, false)
+			if len(args) == 0 {
+				return true
+			}
+			effect := w.functionMutationEffects(commandName(args[0]))
+			changes.posixUnknown = changes.posixUnknown || effect.posixUnknown
+			changes.braceUnknown = changes.braceUnknown || effect.braceUnknown
+			return true
+		})
+	}
+	return changes
+}
+
+func (m shellModes) any() bool { return m.posixUnknown || m.braceUnknown }
+
+// declarationNamesPosix reports a declaration of POSIXLY_CORRECT by any
+// declaration command, a local one included.
+func declarationNamesPosix(decl *syntax.DeclClause) bool {
+	for _, assign := range decl.Args {
+		if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+			return true
+		}
+	}
+	return false
+}
+
+func declarationSetsPosix(decl *syntax.DeclClause) bool {
+	if decl.Variant == nil || !slices.Contains(declarationCommands[:], decl.Variant.Value) {
+		return false
+	}
+	if decl.Variant.Value == "local" || decl.Variant.Value == "declare" || decl.Variant.Value == "typeset" {
+		return false
+	}
+	for _, assign := range decl.Args {
+		if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *modeTexts) callModeMutation(call *syntax.CallExpr, src string) shellModes {
+	return t.callModeMutationAt(call, src, 0)
+}
+
+// callModeMutationAt is callModeMutation for a call nested depth levels deep in
+// eval and trap texts.
+func (t *modeTexts) callModeMutationAt(call *syntax.CallExpr, src string, depth int) shellModes {
+	args, _, _ := wordValues(call.Args, src, nil, false)
+	name, rest := unwrapSetCommand(args)
+	changes := mergeShellModes(optionCommandMutation(name, rest), dynamicModeArgs(name, call))
+	if name == "source" || name == "." {
+		changes.posixUnknown, changes.braceUnknown = true, true
+	}
+	if name == "trap" {
+		changes = t.mergeTrapActionMutation(changes, call, depth)
+	}
+	if name == "unset" && unsetPosixVariable(rest) {
+		changes.posixUnknown = true
+	}
+	if name == "eval" {
+		if literalText, literal := literalEvalText(call.Args); !literal {
+			changes.posixUnknown, changes.braceUnknown = true, true
+		} else {
+			nested := t.nestedTextModeChanges(literalText, depth)
+			changes.posixUnknown = changes.posixUnknown || nested.posixUnknown
+			changes.braceUnknown = changes.braceUnknown || nested.braceUnknown
+		}
+	}
+	if hasPosixEnvironment(call) && (len(call.Args) == 0 || posixPrefixAffectsShell(name)) {
+		changes.posixUnknown = true
+	}
+	if name == "unset" && unsetPosixVariable(rest) {
+		changes.posixUnknown = true
+	}
+	if len(call.Args) > 0 && !literalCommandName(call.Args[0]) {
+		changes.posixUnknown, changes.braceUnknown = true, true
+	}
+	return changes
+}
+
+// mergeTrapActionMutation adds the modes a trap action may change by its own
+// text; the functions it names count as calls of the trap command.
+func (t *modeTexts) mergeTrapActionMutation(changes shellModes, call *syntax.CallExpr, depth int) shellModes {
+	action, ok := trapAction(call)
+	if !ok {
+		changes.posixUnknown, changes.braceUnknown = true, true
+		return changes
+	}
+	nested := t.nestedTextModeChanges(action, depth)
+	changes.posixUnknown = changes.posixUnknown || nested.posixUnknown
+	changes.braceUnknown = changes.braceUnknown || nested.braceUnknown
+	return changes
+}
+
+// nestedTextModeChanges reports the modes an eval or trap text may change. A
+// text nested deeper than maxModeTextDepth is not read: each level holds the
+// next one, so reading them all costs time quadratic in the length. A text
+// read once keeps its answer for the other places it appears.
+func (t *modeTexts) nestedTextModeChanges(text string, depth int) shellModes {
+	if changes, ok := t.changes[text]; ok {
+		return changes
+	}
+	if depth >= maxModeTextDepth {
+		return shellModes{posixUnknown: true, braceUnknown: true}
+	}
+	var changes shellModes
+	if file, full, err := t.parse(text); err != nil {
+		changes = unknownModesForParseError(err)
+	} else {
+		changes = t.shellModeChangesAt(file.Stmts, full, depth+1)
+	}
+	t.changes[text] = changes
+	return changes
+}
+
+// maxModeTextDepth is how deep the mode walk follows eval texts inside eval
+// and trap texts; a deeper text leaves the mode unknown.
+const maxModeTextDepth = 8
+
+// modeTexts holds the eval and trap texts the mode walk has read, shared by
+// all scripts of one command line: a text nested in eval is parsed and scanned
+// once, not again at each level that holds it.
+type modeTexts struct {
+	parsed  map[string]parsedModeText
+	changes map[string]shellModes
+}
+
+type parsedModeText struct {
+	file *syntax.File
+	src  string
+	err  error
+}
+
+func newModeTexts() *modeTexts {
+	return &modeTexts{parsed: make(map[string]parsedModeText), changes: make(map[string]shellModes)}
+}
+
+func (t *modeTexts) parse(text string) (*syntax.File, string, error) {
+	if parsed, ok := t.parsed[text]; ok {
+		return parsed.file, parsed.src, parsed.err
+	}
+	file, full, err := parseShell(text)
+	t.parsed[text] = parsedModeText{file: file, src: full, err: err}
+	return file, full, err
+}
+
+// trapAction returns the literal action of a trap command; a query, a reset or
+// a missing action is an empty action.
+func trapAction(call *syntax.CallExpr) (string, bool) {
+	args := call.Args
+	for len(args) > 0 {
+		name, literal := wordValue(args[0])
+		if !literal {
+			return "", false
+		}
+		args = args[1:]
+		if commandName(name) == "trap" {
+			break
+		}
+	}
+	if len(args) > 0 {
+		if first, literal := wordValue(args[0]); literal && first == "--" {
+			args = args[1:]
+		}
+	}
+	if len(args) < 2 {
+		return "", true
+	}
+	action, literal := wordValue(args[0])
+	if !literal {
+		return "", false
+	}
+	if action == "-" || strings.HasPrefix(action, "-") {
+		return "", true
+	}
+	return action, true
+}
+
+// dynamicModeArgs reports the modes a set, shopt or unset command may change
+// through a word the parser cannot read: an option of set before its
+// positional arguments, any word of shopt, a name of unset.
+func dynamicModeArgs(name string, call *syntax.CallExpr) shellModes {
+	var unknown shellModes
+	if name != "set" && name != "shopt" && name != "unset" {
+		return unknown
+	}
+	command := false
+	for _, word := range call.Args {
+		value, literal := wordValue(word)
+		if !command {
+			command = literal && commandName(value) == name
+			continue
+		}
+		if literal {
+			if name == "set" && setOptionStopsAt(value) {
+				break
+			}
+			continue
+		}
+		unknown.posixUnknown = true
+		unknown.braceUnknown = unknown.braceUnknown || name != "unset"
+		break
+	}
+	return unknown
+}
+
+func optionCommandMutation(name string, rest []string) shellModes {
+	if name != "set" && name != "shopt" {
+		return shellModes{}
+	}
+	apply := applySetModes
+	if name == "shopt" {
+		apply = applyShoptModes
+	}
+	braceOn := apply(rest, shellModes{brace: true}, false)
+	braceOff := apply(rest, shellModes{brace: false}, false)
+	posixOn := apply(rest, shellModes{posix: true}, false)
+	posixOff := apply(rest, shellModes{posix: false}, false)
+	return shellModes{
+		posixUnknown: !posixOn.posix || posixOff.posix,
+		braceUnknown: !braceOn.brace || braceOff.brace,
+	}
+}
+
+func unknownModesForParseError(err error) shellModes {
+	if err == nil {
+		return shellModes{}
+	}
+	return shellModes{posixUnknown: true, braceUnknown: true}
+}
+
+func unwrapSetCommand(args []string) (string, []string) {
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "builtin":
+			i++
+		case "command":
+			i++
+			if i < len(args) && args[i] == "-p" {
+				i++
+			}
+		default:
+			if i < len(args) && args[i] == "--" {
+				i++
+			}
+			if i >= len(args) {
+				return "", nil
+			}
+			return commandName(args[i]), args[i+1:]
+		}
+	}
+	return "", nil
+}
+
+func unsetPosixVariable(args []string) bool {
+	functionsOnly := false
+	for i := range args {
+		arg := args[i]
+		if arg == "--" {
+			return !functionsOnly && slices.Contains(args[i+1:], "POSIXLY_CORRECT")
+		}
+		if strings.HasPrefix(arg, "-") && len(arg) > 1 {
+			for _, flag := range arg[1:] {
+				if flag == 'f' {
+					functionsOnly = true
+				} else if flag == 'v' {
+					functionsOnly = false
+				}
+			}
+			continue
+		}
+		if arg == "POSIXLY_CORRECT" {
+			return !functionsOnly
+		}
+	}
+	return false
+}
+
+func applySetModes(args []string, mode shellModes, conditional bool) shellModes {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if setOptionStopsAt(arg) {
+			break
+		}
+		mode, i = applySetOptionToken(args, i, mode, conditional)
+	}
+	return mode
+}
+
+func setOptionStopsAt(arg string) bool {
+	return arg == "--" || arg == "-" || strings.HasPrefix(arg, "--") || !strings.HasPrefix(arg, "+") && !strings.HasPrefix(arg, "-")
+}
+
+func applySetOptionToken(args []string, i int, mode shellModes, conditional bool) (shellModes, int) {
+	arg := args[i]
+	sign := arg[0] == '-'
+	if arg == "-o" || arg == "+o" {
+		return applyFollowingSetOption(args, i, sign, mode, conditional)
+	}
+	letters := arg[1:]
+	if strings.ContainsRune(letters, 'B') {
+		mode.brace, mode.braceUnknown = setShellMode(mode.brace, mode.braceUnknown, sign, conditional)
+	}
+	before, remainder, found := strings.Cut(letters, "o")
+	if !found {
+		return mode, i
+	}
+	if before != "" && (remainder == "posix" || remainder == "braceexpand") {
+		return applyNamedSetOption(remainder, sign, mode, conditional), i
+	}
+	if remainder == "" || onlySetOptionLetters(remainder) {
+		return applyFollowingSetOption(args, i, sign, mode, conditional)
+	}
+	return mode, i
+}
+
+func applyFollowingSetOption(args []string, i int, sign bool, mode shellModes, conditional bool) (shellModes, int) {
+	if i+1 >= len(args) {
+		return mode, i
+	}
+	return applyNamedSetOption(args[i+1], sign, mode, conditional), i + 1
+}
+
+func onlySetOptionLetters(s string) bool {
+	return strings.Trim(s, "abefhkmnptuvxBCEHPT") == ""
+}
+
+func applyNamedSetOption(name string, enable bool, mode shellModes, conditional bool) shellModes {
+	switch name {
+	case "posix":
+		mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, enable, conditional)
+	case "braceexpand":
+		mode.brace, mode.braceUnknown = setShellMode(mode.brace, mode.braceUnknown, enable, conditional)
+	}
+	return mode
+}
+
+func applyShoptModes(args []string, mode shellModes, conditional bool) shellModes {
+	enable, optionMode, operation := true, false, false
+	for i := range args {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			for _, flag := range arg[1:] {
+				switch flag {
+				case 's':
+					enable = true
+					operation = true
+				case 'u':
+					enable = false
+					operation = true
+				case 'o':
+					optionMode = true
+				}
+			}
+			continue
+		}
+		if operation && optionMode && arg == "posix" {
+			mode.posix, mode.posixUnknown = setShellMode(mode.posix, mode.posixUnknown, enable, conditional)
+		}
+		if operation && optionMode && arg == "braceexpand" {
+			mode.brace, mode.braceUnknown = setShellMode(mode.brace, mode.braceUnknown, enable, conditional)
+		}
+	}
+	return mode
 }
 
 func (info *walkInfo) collectTopLevelCalls(file *syntax.File) {
@@ -1915,7 +3284,8 @@ func coprocCommandReadsStdin(call *syntax.CallExpr, src string, vars map[string]
 		return false, err
 	}
 	read, eval := false, false
-	for _, nested := range inner {
+	for i := range inner {
+		nested := &inner[i]
 		read = read || nested.Name == "read" || nested.Name == "mapfile" || nested.Name == "readarray"
 		eval = eval || nested.Name == "eval"
 	}
@@ -2268,7 +3638,11 @@ func (w *callWalker) addTime(clause *syntax.TimeClause) {
 
 func (w *callWalker) visitStmt(stmt *syntax.Stmt) {
 	if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(stmt.Redirs) > 0 {
-		w.info.redirs[call] = stmtRedirs(stmt.Redirs, w.src)
+		braceMode, known := w.info.braceCalls[call]
+		if !known {
+			braceMode = true
+		}
+		w.info.redirs[call] = stmtRedirs(stmt.Redirs, w.src, braceMode, w.info.unknownBrace[call])
 
 	}
 }
@@ -2314,8 +3688,10 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 			}
 		}
 	}
-	ws := splitWords(words, split)
-	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
+	ws, tildeArgs := markedCallWords(call, words, split, w.src, w.info, w.budget.initialPosix)
+	posixEnv := hasPosixEnvironment(call)
+	mode := shellModes{posix: w.info.posixCalls[call], posixUnknown: w.info.unknownPosix[call], brace: w.info.braceCalls[call], braceUnknown: w.info.unknownBrace[call]}
+	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
 	for _, part := range call.Args[0].Parts {
 		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
 			c.call.Name = ""
@@ -2332,6 +3708,57 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		w.parseErr = err
 		return
 	}
+}
+
+func markedCallWords(call *syntax.CallExpr, words []word, split int, src string, info *walkInfo, initialPosix bool) ([]word, []Tilde) {
+	posix, ok := info.posixCalls[call]
+	if !ok {
+		posix = initialPosix
+	}
+	braceExpand, ok := info.braceCalls[call]
+	if !ok {
+		braceExpand = true
+	}
+	for i := 1; i < len(call.Args); i++ {
+		words[i].tilde = wordTildeWithMode(call.Args[i], src, false, true, posix, braceExpand, info.unknownPosix[call], info.unknownBrace[call])
+	}
+	ws := splitWords(words, split)
+	marks := make([]Tilde, len(ws)-1)
+	for i := 1; i < len(ws); i++ {
+		marks[i-1] = ws[i].tilde
+	}
+	if !slices.ContainsFunc(marks, func(mark Tilde) bool { return mark != 0 }) {
+		marks = nil
+	}
+	return ws, marks
+}
+
+func wordTildeWithMode(word *syntax.Word, src string, assignment, argumentAssignment, posix, braceExpand, posixUnknown, braceUnknown bool) Tilde {
+	basePosix := posix && !posixUnknown
+	baseBrace := braceExpand || braceUnknown
+	base := wordTildeOptions(word, src, assignment, argumentAssignment, basePosix, baseBrace)
+	if posixUnknown {
+		alternate := wordTildeOptions(word, src, assignment, argumentAssignment, true, baseBrace)
+		if alternate != base {
+			base |= TildeModeUnknown
+		}
+	}
+	if braceUnknown {
+		alternate := wordTildeOptions(word, src, assignment, argumentAssignment, basePosix, false)
+		if alternate != base&^TildeModeUnknown {
+			base |= TildeModeUnknown
+		}
+	}
+	return base
+}
+
+func hasPosixEnvironment(call *syntax.CallExpr) bool {
+	for _, assign := range call.Assigns {
+		if assign.Name != nil && assign.Name.Value == "POSIXLY_CORRECT" {
+			return true
+		}
+	}
+	return false
 }
 
 func collectCallContextNode(node syntax.Node, info *walkInfo) {
@@ -2526,6 +3953,710 @@ func assignValue(assign *syntax.Assign, src string) string {
 		value = unquotedText(assign.Value, src)
 	}
 	return value
+}
+
+// tildeChar is one source byte together with the context that controls expansion.
+type tildeChar struct {
+	b        byte
+	eligible bool
+	dynamic  bool
+	offset   int
+}
+
+func wordTilde(word *syntax.Word, src string, assignment, argumentAssignment, posix bool) Tilde {
+	return wordTildeOptions(word, src, assignment, argumentAssignment, posix, true)
+}
+
+func wordTildeOptions(word *syntax.Word, src string, assignment, argumentAssignment, posix, braceExpand bool) Tilde {
+	if word == nil {
+		return 0
+	}
+	chars := make([]tildeChar, 0, len(word.Parts)*4)
+	var nested Tilde
+	for _, part := range word.Parts {
+		partChars, partNested := tildePartCharsMode(part, src, assignment, posix)
+		chars = append(chars, partChars...)
+		nested |= partNested
+	}
+	argAssign := false
+	if argumentAssignment {
+		chars, argAssign = assignmentArgumentTilde(word, src, chars, posix)
+		assignment = argAssign
+	}
+	if braceExpand && argAssign && assignmentTildeBeforeBrace(word, src, chars) {
+		return nested
+	}
+	if braceExpand && argAssign && wordHasBraceExpansion(word) {
+		return nested
+	}
+	braceExpand = braceExpand && !assignment && !argAssign
+	return nested | scanTildeWord(word, src, chars, assignment, braceExpand)
+}
+
+func wordHasBraceExpansion(word *syntax.Word) bool {
+	if word == nil {
+		return false
+	}
+	_, split := splitBraces(word)
+	return split
+}
+
+// Bytes that stand for the braces of a group syntax.SplitBraces would return to
+// literal text; splitBraces turns them back into braces after the split.
+const (
+	literalLeftBrace  = '\x01'
+	literalRightBrace = '\x02'
+)
+
+// splitBraces is syntax.SplitBraces on a copy of word in linear time. SplitBraces
+// copies the parts of a group without a separator, or of an unclosed one, into
+// the enclosing element, so nested groups cost the square of their depth; their
+// braces are hidden from it as literalLeftBrace and literalRightBrace first.
+func splitBraces(word *syntax.Word) (syntax.Word, bool) {
+	copyWord := *word
+	copyWord.Parts = slices.Clone(word.Parts)
+	literal := literalBraceGroups(word.Parts)
+	if literal != nil {
+		for i, offsets := range literal {
+			part, ok := copyWord.Parts[i].(*syntax.Lit)
+			if !ok {
+				continue
+			}
+			lit := *part
+			value := []byte(lit.Value)
+			for _, j := range offsets {
+				if value[j] == '{' {
+					value[j] = literalLeftBrace
+				} else {
+					value[j] = literalRightBrace
+				}
+			}
+			lit.Value = string(value)
+			copyWord.Parts[i] = &lit
+		}
+	}
+	split := syntax.SplitBraces(&copyWord)
+	if literal != nil {
+		restoreLiteralBraces(copyWord.Parts)
+	}
+	return copyWord, split
+}
+
+func restoreLiteralBraces(parts []syntax.WordPart) {
+	restore := strings.NewReplacer(string(rune(literalLeftBrace)), "{", string(rune(literalRightBrace)), "}")
+	var walk func(parts []syntax.WordPart)
+	walk = func(parts []syntax.WordPart) {
+		for i, part := range parts {
+			switch p := part.(type) {
+			case *syntax.Lit:
+				if strings.ContainsAny(p.Value, string([]byte{literalLeftBrace, literalRightBrace})) {
+					lit := *p
+					lit.Value = restore.Replace(p.Value)
+					parts[i] = &lit
+				}
+			case *syntax.BraceExp:
+				for _, elem := range p.Elems {
+					walk(elem.Parts)
+				}
+			}
+		}
+	}
+	walk(parts)
+}
+
+// literalBraceGroups finds, as syntax.SplitBraces pairs them, the braces of the
+// groups it would return to literal text: a group without a comma or a `..` at
+// its own level and a group never closed. It returns the byte offsets by part
+// index, or nil when there are none or a Lit already holds a stand-in byte.
+func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
+	type position struct{ part, index int }
+	type group struct {
+		open      position
+		separated bool
+	}
+	var open []group
+	var literal []position
+	for i, part := range parts {
+		lit, ok := part.(*syntax.Lit)
+		if !ok {
+			continue
+		}
+		if strings.ContainsAny(lit.Value, string([]byte{literalLeftBrace, literalRightBrace})) {
+			return nil
+		}
+		value := lit.Value
+		for j := 0; j < len(value); j++ {
+			switch value[j] {
+			case '\\':
+				j++
+			case '{':
+				open = append(open, group{open: position{i, j}})
+			case ',':
+				if len(open) > 0 {
+					open[len(open)-1].separated = true
+				}
+			case '.':
+				// A `..` separates a sequence; after a comma it is literal, but
+				// the group is separated already.
+				if len(open) > 0 && j+1 < len(value) && value[j+1] == '.' {
+					open[len(open)-1].separated = true
+				}
+			case '}':
+				if len(open) == 0 {
+					continue
+				}
+				top := open[len(open)-1]
+				open = open[:len(open)-1]
+				if !top.separated {
+					literal = append(literal, top.open, position{i, j})
+				}
+			}
+		}
+	}
+	for _, unclosed := range open {
+		literal = append(literal, unclosed.open)
+	}
+	if len(literal) == 0 {
+		return nil
+	}
+	byPart := make(map[int][]int)
+	for _, p := range literal {
+		byPart[p.part] = append(byPart[p.part], p.index)
+	}
+	return byPart
+}
+
+func assignmentTildeBeforeBrace(word *syntax.Word, src string, chars []tildeChar) bool {
+	if _, split := splitBraces(word); !split {
+		return false
+	}
+	tilde := len(src) + 1
+	for _, ch := range chars {
+		if ch.b == '~' && ch.eligible {
+			tilde = ch.offset
+			break
+		}
+	}
+	if tilde > len(src) {
+		return false
+	}
+	for _, ch := range chars {
+		if ch.b == '{' && ch.eligible && ch.offset > tilde {
+			return true
+		}
+	}
+	return false
+}
+
+func assignmentTildeInsideBrace(word *syntax.Word, src string) bool {
+	copyWord, split := splitBraces(word)
+	if !split {
+		return false
+	}
+	var tildeOffsets []int
+	for _, part := range word.Parts {
+		chars, _ := tildePartCharsMode(part, src, true, false)
+		for _, ch := range chars {
+			if ch.b == '~' && ch.eligible {
+				tildeOffsets = append(tildeOffsets, ch.offset)
+			}
+		}
+	}
+	return braceContainsAnyOffset(copyWord.Parts, tildeOffsets)
+}
+
+func braceContainsAnyOffset(parts []syntax.WordPart, offsets []int) bool {
+	for _, part := range parts {
+		brace, ok := part.(*syntax.BraceExp)
+		if !ok {
+			continue
+		}
+		lo, hi := int(brace.Pos().Offset()), int(brace.End().Offset())
+		for _, offset := range offsets {
+			if offset >= lo && offset < hi {
+				return true
+			}
+		}
+		for _, elem := range brace.Elems {
+			if braceContainsAnyOffset(elem.Parts, offsets) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func tildePartCharsMode(part syntax.WordPart, src string, assignment, posix bool) ([]tildeChar, Tilde) {
+	switch p := part.(type) {
+	case *syntax.Lit:
+		return tildeSourceSpan(p, src, true), 0
+	case *syntax.SglQuoted:
+		return tildeSourceSpan(part, src, false), 0
+	case *syntax.DblQuoted:
+		var nested Tilde
+		for _, child := range p.Parts {
+			if param, ok := child.(*syntax.ParamExp); ok && param.Repl != nil && param.Repl.With != nil {
+				nested |= wordTilde(param.Repl.With, src, false, false, posix)
+			}
+		}
+		return tildeSourceSpan(part, src, false), nested
+	case *syntax.ParamExp:
+		var nested Tilde
+		if p.Exp != nil && p.Exp.Word != nil {
+			nested = wordTilde(p.Exp.Word, src, assignment, false, posix)
+		}
+		if p.Repl != nil && p.Repl.With != nil {
+			nested |= wordTilde(p.Repl.With, src, false, false, posix)
+		}
+		return []tildeChar{{b: '$', eligible: false, dynamic: true, offset: int(p.Pos().Offset())}}, nested
+	case *syntax.ExtGlob:
+		// A pattern is no user name: inside a tilde prefix it keeps the tilde.
+		chars := tildeSourceSpan(part, src, true)
+		for i := range chars {
+			chars[i].dynamic = true
+		}
+		return chars, 0
+	case *syntax.CmdSubst, *syntax.ProcSubst, *syntax.ArithmExp:
+		return []tildeChar{{b: '$', eligible: false, dynamic: true, offset: int(part.Pos().Offset())}}, 0
+	default:
+		return tildeSourceSpan(part, src, false), 0
+	}
+}
+
+// scanTildeWord asks syntax.SplitBraces for Bash brace alternatives, then scans
+// their paths with a bounded set of states instead of constructing their products.
+func scanTildeWord(word *syntax.Word, src string, chars []tildeChar, assignment, braceExpand bool) Tilde {
+	if !slices.ContainsFunc(chars, func(ch tildeChar) bool { return ch.b == '~' }) {
+		return 0
+	}
+	if !braceExpand {
+		return scanTildeCharsMode(chars, assignment)
+	}
+	if !hasBraceListExpansion(chars) {
+		return scanTildeCharsMode(chars, assignment)
+	}
+	if !assignment && !braceExpansionCanAffectLeadingTilde(chars) {
+		return scanTildeCharsMode(chars, assignment)
+	}
+	copyWord, split := splitBraces(word)
+	if !split {
+		return scanTildeCharsMode(chars, assignment)
+	}
+	states := scanTildePartsFrom(copyWord.Parts, src, assignment, map[tildeScanState]struct{}{{start: true}: {}})
+	return tildeStatesMarks(states)
+}
+
+func hasBraceListExpansion(chars []tildeChar) bool {
+	commaAtDepth := make([]bool, 0, 8)
+	for i := 0; i < len(chars); i++ {
+		ch, skip := consumeTildeChar(chars, &i)
+		if skip || !ch.eligible {
+			continue
+		}
+		switch ch.b {
+		case '{':
+			commaAtDepth = append(commaAtDepth, false)
+		case ',':
+			if len(commaAtDepth) > 0 {
+				commaAtDepth[len(commaAtDepth)-1] = true
+			}
+		case '}':
+			if len(commaAtDepth) > 0 {
+				hasComma := commaAtDepth[len(commaAtDepth)-1]
+				commaAtDepth = commaAtDepth[:len(commaAtDepth)-1]
+				if hasComma {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// braceExpansionCanAffectLeadingTilde reports whether a brace list can expose
+// a tilde at a word start. A literal prefix, or a terminated tilde prefix,
+// makes later braces irrelevant to tilde expansion.
+func braceExpansionCanAffectLeadingTilde(chars []tildeChar) bool {
+	i := 0
+	for i < len(chars) {
+		ch, skip := consumeTildeChar(chars, &i)
+		if skip {
+			i++
+			continue
+		}
+		if ch.b == '~' && ch.eligible {
+			return braceFollowsTildePrefix(chars, i+1)
+		}
+		if ch.b == '{' && ch.eligible {
+			return !leadingBraceIsLiteral(chars)
+		}
+		return false
+	}
+	return false
+}
+
+func braceFollowsTildePrefix(chars []tildeChar, i int) bool {
+	for i < len(chars) {
+		prefix, continued := consumeTildeChar(chars, &i)
+		if continued {
+			i++
+			continue
+		}
+		if !prefix.eligible || strings.ContainsRune("\\$`'\"", rune(prefix.b)) || prefix.b == '/' || prefix.b == ':' {
+			return false
+		}
+		if prefix.b == '{' {
+			return true
+		}
+		i++
+	}
+	return false
+}
+
+// leadingBraceIsLiteral recognizes a leading singleton brace group without
+// flattening its nested parts through syntax.SplitBraces.
+func leadingBraceIsLiteral(chars []tildeChar) bool {
+	first := 0
+	for first < len(chars) {
+		ch, skip := consumeTildeChar(chars, &first)
+		if skip {
+			first++
+			continue
+		}
+		if ch.b != '{' || !ch.eligible {
+			return false
+		}
+		break
+	}
+	if first >= len(chars) {
+		return false
+	}
+	depth, rootComma := 0, false
+	for i := first; i < len(chars); i++ {
+		ch, skip := consumeTildeChar(chars, &i)
+		if skip {
+			continue
+		}
+		if !ch.eligible {
+			continue
+		}
+		switch ch.b {
+		case '{':
+			depth++
+		case ',':
+			if depth == 1 {
+				rootComma = true
+			}
+		case '}':
+			depth--
+			if depth == 0 {
+				return !rootComma
+			}
+		}
+	}
+	return depth > 0
+}
+
+func tildeStatesMarks(states map[tildeScanState]struct{}) Tilde {
+	var marks Tilde
+	for state := range states {
+		marks |= state.marks | finishTildePrefix(state)
+	}
+	return marks
+}
+
+type tildeScanState struct {
+	start           bool
+	colon           bool
+	pending         uint8
+	prefixKind      uint8
+	prefixDelimited bool
+	prefixInvalid   bool
+	marks           Tilde
+}
+
+func scanTildePartsFrom(parts []syntax.WordPart, src string, assignment bool, states map[tildeScanState]struct{}) map[tildeScanState]struct{} {
+	for _, part := range parts {
+		if !assignment {
+			if brace, ok := part.(*syntax.BraceExp); ok && tildeStatesPastStart(states) && bracePrefixSafe(brace) {
+				continue
+			}
+		}
+		switch p := part.(type) {
+		case *syntax.BraceExp:
+			states = scanTildeBraceStates(states, p, src, assignment)
+		case *syntax.Lit:
+			states = scanTildeText(states, tildeValueChars(p.Value), assignment)
+		default:
+			chars, nested := tildePartCharsMode(part, src, assignment, false)
+			states = scanTildeText(states, chars, assignment)
+			if nested != 0 {
+				marked := make(map[tildeScanState]struct{}, len(states))
+				for state := range states {
+					state.marks |= nested
+					marked[state] = struct{}{}
+				}
+				states = marked
+			}
+		}
+	}
+	return states
+}
+
+func tildeStatesPastStart(states map[tildeScanState]struct{}) bool {
+	for state := range states {
+		if state.start || state.pending != 0 && state.prefixKind != 2 {
+			return false
+		}
+	}
+	return true
+}
+
+func bracePrefixSafe(brace *syntax.BraceExp) bool {
+	for _, elem := range brace.Elems {
+		for _, part := range elem.Parts {
+			lit, ok := part.(*syntax.Lit)
+			if !ok {
+				return false
+			}
+			for i := 0; i < len(lit.Value); i++ {
+				if strings.ContainsRune("\\$`'\"", rune(lit.Value[i])) {
+					return false
+				}
+				if lit.Value[i] == '\\' {
+					i++
+				}
+			}
+		}
+	}
+	return true
+}
+
+func tildeValueChars(value string) []tildeChar {
+	chars := make([]tildeChar, len(value))
+	for i := range value {
+		chars[i] = tildeChar{b: value[i], eligible: true}
+	}
+	return chars
+}
+
+func scanTildeBraceStates(states map[tildeScanState]struct{}, brace *syntax.BraceExp, src string, assignment bool) map[tildeScanState]struct{} {
+	next := make(map[tildeScanState]struct{})
+	for state := range states {
+		for _, elem := range brace.Elems {
+			branch := scanTildePartsFrom(elem.Parts, src, assignment, map[tildeScanState]struct{}{state: {}})
+			for result := range branch {
+				next[result] = struct{}{}
+			}
+		}
+	}
+	return next
+}
+
+func scanTildeText(states map[tildeScanState]struct{}, chars []tildeChar, assignment bool) map[tildeScanState]struct{} {
+	return scanTildeTextMode(states, chars, assignment)
+}
+
+func scanTildeTextMode(states map[tildeScanState]struct{}, chars []tildeChar, assignment bool) map[tildeScanState]struct{} {
+	if len(states) == 1 {
+		var state tildeScanState
+		for candidate := range states {
+			state = candidate
+			break
+		}
+		state = scanTildeCharsState(state, chars, assignment)
+		return map[tildeScanState]struct{}{state: {}}
+	}
+	next := make(map[tildeScanState]struct{}, len(states))
+	for i := 0; i < len(chars); i++ {
+		ch, skip := consumeTildeChar(chars, &i)
+		if skip {
+			continue
+		}
+		clear(next)
+		for state := range states {
+			next[advanceTildeScan(state, ch, assignment)] = struct{}{}
+		}
+		states, next = next, states
+	}
+	return states
+}
+
+func advanceTildeScan(state tildeScanState, ch tildeChar, assignment bool) tildeScanState {
+	if state.pending != 0 {
+		state = advanceTildePrefix(state, ch, assignment)
+	}
+	if state.pending == 0 && ch.b == '~' && ch.eligible && (state.start || assignment && state.colon) {
+		state.pending = 1
+		state.prefixKind = 0
+		state.prefixDelimited = false
+		state.prefixInvalid = false
+	}
+	state.start = false
+	state.colon = assignment && ch.b == ':' && ch.eligible
+	return state
+}
+
+func advanceTildePrefix(state tildeScanState, ch tildeChar, assignment bool) tildeScanState {
+	if ch.b == '/' && ch.eligible {
+		state.marks |= finishTildePrefix(state)
+		return clearTildePrefix(state)
+	}
+	if ch.b == ':' && ch.eligible && !state.prefixDelimited {
+		if state.prefixKind == 0 {
+			state.prefixKind = 1
+		}
+		if assignment {
+			state.marks |= finishTildePrefix(state)
+			return clearTildePrefix(state)
+		}
+		state.prefixDelimited = true
+		return state
+	}
+	if ch.dynamic {
+		if !state.prefixDelimited {
+			state.prefixInvalid = true
+		}
+		return state
+	}
+	if !ch.eligible || strings.ContainsRune("\\$`'\"", rune(ch.b)) || !state.prefixDelimited && strings.ContainsRune("{}", rune(ch.b)) {
+		state.prefixInvalid = true
+		return state
+	}
+	if !state.prefixDelimited && state.prefixKind == 0 {
+		state.prefixKind = 2
+	}
+	return state
+}
+
+func finishTildePrefix(state tildeScanState) Tilde {
+	if state.pending == 0 || state.prefixInvalid {
+		return 0
+	}
+	if state.prefixKind == 2 {
+		return TildeOther
+	}
+	return TildeHome
+}
+
+func clearTildePrefix(state tildeScanState) tildeScanState {
+	state.pending = 0
+	state.prefixKind = 0
+	state.prefixDelimited = false
+	state.prefixInvalid = false
+	return state
+}
+
+func tildeSourceSpan(node syntax.Node, src string, eligible bool) []tildeChar {
+	lo, hi := int(node.Pos().Offset()), int(node.End().Offset())
+	if !validSpan(src, lo, hi) {
+		return nil
+	}
+	chars := make([]tildeChar, hi-lo)
+	for i := lo; i < hi; i++ {
+		chars[i-lo] = tildeChar{b: src[i], eligible: eligible, offset: i}
+	}
+	return chars
+}
+
+func assignmentArgumentTilde(word *syntax.Word, src string, chars []tildeChar, posix bool) ([]tildeChar, bool) {
+	lo, hi := int(word.Pos().Offset()), int(word.End().Offset())
+	if !validSpan(src, lo, hi) {
+		return chars, false
+	}
+	raw := src[lo:hi]
+	eq := strings.IndexByte(raw, '=')
+	if eq <= 0 {
+		return chars, false
+	}
+	nameEnd := eq
+	if raw[eq-1] == '+' {
+		nameEnd--
+	}
+	if !validArgumentAssignName(raw[:nameEnd]) || posix {
+		return chars, false
+	}
+	valueOffset := lo + eq + 1
+	index := len(chars)
+	for i, ch := range chars {
+		if ch.offset >= valueOffset {
+			index = i
+			break
+		}
+	}
+	if index == len(chars) && eq+1 < len(chars) {
+		index = eq + 1
+	}
+	return chars[index:], true
+}
+
+func validArgumentAssignName(name string) bool {
+	if i := strings.IndexByte(name, '['); i >= 0 {
+		if i == 0 || !validShellName(name[:i]) || !balancedArrayName(name[i:]) {
+			return false
+		}
+		return !strings.ContainsRune(name[i+1:len(name)-1], '=')
+	}
+	return validShellName(name)
+}
+
+func balancedArrayName(name string) bool {
+	depth := 0
+	for i, r := range name {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth < 0 || depth == 0 && i != len(name)-1 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+func scanTildeCharsMode(chars []tildeChar, assignment bool) Tilde {
+	state := scanTildeCharsState(tildeScanState{start: true}, chars, assignment)
+	return state.marks | finishTildePrefix(state)
+}
+
+func scanTildeCharsState(state tildeScanState, chars []tildeChar, assignment bool) tildeScanState {
+	for i := 0; i < len(chars); i++ {
+		ch, skip := consumeTildeChar(chars, &i)
+		if skip {
+			continue
+		}
+		state = advanceTildeScan(state, ch, assignment)
+	}
+	return state
+}
+
+func consumeTildeChar(chars []tildeChar, index *int) (tildeChar, bool) {
+	ch := chars[*index]
+	if ch.b != '\\' || !ch.eligible || *index+1 >= len(chars) {
+		return ch, false
+	}
+	*index++
+	ch = chars[*index]
+	if ch.b == '\n' {
+		return ch, true
+	}
+	ch.eligible = false
+	return ch, false
+}
+
+func validShellName(name string) bool {
+	if name == "" || !(name[0] == '_' || name[0] >= 'A' && name[0] <= 'Z' || name[0] >= 'a' && name[0] <= 'z') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if !(c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func commandName(name string) string {
@@ -2728,9 +4859,12 @@ func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inh
 			line = int(redir.Hdoc.Pos().Line()) + lineBase - 1
 		}
 		first := len(*calls)
+		args := shellStmtArgs(call, src, vars)
+		restoreMode := setNestedShellMode(budget, name, args)
 		if err := parseNestedMapped(body, line, via, loopCalls[call], backgroundCalls[call], vars, calls, budget); err != nil {
 			nestedErrs = append(nestedErrs, err)
 		}
+		restoreMode()
 		preserveMappedRaw(*calls, first, body, src)
 	}
 	return errors.Join(nestedErrs...)
@@ -2785,7 +4919,10 @@ func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherite
 		via = append(via, input.name)
 		call, _ := input.shell.Cmd.(*syntax.CallExpr)
 		first := len(*calls)
+		args := shellStmtArgs(call, src, vars)
+		restoreMode := setNestedShellMode(budget, input.name, args)
 		err := parseNestedWithBudget(body.String(), body.pos, lineBase, via, loopCalls[call], backgroundCalls[call], vars, calls, budget)
+		restoreMode()
 		for i := first; i < len(*calls); i++ {
 			offset := (*calls)[i].Offset
 			if validSpan(src, offset, offset) {
@@ -2804,6 +4941,30 @@ func parsePipedHeredocs(piped []pipedHeredoc, src string, lineBase int, inherite
 	return errors.Join(nestedErrs...)
 }
 
+func shellStmtArgs(call *syntax.CallExpr, src string, vars map[string]string) []string {
+	if call == nil {
+		return nil
+	}
+	values, _, _ := wordValues(call.Args, src, vars, false)
+	if len(values) > 1 {
+		return values[1:]
+	}
+	return nil
+}
+
+func setNestedShellMode(budget *nestedParseBudget, name string, args []string) func() {
+	previousPosix, previousBrace := budget.initialPosix, budget.initialBrace
+	previousPosixUnknown, previousBraceUnknown := budget.initialPosixUnknown, budget.initialBraceUnknown
+	end := envCommandStart(args, 0)
+	budget.initialPosix = name == "sh" || shellArgsEnablePosix(args) || envHasPosixCorrect(args[:end])
+	budget.initialBrace = shellArgsEnableBrace(args)
+	budget.initialPosixUnknown, budget.initialBraceUnknown = false, false
+	return func() {
+		budget.initialPosix, budget.initialBrace = previousPosix, previousBrace
+		budget.initialPosixUnknown, budget.initialBraceUnknown = previousPosixUnknown, previousBraceUnknown
+	}
+}
+
 // dedupePipedAlternatives объединяет одинаковые вызовы двух вариантов stdout,
 // сохраняя кратность и различия в перенаправлениях и контексте.
 func dedupePipedAlternatives(calls *[]Call, first, second int) {
@@ -2812,25 +4973,28 @@ func dedupePipedAlternatives(calls *[]Call, first, second int) {
 		return callIdentity{name: call.Name, offset: call.Offset, hash: hashCallParts(hash, call.Via)}
 	}
 	previous := make(map[callIdentity][]Call)
-	for _, call := range (*calls)[first:second] {
-		id := key(call)
-		previous[id] = append(previous[id], call)
+	for i := first; i < second; i++ {
+		call := &(*calls)[i]
+		id := key(*call)
+		previous[id] = append(previous[id], *call)
 	}
 	kept := (*calls)[:second]
-	for _, call := range (*calls)[second:] {
-		id := key(call)
+	for i := second; i < len(*calls); i++ {
+		call := &(*calls)[i]
+		id := key(*call)
 		matches := previous[id]
 		duplicate := false
-		for i, match := range matches {
-			if sameCall(match, call) && match.Line == call.Line && match.Loop == call.Loop && match.Background == call.Background && match.ScriptInput == call.ScriptInput && slices.Equal(match.Redirs, call.Redirs) {
-				matches[i] = matches[len(matches)-1]
+		for j := range matches {
+			match := &matches[j]
+			if sameCall(*match, *call) && match.Line == call.Line && match.Loop == call.Loop && match.Background == call.Background && match.ScriptInput == call.ScriptInput && slices.Equal(match.Redirs, call.Redirs) {
+				matches[j] = matches[len(matches)-1]
 				previous[id] = matches[:len(matches)-1]
 				duplicate = true
 				break
 			}
 		}
 		if !duplicate {
-			kept = append(kept, call)
+			kept = append(kept, *call)
 		}
 	}
 	*calls = kept
@@ -3796,7 +5960,7 @@ func outerSpan(start, end int, pos []int) (int, int) {
 }
 
 // stmtRedirs — перенаправления команды с телами heredoc и их границами в src.
-func stmtRedirs(rs []*syntax.Redirect, src string) []Redir {
+func stmtRedirs(rs []*syntax.Redirect, src string, braceMode, braceUnknown bool) []Redir {
 	out := make([]Redir, 0, len(rs))
 	for _, r := range rs {
 		red := Redir{Op: r.Op.String(), BodyStart: -1, BodyEnd: -1}
@@ -3804,6 +5968,9 @@ func stmtRedirs(rs []*syntax.Redirect, src string) []Redir {
 			red.N = r.N.Value
 		}
 		if r.Word != nil {
+			if red.Op != "<<" && red.Op != "<<-" {
+				red.Tilde = redirectionWordTilde(r.Word, src, red.Op, braceMode, braceUnknown)
+			}
 			if value, literal := wordValue(r.Word); literal {
 				red.Target = value
 			} else {
@@ -3820,6 +5987,85 @@ func stmtRedirs(rs []*syntax.Redirect, src string) []Redir {
 		out = append(out, red)
 	}
 	return out
+}
+
+func redirectionWordTilde(word *syntax.Word, src, op string, braceMode, braceUnknown bool) Tilde {
+	if op != "<<<" && braceUnknown {
+		base := redirectionWordTildeMode(word, src, op, braceMode)
+		alternate := redirectionWordTildeMode(word, src, op, !braceMode)
+		if alternate != base {
+			base |= TildeModeUnknown
+		}
+		return base
+	}
+	return redirectionWordTildeMode(word, src, op, braceMode)
+}
+
+func redirectionWordTildeMode(word *syntax.Word, src, op string, braceMode bool) Tilde {
+	if op != "<<<" && braceMode {
+		if copyWord, split := splitBraces(word); split && braceWordCount(copyWord.Parts) != 1 {
+			return 0
+		}
+	}
+	return wordTildeWithMode(word, src, op == "<<<", false, false, braceMode && op != "<<<", false, false)
+}
+
+func braceWordCount(parts []syntax.WordPart) int {
+	return braceWordCountWithContext(parts, false)
+}
+
+func braceWordCountWithContext(parts []syntax.WordPart, inherited bool) int {
+	present := make([]bool, len(parts))
+	for i, part := range parts {
+		present[i] = wordHasPresence([]syntax.WordPart{part})
+	}
+	prefix, suffix := make([]bool, len(parts)+1), make([]bool, len(parts)+1)
+	for i := range parts {
+		prefix[i+1] = prefix[i] || present[i]
+	}
+	for i := len(parts) - 1; i >= 0; i-- {
+		suffix[i] = suffix[i+1] || present[i]
+	}
+	count := 1
+	for index, part := range parts {
+		factor := 1
+		if brace, ok := part.(*syntax.BraceExp); ok {
+			factor = 0
+			around := inherited
+			around = around || prefix[index] || suffix[index+1]
+			for _, elem := range brace.Elems {
+				if around || wordHasPresence(elem.Parts) {
+					factor = min(2, factor+braceWordCountWithContext(elem.Parts, around))
+				}
+			}
+		}
+		count = min(2, count*factor)
+	}
+	return count
+}
+
+func wordHasPresence(parts []syntax.WordPart) bool {
+	for _, part := range parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			if p.Value != "" {
+				return true
+			}
+		case *syntax.SglQuoted, *syntax.DblQuoted:
+			return true
+		case *syntax.ParamExp, *syntax.CmdSubst, *syntax.ProcSubst, *syntax.ArithmExp:
+			return true
+		case *syntax.BraceExp:
+			for _, elem := range p.Elems {
+				if wordHasPresence(elem.Parts) {
+					return true
+				}
+			}
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // heredocBodyLen — длина тела heredoc: разбор отдаёт его вместе со строкой ограничителя.
@@ -4291,9 +6537,27 @@ func wordValue(w *syntax.Word) (string, bool) {
 
 // sub — вызов программы из слова i командной строки c (i ≥ 1): под обёрткой, после `--`, после ssh.
 func (c cmd) sub(i int, via []string) cmd {
+	argv0, posixEnv := c.argv0, c.posixEnv
+	if c.call.Name == "exec" {
+		for j := 0; j+1 < i-1; j++ {
+			if c.call.Args[j] == "-a" || c.call.Args[j] == "--argv0" {
+				argv0 = c.call.Args[j+1]
+			}
+		}
+	}
+	if c.call.Name == "env" && envHasPosixCorrect(c.call.Args[:max(0, i-1)]) {
+		posixEnv = true
+	}
 	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: c.words[i:], budget: c.budget, source: c.source,
-		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1}
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0}
+}
+
+func tildeArgTail(args []Tilde, start int) []Tilde {
+	if start < 0 || start >= len(args) {
+		return nil
+	}
+	return args[start:]
 }
 
 func (c cmd) via(more ...string) []string {
@@ -4455,8 +6719,8 @@ func markCall(seen *callSet, call Call) {
 }
 
 func markCalls(seen *callSet, calls []Call) {
-	for _, call := range calls {
-		markCall(seen, call)
+	for i := range calls {
+		markCall(seen, calls[i])
 	}
 }
 
@@ -4770,8 +7034,8 @@ func (s *callSet) hasBase(call Call) bool {
 	if first, exists := s.calls[key]; exists && sameCallArgs(first, call) {
 		return true
 	}
-	for _, previous := range s.more[key] {
-		if sameCallArgs(previous, call) {
+	for i := range s.more[key] {
+		if sameCallArgs(s.more[key][i], call) {
 			return true
 		}
 	}
@@ -4786,8 +7050,8 @@ func (s *callSet) hasExact(call Call) bool {
 	if first, exists := s.calls[key]; exists && sameCall(first, call) {
 		return true
 	}
-	for _, previous := range s.more[key] {
-		if sameCall(previous, call) {
+	for i := range s.more[key] {
+		if sameCall(s.more[key][i], call) {
 			return true
 		}
 	}
@@ -4807,8 +7071,8 @@ func (s *callSet) add(call Call) {
 	if sameCall(previous, call) {
 		return
 	}
-	for _, previous := range s.more[key] {
-		if sameCall(previous, call) {
+	for i := range s.more[key] {
+		if sameCall(s.more[key][i], call) {
 			return
 		}
 	}
@@ -5053,15 +7317,21 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 	commandWord := c.words[globalStart+1]
 	args := make([]string, 0, len(parallelArgs)-start-1)
 	words := []word{commandWord}
+	childTilts := make([]Tilde, 0, len(parallelArgs)-start-1)
 	for i := start + 1; i < len(parallelArgs); i++ {
 		if parallelArgs[i] == ":::" || parallelArgs[i] == "::::" {
 			continue
 		}
 		args = append(args, parallelArgs[i])
-		words = append(words, c.words[parallelOffset+i+1])
+		argWord := c.words[parallelOffset+i+1]
+		words = append(words, argWord)
+		childTilts = append(childTilts, argWord.tilde)
+	}
+	if !slices.ContainsFunc(childTilts, func(mark Tilde) bool { return mark != 0 }) {
+		childTilts = nil
 	}
 	child := cmd{call: Call{Name: commandWordName(parallelArgs[start], commandWord), Args: args, Raw: c.call.Raw, Line: c.call.Line,
-		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, Loop: c.call.Loop,
+		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed}
 	return child, true
@@ -5214,13 +7484,109 @@ func expandShellCommand(c cmd, name string, operand int, vars map[string]string,
 	body, positions := script.script, script.pos
 	first := len(*calls)
 	previousLiteralShell := c.budget.literalShell
+	previousPosix := c.budget.initialPosix
+	previousBrace := c.budget.initialBrace
+	previousPosixUnknown := c.budget.initialPosixUnknown
+	previousBraceUnknown := c.budget.initialBraceUnknown
+	c.budget.initialPosix = nestedShellPosix(c, name)
+	c.budget.initialBrace = nestedShellBrace(c)
+	c.budget.initialPosixUnknown, c.budget.initialBraceUnknown = false, false
 	if literalShellScript(c, name, operand) {
 		c.budget.literalShell = name
 	}
 	err := parseNestedWithBudget(body, positions, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
 	c.budget.literalShell = previousLiteralShell
+	c.budget.initialPosix = previousPosix
+	c.budget.initialBrace = previousBrace
+	c.budget.initialPosixUnknown = previousPosixUnknown
+	c.budget.initialBraceUnknown = previousBraceUnknown
 	relocateNestedLines(c, first, calls)
 	return err
+}
+
+func nestedShellPosix(c cmd, name string) bool {
+	argv0 := name
+	if c.argv0 != "" {
+		argv0 = baseName(c.argv0)
+	}
+	if argv0 == "sh" || c.posixEnv {
+		return true
+	}
+	return shellArgsEnablePosix(shellInvocationArgs(c))
+}
+
+func shellArgsEnablePosix(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-c" || arg == "-lc" || arg == "-ic" || arg == "--command" {
+			continue
+		}
+		if arg == "--posix" {
+			return true
+		}
+		if (arg == "-o" || arg == "+o") && i+1 < len(args) {
+			if args[i+1] == "posix" {
+				return arg == "-o"
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-o") && len(arg) > 2 && arg[2:] == "posix" {
+			return true
+		}
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "+") {
+			break
+		}
+	}
+	return false
+}
+
+func nestedShellBrace(c cmd) bool {
+	return shellArgsEnableBrace(shellInvocationArgs(c))
+}
+
+func shellArgsEnableBrace(args []string) bool {
+	mode := true
+	for i := range args {
+		arg := args[i]
+		if arg == "-c" || arg == "-lc" || arg == "-ic" || arg == "--command" {
+			continue
+		}
+		if arg == "+B" || arg == "-B" {
+			mode = arg[0] == '-'
+			continue
+		}
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "+") {
+			break
+		}
+	}
+	return mode
+}
+
+func shellInvocationArgs(c cmd) []string {
+	args := c.call.Args
+	if c.call.Name == "env" {
+		start := envCommandStart(args, 0)
+		if start < len(args) {
+			args = args[start+1:]
+		}
+	}
+	return args
+}
+
+func envHasPosixCorrect(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "POSIXLY_CORRECT=") {
+			return true
+		}
+	}
+	return false
 }
 
 func expandSSH(c cmd, lineBase int, vars map[string]string, calls *[]Call) error {
@@ -5283,7 +7649,8 @@ func remoteStdinReader(c cmd, file *syntax.File, src string, pos []int, remoteCa
 			}
 		}()
 	}
-	for _, call := range remoteCalls {
+	for i := range remoteCalls {
+		call := &remoteCalls[i]
 		if !isShell(call.Name) || !shellReadsHeredoc(call.Name, call.Args) {
 			continue
 		}
@@ -5291,7 +7658,7 @@ func remoteStdinReader(c cmd, file *syntax.File, src string, pos []int, remoteCa
 			reader = newRemoteStdin(file, src, pos)
 		}
 		if reader.reads(call.Offset) {
-			return call, true
+			return *call, true
 		}
 	}
 	return Call{}, false
@@ -5974,8 +8341,42 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 	c.budget.expansionUsed += len(script.text)
 	viaName := c.call.Name
 	first := len(*calls)
+	previousPosix, previousBrace := c.budget.initialPosix, c.budget.initialBrace
+	previousPosixUnknown, previousBraceUnknown := c.budget.initialPosixUnknown, c.budget.initialBraceUnknown
+	c.budget.initialPosix = c.mode.posix || c.mode.posixUnknown
+	c.budget.initialBrace = c.mode.brace || c.mode.braceUnknown
+	c.budget.initialPosixUnknown = c.mode.posixUnknown
+	c.budget.initialBraceUnknown = c.mode.braceUnknown
+	if c.call.Name == "eval" && c.posixEnv {
+		c.budget.initialPosix, c.budget.initialPosixUnknown = true, false
+	}
+	if c.call.Name == "env" {
+		end := envCommandStart(c.call.Args, 0)
+		if envHasPosixCorrect(c.call.Args[:end]) {
+			c.budget.initialPosix = true
+			c.budget.initialPosixUnknown = false
+		}
+	}
+	if c.call.Name == "flock" {
+		c.budget.initialPosixUnknown, c.budget.initialBraceUnknown = true, true
+	}
 	err := parseNestedMapped(script, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
+	c.budget.initialPosix, c.budget.initialBrace = previousPosix, previousBrace
+	c.budget.initialPosixUnknown, c.budget.initialBraceUnknown = previousPosixUnknown, previousBraceUnknown
 	relocateNestedLines(c, first, calls)
+	if c.call.Name == "env" {
+		for i := first; i < len(*calls); i++ {
+			call := &(*calls)[i]
+			if len(call.Via) == len(c.call.Via)+1 && call.Via[len(call.Via)-1] == "env" {
+				for j := range call.tildeArgs {
+					call.tildeArgs[j] = 0
+				}
+				for j := range call.Redirs {
+					call.Redirs[j].Tilde = 0
+				}
+			}
+		}
+	}
 	return err
 }
 
@@ -6213,26 +8614,54 @@ func commandOptionAt(name string, args []string, i int) (scriptArg, bool) {
 		return scriptArg{index: i, offset: len("--session-command=")}, true
 	}
 	if arg == "-c" || arg == "--command" || arg == "--session-command" {
+		if isShell(name) {
+			return shellCommandArgument(args, i+1)
+		}
 		if i+1 < len(args) {
 			return scriptArg{index: i + 1}, true
 		}
 		return scriptArg{}, false
 	}
 	if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") {
-		for j := 1; j < len(arg); j++ {
-			option, takesValue := shortOptionAt(name, arg, j)
-			if option == "-c" {
-				if j+1 < len(arg) {
-					return scriptArg{index: i, offset: j + 1}, true
-				}
-				if i+1 < len(args) {
-					return scriptArg{index: i + 1}, true
-				}
-				return scriptArg{}, false
+		return shortCommandOption(name, args, i, arg)
+	}
+	return scriptArg{}, false
+}
+
+func shellCommandArgument(args []string, start int) (scriptArg, bool) {
+	for j := start; j < len(args); {
+		option := args[j]
+		if option == "-o" || option == "+o" || option == "-O" || option == "+O" {
+			j += 2
+			continue
+		}
+		if strings.Contains(" --posix --norc --noprofile --restricted -B +B -i -l -r -s ", " "+option+" ") {
+			j++
+			continue
+		}
+		if strings.HasPrefix(option, "-") && !strings.HasPrefix(option, "--") && len(option) > 1 && onlySetOptionLetters(option[1:]) {
+			j++
+			continue
+		}
+		return scriptArg{index: j}, true
+	}
+	return scriptArg{}, false
+}
+
+func shortCommandOption(name string, args []string, i int, arg string) (scriptArg, bool) {
+	for j := 1; j < len(arg); j++ {
+		option, takesValue := shortOptionAt(name, arg, j)
+		if option == "-c" {
+			if j+1 < len(arg) {
+				return scriptArg{index: i, offset: j + 1}, true
 			}
-			if takesValue {
-				return scriptArg{}, false
+			if i+1 < len(args) {
+				return scriptArg{index: i + 1}, true
 			}
+			return scriptArg{}, false
+		}
+		if takesValue {
+			return scriptArg{}, false
 		}
 	}
 	return scriptArg{}, false

@@ -143,8 +143,8 @@ func (u *run) shellWays(cmd string) map[string]bool {
 		slog.Debug("parse shell ways", "error", err)
 	}
 	w := map[string]bool{}
-	for _, c := range calls {
-		if way := u.shellWay(c, cmd); way != "" {
+	for i := range calls {
+		if way := u.shellWay(calls[i], cmd); way != "" {
 			w[way] = true
 		}
 	}
@@ -321,7 +321,8 @@ func (u *run) replacementFiles(cmd string) []string {
 func (u *run) filesForSub(cmd string) ([]string, error) {
 	calls, err := shellcmd.Find(cmd, "sub")
 	var out []string
-	for _, c := range calls {
+	for i := range calls {
+		c := &calls[i]
 		if len(c.Args) > 2 {
 			out = append(out, c.Args[2:]...)
 		}

@@ -441,8 +441,8 @@ func TestArgLiteralContract(t *testing.T) {
 	if !foundTarget {
 		t.Fatalf("eval function target not found in %#v", calls)
 	}
-	if got := unsafe.Sizeof(Call{}); got != 128 {
-		t.Errorf("sizeof Call = %d, want 128", got)
+	if got := unsafe.Sizeof(Call{}); got != 160 {
+		t.Errorf("sizeof Call = %d, want 160", got)
 	}
 }
 

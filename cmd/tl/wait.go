@@ -276,7 +276,8 @@ func parseWaitCalls(command string) ([]cachedShellCall, bool) {
 	var nested *shellcmd.NestedError
 	invalid := err != nil && !errors.As(err, &nested)
 	calls := make([]cachedShellCall, 0, len(found))
-	for _, call := range found {
+	for i := range found {
+		call := &found[i]
 		c := cachedShellCall{Name: call.Name, Background: call.Background}
 		if len(call.Args) > 0 {
 			c.Arg0, c.HasArg = call.Args[0], true

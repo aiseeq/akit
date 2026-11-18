@@ -47,9 +47,9 @@ func (u *run) attributeUtility(tool, command, output string, commandCode, ordina
 		return attribution{code: -1}
 	}
 	var toolCalls []shellcmd.Call
-	for _, c := range calls {
-		if c.Name == tool {
-			toolCalls = append(toolCalls, c)
+	for i := range calls {
+		if calls[i].Name == tool {
+			toolCalls = append(toolCalls, calls[i])
 		}
 	}
 	if ordinal < 0 {
@@ -299,8 +299,8 @@ func outputsForCalls(tool, command string, target shellcmd.Call, calls, toolCall
 
 func visibleOutputCalls(toolCalls []shellcmd.Call) []int {
 	visible := make([]int, 0, len(toolCalls))
-	for i, call := range toolCalls {
-		if redirectsBothStreamsToNull(call) {
+	for i := range toolCalls {
+		if redirectsBothStreamsToNull(toolCalls[i]) {
 			continue
 		}
 		visible = append(visible, i)
@@ -332,7 +332,8 @@ func outputForSingleCall(tool string, calls []shellcmd.Call, target shellcmd.Cal
 		return ""
 	}
 	sourceBefore, reachedTarget := false, false
-	for _, call := range calls {
+	for i := range calls {
+		call := &calls[i]
 		if !reachedTarget && call.Name == target.Name {
 			reachedTarget = true
 			continue
@@ -354,8 +355,8 @@ func outputForSingleCall(tool string, calls []shellcmd.Call, target shellcmd.Cal
 }
 
 func hasOtherOutputSource(calls []shellcmd.Call, target shellcmd.Call) bool {
-	for _, call := range calls {
-		if isOtherOutputSource(call.Name) && call.Offset != target.Offset {
+	for i := range calls {
+		if isOtherOutputSource(calls[i].Name) && calls[i].Offset != target.Offset {
 			return true
 		}
 	}
@@ -461,13 +462,13 @@ func hasTrailingVisibleOutputSource(command string, calls, toolCalls []shellcmd.
 		return false
 	}
 	last := -1
-	for i, call := range calls {
-		if call.Name == toolCalls[len(toolCalls)-1].Name {
+	for i := range calls {
+		if calls[i].Name == toolCalls[len(toolCalls)-1].Name {
 			last = i
 		}
 	}
-	for _, call := range calls[last+1:] {
-		if isVisibleOutputSource(command, call) {
+	for i := last + 1; i < len(calls); i++ {
+		if isVisibleOutputSource(command, calls[i]) {
 			return true
 		}
 	}
@@ -553,8 +554,8 @@ func joinOutputBlocks(blocks [][]string) []string {
 }
 
 func hasPartiallyNonEmittingCall(calls []shellcmd.Call, block string) bool {
-	for _, call := range calls {
-		if !redirectsBothStreamsToNull(call) && !callCanEmitOutputBlock(call, block) {
+	for i := range calls {
+		if !redirectsBothStreamsToNull(calls[i]) && !callCanEmitOutputBlock(calls[i], block) {
 			return true
 		}
 	}
@@ -588,8 +589,8 @@ func precedingUsageErrorCall(block string, calls []shellcmd.Call, matched [][]st
 	if !strings.Contains(block, " -h for usage)") || len(calls) < 2 {
 		return -1
 	}
-	for i, call := range calls {
-		if len(matched[i]) != 0 || !callMayHaveUsageError(call) || !callCanEmitOutputBlock(call, block) {
+	for i := range calls {
+		if len(matched[i]) != 0 || !callMayHaveUsageError(calls[i]) || !callCanEmitOutputBlock(calls[i], block) {
 			continue
 		}
 		return i
@@ -721,8 +722,8 @@ func outputLinesWithoutWrappers(target shellcmd.Call, output string) []string {
 }
 
 func filterCommandOutput(tool string, calls []shellcmd.Call, lines []string) []string {
-	for _, call := range calls {
-		if call.Name == "echo" || call.Name == "printf" {
+	for i := range calls {
+		if call := &calls[i]; call.Name == "echo" || call.Name == "printf" {
 			lines = filterEchoLines(tool, call.Args, lines)
 		}
 	}
@@ -792,7 +793,8 @@ func filterEchoLines(tool string, args, lines []string) []string {
 func outputBlockCall(block string, calls []shellcmd.Call) int {
 	match := -1
 	bestScore := 0
-	for i, call := range calls {
+	for i := range calls {
+		call := &calls[i]
 		blockForMatch := block
 		blockForMatch = strings.ReplaceAll(blockForMatch, "("+calls[i].Name+" -h for usage)", "")
 		for line := range strings.SplitSeq(block, "\n") {
@@ -1045,8 +1047,8 @@ func scriptCallAt(script string, offset int, name string, args []string) bool {
 		slog.Debug("parse embedded script calls", "error", err)
 		return false
 	}
-	for _, call := range calls {
-		if call.Offset == offset && call.Name == name && slices.Equal(call.Args, args) {
+	for i := range calls {
+		if call := &calls[i]; call.Offset == offset && call.Name == name && slices.Equal(call.Args, args) {
 			return true
 		}
 	}
@@ -1060,7 +1062,8 @@ func uniqueScriptCallOffset(script string, name string, args []string) int {
 		return -1
 	}
 	match := -1
-	for _, call := range calls {
+	for i := range calls {
+		call := &calls[i]
 		if call.Name != name || !slices.Equal(call.Args, args) {
 			continue
 		}
@@ -1089,9 +1092,9 @@ func (u *run) callHasTruncator(tool, command string, ordinal int) bool {
 		return false
 	}
 	var toolCalls []shellcmd.Call
-	for _, call := range calls {
-		if call.Name == tool {
-			toolCalls = append(toolCalls, call)
+	for i := range calls {
+		if calls[i].Name == tool {
+			toolCalls = append(toolCalls, calls[i])
 		}
 	}
 	if ordinal < 0 || ordinal >= len(toolCalls) {
