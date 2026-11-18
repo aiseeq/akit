@@ -3,6 +3,7 @@ package waits
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -315,6 +316,151 @@ func TestCodexWforPolled(t *testing.T) {
 	got := s.run()
 	if len(got) != 1 || got[0].How != Wfor || got[0].Calls != 3 || got[0].Outcome != Done || got[0].End.Sub(got[0].Start) != 71*time.Second {
 		t.Errorf("одно ожидание wfor на три вызова: %+v", got)
+	}
+}
+
+func TestSnapshotAtEveryEventBoundary(t *testing.T) {
+	s := newEvents()
+	a := s.bash(`timeout 30 bash -c 'while true; do sleep 5; done'`, 0, "r1", false)
+	s.out(a, "", 30)
+	b := s.bash(`timeout 30 bash -c 'while true; do sleep 5; done'`, 31, "r2", false)
+	s.out(b, "", 61)
+	s.tool("SendMessage", "→ main: ready", map[string]string{"to": "main"}, 62)
+	w := s.tool("ScheduleWakeup", "60s", map[string]int{"delaySeconds": 60}, 63)
+	s.out(w, "scheduled", 64)
+	s.add(transcript.Event{Role: transcript.Peer, Who: "main", From: "main", Text: "ok"}, 65)
+	bg := s.bash("go test ./...", 66, "r3", true)
+	s.out(bg, "Command running in background with ID: b7.", 67)
+	s.add(transcript.Event{Role: transcript.Note, Who: "task-notification", Text: "<tool-use-id>" + bg + "</tool-use-id><status>completed</status><summary>exit code 0</summary>"}, 68)
+
+	baseline := New()
+	var want []Wait
+	for _, ev := range s.evs {
+		want = append(want, baseline.Add(ev)...)
+	}
+	want = append(want, baseline.Close()...)
+	for cut := 0; cut <= len(s.evs); cut++ {
+		t.Run(fmt.Sprintf("cut-%d", cut), func(t *testing.T) {
+			r := New()
+			var got []Wait
+			for _, ev := range s.evs[:cut] {
+				got = append(got, r.Add(ev)...)
+			}
+			beforeOpen := r.OpenStates()
+			data, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored := New()
+			if err := json.Unmarshal(data, restored); err != nil {
+				t.Fatal(err)
+			}
+			if afterOpen := restored.OpenStates(); !reflect.DeepEqual(afterOpen, beforeOpen) {
+				t.Fatalf("OpenStates после восстановления = %+v, до = %+v", afterOpen, beforeOpen)
+			}
+			for _, ev := range s.evs[cut:] {
+				got = append(got, restored.Add(ev)...)
+			}
+			got = append(got, restored.Close()...)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("после восстановления: %+v, один проход: %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestSnapshotRejectsInvalidJSON(t *testing.T) {
+	for _, data := range []string{
+		"{", "{}", `{"version":2,"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":0,"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"cur":-1,"wakeup":-1,"tokens_to":-1,"unknown":true}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]},"unknown":true}],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":9,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"by_call":{"x":1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-2,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-1,"wakeup":1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-1,"wakeup":-1,"tokens_to":1}`,
+		`{"version":1,"pending":[null],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":[]}}],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"by_call":{"x":-1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"sends":[-1],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"bg":{"x":-1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+	} {
+		t.Run(data, func(t *testing.T) {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("panic вместо ошибки: %v", p)
+				}
+			}()
+			if err := json.Unmarshal([]byte(data), New()); err == nil {
+				t.Fatalf("ожидали ошибку для %s", data)
+			}
+		})
+	}
+}
+
+func TestSnapshotRequiresEachPrimaryReference(t *testing.T) {
+	for _, field := range []string{"cur", "wakeup", "tokens_to"} {
+		t.Run(field, func(t *testing.T) {
+			data := map[string]any{"version": 1, "cur": -1, "wakeup": -1, "tokens_to": -1}
+			delete(data, field)
+			encoded, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(encoded, New()); err == nil {
+				t.Fatalf("снимок без %s принят: %s", field, encoded)
+			}
+		})
+	}
+}
+
+func TestSnapshotUnmarshalReplaceAndFailureAreAtomic(t *testing.T) {
+	r := New()
+	r.Add(transcript.Event{Role: transcript.Cmd, Who: "Monitor", CallID: "m1", Line: 1})
+	before, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.UnmarshalJSON([]byte("{")); err == nil {
+		t.Fatal("битый JSON принят")
+	}
+	for _, bad := range []string{`{"version":1,"cur":9,"wakeup":-1,"tokens_to":-1}`} {
+		if err := json.Unmarshal([]byte(bad), r); err == nil {
+			t.Fatalf("неверный снимок принят: %s", bad)
+		}
+		after, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("неудачный Unmarshal изменил состояние:\nдо %s\nпосле %s", before, after)
+		}
+	}
+	if err := json.Unmarshal([]byte(`{"version":1,"cur":-1,"wakeup":-1,"tokens_to":-1}`), r); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Open(); ok {
+		t.Fatal("успешный Unmarshal не заменил старое состояние")
+	}
+}
+
+func TestSnapshotCoversRecognizerAndPendingFields(t *testing.T) {
+	fields := func(value any) []string {
+		typ := reflect.TypeOf(value)
+		out := make([]string, typ.NumField())
+		for i := range out {
+			out[i] = typ.Field(i).Name
+		}
+		slices.Sort(out)
+		return out
+	}
+	if got, want := fields(Recognizer{}), []string{"bg", "byCall", "cur", "polls", "prevCmd", "sends", "sessionCmd", "shellText", "tasks", "tokensTo", "wakeup"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("поля Recognizer поменялись: %v", got)
+	}
+	if got, want := fields(pending{}), []string{"callAt", "codex", "limit", "outSeen", "replies", "session", "to", "w"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("поля pending поменялись: %v", got)
 	}
 }
 
