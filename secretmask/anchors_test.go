@@ -74,6 +74,8 @@ func TestContextAnchorGroups(t *testing.T) {
 		{"token: x", anchorName},
 		{`{"api_token1":"x"}`, anchorName},
 		{"--db_password x", anchorName},
+		{"Password: x", anchorName},
+		{"password for admin: x", anchorEnCandidate},
 		{`["--token","x"]`, anchorName},
 		{`{"name":"auth","value":"x"}`, anchorName},
 		{"see https://x", anchorURL},
@@ -164,6 +166,536 @@ func TestMaskRussianLabels(t *testing.T) {
 	}
 	if got, found := Mask("ключ: aB4cD9eF0gH2"); strings.Contains(got, "aB4cD9eF0gH2") || found["token"] == 0 {
 		t.Errorf("token-shaped key value not masked: %q, %v", got, found)
+	}
+}
+
+func TestMaskEnglishPasswordLabelPhrases(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	inputs := []string{
+		"**Password:** " + secret,
+		"__Password__: " + secret,
+		"`Password`: " + secret,
+		"password for the account: " + secret,
+		"password for the current user: " + secret,
+		"password for the\naccount: " + secret,
+		"password for = the account: " + secret,
+		"password - the account: " + secret,
+		"password for the current user account: " + secret,
+		"password" + strings.Repeat(" ", 512) + ": " + secret,
+	}
+	for _, input := range inputs {
+		t.Run(input[:min(len(input), 40)], func(t *testing.T) {
+			got, found := Mask(input)
+			if strings.Contains(got, secret) || found["password"] != 1 {
+				t.Fatalf("English label did not hide its value: output %q, counts %v", got, found)
+			}
+		})
+	}
+}
+
+func TestMaskEnglishPasswordLabelGrammar(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	inputs := []string{
+		"password for the database: " + secret,
+		"passwd for the account: " + secret,
+		"pwd of the account: " + secret,
+		"passphrase for this account: " + secret,
+		"password for admin: " + secret,
+		"password of the account: " + secret,
+		"password\nfor the account: " + secret,
+		"password for\nthe account: " + secret,
+		"password for the \naccount: " + secret,
+		"password for the\r\naccount: " + secret,
+		"- password for admin: " + secret,
+		"Password for the user's (admin) account: " + secret,
+		"DB password: " + secret,
+		"DB Root Password: " + secret,
+		"Root Password: " + secret,
+		"Admin password: " + secret,
+		"db_password for the account: " + secret,
+		"**Password for admin:** " + secret,
+		"**Password for admin**: " + secret,
+		"***Password:*** " + secret,
+		"***Password***: " + secret,
+		"*Password:* " + secret,
+		"*Password*: " + secret,
+		"_Password_: " + secret,
+		"~~Password~~: " + secret,
+		"~~Password:~~ " + secret,
+		"[Password]: " + secret,
+		"«Password»: " + secret,
+		`"Password": ` + secret,
+		"**DB password:** " + secret,
+		"**Database Password:** " + secret,
+		"**Root Password**: " + secret,
+		"*DB password*: " + secret,
+		`"DB password for admin": ` + secret,
+		"password for the account\n: " + secret,
+		"password for the\naccount: " + secret,
+		"password : " + secret,
+		"password \n: " + secret,
+		"password\n: " + secret,
+		"password for " + strings.Repeat("a", 80) + ": " + secret,
+		"password for (superadministrator): " + secret,
+		"**New admin password**: " + secret,
+		"- **New admin password**: " + secret,
+		"db_password - the account: " + secret,
+		"- db_password\n: " + secret,
+		"- __db_password for = the account__\n: " + secret,
+		"__db_password for = the account__\n: " + secret,
+		`"Password"` + "\n: " + secret,
+		"**Password:** " + secret,
+		"__Password__: " + secret,
+		"`Password`: " + secret,
+		"password" + strings.Repeat(" ", 512) + ": " + secret,
+	}
+	for _, input := range inputs {
+		t.Run(input[:min(len(input), 48)], func(t *testing.T) {
+			got, found := Mask(input)
+			if strings.Contains(got, secret) || found["password"] != 1 {
+				t.Fatalf("label value remained or count differed: output %q, counts %v", got, found)
+			}
+		})
+	}
+}
+
+func TestEnglishPasswordLabelMatchesOrdinaryValueRules(t *testing.T) {
+	for _, value := range []string{"hunter2", "changeme", `"literalValue123"`, "cfg.Token", "${PASSWORD}"} {
+		plain, _ := Mask("Password: " + value)
+		phrase, _ := Mask("password for admin: " + value)
+		plainMasked := strings.Contains(plain, "[скрыто:password]")
+		phraseMasked := strings.Contains(phrase, "[скрыто:password]")
+		if phraseMasked != plainMasked {
+			t.Errorf("phrase changed ordinary value behavior for %q: got %q, Password: gives %q", value, phrase, plain)
+		}
+	}
+	for _, value := range []string{"see", "at", "required"} {
+		input := "password for admin: " + value
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("nonsecret bare value changed: %q -> %q, counts %v", input, got, found)
+		}
+	}
+	for _, input := range []string{
+		"password for admin := load",
+		"password for admin => load",
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("bare code expression changed: %q -> %q, counts %v", input, got, found)
+		}
+	}
+	for _, input := range []string{
+		`password for admin := "literalValue123"`,
+		`password for admin => "literalValue123"`,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, "literalValue123") || found["password"] != 1 {
+			t.Errorf("quoted code literal was not hidden: %q, counts %v", got, found)
+		}
+	}
+}
+
+func TestEnglishPasswordLabelsDoNotCaptureOtherSecretNames(t *testing.T) {
+	input := "password for admin: Zq7xW9vK2mPq8Rt; token: Zq7xW9vK2mPq8Rt"
+	got, found := Mask(input)
+	if strings.Contains(got, "Zq7xW9vK2mPq8Rt") || found["password"] != 1 || found["token"] != 1 {
+		t.Errorf("password phrase consumed a neighbouring token label: %q, counts %v", got, found)
+	}
+}
+
+func TestEnglishPasswordLabelNeighboursStay(t *testing.T) {
+	for _, input := range []string{
+		"password for the account is managed by SSO",
+		"Password reset link: https://example.com/reset",
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("ordinary text changed from %q to %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishPasswordLabelKeepsMainNeighbourBehaviour(t *testing.T) {
+	input := "the password: field is required"
+	want := "the password: [скрыто:password] is required"
+	if got, found := Mask(input); got != want || found["password"] != 1 {
+		t.Errorf("main neighbour behaviour changed: got %q, counts %v", got, found)
+	}
+}
+
+func TestEnglishPasswordQuotedLabels(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		`{"text":"password for the account: ` + secret + `"}`,
+		`{"text":"password for the account: ` + secret + `}`,
+		`"password for the account: ` + secret + `"`,
+		`echo "Password for admin: ` + secret,
+		`echo "Password for admin: ` + secret + `"`,
+		`msg = "password for the database: ` + secret + `"`,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || found["password"] != 1 {
+			t.Errorf("quoted English label did not hide its value: %q, counts %v", input, found)
+		}
+	}
+}
+
+func TestEnglishPasswordPrefixesStayOnTheirLine(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"db_password - the account: " + secret,
+		"`Password:` " + secret,
+		`"Password:" ` + secret,
+		"`DB password:` " + secret,
+		"__Password:__ " + secret,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || found["password"] == 0 {
+			t.Errorf("English wrapped label did not hide its value: %q -> %q, counts %v", input, got, found)
+		}
+	}
+
+	for _, rows := range [][]string{
+		{"x", "db_password - the account: " + secret},
+		{"hello", "db_password - the account: " + secret},
+		{"## Section", "db_password - the account: " + secret},
+		{"Note: **important", "password for admin: " + secret},
+		{"See **bold", "password for admin: " + secret},
+		{"Use `make", "password for admin: " + secret},
+		{"secret: **required", "hello", "password for admin: " + secret},
+	} {
+		joined, _ := Mask(strings.Join(rows, "\n"))
+		separate := make([]string, len(rows))
+		for i, row := range rows {
+			separate[i], _ = Mask(row)
+		}
+		if joined != strings.Join(separate, "\n") || strings.Contains(joined, secret) {
+			t.Errorf("prefix parsing crossed a line boundary for %q: joined %q, separate %q", rows, joined, strings.Join(separate, "\n"))
+		}
+	}
+}
+
+func TestMarkdownLabelsForOtherMainSecretNames(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"**Token:** " + secret,
+		"**Secret:** " + secret,
+		"`api_key`: " + secret,
+		"__Token__: " + secret,
+		"**Token**\n: " + secret,
+		"`api_key`\n: " + secret,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || len(found) != 1 {
+			t.Errorf("Markdown label value remained visible: %q -> %q, counts %v", input, got, found)
+		}
+	}
+	wrapped, _ := Mask("**Token:** see the vault")
+	if wrapped != "**Token:** see the vault" {
+		t.Errorf("Markdown changed ordinary Token value handling: got %q", wrapped)
+	}
+}
+
+func TestEnglishPasswordLabelMalformedWrappersAndValuesStay(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"**password for the account: " + secret,
+		"password for the account**: " + secret,
+		"password for the account: https://example.com/reset",
+		"password for the account: **required",
+		"password\nfor\nthe account: " + secret,
+		"mypassword for the account: " + secret,
+		"1password for the account: " + secret,
+		"password\nfor the\naccount: " + secret,
+		"password\nfor\nthe account: " + secret,
+		"password for the `account`: " + secret,
+		"**Password**\n\n: " + secret,
+		"[скрыто:password] for the account: " + secret,
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("malformed or ordinary form changed: %q -> %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishPasswordPhraseLimitDoesNotCaptureProse(t *testing.T) {
+	for _, input := range []string{
+		"password for a b c d e: see the vault",
+		"password for the main admin user account: see the vault",
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("out-of-limit phrase changed prose: %q -> %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishLabelsStayOnSameLineValue(t *testing.T) {
+	for _, input := range []string{
+		"`password`:\n  description: user password",
+		"`password`:\n  minLength: 12",
+		"password for the account:\nUsername: admin",
+		"password\nfor the account:\nZq7xW9vK2mPq8Rt",
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("label consumed next-line value: %q -> %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishDocumentationValuesStayUnchanged(t *testing.T) {
+	for _, input := range []string{
+		"**Password:** TBD",
+		"**Password:** —",
+		"**Password:** Updated",
+		"**Password:** see the vault",
+		"**Password:** N/A",
+		"`password`:\n  description: user password",
+		"`password`:\n  minLength: 12",
+		"password for the account:\nUsername: admin",
+		"**Password**: The password for the database user.",
+		"`password`: the user's password",
+		"- `password`: New password for the user.",
+		"`password`: Updated",
+		"`password`: Required. The password for the account.",
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("documentation value changed: %q -> %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishPasswordDocumentationFastPathStaysUnchanged(t *testing.T) {
+	for _, input := range []string{
+		`"PASSWORD"` + "\n: at least 12 characters",
+		`"PASSWORD"` + strings.Repeat(" ", 40) + "\n: see the vault",
+		`"Password"` + "\n: Required. The password for the account.",
+		`"PASSWORD"` + "\n: see the vault",
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("documentation value changed: %q -> %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishPasswordPhraseWordLimitIsFour(t *testing.T) {
+	for _, header := range []string{
+		"password for a b c d e: ",
+		"password for the main admin user account: ",
+	} {
+		if ix := contextEnglishPasswordAtRE.FindStringSubmatchIndex(header); ix != nil {
+			t.Errorf("English password grammar accepted more than four words: %q, match %v", header, ix)
+		}
+		if _, accepted := englishFastHeaderLead(header, strings.Index(header, "password"), strings.Index(header, "password")+len("password")); accepted {
+			t.Errorf("English fast header accepted more than four words: %q", header)
+		}
+	}
+}
+
+func TestEnglishPasswordDenseLabelsUseFastGrammar(t *testing.T) {
+	var input strings.Builder
+	for range 40 {
+		input.WriteString("**DB password for the account**: Zq7xW9vK2mPq8Rt\n")
+	}
+	masked, _ := Mask(input.String())
+	if strings.Contains(masked, "Zq7xW9vK2mPq8Rt") || strings.Count(masked, maskMarker+"password") != 40 {
+		t.Fatalf("dense Markdown password labels were not all masked: %q", masked)
+	}
+}
+
+func TestEnglishMarkdownPasswordUsesOrdinaryValueRules(t *testing.T) {
+	for _, value := range []string{"hunter2", "changeme"} {
+		plain, _ := Mask("Password: " + value)
+		wrapped, found := Mask("**Password**: " + value)
+		if !strings.Contains(plain, "[скрыто:password]") || wrapped != "**Password**: [скрыто:password]" || found["password"] != 1 {
+			t.Errorf("Markdown password changed ordinary value behavior for %q: plain %q, wrapped %q, counts %v", value, plain, wrapped, found)
+		}
+	}
+}
+
+func TestEnglishMarkdownPasswordUsesPasswordValuePredicate(t *testing.T) {
+	input := "**required"
+	value := contextValue{start: 0, end: len(input)}
+	want := englishPasswordValueIsSecret(input, 0, "password", "password", ":", value)
+	if got := englishMarkdownValueIsSecret(input, 0, "password", "password", ":", value); got != want {
+		t.Errorf("Markdown password value predicate differs: got %v, want %v", got, want)
+	}
+}
+
+func TestEnglishValueScannerRejectsNextLineValue(t *testing.T) {
+	input := "Password:\n  Zq7xW9vK2mPq8Rt"
+	at := strings.Index(input, ":") + 1
+	if value, ok := scanEnglishSameLineValue(input, at, true); ok {
+		t.Errorf("same-line scanner accepted next-line value %q at [%d,%d)", input[value.start:value.end], value.start, value.end)
+	}
+}
+
+func TestEnglishWrapperPairRequiresMatchingMarker(t *testing.T) {
+	if englishWrapperPairIsValid("**Token: ", len("**Token"), "**", false) {
+		t.Fatal("unclosed Markdown wrapper was accepted")
+	}
+	if !englishWrapperPairIsValid("**Token**: ", len("**Token"), "**", false) {
+		t.Fatal("matching Markdown wrapper was rejected")
+	}
+}
+
+func TestMarkdownMatcherRejectsMismatchedWrapper(t *testing.T) {
+	input := "**Token: Zq7xW9vK2mPq8Rt"
+	start := strings.Index(input, "Token")
+	labels := []englishAnchorStart{{start: start, end: start + len("Token"), delimiter: -1}}
+	if matches := markdownSecretLabelMatches(input, labels); len(matches) != 0 {
+		t.Errorf("Markdown matcher accepted a missing closing wrapper: %v", matches)
+	}
+}
+
+func TestEnglishPasswordMatcherIgnoresExistingMaskMarker(t *testing.T) {
+	input := "[скрыто:password] for the account: Zq7xW9vK2mPq8Rt"
+	got, found := Mask(input)
+	if got != input || len(found) != 0 {
+		t.Errorf("existing mask marker was reinterpreted: %q -> %q, counts %v", input, got, found)
+	}
+}
+
+func TestEnglishPrefixCacheKeepsOpeningMarkerContext(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"DB password for prod: x\n**DB password**: " + secret,
+		"db_password\n__db_password for account__: " + secret,
+		"  db_Password**: x\n1 __root db_Password__: " + secret,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || found["password"] == 0 {
+			t.Errorf("prefix cache lost Markdown opening marker: %q -> %q, counts %v", input, got, found)
+		}
+	}
+}
+
+func TestEnglishPasswordMarkerBeforeDelimiterKeepsValueHidden(t *testing.T) {
+	input := `"PASSWORD":** "Zq7xW9vK2mPq8Rt"`
+	got, found := Mask(input)
+	if strings.Contains(got, "Zq7xW9vK2mPq8Rt") || found["password"] == 0 {
+		t.Errorf("closing marker before delimiter left value visible: %q -> %q, counts %v", input, got, found)
+	}
+}
+
+func TestEnglishPasswordThreeWordMarkdownPrefix(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"`Root DB password:` " + secret,
+		`"Root DB password:" ` + secret,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || found["password"] == 0 {
+			t.Errorf("quoted three-word password label remained visible: %q -> %q, counts %v", input, got, found)
+		}
+	}
+	input := "**Root DB password:** TBD"
+	if got, found := Mask(input); got != input || len(found) != 0 {
+		t.Errorf("three-word Markdown documentation value changed: %q -> %q, counts %v", input, got, found)
+	}
+}
+
+func TestEnglishLabelsDoNotSuppressMainNameMatches(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		`"password":="` + secret + `"`,
+		`"PASSWORD"=>"` + secret + `"`,
+		`"password": **` + secret,
+		`"DB_PASSWORD":="` + secret + `"`,
+		`"PASSWD":="` + secret + `"`,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || found["password"] == 0 {
+			t.Errorf("English candidate suppressed main name match: %q -> %q, counts %v", input, got, found)
+		}
+		groups, russianStarts, _ := contextAnchorScan(input)
+		mainPath := &masking{found: make(map[string]int)}
+		withoutEnglish := maskContext(input, mainPath, groups&^anchorEnCandidate, russianStarts, nil)
+		if strings.Contains(withoutEnglish, secret) || mainPath.found["password"] == 0 {
+			t.Errorf("main name group did not independently mask %q: %q, groups %v", input, withoutEnglish, groups)
+		}
+	}
+}
+
+func TestEnglishHyphenPasswordLabelVariants(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"db_pwd - the account: " + secret,
+		`- passphrase - the account: "` + secret + `"`,
+	} {
+		got, found := Mask(input)
+		if strings.Contains(got, secret) || found["password"] == 0 {
+			t.Errorf("hyphen password label remained visible: %q -> %q, counts %v", input, got, found)
+		}
+	}
+	for _, input := range []string{
+		"- db_password" + strings.Repeat(" ", 41) + ": at least 12 characters",
+		`"PASSWORD"` + strings.Repeat(" ", 41) + ": at least 12 characters",
+	} {
+		nameMasking := &masking{found: make(map[string]int)}
+		want := replaceContextMatches(input, nameMatches(input), nameMasking)
+		got, _ := Mask(input)
+		if got != want {
+			t.Errorf("long-space form diverged from ordinary name matching: %q -> %q, name path %q", input, got, want)
+		}
+	}
+}
+
+func TestEnglishMarkdownPasswordValueIsIndependentOfOtherAnchors(t *testing.T) {
+	for _, doc := range []string{
+		"**Password:** TBD",
+		"**Password:** —",
+		"**Password:** Updated",
+		"**Password:** see the vault",
+		"**Password:** N/A",
+		"**Password**: The password for the database user.",
+		"`password`: the user's password",
+		"- `password`: New password for the user.",
+		"`password`: Updated",
+	} {
+		alone, _ := Mask(doc)
+		for _, neighbor := range []string{"token: Zq7xW9vK2mPq8Rt", "password:", "DB password: X"} {
+			joined, _ := Mask(doc + "\n" + neighbor)
+			separate, _ := Mask(neighbor)
+			want := alone + "\n" + separate
+			if joined != want {
+				t.Errorf("neighbor changed markdown label result: doc %q, neighbor %q, alone %q, joined %q, want %q", doc, neighbor, alone, joined, want)
+			}
+		}
+	}
+}
+
+func TestEnglishHeaderCachesAreIndependentOfNeighborContext(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"/etc/password for admin: Zq7xW9vK2mPq8Rt", "a/password for admin: Zq7xW9vK2mPq8Rt"},
+		{"x password**: y", "**DB password**: Zq7xW9vK2mPq8Rt"},
+		{"see password**: note.", "**DB password**: Zq7xW9vK2mPq8Rt"},
+	} {
+		for _, rows := range [][]string{{pair[0], pair[1]}, {pair[1], pair[0]}} {
+			joined, _ := Mask(strings.Join(rows, "\n"))
+			separate := make([]string, len(rows))
+			for i, row := range rows {
+				separate[i], _ = Mask(row)
+			}
+			if joined != strings.Join(separate, "\n") {
+				t.Errorf("neighbor-dependent cache result for %q: joined %q, separate %q", rows, joined, strings.Join(separate, "\n"))
+			}
+		}
+	}
+}
+
+func TestEnglishHeaderBoundaryRejectsEmbeddedLabels(t *testing.T) {
+	secret := "Zq7xW9vK2mPq8Rt"
+	for _, input := range []string{
+		"my**password**: " + secret,
+	} {
+		got, found := Mask(input)
+		if got != input || len(found) != 0 {
+			t.Errorf("invalid boundary was accepted: %q -> %q, counts %v", input, got, found)
+		}
 	}
 }
 

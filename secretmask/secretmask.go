@@ -81,14 +81,17 @@ import (
 )
 
 const contextRussianNamePattern = `(?:(?:\*\*|__|\x60|["'«])?)(?:[Пп][Аа][Рр][Оо][Лл][\p{L}]*|[Тт][Оо][Кк][Ее][Нн][\p{L}]*|[Кк][Лл][Юю][Чч][\p{L}]*)(?:["'»]|(?:\*\*|__|\x60))?(?:[ \t]+[\p{L}\p{N}]+){0,4}[ \t]*(?::=|=>|=|:|—|–| - )(?:(?:\*\*|__|\x60)[ \t]+)?`
+const contextEnglishPasswordPattern = `(?i)\A(?:((?:\*\*\*|\*\*|\*|__|_|~~|\x60|\[|«|")?)(?:[a-z0-9'-]+(?:[ \t]+|[ \t]*\r?\n[ \t]*|_)){0,2}(password|passwd|pwd|passphrase)(?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?(?:(?:[ \t]+|[ \t]*\r?\n[ \t]*)(?:for|of)(?:[ \t]*=[ \t]*)?(?:(?:[ \t]+|[ \t]*\r?\n[ \t]*)(?:\([a-z0-9_]+(?:['-][a-z0-9_]+)*\)|[a-z0-9_]+(?:['-][a-z0-9_]+)*)){1,4})?(?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?[ \t]*(?:\r?\n[ \t]*)?(:=|=>|=|:)(?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?[ \t]*|(?:[a-z0-9'-]+(?:[ \t]+|_)){0,2}(password|passwd|pwd|passphrase)(?:[ \t]+-[ \t]+the[ \t]+account)(:)[ \t]*)`
 
 var (
-	privateKeyRE           = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
-	awsRE                  = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	escapeRE               = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
-	contextNameRE          = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
-	contextRussianNameRE   = regexp.MustCompile(contextRussianNamePattern)
-	contextRussianNameAtRE = regexp.MustCompile(`\A` + contextRussianNamePattern)
+	privateKeyRE               = regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)
+	awsRE                      = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	escapeRE                   = regexp.MustCompile(`(?:\\[A-Za-z]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]+\}|\\U[0-9A-Fa-f]{8}|%(?:25)*[0-9A-Fa-f]{2}|=[0-9A-F]{2}|&#[0-9]+;?|&#x[0-9A-Fa-f]+;?|(?:\x1b|\\[eE]|\\033|\\33|\\x1[bB]|\\u001[bB]|\^\[|␛)\[[0-9;?]*[A-Za-z]|\x1b\(B|\[[0-9;]+m)$`)
+	contextNameRE              = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(?:\\*["'])?([ \t]*)(:=|=>|=|:)`)
+	contextRussianNameRE       = regexp.MustCompile(contextRussianNamePattern)
+	contextRussianNameAtRE     = regexp.MustCompile(`\A` + contextRussianNamePattern)
+	contextEnglishPasswordAtRE = regexp.MustCompile(contextEnglishPasswordPattern)
+	contextMarkdownLabelAtRE   = regexp.MustCompile(`(?i)\A((?:\*\*\*|\*\*|\*|__|_|~~|\x60|\[|«|")?)([a-z0-9]+(?:[_.-][a-z0-9]+)*)((?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?)[ \t]*(?:\r?\n[ \t]*)?(:=|=>|=|:)(?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?[ \t]*`)
 
 	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
@@ -107,6 +110,7 @@ const (
 	anchorTool                                // passwords in tool options and pipelines
 	anchorRuName      anchorGroup = 1 << 5    // Russian password, token and key labels
 	anchorRuCandidate anchorGroup = 1 << 6
+	anchorEnCandidate anchorGroup = 1 << 7
 )
 
 // anchorEdge is what must surround an anchor for it to count.
@@ -132,14 +136,22 @@ type contextAnchor struct {
 	edge  anchorEdge
 }
 
+type englishAnchorStart struct {
+	start     int
+	end       int
+	delimiter int
+}
+
+const englishPasswordAnchorCount = 4
+
 var contextAnchors = [...]contextAnchor{
+	{"password", anchorName, edgeNameUse}, {"passwd", anchorName, edgeNameUse},
+	{"passphrase", anchorName, edgeNameUse}, {"pwd", anchorName, edgeNameUse},
 	{"арол", anchorRuName, edgeNone},
 	{"окен", anchorRuName, edgeNone},
 	{"люч", anchorRuName, edgeNone},
 	{"authorization", anchorHeader, edgeNone},
-	{"password", anchorName, edgeNameUse}, {"passwd", anchorName, edgeNameUse},
-	{"passphrase", anchorName, edgeNameUse}, {"pass", anchorName, edgeNameUse},
-	{"pwd", anchorName, edgeNameUse}, {"token", anchorName, edgeNameUse},
+	{"pass", anchorName, edgeNameUse}, {"token", anchorName, edgeNameUse},
 	{"api_key", anchorName, edgeNameUse}, {"api-key", anchorName, edgeNameUse},
 	{"apikey", anchorName, edgeNameUse}, {"access_key", anchorName, edgeNameUse},
 	{"private_key", anchorName, edgeNameUse}, {"auth", anchorName, edgeNameUse},
@@ -245,34 +257,138 @@ func buildAnchorAutomaton() anchorAutomaton {
 // contextAnchorGroups returns the groups of the anchors found in text, in one
 // pass over it.
 func contextAnchorGroups(text string) anchorGroup {
-	groups, _ := contextAnchorScan(text)
+	groups, _, _ := contextAnchorScan(text)
 	return groups
 }
 
-func contextAnchorScan(text string) (anchorGroup, []int) {
+func contextAnchorScan(text string) (anchorGroup, []int, []englishAnchorStart) {
 	var groups anchorGroup
 	var russianStarts []int
+	var englishCandidates []englishAnchorStart
+	searchThrough, nextDelimiter := 0, -1
 	automaton := &contextAnchorAutomaton
 	state := uint16(0)
 	for i := 0; i < len(text); i++ {
-		state = automaton.next[state&^anchorHit][anchorFold[text[i]]]
+		folded := anchorFold[text[i]]
+		state = automaton.next[state&^anchorHit][folded]
 		if state&anchorHit == 0 {
 			continue
 		}
 		for _, index := range automaton.anchors[state&^anchorHit] {
 			anchor := contextAnchors[index]
-			if anchor.group == anchorRuName {
-				russianStarts = append(russianStarts, i+1-len(anchor.word)-2)
-			}
-			if groups&anchor.group == 0 && anchorEdgeAt(text, i+1-len(anchor.word), i+1, anchor.edge) {
-				groups |= anchor.group
-			}
+			labelAt, end := i+1-len(anchor.word), i+1
+			groups = contextAnchorGroupHit(text, anchor, index, labelAt, end, groups, &russianStarts, &englishCandidates, &searchThrough, &nextDelimiter)
 		}
 	}
 	if len(russianStarts) != 0 {
 		groups |= anchorRuCandidate
 	}
-	return groups, russianStarts
+	if len(englishCandidates) == 0 {
+		return groups, russianStarts, nil
+	}
+	groups |= anchorEnCandidate
+	return groups, russianStarts, englishCandidates
+}
+
+func contextAnchorGroupHit(text string, anchor contextAnchor, index uint8, labelAt, end int, groups anchorGroup, russianStarts *[]int, englishCandidates *[]englishAnchorStart, searchThrough, nextDelimiter *int) anchorGroup {
+	if anchor.group == anchorRuName {
+		*russianStarts = append(*russianStarts, labelAt-2)
+	}
+	anchorUsed := anchorEdgeAt(text, labelAt, end, anchor.edge)
+	nameUsed := anchor.group == anchorName && anchorUsed
+	if index >= englishPasswordAnchorCount {
+		return contextOtherAnchorGroupHit(text, anchor, labelAt, end, groups, anchorUsed, englishCandidates)
+	}
+	if nameUsed {
+		if englishPasswordHasPrefixMarker(text, labelAt) && !englishPasswordIsJSONKey(text, labelAt) {
+			if delimiterAt, ok := englishFastHeaderLead(text, labelAt, end); ok && englishPasswordHasPairedPrefixMarker(text, labelAt, end, delimiterAt) {
+				groups = contextEnglishPasswordAnchorHit(text, labelAt, end, groups, englishCandidates, searchThrough, nextDelimiter)
+			}
+		}
+		if groups&anchorName == 0 {
+			groups |= anchorName
+		}
+		return groups
+	}
+	groups = contextEnglishPasswordAnchorHit(text, labelAt, end, groups, englishCandidates, searchThrough, nextDelimiter)
+	return groups
+}
+
+func contextOtherAnchorGroupHit(text string, anchor contextAnchor, labelAt, end int, groups anchorGroup, anchorUsed bool, englishCandidates *[]englishAnchorStart) anchorGroup {
+	if groups&anchor.group == 0 && anchorUsed {
+		groups |= anchor.group
+	}
+	if anchor.group == anchorName && (end == len(text) || !isAlphaNum(text[end])) && hasEnglishOpeningMarkerByte(text, labelAt) && englishOpeningMarkerStart(text, labelAt) >= 0 {
+		if delimiter, ok := englishFastHeaderLead(text, labelAt, end); ok && delimiter >= 0 {
+			*englishCandidates = append(*englishCandidates, englishAnchorStart{labelAt, end, -1})
+		}
+	}
+	return groups
+}
+
+func hasEnglishOpeningMarkerByte(text string, at int) bool {
+	if at == 0 {
+		return false
+	}
+	switch text[at-1] {
+	case '*', '_', '~', '`', '[', '"':
+		return true
+	case 0xAB:
+		return at >= 2 && text[at-2] == 0xC2
+	default:
+		return false
+	}
+}
+
+func contextEnglishPasswordAnchorHit(text string, labelAt, end int, groups anchorGroup, candidates *[]englishAnchorStart, searchThrough, nextDelimiter *int) anchorGroup {
+	if !englishPasswordAnchorBoundary(text, labelAt) {
+		return groups
+	}
+	if *nextDelimiter < 0 && end <= *searchThrough {
+		return groups
+	}
+	if *nextDelimiter < end {
+		searchFrom := max(end, *searchThrough)
+		if offset := strings.IndexAny(text[searchFrom:], ":="); offset >= 0 {
+			*nextDelimiter = searchFrom + offset
+			*searchThrough = *nextDelimiter + 1
+		} else {
+			*nextDelimiter = -1
+			*searchThrough = len(text)
+		}
+	}
+	if *nextDelimiter >= end && *nextDelimiter-end <= contextEnglishHeaderWindow {
+		delimiter := *nextDelimiter
+		if delimiter-end > 128 {
+			if fastDelimiter, ok := englishFastHeaderLead(text, labelAt, end); ok {
+				delimiter = fastDelimiter
+			} else {
+				return groups
+			}
+		}
+		if text[delimiter] == '=' && englishPrepositionEqualsBefore(text, end, delimiter) {
+			searchFrom := delimiter + 1
+			if offset := strings.IndexAny(text[searchFrom:], ":="); offset >= 0 {
+				delimiter = searchFrom + offset
+			} else {
+				return groups
+			}
+		}
+		*candidates = append(*candidates, englishAnchorStart{labelAt, end, delimiter})
+	}
+	return groups
+}
+
+func englishPrepositionEqualsBefore(text string, end, delimiter int) bool {
+	at := delimiter
+	for at > end && (text[at-1] == ' ' || text[at-1] == '\t') {
+		at--
+	}
+	return at >= end+3 && strings.EqualFold(text[at-3:at], "for") || at >= end+2 && strings.EqualFold(text[at-2:at], "of")
+}
+
+func englishPasswordAnchorBoundary(text string, at int) bool {
+	return at == 0 || !isAlphaNum(text[at-1])
 }
 
 func isNameByte(c byte) bool {
@@ -435,14 +551,14 @@ func (m *masking) mask(text string) string {
 			scan = nil // replacements invalidate byte offsets and run metadata
 		}
 	}
-	groups, russianStarts := contextAnchorScan(text)
+	groups, russianStarts, englishStarts := contextAnchorScan(text)
 	if groups != 0 {
 		var jsonChanged bool
 		text, jsonChanged = maskJSONContext(text, m, groups)
 		if jsonChanged {
-			groups, russianStarts = contextAnchorScan(text)
+			groups, russianStarts, englishStarts = contextAnchorScan(text)
 		}
-		text = maskContext(text, m, groups, russianStarts)
+		text = maskContext(text, m, groups, russianStarts, englishStarts)
 	}
 	if m.found[liveKeyKind] != 0 {
 		text = m.dropLiveKeyTails(text)
@@ -518,7 +634,10 @@ func (m *masking) extend(index int, tail string) {
 }
 
 // Context rules recognize values after familiar command and configuration names.
-func maskContext(text string, m *masking, groups anchorGroup, russianStarts []int) string {
+func maskContext(text string, m *masking, groups anchorGroup, russianStarts []int, englishStarts []englishAnchorStart) string {
+	if groups == anchorEnCandidate && englishPasswordLabelsOnly(englishStarts) {
+		return maskEnglishPasswordOnly(text, m, englishStarts)
+	}
 	matches := make([]contextMatch, 0)
 	if groups&anchorHeader != 0 {
 		matches = append(matches, headerMatches(text)...)
@@ -529,6 +648,10 @@ func maskContext(text string, m *masking, groups anchorGroup, russianStarts []in
 	}
 	if groups&anchorRuCandidate != 0 {
 		matches = append(matches, russianNameMatches(text, russianStarts)...)
+	}
+	if groups&anchorEnCandidate != 0 {
+		matches = append(matches, englishPasswordMatches(text, englishStarts)...)
+		matches = append(matches, markdownSecretLabelMatches(text, englishStarts)...)
 	}
 	if groups&anchorURL != 0 {
 		matches = append(matches, urlMatches(text)...)
@@ -543,17 +666,96 @@ func maskContext(text string, m *masking, groups anchorGroup, russianStarts []in
 			matches = append(matches, toolPasswordMatches(text, segments)...)
 		}
 	}
-	sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
-	spans := make([]contextSpan, 0, len(matches))
+	for i := 1; i < len(matches); i++ {
+		if matches[i].start < matches[i-1].start {
+			sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
+			break
+		}
+	}
+	return replaceContextMatches(text, matches, m)
+}
+
+func englishPasswordLabelsOnly(labels []englishAnchorStart) bool {
+	if len(labels) == 0 {
+		return false
+	}
+	for _, label := range labels {
+		if label.delimiter < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func maskEnglishPasswordOnly(text string, m *masking, labels []englishAnchorStart) string {
+	var out strings.Builder
+	var last int
+	count := 0
+	forEachEnglishPasswordMatch(text, labels, func(match contextMatch) {
+		if match.start < last || match.end <= match.start {
+			return
+		}
+		out.WriteString(text[last:match.start])
+		last = match.end
+		count++
+		if m.tagger != nil && m.isPlaceholder(text[match.start:match.end]) {
+			out.WriteString(text[match.start:match.end])
+			return
+		}
+		out.WriteString(maskMarker)
+		out.WriteString(match.kind)
+		if m.tagger != nil {
+			out.WriteString(m.ph.value)
+			out.WriteString(strconv.Itoa(len(m.values)))
+			m.values = append(m.values, m.original(text[match.start:match.end]))
+		}
+		out.WriteByte(']')
+	})
+	if count == 0 {
+		return text
+	}
+	out.WriteString(text[last:])
+	m.found["password"] += count
+	return out.String()
+}
+
+func replaceContextMatches(text string, matches []contextMatch, m *masking) string {
+	if len(matches) == 0 {
+		return text
+	}
+	var out strings.Builder
+	out.Grow(len(text))
 	last := 0
+	passwordCount := 0
 	for _, match := range matches {
 		if match.start < last || match.end <= match.start {
 			continue
 		}
-		spans = append(spans, contextSpan{match.start, match.end, match.kind})
+		out.WriteString(text[last:match.start])
 		last = match.end
+		if match.kind == "password" {
+			passwordCount++
+		} else {
+			m.found[match.kind]++
+		}
+		if m.tagger != nil && m.isPlaceholder(text[match.start:match.end]) {
+			out.WriteString(text[match.start:match.end])
+			continue
+		}
+		out.WriteString(maskMarker)
+		out.WriteString(match.kind)
+		if m.tagger != nil {
+			out.WriteString(m.ph.value)
+			out.WriteString(strconv.Itoa(len(m.values)))
+			m.values = append(m.values, m.original(text[match.start:match.end]))
+		}
+		out.WriteByte(']')
 	}
-	return replaceSpans(text, spans, m)
+	out.WriteString(text[last:])
+	if passwordCount != 0 {
+		m.found["password"] += passwordCount
+	}
+	return out.String()
 }
 
 // maskJSONContext hides values that JSON keeps apart from their name: an
@@ -929,6 +1131,713 @@ func russianNameMatches(text string, starts []int) []contextMatch {
 	return matches
 }
 
+const contextEnglishHeaderWindow = 1024
+
+type englishValueCacheKey struct {
+	name, value, delimiter string
+	previous               byte
+	filePath               bool
+}
+
+type cachedEnglishPasswordValue struct {
+	key    englishValueCacheKey
+	result bool
+	valid  bool
+}
+
+type englishPasswordHeaderParse struct {
+	indices                  []int
+	labelPair, delimiterPair int
+	valid                    bool
+}
+
+type englishPasswordPrefixCache struct {
+	key         string
+	lead        string
+	delta       int
+	atTextStart bool
+	valid       bool
+}
+
+func englishPasswordMatches(text string, labelStarts []englishAnchorStart) []contextMatch {
+	var matches []contextMatch
+	forEachEnglishPasswordMatch(text, labelStarts, func(match contextMatch) {
+		matches = append(matches, match)
+	})
+	return matches
+}
+
+func forEachEnglishPasswordMatch(text string, labelStarts []englishAnchorStart, visit func(contextMatch)) {
+	var lastValue cachedEnglishPasswordValue
+	var lastPrefix englishPasswordPrefixCache
+	headerCache := make(map[string]englishPasswordHeaderParse, 32)
+	for _, label := range labelStarts {
+		if label.end <= label.start || label.delimiter == -1 {
+			continue
+		}
+		if match, ok := englishPasswordLabelMatch(text, label, &lastValue, headerCache, &lastPrefix); ok {
+			visit(match)
+		}
+	}
+}
+
+func englishPasswordLabelMatch(text string, label englishAnchorStart, valueCache *cachedEnglishPasswordValue, headerCache map[string]englishPasswordHeaderParse, prefixCache *englishPasswordPrefixCache) (contextMatch, bool) {
+	startAt := label.start
+	if hasEnglishOpeningMarkerByte(text, label.start) {
+		if open := englishOpeningMarkerStart(text, label.start); open >= 0 {
+			startAt = open
+		}
+	}
+	if startAt == label.start {
+		cachedStart := label.start + prefixCache.delta
+		leadStart := max(0, cachedStart-len(prefixCache.lead))
+		if prefixCache.valid && cachedStart >= len(prefixCache.lead) && cachedStart <= label.end && (prefixCache.atTextStart && cachedStart == 0 || !prefixCache.atTextStart && text[leadStart:cachedStart] == prefixCache.lead) && text[cachedStart:label.end] == prefixCache.key {
+			startAt = cachedStart
+		} else if prefix, ok := englishPrefixHeaderStart(text, label.start); ok {
+			startAt = prefix
+			prefixCache.key = text[prefix:label.end]
+			prefixLeadStart := max(0, prefix-3)
+			prefixCache.lead = text[prefixLeadStart:prefix]
+			prefixCache.atTextStart = prefix == 0
+			prefixCache.delta = prefix - label.start
+			prefixCache.valid = true
+		}
+	}
+	return englishPasswordMatchAt(text, label, startAt, valueCache, headerCache)
+}
+
+func englishPasswordMatchAt(text string, label englishAnchorStart, start int, valueCache *cachedEnglishPasswordValue, headerCache map[string]englishPasswordHeaderParse) (contextMatch, bool) {
+	if !englishHeaderBoundaryAt(text, start) || start == label.start && hasEnglishOpeningMarkerByte(text, label.start) && englishOpeningMarkerStart(text, label.start) >= 0 {
+		return contextMatch{}, false
+	}
+	limit := min(start+contextEnglishHeaderWindow, len(text))
+	if label.delimiter >= start && label.delimiter < limit {
+		headerEnd := label.delimiter + 1
+		if strings.HasPrefix(text[label.delimiter:], ":=") || strings.HasPrefix(text[label.delimiter:], "=>") {
+			headerEnd++
+		}
+		headerEnd = englishClosingMarkerEnd(text, headerEnd)
+		limit = min(limit, headerEnd)
+	}
+	header := text[start:limit]
+	parsed := englishPasswordHeaderSubmatch(text, start, header, label.delimiter >= 0, headerCache)
+	if !parsed.valid {
+		return contextMatch{}, false
+	}
+	ix := parsed.indices
+	labelStart, labelEnd := start+ix[parsed.labelPair], start+ix[parsed.labelPair+1]
+	name := text[labelStart:labelEnd]
+	kind := "password"
+	delimiter := text[start+ix[parsed.delimiterPair] : start+ix[parsed.delimiterPair+1]]
+	value, ok := scanEnglishSameLineValue(text, start+ix[1], delimiter == ":" || delimiter == ":=")
+	secret := false
+	if ok {
+		secret = englishPasswordValueCached(text, labelStart, name, kind, delimiter, value, valueCache)
+	}
+	if !ok || !secret {
+		return contextMatch{}, false
+	}
+	return contextMatch{value.start, value.end, kind}, true
+}
+
+func englishPasswordHeaderSubmatch(text string, start int, header string, cacheable bool, cache map[string]englishPasswordHeaderParse) englishPasswordHeaderParse {
+	if cacheable && cache != nil {
+		if cached, ok := cache[header]; ok {
+			return cached
+		}
+	}
+	parsed := englishPasswordHeaderParse{indices: contextEnglishPasswordAtRE.FindStringSubmatchIndex(header)}
+	if parsed.indices != nil {
+		parsed.labelPair, parsed.delimiterPair = 4, 6
+		hyphenForm := parsed.indices[8] >= 0
+		openMarker := ""
+		if hyphenForm {
+			parsed.labelPair, parsed.delimiterPair = 8, 10
+		} else if parsed.indices[2] >= 0 {
+			openMarker = text[start+parsed.indices[2] : start+parsed.indices[3]]
+		}
+		parsed.valid = strings.Count(header[:parsed.indices[parsed.delimiterPair+1]], "\n") <= 1 && englishWrapperPairIsValid(header[:parsed.indices[1]], parsed.indices[parsed.labelPair+1], openMarker, hyphenForm)
+	}
+	if cacheable && cache != nil && len(cache) < 256 {
+		cache[header] = parsed
+	}
+	return parsed
+}
+
+func englishPasswordValueCached(text string, nameAt int, name, kind, delimiter string, value contextValue, cache *cachedEnglishPasswordValue) bool {
+	bare := text[value.start:value.end]
+	if value.quoted || strings.ContainsAny(bare, "{[(") || strings.HasSuffix(bare, ":") || authName(strings.ToLower(name)) || strings.EqualFold(name, "pwd") {
+		return englishPasswordValueIsSecret(text, nameAt, name, kind, delimiter, value)
+	}
+	var previous byte
+	if nameAt > 0 {
+		previous = text[nameAt-1]
+	}
+	key := englishValueCacheKey{name, bare, delimiter, previous, startsFilePath(text, nameAt)}
+	if cache.valid && cache.key == key {
+		return cache.result
+	}
+	result := englishPasswordValueIsSecret(text, nameAt, name, kind, delimiter, value)
+	cache.key, cache.result, cache.valid = key, result, true
+	return result
+}
+
+func markdownSecretLabelMatches(text string, labelStarts []englishAnchorStart) []contextMatch {
+	var matches []contextMatch
+	for _, label := range labelStarts {
+		// Password anchors with a delimiter are handled by the English password
+		// matcher. Re-parsing them as generic Markdown labels repeats the same
+		// header work and can disagree about password value rules.
+		if label.delimiter != -1 {
+			continue
+		}
+		if !hasEnglishOpeningMarkerByte(text, label.start) {
+			continue
+		}
+		open := englishOpeningMarkerStart(text, label.start)
+		if open < 0 {
+			continue
+		}
+		start := open
+		end := min(start+contextEnglishHeaderWindow, len(text))
+		ix := contextMarkdownLabelAtRE.FindStringSubmatchIndex(text[start:end])
+		if ix == nil {
+			continue
+		}
+		labelStart, labelEnd := start+ix[4], start+ix[5]
+		if withinMaskMarker(text, start) || withinMaskMarker(text, start+ix[1]) {
+			continue
+		}
+		name := text[labelStart:labelEnd]
+		kind, ok := secretName(name)
+		if !ok {
+			continue
+		}
+		header := text[start : start+ix[1]]
+		openMarker := text[start+ix[2] : start+ix[3]]
+		if !englishWrapperPairIsValid(header, labelEnd-start, openMarker, false) {
+			continue
+		}
+		delimiter := text[start+ix[8] : start+ix[9]]
+		value, ok := scanEnglishSameLineValue(text, start+ix[1], delimiter == ":" || delimiter == ":=")
+		if !ok || !englishMarkdownValueIsSecret(text, labelStart, name, kind, delimiter, value) {
+			continue
+		}
+		matches = append(matches, contextMatch{value.start, value.end, kind})
+	}
+	return matches
+}
+
+func englishMarkdownValueIsSecret(text string, nameAt int, name, kind, delimiter string, value contextValue) bool {
+	if kind == "password" {
+		return englishPasswordValueIsSecret(text, nameAt, name, kind, delimiter, value)
+	}
+	return namedValueIsSecret(text, nameAt, name, kind, delimiter, value)
+}
+
+func scanEnglishSameLineValue(text string, at int, colon bool) (contextValue, bool) {
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if at >= len(text) {
+		return contextValue{}, false
+	}
+	return scanValue(text, at, colon)
+}
+
+func englishWordEnd(text string, at int) bool {
+	return at >= len(text) || !isEnglishPrefixByte(text[at])
+}
+
+func englishFastHeaderLead(text string, labelAt, end int) (int, bool) {
+	if end >= len(text) || isAlphaNum(text[end]) {
+		return -1, false
+	}
+	caseSpace := text[end] == ' ' || text[end] == '\t'
+	if caseSpace {
+		return englishFastHeaderAfterSpace(text, end)
+	}
+	if text[end] != '*' && text[end] != '_' && text[end] != '~' && text[end] != '`' && text[end] != ']' && text[end] != '"' && !strings.HasPrefix(text[end:], "»") {
+		return englishFastHeaderAfterMarker(text, labelAt, end, 0, false)
+	}
+	markerEnd, wrapped := englishFastClosingMarker(text, end)
+	if !wrapped {
+		return -1, false
+	}
+	afterMarker, breaks := englishFastWhitespaceEnd(text, markerEnd)
+	return englishFastHeaderAfterMarker(text, labelAt, afterMarker, breaks, true)
+}
+
+func englishFastHeaderAfterSpace(text string, at int) (int, bool) {
+	end, breaks := englishFastWhitespaceEnd(text, at)
+	if breaks > 1 || end >= len(text) {
+		return -1, false
+	}
+	if englishDelimiterAt(text, end) {
+		return end, true
+	}
+	return englishFastPhraseSuffix(text, end, breaks)
+}
+
+func englishFastClosingMarker(text string, end int) (int, bool) {
+	if strings.HasPrefix(text[end:], "»") {
+		return end + len("»"), true
+	}
+	markerEnd := englishClosingMarkerEnd(text, end)
+	return markerEnd, markerEnd > end
+}
+
+func englishFastHeaderAfterMarker(text string, labelAt, end, breaks int, closed bool) (int, bool) {
+	if englishDelimiterAt(text, end) {
+		open := englishPasswordOpeningMarker(text, labelAt)
+		if breaks > 1 || open == "" && breaks == 0 {
+			return -1, false
+		}
+		if closed || open == `"` {
+			return end, true
+		}
+		delimEnd := end + 1
+		if strings.HasPrefix(text[end:], "=>") {
+			delimEnd++
+		}
+		if englishClosingMarkerEnd(text, delimEnd) > delimEnd {
+			return end, true
+		}
+		return -1, false
+	}
+	end, nextBreaks := englishFastWhitespaceEnd(text, end)
+	breaks += nextBreaks
+	if englishDelimiterAt(text, end) {
+		return end, breaks <= 1 && (breaks == 1 || englishPasswordOpeningMarker(text, labelAt) != "")
+	}
+	if breaks <= 1 {
+		return englishFastPhraseSuffix(text, end, breaks)
+	}
+	return -1, false
+}
+
+func englishPasswordOpeningMarker(text string, labelAt int) string {
+	if open := englishOpeningMarkerStart(text, labelAt); open >= 0 {
+		return text[open:labelAt]
+	}
+	first, ok := englishPreviousWordStart(text, labelAt)
+	if !ok {
+		return ""
+	}
+	if open := englishOpeningMarkerStart(text, first); open >= 0 {
+		return text[open:first]
+	}
+	second, ok := englishPreviousWordStart(text, first)
+	if !ok {
+		return ""
+	}
+	if open := englishOpeningMarkerStart(text, second); open >= 0 {
+		return text[open:second]
+	}
+	return ""
+}
+
+func englishPasswordHasPrefixMarker(text string, labelAt int) bool {
+	if hasEnglishOpeningMarkerByte(text, labelAt) {
+		return true
+	}
+	first, ok := englishPreviousWordStart(text, labelAt)
+	if !ok {
+		return false
+	}
+	if hasEnglishOpeningMarkerByte(text, first) {
+		return true
+	}
+	second, ok := englishPreviousWordStart(text, first)
+	return ok && hasEnglishOpeningMarkerByte(text, second)
+}
+
+func englishPasswordHasPairedPrefixMarker(text string, labelAt, labelEnd, delimiterAt int) bool {
+	if delimiterAt < labelEnd || delimiterAt-labelAt > contextEnglishHeaderWindow {
+		return false
+	}
+	open := englishPasswordOpeningMarker(text, labelAt)
+	if open == "" {
+		return false
+	}
+	openAt := englishOpeningMarkerStart(text, labelAt)
+	if openAt < 0 {
+		first, ok := englishPreviousWordStart(text, labelAt)
+		if !ok {
+			return false
+		}
+		openAt = englishOpeningMarkerStart(text, first)
+		if openAt < 0 {
+			second, ok := englishPreviousWordStart(text, first)
+			if !ok {
+				return false
+			}
+			openAt = englishOpeningMarkerStart(text, second)
+		}
+	}
+	if openAt < 0 || openAt > 0 && isNameByte(text[openAt-1]) {
+		return false
+	}
+	close := open
+	switch open {
+	case "[":
+		close = "]"
+	case "«":
+		close = "»"
+	}
+	if strings.Contains(text[labelEnd:delimiterAt], close) {
+		return true
+	}
+	delimEnd := delimiterAt + 1
+	if strings.HasPrefix(text[delimiterAt:], ":=") || strings.HasPrefix(text[delimiterAt:], "=>") {
+		delimEnd++
+	}
+	return strings.HasPrefix(text[delimEnd:], close)
+}
+
+func englishPasswordIsJSONKey(text string, labelAt int) bool {
+	open := englishPasswordOpeningMarker(text, labelAt)
+	if open != `"` {
+		return false
+	}
+	openAt := englishOpeningMarkerStart(text, labelAt)
+	if openAt < 0 {
+		if prefix, ok := englishPrefixHeaderStart(text, labelAt); ok && strings.HasPrefix(text[prefix:], open) {
+			openAt = prefix
+		}
+	}
+	if openAt < 0 {
+		return false
+	}
+	for openAt > 0 && (text[openAt-1] == ' ' || text[openAt-1] == '\t' || text[openAt-1] == '\r' || text[openAt-1] == '\n') {
+		openAt--
+	}
+	return openAt > 0 && (text[openAt-1] == '{' || text[openAt-1] == ',')
+}
+
+func englishFastWhitespaceEnd(text string, end int) (int, int) {
+	for end < len(text) && (text[end] == ' ' || text[end] == '\t') {
+		end++
+	}
+	breaks := 0
+	if end < len(text) && text[end] == '\r' && end+1 < len(text) && text[end+1] == '\n' {
+		end += 2
+		breaks++
+	} else if end < len(text) && text[end] == '\n' {
+		end++
+		breaks++
+	}
+	for end < len(text) && (text[end] == ' ' || text[end] == '\t') {
+		end++
+	}
+	return end, breaks
+}
+
+func englishFastPhraseSuffix(text string, end, breaks int) (int, bool) {
+	if end >= len(text) {
+		return -1, false
+	}
+	switch text[end] {
+	case '-':
+		if breaks == 0 {
+			return englishHyphenHeaderAt(text, end)
+		}
+		return -1, false
+	case 'f', 'F', 'o', 'O':
+		return englishPrepositionHeaderAt(text, end, breaks)
+	default:
+		return -1, false
+	}
+}
+
+func englishDelimiterAt(text string, at int) bool {
+	return at < len(text) && (text[at] == ':' || text[at] == '=' || strings.HasPrefix(text[at:], "=>"))
+}
+
+func englishHyphenHeaderAt(text string, at int) (int, bool) {
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if at >= len(text) || text[at] != '-' {
+		return -1, false
+	}
+	at++
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if at+3 > len(text) || !strings.EqualFold(text[at:at+3], "the") || !englishWordEnd(text, at+3) {
+		return -1, false
+	}
+	at += 3
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if at+7 > len(text) || !strings.EqualFold(text[at:at+7], "account") || !englishWordEnd(text, at+7) {
+		return -1, false
+	}
+	at = englishClosingMarkerEnd(text, at+7)
+	at, _ = englishFastWhitespaceEnd(text, at)
+	return at, at < len(text) && text[at] == ':'
+}
+
+func englishPrepositionHeaderAt(text string, at, breaks int) (int, bool) {
+	if at+3 <= len(text) && strings.EqualFold(text[at:at+3], "for") && englishWordEnd(text, at+3) {
+		at += 3
+	} else if at+2 <= len(text) && strings.EqualFold(text[at:at+2], "of") && englishWordEnd(text, at+2) {
+		at += 2
+	} else {
+		return -1, false
+	}
+	at = skipEnglishHorizontalSpace(text, at)
+	if at < len(text) && text[at] == '=' {
+		at = skipEnglishHorizontalSpace(text, at+1)
+	}
+	var nextBreaks int
+	at, nextBreaks = englishFastWhitespaceEnd(text, at)
+	breaks += nextBreaks
+	if breaks > 1 {
+		return -1, false
+	}
+	var words int
+	at, words, breaks = englishPhraseWords(text, at, breaks)
+	if words == 0 || breaks > 1 {
+		return -1, false
+	}
+	at = englishClosingMarkerEnd(text, at)
+	at, nextBreaks = englishFastWhitespaceEnd(text, at)
+	breaks += nextBreaks
+	return at, breaks <= 1 && at < len(text) && (text[at] == ':' || text[at] == '=' || strings.HasPrefix(text[at:], "=>"))
+}
+
+func englishPhraseWords(text string, at, breaks int) (int, int, int) {
+	words := 0
+	for words < 4 {
+		end := englishPhraseWordEnd(text, at)
+		if end == at {
+			return at, words, breaks
+		}
+		words++
+		at = end
+		var nextBreaks int
+		at, nextBreaks = englishFastWhitespaceEnd(text, at)
+		breaks += nextBreaks
+		if breaks > 1 {
+			return at, words, breaks
+		}
+		if breaks == 1 {
+			end := min(at+contextEnglishHeaderWindow, len(text))
+			if line := strings.IndexAny(text[at:end], "\r\n"); line >= 0 && !strings.ContainsAny(text[at:at+line], ":=") {
+				return at, words, 2
+			}
+		}
+		if at < len(text) && (text[at] == ':' || text[at] == '=' || strings.HasPrefix(text[at:], "=>")) {
+			return at, words, breaks
+		}
+	}
+	return at, words, breaks
+}
+
+func englishPhraseWordEnd(text string, at int) int {
+	if at >= len(text) {
+		return at
+	}
+	if text[at] == '(' {
+		for end := at + 1; end < len(text) && end-at <= 64; end++ {
+			if text[end] == ')' {
+				return end + 1
+			}
+			if !isEnglishPrefixByte(text[end]) {
+				return at
+			}
+		}
+		return at
+	}
+	if !isAlphaNum(text[at]) && text[at] != '_' {
+		return at
+	}
+	limit := min(at+contextEnglishHeaderWindow, len(text))
+	for at < limit && isEnglishPrefixByte(text[at]) {
+		at++
+	}
+	return at
+}
+
+func skipEnglishHorizontalSpace(text string, at int) int {
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	return at
+}
+
+func englishClosingMarkerEnd(text string, at int) int {
+	if at >= len(text) {
+		return at
+	}
+	switch text[at] {
+	case '*':
+		if strings.HasPrefix(text[at:], "***") {
+			return at + 3
+		}
+		if strings.HasPrefix(text[at:], "**") {
+			return at + 2
+		}
+		return at + 1
+	case '_':
+		if strings.HasPrefix(text[at:], "__") {
+			return at + 2
+		}
+		return at + 1
+	case '~':
+		if strings.HasPrefix(text[at:], "~~") {
+			return at + 2
+		}
+	case '`', ']', '"':
+		return at + 1
+	case 0xC2:
+		if strings.HasPrefix(text[at:], "»") {
+			return at + len("»")
+		}
+	}
+	return at
+}
+
+func englishWrapperPairIsValid(header string, labelEnd int, open string, hyphenForm bool) bool {
+	if hyphenForm {
+		return true
+	}
+	if open == `"` {
+		return true
+	}
+	if open == "" {
+		return !strings.ContainsAny(header[labelEnd:], "*~`[]»\"") && !strings.Contains(header[labelEnd:], "__") && !strings.Contains(header[labelEnd:], "~~")
+	}
+	close := open
+	switch open {
+	case "[":
+		close = "]"
+	case "«":
+		close = "»"
+	}
+	return strings.Contains(header[len(open):], close)
+}
+
+func englishPasswordValueIsSecret(text string, nameAt int, name, kind, delimiter string, value contextValue) bool {
+	if !namedValueIsSecret(text, nameAt, name, kind, delimiter, value) {
+		return false
+	}
+	if value.quoted || strings.EqualFold(text[value.start:value.end], "changeme") {
+		return true
+	}
+	bare := text[value.start:value.end]
+	if shortRussianValue(bare) || strings.HasPrefix(bare, "http://") || strings.HasPrefix(bare, "https://") {
+		return false
+	}
+	return !strings.HasPrefix(bare, "**") || strings.HasSuffix(bare, "**")
+}
+
+func englishPrefixHeaderStart(text string, labelAt int) (int, bool) {
+	first, ok := englishPreviousWordStart(text, labelAt)
+	if !ok {
+		return 0, false
+	}
+	if englishOpeningMarkerAt(text, first) {
+		return first, true
+	}
+	second, hasSecond := englishPreviousWordStart(text, first)
+	if hasSecond {
+		if open := englishOpeningMarkerStart(text, first); open >= 0 {
+			first = open
+		} else if open := englishOpeningMarkerStart(text, second); open >= 0 {
+			first = open
+		} else {
+			first = second
+		}
+	} else if open := englishOpeningMarkerStart(text, first); open >= 0 {
+		first = open
+	}
+	for at := first; at < labelAt; at++ {
+		if isEnglishPrefixByte(text[at]) || text[at] == ' ' || text[at] == '\t' {
+			continue
+		}
+		if at == first {
+			markerFound := false
+			for _, marker := range [...]string{"***", "**", "*", "__", "_", "~~", "`", "[", "«", `"`} {
+				if strings.HasPrefix(text[at:], marker) {
+					at += len(marker)
+					markerFound = true
+					break
+				}
+			}
+			if markerFound {
+				at--
+				continue
+			}
+		}
+		return 0, false
+	}
+	return first, true
+}
+
+func englishOpeningMarkerAt(text string, at int) bool {
+	for _, marker := range [...]string{"***", "**", "*", "__", "_", "~~", "`", "[", "«", `"`} {
+		if strings.HasPrefix(text[at:], marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func englishHeaderBoundaryAt(text string, start int) bool {
+	if start == 0 {
+		return true
+	}
+	c := text[start-1]
+	return !isAlphaNum(c) && c != '_'
+}
+
+func englishOpeningMarkerStart(text string, at int) int {
+	for _, marker := range [...]string{"***", "**", "*", "__", "_", "~~", "`", "[", "«", "\""} {
+		if at >= len(marker) && text[at-len(marker):at] == marker {
+			if strings.HasPrefix(marker, "_") && at > len(marker) && isNameByte(text[at-len(marker)-1]) {
+				continue
+			}
+			return at - len(marker)
+		}
+	}
+	return -1
+}
+
+func englishPreviousWordStart(text string, at int) (int, bool) {
+	if at > 1 && text[at-1] == '_' {
+		start := at - 1
+		for start > 0 && isNameByte(text[start-1]) {
+			start--
+		}
+		if start < at-1 {
+			return start, true
+		}
+	}
+	gap := at
+	for gap > 0 && (text[gap-1] == ' ' || text[gap-1] == '\t') {
+		gap--
+	}
+	if gap == at {
+		return 0, false
+	}
+	wordEnd := gap
+	for gap > 0 && isEnglishPrefixByte(text[gap-1]) {
+		gap--
+	}
+	if gap == wordEnd {
+		return 0, false
+	}
+	return gap, true
+}
+
+func isEnglishPrefixByte(c byte) bool {
+	return isAlphaNum(c) || c == '_' || c == '\'' || c == '-'
+}
+
 func russianNameFromHeader(header string) (name, kind, delimiter string) {
 	delimiterAt, delimiter := russianDelimiterAt(header)
 	if delimiter == "" {
@@ -1019,46 +1928,86 @@ func russianSecretLabel(word string) (kind string, key bool, ok bool) {
 func nameMatches(text string) []contextMatch {
 	var matches []contextMatch
 	for _, ix := range contextNameRE.FindAllStringSubmatchIndex(text, -1) {
-		if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
-			continue
-		}
-		// A name inside the value before it still counts: its own value can lie
-		// past that value's end (auth=::X-API-KEY: value). Overlaps are dropped
-		// in maskContext.
-		name, kind, ok := contextSecretName(text, ix[2], ix[3])
-		if !ok {
-			continue
-		}
-		leftSpace := text[ix[4]:ix[5]]
-		delimiter := text[ix[6]:ix[7]]
-		at := ix[1]
-		if delimiter == "=" && leftSpace == "" && hasHorizontalSpaceAt(text, at) {
-			continue
-		}
-		value, ok := scanValue(text, at, delimiter == ":" || delimiter == ":=")
-		if !ok {
-			continue
-		}
-		// A structure or the next name is no value: the names inside it get
-		// their own match.
-		if valueIsStructure(text, value) {
-			continue
-		}
-		if plainValueFor(name, text[value.start:value.end]) || nonSecretValueForm(text, value, name) {
-			continue
-		}
-		if !value.quoted && notSecretHere(text, ix[2], name, delimiter, text[value.start:value.end]) {
-			continue
-		}
-		// After := and => a bare value is an expression in code; a literal has quotes.
-		if !value.quoted && (delimiter == ":=" || delimiter == "=>") {
-			continue
-		}
-		if valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=") {
-			matches = append(matches, contextMatch{value.start, value.end, kind})
+		if match, ok := nameMatchAt(text, ix); ok {
+			matches = append(matches, match)
 		}
 	}
 	return matches
+}
+
+func nameMatchAt(text string, ix []int) (contextMatch, bool) {
+	if withinMaskMarker(text, ix[0]) || withinMaskMarker(text, ix[6]) {
+		return contextMatch{}, false
+	}
+	// A name inside the value before it still counts: its own value can lie
+	// past that value's end (auth=::X-API-KEY: value). Overlaps are dropped
+	// in maskContext.
+	name, kind, ok := contextSecretName(text, ix[2], ix[3])
+	if !ok {
+		return contextMatch{}, false
+	}
+	leftSpace := text[ix[4]:ix[5]]
+	delimiter := text[ix[6]:ix[7]]
+	at := ix[1]
+	if delimiter == "=" && leftSpace == "" && hasHorizontalSpaceAt(text, at) {
+		return contextMatch{}, false
+	}
+	value, ok := scanValue(text, at, delimiter == ":" || delimiter == ":=")
+	if !ok {
+		return contextMatch{}, false
+	}
+	markdownPassword := kind == "password" && markdownPasswordCloseIsValue(text, ix[0], value)
+	if markdownPassword {
+		value, ok = scanValue(text, value.end, delimiter == ":" || delimiter == ":=")
+		if !ok {
+			return contextMatch{}, false
+		}
+	}
+	secret := namedValueIsSecret(text, ix[2], name, kind, delimiter, value)
+	if markdownPassword {
+		secret = englishPasswordValueIsSecret(text, ix[2], name, kind, delimiter, value)
+	}
+	if !secret {
+		return contextMatch{}, false
+	}
+	return contextMatch{value.start, value.end, kind}, true
+}
+
+func namedValueIsSecret(text string, nameAt int, name, kind, delimiter string, value contextValue) bool {
+	if valueIsStructure(text, value) || plainValueFor(name, text[value.start:value.end]) || nonSecretValueForm(text, value, name) {
+		return false
+	}
+	if !value.quoted && notSecretHere(text, nameAt, name, delimiter, text[value.start:value.end]) {
+		return false
+	}
+	// After := and => a bare value is an expression in code; a literal has quotes.
+	if !value.quoted && (delimiter == ":=" || delimiter == "=>") {
+		return false
+	}
+	return valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=")
+}
+
+func markdownPasswordCloseIsValue(text string, nameStart int, value contextValue) bool {
+	if nameStart < 1 {
+		return false
+	}
+	for _, pair := range [...][2]string{{"***", "***"}, {"**", "**"}, {"*", "*"}, {"__", "__"}, {"_", "_"}, {"~~", "~~"}, {"`", "`"}, {"[", "]"}, {"«", "»"}, {"\"", "\""}} {
+		if text[value.start:value.end] != pair[1] {
+			continue
+		}
+		at := nameStart
+		for range 3 {
+			if at >= len(pair[0]) && text[at-len(pair[0]):at] == pair[0] {
+				return true
+			}
+			prev, ok := englishPreviousWordStart(text, at)
+			if !ok {
+				break
+			}
+			at = prev
+		}
+	}
+	return false
 }
 
 // nonSecretValueForm recognizes code and diagnostic syntax that cannot be a credential.
