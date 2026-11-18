@@ -169,6 +169,163 @@ func TestMaskRussianLabels(t *testing.T) {
 	}
 }
 
+func TestMaskRussianLabelsKeepCyrillicProse(t *testing.T) {
+	for _, input := range []string{
+		"- Описание расхода токенов: показывать сумму по тарифу API.",
+		"Токен: обновлять раз в сутки",
+		"токен: обыкновенное слово без ё",
+		"пароль: Замечательное",
+		"пароль: ёжик в тумане",
+		"пароль: ёжикзамечательный",
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("prose changed from %q to %q, counts %v", input, got, found)
+		}
+	}
+	for _, input := range []string{
+		"токен: a1B2c3D4e5F6g7H8",
+		"пароль: Zq8wX2pLm",
+		"пароль: КрасныйСлон",
+		"токен: КрасныйSecret",
+		"пароль: КрасныйSecret",
+		"пароль: обычноеword",
+	} {
+		if got, found := Mask(input); got == input || len(found) == 0 {
+			t.Errorf("secret value was not masked in %q", input)
+		}
+	}
+}
+
+func TestMaskCodeAssignmentsKeepExpressions(t *testing.T) {
+	for _, input := range []string{
+		"const pass = typeof want === 'string';",
+		"let pass = await check(x);",
+		"pass = new Checker(cfg);",
+		"const token = await fetchToken();",
+		"let secret = process.env.APP_SECRET;",
+		"let pwd = await x.y();",
+		"secret = await vault.read(path)",
+		"api_key = env.API_KEY",
+		"password = settings.SECRET_KEY",
+		"hash = user.password_hash",
+		`password = typeof want === "function";`,
+		"let pwd = check(x);",
+	} {
+		if got, found := Mask(input); got != input || len(found) != 0 {
+			t.Errorf("expression changed from %q to %q, counts %v", input, got, found)
+		}
+	}
+	for _, input := range []string{
+		`const pass = "Xk9#mQ2vL7";`,
+		`const pass = "typeof";`,
+		`token = "sk.eyJ1IjoiZXhhbXBsZSJ9"`,
+		`token = "settings.SECRET_KEY"`,
+		"pass = Xk9mQ2vL7",
+		"password: hunter2",
+		"DB password: Zq8wX2pLm",
+		"export PASS=Xk9mQ2vL7",
+		"token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+		"token=aB3_dE5fG7.hJ9kL2mN4_pQ6rS8",
+		"secret=Xk9_mQ2.vL7",
+		"api_key=a1b2c3d4e5f6_g7h8.i9",
+		"password=my_secret.v2",
+		"password=new",
+		"password=typeof",
+		"password = typeof;",
+		"password=await",
+		"password: process.env.APP_SECRET",
+		"api_key=env.API2_KEY",
+		"token=env.API2",
+		"token=x.ABCDEF0123456789",
+		"api_key=live.4F3A9B2C7D1E6F80",
+		"secret=prod.QWERTYUIOP234567",
+		"otp_secret=totp.JBSWY3DPEHPK3PXP",
+		"password=Hello.WORLD1",
+		"password=Summer.SALE2024",
+		"VAULT_TOKEN=hvs.CAESIJxK9mQ2vL7wP3aB5dE7fG9hJ1kL3mN5pQ7rS9tU1vW3",
+		"VAULT_TOKEN=s.Xk9mQ2vL7wP3aB5dE7fG9hJ1",
+		"token=hvb.AAAAAQKx9mQ2vL7wP3aB5dE7fG9hJ1kL3",
+		"MAPBOX_TOKEN=sk.eyJ1IjoiZXhhbXBsZSIsImEiOiJ4eXoifQ.Xk9mQ2vL7wP3aB5d",
+		"mapbox_token=pk.eyJ1IjoiZXhhbXBsZSIsImEiOiJ4eXoifQ.Xk9mQ2vL7wP3aB5d",
+		"DOPPLER_TOKEN=dp.st.dev.Xk9mQ2vL7wP3aB5dE7fG9hJ1kL3",
+		"secret=abc.Xk9mQ2vL7wP3",
+		"token=x.Xk9mQ2vL7wP3aB5d",
+		"api_key=key.Xk9mQ2vL7wP3aB5d",
+		"password=mysecret.v2",
+		"secret=Xk9mQ2vL7.ABCDEF1234",
+		"secret=foo.bar_..BARX",
+		"secret=foo.bar-baz",
+		"secret=settings.1234_",
+		"secret=USER.password_hash",
+		"password=new Pass2024",
+		"password = await Xk9mQ2vL7",
+		"password = new;",
+		"password = typeof Xk9mQ2vL7",
+		"password = typeof x",
+		"password = typeof;",
+		"password = typeof ;",
+		"password = await 1X.foo",
+		"password = new 1X.foo",
+		"password = await x+secret",
+		"password = new X+secret",
+		"password: new",
+	} {
+		if got, found := Mask(input); got == input || len(found) == 0 {
+			t.Errorf("secret value was not masked in %q", input)
+		}
+	}
+}
+
+func TestMaskInvalidKeywordAssignmentMasksWholeValue(t *testing.T) {
+	for input, want := range map[string]string{
+		"password = await Xk9mQ2vL7":  "password = [скрыто:password]",
+		"password = new Pass2024":     "password = [скрыто:password]",
+		"password = typeof Xk9mQ2vL7": "password = [скрыто:password]",
+		"password = typeof x":         "password = [скрыто:password]",
+		"password = new;":             "password = [скрыто:password];",
+		"password = typeof;":          "password = [скрыто:password];",
+		"password = typeof ;":         "password = [скрыто:password] ;",
+		"password = await 1X.foo":     "password = [скрыто:password]",
+		"password = new 1X.foo":       "password = [скрыто:password]",
+		"password = await x+secret":   "password = [скрыто:password]",
+		"password = new X+secret":     "password = [скрыто:password]",
+	} {
+		if got, found := Mask(input); got != want || found["password"] != 1 {
+			t.Errorf("got %q, counts %v; want %q", got, found, want)
+		}
+	}
+}
+
+func TestCodeAssignmentContinuationRules(t *testing.T) {
+	for input, want := range map[string]bool{
+		"await check(x)":               true,
+		"await vault.read(path)":       true,
+		"await x.y()":                  true,
+		"await 1X.foo":                 false,
+		"await x+secret":               false,
+		"await x":                      false,
+		"new Checker(cfg)":             true,
+		"new object.field":             true,
+		"new 1X.foo":                   false,
+		"new X+secret":                 false,
+		"new X":                        false,
+		"typeof want === \"function\"": true,
+		"typeof object.field":          true,
+		"typeof Xk9mQ2vL7":             false,
+		"typeof x":                     false,
+		"typeof ;":                     false,
+	} {
+		keyword, _, _ := strings.Cut(input, " ")
+		if keyword == input {
+			keyword = strings.TrimSuffix(input, ";")
+		}
+		value := contextValue{start: 0, end: len(keyword)}
+		if got := codeAssignmentExpression(input, value, "="); got != want {
+			t.Errorf("%q: code expression = %v, want %v", input, got, want)
+		}
+	}
+}
+
 func TestMaskEnglishPasswordLabelPhrases(t *testing.T) {
 	secret := "Zq7xW9vK2mPq8Rt"
 	inputs := []string{

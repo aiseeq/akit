@@ -69,6 +69,14 @@
 //     short lower-case password such as hunter2 there is not.
 //   - Context rules can hide prose that resembles an assignment or option,
 //     including “--token is no longer needed” and “password: word”.
+//   - Russian labels leave a bare all-Cyrillic word without internal uppercase
+//     letters visible as prose; quoted values and mixed-case words are checked
+//     normally.
+//   - After `=`, common unquoted code expressions stay visible: typeof needs a
+//     continuation, await/new need a call or field continuation, and field
+//     paths use nonempty identifier segments without digits, and their first
+//     segment is a lowercase word.
+//     Quoted literals and dotted token-like values are still checked.
 package secretmask
 
 import (
@@ -1859,6 +1867,9 @@ func russianContextValue(text string, end int, name, kind, delimiter string) (co
 		!valueIsValueFor(text, value, name, kind, delimiter == ":" || delimiter == ":=", true) {
 		return contextValue{}, false
 	}
+	if !value.quoted && isCyrillicProseWord(text[value.start:value.end]) {
+		return contextValue{}, false
+	}
 	if !value.quoted && (delimiter == ":=" || delimiter == "=>") && !isRussianValueLabel(name) {
 		return contextValue{}, false
 	}
@@ -1908,6 +1919,23 @@ func shortRussianValue(value string) bool {
 		if unicode.IsDigit(r) {
 			return false
 		}
+	}
+	return true
+}
+
+func isCyrillicProseWord(value string) bool {
+	if value == "" {
+		return false
+	}
+	first := true
+	for _, r := range value {
+		if !unicode.IsLetter(r) || !(r >= 'А' && r <= 'Я' || r >= 'а' && r <= 'я' || r == 'Ё' || r == 'ё') {
+			return false
+		}
+		if !first && unicode.IsUpper(r) {
+			return false
+		}
+		first = false
 	}
 	return true
 }
@@ -1963,6 +1991,9 @@ func nameMatchAt(text string, ix []int) (contextMatch, bool) {
 			return contextMatch{}, false
 		}
 	}
+	if !markdownPassword && !value.quoted {
+		value = extendInvalidKeywordAssignment(text, value, delimiter)
+	}
 	secret := namedValueIsSecret(text, ix[2], name, kind, delimiter, value)
 	if markdownPassword {
 		secret = englishPasswordValueIsSecret(text, ix[2], name, kind, delimiter, value)
@@ -1980,6 +2011,9 @@ func namedValueIsSecret(text string, nameAt int, name, kind, delimiter string, v
 	if !value.quoted && notSecretHere(text, nameAt, name, delimiter, text[value.start:value.end]) {
 		return false
 	}
+	if !value.quoted && codeAssignmentExpression(text, value, delimiter) {
+		return false
+	}
 	// After := and => a bare value is an expression in code; a literal has quotes.
 	if !value.quoted && (delimiter == ":=" || delimiter == "=>") {
 		return false
@@ -1987,6 +2021,104 @@ func namedValueIsSecret(text string, nameAt int, name, kind, delimiter string, v
 	return valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=")
 }
 
+// codeAssignmentExpression leaves common unquoted assignment expressions alone.
+// Quoted values still use the normal secret rules, including inside code.
+func codeAssignmentExpression(text string, value contextValue, delimiter string) bool {
+	if delimiter != "=" {
+		return false
+	}
+	word := text[value.start:value.end]
+	switch word {
+	case "await", "new":
+		return keywordCallOrFieldContinuation(text, value.end)
+	case "typeof":
+		return typeofContinuation(text, value.end)
+	}
+	return isCodeFieldPath(word)
+}
+
+func typeofContinuation(text string, at int) bool {
+	start := at
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if at == start || at >= len(text) || !isIdentifierStart(text[at]) {
+		return false
+	}
+	at++
+	for at < len(text) && isIdentifierByte(text[at]) {
+		at++
+	}
+	if at < len(text) && (text[at] == '(' || text[at] == '.') {
+		return true
+	}
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	for _, op := range [...]string{"===", "!==", "==", "!=", "<=", ">=", "<", ">"} {
+		if strings.HasPrefix(text[at:], op) {
+			return true
+		}
+	}
+	return false
+}
+
+func keywordCallOrFieldContinuation(text string, at int) bool {
+	start := at
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if at == start || at >= len(text) || !isIdentifierStart(text[at]) {
+		return false
+	}
+	at++
+	for at < len(text) && isIdentifierByte(text[at]) {
+		at++
+	}
+	return at < len(text) && (text[at] == '(' || text[at] == '.')
+}
+
+func extendInvalidKeywordAssignment(text string, value contextValue, delimiter string) contextValue {
+	word := text[value.start:value.end]
+	if delimiter != "=" || word != "await" && word != "new" && word != "typeof" || codeAssignmentExpression(text, value, delimiter) {
+		return value
+	}
+	at := value.end
+	for at < len(text) && (text[at] == ' ' || text[at] == '\t') {
+		at++
+	}
+	if next, ok := scanBareValue(text, at, false); ok {
+		value.end = next.end
+	}
+	return value
+}
+
+func isCodeFieldPath(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for i := 0; i < len(part); i++ {
+			if !isAlphaNum(part[i]) && part[i] != '_' {
+				return false
+			}
+		}
+		if strings.IndexFunc(part, unicode.IsDigit) >= 0 {
+			return false
+		}
+	}
+	first := parts[0]
+	for i := 0; i < len(first); i++ {
+		if first[i] < 'a' || first[i] > 'z' {
+			return false
+		}
+	}
+	return first != ""
+}
 func markdownPasswordCloseIsValue(text string, nameStart int, value contextValue) bool {
 	if nameStart < 1 {
 		return false
