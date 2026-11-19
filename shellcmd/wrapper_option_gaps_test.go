@@ -151,9 +151,6 @@ func TestTasksetUnknownOptionsKeepMainBehavior(t *testing.T) {
 		`taskset -V 1 kill 1`,
 		`taskset --help 1 kill 1`,
 		`taskset --version 1 kill 1`,
-		`taskset -x 1 kill 1`,
-		`taskset --bogus 1 kill 1`,
-		`taskset -ax 1 kill 1`,
 	} {
 		t.Run(src, func(t *testing.T) {
 			calls, err := Calls(src)

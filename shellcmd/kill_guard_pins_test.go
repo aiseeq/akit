@@ -15,11 +15,11 @@ func TestUnknownWrapperRoutesPinned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := pipedShellName(f.Stmts[0], "strace --unknown bash -s", nil); ok {
-		t.Error("unknown pipeline wrapper accepted")
+	if name, _, ok := pipedShellName(f.Stmts[0], "strace --unknown bash -s", nil); !ok || name != "bash" {
+		t.Error("possible shell behind unknown pipeline wrapper missed")
 	}
-	if _, _, _, ok := shellInputNextTarget("strace", args, 0); ok {
-		t.Error("unknown shell input wrapper accepted")
+	if name, _, _, ok := shellInputNextTarget("strace", args, 0); !ok || name != "bash" {
+		t.Error("possible shell input behind unknown wrapper missed")
 	}
 	c := cmd{call: Call{Name: "strace", Args: []string{"--unknown", "sudo", "-s"}}}
 	if _, ok := sudoShellTarget(c); ok {
