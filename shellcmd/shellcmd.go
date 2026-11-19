@@ -405,8 +405,8 @@ func checkUncertainTime(file *syntax.File, src string, lineBase int, inherited [
 	if err != nil && !errors.As(err, &nested) {
 		return nil
 	}
-	for _, call := range candidates {
-		if signalCall(call) && slices.Contains(call.Via, "time") {
+	for i := range candidates {
+		if call := &candidates[i]; signalCall(call) && slices.Contains(call.Via, "time") {
 			return &NestedError{Script: src, Err: errors.New("shellcmd: ambiguous time option may hide a signal")}
 		}
 	}
@@ -6812,7 +6812,7 @@ func uncertainCommandScripts(c cmd, lineBase int, vars map[string]string) error 
 		if errors.Is(err, errCommandExpansionDepth) || errors.Is(err, errUncertainWrapperBudget) {
 			return err
 		}
-		if slices.ContainsFunc(calls, signalCall) || errors.Is(err, errUnknownWrapperSignal) {
+		if anySignalCall(calls) || errors.Is(err, errUnknownWrapperSignal) {
 			return &NestedError{Script: c.call.Raw, Err: errUnknownWrapperSignal}
 		}
 	}
@@ -6854,7 +6854,7 @@ func processSubstitutionSignal(c cmd, lineBase int, vars map[string]string) (boo
 		if err != nil && !errors.As(err, &nested) {
 			continue
 		}
-		if slices.ContainsFunc(calls, signalCall) || errors.Is(err, errUnknownWrapperSignal) {
+		if anySignalCall(calls) || errors.Is(err, errUnknownWrapperSignal) {
 			return true, nil
 		}
 	}
@@ -6862,7 +6862,8 @@ func processSubstitutionSignal(c cmd, lineBase int, vars map[string]string) (boo
 }
 
 func uncertainCallsSignal(c cmd, calls []Call, vars map[string]string) (bool, error) {
-	for _, call := range calls {
+	for i := range calls {
+		call := &calls[i]
 		if call.Name == "kill" && (slices.Contains(call.Via, "xargs") || slices.Contains(call.Via, "parallel")) && !signalCall(call) {
 			possible, err := xargsMayReceiveSignalTarget(c, vars)
 			if err != nil {
@@ -7331,7 +7332,7 @@ func uncertainWrapperTarget(name string, args []string, shell bool) (int, bool) 
 	remaining := maxNestedScripts * 2
 	for _, start := range uncertainWrapperTargets(name, args) {
 		candidate := commandName(args[start])
-		if shell && uncertainShellCandidate(candidate, args[start+1:], &remaining) || !shell && candidate == "kill" && (start == unknownWrapperOption(name, args)+1 || signalCall(Call{Name: candidate, Args: args[start+1:]})) {
+		if shell && uncertainShellCandidate(candidate, args[start+1:], &remaining) || !shell && candidate == "kill" && (start == unknownWrapperOption(name, args)+1 || signalCall(&Call{Name: candidate, Args: args[start+1:]})) {
 			return start, true
 		}
 	}
@@ -7364,9 +7365,19 @@ func uncertainShellCandidate(name string, args []string, remaining *int) bool {
 	return false
 }
 
+// anySignalCall reports whether a call in calls sends a signal.
+func anySignalCall(calls []Call) bool {
+	for i := range calls {
+		if signalCall(&calls[i]) {
+			return true
+		}
+	}
+	return false
+}
+
 // signalCall recognises numeric and dynamic kill targets, excluding listing
 // modes; pkill and killall are always considered signal calls.
-func signalCall(call Call) bool {
+func signalCall(call *Call) bool {
 	if call.Name == "pkill" || call.Name == "killall" {
 		return true
 	}

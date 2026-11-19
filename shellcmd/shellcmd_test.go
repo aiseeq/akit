@@ -4090,7 +4090,7 @@ func TestUncertainSignalOperands(t *testing.T) {
 		{Call{Name: "killall", Args: []string{"init"}}, true},
 		{Call{Name: "grep", Args: []string{"kill"}}, false},
 	} {
-		if got := signalCall(tc.call); got != tc.want {
+		if got := signalCall(&tc.call); got != tc.want {
 			t.Errorf("signalCall(%#v) = %t, want %t", tc.call, got, tc.want)
 		}
 	}
