@@ -3052,6 +3052,9 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 	var via []string
 	scan := wrapperExecScan{work: work}
 	for {
+		if wrapperReadsStdinShell(name, args) {
+			return "sh", append(via, name), true
+		}
 		if isShell(name) {
 			operand, command, stdin := shellArgs(name, args)
 			return name, via, !shellNoExec(name, args) && !command && (stdin || operand == len(args))
@@ -3590,6 +3593,9 @@ func shellInputNextTarget(name string, args []string, argOffset int) (string, []
 }
 
 func shellInputNextTargetWithScan(name string, args []string, argOffset int, scan *wrapperExecScan) (string, []string, int, bool) {
+	if wrapperReadsStdinShell(name, args) {
+		return "sh", nil, argOffset, true
+	}
 	if target, ok := scan.find(execScanArgs(name, args)); ok {
 		argOffset += len(args) - len(target) + 1
 		return commandName(target[0]), target[1:], argOffset, true
@@ -5186,6 +5192,9 @@ func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work
 	var via []string
 	scan := wrapperExecScan{work: work}
 	for {
+		if hasHeredoc && wrapperReadsStdinShell(name, args) {
+			return "sh", append(via, name), nil
+		}
 		if name == "sudo" && hasHeredoc && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), nil
 		}
@@ -5213,6 +5222,18 @@ func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work
 		if !ok {
 			return "", nil, nil
 		}
+	}
+}
+
+func wrapperReadsStdinShell(name string, args []string) bool {
+	switch name {
+	case "chroot", "setarch", "linux32", "linux64", "i386", "x86_64", "uname26", "nsenter", "run0", "pkexec":
+		if wrapperExitsWithoutCommand(name, args) || name == "chroot" && len(args) == 0 {
+			return false
+		}
+		return wrapperStart(name, args) >= len(args)
+	default:
+		return false
 	}
 }
 
@@ -5286,6 +5307,9 @@ func shellInputForShell(name string, args []string, hasHeredoc bool, via []strin
 }
 
 func nextShellInputTarget(name string, args []string, via []string, scan *wrapperExecScan) (string, []string, []string, bool) {
+	if wrapperReadsStdinShell(name, args) {
+		return "sh", nil, append(via, name), true
+	}
 	if target, ok := scan.find(execScanArgs(name, args)); ok {
 		return commandName(target[0]), target[1:], append(via, name, "exec"), true
 	}
@@ -7598,7 +7622,7 @@ func tasksetHasSeparateCPUList(args []string) bool {
 func longWrapperOptionStep(name string, args []string, i int) (int, bool) {
 	key, _, attached := strings.Cut(args[i], "=")
 	key = wrapperLongOption(name, key)
-	if !valueOptions[name][key] && !flagOptions[name][key] {
+	if !valueOptions[name][key] && !flagOptions[name][key] && !optionalValueOptions[name][key] {
 		return i, true
 	}
 	if valueOptions[name][key] && !attached && i+1 < len(args) {
@@ -7615,7 +7639,7 @@ func wrapperLongOption(name, key string) string {
 		return key
 	}
 	match := ""
-	for _, options := range []map[string]bool{valueOptions[name], flagOptions[name]} {
+	for _, options := range []map[string]bool{valueOptions[name], flagOptions[name], optionalValueOptions[name]} {
 		for option := range options {
 			if strings.HasPrefix(option, key) {
 				if match != "" {
@@ -7636,7 +7660,7 @@ func wrapperLongOptionAmbiguous(name, key string) bool {
 		return false
 	}
 	matches := 0
-	for _, options := range []map[string]bool{valueOptions[name], flagOptions[name]} {
+	for _, options := range []map[string]bool{valueOptions[name], flagOptions[name], optionalValueOptions[name]} {
 		for option := range options {
 			if strings.HasPrefix(option, key) {
 				matches++
@@ -7649,6 +7673,9 @@ func wrapperLongOptionAmbiguous(name, key string) bool {
 func shortWrapperOptionStep(name string, args []string, i int) (int, bool) {
 	for j := 1; j < len(args[i]); j++ {
 		key, takesValue := shortOptionAt(name, args[i], j)
+		if optionalValueOptions[name][key] {
+			return i + 1, false
+		}
 		if !valueOptions[name][key] && !flagOptions[name][key] {
 			return i, true
 		}
@@ -7961,6 +7988,16 @@ func mainUnwrapStart(name string, args []string) (int, bool) {
 func unwrapMain(name string, args []string) ([]string, []string, bool) {
 	// На вложенных подстановках построение неиспользуемых результатов без обёртки
 	// давало 13% всех выделенных объектов в профиле Find.
+	if addedWrapper(name) {
+		if !wrapperOptionsKnown(name, args) {
+			return nil, nil, false
+		}
+		target, ok := unwrapOnce(name, args)
+		if !ok || len(target) == 0 {
+			return nil, nil, false
+		}
+		return target, []string{name}, true
+	}
 	if !baselineWrapper(name) {
 		return nil, nil, false
 	}
@@ -7982,6 +8019,15 @@ func unwrapMain(name string, args []string) ([]string, []string, bool) {
 		return nil, nil, false
 	}
 	return append([]string{name}, args...), slices.Clone(via[:count]), count > 0
+}
+
+func addedWrapper(name string) bool {
+	switch name {
+	case "prlimit", "systemd-inhibit", "dbus-run-session", "run0", "pkexec", "chroot", "setarch", "nsenter", "ssh-agent", "linux32", "linux64", "i386", "x86_64", "uname26":
+		return true
+	default:
+		return false
+	}
 }
 
 func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
@@ -9538,7 +9584,10 @@ func optionNext(name string, args []string, i int) int {
 		return i + 1
 	}
 	for j := 1; j < len(arg); j++ {
-		_, takesValue := shortOptionAt(name, arg, j)
+		key, takesValue := shortOptionAt(name, arg, j)
+		if optionalValueOptions[name][key] {
+			return i + 1
+		}
 		if takesValue {
 			if j == len(arg)-1 && i+1 < len(args) {
 				return i + 2
@@ -9778,7 +9827,7 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 	if name == "command" && commandIsLookup(args) {
 		return nil, false
 	}
-	if (name == "setsid" || name == "flock" || name == "chrt" || name == "strace") && wrapperExitsWithoutCommand(name, args) {
+	if (name == "setsid" || name == "flock" || name == "chrt" || name == "strace" || addedWrapper(name)) && wrapperExitsWithoutCommand(name, args) {
 		return nil, false
 	}
 	if name == "parallel" {
@@ -9829,6 +9878,9 @@ func wrapperExitsWithoutCommand(name string, args []string) bool {
 		}
 		arg, _, _ := strings.Cut(args[i], "=")
 		arg = wrapperLongOption(name, arg)
+		if name == "systemd-inhibit" && arg == "--list" || name == "setarch" && (arg == "--list" || arg == "--show") {
+			return true
+		}
 		if name == "chrt" && (arg == "-m" || arg == "--max") {
 			return true
 		}
@@ -9841,7 +9893,7 @@ func wrapperExitsWithoutCommand(name string, args []string) bool {
 }
 
 func shortGroupExitsWithoutCommand(name, arg string) bool {
-	if len(arg) <= 2 || arg[0] != '-' || arg[1] == '-' {
+	if len(arg) < 2 || arg[0] != '-' || arg[1] == '-' {
 		return false
 	}
 	for j := 1; j < len(arg); j++ {
@@ -9849,7 +9901,10 @@ func shortGroupExitsWithoutCommand(name, arg string) bool {
 		if key == "-h" || key == "-V" || name == "chrt" && key == "-m" {
 			return true
 		}
-		if takesValue {
+		if name == "ssh-agent" && slices.Contains([]string{"-c", "-s", "-D", "-d", "-k"}, key) {
+			return true
+		}
+		if takesValue || optionalValueOptions[name][key] {
 			return false
 		}
 	}
@@ -9859,6 +9914,22 @@ func shortGroupExitsWithoutCommand(name, arg string) bool {
 func wrapperStart(name string, args []string) int {
 	i := wrapperOptionEnd(name, args, 0)
 	switch name {
+	case "prlimit":
+		if hasOption(name, args, "-p", "--pid") {
+			return len(args)
+		}
+	case "chroot":
+		if i < len(args) {
+			i++ // NEWROOT
+		}
+	case "setarch":
+		i = 0
+		if i < len(args) && args[i] != "--" && !strings.HasPrefix(args[i], "-") {
+			i++ // optional architecture
+		}
+		i = wrapperOptionEnd(name, args, i)
+	case "linux32", "linux64", "i386", "x86_64", "uname26":
+		i = wrapperOptionEnd(name, args, 0)
 	case "taskset":
 		if hasOption(name, args, "-p", "--pid") {
 			return len(args)
@@ -9938,62 +10009,96 @@ func commandIsLookup(args []string) bool {
 }
 
 // wrappers — программы, которые запускают программу из своих аргументов.
-var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "taskset", "chrt", "strace", "setpriv", "unshare", "flock", "busybox", "systemd-run", "parallel", "runuser", "doas", "su", "setsid")
+var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "taskset", "chrt", "strace", "setpriv", "unshare", "flock", "busybox", "systemd-run", "parallel", "runuser", "doas", "su", "setsid", "prlimit", "systemd-inhibit", "dbus-run-session", "run0", "pkexec", "chroot", "setarch", "nsenter", "ssh-agent", "linux32", "linux64", "i386", "x86_64", "uname26")
 
 // valueOptions — опции обёрток и ssh, следующее слово после которых — их значение, а не программа.
 var valueOptions = map[string]map[string]bool{
-	"timeout":     set("-s", "--signal", "-k", "--kill-after"),
-	"env":         set("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0"),
-	"sudo":        set("-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-R", "--chroot"),
-	"nice":        set("-n", "--adjustment"),
-	"ionice":      set("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"),
-	"stdbuf":      set("-i", "--input", "-o", "--output", "-e", "--error"),
-	"time":        set("-f", "--format", "-o", "--output"),
-	"exec":        set("-a"),
-	"xargs":       set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file", "--process-slot-var"),
-	"ssh":         set("-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"),
-	"taskset":     set("-p", "--pid"),
-	"setsid":      set(),
-	"chrt":        set("-p", "--pid", "-P", "-T", "-D", "--sched-period", "--sched-runtime", "--sched-deadline"),
-	"strace":      set("-o", "--output", "-e", "-p", "--attach", "-u", "-s", "-O", "--summary-syscall-overhead", "-I", "-E", "-P", "-a", "-S", "-X", "-b", "--detach-on", "-U", "--summary-columns", "--argv0", "--trace", "--trace-fds", "--trace-path", "--abbrev", "--verbose", "--signal", "--status", "--inject", "--fault", "--syscall-limit", "--read", "--write", "--user", "--string-limit", "--env", "--columns", "--const-print-style", "--stack-trace-frame-limit", "--summary-sort-by", "--interruptible", "--decode-pids", "--raw", "--kvm", "--color"),
-	"setpriv":     set("--reuid", "--ruid", "--euid", "--regid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig", "--ptracer", "--landlock-access", "--landlock-rule", "--landlock-restrict", "--seccomp-filter"),
-	"unshare":     set("-S", "-G", "-R", "-w", "-l", "--setuid", "--setgid", "--setgroups", "--root", "--wd", "--load-interp", "--map-user", "--map-group", "--map-users", "--map-groups", "--monotonic", "--boottime", "--propagation"),
-	"flock":       set("-E", "--conflict-exit-code", "-w", "--wait", "--timeout"),
-	"systemd-run": set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--host", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--nice", "--root-directory", "--json", "--job-mode", "--path-property", "--socket-property", "--background", "--expand-environment", "-C", "--capsule"),
-	"runuser":     set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "--session-command", "-s", "--shell", "-w", "--whitelist-environment"),
-	"su":          set("-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
-	"doas":        set("-u", "--user", "-a", "--auth-type", "-C", "--config"),
-	"watch":       set("-n", "--interval", "-q", "--equexit"),
-	"script":      set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io", "-m", "--logging-format", "-o", "--output-limit"),
-	"parallel":    set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "-a", "--arg-file", "--sshloginfile", "--joblog", "--results", "--workdir", "--env", "--block", "--recstart", "--recend", "--regexp", "--tagstring", "--halt", "--timeout", "--delay", "--memfree", "--load", "--nice", "--filter", "--return", "--transferfile", "--cleanup", "--trc", "--basefile", "--record-env", "-C", "--colsep", "-I", "-E", "--retries", "--tmpdir", "--header", "--termseq", "--sshdelay", "--group-by", "--compress-program", "--limit", "--memsuspend"),
-	"tmux":        set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e", "-F", "-B", "-l", "-m", "-R", "-T", "-p"),
+	"timeout":          set("-s", "--signal", "-k", "--kill-after"),
+	"env":              set("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0"),
+	"sudo":             set("-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-R", "--chroot"),
+	"nice":             set("-n", "--adjustment"),
+	"ionice":           set("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"),
+	"stdbuf":           set("-i", "--input", "-o", "--output", "-e", "--error"),
+	"time":             set("-f", "--format", "-o", "--output"),
+	"exec":             set("-a"),
+	"xargs":            set("-I", "-n", "--max-args", "-P", "--max-procs", "-L", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file", "--process-slot-var"),
+	"ssh":              set("-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w"),
+	"taskset":          set("-p", "--pid"),
+	"setsid":           set(),
+	"chrt":             set("-p", "--pid", "-P", "-T", "-D", "--sched-period", "--sched-runtime", "--sched-deadline"),
+	"strace":           set("-o", "--output", "-e", "-p", "--attach", "-u", "-s", "-O", "--summary-syscall-overhead", "-I", "-E", "-P", "-a", "-S", "-X", "-b", "--detach-on", "-U", "--summary-columns", "--argv0", "--trace", "--trace-fds", "--trace-path", "--abbrev", "--verbose", "--signal", "--status", "--inject", "--fault", "--syscall-limit", "--read", "--write", "--user", "--string-limit", "--env", "--columns", "--const-print-style", "--stack-trace-frame-limit", "--summary-sort-by", "--interruptible", "--decode-pids", "--raw", "--kvm", "--color"),
+	"setpriv":          set("--reuid", "--ruid", "--euid", "--regid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--apparmor-profile", "--selinux-label", "--pdeathsig", "--ptracer", "--landlock-access", "--landlock-rule", "--landlock-restrict", "--seccomp-filter"),
+	"unshare":          set("-S", "-G", "-R", "-w", "-l", "--setuid", "--setgid", "--setgroups", "--root", "--wd", "--load-interp", "--map-user", "--map-group", "--map-users", "--map-groups", "--monotonic", "--boottime", "--propagation"),
+	"flock":            set("-E", "--conflict-exit-code", "-w", "--wait", "--timeout"),
+	"systemd-run":      set("--unit", "--description", "--slice", "--property", "-p", "--uid", "--gid", "--working-directory", "--service-type", "-E", "--setenv", "-u", "-M", "-H", "--host", "--machine", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--nice", "--root-directory", "--json", "--job-mode", "--path-property", "--socket-property", "--background", "--expand-environment", "-C", "--capsule"),
+	"prlimit":          set("-o", "--output", "-p", "--pid"),
+	"systemd-inhibit":  set("--what", "--who", "--why", "--mode"),
+	"dbus-run-session": set("--config-file", "--dbus-daemon"),
+	"run0":             set("-u", "--user", "-g", "--group", "--machine", "--unit", "--property", "--description", "--slice", "--nice", "-D", "--chdir", "--setenv", "--background", "--shell-prompt-prefix", "--lightweight", "--area"),
+	"pkexec":           set("--user"),
+	"chroot":           set("--userspec", "--groups"),
+	"nsenter":          set("-t", "--target", "-N", "--net-socket", "-S", "--setuid", "-G", "--setgid"),
+	"ssh-agent":        set("-E", "-a", "-O", "-P", "-t"),
+	"runuser":          set("-u", "--user", "-g", "--group", "-G", "--supp-group", "-c", "--command", "--session-command", "-s", "--shell", "-w", "--whitelist-environment"),
+	"su":               set("-c", "--command", "--session-command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"),
+	"doas":             set("-u", "--user", "-a", "--auth-type", "-C", "--config"),
+	"watch":            set("-n", "--interval", "-q", "--equexit"),
+	"script":           set("-c", "--command", "-E", "--echo", "-I", "--log-in", "-O", "--log-out", "-T", "--log-timing", "-B", "--log-io", "-m", "--logging-format", "-o", "--output-limit"),
+	"parallel":         set("-j", "--jobs", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-S", "--sshlogin", "-a", "--arg-file", "--sshloginfile", "--joblog", "--results", "--workdir", "--env", "--block", "--recstart", "--recend", "--regexp", "--tagstring", "--halt", "--timeout", "--delay", "--memfree", "--load", "--nice", "--filter", "--return", "--transferfile", "--cleanup", "--trc", "--basefile", "--record-env", "-C", "--colsep", "-I", "-E", "--retries", "--tmpdir", "--header", "--termseq", "--sshdelay", "--group-by", "--compress-program", "--limit", "--memsuspend"),
+	"tmux":             set("-L", "-S", "-f", "-c", "-t", "-s", "-n", "-x", "-y", "-e", "-F", "-B", "-l", "-m", "-R", "-T", "-p"),
 }
 
 var flagOptions = map[string]map[string]bool{
-	"time":        set("-p", "--portability", "-v", "--verbose", "-a", "--append", "-q", "--quiet"),
-	"env":         set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug", "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"),
-	"exec":        set("-c", "-l"),
-	"sudo":        set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
-	"timeout":     set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
-	"nohup":       set("--help", "--version"),
-	"taskset":     set("-a", "--all-tasks", "-c", "--cpu-list"),
-	"setsid":      set("-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V", "--version"),
-	"chrt":        set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks", "-m", "--max", "-v", "--verbose"),
-	"strace":      set("-A", "-C", "-f", "-ff", "-c", "-q", "-qq", "-T", "-tt", "-y", "-yy", "-D", "-d", "--debug", "-h", "-i", "-k", "-n", "-N", "-r", "-t", "-v", "-w", "-x", "-xx", "-z", "--successful-only", "-Z", "--failed-only", "-Y", "-V", "--absolute-timestamps", "--always-show-pid", "--follow-forks", "--daemonize", "--summary", "--summary-wall-clock", "--summary-only", "--quiet", "--instruction-pointer", "--syscall-number", "--arg-names", "--relative-timestamps", "--syscall-times", "--no-abbrev", "--strings-in-hex", "--stack-trace", "--decode-fds", "--namespace", "--secontext", "--kill-on-exit", "--output-append-mode", "--output-separately", "--seccomp-bpf", "--tips", "--help", "--version"),
-	"unshare":     set("-r", "--map-root-user", "-c", "--map-current-user", "--map-subids", "-U", "--user", "-f", "--fork", "-m", "--mount", "-p", "--pid", "-n", "--net", "-i", "--ipc", "-u", "--uts", "-C", "--cgroup", "-T", "--time", "--mount-proc", "--mount-binfmt", "--kill-child", "--map-auto", "--keep-caps"),
-	"setpriv":     set("--init-groups", "--clear-groups", "--no-new-privs", "--keep-caps", "--dump", "--list-caps"),
-	"watch":       set("-d", "--differences", "-t", "--no-title", "-c", "--color", "-g", "--chgexit", "-e", "--errexit", "-b", "--beep", "-p", "--precise", "-x", "--exec"),
-	"parallel":    set("-k", "--keep-order", "--tag", "-q", "--quote", "--ungroup", "--group", "--line-buffer", "--tagstring"),
-	"flock":       set("-x", "--exclusive", "-e", "-s", "--shared", "-u", "--unlock", "-n", "--nonblocking", "--nb", "-o", "--close", "-F", "--no-fork", "--fcntl", "--verbose", "-h", "--help", "-V", "--version"),
-	"systemd-run": set("-r", "--remain-after-exit", "--slice-inherit", "--tty", "-q", "--quiet", "-t", "--pty", "-T", "--pty-late", "-P", "--pipe", "-G", "--collect", "-d", "--user", "--scope", "--wait", "--system", "--same-dir", "-R", "--same-root-dir", "--send-sighup", "--no-ask-password", "--no-block", "--no-pager", "--ignore-failure", "-S", "--shell", "-v", "--verbose", "--on-clock-change", "--on-timezone-change"),
-	"doas":        set("-n", "--non-interactive", "-s", "-L", "--"),
-	"ionice":      set("-t", "--ignore"),
-	"xargs":       set("-e", "-i", "-l", "--eof", "--replace", "--max-lines", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty", "--show-limits"),
-	"script":      set("-q", "--quiet", "-f", "--flush", "-V", "--version"),
-	"command":     set("-p", "-x"),
-	"tmux":        set("-2", "-8", "-C", "-D", "-N", "-V", "-v", "-q", "-u"),
-	"su":          set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast"),
-	"runuser":     set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast", "-P", "--pty", "-T", "--no-pty", "--close-session", "--reset-environment"),
+	"time":             set("-p", "--portability", "-v", "--verbose", "-a", "--append", "-q", "--quiet"),
+	"env":              set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug", "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"),
+	"exec":             set("-c", "-l"),
+	"sudo":             set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
+	"timeout":          set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
+	"nohup":            set("--help", "--version"),
+	"taskset":          set("-a", "--all-tasks", "-c", "--cpu-list"),
+	"setsid":           set("-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V", "--version"),
+	"chrt":             set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks", "-m", "--max", "-v", "--verbose"),
+	"strace":           set("-A", "-C", "-f", "-ff", "-c", "-q", "-qq", "-T", "-tt", "-y", "-yy", "-D", "-d", "--debug", "-h", "-i", "-k", "-n", "-N", "-r", "-t", "-v", "-w", "-x", "-xx", "-z", "--successful-only", "-Z", "--failed-only", "-Y", "-V", "--absolute-timestamps", "--always-show-pid", "--follow-forks", "--daemonize", "--summary", "--summary-wall-clock", "--summary-only", "--quiet", "--instruction-pointer", "--syscall-number", "--arg-names", "--relative-timestamps", "--syscall-times", "--no-abbrev", "--strings-in-hex", "--stack-trace", "--decode-fds", "--namespace", "--secontext", "--kill-on-exit", "--output-append-mode", "--output-separately", "--seccomp-bpf", "--tips", "--help", "--version"),
+	"unshare":          set("-r", "--map-root-user", "-c", "--map-current-user", "--map-subids", "-U", "--user", "-f", "--fork", "-m", "--mount", "-p", "--pid", "-n", "--net", "-i", "--ipc", "-u", "--uts", "-C", "--cgroup", "-T", "--time", "--mount-proc", "--mount-binfmt", "--kill-child", "--map-auto", "--keep-caps"),
+	"setpriv":          set("--init-groups", "--clear-groups", "--no-new-privs", "--keep-caps", "--dump", "--list-caps"),
+	"watch":            set("-d", "--differences", "-t", "--no-title", "-c", "--color", "-g", "--chgexit", "-e", "--errexit", "-b", "--beep", "-p", "--precise", "-x", "--exec"),
+	"parallel":         set("-k", "--keep-order", "--tag", "-q", "--quote", "--ungroup", "--group", "--line-buffer", "--tagstring"),
+	"flock":            set("-x", "--exclusive", "-e", "-s", "--shared", "-u", "--unlock", "-n", "--nonblocking", "--nb", "-o", "--close", "-F", "--no-fork", "--fcntl", "--verbose", "-h", "--help", "-V", "--version"),
+	"systemd-run":      set("-r", "--remain-after-exit", "--slice-inherit", "--tty", "-q", "--quiet", "-t", "--pty", "-T", "--pty-late", "-P", "--pipe", "-G", "--collect", "-d", "--user", "--scope", "--wait", "--system", "--same-dir", "-R", "--same-root-dir", "--send-sighup", "--no-ask-password", "--no-block", "--no-pager", "--ignore-failure", "-S", "--shell", "-v", "--verbose", "--on-clock-change", "--on-timezone-change"),
+	"doas":             set("-n", "--non-interactive", "-s", "-L", "--"),
+	"ionice":           set("-t", "--ignore"),
+	"xargs":            set("-e", "-i", "-l", "--eof", "--replace", "--max-lines", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty", "--show-limits"),
+	"script":           set("-q", "--quiet", "-f", "--flush", "-V", "--version"),
+	"command":          set("-p", "-x"),
+	"tmux":             set("-2", "-8", "-C", "-D", "-N", "-V", "-v", "-q", "-u"),
+	"su":               set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast"),
+	"runuser":          set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast", "-P", "--pty", "-T", "--no-pty", "--close-session", "--reset-environment"),
+	"prlimit":          set("--noheadings", "--raw", "--verbose", "-h", "--help", "-V", "--version"),
+	"systemd-inhibit":  set("--no-ask-password", "--no-pager", "--no-legend", "--list", "-h", "--help", "--version"),
+	"dbus-run-session": set("--", "--help", "--version"),
+	"run0":             set("--no-ask-password", "--slice-inherit", "--via-shell", "-i", "--pty", "--pty-late", "--pipe", "--empower", "-h", "--help", "-V", "--version"),
+	"pkexec":           set("--disable-internal-agent", "--help", "--version", "--keep-cwd"),
+	"chroot":           set("--skip-chdir"),
+	"setarch":          set("-B", "--32bit", "-F", "--fdpic-funcptrs", "-I", "--short-inode", "-L", "--addr-compat-layout", "-R", "--addr-no-randomize", "-S", "--whole-seconds", "-T", "--sticky-timeouts", "-X", "--read-implies-exec", "-Z", "--mmap-page-zero", "-3", "--3gb", "--4gb", "--uname-2.6", "-v", "--verbose", "--list", "-h", "--help", "-V", "--version"),
+	"nsenter":          set("-a", "--all", "--user-parent", "--preserve-credentials", "--keep-caps", "-e", "--env", "-F", "--no-fork", "-c", "--join-cgroup", "-Z", "--follow-context", "-h", "--help", "-V", "--version"),
+	"ssh-agent":        set("-c", "-D", "-d", "-k", "-s", "-T", "-U", "--"),
+}
+
+// optionalValueOptions are accepted either without a value or with an attached value.
+// util-linux prlimit resource limits require attached values; nsenter namespace options
+// accept an optional attached path or ID.
+var optionalValueOptions = map[string]map[string]bool{
+	"prlimit": set("-c", "--core", "-d", "--data", "-e", "--nice", "-f", "--fsize", "-i", "--sigpending", "-l", "--memlock", "-m", "--rss", "-n", "--nofile", "-q", "--msgqueue", "-r", "--rtprio", "-s", "--stack", "-t", "--cpu", "-u", "--nproc", "-v", "--as", "-x", "--locks", "-y", "--rttime"),
+	"nsenter": set("-m", "--mount", "-u", "--uts", "-i", "--ipc", "-n", "--net", "-p", "--pid", "-C", "--cgroup", "-U", "--user", "-T", "--time", "-r", "--root", "-w", "--wd", "-W", "--wdns"),
+	"setarch": set("--show"),
+}
+
+func init() {
+	for _, alias := range []string{"linux32", "linux64", "i386", "x86_64", "uname26"} {
+		valueOptions[alias] = valueOptions["setarch"]
+		flagOptions[alias] = flagOptions["setarch"]
+		optionalValueOptions[alias] = optionalValueOptions["setarch"]
+	}
 }
 
 func set(items ...string) map[string]bool {
