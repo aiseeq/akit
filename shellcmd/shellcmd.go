@@ -17,6 +17,10 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
+var errUnknownWrapperSignal = errors.New("shellcmd: unknown wrapper option may hide a signal")
+var errUncertainWrapperBudget = errors.New("shellcmd: uncertain wrapper search exceeds budget")
+var errCommandExpansionDepth = errors.New("shellcmd: command expansion depth exceeded")
+
 // bashBuiltinAndKeywordNames is from GNU Bash 5.3.9:
 // `bash --version`, `compgen -b`, and `compgen -k`.
 const bashBuiltinAndKeywordNames = `
@@ -241,6 +245,7 @@ type nestedParseBudget struct {
 	walkInfoNodes  int
 	stdinSteps     int
 	substSteps     int
+	uncertainWork  int
 	trackWork      bool
 	literalShell   string
 	parsedShells   map[string]int
@@ -292,7 +297,64 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if optionErr != nil {
 		return optionErr
 	}
-	return walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
+	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
+	if err != nil {
+		return err
+	}
+	return checkUncertainTime(file, src, lineBase, inherited, vars, budget)
+}
+
+// A shell time clause can also be read as the external time wrapper. Keep the
+// shell's calls, but report an ambiguous signal found by that interpretation.
+func checkUncertainTime(file *syntax.File, src string, lineBase int, inherited []string, vars map[string]string, budget *nestedParseBudget) error {
+	if !strings.Contains(src, "time") {
+		return nil
+	}
+	var offsets []int
+	syntax.Walk(file, func(node syntax.Node) bool {
+		clause, ok := node.(*syntax.TimeClause)
+		if !ok || clause.Stmt == nil {
+			return true
+		}
+		call, ok := clause.Stmt.Cmd.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		args, _ := words(call.Args, src, vars)
+		if !wrapperOptionsKnown("time", args) {
+			offsets = append(offsets, int(clause.Pos().Offset()))
+		}
+		return true
+	})
+	if len(offsets) == 0 {
+		return nil
+	}
+	var alternate strings.Builder
+	last := 0
+	for _, offset := range offsets {
+		if offset < last || offset >= len(src) {
+			continue
+		}
+		alternate.WriteString(src[last:offset])
+		alternate.WriteByte('\\')
+		last = offset
+	}
+	alternate.WriteString(src[last:])
+	var candidates []Call
+	err := parseWithBudget(alternate.String(), lineBase, inherited, maps.Clone(vars), &candidates, budget)
+	var nested *NestedError
+	if err != nil && !errors.As(err, &nested) {
+		return nil
+	}
+	for _, call := range candidates {
+		if signalCall(call) && slices.Contains(call.Via, "time") {
+			return &NestedError{Script: src, Err: errors.New("shellcmd: ambiguous time option may hide a signal")}
+		}
+	}
+	if errors.Is(err, errUnknownWrapperSignal) || errors.Is(err, errUncertainWrapperBudget) || errors.Is(err, errCommandExpansionDepth) {
+		return err
+	}
+	return nil
 }
 
 func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
@@ -962,7 +1024,7 @@ func collectPipedLiteralWalkInfo(binary *syntax.BinaryCmd, src string, vars map[
 	if !literal || (commandName(name) != "echo" && commandName(name) != "printf") {
 		return false, nil
 	}
-	shell, via, ok := pipedShellName(binary.Y, src, vars)
+	shell, via, ok := pipedShellNameWithWork(binary.Y, src, vars, nil)
 	if !ok {
 		return false, nil
 	}
@@ -1288,7 +1350,7 @@ func collectPipedHeredocWalkInfo(binary *syntax.BinaryCmd, src string, vars map[
 	if !ok || !stdinEchoingCall(producer, src, vars) {
 		return false
 	}
-	name, via, accepted := pipedShellName(binary.Y, src, vars)
+	name, via, accepted := pipedShellNameWithWork(binary.Y, src, vars, nil)
 	if !accepted {
 		return false
 	}
@@ -1401,7 +1463,7 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 	} else if script != nil && shellScriptFromOtherFD(call, src, vars) {
 		script = nil
 	}
-	name, shellVia, input, err := shellInputName(stmt, src, vars, script)
+	name, shellVia, input, err := shellInputNameFrom(stmt, src, vars, script, false)
 	if err != nil {
 		info.errors = append(info.errors, err)
 	} else if input {
@@ -1412,7 +1474,7 @@ func collectStmtWalkInfo(stmt *syntax.Stmt, file *syntax.File, src string, vars 
 		info.scriptInputs[call] = true
 	}
 	if stdin.redir != nil && script != stdin.redir {
-		name, shellVia, input, err := sourceArgsShellInput(stmt, src, vars, stdin.redir)
+		name, shellVia, input, err := shellInputNameFrom(stmt, src, vars, stdin.redir, true)
 		if err != nil {
 			info.errors = append(info.errors, err)
 		} else if input {
@@ -1609,8 +1671,8 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 			name, args = commandName(target[0]), target[1:]
 			continue
 		}
-		if name == "sudo" && sudoReadsStdin(args) {
-			return "bash", append(via, "sudo"), true
+		if shell, ok := implicitPipedShell(name, args); ok {
+			return shell, append(via, name), true
 		}
 		if name == "env" {
 			if target, ok := envSplitCommand(args); ok {
@@ -1626,6 +1688,11 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 		}
 		if wrappers[name] {
 			if !wrapperOptionsKnown(name, args) {
+				if start, ok := uncertainWrapperTarget(name, args, true); ok {
+					via = append(via, name)
+					name, args = commandName(args[start]), args[start+1:]
+					continue
+				}
 				return "", nil, false
 			}
 			if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
@@ -1641,6 +1708,16 @@ func pipedShellNameWithWork(stmt *syntax.Stmt, src string, vars map[string]strin
 		via = append(via, wrapperVia...)
 		name, args = commandName(wrapped[0]), wrapped[1:]
 	}
+}
+
+func implicitPipedShell(name string, args []string) (string, bool) {
+	if name == "sudo" && sudoReadsStdin(args) {
+		return "bash", true
+	}
+	if name == "su" && uncertainSuReadsStdin(args) {
+		return "sh", true
+	}
+	return "", false
 }
 
 func markPipeline(stmt *syntax.Stmt, src string, vars map[string]string, info *walkInfo) {
@@ -1691,6 +1768,9 @@ func shellInputTargetWithIndexAndWork(call *syntax.CallExpr, src string, vars ma
 	scan := wrapperExecScan{work: work}
 	for {
 		if name == "sudo" && sudoReadsStdin(args) {
+			return true
+		}
+		if name == "su" && uncertainSuReadsStdin(args) {
 			return true
 		}
 		if (name == "su" || name == "runuser") && suReadsShell(name, args) {
@@ -2129,6 +2209,9 @@ func shellInputNextTargetWithScan(name string, args []string, argOffset int, sca
 	}
 	if wrappers[name] {
 		if !wrapperOptionsKnown(name, args) {
+			if start, ok := uncertainWrapperTarget(name, args, true); ok {
+				return commandName(args[start]), args[start+1:], argOffset + start + 1, true
+			}
 			return "", nil, argOffset, false
 		}
 		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
@@ -2856,13 +2939,6 @@ func shellInputName(stmt *syntax.Stmt, src string, vars map[string]string, stdin
 	return shellInputNameFrom(stmt, src, vars, stdinInput, false)
 }
 
-// sourceArgsShellInput finds the shell that reads stdin among the arguments
-// of source or . whose own script is another descriptor: the sourced file may
-// run them, as in source /dev/fd/3 exec -- bash <<E.
-func sourceArgsShellInput(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect) (string, []string, bool, error) {
-	return shellInputNameFrom(stmt, src, vars, stdinInput, true)
-}
-
 func shellInputNameFrom(stmt *syntax.Stmt, src string, vars map[string]string, stdinInput *syntax.Redirect, sourceArgs bool) (string, []string, bool, error) {
 	if stdinInput == nil {
 		return "", nil, false, nil
@@ -2912,7 +2988,7 @@ func resolveShellInputWithWork(name string, args []string, hasHeredoc bool, work
 		if name == "sudo" && hasHeredoc && sudoReadsStdin(args) {
 			return "bash", append(via, "sudo"), nil
 		}
-		if (name == "su" || name == "runuser") && hasHeredoc && suReadsShell(name, args) {
+		if (name == "su" || name == "runuser") && hasHeredoc && (suReadsShell(name, args) || name == "su" && uncertainSuReadsStdin(args)) {
 			return "sh", append(via, name), nil
 		}
 		if isScriptInputShell(name) {
@@ -3014,6 +3090,9 @@ func nextShellInputTarget(name string, args []string, via []string, scan *wrappe
 	}
 	if target, routeVia, _, ok := sudoDashDashRoute(name, args); ok && len(target) > 0 {
 		return commandName(target[0]), target[1:], append(via, routeVia...), true
+	}
+	if start, ok := uncertainWrapperTarget(name, args, true); ok {
+		return commandName(args[start]), args[start+1:], append(via, name), true
 	}
 	if wrappers[name] {
 		if wrapped, ok := unwrapOnce(name, args); ok && len(wrapped) > 0 {
@@ -4274,7 +4353,7 @@ func (c cmd) via(more ...string) []string {
 // emit записывает вызовы точного разбора и совместимого с прежней версией обхода.
 func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
 	if c.expansionDepth > maxNestedScripts {
-		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: command expansion depth exceeds %d", maxNestedScripts)}
+		return &NestedError{Script: c.call.Raw, Err: errCommandExpansionDepth}
 	}
 	if c.call.Name == "setsid" && setsidDynamicTarget(c.call.Args) {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: dynamic setsid command is not modeled")}
@@ -4331,7 +4410,260 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 	if err := emitExactWrapperTarget(c, exactOK, exactStart, exactVia, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
-	return emitMainTarget(c, main, mainVia, mainOK, lineBase, vars, calls, seen)
+	if err := emitMainTarget(c, main, mainVia, mainOK, lineBase, vars, calls, seen); err != nil {
+		return err
+	}
+	if err := emitUncertainWrapper(c, lineBase, vars); err != nil {
+		return err
+	}
+	if !exactOK {
+		if start, via, ok := uncertainNestedWrapper(name, args); ok {
+			return emit(c.sub(start, c.via(via...)), lineBase, vars, calls, seen)
+		}
+		if uncertainNestedBeyondLimit(name, args) {
+			return &NestedError{Script: c.call.Raw, Err: errCommandExpansionDepth}
+		}
+	}
+	return nil
+}
+
+// Explore only actual wrapper targets, never arbitrary argument suffixes.
+// Speculative calls stay private: an ambiguous signal or search limit is reported as an error.
+func emitUncertainWrapper(c cmd, lineBase int, vars map[string]string) error {
+	if c.call.Name == "su" || c.call.Name == "runuser" || c.call.Name == "flock" {
+		if err := uncertainCommandScripts(c, lineBase, vars); err != nil {
+			return err
+		}
+	}
+	if c.call.Name == "su" {
+		if c.call.ScriptInput && uncertainSuReadsStdin(c.call.Args) {
+			return uncertainProcessInput(c, lineBase, vars)
+		}
+		return nil
+	}
+	for _, start := range uncertainWrapperTargets(c.call.Name, c.call.Args) {
+		if c.budget != nil {
+			c.budget.uncertainWork++
+			if c.budget.uncertainWork > c.budget.limit {
+				return &NestedError{Script: c.call.Raw, Err: errUncertainWrapperBudget}
+			}
+		}
+		candidate := c.sub(start+1, c.via(c.call.Name))
+		remaining := maxNestedScripts * 2
+		if c.call.ScriptInput && uncertainShellCandidate(candidate.call.Name, candidate.call.Args, &remaining) {
+			if err := uncertainProcessInput(c, lineBase, vars); err != nil {
+				return err
+			}
+		}
+		var calls []Call
+		err := emit(candidate, lineBase, maps.Clone(vars), &calls, newCallSet())
+		signal, signalErr := uncertainCallsSignal(c, calls, vars)
+		if signalErr != nil {
+			return &NestedError{Script: c.call.Raw, Err: signalErr}
+		}
+		if signal {
+			return &NestedError{Script: c.call.Raw, Err: errUnknownWrapperSignal}
+		}
+		if errors.Is(err, errUnknownWrapperSignal) || errors.Is(err, errUncertainWrapperBudget) || errors.Is(err, errCommandExpansionDepth) {
+			return err
+		}
+	}
+	return nil
+}
+
+func uncertainProcessInput(c cmd, lineBase int, vars map[string]string) error {
+	signal, err := processSubstitutionSignal(c, lineBase, vars)
+	if err != nil {
+		return &NestedError{Script: c.call.Raw, Err: err}
+	}
+	if signal {
+		return &NestedError{Script: c.call.Raw, Err: errUnknownWrapperSignal}
+	}
+	return nil
+}
+
+func uncertainCommandScripts(c cmd, lineBase int, vars map[string]string) error {
+	for _, start := range uncertainWrapperTargets(c.call.Name, c.call.Args) {
+		index := start
+		if c.call.Name == "su" || c.call.Name == "runuser" {
+			index++ // the first positional word is a user
+		}
+		arg, ok := commandOptionAt(c.call.Name, c.call.Args, index)
+		if !ok {
+			continue
+		}
+		script, ok := mappedScriptWords(c, []scriptArg{arg})
+		if !ok {
+			continue
+		}
+		var calls []Call
+		err := parseNestedMapped(script, lineBase, c.via(c.call.Name, "-c"), c.call.Loop, c.call.Background, maps.Clone(vars), &calls, c.budget)
+		if errors.Is(err, errCommandExpansionDepth) || errors.Is(err, errUncertainWrapperBudget) {
+			return err
+		}
+		if slices.ContainsFunc(calls, signalCall) || errors.Is(err, errUnknownWrapperSignal) {
+			return &NestedError{Script: c.call.Raw, Err: errUnknownWrapperSignal}
+		}
+	}
+	return nil
+}
+
+// A literal echo or printf in an input process substitution supplies a known
+// shell script. Other producers remain represented as unknown script input.
+func processSubstitutionSignal(c cmd, lineBase int, vars map[string]string) (bool, error) {
+	for _, redir := range c.call.Redirs {
+		if redir.Op != "<" || !strings.HasPrefix(redir.Target, "<(") || !strings.HasSuffix(redir.Target, ")") {
+			continue
+		}
+		src := redir.Target[2 : len(redir.Target)-1]
+		file, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+		if err != nil {
+			return false, fmt.Errorf("shellcmd: parse process substitution: %w", err)
+		}
+		if len(file.Stmts) != 1 {
+			continue
+		}
+		body, ok, err := literalProducerBody(file.Stmts[0], src, vars)
+		if err != nil {
+			return false, fmt.Errorf("shellcmd: read process substitution: %w", err)
+		}
+		if !ok {
+			continue
+		}
+		var calls []Call
+		budget := c.budget
+		if budget == nil {
+			budget = newNestedParseBudget(len(body.String()))
+		}
+		err = parseWithBudget(body.String(), lineBase, nil, maps.Clone(vars), &calls, budget)
+		if errors.Is(err, errUncertainWrapperBudget) || errors.Is(err, errCommandExpansionDepth) {
+			return false, err
+		}
+		var nested *NestedError
+		if err != nil && !errors.As(err, &nested) {
+			continue
+		}
+		if slices.ContainsFunc(calls, signalCall) || errors.Is(err, errUnknownWrapperSignal) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func uncertainCallsSignal(c cmd, calls []Call, vars map[string]string) (bool, error) {
+	for _, call := range calls {
+		if call.Name == "kill" && (slices.Contains(call.Via, "xargs") || slices.Contains(call.Via, "parallel")) && !signalCall(call) {
+			possible, err := xargsMayReceiveSignalTarget(c, vars)
+			if err != nil {
+				return false, err
+			}
+			if possible {
+				return true, nil
+			}
+		}
+		if !signalCall(call) {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// A literal pipe into xargs supplies arguments to an otherwise bare kill.
+// Unknown input must remain conservative; known non-target data cannot signal.
+func xargsMayReceiveSignalTarget(c cmd, vars map[string]string) (bool, error) {
+	file, err := syntax.NewParser().Parse(strings.NewReader(c.source), "")
+	if err != nil {
+		return false, fmt.Errorf("shellcmd: parse xargs pipe: %w", err)
+	}
+	known, possible := false, false
+	var inputErr error
+	syntax.Walk(file, func(node syntax.Node) bool {
+		pipe, ok := node.(*syntax.BinaryCmd)
+		if !ok || pipe.Op != syntax.Pipe && pipe.Op != syntax.PipeAll || pipe.Y == nil || c.call.Offset < int(pipe.Y.Pos().Offset()) || c.call.Offset >= int(pipe.Y.End().Offset()) {
+			return true
+		}
+		var literal, target bool
+		literal, target, inputErr = xargsLiteralPipeTarget(pipe.X, c.source, vars)
+		known = known || literal
+		possible = possible || target
+		return inputErr == nil
+	})
+	if inputErr != nil {
+		return false, inputErr
+	}
+	return !known || possible, nil
+}
+
+func xargsLiteralPipeTarget(stmt *syntax.Stmt, src string, vars map[string]string) (bool, bool, error) {
+	body, ok, err := literalProducerBody(stmt, src, vars)
+	if err != nil {
+		return false, false, fmt.Errorf("shellcmd: read xargs pipe: %w", err)
+	}
+	if !ok {
+		return false, false, nil
+	}
+	for target := range strings.FieldsSeq(body.String()) {
+		if signalTargetWord(target) {
+			return true, true, nil
+		}
+	}
+	return true, false, nil
+}
+
+func literalProducerBody(stmt *syntax.Stmt, src string, vars map[string]string) (mapped, bool, error) {
+	producer := literalPipeProducer(stmt)
+	if producer == nil || len(producer.Args) == 0 {
+		return mapped{}, false, nil
+	}
+	name, literal := wordValue(producer.Args[0])
+	if !literal || commandName(name) != "echo" && commandName(name) != "printf" {
+		return mapped{}, false, nil
+	}
+	return literalPipeBody(commandName(name), producer.Args[1:], src, vars)
+}
+
+// Descend through known wrappers up to the first wrapper with an unknown
+// option, so a permissive compatibility route cannot skip that wrapper.
+func uncertainNestedWrapper(name string, args []string) (int, []string, bool) {
+	start := 1
+	var via []string
+	for len(via) < maxNestedScripts && wrappers[name] && wrapperOptionsKnown(name, args) {
+		if wrapperRunsScript(name, args) {
+			break
+		}
+		target, ok := unwrapOnce(name, args)
+		if !ok || len(target) == 0 {
+			break
+		}
+		start += len(args) - len(target)
+		via = append(via, name)
+		name, args = commandName(target[0]), target[1:]
+		if wrappers[name] && !wrapperOptionsKnown(name, args) {
+			return start, via, true
+		}
+		start++
+	}
+	return 0, nil, false
+}
+
+func uncertainNestedBeyondLimit(name string, args []string) bool {
+	depth := 0
+	for wrappers[name] {
+		if !wrapperOptionsKnown(name, args) {
+			return depth >= maxNestedScripts
+		}
+		if wrapperRunsScript(name, args) {
+			return false
+		}
+		target, ok := unwrapOnce(name, args)
+		if !ok || len(target) == 0 {
+			return false
+		}
+		name, args = commandName(target[0]), target[1:]
+		depth++
+	}
+	return false
 }
 
 func flockVerboseOption(args []string) bool {
@@ -4487,8 +4819,12 @@ func sudoShellTarget(c cmd) (cmd, bool) {
 }
 
 func wrapperOptionsKnown(name string, args []string) bool {
-	if name == "command" && commandIsLookup(args) {
-		return true
+	return unknownWrapperOption(name, args) < 0
+}
+
+func unknownWrapperOption(name string, args []string) int {
+	if name == "command" || name == "exec" || name == "builtin" {
+		return -1
 	}
 	for i := 0; i < len(args) && wrapperOptionWord(name, args[i]); {
 		if sudoEnvWord(name, args[i]) {
@@ -4501,7 +4837,7 @@ func wrapperOptionsKnown(name string, args []string) bool {
 				i = optionNext(name, args, i)
 				continue
 			}
-			return false
+			return i
 		}
 		if next <= i {
 			i++
@@ -4509,7 +4845,328 @@ func wrapperOptionsKnown(name string, args []string) bool {
 			i = next
 		}
 	}
-	return true
+	return -1
+}
+
+// An unknown option can be a flag or consume the next word. The search is
+// bounded by argument positions, and keeps known options for wrapper parsing.
+type uncertainOptionState struct {
+	i     int
+	known []string
+}
+
+func uncertainWrapperTargets(name string, args []string) []int {
+	return uncertainWrapperTargetsWithWork(name, args, nil)
+}
+
+func uncertainWrapperTargetsWithWork(name string, args []string, work *int) []int {
+	if !wrappers[name] {
+		return nil
+	}
+	first := unknownWrapperOption(name, args)
+	if first < 0 || wrapperHelpBeforeUnknown(name, args[:first+1]) {
+		return nil
+	}
+	var starts []int
+	walkUncertainOptions(name, args, work, func(state uncertainOptionState) bool {
+		i := state.i
+		if i >= len(args) {
+			return false
+		}
+		if args[i] == "--" {
+			i++
+		}
+		if start, ok := uncertainTargetStart(name, args, i, state.known); ok && !slices.Contains(starts, start) {
+			starts = append(starts, start)
+		}
+		return false
+	})
+	return starts
+}
+
+// walkUncertainOptions explores both meanings of unknown options once per position.
+func walkUncertainOptions(name string, args []string, work *int, visit func(uncertainOptionState) bool) bool {
+	queue := []uncertainOptionState{{}}
+	visited := make(map[int]bool)
+	for len(queue) > 0 {
+		if work != nil {
+			*work++
+		}
+		state := queue[0]
+		queue = queue[1:]
+		i := state.i
+		if visited[i] {
+			continue
+		}
+		visited[i] = true
+		if i >= len(args) || !wrapperOptionWord(name, args[i]) || args[i] == "--" {
+			if visit(state) {
+				return true
+			}
+			continue
+		}
+		if sudoEnvWord(name, args[i]) {
+			queue = append(queue, uncertainOptionState{i + 1, append(slices.Clone(state.known), args[i])})
+			continue
+		}
+		next, unknown := wrapperOptionStep(name, args, i)
+		if unknown && name == "taskset" && tasksetAttachedCPUCluster(args[i]) {
+			next, unknown = optionNext(name, args, i), false
+		}
+		if unknown {
+			queue = uncertainOptionBranches(queue, state, args)
+			continue
+		}
+		if next <= i {
+			next = i + 1
+		}
+		known := append(slices.Clone(state.known), args[i:next]...)
+		queue = append(queue, uncertainOptionState{next, known})
+	}
+	return false
+}
+
+// su runs the user's shell, not a program named by its first positional word.
+// With no additional shell arguments, that shell can read a script from stdin.
+func uncertainSuReadsStdin(args []string) bool {
+	if unknownWrapperOption("su", args) < 0 {
+		return false
+	}
+	return walkUncertainOptions("su", args, nil, func(state uncertainOptionState) bool {
+		clean := append(slices.Clone(state.known), args[state.i:]...)
+		return suReadsShell("su", clean)
+	})
+}
+
+func uncertainOptionBranches(queue []uncertainOptionState, state uncertainOptionState, args []string) []uncertainOptionState {
+	i := state.i
+	queue = append(queue, uncertainOptionState{i + 1, state.known})
+	if i+1 < len(args) && !strings.Contains(args[i], "=") {
+		queue = append(queue, uncertainOptionState{i + 2, state.known})
+	}
+	return queue
+}
+
+func wrapperHelpBeforeUnknown(name string, args []string) bool {
+	switch name {
+	case "taskset", "strace", "flock", "setsid", "chrt":
+		return wrapperExitsWithoutCommand(name, args)
+	}
+	return false
+}
+
+func uncertainTargetStart(name string, args []string, i int, known []string) (int, bool) {
+	if i >= len(args) {
+		return 0, false
+	}
+	clean := append(slices.Clone(known), args[i:]...)
+	if name == "parallel" {
+		return i, true
+	}
+	if (name == "timeout" || wrapperStart(name, clean) > len(known)) && !uncertainPositionalValid(name, args[i]) {
+		return 0, false
+	}
+	target, ok := unwrapOnce(name, clean)
+	if !ok || len(target) == 0 {
+		return 0, false
+	}
+	start := len(args) - len(target)
+	return start, start >= i && start < len(args)
+}
+
+// These wrappers consume a duration, CPU mask or scheduling priority before
+// the command. A command name in that position cannot start a valid route.
+func uncertainPositionalValid(name, value string) bool {
+	if name != "timeout" && name != "taskset" && name != "chrt" {
+		return true
+	}
+	if strings.ContainsAny(value, "$`") {
+		return true
+	}
+	if name == "timeout" {
+		value = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(value, "s"), "m"), "h"), "d")
+		_, err := strconv.ParseFloat(value, 64)
+		return err == nil || validHexDuration(value)
+	}
+	if name == "taskset" {
+		for _, part := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '-' || r == ':' }) {
+			if !validCPUPart(part) {
+				return false
+			}
+		}
+		return value != ""
+	}
+	_, err := strconv.Atoi(value)
+	return err == nil
+}
+
+func validHexDuration(value string) bool {
+	if !strings.HasPrefix(value, "0x") && !strings.HasPrefix(value, "0X") {
+		return false
+	}
+	_, err := strconv.ParseUint(value[2:], 16, 64)
+	return err == nil
+}
+
+func validCPUPart(value string) bool {
+	if _, err := strconv.ParseUint(value, 0, 64); err == nil {
+		return true
+	}
+	_, err := strconv.ParseUint(value, 16, 64)
+	return err == nil
+}
+
+func uncertainWrapperTarget(name string, args []string, shell bool) (int, bool) {
+	remaining := maxNestedScripts * 2
+	for _, start := range uncertainWrapperTargets(name, args) {
+		candidate := commandName(args[start])
+		if shell && uncertainShellCandidate(candidate, args[start+1:], &remaining) || !shell && candidate == "kill" && (start == unknownWrapperOption(name, args)+1 || signalCall(Call{Name: candidate, Args: args[start+1:]})) {
+			return start, true
+		}
+	}
+	return 0, false
+}
+
+func uncertainShellCandidate(name string, args []string, remaining *int) bool {
+	if isShell(name) {
+		return true
+	}
+	if !wrappers[name] || *remaining <= 0 {
+		return false
+	}
+	*remaining--
+	if name == "su" {
+		return uncertainSuReadsStdin(args)
+	}
+	if start, ok := sudoDashDashAssignmentStart(name, args); ok {
+		return uncertainShellCandidate(commandName(args[start]), args[start+1:], remaining)
+	}
+	if wrapperOptionsKnown(name, args) {
+		target, ok := unwrapOnce(name, args)
+		return ok && len(target) > 0 && uncertainShellCandidate(commandName(target[0]), target[1:], remaining)
+	}
+	for _, start := range uncertainWrapperTargets(name, args) {
+		if uncertainShellCandidate(commandName(args[start]), args[start+1:], remaining) {
+			return true
+		}
+	}
+	return false
+}
+
+// signalCall recognises numeric and dynamic kill targets, excluding listing
+// modes; pkill and killall are always considered signal calls.
+func signalCall(call Call) bool {
+	if call.Name == "pkill" || call.Name == "killall" {
+		return true
+	}
+	if call.Name != "kill" {
+		return false
+	}
+	if len(call.Args) > 0 && (call.Args[0] == "-l" || call.Args[0] == "-L" || call.Args[0] == "--list" || call.Args[0] == "--table") {
+		return false
+	}
+	var state signalScan
+	for i := 0; i < len(call.Args); i++ {
+		i = state.step(call.Args, i)
+	}
+	return state.target
+}
+
+type signalScan struct {
+	target, signalOptionSeen, otherOption, afterDash bool
+}
+
+func (s *signalScan) step(args []string, i int) int {
+	arg := args[i]
+	if arg == "--" {
+		s.afterDash = true
+		return i
+	}
+	if s.afterDash {
+		s.target = s.target || signalTargetWord(arg)
+		return i
+	}
+	switch arg {
+	case "--verbose", "-v", "-a", "--all":
+		return i
+	case "-q", "--queue":
+		s.otherOption = true
+		return i + 1
+	case "--timeout":
+		s.otherOption = true
+		return i + 2
+	}
+	if next, option, valid := signalOption(args, i); option {
+		if valid {
+			if strings.HasPrefix(arg, "-") && integerWord(arg) && (s.signalOptionSeen || s.otherOption) {
+				s.target = true
+			} else {
+				s.signalOptionSeen = true
+			}
+		}
+		return next - 1
+	}
+	s.target = s.target || signalTargetWord(arg)
+	return i
+}
+
+func signalTargetWord(arg string) bool {
+	if arg == "" {
+		return false
+	}
+	if strings.ContainsAny(arg, "$`%") {
+		return true
+	}
+	if integerWord(arg) {
+		return true
+	}
+	_, err := strconv.ParseInt(arg, 0, 64)
+	return err == nil
+}
+
+func signalOption(args []string, i int) (int, bool, bool) {
+	arg := args[i]
+	if arg == "--" {
+		return i + 1, true, true
+	}
+	if arg == "-s" || arg == "--signal" || arg == "-n" {
+		return i + 2, true, i+1 < len(args) && signalName(args[i+1])
+	}
+	if value, ok := strings.CutPrefix(arg, "--signal="); ok {
+		return i + 1, true, signalName(value)
+	}
+	if len(arg) > 2 && (strings.HasPrefix(arg, "-s") || strings.HasPrefix(arg, "-n")) {
+		return i + 1, true, signalName(arg[2:])
+	}
+	if strings.HasPrefix(arg, "-") {
+		return i + 1, true, signalName(arg[1:])
+	}
+	return i, false, true
+}
+
+func integerWord(value string) bool {
+	_, err := strconv.Atoi(value)
+	return err == nil
+}
+
+func signalName(name string) bool {
+	if strings.ContainsAny(name, "$`") {
+		return true
+	}
+	if _, err := strconv.Atoi(name); err == nil {
+		return true
+	}
+	name = strings.TrimPrefix(strings.ToUpper(name), "SIG")
+	if name == "RTMIN" || name == "RTMAX" {
+		return true
+	}
+	if offset, ok := strings.CutPrefix(name, "RTMIN+"); ok {
+		return validCPUPart(offset)
+	}
+	if offset, ok := strings.CutPrefix(name, "RTMAX-"); ok {
+		return validCPUPart(offset)
+	}
+	return slices.Contains([]string{"HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS"}, name)
 }
 
 // taskset's older Calls behavior passes malformed attached CPU-list groups
@@ -6512,6 +7169,9 @@ func (s *wrapperExecScan) find(args []string) ([]string, bool) {
 }
 
 func execScanArgs(name string, args []string) []string {
+	if name == "command" && commandIsLookup(args) {
+		return nil
+	}
 	if wrappers[name] {
 		return args[wrapperOptionEnd(name, args, 0):]
 	}
@@ -6627,6 +7287,9 @@ func wrapperRunsScript(name string, args []string) bool {
 }
 
 func unwrapOnce(name string, args []string) ([]string, bool) {
+	if name == "command" && commandIsLookup(args) {
+		return nil, false
+	}
 	if (name == "setsid" || name == "flock" || name == "chrt" || name == "strace") && wrapperExitsWithoutCommand(name, args) {
 		return nil, false
 	}
@@ -6642,9 +7305,6 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 			}
 		}
 		return target, true
-	}
-	if name == "command" && commandIsLookup(args) {
-		return nil, false
 	}
 	i := wrapperStart(name, args)
 	if name == "timeout" && i < len(args) && args[i] != "--" {
@@ -6776,13 +7436,13 @@ func optionMatches(name, arg, option string) bool {
 	return false
 }
 
-// commandIsLookup — `command -v X`/`-V X`: ключи до имени программы ищут её, а не запускают.
+// commandIsLookup identifies short option groups that look up command names.
 func commandIsLookup(args []string) bool {
 	for _, arg := range args {
-		if arg == "--" || !strings.HasPrefix(arg, "-") {
+		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
 			return false
 		}
-		if strings.ContainsAny(arg, "vV") {
+		if !strings.HasPrefix(arg, "--") && strings.ContainsAny(arg[1:], "vV") {
 			return true
 		}
 	}
@@ -6822,7 +7482,9 @@ var valueOptions = map[string]map[string]bool{
 }
 
 var flagOptions = map[string]map[string]bool{
+	"time":        set("-p", "--portability", "-v", "--verbose", "-a", "--append", "-q", "--quiet"),
 	"env":         set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug", "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"),
+	"exec":        set("-c", "-l"),
 	"sudo":        set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
 	"timeout":     set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
 	"nohup":       set("--help", "--version"),
@@ -6838,9 +7500,9 @@ var flagOptions = map[string]map[string]bool{
 	"systemd-run": set("-r", "--remain-after-exit", "--slice-inherit", "--tty", "-q", "--quiet", "-t", "--pty", "-T", "--pty-late", "-P", "--pipe", "-G", "--collect", "-d", "--user", "--scope", "--wait", "--system", "--same-dir", "-R", "--same-root-dir", "--send-sighup", "--no-ask-password", "--no-block", "--no-pager", "--ignore-failure", "-S", "--shell", "-v", "--verbose", "--on-clock-change", "--on-timezone-change"),
 	"doas":        set("-n", "--non-interactive", "-s", "-L", "--"),
 	"ionice":      set("-t", "--ignore"),
-	"xargs":       set("-e", "-i", "-l", "--eof", "--replace", "--max-lines", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty"),
+	"xargs":       set("-e", "-i", "-l", "--eof", "--replace", "--max-lines", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-0", "--null", "-p", "--interactive", "-o", "--open-tty", "--show-limits"),
 	"script":      set("-q", "--quiet", "-f", "--flush", "-V", "--version"),
-	"command":     set("-p"),
+	"command":     set("-p", "-x"),
 	"tmux":        set("-2", "-8", "-C", "-D", "-N", "-V", "-v", "-q", "-u"),
 	"su":          set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast"),
 	"runuser":     set("-l", "--login", "-m", "--preserve-environment", "-p", "--preserve-environment", "-f", "--fast", "-P", "--pty", "-T", "--no-pty", "--close-session", "--reset-environment"),

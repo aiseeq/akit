@@ -3704,6 +3704,442 @@ func TestUnknownWrapperOptionsUseMainBehavior(t *testing.T) {
 	t.Fatalf("main shell search after unknown key was lost: %#v", calls)
 }
 
+func TestUnknownWrapperOptionSignalRoutes(t *testing.T) {
+	for _, command := range []string{
+		`strace --zzz kill -9 -1`,
+		`strace --zzz value kill -9 -1`,
+		`strace -f --zzz value kill -9 -1`,
+		`/usr/bin/time --zzz value kill -9 -1`,
+		`time --zzz kill -9 -1`,
+		`time --zzz value kill -9 -1`,
+		"time --zzz bash -s <<E\nkill -9 -1\nE",
+		"time --zzz value bash -s <<E\nkill -9 -1\nE",
+		`echo 'kill -9 -1' | time --zzz bash`,
+		`echo 'kill -9 -1' | time --zzz value bash`,
+		`time --zzz bash -c 'kill -1; bash -c if'`,
+		`nice nice --zzz value kill -9 -1`,
+		`sudo nice --zzz value kill -9 -1`,
+		`timeout --zzz value 5 kill -9 -1`,
+		`taskset -x 1 kill 1`,
+		`taskset --bogus 1 kill 1`,
+		`taskset -ax 1 kill 1`,
+		`flock --zzz value /tmp/lock kill -9 -1`,
+		`strace --zzz=value kill -9 -1`,
+		"strace --zzz value bash -s <<E\nkill -9 -1\nE",
+		`echo 'kill -9 -1' | strace --zzz value bash`,
+		"/usr/bin/time --zzz value bash -s <<E\nkill -9 -1\nE",
+		`echo 'kill -9 -1' | /usr/bin/time --zzz value bash`,
+		`echo -1 | xargs --zzz value kill -9`,
+		`printf %s 123 | xargs --zzz value kill`,
+		`cat | xargs --zzz value kill`,
+		`parallel --zzz value pkill -9 init`,
+		`parallel --zzz value kill -9 -1`,
+		`echo -1 | parallel --zzz value kill -9`,
+		`parallel --zzz -- kill -9 -1`,
+		`parallel --zzz=value -- kill -9 -1`,
+		`taskset --zzz value -c0 kill -9 -1`,
+		`echo 'kill -9 -1' | parallel --zzz value bash`,
+		"strace --zzz value nice bash -s <<E\nkill -9 -1\nE",
+		`echo 'kill -9 -1' | strace --zzz value nice bash`,
+		"strace --zzz value nice --yyy other bash -s <<E\nkill -9 -1\nE",
+		`strace --zzz value bash < <(echo 'kill -9 -1')`,
+		`strace --zzz value bash < <(printf '%s' 'pkill -9 init')`,
+		`strace --zzz=value -- kill -9 -1`,
+		`su --zzz value -c 'kill -9 -1'`,
+		`echo 'kill -9 -1' | su --zzz value operator`,
+		`echo 'kill -9 -1' | su --zzz=value operator`,
+		`echo 'kill -9 -1' | strace --zzz value su --yyy other operator`,
+		"su --zzz value operator <<E\nkill -9 -1\nE",
+		`su --zzz value operator < <(echo 'kill -9 -1')`,
+		`echo 'pkill -9 init' | time --zzz value bash`,
+		"time --zzz value bash -s <<E\npkill -9 init\nE",
+	} {
+		t.Run(command, func(t *testing.T) {
+			calls, err := Calls(command)
+			if err != nil {
+				return
+			}
+			for _, call := range calls {
+				if call.Name == "kill" {
+					return
+				}
+			}
+			t.Fatalf("signal lost: %#v", calls)
+		})
+	}
+}
+
+func TestUnknownWrapperOptionOrdinaryCommands(t *testing.T) {
+	for _, command := range []string{
+		`strace --zzz grep kill /var/log/syslog`,
+		`strace --zzz value grep kill /var/log/syslog`,
+		`strace --zzz git log --grep kill`,
+		`strace --zzz=value grep kill /var/log/syslog`,
+		`strace --zzz=value grep kill 9`,
+		`echo -1 | nice --zzz value xargs grep foo`,
+		`echo 'kill -9 -1' | strace --zzz=value grep text`,
+		`strace --zzz ls -l`,
+		`/usr/bin/time --zzz value grep kill /var/log/syslog`,
+		`parallel --zzz value grep kill /var/log/syslog`,
+		`su --zzz echo kill -9 -1`,
+		`chrt -m --zzz 1 kill -9 -1`,
+		`nice su -c 'echo probe' -- nice --zzz kill 9`,
+		`strace --zzz value grep kill < <(echo 'kill -9 -1')`,
+		`echo 'grep kill file' | su --zzz value operator`,
+		`echo 'kill -9 -1' | su --zzz -c 'echo probe' operator`,
+		`strace --zzz value bash < <(echo 'grep kill file')`,
+		`strace --zzz value bash < <(cat file)`,
+		`echo src | xargs --zzz grep -r kill`,
+		`printf %s src | xargs --zzz grep -r kill`,
+		`time --zzz grep kill /var/log/syslog`,
+		`time --zzz value git log --grep kill`,
+		`time`,
+		`time (echo probe)`,
+		"time --zzz bash -s <<E\ngrep kill file\nE",
+		`echo 'grep kill file' | time --zzz value bash`,
+		`echo 'grep kill file' | strace --zzz value bash`,
+		"strace --zzz value bash -s <<E\ngrep kill file\nE",
+	} {
+		t.Run(command, func(t *testing.T) {
+			calls, err := Calls(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range calls {
+				if call.Name == "kill" {
+					t.Fatalf("argument mistaken for a signal: %#v", calls)
+				}
+			}
+		})
+	}
+}
+
+func TestUncertainTimeKeepsUnrelatedSignal(t *testing.T) {
+	calls, err := Calls(`time --zzz grep file; kill 9`)
+	if err != nil || !containsCallName(calls, "kill") {
+		t.Fatalf("unrelated signal: calls %v, error %v", calls, err)
+	}
+}
+
+func TestUncertainTimeRejectsUnparseableAlternative(t *testing.T) {
+	file, _, err := parseShell(`time --zzz kill -1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := `time --zzz kill > `
+	if err := checkUncertainTime(file, src, 0, nil, nil, newNestedParseBudget(len(src))); err != nil {
+		t.Fatalf("unparseable alternative returned an error: %v", err)
+	}
+}
+
+func TestUncertainTimeRetainsCallsOnNestedError(t *testing.T) {
+	src := `time --zzz bash -c 'kill 9; bash -c if'`
+	file, _, err := parseShell(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkUncertainTime(file, src, 0, nil, nil, newNestedParseBudget(len(src))); err == nil {
+		t.Fatal("signal before nested parse error was lost")
+	}
+}
+
+func TestUncertainTimeRejectsPartialCallsOnWalkError(t *testing.T) {
+	src := "time --zzz kill 9; zr <<\"E\"x\nb \\\nEx\nzk 6"
+	file, _, err := parseShell(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkUncertainTime(file, src, 0, nil, nil, newNestedParseBudget(len(src))); err != nil {
+		t.Fatalf("partial calls from an invalid alternative: %v", err)
+	}
+}
+
+func TestUncertainTimeRejectsOutOfRangePosition(t *testing.T) {
+	file, _, err := parseShell(`     time --zzz kill -1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkUncertainTime(file, "time", 0, nil, nil, newNestedParseBudget(4)); err != nil {
+		t.Fatalf("out-of-range position: %v", err)
+	}
+}
+
+func TestUncertainTimeRejectsOutOfOrderPosition(t *testing.T) {
+	src := `time --zzz kill -1; time --yyy kill -1`
+	file, _, err := parseShell(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Stmts[0], file.Stmts[1] = file.Stmts[1], file.Stmts[0]
+	if err := checkUncertainTime(file, src, 0, nil, nil, newNestedParseBudget(len(src))); err != nil {
+		t.Logf("ambiguous time: %v", err)
+	}
+}
+
+func TestUncertainWrapperTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		shell bool
+		start int
+		ok    bool
+	}{
+		{"grep", []string{"--zzz", "kill", "-9"}, false, 0, false},
+		{"strace", []string{"-f", "kill", "-9"}, false, 0, false},
+		{"strace", []string{"--zzz", "kill", "name"}, false, 1, true},
+		{"strace", []string{"--zzz", "value", "kill", "123"}, false, 2, true},
+		{"strace", []string{"--zzz", "grep", "kill", "file"}, false, 0, false},
+		{"strace", []string{"--zzz=x", "grep", "kill", "-9"}, false, 0, false},
+		{"strace", []string{"--zzz=x", "--bad", "kill", "-9", "-1"}, false, 2, true},
+		{"strace", []string{"--zzz", "value", "bash", "-s"}, true, 2, true},
+		{"strace", []string{"--zzz", "value", "kill", "-9"}, true, 0, false},
+		{"strace", []string{"--zzz", "-Q", "kill", "-9", "-1"}, false, 2, true},
+		{"timeout", []string{"--zzz", "value", "5", "kill", "-9", "-1"}, false, 3, true},
+		{"timeout", []string{"--zzz"}, false, 0, false},
+	} {
+		start, ok := uncertainWrapperTarget(tc.name, tc.args, tc.shell)
+		if start != tc.start || ok != tc.ok {
+			t.Errorf("%s %q shell=%t: got %d, %t; want %d, %t", tc.name, tc.args, tc.shell, start, ok, tc.start, tc.ok)
+		}
+	}
+}
+
+func TestUncertainWrapperTargetNested(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		start int
+		via   []string
+	}{
+		{"nice", []string{"sudo", "nice", "--zzz", "v", "kill"}, 2, []string{"nice", "sudo"}},
+		{"nice", []string{"grep", "kill"}, 0, nil},
+		{"nice", []string{"nice", "grep", "kill"}, 0, nil},
+		{"nice", nil, 0, nil},
+		{"strace", []string{"--zzz", "kill"}, 0, nil},
+		{"strace", []string{"--zzz", "nice", "--yyy", "value", "kill"}, 0, nil},
+	} {
+		start, via, ok := uncertainNestedWrapper(tc.name, tc.args)
+		if start != tc.start || !reflect.DeepEqual(via, tc.via) || ok != (tc.via != nil) {
+			t.Errorf("%s %q: got %d, %q, %t; want %d, %q", tc.name, tc.args, start, via, ok, tc.start, tc.via)
+		}
+	}
+	deep := strings.Fields(strings.Repeat("nice ", maxNestedScripts) + "nice --zzz kill -1")
+	if _, _, ok := uncertainNestedWrapper("nice", deep); ok {
+		t.Fatal("nested wrapper search exceeded its depth limit")
+	}
+}
+
+func TestUncertainSignalOperands(t *testing.T) {
+	for _, tc := range []struct {
+		call Call
+		want bool
+	}{
+		{Call{Name: "kill"}, false},
+		{Call{Name: "kill", Args: []string{""}}, false},
+		{Call{Name: "kill", Args: []string{"0"}}, true},
+		{Call{Name: "kill", Args: []string{"9"}}, true},
+		{Call{Name: "kill", Args: []string{"$pid"}}, true},
+		{Call{Name: "kill", Args: []string{"%1"}}, true},
+		{Call{Name: "kill", Args: []string{"-s", "KILL", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-s", "$sig", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"--signal=KILL", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-sKILL", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-n9", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-n", "9"}}, false},
+		{Call{Name: "kill", Args: []string{"-n", "9", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-SIGKILL", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-RTMAX", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-RTMAX-1", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-RTMIN+1", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"--signal=NOTASIGNAL", "-1"}}, false},
+		{Call{Name: "kill", Args: []string{"-sNOTASIGNAL", "-1"}}, false},
+		{Call{Name: "kill", Args: []string{"-KILL", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-9", "-1", "invalid"}}, true},
+		{Call{Name: "kill", Args: []string{"invalid", "-9", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"--verbose", "-9", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"--verbose", "-9"}}, false},
+		{Call{Name: "kill", Args: []string{"-a", "-9"}}, false},
+		{Call{Name: "kill", Args: []string{"-q", "5", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-q", "5"}}, false},
+		{Call{Name: "kill", Args: []string{"-a", "-9", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"--timeout", "100", "KILL", "-TERM", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"--timeout", "100", "KILL"}}, false},
+		{Call{Name: "kill", Args: []string{"-9", "0x1"}}, true},
+		{Call{Name: "kill", Args: []string{"-9"}}, false},
+		{Call{Name: "kill", Args: []string{"-l", "9"}}, false},
+		{Call{Name: "kill", Args: []string{"--", "-1"}}, true},
+		{Call{Name: "kill", Args: []string{"-s"}}, false},
+		{Call{Name: "kill", Args: []string{"-s", "NOTASIGNAL"}}, false},
+		{Call{Name: "kill", Args: []string{"-s", "NOTASIGNAL", "-1"}}, false},
+		{Call{Name: "kill", Args: []string{"-r", "/var/log"}}, false},
+		{Call{Name: "kill", Args: []string{"-r"}}, false},
+		{Call{Name: "kill", Args: []string{"-n", "/var/log"}}, false},
+		{Call{Name: "kill", Args: []string{"2024.log"}}, false},
+		{Call{Name: "pkill", Args: []string{"init"}}, true},
+		{Call{Name: "killall", Args: []string{"init"}}, true},
+		{Call{Name: "grep", Args: []string{"kill"}}, false},
+	} {
+		if got := signalCall(tc.call); got != tc.want {
+			t.Errorf("signalCall(%#v) = %t, want %t", tc.call, got, tc.want)
+		}
+	}
+}
+
+func TestUncertainWrapperRequiredOperands(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        bool
+	}{
+		{"timeout", "5s", true}, {"timeout", "5m", true}, {"timeout", "2h", true}, {"timeout", "1d", true}, {"timeout", "0x10", true}, {"timeout", "0.5", true}, {"timeout", "echo", false},
+		{"taskset", "0x1", true}, {"taskset", "ff", true}, {"taskset", "1-3,5", true}, {"taskset", "echo", false},
+		{"taskset", "", false}, {"chrt", "5", true}, {"chrt", "echo", false},
+		{"timeout", "$duration", true}, {"flock", "/tmp/lock", true},
+	} {
+		if got := uncertainPositionalValid(tc.name, tc.value); got != tc.want {
+			t.Errorf("%s %q = %t, want %t", tc.name, tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestUncertainWrapperDefensiveConditions(t *testing.T) {
+	if start, ok := uncertainTargetStart("nice", []string{"skip", "kill", "9"}, 1, []string{"not-an-option"}); ok || start != 0 {
+		t.Fatalf("target before allowed suffix: %d, %t", start, ok)
+	}
+	if starts := uncertainWrapperTargets("env", []string{"--zzz", "X=1", "kill", "9"}); !slices.Equal(starts, []int{2}) {
+		t.Fatalf("duplicate target positions: %v", starts)
+	}
+	if states := uncertainOptionBranches(nil, uncertainOptionState{}, []string{"--zzz=value", "grep"}); len(states) != 1 || states[0].i != 1 {
+		t.Fatalf("attached value consumed another word: %#v", states)
+	}
+	for _, tc := range []struct{ name, option string }{{"strace", "-h"}, {"chrt", "-m"}} {
+		if !wrapperHelpBeforeUnknown(tc.name, []string{tc.option}) {
+			t.Errorf("%s %s is an exit mode", tc.name, tc.option)
+		}
+	}
+	for _, args := range [][]string{{"--"}, {"-s", "NOTASIGNAL"}} {
+		_, option, valid := signalOption(args, 0)
+		if !option || valid != (args[0] == "--") {
+			t.Errorf("signalOption(%q) = option %t, valid %t", args, option, valid)
+		}
+	}
+	remaining := maxNestedScripts
+	if !uncertainShellCandidate("sudo", []string{"--", "X=1", "bash"}, &remaining) {
+		t.Fatal("sudo assignment route lost its shell")
+	}
+	if !uncertainSuReadsStdin([]string{"--zzz", "-c", "operator"}) || uncertainSuReadsStdin([]string{"--zzz", "-c", "echo probe", "operator"}) {
+		t.Fatal("su stdin paths did not distinguish consumed and active -c")
+	}
+}
+
+func TestUncertainWrapperSearchBudget(t *testing.T) {
+	budget := newNestedParseBudget(1)
+	budget.uncertainWork = budget.limit
+	c := cmd{call: Call{Name: "nice", Args: []string{"--zzz", "echo"}}, budget: budget}
+	if err := emitUncertainWrapper(c, 0, nil); !errors.Is(err, errUncertainWrapperBudget) {
+		t.Fatalf("budget exhaustion: %v", err)
+	}
+}
+
+func TestUncertainWrapperOptionSearchGrowth(t *testing.T) {
+	args := append(strings.Fields(strings.Repeat("--unknown ", 14)), "kill", "-1")
+	work := 0
+	if starts := uncertainWrapperTargetsWithWork("nice", args, &work); len(starts) == 0 {
+		t.Fatal("signal lost behind unknown options")
+	}
+	if work > 3*len(args) {
+		t.Fatalf("unknown option search took %d steps for %d words", work, len(args))
+	}
+}
+
+func TestUncertainXargsInput(t *testing.T) {
+	if _, err := xargsMayReceiveSignalTarget(cmd{source: "if"}, nil); err == nil {
+		t.Fatal("invalid source did not return a parse error")
+	}
+	c := cmd{call: Call{Name: "xargs", Offset: len("echo src | ")}, source: "echo src | xargs --zzz grep -r kill"}
+	calls := []Call{{Name: "kill"}, {Name: "pkill"}}
+	if found, err := uncertainCallsSignal(c, calls, nil); err != nil || !found {
+		t.Fatalf("later signal lost: %t, %v", found, err)
+	}
+	validCall := Call{Name: "kill", Args: []string{"9"}, Via: []string{"xargs"}}
+	if found, err := uncertainCallsSignal(cmd{source: "if"}, []Call{validCall}, nil); err != nil || !found {
+		t.Fatalf("known target unnecessarily required stdin: %t, %v", found, err)
+	}
+	ordinary := Call{Name: "grep", Args: []string{"foo"}, Via: []string{"xargs"}}
+	c = cmd{call: Call{Name: "nice", Offset: len("echo -1 | ")}, source: "echo -1 | nice --zzz v xargs grep foo"}
+	if found, err := uncertainCallsSignal(c, []Call{ordinary}, nil); err != nil || found {
+		t.Fatalf("stdin made grep into a signal: %t, %v", found, err)
+	}
+	for _, tc := range []struct {
+		src  string
+		want bool
+	}{
+		{"echo -1 |& xargs --zzz v kill", true},
+		{"echo src |& xargs --zzz v kill", false},
+		{"echo -1 | cat; echo src | xargs --zzz v kill", false},
+		{"echo src | xargs --zzz v kill; echo -1 | cat", false},
+	} {
+		c := cmd{call: Call{Name: "xargs", Offset: strings.Index(tc.src, "xargs")}, source: tc.src}
+		got, err := xargsMayReceiveSignalTarget(c, nil)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %t, %v; want %t", tc.src, got, err, tc.want)
+		}
+	}
+}
+
+func TestUncertainProcessSubstitutionWithoutBudget(t *testing.T) {
+	c := cmd{call: Call{Redirs: []Redir{{Op: "<", Target: `<(echo 'kill 9')`}}}}
+	if signal, err := processSubstitutionSignal(c, 0, nil); err != nil || !signal {
+		t.Fatalf("literal process substitution: %t, %v", signal, err)
+	}
+	c.call.Redirs[0].Op = ">"
+	if signal, err := processSubstitutionSignal(c, 0, nil); err != nil || signal {
+		t.Fatalf("output process substitution: %t, %v", signal, err)
+	}
+	c.call.Redirs[0].Op = "<"
+	for _, target := range []string{`<()`, `<(echo a; echo b)`, `<(cat file)`, `<(echo 'grep kill file')`, `plain`} {
+		c.call.Redirs[0].Target = target
+		if signal, err := processSubstitutionSignal(c, 0, nil); err != nil || signal {
+			t.Errorf("%s: signal=%t, err=%v", target, signal, err)
+		}
+	}
+	c.call.Redirs[0].Target = `<(if)`
+	if _, err := processSubstitutionSignal(c, 0, nil); err == nil {
+		t.Fatal("invalid process substitution did not return an error")
+	}
+}
+
+func TestUncertainInputRequiresShellAndScriptInput(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		input bool
+	}{
+		{"strace", []string{"--zzz", "v", "bash"}, false},
+		{"strace", []string{"--zzz", "v", "grep"}, true},
+		{"su", []string{"--zzz", "v", "operator"}, false},
+		{"su", []string{"--zzz", "v", "operator", "script.sh"}, true},
+	} {
+		c := cmd{call: Call{Name: tc.name, Args: tc.args, ScriptInput: tc.input, Redirs: []Redir{{Op: "<", Target: `<(echo 'kill 9')`}}}, words: make([]word, len(tc.args)+1), budget: newNestedParseBudget(100)}
+		if err := emitUncertainWrapper(c, 0, nil); err != nil {
+			t.Errorf("%s %q script=%t: %v", tc.name, tc.args, tc.input, err)
+		}
+	}
+}
+
+func TestUncertainShellCandidateBudget(t *testing.T) {
+	remaining := 10
+	if !uncertainShellCandidate("command", []string{"--zzz", "bash"}, &remaining) {
+		t.Fatal("builtin option hid shell")
+	}
+	remaining = 0
+	if uncertainShellCandidate("nice", []string{"bash"}, &remaining) {
+		t.Fatal("shell search exceeded its budget")
+	}
+	if !uncertainShellCandidate("bash", nil, &remaining) {
+		t.Fatal("direct shell was lost at the budget boundary")
+	}
+}
+
 func TestBenignWrapperArgumentsDoNotBecomeCommands(t *testing.T) {
 	commands := []string{
 		"strace -f grep kill /tmp/log",
@@ -5421,5 +5857,119 @@ func TestNestedShellInsideSubstitutionReportedOnce(t *testing.T) {
 	calls, err := Find(src, "kill")
 	if err != nil || len(calls) != 1 || !slices.Equal(calls[0].Via, []string{"bash", "-c"}) {
 		t.Fatalf("calls = %+v, err = %v", calls, err)
+	}
+}
+
+func TestUnknownWrapperOptionReview(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		signal  bool
+	}{
+		{"strace --zzz v pkill -9 init", true},
+		{"nice --zzz v pkill -9 init", true},
+		{"timeout --zzz v 5 pkill -9 init", true},
+		{"time --zzz v pkill -9 init", true},
+		{"strace --zzz v sudo kill -9 -1", true},
+		{"nice --zzz v nice kill -9 -1", true},
+		{"timeout --zzz v 5 env kill -9 -1", true},
+		{"time --zzz v nice kill -9 -1", true},
+		{"strace --zzz v eval 'kill -9 -1'", true},
+		{"echo -1 | nice --zzz v xargs kill -9", true},
+		{"echo -1 | xargs --zzz v kill", true},
+		{"nice --zzz v -Y kill -9 -1", true},
+		{"strace --zzz --yyy v kill -9 -1", true},
+		{"strace --zzz v --yyy w kill -9 -1", true},
+		{"strace -f nice --zzz --yyy v kill -9 -1", true},
+		{"time -p --zzz v kill -9 -1", true},
+		{"/usr/bin/time -v --zzz v kill -9 -1", true},
+		{"strace --zzz v kill $pid", true},
+		{"strace --zzz v kill %1", true},
+		{"nice --zzz echo kill -9 -1", true},
+		{"time --zzz echo kill -9 -1", true},
+		{"strace --zzz nice --yyy v kill -9 -1", true},
+		{"timeout --zzz 5 echo kill -9 -1", false},
+		{"taskset --zzz 1 echo kill -9 -1", false},
+		{"nice --zzz grep kill -r /var/log", false},
+		{"strace --zzz grep kill -n /var/log/syslog", false},
+		{"time --zzz grep kill -r /var/log", false},
+		{"strace --zzz v kill 0", true},
+		{"strace --zzz v kill 9", true},
+		{"strace --zzz v kill ''", false},
+		{"echo -1 | xargs --zzz v kill", true},
+		{"strace -h --zzz kill -9 -1", false},
+		{"strace --zzz grep kill -n /var/log/syslog", false},
+		{"timeout --zzz 5 echo kill -9 -1", false},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			calls, err := Calls(tc.command)
+			found := false
+			for _, call := range calls {
+				found = found || call.Name == "kill" || call.Name == "pkill" || call.Name == "killall"
+			}
+			if tc.signal && !found && err == nil || !tc.signal && (found || err != nil) {
+				t.Fatalf("signal=%t calls=%#v err=%v", tc.signal, calls, err)
+			}
+		})
+	}
+}
+
+func TestUnknownWrapperOptionRoundThree(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		signal  bool
+	}{
+		{"strace --zzz v kill -9 -1 x", true},
+		{"strace --zzz kill -9 -1 x", true},
+		{"nice --zzz v kill -9 -1 x", true},
+		{"strace --zzz v kill --verbose -9 -1", true},
+		{"strace --zzz v kill -q 5 -1", true},
+		{"strace --zzz v kill -a -9 -1", true},
+		{"strace --zzz v kill --timeout 100 KILL -TERM -1", true},
+		{"echo -1 | xargs --zzz v -I{} kill -9 {}", true},
+		{"echo -1 | xargs --zzz v -I {} kill -9 {}", true},
+		{"echo -1 | xargs --zzz v -IX kill -9 X", true},
+		{"parallel --zzz v kill -9 ::: -1", true},
+		{"parallel --zzz kill -9 ::: -1", true},
+		{"parallel --zzz v kill -9 {} ::: -1", true},
+		{"flock --zzz v /tmp/f -c 'kill -9 -1'", true},
+		{"su --zzz v root -c 'kill -9 -1'", true},
+		{"runuser --zzz v root -c 'kill -9 -1'", true},
+		{"timeout --zzz v 0x10 kill -9 -1", true},
+		{"strace --zzz v kill -SIGKILL -1", true},
+		{"strace --zzz v kill -n 9 -1", true},
+		{"strace --zzz v kill -RTMAX -1", true},
+		{"strace --zzz v kill -RTMAX-1 -1", true},
+		{"timeout --zzz v 5m kill -9 -1", true},
+		{"taskset --zzz v -c 0-7:2 kill -9 -1", true},
+		{"sudo --zzz v FOO=1 kill -9 -1", true},
+		{"su --zzz -c true < <(echo 'kill -9 -1')", true},
+		{"strace --zzz v bash < <(echo 'nice --zzz v kill -9 -1')", true},
+		{"echo x | xargs --zzz v kill -9 -1", true},
+		{"echo -1 |& xargs --zzz v kill", true},
+		{"strace --zzz man kill", false},
+		{"strace --zzz pgrep kill", false},
+		{"nice --zzz man kill", false},
+		{"nice --zzz which kill", false},
+		{"env --zzz man kill", false},
+		{"sudo --zzz man kill", false},
+		{"strace -f --zzz type kill", false},
+		{"strace --zzz v kill", false},
+		{"command --zzz echo kill -9 -1", false},
+		{"exec --zzz echo kill -9 -1", false},
+		{"builtin --zzz echo kill -9 -1", false},
+		{"strace -h --zzz kill -9 -1", false},
+		{"chrt -m --zzz kill -9 -1", false},
+		{"echo 'kill -9 -1' | su --zzz v root script.sh", false},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			calls, err := Calls(tc.command)
+			found := false
+			for _, call := range calls {
+				found = found || call.Name == "kill" || call.Name == "pkill" || call.Name == "killall"
+			}
+			if tc.signal && !found && err == nil || !tc.signal && (found || err != nil) {
+				t.Fatalf("signal=%t calls=%#v err=%v", tc.signal, calls, err)
+			}
+		})
 	}
 }
