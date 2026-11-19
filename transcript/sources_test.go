@@ -1,9 +1,11 @@
 package transcript
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -49,6 +51,127 @@ func TestAllSourcesWindowSkipsSourcesStartedAfterUntil(t *testing.T) {
 	}
 	if size == 0 || size >= int64(len(rows[after]))+int64(len(rows[before]))+int64(len(rows[unknown])) {
 		t.Fatalf("included size = %d, skipped source should not count", size)
+	}
+}
+
+func TestAllSourcesProjectMatchesCodexCWDAndWorkerTree(t *testing.T) {
+	home := t.TempDir()
+	workerRoot := filepath.Join(home, ".local", "state", "worker")
+	writeRollout := func(worker, name, firstLine string) string {
+		t.Helper()
+		path := filepath.Join(workerRoot, worker, "codex", "sessions", "2026", "11", "16", name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(firstLine+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	alpha := writeRollout("job-alpha", "rollout-alpha.jsonl", `{"type":"session_meta","payload":{"cwd":"/home/user/worktrees/projalpha/w-x"}}`)
+	other := writeRollout("job-other", "rollout-other.jsonl", `{"type":"session_meta","payload":{"cwd":"/home/user/worktrees/other/w-y"}}`)
+	fallback := writeRollout("job-fallback", "rollout-fallback.jsonl", `{"type":"event_msg","payload":{}}`)
+	for worker, dir := range map[string]string{"job-alpha": "/home/user/worktrees/projalpha/w-x", "job-other": "/home/user/worktrees/other/w-y", "job-fallback": "/home/user/worktrees/projalpha/w-z"} {
+		data, err := json.Marshal(map[string]string{"dir": dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workerRoot, worker, "job.json"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claudeDir := filepath.Join(home, ".claude", "projects", "-work-projalpha")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claude := filepath.Join(claudeDir, "claude.jsonl")
+	if err := os.WriteFile(claude, []byte(`{"type":"user"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sources, err := AllSourcesWindow(home, time.Time{}, time.Time{}, "projalpha", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, src := range sources {
+		got[src.Path] = true
+	}
+	if !got[alpha] || got[other] || !got[fallback] || !got[claude] {
+		t.Fatalf("sources = %v; want codex cwd and job tree matches, plus path-matched Claude", got)
+	}
+}
+
+func TestAllSourcesProjectCodexMetadataFallbacks(t *testing.T) {
+	home := t.TempDir()
+	workerRoot := filepath.Join(home, ".local", "state", "worker")
+	writeRollout := func(worker, body string) string {
+		t.Helper()
+		path := filepath.Join(workerRoot, worker, "codex", "sessions", "2026", "11", "16", "rollout-2026-11-16T17-00-00-test.jsonl")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	metaLater := writeRollout("meta-later", `{"type":"event_msg"}`+"\n"+`{"type":"session_meta","payload":{"cwd":"/work/projalpha/w"}}`+"\n")
+	turnContextOnly := writeRollout("turn-context", `{"type":"turn_context","payload":{"cwd":"/work/projalpha/w"}}`+"\n")
+	longLine := writeRollout("long-line", `{"pad":"`+strings.Repeat("x", 2<<20)+`"}`+"\n"+`{"type":"session_meta","payload":{"cwd":"/work/projalpha/w"}}`+"\n")
+	missingJob := writeRollout("missing-job", `{"type":"event_msg"}`+"\n")
+	badJob := writeRollout("bad-job", `{"type":"event_msg"}`+"\n")
+	for worker, dir := range map[string]string{
+		"long-line": "/work/projalpha/w-fallback",
+	} {
+		if err := os.WriteFile(filepath.Join(workerRoot, worker, "job.json"), []byte(`{"dir":"`+dir+`"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(workerRoot, "bad-job", "job.json"), []byte(`{"dir":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sources, err := AllSourcesWindow(home, time.Time{}, time.Time{}, "projalpha", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, src := range sources {
+		got[src.Path] = true
+	}
+	if !got[metaLater] || !got[longLine] || got[turnContextOnly] || got[missingJob] || got[badJob] {
+		t.Fatalf("sources = %v; want later session_meta and long-line job fallback only", got)
+	}
+
+	wrongBase := filepath.Join(workerRoot, "not-a-codex-job", "notcodex", "sessions", "2026", "11", "16", "rollout-test.jsonl")
+	if tree, err := workerTree(wrongBase); err != nil || tree != "" {
+		t.Fatalf("workerTree(%q) = (%q, %v), want empty tree outside codex directory", wrongBase, tree, err)
+	}
+}
+
+func TestAllSourcesProjectDoesNotReadClaudeOrOldCodexForCWD(t *testing.T) {
+	home := t.TempDir()
+	claude := filepath.Join(home, ".claude", "projects", "other-project", "fifo.jsonl")
+	old := filepath.Join(home, ".local", "state", "worker", "old-job", "codex", "sessions", "2026", "11", "01", "rollout-2026-11-01T00-00-00-test.jsonl")
+	for _, path := range []string{claude, old} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(old, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := AllSourcesWindow(home, time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC), time.Time{}, "projalpha", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("sources = %v, want none", sources)
 	}
 }
 

@@ -52,7 +52,9 @@ path (Claude Code or codex rollout).
   --no-subagents with --all: omit subagent transcripts
   --subagents   with SESSION: include that session's subagents
   --codex       with --all: also codex rollouts of worker fighters
-  --project S   with --all: project folders containing S
+  --project S   with --all: project folders containing S; codex checks the
+                transcript path and working directory (worker task directory if
+                the session has no cwd)
   --max N       last N events (default 100, 0 = all)
   --width N     characters of text per event (default 300, 0 = whole)
   --usage       tokens, API cost, and subscription-week percentage instead of

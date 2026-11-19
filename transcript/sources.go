@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -62,7 +63,9 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 	}
 	var out []Source
 	for _, p := range paths {
-		if project != "" && !strings.Contains(p, project) {
+		codexSource := strings.Contains(p, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator))
+		pathMatches := projectPathMatches(p, project)
+		if !pathMatches && !codexSource {
 			continue
 		}
 		st, e := os.Stat(p)
@@ -75,14 +78,16 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 		if st.ModTime().Before(since) {
 			continue
 		}
-		if !until.IsZero() {
-			started, known, err := sourceStart(p)
-			if errors.Is(err, fs.ErrNotExist) {
+		if sourceStartsAfter(p, until) {
+			continue
+		}
+		if !pathMatches {
+			matches, err := codexProjectMatches(p, project)
+			if err != nil {
+				slog.Warn("skip codex source during project filter", "path", p, "error", err)
 				continue
 			}
-			// Any other read error leaves the start unknown: the source stays, and reading it
-			// reports the file as unreadable without stopping the others.
-			if err == nil && known && started.After(until) {
+			if !matches {
 				continue
 			}
 		}
@@ -94,6 +99,88 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
+}
+
+func sourceStartsAfter(path string, until time.Time) bool {
+	if until.IsZero() {
+		return false
+	}
+	started, known, err := sourceStart(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	// Other read errors leave the start unknown, so the source stays in the list.
+	return err == nil && known && started.After(until)
+}
+
+func projectPathMatches(path, project string) bool {
+	return project == "" || strings.Contains(path, project)
+}
+
+// codexProjectMatches checks the session's cwd in its first records, falling back to
+// the worker job metadata when older or incomplete rollouts have no cwd.
+func codexProjectMatches(path, project string) (bool, error) {
+	cwd, err := codexCWD(path)
+	if err != nil {
+		return false, err
+	}
+	if cwd == "" {
+		cwd, err = workerTree(path)
+		if err != nil {
+			return false, err
+		}
+	}
+	return strings.Contains(cwd, project), nil
+}
+
+func codexCWD(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open transcript for cwd: %w", err)
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 4096), 1<<20)
+	for lines := 0; lines < 64 && s.Scan(); lines++ {
+		var rec struct {
+			Type    string `json:"type"`
+			Payload struct {
+				CWD string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(s.Bytes(), &rec) == nil && rec.Type == "session_meta" && rec.Payload.CWD != "" {
+			return rec.Payload.CWD, nil
+		}
+	}
+	if err := s.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read transcript cwd: %w", err)
+	}
+	return "", nil
+}
+
+func workerTree(path string) (string, error) {
+	// .../worker/<job>/codex/sessions/.../rollout-*.jsonl
+	workerDir := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(path)))))
+	if filepath.Base(workerDir) != "codex" {
+		return "", nil
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(workerDir), "job.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read worker job metadata: %w", err)
+	}
+	var job struct {
+		Dir string `json:"dir"`
+	}
+	if err := json.Unmarshal(data, &job); err != nil {
+		return "", fmt.Errorf("decode worker job metadata: %w", err)
+	}
+	return job.Dir, nil
 }
 
 // rolloutStamp is the start time codex writes into a rollout file name, in local time.
