@@ -1104,8 +1104,13 @@ func definesDeferredCode(file *syntax.File) bool {
 // while walking, such as one from a literal eval, adds its mode changes to the
 // name and to the functions that call it.
 func (w *shellModeWalker) defineFunction(fn *syntax.FuncDecl, src string) {
-	name := fn.Name.Value
-	w.functions[name] = fn.Body
+	names := funcDeclNames(fn)
+	if len(names) == 0 || fn.Body == nil {
+		return
+	}
+	for _, name := range names {
+		w.functions[name.Value] = fn.Body
+	}
 	if _, known := w.functionSrc[fn.Body]; known {
 		return
 	}
@@ -1116,12 +1121,25 @@ func (w *shellModeWalker) defineFunction(fn *syntax.FuncDecl, src string) {
 	w.dynamicModeRisk = w.dynamicModeRisk || mutation.any()
 	gain := shellModes{posixUnknown: mutation.posixUnknown, braceUnknown: mutation.braceUnknown}
 	for _, callee := range callees {
-		w.functionCallers[callee] = append(w.functionCallers[callee], name)
+		for _, name := range names {
+			w.functionCallers[callee] = append(w.functionCallers[callee], name.Value)
+		}
 		effect := w.functionEffects[callee]
 		gain.posixUnknown = gain.posixUnknown || effect.posixUnknown
 		gain.braceUnknown = gain.braceUnknown || effect.braceUnknown
 	}
-	w.spreadFunctionEffect(name, gain)
+	for _, name := range names {
+		w.spreadFunctionEffect(name.Value, gain)
+	}
+}
+
+// funcDeclNames lists the names a declaration defines: one Name, several
+// zsh Names, or none for an anonymous function.
+func funcDeclNames(fn *syntax.FuncDecl) []*syntax.Lit {
+	if fn.Name != nil {
+		return []*syntax.Lit{fn.Name}
+	}
+	return fn.Names
 }
 
 // spreadFunctionEffect adds the modes to a function and to its callers, over
@@ -9339,8 +9357,10 @@ func (c Call) ShadowedByFunction(cmd string) (bool, error) {
 	}
 	shadowed := false
 	syntax.Walk(file, func(n syntax.Node) bool {
-		if fn, ok := n.(*syntax.FuncDecl); ok && unescapeBare(fn.Name.Value) == c.Name && int(fn.Pos().Offset()) < c.Offset {
-			shadowed = true
+		if fn, ok := n.(*syntax.FuncDecl); ok && int(fn.Pos().Offset()) < c.Offset {
+			for _, name := range funcDeclNames(fn) {
+				shadowed = shadowed || unescapeBare(name.Value) == c.Name
+			}
 		}
 		return !shadowed
 	})

@@ -475,11 +475,7 @@ func assignFunctionDecls(regions scopeSet, scopes spanIndex) map[string]*assignF
 		if f.Body == nil {
 			continue
 		}
-		names := append([]*syntax.Lit(nil), f.Names...)
-		if f.Name != nil {
-			names = append(names, f.Name)
-		}
-		for _, name := range names {
+		for _, name := range funcDeclNames(f) {
 			_, isolated := f.Body.Cmd.(*syntax.Subshell)
 			function := funcs[name.Value]
 			if function == nil {
@@ -1322,10 +1318,7 @@ func functionScopes(function *syntax.FuncDecl) ([]Scope, *span) {
 		return nil, nil
 	}
 	body := functionBodySpan(function.Body)
-	names := function.Names
-	if function.Name != nil {
-		names = []*syntax.Lit{function.Name}
-	}
+	names := funcDeclNames(function)
 	decl := int(function.Pos().Offset())
 	_, isolated := function.Body.Cmd.(*syntax.Subshell)
 	scopes := make([]Scope, 0, len(names))
