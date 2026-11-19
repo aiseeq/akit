@@ -143,3 +143,17 @@ func testLayoutCases(t *testing.T, browserCtx context.Context, cases []layoutTes
 		})
 	}
 }
+
+func testSingleLayoutPage(t *testing.T, browserCtx context.Context, page string, check func(context.Context) (int, string, error)) (int, string, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "page.html")
+	if err := os.WriteFile(path, []byte(page), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tabCtx, cancelTab := chromedp.NewContext(browserCtx)
+	defer cancelTab()
+	if err := chromedp.Do(tabCtx, chromedp.EmulateViewport(800, 600), chromedp.Navigate("file://"+path)); err != nil {
+		t.Fatal(err)
+	}
+	return check(tabCtx)
+}

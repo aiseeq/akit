@@ -165,17 +165,41 @@ warned about. Exit 0 clean, 1 private data, a missing skill, an unmatched sectio
 ## page-shot
 
 Frames of an HTML page in headless Chrome before publishing: windows 1440×900, 1536×860 at scale
-1.25, 1366×768, 390×844 and the full height. On every window it checks for a horizontal scroll and
-for labels drawn over each other, and for small icons (svg, img, a symbol glyph, an `ic`/`icon` class, an empty
+1.25, 1366×768, 390×844 and the full height. On every window it checks for a horizontal scroll,
+font families outside Golos Text, Russo One and JetBrains Mono, labels drawn over each other, and
+small icons (svg, img, a symbol glyph, an `ic`/`icon` class, an empty
 decorated box) whose center is more than 2 px off the first text line next to them in the same row; text
 farther than 3em from the icon is not its line (table cells, chart columns). Exit 0 frames clean, 1 shooting failed, 2 frames taken but a
 layout fault found (window and culprits in stderr).
+
+Font visibility follows one scrolling rule: `overflow: auto` and `scroll` leave text reachable when
+the element actually scrolls on that axis (`scrollHeight > clientHeight` or `scrollWidth > clientWidth`).
+This includes the window and a viewport-sized scrolling `body`. A `body` that grows to fit its text
+does not count as a scroller. `hidden` and `clip` cut off text. An `auto` or `scroll` element that does
+not scroll does not make text reachable; visibility then follows its ancestors and the window. A `body`
+with `hidden` or `clip` cuts off its contents only when `html` has non-visible overflow; otherwise the
+body overflow is transferred to the window. A fixed element attached to the window is bounded by the
+viewport even when the document is tall; fixed elements attached to a transformed, filtered, or
+contained ancestor follow that ancestor's clipping. Fixed elements are not clipped by body overflow.
+A scrollable container exposes its scrollport area, which is still clipped by hidden ancestors and the
+window.
 
     page-shot page.html                 # frames into page-shots/ next to the page
     page-shot --at 1s,4s page.html      # an animation: frames at several moments
     page-shot --element '#noticed article.note' --out shots page.html
                                         # each matching element whole, 1536×860 at 1.25 only:
                                         # <id>.png (el-<n>.png without an id), paths in stdout
+
+## page-upd
+
+Compares direct child elements of `main` with a previous HTML snapshot, ignoring `data-upd` while
+comparing normalized markup. Changed or new blocks receive the current local time. Source formatting
+and all bytes outside the changed opening tag are preserved. `--column` accepts a tag, `#id` or
+`.class`. If the snapshot argument is omitted, `--artifacts DIR/ID` selects the lexically latest
+HTML snapshot under that page's artifact directory.
+
+    page-upd page.html snapshot.html
+    page-upd --column .content --artifacts ~/.claude/artifacts/ID page.html
 
 ## prior
 

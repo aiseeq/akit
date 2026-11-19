@@ -46,3 +46,9 @@ func TestUsageNamesTheElementWindow(t *testing.T) {
 		t.Fatalf("usage lacks %q: %q", want, usageText())
 	}
 }
+
+func TestUsageDescribesFontLayoutExit(t *testing.T) {
+	if !strings.Contains(usageText(), "неподходящий шрифт") {
+		t.Fatalf("usage does not mention font findings in exit code 2: %q", usageText())
+	}
+}
