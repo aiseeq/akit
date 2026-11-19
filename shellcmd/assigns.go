@@ -143,9 +143,11 @@ type assignContext struct {
 	// shell modes at the assignment and whether a declaration command makes it.
 	assignmentModes map[*syntax.Assign]shellModes
 	declarations    map[*syntax.Assign]bool
+	uncertainDecls  map[*syntax.DeclClause]bool
 }
 
 func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
+	uncertainDecls := uncertainDeclarationRedirects(file)
 	rawScopes := make([]span, len(regions.scopes))
 	for i, scope := range regions.scopes {
 		rawScopes[i] = span{scope.Start, scope.End}
@@ -170,13 +172,14 @@ func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
 		scopeIndex:        scopeIndex,
 		functionIndex:     newSpanIndex(regions.functions),
 		funsubs:           funsubSpans(file),
-		funsubLocals:      funsubLocalBindings(file, scopeIndex),
+		funsubLocals:      funsubLocalBindings(file, scopeIndex, uncertainDecls),
 		functionChanges:   functionChanges,
 		functionDefs:      functionDefs,
 		functionNames:     slices.Sorted(maps.Keys(functionChanges)),
 		functionNameSet:   functionNameSet(functionChanges),
 		deferredIndex:     newSpanIndex(regions.index.deferredCalls),
 		functionDocBySpan: make(map[span]functionDocScope, len(regions.functionDocs)),
+		uncertainDecls:    uncertainDecls,
 	}
 	for _, doc := range regions.functionDocs {
 		ctx.functionDocBySpan[doc.doc] = doc
@@ -204,7 +207,16 @@ func assignmentsForNode(node syntax.Node, full string, ctx assignContext) []Assi
 		if n.Variant.Value == "local" && !ctx.functionIndex.contains(declOff) && !insideAny(ctx.funsubs, declOff) {
 			return nil
 		}
-		return assignmentsFromSyntax(n.Args, full, ctx, declHasGlobal(n))
+		assignments := assignmentsFromSyntax(n.Args, full, ctx, declHasGlobal(n))
+		if ctx.uncertainDecls[n] {
+			for i := range assignments {
+				assignments[i].Value = ""
+				assignments[i].Tilde = 0
+				assignments[i].Append = false
+				assignments[i].Unknown = true
+			}
+		}
+		return assignments
 	case *syntax.ForClause:
 		return unknownLoopAssignment(n, ctx)
 	}
@@ -219,6 +231,12 @@ func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignCont
 		}
 		off := int(a.Pos().Offset())
 		start, end := assignmentScope(ctx, a.Name.Value, off, forceGlobal)
+		uncertainFunsub := false
+		if !forceGlobal {
+			if binding, ok := funsubBinding(ctx.funsubLocals, ctx.replySubs, a.Name.Value, off, true); ok {
+				uncertainFunsub = binding.uncertain
+			}
+		}
 		mode, ok := ctx.assignmentModes[a]
 		if !ok {
 			mode.brace = true
@@ -237,7 +255,12 @@ func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignCont
 			value = assignValue(a, full)
 			tilde = assignmentValueTilde(a, full, mode, ctx.declarations[a])
 		}
-		assignment := Assign{Name: a.Name.Value, Value: value, Tilde: tilde, Append: a.Append, Offset: off, ScopeStart: start, ScopeEnd: end}
+		assignment := Assign{Name: a.Name.Value, Value: value, Tilde: tilde, Append: a.Append, Unknown: uncertainFunsub, Offset: off, ScopeStart: start, ScopeEnd: end}
+		if uncertainFunsub {
+			assignment.Value = ""
+			assignment.Tilde = 0
+			assignment.Append = false
+		}
 		out = append(out, assignment)
 		if execution, ok := functionDocExecution(assignment, off, ctx); ok {
 			out = append(out, execution)
@@ -248,7 +271,7 @@ func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignCont
 
 func assignmentScope(ctx assignContext, name string, off int, forceGlobal bool) (int, int) {
 	start, end := ctx.scopeIndex.innermost(off)
-	if localScope, ok := funsubBinding(ctx.funsubLocals, ctx.replySubs, name, off, true); ok && !forceGlobal {
+	if localScope, ok := funsubBinding(ctx.funsubLocals, ctx.replySubs, name, off, true); ok && !localScope.uncertain && !forceGlobal {
 		// A funsub-local binding applies only when the funsub itself performs
 		// the assignment. Preserve any narrower execution scope nested inside it.
 		if start < localScope.start || end > localScope.end {
@@ -331,6 +354,72 @@ func declarationAssignments(file *syntax.File) map[*syntax.Assign]bool {
 	return declarations
 }
 
+func uncertainDeclarationRedirects(node syntax.Node) map[*syntax.DeclClause]bool {
+	type redirectedStmt struct {
+		start, end int
+	}
+	var uncertainStatements []redirectedStmt
+	syntax.Walk(node, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok || len(stmt.Redirs) == 0 {
+			return true
+		}
+		for _, redir := range stmt.Redirs {
+			if !redirectDefinitelySucceeds(redir) {
+				uncertainStatements = append(uncertainStatements, redirectedStmt{
+					start: int(stmt.Pos().Offset()), end: int(stmt.End().Offset()),
+				})
+				return true
+			}
+		}
+		return true
+	})
+	uncertain := make(map[*syntax.DeclClause]bool)
+	syntax.Walk(node, func(node syntax.Node) bool {
+		decl, ok := node.(*syntax.DeclClause)
+		if !ok || decl.Variant == nil || !isLocalDeclaration(decl) {
+			return true
+		}
+		off := int(decl.Pos().Offset())
+		for _, stmt := range uncertainStatements {
+			if stmt.start <= off && off < stmt.end {
+				uncertain[decl] = true
+				break
+			}
+		}
+		return true
+	})
+	return uncertain
+}
+
+func redirectDefinitelySucceeds(redir *syntax.Redirect) bool {
+	switch redir.Op {
+	case syntax.Hdoc, syntax.DashHdoc, syntax.WordHdoc:
+		return true
+	case syntax.DplIn, syntax.DplOut:
+		if redir.Word == nil {
+			return false
+		}
+		target, literal := wordValue(redir.Word)
+		if !literal {
+			return false
+		}
+		if target == "-" || target == "/dev/null" {
+			return true
+		}
+		if before, ok := strings.CutSuffix(target, "-"); ok {
+			target = before
+		}
+		return target == "0" || target == "1" || target == "2"
+	default:
+		if redir.Word == nil {
+			return false
+		}
+		target, literal := wordValue(redir.Word)
+		return literal && target == "/dev/null"
+	}
+}
+
 // assignmentValueTilde marks the tilde expansion of a scalar value in the
 // shell modes at the assignment; a declaration command also brace-expands it.
 func assignmentValueTilde(a *syntax.Assign, full string, mode shellModes, declaration bool) Tilde {
@@ -374,13 +463,14 @@ type assignFunction struct {
 }
 
 type assignDefinition struct {
-	body       *syntax.Stmt
-	span       span
-	shells     []functionShell
-	isolated   bool
-	declOffset int
-	vars       []string
-	calls      []string
+	body           *syntax.Stmt
+	span           span
+	shells         []functionShell
+	isolated       bool
+	declOffset     int
+	vars           []string
+	calls          []string
+	uncertainDecls map[*syntax.DeclClause]bool
 }
 
 type functionShell struct {
@@ -399,10 +489,11 @@ type functionDocScope struct {
 }
 
 type localBinding struct {
-	name   string
-	offset int
-	start  int
-	end    int
+	name      string
+	offset    int
+	start     int
+	end       int
+	uncertain bool
 }
 
 // assignFunctionChanges returns variables that each function can change in its caller. Calls
@@ -486,6 +577,7 @@ func assignFunctionDecls(regions scopeSet, scopes spanIndex) map[string]*assignF
 			shells := append([]functionShell{{span: bodySpan, node: f.Body}}, functionHereDocShells(regions.functionDocsByFunction[f], scopes)...)
 			function.definitions = append(function.definitions, assignDefinition{
 				body: f.Body, span: bodySpan, shells: shells, isolated: isolated, declOffset: int(f.Pos().Offset()),
+				uncertainDecls: uncertainDeclarationRedirects(f.Body),
 			})
 		}
 	}
@@ -494,34 +586,35 @@ func assignFunctionDecls(regions scopeSet, scopes spanIndex) map[string]*assignF
 
 func functionLocals(body *syntax.Stmt, fn span, scopes spanIndex) []localBinding {
 	var locals []localBinding
-	collectExecutedLocals(body, true, fn, scopes, &locals)
-	return append(locals, funsubLocalBindingsInFunction(body, fn, scopes)...)
+	uncertain := uncertainDeclarationRedirects(body)
+	collectExecutedLocals(body, true, fn, scopes, uncertain, &locals)
+	return append(locals, funsubLocalBindingsInFunction(body, fn, scopes, uncertain)...)
 }
 
-func collectExecutedLocals(stmt *syntax.Stmt, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
+func collectExecutedLocals(stmt *syntax.Stmt, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
 	if stmt == nil || !executes {
 		return
 	}
 	switch cmd := stmt.Cmd.(type) {
 	case *syntax.DeclClause:
-		collectLocalDeclaration(cmd, fn, scopes, locals)
+		collectLocalDeclaration(cmd, fn, scopes, uncertain, locals)
 	case *syntax.Block:
-		collectExecutedLocalsIn(cmd.Stmts, executes, fn, scopes, locals)
+		collectExecutedLocalsIn(cmd.Stmts, executes, fn, scopes, uncertain, locals)
 	case *syntax.BinaryCmd:
-		collectBinaryLocals(cmd, executes, fn, scopes, locals)
+		collectBinaryLocals(cmd, executes, fn, scopes, uncertain, locals)
 	case *syntax.IfClause:
-		collectIfLocals(cmd, executes, fn, scopes, locals)
+		collectIfLocals(cmd, executes, fn, scopes, uncertain, locals)
 	case *syntax.WhileClause:
-		collectWhileLocals(cmd, executes, fn, scopes, locals)
+		collectWhileLocals(cmd, executes, fn, scopes, uncertain, locals)
 	case *syntax.ForClause:
-		collectExecutedLocalsIn(cmd.Do, false, fn, scopes, locals)
+		collectExecutedLocalsIn(cmd.Do, false, fn, scopes, uncertain, locals)
 	case *syntax.CaseClause:
-		collectCaseLocals(cmd, fn, scopes, locals)
+		collectCaseLocals(cmd, fn, scopes, uncertain, locals)
 	}
 }
 
-func collectLocalDeclaration(decl *syntax.DeclClause, fn span, scopes spanIndex, locals *[]localBinding) {
-	if !isLocalDeclaration(decl) || declHasGlobal(decl) || !inFunctionShell(scopes, fn, int(decl.Pos().Offset())) {
+func collectLocalDeclaration(decl *syntax.DeclClause, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
+	if uncertain[decl] || !isLocalDeclaration(decl) || declHasGlobal(decl) || !inFunctionShell(scopes, fn, int(decl.Pos().Offset())) {
 		return
 	}
 	for _, a := range decl.Args {
@@ -531,38 +624,38 @@ func collectLocalDeclaration(decl *syntax.DeclClause, fn span, scopes spanIndex,
 	}
 }
 
-func collectBinaryLocals(cmd *syntax.BinaryCmd, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
+func collectBinaryLocals(cmd *syntax.BinaryCmd, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
 	if cmd.Op == syntax.AndStmt || cmd.Op == syntax.OrStmt {
-		collectExecutedLocals(cmd.X, executes, fn, scopes, locals)
-		collectExecutedLocals(cmd.Y, false, fn, scopes, locals)
+		collectExecutedLocals(cmd.X, executes, fn, scopes, uncertain, locals)
+		collectExecutedLocals(cmd.Y, false, fn, scopes, uncertain, locals)
 	}
 }
 
-func collectIfLocals(cmd *syntax.IfClause, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
-	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, locals)
-	collectExecutedLocalsIn(cmd.Then, false, fn, scopes, locals)
+func collectIfLocals(cmd *syntax.IfClause, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
+	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, uncertain, locals)
+	collectExecutedLocalsIn(cmd.Then, false, fn, scopes, uncertain, locals)
 }
 
-func collectWhileLocals(cmd *syntax.WhileClause, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
-	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, locals)
-	collectExecutedLocalsIn(cmd.Do, false, fn, scopes, locals)
+func collectWhileLocals(cmd *syntax.WhileClause, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
+	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, uncertain, locals)
+	collectExecutedLocalsIn(cmd.Do, false, fn, scopes, uncertain, locals)
 }
 
-func collectCaseLocals(cmd *syntax.CaseClause, fn span, scopes spanIndex, locals *[]localBinding) {
+func collectCaseLocals(cmd *syntax.CaseClause, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
 	for _, item := range cmd.Items {
-		collectExecutedLocalsIn(item.Stmts, false, fn, scopes, locals)
+		collectExecutedLocalsIn(item.Stmts, false, fn, scopes, uncertain, locals)
 	}
 }
 
-func collectExecutedLocalsIn(stmts []*syntax.Stmt, executes bool, fn span, scopes spanIndex, locals *[]localBinding) {
+func collectExecutedLocalsIn(stmts []*syntax.Stmt, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
 	for _, stmt := range stmts {
-		collectExecutedLocals(stmt, executes, fn, scopes, locals)
+		collectExecutedLocals(stmt, executes, fn, scopes, uncertain, locals)
 	}
 }
 
 func localShadows(locals []localBinding, name string, offset int) bool {
 	for _, local := range locals {
-		if local.name == name && local.offset < offset && local.start <= offset && offset < local.end {
+		if local.name == name && !local.uncertain && local.offset < offset && local.start <= offset && offset < local.end {
 			return true
 		}
 	}
@@ -581,17 +674,17 @@ func funsubSpans(node syntax.Node) []span {
 	return spans
 }
 
-func funsubLocalBindings(node syntax.Node, scopes spanIndex) []localBinding {
-	return funsubLocalBindingsInFunction(node, span{-1, -1}, scopes)
+func funsubLocalBindings(node syntax.Node, scopes spanIndex, uncertain map[*syntax.DeclClause]bool) []localBinding {
+	return funsubLocalBindingsInFunction(node, span{-1, -1}, scopes, uncertain)
 }
 
-func funsubLocalBindingsInFunction(node syntax.Node, fn span, scopes spanIndex) []localBinding {
+func funsubLocalBindingsInFunction(node syntax.Node, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool) []localBinding {
 	var funsubs []span
 	var declarations []*syntax.DeclClause
 	syntax.Walk(node, func(node syntax.Node) bool {
 		return collectFunsubLocalNode(node, fn, &funsubs, &declarations)
 	})
-	return bindFunsubLocalDeclarations(funsubs, declarations, scopes)
+	return bindFunsubLocalDeclarations(funsubs, declarations, scopes, uncertain)
 }
 
 func collectFunsubLocalNode(node syntax.Node, fn span, funsubs *[]span, declarations *[]*syntax.DeclClause) bool {
@@ -614,7 +707,7 @@ func collectFunsubLocalNode(node syntax.Node, fn span, funsubs *[]span, declarat
 	return true
 }
 
-func bindFunsubLocalDeclarations(funsubs []span, declarations []*syntax.DeclClause, scopes spanIndex) []localBinding {
+func bindFunsubLocalDeclarations(funsubs []span, declarations []*syntax.DeclClause, scopes spanIndex, uncertain map[*syntax.DeclClause]bool) []localBinding {
 	slices.SortFunc(funsubs, func(a, b span) int {
 		if a.start != b.start {
 			return a.start - b.start
@@ -649,34 +742,38 @@ func bindFunsubLocalDeclarations(funsubs []span, declarations []*syntax.DeclClau
 		}
 		for _, a := range decl.Args {
 			if a.Name != nil {
-				locals = append(locals, localBinding{name: a.Name.Value, offset: int(a.Pos().Offset()), start: fn.start, end: fn.end})
+				locals = append(locals, localBinding{
+					name: a.Name.Value, offset: int(a.Pos().Offset()), start: fn.start, end: fn.end,
+					uncertain: uncertain[decl],
+				})
 			}
 		}
 	}
 	return locals
 }
 
-func funsubBinding(locals []localBinding, replySubs []span, name string, offset int, includeDeclaration bool) (span, bool) {
-	var found span
+func funsubBinding(locals []localBinding, replySubs []span, name string, offset int, includeDeclaration bool) (localBinding, bool) {
+	var found localBinding
 	for _, local := range locals {
 		atOrAfter := local.offset < offset || includeDeclaration && local.offset == offset
 		if local.name == name && atOrAfter && local.start <= offset && offset < local.end && local.end-local.start > 0 &&
-			(found.end == 0 || local.end-local.start < found.end-found.start) {
-			found = span{start: local.start, end: local.end}
+			(found.end == 0 || local.end-local.start < found.end-found.start ||
+				local.end-local.start == found.end-found.start && local.offset > found.offset) {
+			found = local
 		}
 	}
 	if name == "REPLY" {
 		for _, reply := range replySubs {
 			if reply.start <= offset && offset < reply.end &&
 				(found.end == 0 || reply.end-reply.start < found.end-found.start) {
-				found = reply
+				found = localBinding{start: reply.start, end: reply.end}
 			}
 		}
 	}
 	if found.end != 0 {
 		return found, true
 	}
-	return span{}, false
+	return localBinding{}, false
 }
 
 func insideAny(spans []span, off int) bool {
@@ -750,19 +847,79 @@ func calledFunctionNames(args []*syntax.Word, functions []string, functionSet ma
 	if !literal {
 		return functions
 	}
-	evalArgs, isEval := evalArguments(args, name)
-	if isEval {
-		for _, arg := range evalArgs {
-			if _, ok := wordValue(arg); !ok {
-				return functions
-			}
-		}
-		return evalFunctionNames(evalArgs, functions)
-	}
 	if functionSet[name] {
 		return []string{name}
 	}
+	switch name {
+	case "eval":
+		return evalCallFunctionNames(args[1:], functions)
+	case "command":
+		return wrappedBuiltinFunctionNames(args[1:], true, functions)
+	case "builtin":
+		return wrappedBuiltinFunctionNames(args[1:], false, functions)
+	}
 	return nil
+}
+
+func wrappedBuiltinFunctionNames(args []*syntax.Word, command bool, functions []string) []string {
+	for len(args) > 0 {
+		option, literal := wordValue(args[0])
+		if !literal {
+			return functions
+		}
+		if option == "--" {
+			args = args[1:]
+			break
+		}
+		if command && len(option) > 1 && option[0] == '-' {
+			valid := true
+			query := false
+			for _, flag := range option[1:] {
+				switch flag {
+				case 'p':
+				case 'v', 'V':
+					query = true
+				default:
+					valid = false
+				}
+			}
+			if !valid || query {
+				return nil
+			}
+			args = args[1:]
+			continue
+		}
+		if !command && strings.HasPrefix(option, "-") {
+			return nil
+		}
+		break
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	name, literal := wordValue(args[0])
+	if !literal {
+		return functions
+	}
+	switch name {
+	case "eval":
+		return evalCallFunctionNames(args[1:], functions)
+	case "command":
+		return wrappedBuiltinFunctionNames(args[1:], true, functions)
+	case "builtin":
+		return wrappedBuiltinFunctionNames(args[1:], false, functions)
+	default:
+		return nil
+	}
+}
+
+func evalCallFunctionNames(evalArgs []*syntax.Word, functions []string) []string {
+	for _, arg := range evalArgs {
+		if _, ok := wordValue(arg); !ok {
+			return functions
+		}
+	}
+	return evalFunctionNames(evalArgs, functions)
 }
 
 func functionNameSet[V any](functions map[string]V) map[string]bool {
@@ -771,18 +928,6 @@ func functionNameSet[V any](functions map[string]V) map[string]bool {
 		set[name] = true
 	}
 	return set
-}
-
-func evalArguments(args []*syntax.Word, name string) ([]*syntax.Word, bool) {
-	if name == "eval" {
-		return args[1:], true
-	}
-	if (name == "builtin" || name == "command") && len(args) > 1 {
-		if next, ok := wordValue(args[1]); ok && next == "eval" {
-			return args[2:], true
-		}
-	}
-	return nil, false
 }
 
 func evalFunctionNames(args []*syntax.Word, functions []string) []string {
@@ -819,12 +964,13 @@ func evalDelimiter(char byte) bool {
 }
 
 func collectDeclChanges(f *assignFunction, definition *assignDefinition, decl *syntax.DeclClause, locals []localBinding, scopes spanIndex) {
+	uncertainRedirect := definition.uncertainDecls[decl]
 	global := declHasGlobal(decl)
 	for _, a := range decl.Args {
 		if a.Name == nil || a.Naked || localShadows(locals, a.Name.Value, int(a.Pos().Offset())) && !global || !inFunctionShell(scopes, definition.span, int(a.Pos().Offset())) {
 			continue
 		}
-		if (decl.Variant.Value == "local" || decl.Variant.Value == "declare" || decl.Variant.Value == "typeset") && !global {
+		if (decl.Variant.Value == "local" || decl.Variant.Value == "declare" || decl.Variant.Value == "typeset") && !global && !uncertainRedirect {
 			continue
 		}
 		f.vars[a.Name.Value] = true
