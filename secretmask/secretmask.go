@@ -3649,9 +3649,12 @@ func curlExtraMatches(text string, segments [][2]int) []contextMatch {
 				if !strings.Contains(cookie, "=") || strings.Contains(cookie, "/") {
 					continue
 				}
-				if eq := strings.IndexByte(cookie, '='); eq >= 0 && eq+1 < len(cookie) {
-					value.start += eq + 1
+				for _, m := range cookiePairMatches(part, 0, value.start, value.end) {
+					if valueIsValue(part, contextValue{start: m.start, end: m.end, quoted: value.quoted}, "token", "token", false) {
+						matches = append(matches, contextMatch{segment[0] + m.start, segment[0] + m.end, "token"})
+					}
 				}
+				continue
 			}
 			if valueIsValue(part, value, "token", "token", false) {
 				matches = append(matches, contextMatch{segment[0] + value.start, segment[0] + value.end, "token"})
@@ -3708,15 +3711,91 @@ func cookieHeaderMatches(part string, offset, start, end int) []contextMatch {
 	if eq < 0 {
 		return nil
 	}
-	at := start + colon + 1 + eq + 1
+	at := start + colon + 1
 	endAt := end
 	if endAt > at && (part[endAt-1] == '\'' || part[endAt-1] == '"') {
 		endAt--
 	}
-	if at >= endAt {
+	return cookiePairMatches(part, offset, at, endAt)
+}
+
+// cookiePairMatches masks the value of each name=value pair of a cookie string part[start:end], and a whole
+// piece between ';' that has no '='. A value that is only a shell reference ($NAME, ${…}, $(…), `…`) is not a
+// secret in the text and stays; a reference with ';' inside does not split the pair.
+func cookiePairMatches(part string, offset, start, end int) []contextMatch {
+	if !strings.Contains(part[start:end], "=") {
 		return nil
 	}
-	return []contextMatch{{offset + at, offset + endAt, "token"}}
+	var matches []contextMatch
+	for at := start; at < end; {
+		valueStart := at
+		for valueStart < end && (part[valueStart] == ' ' || part[valueStart] == '\t') {
+			valueStart++
+		}
+		semi := strings.IndexByte(part[valueStart:end], ';')
+		if eq := strings.IndexByte(part[valueStart:end], '='); eq >= 0 && (semi < 0 || eq < semi) {
+			valueStart += eq + 1
+			for valueStart < end && (part[valueStart] == ' ' || part[valueStart] == '\t') {
+				valueStart++
+			}
+		}
+		ref := shellReferenceLen(part[valueStart:end])
+		valueEnd := valueStart + ref
+		next := end
+		if semi := strings.IndexByte(part[valueEnd:end], ';'); semi >= 0 {
+			next = valueEnd + semi
+		}
+		if ref == 0 || strings.TrimRight(part[valueEnd:next], " \t") != "" {
+			if valueStart < next {
+				matches = append(matches, contextMatch{offset + valueStart, offset + next, "token"})
+			}
+		}
+		at = next + 1
+	}
+	return matches
+}
+
+// shellReferenceLen is the length of the shell reference at the start of value ($NAME, $1, ${…}, $(…), `…`), or
+// 0 when value does not start with a complete one.
+func shellReferenceLen(value string) int {
+	if strings.HasPrefix(value, "`") {
+		if i := strings.IndexByte(value[1:], '`'); i >= 0 {
+			return i + 2
+		}
+		return 0
+	}
+	if len(value) < 2 || value[0] != '$' {
+		return 0
+	}
+	switch c := value[1]; {
+	case c == '{' || c == '(':
+		closer := byte('}')
+		if c == '(' {
+			closer = ')'
+		}
+		depth := 0
+		for i := 1; i < len(value); i++ {
+			switch value[i] {
+			case c:
+				depth++
+			case closer:
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		}
+		return 0
+	case c >= '0' && c <= '9':
+		return 2
+	case c == '_' || isAlphaNum(c):
+		i := 2
+		for i < len(value) && (value[i] == '_' || isAlphaNum(value[i])) {
+			i++
+		}
+		return i
+	}
+	return 0
 }
 
 func mysqlMatches(part, tool string, offset int, matches *[]contextMatch) {

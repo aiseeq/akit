@@ -971,3 +971,48 @@ func TestMaskKeepsJSONValid(t *testing.T) {
 		})
 	}
 }
+
+// A cookie value that is only a shell reference is not a secret in the text; a literal value next to it, a piece
+// without a name, and a value after spaces are hidden.
+func TestMaskCookieShellReferences(t *testing.T) {
+	for _, input := range []string{
+		`curl -H "Cookie: a=$X; Vvalue123" x`,
+		`curl -H "Cookie: a=$X;Vvalue123" x`,
+		`curl -H "Cookie: a=1; Vvalue123" x`,
+		`curl -H "Cookie: a=$X; b=$Y; Vvalue123" x`,
+		`curl -H "Cookie: sid=${X}Vvalue123" x`,
+		`curl -H "Cookie: sid=$X-Vvalue123" x`,
+		`curl -H "Cookie: a=$X; sid=Vvalue123" x`,
+		`curl -b "a=1; Vvalue123" x`,
+		`curl -b "a=1; sid= Vvalue123" x`,
+		`curl -b "a=$X; sid=Vvalue123" x`,
+		`curl -b "sid=Vvalue123(" x`,
+		`curl -H "Cookie: a=1; Vvalue123; b=2" x`,
+		`curl -b "Vvalue123; a=$X" x`,
+		`curl -H "Cookie: sid=$1Vvalue123" x`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			if got, _ := Mask(input); strings.Contains(got, "Vvalue123") {
+				t.Fatalf("value left in %q", got)
+			}
+		})
+	}
+	for _, input := range []string{
+		`curl -s -H "Cookie: admin_token=$TOKEN" http://localhost:8090/x | jq .`,
+		`curl -H "Cookie: a=$A ;b=$B" x`,
+		`curl -H "Cookie: sid=$(a;b)" x`,
+		`curl -H "Cookie: sid=$(a $(b))" x`,
+		`curl -H "Cookie: sid=$1" x`,
+		"curl -H \"Cookie: sid=`cat f`\" x",
+		`curl -H "Cookie: sid=$token" x`,
+		`curl -b "sid=<token>" x`,
+		`curl -b "sid=${TOKEN}; a=$(cat f)" x`,
+		`curl -H "Cookie: a=$X; $Y" x`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			if got, found := Mask(input); got != input || len(found) != 0 {
+				t.Fatalf("changed to %q, %v", got, found)
+			}
+		})
+	}
+}
