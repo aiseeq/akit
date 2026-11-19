@@ -34,6 +34,11 @@ func TestStopChildGroupRecoversLeaderValidationRaces(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd, member := startRaceGroup(t)
+			fd, err := unix.PidfdOpen(member, 0)
+			if err != nil {
+				t.Fatalf("open member pidfd: %v", err)
+			}
+			defer unix.Close(fd)
 			injectLeaderExit(t, cmd, tc.point)
 			realSignal := signalProcess
 			termRequested := false
@@ -52,7 +57,9 @@ func TestStopChildGroupRecoversLeaderValidationRaces(t *testing.T) {
 			if !termRequested {
 				t.Error("race recovery did not send the requested SIGTERM to verified descendants")
 			}
-			waitForGroupMemberDead(t, member, time.Second)
+			if !trackedMemberGone(fd, time.Second) {
+				t.Error("group member still alive after race recovery")
+			}
 		})
 	}
 }
@@ -230,8 +237,8 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 					if stopErr != nil {
 						t.Errorf("iteration %d: Cancel returned %v", i, stopErr)
 					}
-					if !groupMemberGone(pid, time.Second) {
-						t.Errorf("iteration %d: group member %d survived Cancel", i, pid)
+					if !trackedMemberGone(fd, time.Second) {
+						t.Errorf("iteration %d: group member survived Cancel", i)
 					}
 				} else {
 					alive, err := processAlive(&trackedProcess{fd: fd})
@@ -239,14 +246,15 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 						t.Errorf("iteration %d: member should survive leader exit: alive=%v err=%v", i, alive, err)
 					}
 				}
-				if err := signalProcess(pid, &trackedProcess{fd: fd}, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+				if err := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
 					t.Errorf("iteration %d: cleanup member: %v", i, err)
 				}
-				if !groupMemberGone(pid, time.Second) {
-					t.Errorf("iteration %d: member %d survived cleanup", i, pid)
+				if !trackedMemberGone(fd, time.Second) {
+					t.Errorf("iteration %d: member survived cleanup", i)
 				}
 				// TestMain is a subreaper: collect this member if it was adopted.
-				if _, err := unix.Wait4(pid, nil, unix.WNOHANG, nil); err != nil && !errors.Is(err, unix.ECHILD) {
+				var info unix.Siginfo
+				if err := unix.Waitid(unix.P_PIDFD, fd, &info, unix.WEXITED|unix.WNOHANG, nil); err != nil && !errors.Is(err, unix.ECHILD) {
 					t.Errorf("iteration %d: reap member: %v", i, err)
 				}
 				_ = unix.Close(fd)
@@ -259,6 +267,21 @@ func TestStopChildGroupCancelRaceStress(t *testing.T) {
 	close(jobs)
 	wg.Wait()
 	t.Logf("race Cancel=%d, leader first=%d, guaranteed=%d, total=%d", racedCancel.Load(), leaderFirst.Load(), guaranteed.Load(), iterations)
+}
+
+func trackedMemberGone(fd int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	tracked := &trackedProcess{fd: fd}
+	for {
+		alive, err := processAlive(tracked)
+		if err == nil && !alive {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func startRaceGroup(t *testing.T) (*exec.Cmd, int) {
@@ -282,24 +305,4 @@ func startRaceGroup(t *testing.T) (*exec.Cmd, int) {
 	})
 	waitReady(t, ready)
 	return cmd, readPID(t, pidFile)
-}
-
-func waitForGroupMemberDead(t *testing.T, pid int, timeout time.Duration) {
-	t.Helper()
-	if !groupMemberGone(pid, timeout) {
-		stat, err := ReadStat("/proc", pid)
-		t.Fatalf("group member %d still alive after %v: stat=%+v err=%v", pid, timeout, stat, err)
-	}
-}
-
-func groupMemberGone(pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		stat, err := ReadStat("/proc", pid)
-		if err != nil || stat.State == "Z" || stat.State == "X" {
-			return true
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return false
 }
