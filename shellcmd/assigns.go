@@ -94,8 +94,9 @@ func (a Assign) VisibleAt(off int) bool {
 }
 
 // Assigns returns assignments of cmd in text order, including Unknown entries for array and
-// element assignments, for-loop variables, and calls to functions whose bodies may change
-// variables in the calling shell. Unknown entries have an empty Value and Append=false.
+// element assignments, for-loop variables, calls to functions whose bodies may change variables
+// in the calling shell, and assignments under a redirect that may fail. Unknown entries have an
+// empty Value and Append=false.
 // Prefix assignments (`S=x cmd`) change only the environment of their command and are left out,
 // as are declarations without a value (`export T`) and `local` outside a function. Literal,
 // quoted and escaped function names are recognized; `eval` checks for function names as separate
@@ -116,9 +117,19 @@ func Assigns(cmd string) ([]Assign, error) {
 	ctx := newAssignContext(file, regions)
 	ctx.assignmentModes = assignmentShellModes(file, full)
 	ctx.declarations = declarationAssignments(file)
+	uncertainRedirects := uncertainRedirectStatements(file)
 	var out []Assign
 	syntax.Walk(file, func(node syntax.Node) bool {
-		out = append(out, assignmentsForNode(node, full, ctx)...)
+		assignments := assignmentsForNode(node, full, ctx)
+		for i := range assignments {
+			if insideAny(uncertainRedirects, assignments[i].Offset) {
+				assignments[i].Value = ""
+				assignments[i].Tilde = 0
+				assignments[i].Append = false
+				assignments[i].Unknown = true
+			}
+		}
+		out = append(out, assignments...)
 		return true
 	})
 	slices.SortStableFunc(out, func(a, b Assign) int { return a.Offset - b.Offset })
@@ -271,7 +282,14 @@ func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignCont
 
 func assignmentScope(ctx assignContext, name string, off int, forceGlobal bool) (int, int) {
 	start, end := ctx.scopeIndex.innermost(off)
-	if localScope, ok := funsubBinding(ctx.funsubLocals, ctx.replySubs, name, off, true); ok && !localScope.uncertain && !forceGlobal {
+	if localScope, ok := funsubBinding(ctx.funsubLocals, ctx.replySubs, name, off, true); ok && !forceGlobal {
+		if localScope.uncertain {
+			if certain, found := certainFunsubBinding(ctx.funsubLocals, name, off); found {
+				localScope = certain
+			} else {
+				return start, end
+			}
+		}
 		// A funsub-local binding applies only when the funsub itself performs
 		// the assignment. Preserve any narrower execution scope nested inside it.
 		if start < localScope.start || end > localScope.end {
@@ -279,6 +297,18 @@ func assignmentScope(ctx assignContext, name string, off int, forceGlobal bool) 
 		}
 	}
 	return start, end
+}
+
+// certainFunsubBinding finds the narrowest non-uncertain funsub local active at off.
+func certainFunsubBinding(locals []localBinding, name string, offset int) (localBinding, bool) {
+	var found localBinding
+	for _, local := range locals {
+		if local.name == name && !local.uncertain && local.offset <= offset && local.start <= offset && offset < local.end &&
+			funsubBindingPreferred(local, found) {
+			found = local
+		}
+	}
+	return found, found.end != 0
 }
 
 func unknownFunctionAssignments(call *syntax.CallExpr, ctx assignContext) []Assign {
@@ -355,25 +385,7 @@ func declarationAssignments(file *syntax.File) map[*syntax.Assign]bool {
 }
 
 func uncertainDeclarationRedirects(node syntax.Node) map[*syntax.DeclClause]bool {
-	type redirectedStmt struct {
-		start, end int
-	}
-	var uncertainStatements []redirectedStmt
-	syntax.Walk(node, func(node syntax.Node) bool {
-		stmt, ok := node.(*syntax.Stmt)
-		if !ok || len(stmt.Redirs) == 0 {
-			return true
-		}
-		for _, redir := range stmt.Redirs {
-			if !redirectDefinitelySucceeds(redir) {
-				uncertainStatements = append(uncertainStatements, redirectedStmt{
-					start: int(stmt.Pos().Offset()), end: int(stmt.End().Offset()),
-				})
-				return true
-			}
-		}
-		return true
-	})
+	uncertainStatements := uncertainRedirectStatements(node)
 	uncertain := make(map[*syntax.DeclClause]bool)
 	syntax.Walk(node, func(node syntax.Node) bool {
 		decl, ok := node.(*syntax.DeclClause)
@@ -384,6 +396,26 @@ func uncertainDeclarationRedirects(node syntax.Node) map[*syntax.DeclClause]bool
 		for _, stmt := range uncertainStatements {
 			if stmt.start <= off && off < stmt.end {
 				uncertain[decl] = true
+				break
+			}
+		}
+		return true
+	})
+	return uncertain
+}
+
+// uncertainRedirectStatements returns command spans whose named command may not run because
+// a redirect can fail. Assignment-only statements expand and assign before redirects are applied.
+func uncertainRedirectStatements(node syntax.Node) []span {
+	var uncertain []span
+	syntax.Walk(node, func(node syntax.Node) bool {
+		stmt, ok := node.(*syntax.Stmt)
+		if !ok || len(stmt.Redirs) == 0 || stmtHasNoCommand(stmt) {
+			return true
+		}
+		for _, redir := range stmt.Redirs {
+			if !redirectDefinitelySucceeds(redir) {
+				uncertain = append(uncertain, span{int(stmt.Pos().Offset()), int(stmt.End().Offset())})
 				break
 			}
 		}
@@ -757,8 +789,7 @@ func funsubBinding(locals []localBinding, replySubs []span, name string, offset 
 	for _, local := range locals {
 		atOrAfter := local.offset < offset || includeDeclaration && local.offset == offset
 		if local.name == name && atOrAfter && local.start <= offset && offset < local.end && local.end-local.start > 0 &&
-			(found.end == 0 || local.end-local.start < found.end-found.start ||
-				local.end-local.start == found.end-found.start && local.offset > found.offset) {
+			funsubBindingPreferred(local, found) {
 			found = local
 		}
 	}
@@ -774,6 +805,22 @@ func funsubBinding(locals []localBinding, replySubs []span, name string, offset 
 		return found, true
 	}
 	return localBinding{}, false
+}
+
+// funsubBindingPreferred prefers the innermost active funsub, then a certain binding
+// over an uncertain one with the same span, and finally the later declaration.
+func funsubBindingPreferred(candidate, current localBinding) bool {
+	if current.end == 0 {
+		return true
+	}
+	candidateSpan, currentSpan := candidate.end-candidate.start, current.end-current.start
+	if candidateSpan != currentSpan {
+		return candidateSpan < currentSpan
+	}
+	if candidate.uncertain != current.uncertain {
+		return !candidate.uncertain
+	}
+	return candidate.offset > current.offset
 }
 
 func insideAny(spans []span, off int) bool {

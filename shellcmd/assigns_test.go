@@ -25,6 +25,125 @@ func TestAssignsOrderValuesAndOffsets(t *testing.T) {
 	}
 }
 
+func TestAssignsFailingRedirectsAndFunsubLocalPrecision(t *testing.T) {
+	tests := []struct {
+		name, src, want string
+		unknown         bool
+	}{
+		{"export", `S=/clean; export S=/bad 2>/nonexistent/x`, "", true},
+		{"readonly", `S=/clean; readonly S=/bad 2>/nonexistent/x`, "", true},
+		{"brace group", `S=/clean; { S=/bad; } 2>/nonexistent/x`, "", true},
+		{"if", `S=/clean; if true; then S=/bad; fi 2>/nonexistent/x`, "", true},
+		{"case", `S=/clean; case x in x) S=/bad;; esac 2>/nonexistent/x`, "", true},
+		{"successful redirect", `S=/clean; { S=/bad; } 2>/dev/null`, "/bad", false},
+		{"duplicated descriptor", `S=/clean; { S=/bad; } 2>&1`, "/bad", false},
+		{"successful function redirect", `S=/clean; f() { S=/bad; }; f 2>/dev/null`, "", true},
+		{"funsub later failing local", `S=/clean; x=${ local S 2>/dev/null; local S 2>/nonexistent/x; S=/bad; }`, "/clean", false},
+		{"funsub successful output redirect", `S=/clean; x=${ local S; local S >/tmp/w; S=/bad; }`, "/clean", false},
+		{"nested funsub failing local", `S=/clean; x=${ local S; y=${ local S 2>/nonexistent/x; S=/bad; }; }`, "/clean", false},
+		{"nested funsub successful output redirect", `S=/clean; x=${ local S; y=${ local S >/tmp/w; S=/bad; }; }`, "/clean", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Assigns(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := "/clean"
+			for _, assignment := range got {
+				if assignment.Name != "S" || !assignment.VisibleAt(len(tt.src)+1) {
+					continue
+				}
+				if assignment.Unknown {
+					value = "<unknown>"
+				} else if assignment.Append {
+					if value != "<unknown>" {
+						value += assignment.Value
+					}
+				} else {
+					value = assignment.Value
+				}
+			}
+			want := tt.want
+			if tt.unknown {
+				want = "<unknown>"
+			}
+			if value != want {
+				t.Errorf("Assigns(%q) = %+v, resolved S=%q, want %q", tt.src, got, value, want)
+			}
+		})
+	}
+}
+
+func TestAssignsUncertainFunsubBindingInsideOuterFunsub(t *testing.T) {
+	tests := []struct {
+		name, src, want string
+	}{
+		{"command substitution", `S=/clean; x=${ local S=/o; y=${ local S >/tmp/w; S=/bad; }; echo M@$S >&2; }`, "<unknown>"},
+		{"reply substitution", `S=/clean; x=${ local S=/o; y=${| local S >/tmp/w; S=/bad; }; echo M@$S >&2; }`, "<unknown>"},
+		{"append after inner substitution", `S=/clean; x=${ local S=/o; y=${ local S >/tmp/w; S=/bad; }; S+=/z; echo M@$S >&2; }`, "<unknown>"},
+		{"three nested substitutions", `S=/clean; x=${ local S=/o; y=${ z=${ local S >/tmp/w; S=/bad; }; echo M@$S >&2; }; }`, "<unknown>"},
+		// At equal scope a certain local declared earlier still holds: S is local whether or not the later one runs.
+		{"certain local before uncertain one", `S=/clean; x=${ local S; local S >/tmp/w; S=/bad; echo M@$S >&2; }`, "/bad"},
+		{"certain local with value before uncertain one", `S=/clean; x=${ local S=/o; local S >/tmp/w; S=/bad; echo M@$S >&2; }`, "/bad"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Assigns(tt.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			echoOff := strings.Index(tt.src, "echo M@$S")
+			value := "<unset>"
+			for _, assignment := range got {
+				if assignment.Name != "S" || !assignment.VisibleAt(echoOff) {
+					continue
+				}
+				if assignment.Unknown {
+					value = "<unknown>"
+				} else if assignment.Append {
+					if value != "<unknown>" {
+						value += assignment.Value
+					}
+				} else {
+					value = assignment.Value
+				}
+			}
+			if value != tt.want {
+				t.Errorf("Assigns(%q) = %+v, resolved S at echo=%q, want %q", tt.src, got, value, tt.want)
+			}
+		})
+	}
+}
+
+func TestAssignsAssignmentOnlyCommandsRunBeforeRedirects(t *testing.T) {
+	for _, src := range []string{
+		`S=/clean; S=/bad 2>/nonexistent/x; echo M@$S`,
+		`S=/clean; S=/bad >/tmp/w; echo M@$S`,
+		`S=/clean; S=/bad <file; echo M@$S`,
+		`S=/clean; [[ x ]] && S=/bad 2>/nonexistent/x; echo M@$S`,
+		`S=/clean; x=${ S=/bad; } 2>/nonexistent/x; echo M@$S`,
+	} {
+		got, err := Assigns(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := "/clean"
+		for _, assignment := range got {
+			if assignment.Name == "S" && assignment.VisibleAt(len(src)+1) {
+				if assignment.Unknown {
+					value = "<unknown>"
+				} else {
+					value = assignment.Value
+				}
+			}
+		}
+		if value != "/bad" {
+			t.Errorf("Assigns(%q) = %+v, resolved S=%q, want /bad", src, got, value)
+		}
+	}
+}
+
 func TestAssignsSkipsPrefixAndValuelessDeclarations(t *testing.T) {
 	for _, src := range []string{`X=1 cmd`, `export T`, `bash -c 'S=1'`, `local L=1`} {
 		got, err := Assigns(src)
