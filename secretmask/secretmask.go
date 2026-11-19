@@ -3649,11 +3649,7 @@ func curlExtraMatches(text string, segments [][2]int) []contextMatch {
 				if !strings.Contains(cookie, "=") || strings.Contains(cookie, "/") {
 					continue
 				}
-				for _, m := range cookiePairMatches(part, 0, value.start, value.end) {
-					if valueIsValue(part, contextValue{start: m.start, end: m.end, quoted: value.quoted}, "token", "token", false) {
-						matches = append(matches, contextMatch{segment[0] + m.start, segment[0] + m.end, "token"})
-					}
-				}
+				matches = append(matches, cookieOptionMatches(part, segment[0], value)...)
 				continue
 			}
 			if valueIsValue(part, value, "token", "token", false) {
@@ -3717,6 +3713,18 @@ func cookieHeaderMatches(part string, offset, start, end int) []contextMatch {
 		endAt--
 	}
 	return cookiePairMatches(part, offset, at, endAt)
+}
+
+// cookieOptionMatches masks the cookie pairs of a curl -b value whose values pass the same check as other
+// option values.
+func cookieOptionMatches(part string, offset int, value contextValue) []contextMatch {
+	var matches []contextMatch
+	for _, m := range cookiePairMatches(part, 0, value.start, value.end) {
+		if valueIsValue(part, contextValue{start: m.start, end: m.end, quoted: value.quoted}, "token", "token", false) {
+			matches = append(matches, contextMatch{offset + m.start, offset + m.end, "token"})
+		}
+	}
+	return matches
 }
 
 // cookiePairMatches masks the value of each name=value pair of a cookie string part[start:end], and a whole
