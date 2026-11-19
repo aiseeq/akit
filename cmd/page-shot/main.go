@@ -1,6 +1,7 @@
 // page-shot снимает кадры HTML-страницы в headless Chrome на нескольких окнах
 // и полную высоту, чтобы страницу смотрели глазами до публикации, и на каждом
-// окне проверяет горизонтальный скролл, наложение подписей и выравнивание значков:
+// окне проверяет горизонтальный скролл, наложение подписей, выравнивание значков
+// и семейства шрифтов:
 // что-то из этого есть - код выхода 2.
 package main
 
@@ -59,22 +60,35 @@ var (
 	errOverflow = errors.New("горизонтальный скролл")
 	errOverlap  = errors.New("наложение подписей")
 	errAlign    = errors.New("значки не выровнены с текстом")
+	errFonts    = errors.New("шрифты вне набора страницы")
 	errGazette  = errors.New("нет разметки Gazette (скилл web-page, gazette.js)")
 )
 
 func main() {
 	err := run()
-	switch {
-	case err == nil:
-	case errors.Is(err, errOverflow), errors.Is(err, errOverlap), errors.Is(err, errAlign), errors.Is(err, errGazette):
+	code := exitCode(err)
+	switch code {
+	case 0:
+	case exitLayout:
 		for line := range strings.SplitSeq(err.Error(), "\n") {
 			fmt.Fprintln(os.Stderr, "page-shot:", line)
 		}
-		os.Exit(exitLayout)
 	default:
 		fmt.Fprintln(os.Stderr, "page-shot:", err)
-		os.Exit(exitError)
 	}
+	if code != 0 {
+		os.Exit(code)
+	}
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, errOverflow) || errors.Is(err, errOverlap) || errors.Is(err, errAlign) || errors.Is(err, errFonts) || errors.Is(err, errGazette) {
+		return exitLayout
+	}
+	return exitError
 }
 
 func run() error {
@@ -132,7 +146,7 @@ func run() error {
 
 // shootViewports снимает страницу на всех окнах и собирает находки раскладки в одну ошибку.
 func shootViewports(allocCtx context.Context, target, dir string, moments []time.Duration) error {
-	var overflowed, overlapped, misaligned []string
+	var overflowed, overlapped, misaligned, badFonts []string
 	gazetteMissing := false
 	for i, vp := range viewports {
 		lay, err := shoot(allocCtx, target, dir, vp, moments)
@@ -160,6 +174,10 @@ func shootViewports(allocCtx context.Context, target, dir string, moments []time
 				fmt.Fprint(os.Stderr, theme.align.report(window))
 				misaligned = append(misaligned, window)
 			}
+			if theme.fonts != nil {
+				fmt.Fprint(os.Stderr, theme.fonts.report(window))
+				badFonts = append(badFonts, window)
+			}
 		}
 		gazetteMissing = gazetteMissing || lay.gazetteMissing
 	}
@@ -173,6 +191,9 @@ func shootViewports(allocCtx context.Context, target, dir string, moments []time
 	if len(misaligned) > 0 {
 		errs = append(errs, fmt.Errorf("%w на окнах %s", errAlign, strings.Join(misaligned, ", ")))
 	}
+	if len(badFonts) > 0 {
+		errs = append(errs, fmt.Errorf("%w на окнах %s", errFonts, strings.Join(badFonts, ", ")))
+	}
 	if gazetteMissing {
 		errs = append(errs, errGazette)
 	}
@@ -185,6 +206,7 @@ type themeLayout struct {
 	overflow       *overflow
 	overlap        *overlapResult
 	align          *alignResult
+	fonts          *fontResult
 	gazetteMissing bool
 }
 
@@ -320,20 +342,45 @@ func finishTheme(ctx context.Context, dir string, vp viewport, theme string) (th
 	if lay.align, err = checkAlign(ctx); err != nil {
 		return themeLayout{}, nil, err
 	}
-	var titles *titleTips
+	fonts, titles, fullFrame, err := finishThemeInspections(ctx, theme, checkFonts, checkTitles, func(ctx context.Context) ([]byte, error) {
+		return chromedp.Run(ctx, chromedp.FullScreenshot(100))
+	})
+	if err != nil {
+		return themeLayout{}, nil, err
+	}
+	lay.fonts = fonts
 	if theme == "light" {
-		if titles, err = checkTitles(ctx); err != nil {
-			return themeLayout{}, nil, err
-		}
-		buf, err := chromedp.Run(ctx, chromedp.FullScreenshot(100))
-		if err != nil {
-			return themeLayout{}, nil, fmt.Errorf("кадр полной высоты: %w", err)
-		}
-		if err := save(filepath.Join(dir, vp.name()+"-full.png"), buf); err != nil {
+		if err := save(filepath.Join(dir, vp.name()+"-full.png"), fullFrame); err != nil {
 			return themeLayout{}, nil, err
 		}
 	}
 	return lay, titles, nil
+}
+
+func finishThemeInspections(
+	ctx context.Context,
+	theme string,
+	fontsCheck func(context.Context) (*fontResult, error),
+	titlesCheck func(context.Context) (*titleTips, error),
+	fullScreenshot func(context.Context) ([]byte, error),
+) (*fontResult, *titleTips, []byte, error) {
+	fonts, err := fontsCheck(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var titles *titleTips
+	var frame []byte
+	if theme == "light" {
+		titles, err = titlesCheck(ctx)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		frame, err = fullScreenshot(ctx)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("кадр полной высоты: %w", err)
+		}
+	}
+	return fonts, titles, frame, nil
 }
 
 func reportHoverWarnings(ctx context.Context, dir string, vp viewport, theme string) error {
@@ -506,7 +553,7 @@ func printUsage(fs *flag.FlagSet) {
 	fs.PrintDefaults()
 	fmt.Fprintln(fs.Output(), windowsHelp())
 	fmt.Fprintf(fs.Output(), "--element: только окно %s, каждый элемент целиком в <id>.png (без id - el-<n>.png), без проверок раскладки.\n", elementViewport.name())
-	fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, значок не выровнен с текстом или нет разметки Gazette; подробности в stderr.")
+	fmt.Fprintln(fs.Output(), "Код выхода 2 - на каком-то окне горизонтальный скролл, наложение подписей, неверное выравнивание значка, неподходящий шрифт или нет разметки Gazette; подробности в stderr.")
 	fmt.Fprintln(fs.Output(), "Подсказки title= (и <title> в SVG) - предупреждение в stderr с числом и первыми 5, код выхода не меняют: их рисует браузер цветами системы.")
 	fmt.Fprintf(fs.Output(), "Тёмные кадры снимаются при признаках тёмной темы; пузыри проверяются только в выбранной теме (до %d наведений на окно), предупреждения не меняют код выхода.\n", maxHoverCandidates)
 	fmt.Fprintln(fs.Output(), "Открытые shadowRoot проверяются; iframe и закрытые shadowRoot не обходятся.")
