@@ -134,14 +134,78 @@ func run() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("hide-scrollbars", true))...)
+	allocCtx, cancelAlloc := newAllocator(ctx, chromedp.Flag("hide-scrollbars", true))
 	defer cancelAlloc()
 
 	if *selector != "" {
 		return shootElements(allocCtx, target, dir, *selector, moments[len(moments)-1])
 	}
 	return shootViewports(allocCtx, target, dir, moments)
+}
+
+// chromeSocketTail is what Chrome appends to its temp folder for the singleton socket: com.google.Chrome.XXXXXX/
+// SingletonSocket. A unix socket path holds at most 107 bytes, and Chrome exits when its path is longer.
+const (
+	chromeSocketTail = len("/com.google.Chrome.XXXXXX/SingletonSocket")
+	maxSocketPath    = 107
+)
+
+// newAllocator starts Chrome with a temp folder of its own: Chrome and its crash handler leave com.google.Chrome.*
+// folders in TMPDIR on every run. The returned cancel stops Chrome and removes the folder.
+func newAllocator(ctx context.Context, opts ...chromedp.ExecAllocatorOption) (context.Context, func()) {
+	opts = append(chromedp.DefaultExecAllocatorOptions[:], opts...)
+	chromeTmp, err := chromeTempDir()
+	if err != nil { //nolint:fallback-return // Chrome still runs in TMPDIR as before, it only leaves its folders there; the warning says so
+		fmt.Fprintf(os.Stderr, "page-shot: временная папка Chrome: %v; Chrome пишет прямо в TMPDIR\n", err)
+	} else {
+		opts = append(opts, chromedp.Env("TMPDIR="+chromeTmp))
+	}
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
+	return allocCtx, func() {
+		cancelAlloc() // waits for the main Chrome process to exit
+		if chromeTmp != "" {
+			removeChromeTmp(chromeTmp)
+		}
+	}
+}
+
+// shortTmpRoot holds the temp folder of Chrome when TMPDIR is too long for it.
+var shortTmpRoot = "/tmp"
+
+// chromeTempDir makes the temp folder of Chrome under TMPDIR, or under shortTmpRoot when the singleton socket path
+// under TMPDIR would be too long.
+func chromeTempDir() (string, error) {
+	var last error
+	for _, root := range []string{os.TempDir(), shortTmpRoot} {
+		dir, err := os.MkdirTemp(root, "pshot")
+		if err != nil {
+			last = err
+			continue
+		}
+		if len(dir)+chromeSocketTail <= maxSocketPath {
+			return dir, nil
+		}
+		removeChromeTmp(dir)
+		last = fmt.Errorf("путь сокета Chrome под %s — %d байт, предел %d", root, len(dir)+chromeSocketTail, maxSocketPath)
+	}
+	return "", last
+}
+
+// removeChromeTmp removes the temp folder of Chrome. The crash handler can still write into it for a moment after
+// Chrome exits, so a failed removal is retried for up to 5 s, then reported.
+func removeChromeTmp(dir string) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := os.RemoveAll(dir)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "page-shot: не удалена временная папка Chrome %s: %v\n", dir, err)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // shootViewports снимает страницу на всех окнах и собирает находки раскладки в одну ошибку.

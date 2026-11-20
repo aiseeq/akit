@@ -53,7 +53,7 @@ func startSharedTestBrowser() {
 	} else {
 		base, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		sharedRootCancel = cancel
-		sharedTestAllocator, sharedAllocCancel = chromedp.NewExecAllocator(base, append(chromedp.DefaultExecAllocatorOptions[:], chromedp.ExecPath(chrome), chromedp.NoSandbox)...)
+		sharedTestAllocator, sharedAllocCancel = newAllocator(base, chromedp.ExecPath(chrome), chromedp.NoSandbox)
 		sharedTestBrowser, sharedTestCancel = chromedp.NewContext(sharedTestAllocator)
 		if err := chromedp.Do(sharedTestBrowser); err != nil {
 			sharedChromeErr = fmt.Errorf("запустить Chrome: %w", err)
