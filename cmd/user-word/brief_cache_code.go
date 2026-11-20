@@ -1,0 +1,3 @@
+package main
+
+const briefCacheCode = "230452a3b4d0e1c4221c965b744fa18a81f55c2f3656a66dfdfa7dd31ebd2454"

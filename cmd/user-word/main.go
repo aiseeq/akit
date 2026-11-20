@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+
+	"github.com/aiseeq/akit/transcript/replycache"
 )
 
 const usage = `user-word — the user's own words from another session's transcript, around a fragment.
@@ -84,13 +86,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "user-word: %v\n", err)
 		os.Exit(exitUsage)
 	}
-	os.Exit(run(opts, env{home: home, loc: time.Local}, os.Stdout, os.Stderr))
+	cache := replycache.NewForCode(briefCacheCode)
+	cache.Cleanup(time.Now())
+	os.Exit(run(opts, env{home: home, loc: time.Local, replyCache: cache}, os.Stdout, os.Stderr))
 }
 
 // env — то, что user-word берёт из окружения; в тестах подменяется.
 type env struct {
-	home string
-	loc  *time.Location
+	home       string
+	loc        *time.Location
+	replyCache *replycache.Cache
 }
 
 var dateArg = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)

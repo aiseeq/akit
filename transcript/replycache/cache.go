@@ -8,11 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -20,13 +21,16 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-const version = 1
+const version = 3
 const maxEntry = 256 << 20
 const maxCache = 512 << 20
 const maxAge = 30 * 24 * time.Hour
 const liveAge = 10 * time.Minute
 const privateMode = 0700
 const otherPermissions = 0077
+
+// RecordBucketSeconds is the width of activity buckets stored with transcript events.
+const RecordBucketSeconds int64 = 15 * 60
 
 var errBadPrefilter = errors.New("bad lines require filtered reading")
 
@@ -38,10 +42,11 @@ type key struct {
 }
 
 type header struct {
-	Key    key
-	Bad    int
-	Length int64
-	Sum    [32]byte
+	Key          key
+	Bad          int
+	CompleteFile bool
+	Length       int64
+	Sum          [32]byte
 }
 
 type event struct {
@@ -49,31 +54,108 @@ type event struct {
 	Zero               bool
 	Line               int
 	Role               transcript.Role
+	Images             int
 	Who, Subtype, Text string
+	Raw, RawDay        string
+	Answer             string
 }
 
 type record struct {
-	Events   []event
-	Name     string
-	Bad      int
-	FirstBad string
+	Events           []event
+	BadLines         []badLine
+	BadCoverageDays  []string
+	RecordBuckets    []int64
+	CompleteFile     bool
+	ActivityComplete bool
+	ActivityCode     string
+	Coverage         []coverageRange
+	BadDays          []string
+	BadGlobal        bool
+	Name             string
+	Bad              int
+	FirstBad         string
 }
 
-// Cache is safe for concurrent use. Misses counts original transcript reads.
-type Cache struct {
-	root, dir string
-	Misses    atomic.Int64
+type badLine struct {
+	Nano    int64
+	Zero    bool
+	Day     string
+	Line    int
+	Message string
 }
+
+// Snapshot binds a cached event record to the source file state observed before scanning.
+type Snapshot struct {
+	key    key
+	Reason string
+}
+
+// CachedTranscript is the query-independent content cached for one transcript.
+type CachedTranscript struct {
+	Events           []transcript.Event
+	BadLines         []BadLine
+	BadCoverageDays  []string
+	RawDays          []string
+	Meta             transcript.Meta
+	RecordBuckets    []int64
+	ActivityComplete bool
+	Coverage         []CoverageRange
+	BadDays          []string
+	BadGlobal        bool
+}
+
+// BadLine describes a malformed source record captured during a covered scan.
+type BadLine struct {
+	Time    time.Time
+	Day     string
+	Line    int
+	Message string
+}
+
+type coverageRange struct{ From, Until int64 }
+
+// CoverageRange is one contiguous time interval represented by a file record.
+type CoverageRange struct{ From, Until time.Time }
+
+// Covers reports whether the stored file scan includes the requested time interval.
+func (c CachedTranscript) Covers(from, until time.Time) bool {
+	if !c.ActivityComplete {
+		return false
+	}
+	for _, interval := range c.Coverage {
+		if !from.Before(interval.From) && !until.After(interval.Until) {
+			return true
+		}
+	}
+	return false
+}
+
+// Cache is safe for concurrent use. Misses counts original transcript reads;
+// Issues counts cache failures that fall back to original transcript reads.
+type Cache struct {
+	root, dir    string
+	activityCode string
+	Misses       atomic.Int64
+	Issues       atomic.Int64 // cache failures which fall back to original transcript reads
+	lastIssue    atomic.Pointer[cacheIssue]
+}
+
+type cacheIssue struct{ message string }
 
 // New uses the standard user cache directory. An unavailable cache is harmless.
 func New() *Cache {
+	return NewForCode("")
+}
+
+// NewForCode binds query-independent activity data to its producer's parser version.
+func NewForCode(activityCode string) *Cache {
 	root, err := os.UserCacheDir()
 	if err != nil { //nolint:silent-error-handling // Без каталога кэша потребитель читает оригинал.
 		return &Cache{}
 	}
 	root = filepath.Join(root, "akit", "transcript-replies")
 	code := cacheCode + "-" + runtime.Version() + "-" + runtime.GOOS + "-" + runtime.GOARCH
-	return &Cache{root: root, dir: filepath.Join(root, code)}
+	return &Cache{root: root, dir: filepath.Join(root, code), activityCode: activityCode}
 }
 
 func fileKey(path string) (key, error) {
@@ -81,6 +163,10 @@ func fileKey(path string) (key, error) {
 	if err != nil {
 		return key{}, fmt.Errorf("stat transcript: %w", err)
 	}
+	return fileKeyFromInfo(path, info)
+}
+
+func fileKeyFromInfo(path string, info os.FileInfo) (key, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.Mode().IsRegular() {
 		return key{}, errors.New("not a regular file")
@@ -91,6 +177,83 @@ func fileKey(path string) (key, error) {
 func (c *Cache) path(path string) string {
 	sum := sha256.Sum256([]byte(path))
 	return filepath.Join(c.dir, hex.EncodeToString(sum[:])+".gob")
+}
+
+// Snapshot captures the source identity before a scan.
+func (c *Cache) Snapshot(path string) Snapshot {
+	k, err := fileKey(path)
+	if err != nil {
+		return Snapshot{Reason: fmt.Sprintf("snapshot source: %v", err)}
+	}
+	return Snapshot{key: k}
+}
+
+// SnapshotFile binds a scan to the identity of the already-open source file.
+// A later store still checks the path identity, so replacement during the scan
+// prevents publishing events from the old file under the new path.
+func (c *Cache) SnapshotFile(path string, info os.FileInfo) Snapshot {
+	k, err := fileKeyFromInfo(path, info)
+	if err != nil {
+		return Snapshot{Reason: fmt.Sprintf("snapshot source: %v", err)}
+	}
+	return Snapshot{key: k}
+}
+
+// NoteIssue accounts for a cache error which the caller deliberately treats as
+// a miss, preserving the normal transcript-reading result.
+func (c *Cache) NoteIssue(message string) {
+	if c != nil {
+		c.lastIssue.Store(&cacheIssue{message: message})
+		c.Issues.Add(1)
+	}
+}
+
+// LastIssue returns the most recent cache failure retained for diagnostics.
+func (c *Cache) LastIssue() string {
+	if c == nil {
+		return ""
+	}
+	issue := c.lastIssue.Load()
+	if issue == nil {
+		return ""
+	}
+	return issue.message
+}
+
+// Available reports whether the cache directory is private and can accept a file.
+func (c *Cache) Available() bool {
+	return c.writable()
+}
+
+// HasEntries reports whether the current cache directory contains any transcript records.
+// Callers can skip one cache lookup per source file when a newly created cache is empty.
+func (c *Cache) HasEntries() bool {
+	if c == nil || c.dir == "" {
+		return false
+	}
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".gob") {
+			return true
+		}
+	}
+	return false
+}
+
+func compactInt64(values []int64) []int64 {
+	if len(values) < 2 {
+		return values
+	}
+	out := values[:1]
+	for _, v := range values[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func privateDir(path string) bool {
@@ -106,6 +269,11 @@ func (c *Cache) open(path string, rejectBad bool) (*os.File, *gob.Decoder, heade
 	if c == nil || c.dir == "" || !privateDir(c.dir) {
 		return nil, nil, header{}, errors.New("no cache")
 	}
+	cachePath := c.path(path)
+	info, err := os.Lstat(cachePath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&otherPermissions != 0 {
+		return nil, nil, header{}, errors.New("unsafe cache entry")
+	}
 	k, err := fileKey(path)
 	if err != nil {
 		return nil, nil, header{}, err
@@ -116,11 +284,7 @@ func (c *Cache) open(path string, rejectBad bool) (*os.File, *gob.Decoder, heade
 		return nil, nil, header{}, fmt.Errorf("open transcript: %w", err)
 	}
 	original.Close()
-	info, err := os.Lstat(c.path(path))
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&otherPermissions != 0 {
-		return nil, nil, header{}, errors.New("unsafe cache entry")
-	}
-	f, err := os.Open(c.path(path))
+	f, err := os.Open(cachePath)
 	if err != nil {
 		return nil, nil, header{}, fmt.Errorf("open cache entry: %w", err)
 	}
@@ -162,38 +326,258 @@ func (c *Cache) Valid(path string, rejectBad bool) bool {
 	if rejectBad && recentlyModified(path) {
 		return false
 	}
-	f, _, _, err := c.open(path, rejectBad)
+	f, _, h, err := c.open(path, rejectBad)
 	if err != nil {
 		return false
 	}
 	f.Close()
-	return true
+	return h.CompleteFile
 }
 
-func (c *Cache) load(path string, rejectBad bool) ([]transcript.Event, transcript.Meta, error) {
+func (c *Cache) loadRecord(path string, rejectBad bool) (record, header, error) {
 	f, dec, h, err := c.open(path, rejectBad)
 	if err != nil {
-		return nil, transcript.Meta{}, err
+		return record{}, header{}, err
 	}
 	defer f.Close()
 	var payload []byte
 	if err := dec.Decode(&payload); err != nil {
-		return nil, transcript.Meta{}, fmt.Errorf("decode cache: %w", err)
+		return record{}, header{}, fmt.Errorf("decode cache: %w", err)
 	}
 	if int64(len(payload)) != h.Length || sha256.Sum256(payload) != h.Sum {
-		return nil, transcript.Meta{}, errors.New("invalid cache checksum")
+		return record{}, header{}, errors.New("invalid cache checksum")
 	}
 	var rec record
 	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&rec); err != nil {
-		return nil, transcript.Meta{}, fmt.Errorf("decode cache payload: %w", err)
+		return record{}, header{}, fmt.Errorf("decode cache payload: %w", err)
 	}
-	if rec.Bad != h.Bad {
-		return nil, transcript.Meta{}, errors.New("invalid cache diagnostics")
+	if rec.Bad != h.Bad || rec.CompleteFile != h.CompleteFile {
+		return record{}, header{}, errors.New("invalid cache diagnostics")
+	}
+	if !validCoverage(rec.Coverage) {
+		return record{}, header{}, errors.New("invalid cache coverage")
 	}
 	if k, err := fileKey(path); err != nil || k != h.Key {
-		return nil, transcript.Meta{}, errors.New("transcript changed")
+		return record{}, header{}, errors.New("transcript changed")
 	}
-	return unpack(rec), meta(rec), nil
+	return rec, h, nil
+}
+
+func validCoverage(ranges []coverageRange) bool {
+	for i, current := range ranges {
+		if current.Until < current.From {
+			return false
+		}
+		if i > 0 && current.From <= ranges[i-1].Until {
+			return false
+		}
+	}
+	return true
+}
+
+// CachedEvents reads a query-independent event record without populating a missing cache.
+func (c *Cache) CachedEvents(path string) (CachedTranscript, bool, error) {
+	rec, _, err := c.loadRecord(path, false)
+	if err != nil {
+		return CachedTranscript{}, false, err
+	}
+	coverage := make([]CoverageRange, 0, len(rec.Coverage))
+	for _, interval := range rec.Coverage {
+		coverage = append(coverage, CoverageRange{From: time.Unix(0, interval.From).UTC(), Until: time.Unix(0, interval.Until).UTC()})
+	}
+	rawDays := make([]string, len(rec.Events))
+	for i := range rec.Events {
+		rawDays[i] = rec.Events[i].RawDay
+	}
+	return CachedTranscript{
+		Events:           unpackRaw(rec),
+		BadLines:         unpackBadLines(rec.BadLines),
+		BadCoverageDays:  slices.Clone(rec.BadCoverageDays),
+		RawDays:          rawDays,
+		Meta:             meta(rec),
+		RecordBuckets:    rec.RecordBuckets,
+		ActivityComplete: rec.ActivityComplete && rec.ActivityCode == c.activityCode,
+		Coverage:         coverage,
+		BadDays:          slices.Clone(rec.BadDays),
+		BadGlobal:        rec.BadGlobal,
+	}, true, nil
+}
+
+// StoreEvents publishes query-independent user and ask events plus record-time buckets.
+func (c *Cache) StoreEvents(path string, snapshot Snapshot, events []transcript.Event, buckets []int64, badDays []string, badGlobal bool, from, until time.Time, m transcript.Meta) string {
+	return c.StoreEventsWithBadLines(path, snapshot, events, buckets, badDays, badGlobal, nil, nil, from, until, m)
+}
+
+// StoreEventsWithBadLines adds query-filtered malformed-line details and the raw days
+// for which those details are complete. Query callers still decide relevance at read time.
+func (c *Cache) StoreEventsWithBadLines(path string, snapshot Snapshot, events []transcript.Event, buckets []int64, badDays []string, badGlobal bool, badLines []BadLine, badCoverageDays []string, from, until time.Time, m transcript.Meta) string {
+	return c.StoreEventsWithBadLinesFromLookup(path, snapshot, events, buckets, badDays, badGlobal, badLines, badCoverageDays, from, until, m, true)
+}
+
+// StoreEventsWithBadLinesFromLookup merges an existing record only when the caller
+// successfully loaded one before scanning. This avoids reopening the source and
+// probing the cache a second time on a cold miss.
+func (c *Cache) StoreEventsWithBadLinesFromLookup(path string, snapshot Snapshot, events []transcript.Event, buckets []int64, badDays []string, badGlobal bool, badLines []BadLine, badCoverageDays []string, from, until time.Time, m transcript.Meta, mergeExisting bool) string {
+	if snapshot.Reason != "" {
+		return snapshot.Reason
+	}
+	if c == nil || c.dir == "" || snapshot.key.Path != path {
+		return "event cache unavailable or source mismatch"
+	}
+	current, err := fileKey(path)
+	if err != nil {
+		return fmt.Sprintf("restat source before event cache write: %v", err)
+	}
+	if current != snapshot.key {
+		return "source changed before event cache write"
+	}
+	rec := record{
+		ActivityComplete: true, ActivityCode: c.activityCode, Name: m.Name, Bad: m.Bad,
+		Events: packEvents(events), Coverage: []coverageRange{{From: from.UnixNano(), Until: until.UnixNano()}},
+		BadDays: compactStrings(slices.Clone(badDays)), BadGlobal: badGlobal,
+		BadLines: packBadLines(badLines), BadCoverageDays: compactStrings(slices.Clone(badCoverageDays)),
+	}
+	if m.FirstBad != nil {
+		rec.FirstBad = m.FirstBad.Error()
+	}
+	var old record
+	oldLoaded := false
+	if mergeExisting {
+		var err error
+		old, _, err = c.loadRecord(path, false)
+		oldLoaded = err == nil
+	}
+	if oldLoaded && old.ActivityComplete && old.ActivityCode == c.activityCode {
+		rec.Events = mergeEvents(old.Events, rec.Events)
+		rec.RecordBuckets = append(old.RecordBuckets, buckets...)
+		rec.Bad = max(rec.Bad, old.Bad)
+		rec.BadDays = mergeStrings(old.BadDays, rec.BadDays)
+		rec.BadLines = mergeBadLines(old.BadLines, rec.BadLines)
+		rec.BadCoverageDays = mergeStrings(old.BadCoverageDays, rec.BadCoverageDays)
+		rec.BadGlobal = rec.BadGlobal || old.BadGlobal
+		if rec.FirstBad == "" {
+			rec.FirstBad = old.FirstBad
+		}
+		rec.Name = firstNonEmpty(rec.Name, old.Name)
+		rec.Coverage = mergeCoverage(old.Coverage, rec.Coverage)
+	} else {
+		rec.RecordBuckets = buckets
+	}
+	slices.Sort(rec.RecordBuckets)
+	rec.RecordBuckets = compactInt64(rec.RecordBuckets)
+	c.save(snapshot.key, rec)
+	return ""
+}
+
+func packBadLines(lines []BadLine) []badLine {
+	out := make([]badLine, 0, len(lines))
+	for _, item := range lines {
+		stored := badLine{Day: item.Day, Line: item.Line, Message: item.Message}
+		if item.Time.IsZero() {
+			stored.Zero = true
+		} else {
+			stored.Nano = item.Time.UnixNano()
+		}
+		out = append(out, stored)
+	}
+	return mergeBadLines(nil, out)
+}
+
+func unpackBadLines(lines []badLine) []BadLine {
+	out := make([]BadLine, 0, len(lines))
+	for _, item := range lines {
+		stamp := time.Time{}
+		if !item.Zero {
+			stamp = time.Unix(0, item.Nano).UTC()
+		}
+		out = append(out, BadLine{Time: stamp, Day: item.Day, Line: item.Line, Message: item.Message})
+	}
+	return out
+}
+
+func mergeBadLines(old, current []badLine) []badLine {
+	seen := make(map[badLine]bool, len(old)+len(current))
+	out := make([]badLine, 0, len(old)+len(current))
+	for _, list := range [][]badLine{old, current} {
+		for _, item := range list {
+			if seen[item] {
+				continue
+			}
+			seen[item] = true
+			out = append(out, item)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		if out[i].Day != out[j].Day {
+			return out[i].Day < out[j].Day
+		}
+		return out[i].Message < out[j].Message
+	})
+	return out
+}
+
+func mergeCoverage(old, current []coverageRange) []coverageRange {
+	ranges := append(slices.Clone(old), current...)
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].From != ranges[j].From {
+			return ranges[i].From < ranges[j].From
+		}
+		return ranges[i].Until < ranges[j].Until
+	})
+	if len(ranges) < 2 {
+		return ranges
+	}
+	merged := ranges[:1]
+	for _, next := range ranges[1:] {
+		last := &merged[len(merged)-1]
+		if next.From <= last.Until {
+			last.Until = max(last.Until, next.Until)
+			continue
+		}
+		merged = append(merged, next)
+	}
+	return merged
+}
+
+func mergeEvents(old, current []event) []event {
+	seen := make(map[event]bool, len(old)+len(current))
+	merged := make([]event, 0, len(old)+len(current))
+	for _, list := range [][]event{old, current} {
+		for i := range list {
+			item := list[i]
+			if seen[item] {
+				continue
+			}
+			seen[item] = true
+			merged = append(merged, item)
+		}
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Nano != merged[j].Nano {
+			return merged[i].Nano < merged[j].Nano
+		}
+		return merged[i].Line < merged[j].Line
+	})
+	return merged
+}
+
+func firstNonEmpty(first, second string) string {
+	if first != "" {
+		return first
+	}
+	return second
+}
+
+func compactStrings(values []string) []string {
+	slices.Sort(values)
+	return slices.Compact(values)
+}
+
+func mergeStrings(old, current []string) []string {
+	return compactStrings(append(slices.Clone(old), current...))
 }
 
 // Events returns a complete record, or usable=false for bad lines with a query-dependent prefilter.
@@ -202,12 +586,12 @@ func (c *Cache) Events(path string, rejectBad bool) ([]transcript.Event, transcr
 	if rejectBad && recentlyModified(path) {
 		return nil, transcript.Meta{}, false, nil
 	}
-	events, cachedMeta, loadErr := c.load(path, rejectBad)
+	cachedRec, _, loadErr := c.loadRecord(path, rejectBad)
 	if errors.Is(loadErr, errBadPrefilter) {
 		return nil, transcript.Meta{}, false, nil
 	}
-	if loadErr == nil {
-		return events, cachedMeta, true, nil
+	if loadErr == nil && cachedRec.CompleteFile {
+		return unpackDisplayed(cachedRec), meta(cachedRec), true, nil
 	}
 	if c == nil {
 		return nil, transcript.Meta{}, false, errors.New("cache unavailable")
@@ -223,13 +607,14 @@ func (c *Cache) Events(path string, rejectBad bool) ([]transcript.Event, transcr
 	var rec record
 	m, err := transcript.Read(path, nil, func(ev transcript.Event) {
 		if ev.Role == transcript.User || ev.Role == transcript.Ask {
-			rec.Events = append(rec.Events, event{Nano: ev.Time.UnixNano(), Zero: ev.Time.IsZero(), Line: ev.Line, Role: ev.Role, Who: ev.Who, Subtype: ev.Subtype, Text: ev.Shown()})
+			rec.Events = append(rec.Events, packEvent(ev))
 		}
 	})
 	if err != nil {
 		return nil, transcript.Meta{}, false, err
 	}
 	rec.Name, rec.Bad = m.Name, m.Bad
+	rec.CompleteFile = true
 	if m.FirstBad != nil {
 		rec.FirstBad = m.FirstBad.Error()
 	}
@@ -240,23 +625,63 @@ func (c *Cache) Events(path string, rejectBad bool) ([]transcript.Event, transcr
 	if rejectBad && rec.Bad > 0 {
 		return nil, transcript.Meta{}, false, nil
 	}
-	return unpack(rec), meta(rec), true, nil
+	return unpackDisplayed(rec), meta(rec), true, nil
 }
 
-func unpack(rec record) []transcript.Event {
+func unpackRaw(rec record) []transcript.Event {
 	events := make([]transcript.Event, 0, len(rec.Events))
-	for _, ev := range rec.Events {
+	for i := range rec.Events {
+		ev := &rec.Events[i]
 		var at time.Time
 		if !ev.Zero {
 			at = time.Unix(0, ev.Nano).UTC()
 		}
-		// Restore only the display projection: the other Event fields are deliberately absent from the cache.
 		var restored transcript.Event
 		restored.Time, restored.Line, restored.Role = at, ev.Line, ev.Role
 		restored.Who, restored.Subtype, restored.Text = ev.Who, ev.Subtype, ev.Text
+		restored.Answer, restored.Images = ev.Answer, ev.Images
+		if ev.Raw != "" {
+			restored.Raw = []byte(ev.Raw)
+		}
 		events = append(events, restored)
 	}
 	return events
+}
+
+func unpackDisplayed(rec record) []transcript.Event {
+	events := unpackRaw(rec)
+	for i := range events {
+		events[i].Text = events[i].Shown()
+		events[i].Images = 0
+		events[i].Answer = ""
+		events[i].Raw = nil
+	}
+	return events
+}
+
+func packEvents(events []transcript.Event) []event {
+	out := make([]event, 0, len(events))
+	for i := range events {
+		ev := &events[i]
+		if ev.Role != transcript.User && ev.Role != transcript.Ask {
+			continue
+		}
+		out = append(out, packEvent(*ev))
+	}
+	return out
+}
+
+func packEvent(ev transcript.Event) event {
+	raw := string(ev.Raw)
+	rawDay := ""
+	if _, stamp, ok := bytes.Cut(ev.Raw, []byte(`"timestamp":"`)); ok && len(stamp) >= len("2006-01-02") {
+		rawDay = string(stamp[:len("2006-01-02")])
+	}
+	return event{
+		Nano: ev.Time.UnixNano(), Zero: ev.Time.IsZero(), Line: ev.Line, Role: ev.Role,
+		Who: ev.Who, Subtype: ev.Subtype, Text: ev.Text, Answer: ev.Answer, Images: ev.Images,
+		Raw: raw, RawDay: rawDay,
+	}
 }
 
 func meta(rec record) transcript.Meta {
@@ -283,7 +708,7 @@ func (c *Cache) save(k key, rec record) {
 		return
 	}
 	defer os.Remove(f.Name())
-	h := header{Key: k, Bad: rec.Bad, Length: int64(payload.Len()), Sum: sha256.Sum256(payload.Bytes())}
+	h := header{Key: k, Bad: rec.Bad, CompleteFile: rec.CompleteFile, Length: int64(payload.Len()), Sum: sha256.Sum256(payload.Bytes())}
 	enc := gob.NewEncoder(f)
 	err = enc.Encode(h)
 	if err == nil {
@@ -300,9 +725,9 @@ func (c *Cache) save(k key, rec record) {
 // cleanupInfo позволяет проверить ошибку метаданных исчезнувшей записи.
 var cleanupInfo = func(entry os.DirEntry) (os.FileInfo, error) { return entry.Info() }
 
-// Cleanup occasionally removes obsolete entries, other code versions and excess bytes.
+// Cleanup removes obsolete entries, other code versions and excess bytes.
 func (c *Cache) Cleanup(now time.Time) {
-	if c == nil || c.root == "" || now.UnixNano()%1024 != 0 {
+	if c == nil || c.root == "" {
 		return
 	}
 	dirs, err := os.ReadDir(c.root)
@@ -340,6 +765,9 @@ func (c *Cache) Cleanup(now time.Time) {
 			}
 			if now.Sub(info.ModTime()) > maxAge {
 				_ = os.Remove(p) //nolint:ignored-error // Неудалённая запись останется до следующей уборки.
+				continue
+			}
+			if strings.HasPrefix(entry.Name(), ".entry-") || strings.HasPrefix(entry.Name(), ".probe-") {
 				continue
 			}
 			f, err := os.Open(p)
