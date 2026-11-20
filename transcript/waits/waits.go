@@ -194,11 +194,7 @@ func (r *Recognizer) endPolls() []Wait {
 	for _, sid := range slices.Sorted(maps.Keys(r.polls)) {
 		p := r.polls[sid]
 		delete(r.polls, sid)
-		for id, q := range r.byCall {
-			if q == p {
-				delete(r.byCall, id)
-			}
-		}
+		r.forget(p)
 		ps = append(ps, p)
 	}
 	return finishAll(ps)
@@ -219,12 +215,17 @@ func (r *Recognizer) breakChain() []Wait {
 	if p == nil {
 		return nil
 	}
+	r.forget(p) // вывода не дождались, а агент уже делает другое
+	return []Wait{finish(p)}
+}
+
+// forget — ожидание закончено: вывод его вызовов больше ничего не меняет.
+func (r *Recognizer) forget(p *pending) {
 	for id, q := range r.byCall {
 		if q == p {
-			delete(r.byCall, id) // вывода не дождались, а агент уже делает другое
+			delete(r.byCall, id)
 		}
 	}
-	return []Wait{finish(p)}
 }
 
 func (r *Recognizer) cmd(ev transcript.Event) []Wait {
@@ -266,6 +267,7 @@ func (r *Recognizer) cmd(ev transcript.Event) []Wait {
 		r.sends = append(r.sends, p)
 	case how == Wakeup:
 		if r.wakeup != nil {
+			r.forget(r.wakeup) // новое пробуждение заменило прежнее: оно закончено и в Close не повторится
 			done = append(done, finish(r.wakeup))
 		}
 		r.wakeup = p

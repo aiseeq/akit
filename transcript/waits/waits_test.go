@@ -545,3 +545,25 @@ func TestCommandHow(t *testing.T) {
 		}
 	}
 }
+
+func TestWakeupReplacedBeforeOutputCountsOnce(t *testing.T) {
+	for _, n := range []int{2, 3} {
+		t.Run(fmt.Sprintf("%d wakeups", n), func(t *testing.T) {
+			s := newEvents()
+			var ids []string
+			for i := range n {
+				ids = append(ids, s.tool("ScheduleWakeup", "60s", map[string]int{"delaySeconds": 60}, i))
+			}
+			s.out(ids[0], "scheduled", n) // a late output of the replaced wakeup changes nothing
+			got := s.run()
+			if len(got) != n {
+				t.Fatalf("waits = %d, want %d: %+v", len(got), n, got)
+			}
+			for i, w := range got {
+				if w.How != Wakeup || len(w.CallIDs) != 1 || w.CallIDs[0] != ids[i] {
+					t.Fatalf("wait %d = %s %v, want wakeup %s", i, w.How, w.CallIDs, ids[i])
+				}
+			}
+		})
+	}
+}
