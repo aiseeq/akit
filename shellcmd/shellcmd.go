@@ -9912,36 +9912,37 @@ func shortGroupExitsWithoutCommand(name, arg string) bool {
 }
 
 func wrapperStart(name string, args []string) int {
-	if name == "command" {
-		return commandTargetStart(args)
-	}
-	i := wrapperOptionEnd(name, args, 0)
 	switch name {
-	case "prlimit":
-		if hasOption(name, args, "-p", "--pid") {
-			return len(args)
-		}
-	case "chroot":
-		if i < len(args) {
-			i++ // NEWROOT
-		}
+	case "command":
+		return commandTargetStart(args)
 	case "setarch":
-		i = 0
-		if i < len(args) && args[i] != "--" && !strings.HasPrefix(args[i], "-") {
-			i++ // optional architecture
-		}
-		i = wrapperOptionEnd(name, args, i)
-	case "linux32", "linux64", "i386", "x86_64", "uname26":
-		i = wrapperOptionEnd(name, args, 0)
-	case "taskset":
+		return setarchStart(args)
+	case "prlimit", "taskset":
 		if hasOption(name, args, "-p", "--pid") {
 			return len(args)
 		}
-		if i < len(args) && (!hasOption(name, args, "-c", "--cpu-list") || tasksetHasSeparateCPUList(args[:i])) {
-			i++
-		}
-	case "flock":
+	}
+	return wrapperOperandEnd(name, args, wrapperOptionEnd(name, args, 0))
+}
+
+// setarchStart skips the optional architecture operand, then the options.
+func setarchStart(args []string) int {
+	i := 0
+	if i < len(args) && args[i] != "--" && !strings.HasPrefix(args[i], "-") {
+		i++ // optional architecture
+	}
+	return wrapperOptionEnd("setarch", args, i)
+}
+
+// wrapperOperandEnd skips the operands a wrapper takes before its command.
+func wrapperOperandEnd(name string, args []string, i int) int {
+	switch name {
+	case "chroot", "flock":
 		if i < len(args) {
+			i++ // NEWROOT, or the lock file
+		}
+	case "taskset":
+		if i < len(args) && (!hasOption(name, args, "-c", "--cpu-list") || tasksetHasSeparateCPUList(args[:i])) {
 			i++
 		}
 	case "chrt":
