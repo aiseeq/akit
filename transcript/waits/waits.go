@@ -82,6 +82,7 @@ type pending struct {
 // Recognizer — распознаватель одного файла.
 type Recognizer struct {
 	cur      *pending            // ожидание переднего плана, к которому может прийти повтор
+	lastTime time.Time           // наибольшая метка обработанного события: queued-событие доставлено не раньше неё
 	byCall   map[string]*pending // вызовы, ждущие вывода
 	bg       map[string]*pending // ждут task-notification, по id вызова
 	sends    []*pending
@@ -104,6 +105,14 @@ func New() *Recognizer {
 
 // Add принимает событие и отдаёт ожидания, которые им закончились.
 func (r *Recognizer) Add(ev transcript.Event) []Wait {
+	done := r.add(ev)
+	if ev.Time.After(r.lastTime) {
+		r.lastTime = ev.Time
+	}
+	return done
+}
+
+func (r *Recognizer) add(ev transcript.Event) []Wait {
 	switch ev.Role {
 	case transcript.Cmd:
 		return r.cmd(ev)
@@ -476,7 +485,7 @@ func (r *Recognizer) replied(ev transcript.Event) []Wait {
 		if to == "" || to != ev.From && name != ev.Who {
 			return false
 		}
-		p.w.End, p.w.Outcome = ev.Time, Done
+		p.w.End, p.w.Outcome = r.endTime(ev, p), Done
 		done = append(done, finish(p))
 		return true
 	})
@@ -490,8 +499,21 @@ func (r *Recognizer) wake(ev transcript.Event) []Wait {
 		return nil
 	}
 	r.wakeup = nil
-	p.w.End, p.w.Outcome = ev.Time, Done
+	p.w.End, p.w.Outcome = r.endTime(ev, p), Done
 	return []Wait{finish(p)}
+}
+
+// endTime preserves the first closing event. A queued message's timestamp is when it was written, so its delivery
+// cannot predate the latest event already read from the transcript or the wait's start.
+func (r *Recognizer) endTime(ev transcript.Event, p *pending) time.Time {
+	if ev.Time.Before(p.w.Start) {
+		end := p.w.Start
+		if r.lastTime.After(end) {
+			end = r.lastTime
+		}
+		return end
+	}
+	return ev.Time
 }
 
 // shells — инструменты, которые запускают команду: Bash у Claude, у codex — exec и старые вызовы.

@@ -11,11 +11,12 @@ import (
 	"time"
 )
 
-const snapshotVersion = 1
+const snapshotVersion = 2
 
 // snapshot stores each pending wait once and represents shared pointers by index.
 type snapshot struct {
 	Version    int                `json:"version"`
+	LastTime   time.Time          `json:"last_time"`
 	Pending    []*pendingSnapshot `json:"pending"`
 	Cur        *int               `json:"cur"`
 	ByCall     map[string]int     `json:"by_call"`
@@ -60,7 +61,7 @@ func (r *Recognizer) MarshalJSON() ([]byte, error) {
 	ids := make(map[*pending]int, len(ps))
 	st := snapshot{Version: snapshotVersion, Pending: make([]*pendingSnapshot, len(ps)),
 		ByCall: make(map[string]int, len(r.byCall)), BG: make(map[string]int, len(r.bg)), Sends: make([]int, 0, len(r.sends)),
-		Tasks: maps.Clone(r.tasks), Polls: make(map[string]int, len(r.polls)),
+		LastTime: r.lastTime, Tasks: maps.Clone(r.tasks), Polls: make(map[string]int, len(r.polls)),
 		ShellText: maps.Clone(r.shellText), SessionCmd: maps.Clone(r.sessionCmd), PrevCmd: r.prevCmd}
 	for i, p := range ps {
 		ids[p] = i
@@ -199,7 +200,7 @@ func restoreSnapshot(st snapshot) (Recognizer, error) {
 		return Recognizer{}, err
 	}
 
-	r := Recognizer{cur: cur, byCall: byCall, bg: bg, sends: sends, wakeup: wakeup, tokensTo: tokensTo,
+	r := Recognizer{cur: cur, lastTime: st.LastTime, byCall: byCall, bg: bg, sends: sends, wakeup: wakeup, tokensTo: tokensTo,
 		tasks: maps.Clone(st.Tasks), polls: polls, shellText: maps.Clone(st.ShellText),
 		sessionCmd: maps.Clone(st.SessionCmd), prevCmd: st.PrevCmd}
 	if r.tasks == nil {

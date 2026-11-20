@@ -37,6 +37,30 @@ func snapshotResumeAt(t *testing.T, s *events, cut int) []Wait {
 }
 
 func TestSnapshotPreservesRecognitionDetails(t *testing.T) {
+	t.Run("queued delivery time", func(t *testing.T) {
+		s := newEvents()
+		wake := s.tool("ScheduleWakeup", "1200s", map[string]int{"delaySeconds": 1200}, 2)
+		s.out(wake, "scheduled", 3)
+		s.add(transcript.Event{Role: transcript.User, Queued: true}, 1)
+
+		r := New()
+		for _, ev := range s.evs[:2] {
+			r.Add(ev)
+		}
+		data, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r = New()
+		if err := json.Unmarshal(data, r); err != nil {
+			t.Fatal(err)
+		}
+		got := one(t, r.Add(s.evs[2]))
+		if !got.End.Equal(s.evs[1].Time) {
+			t.Fatalf("время доставки queued после восстановления = %s, ждали %s", got.End, s.evs[1].Time)
+		}
+	})
+
 	t.Run("repeat call time", func(t *testing.T) {
 		s := newEvents()
 		cmd := `timeout 60 bash -c 'until [ -f /t/x ]; do sleep 5; done'`
@@ -163,7 +187,7 @@ func TestSnapshotOpenStatesSortsMapBackedWaits(t *testing.T) {
 }
 
 func TestSnapshotNullMapsAndRepliesCannotPanic(t *testing.T) {
-	const emptyMaps = `{"version":1,"by_call":null,"bg":null,"polls":null,"tasks":null,"shell_text":null,"session_cmd":null,"sends":null,"cur":-1,"wakeup":-1,"tokens_to":-1}`
+	const emptyMaps = `{"version":2,"by_call":null,"bg":null,"polls":null,"tasks":null,"shell_text":null,"session_cmd":null,"sends":null,"cur":-1,"wakeup":-1,"tokens_to":-1}`
 	r := New()
 	if err := json.Unmarshal([]byte(emptyMaps), r); err != nil {
 		t.Fatal(err)
@@ -181,7 +205,7 @@ func TestSnapshotNullMapsAndRepliesCannotPanic(t *testing.T) {
 	}
 	r.Close()
 
-	const nullReplies = `{"version":1,"pending":[{"wait":{"How":"sleep","Calls":1,"Line":1,"CallIDs":["a"]},"replies":null}],"cur":0,"wakeup":-1,"tokens_to":-1}`
+	const nullReplies = `{"version":2,"pending":[{"wait":{"How":"sleep","Calls":1,"Line":1,"CallIDs":["a"]},"replies":null}],"cur":0,"wakeup":-1,"tokens_to":-1}`
 	r = New()
 	if err := json.Unmarshal([]byte(nullReplies), r); err != nil {
 		t.Fatal(err)

@@ -255,6 +255,79 @@ func TestSendAndWakeup(t *testing.T) {
 	}
 }
 
+func TestSendQueuedPeerClosesAtDelivery(t *testing.T) {
+	s := newEvents()
+	s.tool("SendMessage", "→ recipient: hello", map[string]string{"to": "recipient"}, 2)
+	s.add(transcript.Event{Role: transcript.Peer, Who: "recipient", From: "recipient", Queued: true}, 1)
+
+	r := New()
+	var got []Wait
+	for _, ev := range s.evs {
+		got = r.Add(ev)
+		if ev.Queued {
+			break
+		}
+	}
+	w := one(t, got)
+	if w.How != Send || w.Outcome != Done || w.End.Before(w.Start) || !w.End.Equal(w.Start) {
+		t.Errorf("первый queued-ответ закрывает письмо по времени доставки: %+v", w)
+	}
+}
+
+func TestWakeupQueuedMessageClosesAtDelivery(t *testing.T) {
+	s := newEvents()
+	w := s.tool("ScheduleWakeup", "1200s", map[string]int{"delaySeconds": 1200}, 2)
+	s.out(w, "scheduled", 2)
+	s.add(transcript.Event{Role: transcript.User, Queued: true}, 1)
+
+	r := New()
+	var got []Wait
+	for _, ev := range s.evs {
+		got = r.Add(ev)
+		if ev.Queued {
+			break
+		}
+	}
+	wait := one(t, got)
+	if wait.How != Wakeup || wait.Outcome != Done || wait.End.Before(wait.Start) || !wait.End.Equal(wait.Start) {
+		t.Errorf("первое queued-сообщение закрывает пробуждение по времени доставки: %+v", wait)
+	}
+}
+
+func TestWakeupEarlyUnqueuedEventClosesAtObservedTime(t *testing.T) {
+	s := newEvents()
+	w := s.tool("ScheduleWakeup", "1200s", map[string]int{"delaySeconds": 1200}, 2)
+	s.out(w, "scheduled", 4)
+	s.add(transcript.Event{Role: transcript.User}, 1)
+
+	r := New()
+	var got []Wait
+	for _, ev := range s.evs {
+		got = append(got, r.Add(ev)...)
+	}
+	wait := one(t, got)
+	if wait.How != Wakeup || wait.Outcome != Done || !wait.End.Equal(s.evs[1].Time) {
+		t.Errorf("обычное раннее событие закрывает ожидание по последней метке: %+v", wait)
+	}
+}
+
+func TestWakeupQueuedTimestampAfterStartIsPreserved(t *testing.T) {
+	s := newEvents()
+	w := s.tool("ScheduleWakeup", "1200s", map[string]int{"delaySeconds": 1200}, 2)
+	s.out(w, "scheduled", 4)
+	s.add(transcript.Event{Role: transcript.User, Queued: true}, 3)
+
+	r := New()
+	var got []Wait
+	for _, ev := range s.evs {
+		got = append(got, r.Add(ev)...)
+	}
+	wait := one(t, got)
+	if wait.How != Wakeup || wait.Outcome != Done || !wait.End.Equal(s.evs[2].Time) {
+		t.Errorf("queued-метка после Start остаётся End даже если предыдущее событие позже: %+v", wait)
+	}
+}
+
 // Open — строка самого раннего незаконченного; после конца — нет; Close отдаёт незаконченные с исходом none.
 func TestOpenClose(t *testing.T) {
 	s := newEvents()
@@ -371,21 +444,21 @@ func TestSnapshotAtEveryEventBoundary(t *testing.T) {
 
 func TestSnapshotRejectsInvalidJSON(t *testing.T) {
 	for _, data := range []string{
-		"{", "{}", `{"version":2,"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		"{", "{}", `{"version":3,"cur":-1,"wakeup":-1,"tokens_to":-1}`,
 		`{"version":0,"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"cur":-1,"wakeup":-1,"tokens_to":-1,"unknown":true}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]},"unknown":true}],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":9,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"by_call":{"x":1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-2,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-1,"wakeup":1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-1,"wakeup":-1,"tokens_to":1}`,
-		`{"version":1,"pending":[null],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":[]}}],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"by_call":{"x":-1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"sends":[-1],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
-		`{"version":1,"pending":[{"wait":{"CallIDs":["c1"]}}],"bg":{"x":-1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"cur":-1,"wakeup":-1,"tokens_to":-1,"unknown":true}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]},"unknown":true}],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":9,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"by_call":{"x":1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-2,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-1,"wakeup":1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"cur":-1,"wakeup":-1,"tokens_to":1}`,
+		`{"version":2,"pending":[null],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":[]}}],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"by_call":{"x":-1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"sends":[-1],"cur":-1,"wakeup":-1,"tokens_to":-1}`,
+		`{"version":2,"pending":[{"wait":{"CallIDs":["c1"]}}],"bg":{"x":-1},"cur":-1,"wakeup":-1,"tokens_to":-1}`,
 	} {
 		t.Run(data, func(t *testing.T) {
 			defer func() {
@@ -403,7 +476,7 @@ func TestSnapshotRejectsInvalidJSON(t *testing.T) {
 func TestSnapshotRequiresEachPrimaryReference(t *testing.T) {
 	for _, field := range []string{"cur", "wakeup", "tokens_to"} {
 		t.Run(field, func(t *testing.T) {
-			data := map[string]any{"version": 1, "cur": -1, "wakeup": -1, "tokens_to": -1}
+			data := map[string]any{"version": 2, "cur": -1, "wakeup": -1, "tokens_to": -1}
 			delete(data, field)
 			encoded, err := json.Marshal(data)
 			if err != nil {
@@ -426,7 +499,7 @@ func TestSnapshotUnmarshalReplaceAndFailureAreAtomic(t *testing.T) {
 	if err := r.UnmarshalJSON([]byte("{")); err == nil {
 		t.Fatal("битый JSON принят")
 	}
-	for _, bad := range []string{`{"version":1,"cur":9,"wakeup":-1,"tokens_to":-1}`} {
+	for _, bad := range []string{`{"version":2,"cur":9,"wakeup":-1,"tokens_to":-1}`} {
 		if err := json.Unmarshal([]byte(bad), r); err == nil {
 			t.Fatalf("неверный снимок принят: %s", bad)
 		}
@@ -438,11 +511,18 @@ func TestSnapshotUnmarshalReplaceAndFailureAreAtomic(t *testing.T) {
 			t.Fatalf("неудачный Unmarshal изменил состояние:\nдо %s\nпосле %s", before, after)
 		}
 	}
-	if err := json.Unmarshal([]byte(`{"version":1,"cur":-1,"wakeup":-1,"tokens_to":-1}`), r); err != nil {
+	if err := json.Unmarshal([]byte(`{"version":2,"cur":-1,"wakeup":-1,"tokens_to":-1}`), r); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := r.Open(); ok {
 		t.Fatal("успешный Unmarshal не заменил старое состояние")
+	}
+}
+
+func TestSnapshotRejectsVersion1(t *testing.T) {
+	const old = `{"version":1,"cur":-1,"wakeup":-1,"tokens_to":-1}`
+	if err := json.Unmarshal([]byte(old), New()); err == nil {
+		t.Fatal("снимок версии 1 принят")
 	}
 }
 
@@ -456,7 +536,7 @@ func TestSnapshotCoversRecognizerAndPendingFields(t *testing.T) {
 		slices.Sort(out)
 		return out
 	}
-	if got, want := fields(Recognizer{}), []string{"bg", "byCall", "cur", "polls", "prevCmd", "sends", "sessionCmd", "shellText", "tasks", "tokensTo", "wakeup"}; !reflect.DeepEqual(got, want) {
+	if got, want := fields(Recognizer{}), []string{"bg", "byCall", "cur", "lastTime", "polls", "prevCmd", "sends", "sessionCmd", "shellText", "tasks", "tokensTo", "wakeup"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("поля Recognizer поменялись: %v", got)
 	}
 	if got, want := fields(pending{}), []string{"callAt", "codex", "limit", "outSeen", "replies", "session", "to", "w"}; !reflect.DeepEqual(got, want) {
