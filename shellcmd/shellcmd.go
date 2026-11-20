@@ -9912,6 +9912,9 @@ func shortGroupExitsWithoutCommand(name, arg string) bool {
 }
 
 func wrapperStart(name string, args []string) int {
+	if name == "command" {
+		return commandTargetStart(args)
+	}
 	i := wrapperOptionEnd(name, args, 0)
 	switch name {
 	case "prlimit":
@@ -9947,6 +9950,25 @@ func wrapperStart(name string, args []string) int {
 		}
 	}
 	return i
+}
+
+// commandTargetStart treats expanded words as uncertain options while looking
+// for the command operand. Their runtime value may be an option, so a later
+// literal word can still be the command being wrapped.
+func commandTargetStart(args []string) int {
+	for i, arg := range args {
+		if arg == "--" {
+			return i + 1
+		}
+		if strings.ContainsAny(arg, "$`") {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			continue
+		}
+		return i
+	}
+	return len(args)
 }
 
 func hasOption(name string, args []string, options ...string) bool {
@@ -9999,6 +10021,10 @@ func optionMatches(name, arg, option string) bool {
 func commandIsLookup(args []string) bool {
 	for _, arg := range args {
 		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
+			return false
+		}
+		// An option assembled by expansion is not a literal command lookup.
+		if strings.ContainsAny(arg, "$`") {
 			return false
 		}
 		if !strings.HasPrefix(arg, "--") && strings.ContainsAny(arg[1:], "vV") {
