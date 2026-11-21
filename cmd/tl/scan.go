@@ -703,6 +703,9 @@ func (f *filter) readEvents(path string, keep func([]byte, transcript.ToolNames)
 			return meta, nil
 		}
 	}
+	if isCodexRollout(path) && keep == nil && !f.opts.roles[transcript.Cmd] && !f.opts.roles[transcript.Out] {
+		return transcript.ReadWorkerCodexWindowWithRoles(path, f.opts.roles, f.opts.since, f.opts.until, consume)
+	}
 	return transcript.ReadWithTools(path, keep, consume)
 }
 

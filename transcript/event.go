@@ -80,6 +80,8 @@ type Event struct {
 	Reply *Reply
 	// Tokens — расход codex (событие token_count, note «token_count»).
 	Tokens *Tokens
+
+	codexResponseItem bool
 }
 
 // Tokens — расход сессии codex на момент события: всего с начала и последнего запроса, лимит подписки.
@@ -216,18 +218,38 @@ func ReadWithTools(path string, keep func([]byte, ToolNames) bool, fn func(Event
 	return read(path, nil, keep, fn, nil)
 }
 
+// ReadCodexWithRoles emits only requested Codex roles.
+func ReadCodexWithRoles(path string, roles map[Role]bool, fn func(Event)) (Meta, error) {
+	return readWithRoleWindow(path, nil, nil, fn, nil, roles, time.Time{}, time.Time{})
+}
+
+// ReadWorkerCodexWithRoles reads a worker rollout with the regular Codex parser.
+func ReadWorkerCodexWithRoles(path string, roles map[Role]bool, fn func(Event)) (Meta, error) {
+	return readWithRoleWindow(path, nil, nil, fn, nil, roles, time.Time{}, time.Time{})
+}
+
+// ReadWorkerCodexWindowWithRoles reads a worker rollout and applies the time window to parsed events.
+func ReadWorkerCodexWindowWithRoles(path string, roles map[Role]bool, since, until time.Time, fn func(Event)) (Meta, error) {
+	return readWithRoleWindow(path, nil, nil, fn, nil, roles, since, until)
+}
+
 // ReadWithCodexCommandsDiscardOutput reads command completions without retaining their output.
 func ReadWithCodexCommandsDiscardOutput(path string, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
 	return read(path, nil, nil, fn, commandFn)
 }
 
 func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
+	return readWithRoleWindow(path, keep, keepWithTools, fn, commandFn, nil, time.Time{}, time.Time{})
+}
+
+func readWithRoleWindow(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult), codexRoles map[Role]bool, since, until time.Time) (Meta, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Meta{}, fmt.Errorf("transcript: %w", err)
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
+	fn = eventFilter(fn, codexRoles, since, until)
 	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), keep: keep, keepWithTools: keepWithTools, fn: fn, commandFn: commandFn}
 	if keepWithTools != nil {
 		rd.toolNames = make(map[string]struct{})
@@ -236,32 +258,235 @@ func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNa
 	if err != nil && !errors.Is(err, io.EOF) { // EOF — файл короче codexHead
 		return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
 	}
-	if bytes.Contains(head, []byte(`"type":"session_meta"`)) {
+	codexSource := bytes.Contains(head, []byte(`"type":"session_meta"`))
+	var deferred codexEventBuffer
+	if codexSource && codexRoles != nil {
+		deferred.emit = fn
+		rd.codex.markResponseItems = true
+		rd.fn = deferred.add
+	} else if codexSource {
 		rd.codex.eventUser, rd.codex.eventAgent, err = codexMessages(f)
 		if err != nil {
 			return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
 		}
 	}
 	for {
-		var raw []byte
-		var err error
-		if keepWithTools == nil {
-			raw, err = readLine(r)
-		} else {
-			raw, err = readLineView(r)
-		}
-		if len(raw) > 0 {
-			rd.line(raw)
-		} else if err == nil {
-			rd.lineNo++ // a blank line is still a line of the file: numbers match sed -n
-		}
+		err := readWindowLine(r, &rd, codexSource, codexRoles)
 		if err != nil {
 			rd.meta.Originator, rd.meta.Account = rd.codex.originator, rd.codex.firstAccount
 			if errors.Is(err, io.EOF) {
+				deferred.flush(rd.codex)
 				return rd.meta, nil
 			}
 			return rd.meta, fmt.Errorf("transcript %s: %w", path, err)
 		}
+	}
+}
+
+func readWindowLine(r *bufio.Reader, rd *reader, codexSource bool, roles map[Role]bool) error {
+	var raw []byte
+	var skipped bool
+	var err error
+	if rd.keepWithTools != nil {
+		raw, err = readLineView(r)
+	} else if codexSource && roles != nil {
+		raw, skipped, err = readCodexRoleLine(r, roles, rd.codex.eventUser && rd.codex.eventAgent)
+	} else {
+		raw, err = readLine(r)
+	}
+	if skipped {
+		rd.lineNo++
+		return err
+	}
+	if len(raw) == 0 {
+		if err == nil {
+			rd.lineNo++ // a blank line is still a line of the file: numbers match sed -n
+		}
+		return err
+	}
+	if codexSource && roles != nil {
+		user, agent := codexMessageLineMarkers(raw)
+		rd.codex.eventUser = rd.codex.eventUser || user
+		rd.codex.eventAgent = rd.codex.eventAgent || agent
+	}
+	rd.line(raw)
+	return err
+}
+
+type codexEventBuffer struct {
+	events []Event
+	emit   func(Event)
+}
+
+func (b *codexEventBuffer) add(event Event) { b.events = append(b.events, event) }
+
+func (b *codexEventBuffer) flush(parser *codexParser) {
+	for i := range b.events {
+		event := &b.events[i]
+		if isCodexTUIDuplicate(*event, parser) {
+			continue
+		}
+		event.codexResponseItem = false
+		b.emit(*event)
+	}
+}
+
+func isCodexTUIDuplicate(event Event, parser *codexParser) bool {
+	return event.codexResponseItem &&
+		(event.Role == User && parser.eventUser || event.Role == Agent && parser.eventAgent)
+}
+
+func codexMessageLineMarkers(line []byte) (user, agent bool) {
+	head := line[:min(len(line), codexHead)]
+	return bytes.Contains(head, userMessageLine), bytes.Contains(head, agentMessageLine)
+}
+
+func eventFilter(fn func(Event), roles map[Role]bool, since, until time.Time) func(Event) {
+	if roles == nil && since.IsZero() && until.IsZero() {
+		return fn
+	}
+	return func(event Event) {
+		if roles != nil && !roles[event.Role] {
+			return
+		}
+		if !since.IsZero() && event.Time.Before(since) || !until.IsZero() && event.Time.After(until) {
+			return
+		}
+		fn(event)
+	}
+}
+
+func readCodexRoleLine(r *bufio.Reader, roles map[Role]bool, dropTUIDuplicates bool) ([]byte, bool, error) {
+	line, err := readLineView(r)
+	if len(line) == 0 {
+		return line, false, err
+	}
+	return line, codexLineHasNoRequestedEvents(line, roles, dropTUIDuplicates), err
+}
+
+func codexLineHasNoRequestedEvents(line []byte, roles map[Role]bool, dropTUIDuplicates bool) bool {
+	if codexLineNeedsStateParse(line) {
+		return false
+	}
+	return codexLineHasNoRequestedFacts(codexLineFactsForCandidates(line), roles, dropTUIDuplicates)
+}
+
+func codexLineNeedsStateParse(line []byte) bool {
+	return bytes.Contains(line, []byte(`\u`)) || bytes.Contains(line, []byte(`"session_meta"`)) ||
+		bytes.Contains(line, []byte(`"turn_context"`)) || bytes.HasPrefix(line, []byte(`{"type":"agent-name","agentName":"`))
+}
+
+func codexLineFactsForCandidates(line []byte) codexLineFacts {
+	var facts codexLineFacts
+	for i := 0; i < len(line); {
+		quote := bytes.IndexByte(line[i:], '"')
+		if quote < 0 {
+			break
+		}
+		i += quote
+		if i+1 < len(line) {
+			facts.addCandidate(line[i:])
+		}
+		i++
+	}
+	return facts
+}
+
+func codexLineHasNoRequestedFacts(facts codexLineFacts, roles map[Role]bool, dropTUIDuplicates bool) bool {
+	if dropTUIDuplicates && !roles[Cmd] && !roles[Out] && facts.responseItem && !facts.userMessage && !facts.agentMessage {
+		return true
+	}
+	return !codexFactsHaveRequestedEvent(facts, roles)
+}
+
+func codexFactsHaveRequestedEvent(facts codexLineFacts, roles map[Role]bool) bool {
+	return codexMessageFactsMatch(facts, roles) || codexNoteFactsMatch(facts, roles) || codexToolFactsMatch(facts, roles)
+}
+
+func codexMessageFactsMatch(facts codexLineFacts, roles map[Role]bool) bool {
+	if roles[User] && (facts.userMessage || facts.responseItem && facts.message && facts.user) {
+		return true
+	}
+	return roles[Agent] && (facts.agentMessage || facts.responseItem && facts.message && facts.assistant)
+}
+
+func codexNoteFactsMatch(facts codexLineFacts, roles map[Role]bool) bool {
+	return roles[Note] && (facts.tokenCount || facts.compacted)
+}
+
+func codexToolFactsMatch(facts codexLineFacts, roles map[Role]bool) bool {
+	if !roles[Cmd] && !roles[Out] {
+		return false
+	}
+	return facts.functionCall || facts.customToolCall || facts.functionCallOutput || facts.customToolCallOutput
+}
+
+type codexLineFacts struct {
+	responseItem, message, user, assistant                                 bool
+	userMessage, agentMessage, tokenCount, compacted                       bool
+	functionCall, customToolCall, functionCallOutput, customToolCallOutput bool
+}
+
+func (f *codexLineFacts) addCandidate(s []byte) {
+	switch s[1] {
+	case 't':
+		f.addTokenCandidate(s)
+	case 'r':
+		if bytes.HasPrefix(s, []byte(`"response_item"`)) {
+			f.responseItem = true
+		}
+	case 'm':
+		if bytes.HasPrefix(s, []byte(`"message"`)) {
+			f.message = true
+		}
+	case 'u':
+		f.addUserCandidate(s)
+	case 'a':
+		f.addAssistantCandidate(s)
+	case 'c':
+		f.addCustomToolCandidate(s)
+	case 'f':
+		f.addFunctionCallCandidate(s)
+	}
+}
+
+func (f *codexLineFacts) addTokenCandidate(s []byte) {
+	if bytes.HasPrefix(s, []byte(`"token_count"`)) {
+		f.tokenCount = true
+	}
+}
+
+func (f *codexLineFacts) addUserCandidate(s []byte) {
+	if bytes.HasPrefix(s, []byte(`"user_message"`)) {
+		f.userMessage = true
+	} else if bytes.HasPrefix(s, []byte(`"user"`)) {
+		f.user = true
+	}
+}
+
+func (f *codexLineFacts) addAssistantCandidate(s []byte) {
+	if bytes.HasPrefix(s, []byte(`"assistant"`)) {
+		f.assistant = true
+	} else if bytes.HasPrefix(s, []byte(`"agent_message"`)) {
+		f.agentMessage = true
+	}
+}
+
+func (f *codexLineFacts) addCustomToolCandidate(s []byte) {
+	if bytes.HasPrefix(s, []byte(`"compacted"`)) {
+		f.compacted = true
+	} else if bytes.HasPrefix(s, []byte(`"custom_tool_call"`)) {
+		f.customToolCall = true
+	} else if bytes.HasPrefix(s, []byte(`"custom_tool_call_output"`)) {
+		f.customToolCallOutput = true
+	}
+}
+
+func (f *codexLineFacts) addFunctionCallCandidate(s []byte) {
+	if bytes.HasPrefix(s, []byte(`"function_call_output"`)) {
+		f.functionCallOutput = true
+	} else if bytes.HasPrefix(s, []byte(`"function_call"`)) {
+		f.functionCall = true
 	}
 }
 

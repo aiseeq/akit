@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"regexp/syntax"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
@@ -445,6 +447,49 @@ func TestCodexSkippedState(t *testing.T) {
 	if !strings.Contains(want[0], `"Who":" Other "`) || !strings.Contains(want[0], `"Cwd":"/context"`) ||
 		!strings.Contains(want[1], `"Who":"Custom"`) || !strings.Contains(want[1], `"SessionID":"two"`) {
 		t.Fatalf("состояние Codex: %q", want)
+	}
+}
+
+func TestCodexDefaultRolesSkipOnlyUnrequestedRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex", "sessions", "2026", "11", "18", "rollout-2026-11-18T10-00-00-test.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rows := []string{
+		`{"type":"session_meta","payload":{"id":"session","cwd":"/work/akit"}}`,
+		`{"timestamp":"2026-11-18T09:59:59Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"` + strings.Repeat("old ", 1<<19) + `"}]}}`,
+		`{"timestamp":"2026-11-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`,
+		`{"timestamp":"2026-11-18T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"c1","arguments":"large command"}}`,
+		`{"timestamp":"2026-11-18T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"` + strings.Repeat("x", 2<<20) + `"}}`,
+		`{"timestamp":"2026-11-18T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}}`,
+		`{"timestamp":"2026-11-18T10:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"quoted \"text\""}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(rows, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := options{roles: map[transcript.Role]bool{transcript.User: true, transcript.Agent: true}, since: time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)}
+	f, err := newFilter(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, _, err := f.file(source{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []transcript.Event
+	if _, err := transcript.ReadWithTools(path, nil, func(ev transcript.Event) {
+		if opts.roles[ev.Role] && (opts.since.IsZero() || !ev.Time.Before(opts.since)) && (opts.until.IsZero() || !ev.Time.After(opts.until)) {
+			want = append(want, ev)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gotEvents := make([]transcript.Event, len(got))
+	for i := range got {
+		gotEvents[i] = got[i].ev
+	}
+	if !reflect.DeepEqual(gotEvents, want) {
+		t.Fatalf("role-filtered events differ:\n got: %#v\nwant: %#v", gotEvents, want)
 	}
 }
 

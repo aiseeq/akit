@@ -358,5 +358,5 @@ func usageProvider(model string) string {
 	}
 }
 
-// isCodexRollout — файл codex: codex называет журналы сессий rollout-<время>-<id>.jsonl.
+// isCodexRollout — Codex names session journals rollout-<time>-<id>.jsonl.
 func isCodexRollout(path string) bool { return strings.HasPrefix(filepath.Base(path), "rollout-") }

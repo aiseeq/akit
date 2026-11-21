@@ -2,6 +2,7 @@ package transcript
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -55,9 +57,9 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 		paths = append(paths, subs...)
 	}
 	if codex {
-		more, e := filepath.Glob(filepath.Join(WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"))
-		if e != nil {
-			return nil, fmt.Errorf("list codex transcripts: %w", e)
+		more, err := workerCodexRollouts(home)
+		if err != nil {
+			return nil, fmt.Errorf("list codex transcripts: %w", err)
 		}
 		paths = append(paths, more...)
 	}
@@ -101,6 +103,111 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 	return out, nil
 }
 
+// workerCodexRollouts walks the fixed worker session layout directly. Glob would
+// stat each job's codex/sessions path before reading it, which dominates discovery
+// when the worker tree contains many short lived jobs.
+func workerCodexRollouts(home string) ([]string, error) {
+	root := filepath.Join(home, ".local", "state", "worker")
+	var paths []string
+	jobs, err := readWorkerDir(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, job := range jobs {
+		jobPath := filepath.Join(root, job.Name())
+		isDir, err := workerDirEntry(job, jobPath)
+		if err != nil {
+			return nil, err
+		}
+		if !isDir {
+			continue
+		}
+		more, err := workerCodexRolloutsInSessions(filepath.Join(jobPath, "codex", "sessions"))
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, more...)
+	}
+	return paths, nil
+}
+
+func workerCodexRolloutsInSessions(sessions string) ([]string, error) {
+	return workerCodexRolloutsAtDepth(sessions, 3)
+}
+
+func workerCodexRolloutsAtDepth(dir string, depth int) ([]string, error) {
+	var paths []string
+	entries, err := readWorkerDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if depth == 0 {
+			name := entry.Name()
+			if strings.HasPrefix(name, "rollout-") && strings.HasSuffix(name, ".jsonl") {
+				paths = append(paths, path)
+			}
+			continue
+		}
+		isDir, err := workerDirEntry(entry, path)
+		if err != nil {
+			return nil, err
+		}
+		if isDir {
+			more, err := workerCodexRolloutsAtDepth(path, depth-1)
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, more...)
+		}
+	}
+	return paths, nil
+}
+
+func readWorkerDir(path string) ([]fs.DirEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if ignoredWorkerGlobError(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read worker transcript directory %s: %w", path, err)
+	}
+	entries, readErr := f.ReadDir(-1)
+	closeErr := f.Close()
+	if ignoredWorkerGlobError(readErr) {
+		return nil, nil
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("read worker transcript directory %s: %w", path, readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close worker transcript directory %s: %w", path, closeErr)
+	}
+	return entries, nil
+}
+
+func ignoredWorkerGlobError(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.ENOTDIR)
+}
+
+func workerDirEntry(entry fs.DirEntry, path string) (bool, error) {
+	if entry.IsDir() {
+		return true, nil
+	}
+	if entry.Type()&fs.ModeSymlink == 0 {
+		return false, nil
+	}
+	info, err := os.Stat(path)
+	if ignoredWorkerGlobError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat worker transcript directory %s: %w", path, err)
+	}
+	return info.IsDir(), nil
+}
+
 func sourceStartsAfter(path string, until time.Time) bool {
 	if until.IsZero() {
 		return false
@@ -142,13 +249,19 @@ func codexCWD(path string) (string, error) {
 	s := bufio.NewScanner(f)
 	s.Buffer(make([]byte, 4096), 1<<20)
 	for lines := 0; lines < 64 && s.Scan(); lines++ {
+		line := s.Bytes()
+		// Most rollout records are not session metadata. Avoid decoding them; if
+		// the line has escapes, keep the JSON path because the type may be escaped.
+		if !bytes.Contains(line, []byte("session_meta")) && bytes.IndexByte(line, '\\') < 0 {
+			continue
+		}
 		var rec struct {
 			Type    string `json:"type"`
 			Payload struct {
 				CWD string `json:"cwd"`
 			} `json:"payload"`
 		}
-		if json.Unmarshal(s.Bytes(), &rec) == nil && rec.Type == "session_meta" && rec.Payload.CWD != "" {
+		if json.Unmarshal(line, &rec) == nil && rec.Type == "session_meta" && rec.Payload.CWD != "" {
 			return rec.Payload.CWD, nil
 		}
 	}

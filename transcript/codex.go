@@ -168,6 +168,7 @@ type codexParser struct {
 	// firstAccount — учётка первого session_meta для Meta.Account; account — последнего, для Tokens.Account.
 	firstAccount          string
 	eventUser, eventAgent bool
+	markResponseItems     bool
 	named                 bool
 }
 
@@ -197,15 +198,27 @@ func codexMessages(f *os.File) (user, agent bool, err error) {
 	}
 	r := bufio.NewReaderSize(io.NewSectionReader(f, 0, st.Size()), 1<<20)
 	for !user || !agent {
-		line, err := readLine(r)
-		head := line[:min(len(line), codexHead)]
+		chunk, err := r.ReadSlice('\n')
+		head := chunk[:min(len(chunk), codexHead)]
+		lineLen := len(chunk)
+		for errors.Is(err, bufio.ErrBufferFull) {
+			var rest []byte
+			rest, err = r.ReadSlice('\n')
+			lineLen += len(rest)
+			if lineLen > maxLine {
+				return false, false, fmt.Errorf("line longer than %d bytes", maxLine)
+			}
+		}
+		if lineLen > maxLine {
+			return false, false, fmt.Errorf("line longer than %d bytes", maxLine)
+		}
 		user = user || bytes.Contains(head, userMessageLine)
 		agent = agent || bytes.Contains(head, agentMessageLine)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return false, false, err
+			return false, false, fmt.Errorf("read Codex message markers: %w", err)
 		}
 	}
 	return user, agent, nil
@@ -222,6 +235,24 @@ func (p *codexParser) parse(rec *record) []Event {
 	return events
 }
 
+func (p *codexParser) rememberSessionMeta(id, cwd, originator, account string) {
+	if id != "" && !p.named {
+		p.session, p.named = id, true
+		if cwd != "" {
+			p.cwd = cwd
+		}
+	}
+	if p.originator == "" {
+		p.originator = originator
+	}
+	if account != "" {
+		p.account = account
+		if p.firstAccount == "" {
+			p.firstAccount = account
+		}
+	}
+}
+
 func (p *codexParser) events(rec *record) []Event {
 	pl := rec.Payload
 	ev := func(role Role, who, text string) []Event {
@@ -235,21 +266,7 @@ func (p *codexParser) events(rec *record) []Event {
 		// rollout суб-агента повторяет сразу за своим session_meta родительский: это не новая сессия. session_meta
 		// после событий — новая: копия rollout фермы (*.rollout.jsonl) начинает им срез следующей сессии, а
 		// бывает, что он идёт после первых token_count (49 из 1997 rollout за 31 день по замеру).
-		if pl.ID != "" && !p.named {
-			p.session, p.named = pl.ID, true
-			if pl.Cwd != "" {
-				p.cwd = pl.Cwd
-			}
-		}
-		if p.originator == "" {
-			p.originator = pl.Originator
-		}
-		if pl.CreatorAccountID != "" {
-			p.account = pl.CreatorAccountID
-			if p.firstAccount == "" {
-				p.firstAccount = pl.CreatorAccountID
-			}
-		}
+		p.rememberSessionMeta(pl.ID, pl.Cwd, pl.Originator, pl.CreatorAccountID)
 		return nil
 	case "turn_context":
 		if pl.Cwd != "" {
@@ -274,23 +291,30 @@ func (p *codexParser) events(rec *record) []Event {
 func (p *codexParser) responseItem(pl *payload, ev func(Role, string, string) []Event) []Event {
 	switch pl.Type {
 	case "message":
-		text, images, _ := content(pl.Content)
-		withImages := func(es []Event) []Event {
-			for i := range es {
-				es[i].Images = images
-			}
-			return es
-		}
 		switch pl.Role {
 		case "assistant":
 			if p.eventAgent {
 				return nil
 			}
-			return withImages(ev(Agent, "", text))
 		case "user":
 			if p.eventUser {
 				return nil
 			}
+		default:
+			return nil
+		}
+		text, images, _ := content(pl.Content)
+		withImages := func(es []Event) []Event {
+			for i := range es {
+				es[i].Images = images
+				es[i].codexResponseItem = p.markResponseItems
+			}
+			return es
+		}
+		switch pl.Role {
+		case "assistant":
+			return withImages(ev(Agent, "", text))
+		case "user":
 			for _, pre := range codexInjected {
 				if strings.HasPrefix(strings.TrimSpace(text), pre) {
 					return nil

@@ -102,6 +102,88 @@ func TestAllSourcesProjectMatchesCodexCWDAndWorkerTree(t *testing.T) {
 	}
 }
 
+func TestAllSourcesProjectKeepsOldCodexRunModifiedSince(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "state", "worker", "job", "codex", "sessions", "2026", "11", "16", "rollout-2026-11-16T17-00-00-test.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"cwd":"/work/akit"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
+	modified := since.Add(time.Hour)
+	if err := os.Chtimes(path, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := AllSourcesWindow(home, since, time.Time{}, "akit", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || sources[0].Path != path {
+		t.Fatalf("sources = %v, want old run modified after since", sources)
+	}
+}
+
+func TestCodexCWDParsesEscapedSessionMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	line := `{"\u0074ype":"session_meta","payload":{"cwd":"/work/akit"}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := codexCWD(path)
+	if err != nil || cwd != "/work/akit" {
+		t.Fatalf("codexCWD = (%q, %v), want /work/akit", cwd, err)
+	}
+}
+
+func TestCodexCWDCanonicalRecordSkipsEmptyCwdAndUnescapesValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	rows := `{"type":"session_meta","payload":{"cwd":""}}` + "\n" +
+		`{"type":"session_meta","payload":{"cwd":"/work/ak\u0069t"}}` + "\n"
+	if err := os.WriteFile(path, []byte(rows), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := codexCWD(path)
+	if err != nil || cwd != "/work/akit" {
+		t.Fatalf("codexCWD = (%q, %v), want /work/akit", cwd, err)
+	}
+}
+
+func TestCodexCWDUsesEncodingJSONFieldNestingAndDuplicateRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	rows := `{"nested":{"cwd":"/work/other"},"type":"session_meta","payload":{"cwd":"/work/akit"}}` + "\n" +
+		`{"type":"session_meta","payload":{"cwd":"/work/first","cwd":"/work/last"}}` + "\n"
+	if err := os.WriteFile(path, []byte(rows), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := codexCWD(path)
+	if err != nil || cwd != "/work/akit" {
+		t.Fatalf("codexCWD = (%q, %v), want root payload cwd /work/akit", cwd, err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Split(rows, "\n")[1]+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err = codexCWD(path)
+	if err != nil || cwd != "/work/last" {
+		t.Fatalf("codexCWD duplicate = (%q, %v), want /work/last", cwd, err)
+	}
+}
+
+func TestAllSourcesSkipsFileAtWorkerSessionsPath(t *testing.T) {
+	home := t.TempDir()
+	sessions := filepath.Join(home, ".local", "state", "worker", "job", "codex", "sessions")
+	if err := os.MkdirAll(filepath.Dir(sessions), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sessions, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AllSourcesWindow(home, time.Time{}, time.Time{}, "", true, false); err != nil {
+		t.Fatalf("AllSourcesWindow with sessions file: %v", err)
+	}
+}
+
 func TestAllSourcesProjectCodexMetadataFallbacks(t *testing.T) {
 	home := t.TempDir()
 	workerRoot := filepath.Join(home, ".local", "state", "worker")
