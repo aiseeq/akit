@@ -141,6 +141,106 @@ func TestFileAppears(t *testing.T) {
 	}
 }
 
+func TestKernelWakeFileConditions(t *testing.T) {
+	t.Run("file creation", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "target")
+		assertWake(t, []string{"file", path, "--every", "10s", "--timeout", "3s"}, func() error {
+			return os.WriteFile(path, []byte("ready"), 0o644)
+		})
+	})
+	t.Run("line append", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "log")
+		if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		assertWake(t, []string{"line", "^READY$", path, "--new", "--every", "10s", "--timeout", "3s"}, func() error {
+			return appendFile(path, "READY\n")
+		})
+	})
+	t.Run("line replacement", func(t *testing.T) {
+		dir := t.TempDir()
+		path, replacement := filepath.Join(dir, "log"), filepath.Join(dir, "new")
+		if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		assertWake(t, []string{"line", "^READY$", path, "--every", "10s", "--timeout", "3s"}, func() error {
+			if err := os.WriteFile(replacement, []byte("READY\n"), 0o644); err != nil {
+				return err
+			}
+			return os.Rename(replacement, path)
+		})
+	})
+	t.Run("line appears", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "log")
+		assertWake(t, []string{"line", "^READY$", path, "--every", "10s", "--timeout", "3s"}, func() error {
+			return os.WriteFile(path, []byte("READY\n"), 0o644)
+		})
+	})
+	t.Run("unrelated write", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "watched")
+		opts, err := parseArgs([]string{"file", path, "--every", "10s", "--timeout", "250ms"}, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			time.Sleep(80 * time.Millisecond)
+			_ = os.WriteFile(filepath.Join(dir, "other"), []byte("x"), 0o644)
+		}()
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), opts, &out, &errOut); code != exitTimeout {
+			t.Fatalf("unrelated event woke condition: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+		}
+	})
+}
+
+func TestKernelWakeExit(t *testing.T) {
+	for _, count := range []int{1, 2} {
+		t.Run(strconv.Itoa(count)+" process(es)", func(t *testing.T) {
+			args := []string{"exit"}
+			var children []*exec.Cmd
+			for range count {
+				cmd := exec.Command("bash", "-c", "sleep 0.2")
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				children = append(children, cmd)
+				args = append(args, strconv.Itoa(cmd.Process.Pid))
+			}
+			defer func() {
+				for _, cmd := range children {
+					_ = cmd.Wait()
+				}
+			}()
+			args = append(args, "--every", "10s", "--timeout", "3s")
+			assertWake(t, args, func() error { return nil })
+		})
+	}
+}
+
+func assertWake(t *testing.T, args []string, change func() error) {
+	t.Helper()
+	opts, err := parseArgs(args, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- run(context.Background(), opts, &out, &errOut) }()
+	started := time.Now()
+	if err := change(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-done:
+		if elapsed := time.Since(started); elapsed > 800*time.Millisecond || code != 0 {
+			t.Fatalf("wake after %s, code=%d stdout=%q stderr=%q", elapsed, code, out.String(), errOut.String())
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("condition did not wake promptly")
+	}
+}
+
 func TestTimeoutSaysWhatIsMissing(t *testing.T) {
 	dir := t.TempDir()
 	have := filepath.Join(dir, "have")
@@ -208,7 +308,7 @@ func TestCheckErrorStops(t *testing.T) {
 }
 
 func TestExit(t *testing.T) {
-	cmd := exec.Command("sleep", "0.2")
+	cmd := exec.Command("sleep", "1")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

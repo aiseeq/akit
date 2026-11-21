@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aiseeq/akit/clihelp"
@@ -261,6 +262,46 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	met := make([]bool, len(opts.conds))
 	tick := time.NewTicker(opts.every)
 	defer tick.Stop()
+	wakeCtx, stopWatches := context.WithCancel(ctx)
+	wake := make(chan struct{}, 1)
+	var cleanupWatches []func()
+	var wakeReaders sync.WaitGroup
+	defer func() {
+		stopWatches()
+		wakeReaders.Wait()
+		for _, cleanup := range cleanupWatches {
+			cleanup()
+		}
+	}()
+	for _, c := range opts.conds {
+		wc, ok := c.(wakeCond)
+		if !ok {
+			continue
+		}
+		ch, cleanup := wc.watch(wakeCtx)
+		cleanupWatches = append(cleanupWatches, cleanup)
+		if ch == nil {
+			continue
+		}
+		wakeReaders.Add(1)
+		go func(events <-chan struct{}) {
+			defer wakeReaders.Done()
+			for {
+				select {
+				case <-wakeCtx.Done():
+					return
+				case _, open := <-events:
+					if !open {
+						return
+					}
+					select {
+					case wake <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}(ch)
+	}
 	for {
 		for i, c := range opts.conds {
 			if met[i] {
@@ -282,6 +323,7 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, timeoutReport(opts.conds, met, start))
 			return exitTimeout
 		case <-tick.C:
+		case <-wake:
 		}
 	}
 }

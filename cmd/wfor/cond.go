@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/proc"
+	"golang.org/x/sys/unix"
 )
 
 // cond — одно условие ожидания. check отвечает, выполнено ли оно сейчас; ошибка — ждать дальше нельзя (нет прав,
@@ -26,11 +29,20 @@ type cond interface {
 	state() string
 }
 
+// wakeCond supplies hints that a condition may have changed. check remains authoritative.
+type wakeCond interface {
+	watch(context.Context) (<-chan struct{}, func())
+}
+
 // fileCond — файл есть и не пуст.
 type fileCond struct {
 	path string
 	size int64
 	seen bool
+}
+
+func (c *fileCond) watch(ctx context.Context) (<-chan struct{}, func()) {
+	return watchFile(ctx, c.path)
 }
 
 func (c *fileCond) check(context.Context) (bool, error) {
@@ -102,6 +114,66 @@ type lineCond struct {
 	skipped bool // начато с --new или --after: повтор вызова должен продолжить с той же строки
 	// partial — с --new файл кончался неполной строкой: она начата до старта и не в счёт, пока не кончится
 	partial bool
+}
+
+func (c *lineCond) watch(ctx context.Context) (<-chan struct{}, func()) {
+	return watchFile(ctx, c.path)
+}
+
+// watchFile watches the containing directory so creation and atomic replacement are visible.
+func watchFile(ctx context.Context, path string) (<-chan struct{}, func()) {
+	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil { //nolint:silent-error-handling // Event support is optional; ticker checks remain the fallback.
+		return nil, func() {}
+	}
+	if _, err := unix.InotifyAddWatch(fd, filepath.Dir(path), unix.IN_CREATE|unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO|unix.IN_ATTRIB); err != nil { //nolint:silent-error-handling // Missing/unavailable parent paths fall back to ticker checks.
+		_ = unix.Close(fd)
+		return nil, func() {}
+	}
+	out := make(chan struct{}, 1)
+	done := make(chan struct{})
+	name := filepath.Base(path)
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, readErr := unix.Read(fd, buf)
+			if readErr == unix.EAGAIN || readErr == unix.EINTR {
+				timer := time.NewTimer(10 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
+			if readErr != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
+				return
+			}
+			for off := 0; off+unix.SizeofInotifyEvent <= n; {
+				length := int(binary.LittleEndian.Uint32(buf[off+12 : off+16]))
+				if off+unix.SizeofInotifyEvent+length > n {
+					break
+				}
+				eventName := string(bytes.TrimRight(buf[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
+				if eventName == name {
+					select {
+					case out <- struct{}{}:
+					default:
+					}
+				}
+				off += unix.SizeofInotifyEvent + length
+			}
+		}
+	}()
+	cleanup := func() { _ = unix.Close(fd); <-done }
+	return out, cleanup
 }
 
 // markLen — сколько байт начала и края прочитанного сверяется, чтобы узнать перезапись на месте.
@@ -284,6 +356,63 @@ type exitCond struct {
 	comm   map[int]string
 	left   []int
 	absent []int // не было уже на старте: опечатка в pid выглядит так же, как конец процесса
+}
+
+func (c *exitCond) watch(ctx context.Context) (<-chan struct{}, func()) {
+	var fds []int
+	for _, pid := range c.pids {
+		if _, tracked := c.start[pid]; !tracked {
+			continue
+		}
+		fd, err := unix.PidfdOpen(pid, 0)
+		if err == nil {
+			fds = append(fds, fd)
+		} else {
+			continue
+		}
+	}
+	if len(fds) == 0 {
+		return nil, func() {}
+	}
+	out := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			for _, fd := range fds {
+				if fd >= 0 {
+					_ = unix.Close(fd)
+				}
+			}
+		}()
+		for {
+			for i, fd := range fds {
+				if fd < 0 {
+					continue
+				}
+				poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+				n, err := unix.Poll(poll, 250)
+				if err == unix.EINTR {
+					continue
+				}
+				if err == nil && n > 0 && poll[0].Revents != 0 {
+					select {
+					case out <- struct{}{}:
+					default:
+					}
+					_ = unix.Close(fd)
+					fds[i] = -1
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}()
+	cleanup := func() { <-done }
+	return out, cleanup
 }
 
 func newExitCond(pids []int) (*exitCond, error) {
