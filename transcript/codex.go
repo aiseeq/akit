@@ -29,14 +29,14 @@ type payload struct {
 	CreatorAccountID string `json:"creator_account_id"`
 	Model            string `json:"model"`
 	// event_msg: user_message, agent_message, token_count
-	Message       string            `json:"message"`
-	Images        []json.RawMessage `json:"images"`
-	LocalImages   []json.RawMessage `json:"local_images"`
-	Info          *tokenInfo        `json:"info"`
-	RateLimits    *rateLimits       `json:"rate_limits"`
-	Item          *codexCommandItem `json:"item"`
-	StartedAtMS   int64             `json:"started_at_ms"`
-	CompletedAtMS int64             `json:"completed_at_ms"`
+	Message       string                      `json:"message"`
+	Images        []json.RawMessage           `json:"images"`
+	LocalImages   []json.RawMessage           `json:"local_images"`
+	Info          *tokenInfo                  `json:"info"`
+	RateLimits    *rateLimits                 `json:"rate_limits"`
+	Item          *codexCommandItemWithOutput `json:"item"`
+	StartedAtMS   int64                       `json:"started_at_ms"`
+	CompletedAtMS int64                       `json:"completed_at_ms"`
 }
 
 // CodexCommandResult — завершение одной команды оболочки из item_completed.
@@ -109,7 +109,7 @@ func codexCommandResultFromPayload(recType string, pl *payload, line int) (Codex
 	if recType != "event_msg" || pl == nil || pl.Type != "item_completed" || pl.Item == nil {
 		return CodexCommandResult{}, false
 	}
-	return commandResult(line, pl.StartedAtMS, pl.CompletedAtMS, *pl.Item, "")
+	return commandResult(line, pl.StartedAtMS, pl.CompletedAtMS, pl.Item.codexCommandItem, pl.Item.Output)
 }
 
 func commandResult(line int, started, completed int64, it codexCommandItem, output string) (CodexCommandResult, bool) {
@@ -218,6 +218,7 @@ func (p *codexParser) parse(rec *record) []Event {
 	}
 	for i := range events {
 		events[i].SessionID, events[i].Cwd = p.session, p.cwd
+		events[i].Model = p.model
 	}
 	return events
 }

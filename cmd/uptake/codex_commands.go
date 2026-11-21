@@ -21,19 +21,6 @@ type commandResult struct {
 	out  string
 }
 
-// codexCommandResults — завершения команд из файла codex по порядку строк; код известен (не меньше нуля).
-func codexCommandResults(path string) ([]commandResult, error) {
-	items, err := transcript.CodexCommandResults(path)
-	if err != nil {
-		return nil, err
-	}
-	res := make([]commandResult, 0, len(items))
-	for _, item := range items {
-		res = append(res, commandResult{line: item.Line, at: item.Completed, cmd: item.Command, code: item.ExitCode, out: item.Output})
-	}
-	return res, nil
-}
-
 // attachCommandResults даёт каждому вызову команды codex свой вывод: вызов получает собственный id, а вывод с
 // кодом из его завершения встаёт в события на строку завершения. Завершение ищется после вызова с той же
 // командой и до следующего вызова той же команды; одинаковые команды одного скрипта берут завершения по

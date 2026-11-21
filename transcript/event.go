@@ -56,6 +56,8 @@ type Event struct {
 	// Поля записи Claude Code; у codex UUID пуст, SessionID и Cwd — из session_meta, Cwd меняет turn_context.
 	// Cwd — папка сессии в момент записи: меняется внутри сессии.
 	UUID, SessionID, Cwd string
+	// Model — модель хода Codex на момент события.
+	Model string
 	// MessageID — message.id assistant-записи Claude Code.
 	MessageID string
 	// Sidechain — запись боковой ветки (суб-агент в транскрипте сессии, старый формат): не разговор сессии.
@@ -216,9 +218,20 @@ func ReadWithTools(path string, keep func([]byte, ToolNames) bool, fn func(Event
 	return read(path, nil, keep, fn, nil)
 }
 
+// ReadWithCodexCommands reads transcript events and completed Codex commands in one pass.
+func ReadWithCodexCommands(path string, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
+	return read(path, nil, nil, fn, commandFn)
+}
+
 // ReadWithCodexCommandsDiscardOutput reads command completions without retaining their output.
 func ReadWithCodexCommandsDiscardOutput(path string, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
-	return read(path, nil, nil, fn, commandFn)
+	if commandFn == nil {
+		return ReadWithCodexCommands(path, fn, nil)
+	}
+	return ReadWithCodexCommands(path, fn, func(result CodexCommandResult) {
+		result.Output = ""
+		commandFn(result)
+	})
 }
 
 func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
