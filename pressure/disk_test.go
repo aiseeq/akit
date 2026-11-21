@@ -232,13 +232,21 @@ func TestSkippedWindowMarksBaselineForNextCheck(t *testing.T) {
 		_, _ = bufio.NewReader(conn).ReadBytes('\n')
 		_, _ = fmt.Fprint(conn, response(*now, 0))
 	})
+	ioReads := 0
+	m.readFile = func(path string) ([]byte, error) {
+		if path == filepath.Join(m.procRoot, "pressure", "io") {
+			ioReads++
+		}
+		return os.ReadFile(path)
+	}
 	limits := Limits{Runnable: 100, MaxIOFull: 100}
 	v, err := m.Check(context.Background(), limits, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sleeps != 0 || !v.Load.SwapUnmeasured || v.Load.IOSome != 12.34 {
-		t.Fatalf("first Check: sleeps = %d, SwapUnmeasured = %t, IOSome = %g", sleeps, v.Load.SwapUnmeasured, v.Load.IOSome)
+	// IOSome — из того же единственного чтения PSI io, которым отмечается начало следующего замера.
+	if sleeps != 0 || !v.Load.SwapUnmeasured || v.Load.IOSome != 12.34 || ioReads != 1 {
+		t.Fatalf("first Check: sleeps = %d, SwapUnmeasured = %t, IOSome = %g, PSI io reads = %d", sleeps, v.Load.SwapUnmeasured, v.Load.IOSome, ioReads)
 	}
 	*now = now.Add(2 * time.Second)
 	writeProc(t, m.procRoot, "vmstat", "pswpin 110\npswpout 10\n")
