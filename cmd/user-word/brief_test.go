@@ -210,6 +210,32 @@ func TestAcceptBriefArgs(t *testing.T) {
 	}
 }
 
+func TestBriefCount(t *testing.T) {
+	e := testEnv(t)
+	brief := writeBrief(t, t.TempDir(), "Задача (пользователь 31.10: «сделай быстрее»).\n")
+	for _, args := range [][]string{
+		{brief, "--count"},
+		{brief, "--until", "2026-10-31 11:00", "--count"},
+		{brief, "--count", "--until", "2026-10-31 11:00"},
+	} {
+		code, out, errOut := runUW(t, e, append([]string{"--brief"}, args...)...)
+		if code != 0 || out != "1\n" || errOut != "" {
+			t.Errorf("--brief %q: code %d, stdout %q, stderr %q", args, code, out, errOut)
+		}
+	}
+
+	empty := writeBrief(t, t.TempDir(), "Задача без цитат.\n")
+	code, out, errOut := runUW(t, e, "--brief", empty, "--count")
+	if code != exitNone || out != "0\n" || errOut != "" {
+		t.Errorf("без цитат: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+
+	code, out, errOut = runUW(t, e, "--brief", filepath.Join(t.TempDir(), "missing.md"), "--count")
+	if code != exitUsage || out != "" || !strings.Contains(errOut, "brief") {
+		t.Errorf("нет файла: code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
 // Образец вызова в тексте брифа (`user-word <jsonl> '<кусок>'`) — не ссылка: путь ссылки — абсолютный или от ~ и
 // кончается на .jsonl.
 func TestAcceptBriefPlaceholderNotLink(t *testing.T) {

@@ -21,7 +21,7 @@ const usage = `user-word — the user's own words from another session's transcr
 Usage:
   user-word TRANSCRIPT.jsonl 'FRAGMENT' [MINUTES]
   user-word --search 'FRAGMENT' [--since YYYY-MM-DD] [--project S]
-  user-word --brief FILE [--until 'YYYY-MM-DD HH:MM']
+  user-word --brief FILE [--until 'YYYY-MM-DD HH:MM'] [--count]
 
 The first form prints the agent context before the user's matching line. Long
 replies show their last part; questions cut from it are listed above the excerpt.
@@ -35,6 +35,7 @@ contains S (a project path like ~/git/akit works too).
 
 --brief finds user words cited in a brief and prints their transcript context.
 Without --until, the brief file's modification time is used.
+--count prints only the number of words cited in the brief, without reading transcripts.
 
 FRAGMENT matches ignoring case, ё/е and line breaks or runs of spaces.
 User lines: typed or queued by the human, and answers in a question dialog.
@@ -65,6 +66,7 @@ type options struct {
 	project string
 	brief   bool
 	until   string
+	count   bool
 }
 
 var errHelp = errors.New("help")
@@ -113,20 +115,33 @@ func parseArgs(args []string) (options, error) {
 
 func parseBriefArgs(args []string) (options, error) {
 	opts := options{mins: 30, brief: true}
-	if len(args) < 2 || len(args) > 4 {
-		return opts, errors.New("--brief needs FILE and optional --until time")
+	if len(args) < 2 {
+		return opts, errors.New("--brief needs FILE and optional --until time or --count")
 	}
 	opts.path = args[1]
-	if len(args) == 2 {
-		return opts, nil
+	for i := 2; i < len(args); i++ {
+		switch args[i] {
+		case "--count":
+			if opts.count {
+				return opts, errors.New("--brief accepts --count only once")
+			}
+			opts.count = true
+		case "--until":
+			if opts.until != "" {
+				return opts, errors.New("--brief accepts --until only once")
+			}
+			if i+1 >= len(args) || args[i+1] == "--count" || args[i+1] == "--until" {
+				return opts, errors.New("--until needs YYYY-MM-DD HH:MM")
+			}
+			i++
+			if _, err := time.ParseInLocation("2006-01-02 15:04", args[i], time.Local); err != nil {
+				return opts, fmt.Errorf("--until needs YYYY-MM-DD HH:MM, got %q", args[i])
+			}
+			opts.until = args[i]
+		default:
+			return opts, fmt.Errorf("--brief accepts only --until 'YYYY-MM-DD HH:MM' and --count")
+		}
 	}
-	if len(args) != 4 || args[2] != "--until" {
-		return opts, errors.New("--brief accepts only --until 'YYYY-MM-DD HH:MM'")
-	}
-	if _, err := time.ParseInLocation("2006-01-02 15:04", args[3], time.Local); err != nil {
-		return opts, fmt.Errorf("--until needs YYYY-MM-DD HH:MM, got %q", args[3])
-	}
-	opts.until = args[3]
 	return opts, nil
 }
 

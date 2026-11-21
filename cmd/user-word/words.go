@@ -973,6 +973,13 @@ func runBrief(opts options, e env, stdout, stderr io.Writer) int {
 		}
 	}
 	words := extractBriefWords(string(data), until, e.loc)
+	if opts.count {
+		fmt.Fprintf(stdout, "%d\n", len(words))
+		if len(words) == 0 {
+			return exitNone
+		}
+		return 0
+	}
 	if len(words) == 0 {
 		fmt.Fprintf(stdout, "no user words in %s\n", opts.path)
 		return 0
