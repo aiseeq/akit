@@ -93,6 +93,9 @@ func TestTerra(t *testing.T) {
 	if c, ok := Cost("gpt-6.1-sol", u); !ok || !near(c, 12.1) {
 		t.Errorf("sol: %v %v", c, ok)
 	}
+	if c, ok := Cost("gpt-6.2-sol", u); !ok || !near(c, 12.1) {
+		t.Errorf("sol 6.2: %v %v", c, ok)
+	}
 }
 
 func TestGatewayFlashModels(t *testing.T) {
