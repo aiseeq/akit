@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -260,10 +262,10 @@ func TestCachedRawUserMarkerRemainsCandidateWhenParserLacksContext(t *testing.T)
 func TestBriefCacheOnlyIndexesUserLikeQueueAttachments(t *testing.T) {
 	ordinary := []byte(`{"type":"attachment","timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"image","text":"Save my note"}}`)
 	queued := []byte(`{"type":"attachment","timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"queued_command","origin":{"kind":"human"},"prompt":"Save my note"}}`)
-	if briefCacheUserRecord(ordinary, classifyBriefRecordPrefix(ordinary)) {
+	if mustBriefCacheUserRecord(t, ordinary, classifyBriefRecordPrefix(ordinary)) {
 		t.Fatal("ordinary attachment was treated as a user reply")
 	}
-	if !briefCacheUserRecord(queued, classifyBriefRecordPrefix(queued)) {
+	if !mustBriefCacheUserRecord(t, queued, classifyBriefRecordPrefix(queued)) {
 		t.Fatal("human queued command was not indexed as a user reply")
 	}
 }
@@ -294,7 +296,10 @@ func TestBriefCacheClassifiesScannedUserRecordHints(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			hints := scanBriefRecordHints([]byte(tc.raw))
-			got, _ := briefCacheScannedUserRecordInfo([]byte(tc.raw), hints)
+			got, _, err := briefCacheScannedUserRecordInfo([]byte(tc.raw), hints)
+			if err != nil {
+				t.Fatalf("classifier error: %v", err)
+			}
 			if got != tc.want {
 				t.Fatalf("userLike=%t, want %t", got, tc.want)
 			}
@@ -305,10 +310,10 @@ func TestBriefCacheClassifiesScannedUserRecordHints(t *testing.T) {
 func TestBriefCacheSkipsGeneratedUserPrompts(t *testing.T) {
 	human := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"remember this"}}`)
 	generated := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"role":"user","content":"generated prompt"}}`)
-	if !briefCacheUserRecord(human, classifyBriefRecordPrefix(human)) {
+	if !mustBriefCacheUserRecord(t, human, classifyBriefRecordPrefix(human)) {
 		t.Fatal("human-origin user record was omitted")
 	}
-	if briefCacheUserRecord(generated, classifyBriefRecordPrefix(generated)) {
+	if mustBriefCacheUserRecord(t, generated, classifyBriefRecordPrefix(generated)) {
 		t.Fatal("generated prompt was stored as a human reply")
 	}
 }
@@ -327,18 +332,22 @@ func TestBriefCacheParsesReorderedHumanUserRecord(t *testing.T) {
 	}
 }
 
-func TestBriefCacheUsesPrefetchedTimestampForCachedReplies(t *testing.T) {
-	raw := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"remember this"}}`)
-	collector := briefQuoteCollector{indexEnabled: true}
-	hints, ok := collector.fastHintsForRecord(raw)
-	if !ok {
-		t.Fatal("expected fast timestamp hints")
+func TestBriefCacheStoresExactTimestampForCachedReplies(t *testing.T) {
+	raw := []byte(`{"type":"user","timestamp":"2026-10-31T12:00:00.000000001+02:00","origin":{"kind":"human"},"message":{"role":"user","content":"remember this"}}`)
+	stamp, err := transcriptTimestamp(raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	collector.setRawDay(hints.rawDay, raw, hints)
+	collector := briefQuoteCollector{indexEnabled: true}
+	hints := scanBriefRecordHints(raw)
+	collector.setRawDay([]byte(stamp.UTC().Format(time.DateOnly)), raw, hints)
 	if len(collector.indexReplies) != 1 {
 		t.Fatalf("cached event count=%d, want one", len(collector.indexReplies))
 	}
-	want := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
+	if len(collector.indexBuckets) != 1 || collector.indexBuckets[0] != stamp.UnixNano() {
+		t.Fatalf("cached record time=%v, want exact Unix nanoseconds %d", collector.indexBuckets, stamp.UnixNano())
+	}
+	want := time.Date(2026, 10, 31, 10, 0, 0, 1, time.UTC)
 	if !collector.indexReplies[0].Time.Equal(want) {
 		t.Fatalf("cached event time=%s, want %s", collector.indexReplies[0].Time, want)
 	}
@@ -366,28 +375,28 @@ func TestBriefCacheTypeAfterMessage(t *testing.T) {
 
 func TestBriefCacheReorderedEventMessage(t *testing.T) {
 	raw := []byte(`{"timestamp":"2026-10-31T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"remember this"}}`)
-	if !briefCacheUserRecord(raw, classifyBriefRecordPrefix(raw)) {
+	if !mustBriefCacheUserRecord(t, raw, classifyBriefRecordPrefix(raw)) {
 		t.Fatal("reordered human event message was not indexed")
 	}
 }
 
 func TestBriefCacheReorderedQueuedCommand(t *testing.T) {
 	raw := []byte(`{"timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"queued_command","prompt":"remember this","origin":{"kind":"human"}},"type":"attachment"}`)
-	if !briefCacheUserRecord(raw, classifyBriefRecordPrefix(raw)) {
+	if !mustBriefCacheUserRecord(t, raw, classifyBriefRecordPrefix(raw)) {
 		t.Fatal("reordered human queued command was not indexed")
 	}
 }
 
 func TestBriefCacheQueuedCommandMarkersAfterLongPrompt(t *testing.T) {
 	raw := []byte(`{"type":"attachment","timestamp":"2026-10-31T10:00:00Z","attachment":{"type":"queued_command","prompt":"` + strings.Repeat("x", briefCachePrefixLookahead) + `","origin":{"kind":"human"}}}`)
-	if !briefCacheUserRecord(raw, classifyBriefRecordPrefix(raw)) {
+	if !mustBriefCacheUserRecord(t, raw, classifyBriefRecordPrefix(raw)) {
 		t.Fatal("human queued command after a long prompt was not indexed")
 	}
 }
 
 func TestBriefCacheSkipsTailSearchForUnrelatedRecords(t *testing.T) {
 	unrelated := []byte(`{"timestamp":"2026-10-31T10:00:00Z","payload":{"content":"` + strings.Repeat("x", 8192) + `"}}`)
-	if briefCacheUserRecord(unrelated, briefRecordUnknown) {
+	if mustBriefCacheUserRecord(t, unrelated, briefRecordUnknown) {
 		t.Fatal("unrelated record classified as a human reply")
 	}
 
@@ -398,6 +407,15 @@ func TestBriefCacheSkipsTailSearchForUnrelatedRecords(t *testing.T) {
 	if len(collector.indexReplies) != 1 || collector.indexReplies[0].Text != "remember this" {
 		t.Fatalf("user event count=%d", len(collector.indexReplies))
 	}
+}
+
+func mustBriefCacheUserRecord(t *testing.T, raw []byte, kind briefRecordKind) bool {
+	t.Helper()
+	user, err := briefCacheUserRecord(raw, kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return user
 }
 
 func TestBriefFastHintsKeepRecordKindForCacheIndex(t *testing.T) {
@@ -508,9 +526,12 @@ func TestBriefCacheMergesRecordDaysFromNonCandidateFiles(t *testing.T) {
 
 func TestCachedRecordDayUsesExclusiveEnd(t *testing.T) {
 	start := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
-	nextDayBucket := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC).Unix() / replycache.RecordBucketSeconds * replycache.RecordBucketSeconds
-	if cachedRecordDay([]int64{nextDayBucket}, start, start.AddDate(0, 0, 1)) {
+	nextDayBucket := cachedRecordTime("2026-11-01T00:00:00Z")
+	if cachedRecordDay([]replycache.RecordTime{nextDayBucket}, start, start.AddDate(0, 0, 1)) {
 		t.Fatal("00:05 next-day record bucket counted in prior day")
+	}
+	if cachedRecordDay([]replycache.RecordTime{cachedRecordTime("2026-10-31T10:00:00Z")}, start, start.Add(time.Hour)) {
+		t.Fatal("record exactly at the exclusive end was counted")
 	}
 }
 
@@ -518,10 +539,9 @@ func TestCachedRecordDayIncludesUntilBoundary(t *testing.T) {
 	until := time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)
 	interval := markerRecordInterval{start: until, end: until.AddDate(0, 0, 1)}
 	key := markerRecordDayKey(interval.start)
-	bucket := until.Unix() / replycache.RecordBucketSeconds * replycache.RecordBucketSeconds
 	recordDays := make(map[string]bool)
 	filters := briefQuoteFilters{recordWindows: map[string]markerRecordInterval{key: interval}}
-	if _, err := cachedBriefCandidate(replycache.CachedTranscript{RecordBuckets: []int64{bucket}}, filters, nil, until, time.UTC, recordDays); err != nil {
+	if _, err := cachedBriefCandidate(replycache.CachedTranscript{RecordTimes: []replycache.RecordTime{cachedRecordTime(until.Format(time.RFC3339Nano))}}, filters, nil, until, time.UTC, recordDays); err != nil {
 		t.Fatal(err)
 	}
 	if !recordDays[key] {
@@ -529,93 +549,293 @@ func TestCachedRecordDayIncludesUntilBoundary(t *testing.T) {
 	}
 }
 
-func TestBriefBucketTimestampParsesOffsets(t *testing.T) {
-	got, ok := briefBucketTimestamp([]byte("2026-10-31T00:05:00.125+01:00"))
-	want := time.Date(2026, 10, 30, 23, 5, 0, 0, time.UTC)
-	if !ok || !got.Equal(want) {
-		t.Fatalf("offset timestamp = %v, %v; want %v", got, ok, want)
+func TestCachedRecordDayExcludesLaterRecordInFormerQuarterHour(t *testing.T) {
+	until := time.Date(2026, 11, 11, 10, 2, 0, 0, time.UTC)
+	after := time.Date(2026, 11, 11, 10, 8, 0, 0, time.UTC)
+	interval := markerRecordInterval{start: until.Add(-time.Hour), end: after.Add(time.Hour)}
+	key := markerRecordDayKey(interval.start)
+	filters := briefQuoteFilters{recordWindows: map[string]markerRecordInterval{key: interval}}
+	recordDays := make(map[string]bool)
+	_, err := cachedBriefCandidate(replycache.CachedTranscript{
+		RecordTimes: []replycache.RecordTime{cachedRecordTime(after.Format(time.RFC3339Nano))},
+	}, filters, nil, until, time.UTC, recordDays)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := briefBucketTimestamp([]byte("2026-02-30T12:00:00Z")); ok {
-		t.Fatal("invalid calendar date accepted")
-	}
-}
-
-func TestBriefTimestampAfterUTCUsesFractionalCutoff(t *testing.T) {
-	cutoff := []byte("2026-10-31T10:00:05.500000000Z")
-	for _, raw := range []string{"2026-10-31T10:00:04Z", "2026-10-31T10:00:05Z", "2026-10-31T10:00:05.5Z"} {
-		after, canonical := briefTimestampAfterUTC([]byte(raw), cutoff)
-		if !canonical || after {
-			t.Fatalf("timestamp %q after cutoff=%v canonical=%v", raw, after, canonical)
-		}
-	}
-	for _, raw := range []string{"2026-10-31T10:00:05.500000001Z", "2026-10-31T10:00:06Z"} {
-		after, canonical := briefTimestampAfterUTC([]byte(raw), cutoff)
-		if !canonical || !after {
-			t.Fatalf("timestamp %q after cutoff=%v canonical=%v", raw, after, canonical)
-		}
-	}
-	if _, canonical := briefTimestampAfterUTC([]byte("2026-10-31T10:00:06+01:00"), cutoff); canonical {
-		t.Fatal("offset timestamp entered the canonical UTC path")
-	}
-	dateCutoff := []byte("2026-10-31")
-	utcCutoff := []byte("2026-10-31T00:00:00.000000000Z")
-	until, _ := time.Parse(time.RFC3339Nano, string(utcCutoff))
-	if briefTimestampAfterScanUntil([]byte("2026-10-30"), []byte("2026-10-30T23:59:59Z"), dateCutoff, utcCutoff, until) {
-		t.Fatal("earlier UTC day was treated as after --until")
-	}
-	if !briefTimestampAfterScanUntil([]byte("2026-10-30"), []byte("2026-10-30T23:30:00-01:00"), dateCutoff, utcCutoff, until) {
-		t.Fatal("offset timestamp crossing into the cutoff day was skipped")
+	if recordDays[key] {
+		t.Fatal("record after --until was attributed to the marker day")
 	}
 }
 
-func TestBriefBucketUnixMatchesTimeParse(t *testing.T) {
-	for _, raw := range []string{
-		"2026-10-30T23:05:00.125+01:00",
-		"2000-02-29T12:34:56Z",
-		"1969-12-31T23:59:59Z",
-		"2026-11-11T00:00:00-07:30",
+func TestCachedRecordDayUsesNanosecondUntilBoundary(t *testing.T) {
+	until := time.Date(2026, 11, 11, 10, 2, 0, 0, time.UTC)
+	interval := markerRecordInterval{start: until.Truncate(24 * time.Hour), end: until.AddDate(0, 0, 1)}
+	key := markerRecordDayKey(interval.start)
+	filters := briefQuoteFilters{recordWindows: map[string]markerRecordInterval{key: interval}}
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{name: "exact boundary", at: until, want: true},
+		{name: "one nanosecond after", at: until.Add(time.Nanosecond), want: false},
 	} {
-		want, err := time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, ok := briefBucketUnix([]byte(raw))
-		if !ok || got != want.Unix() {
-			t.Fatalf("briefBucketUnix(%q) = %d, %v; want %d", raw, got, ok, want.Unix())
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			recordDays := make(map[string]bool)
+			_, err := cachedBriefCandidate(replycache.CachedTranscript{RecordTimes: []replycache.RecordTime{cachedRecordTime(tc.at.Format(time.RFC3339Nano))}}, filters, nil, until, time.UTC, recordDays)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recordDays[key] != tc.want {
+				t.Fatalf("recordDays[%q]=%v, want %v", key, recordDays[key], tc.want)
+			}
+		})
 	}
-	for _, raw := range []string{"2026-02-30T12:00:00Z", "2026-10-30T23:05:00+24:00"} {
-		if _, ok := briefBucketUnix([]byte(raw)); ok {
-			t.Fatalf("briefBucketUnix(%q) accepted invalid timestamp", raw)
+}
+
+func TestCachedRecordDayMatchesBaseUTCRecordDayRules(t *testing.T) {
+	until := time.Date(2026, 10, 31, 10, 2, 0, 0, time.UTC)
+	start := until.Add(-time.Hour)
+	end := until.Add(time.Hour)
+	for _, tc := range []struct {
+		stamp string
+		want  bool
+	}{
+		{stamp: "2026-10-31T12:02:00+02:00", want: false},
+		{stamp: "2026-11-01T00:02:00+14:00", want: false},
+	} {
+		if got := cachedRecordDay([]replycache.RecordTime{cachedRecordTime(tc.stamp)}, start, end); got != tc.want {
+			t.Errorf("cachedRecordDay(%q)=%v, want %v", tc.stamp, got, tc.want)
 		}
 	}
 }
 
-func TestBriefUTCBucketKeyReusesFractionalTimestampBucket(t *testing.T) {
-	first, ok := briefUTCBucketKey([]byte("2026-10-31T10:02:03Z"))
-	if !ok {
-		t.Fatal("UTC timestamp key was rejected")
-	}
-	if !briefUTCBucketMatchesKey([]byte("2026-10-31T10:14:59.123456Z"), first) {
-		t.Fatal("same 15-minute UTC bucket did not match key")
-	}
-	if briefUTCBucketMatchesKey([]byte("2026-10-31T10:15:00Z"), first) || briefUTCBucketMatchesKey([]byte("2026-11-01T10:02:03Z"), first) {
-		t.Fatal("different UTC bucket matched key")
-	}
-	second, ok := briefUTCBucketKey([]byte("2026-10-31T10:14:59.123456Z"))
-	if !ok || first != second {
-		t.Fatal("timestamps in one 15-minute UTC bucket got different keys")
-	}
-	if next, ok := briefUTCBucketKey([]byte("2026-10-31T10:15:00Z")); !ok || first == next {
-		t.Fatal("timestamps on opposite sides of a bucket boundary got the same key")
-	}
-	if _, ok := briefUTCBucketKey([]byte("2026-10-31T10:15:03+01:00")); ok {
-		t.Fatal("offset timestamp entered the UTC fast path")
-	}
-	for _, value := range []string{"2026-10-31T10:02:60Z", "2026-10-31T10:60:03Z"} {
-		if _, ok := briefUTCBucketKey([]byte(value)); ok {
-			t.Fatalf("invalid timestamp %q entered the fast path", value)
+func TestBriefCacheFallsBackForUnclosedTimestamp(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	e := testEnv(t)
+	writeTranscript(t, e.home, "-home-x-proj", "known", human("2026-10-30T10:00:00Z", "known note"))
+	path := writeTranscript(t, e.home, "-home-y-proj", "growing",
+		human("2026-10-31T09:00:00Z", "unrelated"),
+		human("2026-10-31T10:03:00Z", "after cutoff"),
+		`{"type":"user","timestamp":"2026-10-31T10:04:00Z`,
+		human("2026-10-31T10:05:00Z", "later"),
+	)
+	e.replyCache = replycache.New()
+	uncached := e
+	uncached.replyCache = nil
+	brief := writeBrief(t, t.TempDir(), "Пользователь 30.10: «known note»\nПользователь 31.10: «missing phrase»\n")
+	for range 2 {
+		wantCode, want := briefRun(t, uncached, brief, "--until", "2026-10-31 10:02")
+		gotCode, got := briefRun(t, e, brief, "--until", "2026-10-31 10:02")
+		if gotCode != wantCode || got != want {
+			t.Fatalf("cached scan of an incomplete final row differs (code %d, want %d)", gotCode, wantCode)
 		}
+		if gotCode != 1 || strings.Contains(got, "malformed transcript lines") {
+			t.Fatalf("row after --until did not follow the direct reader's cutoff (code %d)", gotCode)
+		}
+	}
+	if _, complete, _ := e.replyCache.CachedEvents(path); complete {
+		t.Fatal("failed cache scan published a record")
+	}
+}
+
+func TestBriefCacheFallsBackOnIndexIssue(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	e := testEnv(t)
+	path := writeTranscript(t, e.home, "-home-x-proj", "bad-user",
+		`{"type":"user","timestamp":"2026-10-31T10:00:00Z","origin":{"kind":"human"},"message":{"content":"broken"`,
+	)
+	e.replyCache = replycache.New()
+	uncached := e
+	uncached.replyCache = nil
+	brief := writeBrief(t, t.TempDir(), "Пользователь 31.10: «broken»\n")
+	wantCode, want := briefRun(t, uncached, brief, "--until", "2026-10-31 10:02")
+	gotCode, got := briefRun(t, e, brief, "--until", "2026-10-31 10:02")
+	if gotCode != wantCode || got != want {
+		t.Fatalf("cache index issue changed direct result (code %d, want %d)", gotCode, wantCode)
+	}
+	if _, complete, _ := e.replyCache.CachedEvents(path); complete {
+		t.Fatal("cache index error published a record")
+	}
+}
+
+func TestBriefCacheFallsBackOutsideUnixNanoRange(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	e := testEnv(t)
+	e.replyCache = replycache.New()
+	path := writeTranscript(t, e.home, "-home-x-proj", "in-range-source", human("2026-10-31T10:00:00Z", "synthetic"))
+	filters := briefQuoteFilters{from: briefCacheCoverageUntil().Add(time.Nanosecond)}
+	until := filters.from.Add(time.Hour)
+	got := scanBriefTranscript(path, filters, nil, until, time.UTC, e.replyCache, false)
+	want := scanBriefTranscript(path, filters, nil, until, time.UTC, nil, false)
+	if got.err != want.err || len(got.hits) != len(want.hits) || len(got.warnings) != len(want.warnings) {
+		t.Fatalf("out-of-range cache path differs from direct scan (cached err=%v, direct err=%v)", got.err, want.err)
+	}
+	if _, complete, _ := e.replyCache.CachedEvents(path); complete {
+		t.Fatal("out-of-range query published a cache record")
+	}
+}
+
+func cachedRecordTime(value string) replycache.RecordTime {
+	stamp, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		panic(err)
+	}
+	return replycache.RecordTime{Seconds: stamp.Unix(), Nanosecond: int32(stamp.Nanosecond()), TextDay: value[:len(time.DateOnly)], RecordDay: validUTCTimestampDate([]byte(value))}
+}
+
+func TestBriefCacheHumanOriginParsesWholeUnorderedRecord(t *testing.T) {
+	ordered := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","origin":{"source":"cli","kind":"human"},"message":{"content":"synthetic"}}`)
+	if human, err := briefCacheHumanOrigin(ordered, briefCacheRecordHeader(ordered), false); err != nil || !human {
+		t.Fatal("human origin with reordered keys was missed")
+	}
+	long := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":"` + strings.Repeat("x", 5000) + `"},"padding":"` + strings.Repeat("y", 5000) + `","origin":{"source":"cli","kind":"human"}}`)
+	if human, err := briefCacheHumanOrigin(long, briefCacheRecordHeader(long), false); err != nil || !human {
+		t.Fatal("human origin beyond the message tail was missed")
+	}
+}
+
+func TestBriefCacheClassifierReturnsMalformedRecordError(t *testing.T) {
+	raw := []byte(`{"type":"user","origin":{"kind":"human"}`)
+	if _, _, err := briefCacheUserRecordInfo(raw, briefRecordUser); err == nil {
+		t.Fatal("malformed cached user record was classified without an error")
+	}
+}
+
+func TestBriefVisibleLinesHonorsExactUntil(t *testing.T) {
+	until := time.Date(2026, 11, 11, 10, 2, 0, 0, time.UTC)
+	lines := []line{{t: until.Add(-time.Second)}, {t: until}, {t: until.Add(time.Second)}}
+	got := briefVisibleLines(lines, until)
+	if len(got) != 2 || !got[1].t.Equal(until) {
+		t.Fatalf("visible lines = %#v; want rows through exact cutoff", got)
+	}
+}
+
+func TestKeepWithHintsExcludesRecordAfterUntil(t *testing.T) {
+	until := time.Date(2026, 11, 11, 10, 2, 0, 0, time.UTC)
+	collector := briefQuoteCollector{
+		indexEnabled: true,
+		until:        until,
+		untilDate:    []byte(until.UTC().Format(time.DateOnly)),
+		untilUTC:     []byte(until.UTC().Format("2006-01-02T15:04:05.000000000Z")),
+	}
+	raw := []byte(`{"type":"user","origin":{"kind":"human"},"timestamp":"2026-11-11T10:08:00Z","message":{"content":"synthetic"}}`)
+	hints, _ := collector.fastHintsForRecord(raw)
+	if collector.keepWithHints(raw, hints) {
+		t.Fatal("record after --until was retained")
+	}
+	if len(collector.indexBuckets) != 0 {
+		t.Fatal("record after --until entered the activity index")
+	}
+	collector.lastAgent = []byte("agent context before cutoff")
+	agent := []byte(`{"type":"assistant","timestamp":"2026-11-11T10:02:01Z","message":{"content":[{"type":"text","text":"agent context after cutoff"}]}}`)
+	agentHints, _ := collector.fastHintsForRecord(agent)
+	if collector.keepWithHints(agent, agentHints) {
+		t.Fatal("agent record after --until was retained")
+	}
+	if string(collector.lastAgent) != "agent context before cutoff" {
+		t.Fatalf("post-cutoff agent replaced context: %q", collector.lastAgent)
+	}
+}
+
+func TestBriefTimestampAfterUntilUsesBaseRule(t *testing.T) {
+	until := time.Date(2026, 10, 31, 10, 2, 0, 0, time.UTC)
+	for _, raw := range []string{
+		`{"timestamp":"2026-10-31T12:02:00.000000000+02:00"}`,
+		`{"timestamp":"2026-10-31T09:59:00Z"}`,
+	} {
+		past, err := briefTimestampAfterUntil([]byte(raw), until)
+		if err != nil || past {
+			t.Errorf("record at/before until treated as after: %s", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"timestamp":"2026-10-31T10:02:00.000000001Z"}`,
+		`{"timestamp":"2026-10-31T11:02:00-01:00"}`,
+		`{"timestamp":"2026-11-01T00:02:00+14:00"}`,
+	} {
+		past, err := briefTimestampAfterUntil([]byte(raw), until)
+		if err != nil || !past {
+			t.Errorf("record after until treated as before: %s", raw)
+		}
+	}
+	past, err := briefTimestampAfterUntil([]byte(`{"type":"user"}`), until)
+	if err != nil || past {
+		t.Fatal("missing timestamp was treated as after --until")
+	}
+	if _, err := briefTimestampAfterUntil([]byte(`{"timestamp":"invalid"}`), until); err == nil {
+		t.Fatal("invalid timestamp error was hidden")
+	}
+}
+
+func TestIndexRecordRetainsDataPastCurrentUntil(t *testing.T) {
+	until := time.Date(2026, 10, 31, 10, 2, 0, 0, time.UTC)
+	collector := briefQuoteCollector{indexEnabled: true, until: until}
+	first := []byte(`{"timestamp":"2026-11-01T00:02:00+14:00","type":"user"}`)
+	within, err := collector.indexRecordTimestampValid(first)
+	if err != nil || !within {
+		t.Fatalf("valid record after --until: indexable=%v err=%v, want true", within, err)
+	}
+	malformed := []byte(`{"type":"user","message":`)
+	within, err = collector.indexRecordTimestampValid(malformed)
+	if err != nil || !within {
+		t.Fatalf("timestamp-less record: indexable=%v err=%v, want true", within, err)
+	}
+}
+
+func TestKeepWithHintsSurfacesTimestampParseError(t *testing.T) {
+	collector := briefQuoteCollector{indexEnabled: true}
+	raw := []byte(`{"type":"user","timestamp":"not-a-timestamp","message":{"content":"synthetic"}}`)
+	hints := scanBriefRecordHints(raw)
+	if !collector.keepWithHints(raw, hints) {
+		t.Fatal("record with invalid timestamp was not handed to the scanner")
+	}
+	if collector.timestampErr == nil {
+		t.Fatal("timestamp parse error was hidden")
+	}
+}
+
+func TestBriefScanNoteBadInheritsLastTimestamp(t *testing.T) {
+	previous := time.Date(2026, 10, 31, 10, 2, 0, 1, time.UTC)
+	scan := briefScan{lastTimestamp: previous, badDays: make(map[string]bool)}
+	scan.noteBad(2, errors.New("synthetic malformed line"), nil,
+		[]byte(`{"type":"user"}`), true)
+	if got := scan.badRecords[0].Time; !got.Equal(previous) {
+		t.Fatalf("malformed row time=%s, want previous record time %s", got, previous)
+	}
+}
+
+func TestBriefScanKeepsExactPreviousTimestampForUntimestampedBadRow(t *testing.T) {
+	previous := time.Date(2026, 10, 31, 10, 2, 0, 1, time.UTC)
+	data := `{"type":"user","timestamp":"2026-10-31T10:02:00.000000001Z","message":{"content":"synthetic"}}` + "\n" + `{broken}` + "\n"
+	scan := briefScan{badDays: make(map[string]bool), linesBefore: func() (int, error) { return 0, nil }}
+	_, err := scan.lines(bufio.NewReader(strings.NewReader(data)), transcript.NewParser(), previous.Add(time.Minute), nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan.badRecords) != 1 {
+		t.Fatalf("bad row count=%d, want 1", len(scan.badRecords))
+	}
+	if !scan.badRecords[0].Time.Equal(previous) {
+		t.Fatalf("bad row time=%s, want previous exact timestamp %s", scan.badRecords[0].Time, previous)
+	}
+}
+
+func TestBriefScanWarningRelevantInheritsLastTimestamp(t *testing.T) {
+	previous := time.Date(2026, 10, 31, 10, 2, 0, 1, time.UTC)
+	raw := []byte(`{"type":"user"}`)
+	scan := briefScan{
+		lastTimestamp: previous,
+		warningFrom:   previous,
+		warningUntil:  previous,
+	}
+	if !scan.warningRelevant(raw) {
+		t.Fatal("missing timestamp did not inherit the previous timestamp for warning filtering")
+	}
+	scan.warningFrom = previous.Add(time.Second)
+	scan.warningUntil = previous.Add(time.Minute)
+	if scan.warningRelevant(raw) {
+		t.Fatal("missing timestamp warning escaped the inherited-time window")
 	}
 }
 

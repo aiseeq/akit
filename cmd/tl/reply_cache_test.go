@@ -58,7 +58,7 @@ func TestReplyCacheMatchesOriginal(t *testing.T) {
 	}
 }
 
-func TestRunUsesReplyCacheAndCleans(t *testing.T) {
+func TestRunUsesReplyCacheAndPreservesSiblingCode(t *testing.T) {
 	e := fakeHome(t)
 	cache := replycache.New()
 	oldFactory := newReplyCache
@@ -78,8 +78,8 @@ func TestRunUsesReplyCacheAndCleans(t *testing.T) {
 	if cache.Misses.Load() != 1 {
 		t.Fatalf("misses: %d", cache.Misses.Load())
 	}
-	if _, err := os.Stat(obsolete); !os.IsNotExist(err) {
-		t.Fatalf("cleanup: %v", err)
+	if _, err := os.Stat(obsolete); err != nil {
+		t.Fatalf("cleanup removed a sibling cache code directory: %v", err)
 	}
 }
 

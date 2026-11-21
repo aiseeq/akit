@@ -855,14 +855,13 @@ func TestBriefFastHintsByDay(t *testing.T) {
 	}
 	user := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":"old"}}`)
 	hints, ok := c.fastHintsForRecord(user)
-	if !ok || hints.user || hints.agent || string(hints.rawDay) != "2026-10-31" || string(hints.timestamp) != "2026-10-31T10:00:00Z" {
+	if !ok || !hints.user || hints.agent || string(hints.rawDay) != "2026-10-31" || string(hints.timestamp) != "2026-10-31T10:00:00Z" {
 		t.Fatalf("irrelevant user hints = (%+v, %v)", hints, ok)
 	}
 	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
-	wantDay, wantPast, wantKnown, wantErr := briefRecordStatus(user, []byte("2026-10-31"), until)
-	gotDay, gotPast, gotErr := briefRecordPast(user, hints, []byte("2026-10-31"), until)
-	if string(gotDay) != string(wantDay) || gotPast != (wantKnown && wantPast) || (gotErr == nil) != (wantErr == nil) {
-		t.Fatalf("cached record status = (%s, %v, %v), want (%s, %v, %v)", gotDay, gotPast, gotErr, wantDay, wantKnown && wantPast, wantErr)
+	gotDay, gotPast, gotErr := briefRecordPast(user, hints, until)
+	if string(gotDay) != "2026-10-31" || gotPast || gotErr != nil {
+		t.Fatalf("cached record status = (%s, %v, %v), want (2026-10-31, false, nil)", gotDay, gotPast, gotErr)
 	}
 	agent := []byte(`{"type":"assistant","timestamp":"2026-10-31T10:00:00Z","message":{"content":[{"type":"text","text":"context"}]}}`)
 	if hints, ok := c.fastHintsForRecord(agent); !ok || !hints.agent {
@@ -978,13 +977,46 @@ func TestBriefRecordAtUntilIsNotPast(t *testing.T) {
 	raw := []byte(`{"timestamp":"2026-10-31T11:00:00Z"}`)
 	hints := briefRecordHints{rawDay: stamp[:len(time.DateOnly)], timestamp: stamp}
 	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
-	_, past, err := briefRecordPast(raw, hints, []byte("2026-10-31"), until)
+	_, past, err := briefRecordPast(raw, hints, until)
 	if err != nil || past {
 		t.Fatalf("timestamp equal to until: past=%v err=%v", past, err)
 	}
-	_, past, known, err := briefRecordStatus(raw, []byte("2026-10-31"), until)
-	if err != nil || !known || past {
-		t.Fatalf("uncached timestamp equal to until: known=%v past=%v err=%v", known, past, err)
+}
+
+func TestBriefRecordPastUsesTimeWithinTextDay(t *testing.T) {
+	until := time.Date(2026, 10, 31, 10, 2, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		stamp string
+		past  bool
+	}{
+		{stamp: "2026-10-31T10:01:59.999999999Z", past: false},
+		{stamp: "2026-10-31T10:02:00Z", past: false},
+		{stamp: "2026-10-31T10:02:00.000000001Z", past: true},
+	} {
+		raw := []byte(`{"timestamp":"` + tc.stamp + `"}`)
+		hints := briefRecordHints{rawDay: []byte(tc.stamp[:len(time.DateOnly)]), timestamp: []byte(tc.stamp)}
+		_, past, err := briefRecordPast(raw, hints, until)
+		if err != nil || past != tc.past {
+			t.Errorf("timestamp %q past=%v err=%v, want past=%v", tc.stamp, past, err, tc.past)
+		}
+	}
+}
+
+func TestBriefRecordPastComparesTextDayBeforeOffsetTime(t *testing.T) {
+	until := time.Date(2026, 10, 31, 10, 2, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		stamp string
+		past  bool
+	}{
+		{stamp: "2026-10-31T12:02:00+02:00", past: false},
+		{stamp: "2026-11-01T00:02:00+14:00", past: true},
+	} {
+		raw := []byte(`{"timestamp":"` + tc.stamp + `"}`)
+		hints := briefRecordHints{rawDay: []byte(tc.stamp[:len(time.DateOnly)]), timestamp: []byte(tc.stamp)}
+		_, past, err := briefRecordPast(raw, hints, until)
+		if err != nil || past != tc.past {
+			t.Errorf("timestamp %q past=%v err=%v, want past=%v", tc.stamp, past, err, tc.past)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package replycache
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
@@ -21,16 +22,13 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-const version = 3
+const version = 4
 const maxEntry = 256 << 20
 const maxCache = 512 << 20
 const maxAge = 30 * 24 * time.Hour
 const liveAge = 10 * time.Minute
 const privateMode = 0700
 const otherPermissions = 0077
-
-// RecordBucketSeconds is the width of activity buckets stored with transcript events.
-const RecordBucketSeconds int64 = 15 * 60
 
 var errBadPrefilter = errors.New("bad lines require filtered reading")
 
@@ -64,7 +62,8 @@ type record struct {
 	Events           []event
 	BadLines         []badLine
 	BadCoverageDays  []string
-	RecordBuckets    []int64
+	RecordBuckets    []int64 // Exact UnixNano timestamps of transcript activity.
+	RecordTimes      []RecordTime
 	CompleteFile     bool
 	ActivityComplete bool
 	ActivityCode     string
@@ -84,6 +83,15 @@ type badLine struct {
 	Message string
 }
 
+// RecordTime preserves an exact instant and the source timestamp's calendar day.
+// Some callers decide --until by that text day before comparing the instant.
+type RecordTime struct {
+	Seconds    int64
+	Nanosecond int32
+	TextDay    string
+	RecordDay  bool
+}
+
 // Snapshot binds a cached event record to the source file state observed before scanning.
 type Snapshot struct {
 	key    key
@@ -97,7 +105,8 @@ type CachedTranscript struct {
 	BadCoverageDays  []string
 	RawDays          []string
 	Meta             transcript.Meta
-	RecordBuckets    []int64
+	RecordBuckets    []int64 // Exact UnixNano timestamps of transcript activity.
+	RecordTimes      []RecordTime
 	ActivityComplete bool
 	Coverage         []CoverageRange
 	BadDays          []string
@@ -396,6 +405,7 @@ func (c *Cache) CachedEvents(path string) (CachedTranscript, bool, error) {
 		RawDays:          rawDays,
 		Meta:             meta(rec),
 		RecordBuckets:    rec.RecordBuckets,
+		RecordTimes:      slices.Clone(rec.RecordTimes),
 		ActivityComplete: rec.ActivityComplete && rec.ActivityCode == c.activityCode,
 		Coverage:         coverage,
 		BadDays:          slices.Clone(rec.BadDays),
@@ -418,6 +428,17 @@ func (c *Cache) StoreEventsWithBadLines(path string, snapshot Snapshot, events [
 // successfully loaded one before scanning. This avoids reopening the source and
 // probing the cache a second time on a cold miss.
 func (c *Cache) StoreEventsWithBadLinesFromLookup(path string, snapshot Snapshot, events []transcript.Event, buckets []int64, badDays []string, badGlobal bool, badLines []BadLine, badCoverageDays []string, from, until time.Time, m transcript.Meta, mergeExisting bool) string {
+	reason := c.StoreEventsWithRecordTimesFromLookup(path, snapshot, events, buckets, nil, badDays, badGlobal, badLines, badCoverageDays, from, until, m, mergeExisting)
+	if strings.HasPrefix(reason, "save cache record:") {
+		return ""
+	}
+	return reason
+}
+
+// StoreEventsWithRecordTimesFromLookup stores activity timestamps with their original
+// textual values as well as exact instants. Some readers use the source date before
+// comparing timestamp instants, so UnixNano alone is not sufficient.
+func (c *Cache) StoreEventsWithRecordTimesFromLookup(path string, snapshot Snapshot, events []transcript.Event, buckets []int64, recordTimes []RecordTime, badDays []string, badGlobal bool, badLines []BadLine, badCoverageDays []string, from, until time.Time, m transcript.Meta, mergeExisting bool) string {
 	if snapshot.Reason != "" {
 		return snapshot.Reason
 	}
@@ -447,26 +468,74 @@ func (c *Cache) StoreEventsWithBadLinesFromLookup(path string, snapshot Snapshot
 		old, _, err = c.loadRecord(path, false)
 		oldLoaded = err == nil
 	}
-	if oldLoaded && old.ActivityComplete && old.ActivityCode == c.activityCode {
-		rec.Events = mergeEvents(old.Events, rec.Events)
-		rec.RecordBuckets = append(old.RecordBuckets, buckets...)
-		rec.Bad = max(rec.Bad, old.Bad)
-		rec.BadDays = mergeStrings(old.BadDays, rec.BadDays)
-		rec.BadLines = mergeBadLines(old.BadLines, rec.BadLines)
-		rec.BadCoverageDays = mergeStrings(old.BadCoverageDays, rec.BadCoverageDays)
-		rec.BadGlobal = rec.BadGlobal || old.BadGlobal
-		if rec.FirstBad == "" {
-			rec.FirstBad = old.FirstBad
-		}
-		rec.Name = firstNonEmpty(rec.Name, old.Name)
-		rec.Coverage = mergeCoverage(old.Coverage, rec.Coverage)
-	} else {
-		rec.RecordBuckets = buckets
-	}
+	mergeActivityData(&rec, old, oldLoaded, c.activityCode, buckets, recordTimes)
+	// The TL whole-file cache and the activity index share this record. Keep
+	// whole-file content owned by TL while refreshing activity data owned by the
+	// current producer.
+	preserveWholeFile(&rec, old, oldLoaded)
 	slices.Sort(rec.RecordBuckets)
 	rec.RecordBuckets = compactInt64(rec.RecordBuckets)
-	c.save(snapshot.key, rec)
+	slices.SortFunc(rec.RecordTimes, func(a, b RecordTime) int {
+		if n := cmp.Compare(a.Seconds, b.Seconds); n != 0 {
+			return n
+		}
+		if n := cmp.Compare(a.Nanosecond, b.Nanosecond); n != 0 {
+			return n
+		}
+		if n := strings.Compare(a.TextDay, b.TextDay); n != 0 {
+			return n
+		}
+		if a.RecordDay == b.RecordDay {
+			return 0
+		}
+		if a.RecordDay {
+			return 1
+		}
+		return -1
+	})
+	rec.RecordTimes = slices.Compact(rec.RecordTimes)
+	if err := c.save(snapshot.key, rec); err != nil {
+		return fmt.Sprintf("save cache record: %v", err)
+	}
 	return ""
+}
+
+func mergeActivityData(rec *record, old record, oldLoaded bool, activityCode string, buckets []int64, times []RecordTime) {
+	if oldLoaded && old.ActivityComplete && old.ActivityCode == activityCode {
+		mergeActivityRecord(rec, old, buckets, times)
+		return
+	}
+	rec.RecordBuckets = buckets
+	rec.RecordTimes = slices.Clone(times)
+}
+
+func mergeActivityRecord(rec *record, old record, buckets []int64, times []RecordTime) {
+	rec.Events = mergeEvents(old.Events, rec.Events)
+	rec.RecordBuckets = append(old.RecordBuckets, buckets...)
+	rec.RecordTimes = append(old.RecordTimes, times...)
+	rec.Bad = max(rec.Bad, old.Bad)
+	rec.BadDays = mergeStrings(old.BadDays, rec.BadDays)
+	rec.BadLines = mergeBadLines(old.BadLines, rec.BadLines)
+	rec.BadCoverageDays = mergeStrings(old.BadCoverageDays, rec.BadCoverageDays)
+	rec.BadGlobal = rec.BadGlobal || old.BadGlobal
+	if rec.FirstBad == "" {
+		rec.FirstBad = old.FirstBad
+	}
+	rec.Name = firstNonEmpty(rec.Name, old.Name)
+	rec.Coverage = mergeCoverage(old.Coverage, rec.Coverage)
+}
+
+func preserveWholeFile(rec *record, old record, oldLoaded bool) {
+	if !oldLoaded || !old.CompleteFile {
+		return
+	}
+	rec.Events = old.Events
+	rec.CompleteFile = true
+	rec.Name = firstNonEmpty(rec.Name, old.Name)
+	rec.Bad = max(rec.Bad, old.Bad)
+	if rec.FirstBad == "" {
+		rec.FirstBad = old.FirstBad
+	}
 }
 
 func packBadLines(lines []BadLine) []badLine {
@@ -620,12 +689,31 @@ func (c *Cache) Events(path string, rejectBad bool) ([]transcript.Event, transcr
 	}
 	after, statErr := fileKey(path)
 	if statErr == nil && before == after {
-		c.save(before, rec)
+		// Preserve query-independent activity metadata written by user-word.
+		old, _, oldErr := c.loadRecord(path, rejectBad)
+		if oldErr == nil && old.ActivityComplete {
+			rec.ActivityComplete = old.ActivityComplete
+			rec.ActivityCode = old.ActivityCode
+			rec.Coverage = old.Coverage
+			rec.RecordBuckets = old.RecordBuckets
+			rec.RecordTimes = old.RecordTimes
+			rec.BadLines = old.BadLines
+			rec.BadCoverageDays = old.BadCoverageDays
+			rec.BadDays = old.BadDays
+			rec.BadGlobal = old.BadGlobal
+		}
+		c.saveEventRecord(before, rec)
 	}
 	if rejectBad && rec.Bad > 0 {
 		return nil, transcript.Meta{}, false, nil
 	}
 	return unpackDisplayed(rec), meta(rec), true, nil
+}
+
+func (c *Cache) saveEventRecord(before key, rec record) {
+	if err := c.save(before, rec); err != nil {
+		c.NoteIssue(fmt.Sprintf("save event cache record: %v", err))
+	}
 }
 
 func unpackRaw(rec record) []transcript.Event {
@@ -692,20 +780,26 @@ func meta(rec record) transcript.Meta {
 	return m
 }
 
-func (c *Cache) save(k key, rec record) {
+func (c *Cache) save(k key, rec record) error {
 	if c.dir == "" {
-		return
+		return errors.New("cache directory unavailable")
 	}
 	var payload bytes.Buffer
-	if gob.NewEncoder(&payload).Encode(rec) != nil || payload.Len() > maxEntry {
-		return
+	if err := gob.NewEncoder(&payload).Encode(rec); err != nil {
+		return fmt.Errorf("encode cache record: %w", err)
 	}
-	if os.MkdirAll(c.dir, privateMode) != nil || !privateDir(c.dir) {
-		return
+	if payload.Len() > maxEntry {
+		return fmt.Errorf("cache record exceeds %d bytes", maxEntry)
+	}
+	if err := os.MkdirAll(c.dir, privateMode); err != nil {
+		return fmt.Errorf("create cache directory: %w", err)
+	}
+	if !privateDir(c.dir) {
+		return errors.New("cache directory is not private")
 	}
 	f, err := os.CreateTemp(c.dir, ".entry-*")
-	if err != nil { //nolint:silent-error-handling // Запись кэша необязательна для ответа.
-		return
+	if err != nil {
+		return fmt.Errorf("create temporary cache entry: %w", err)
 	}
 	defer os.Remove(f.Name())
 	h := header{Key: k, Bad: rec.Bad, CompleteFile: rec.CompleteFile, Length: int64(payload.Len()), Sum: sha256.Sum256(payload.Bytes())}
@@ -717,9 +811,13 @@ func (c *Cache) save(k key, rec record) {
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
-	if err == nil {
-		_ = os.Rename(f.Name(), c.path(k.Path)) //nolint:ignored-error // Следующий вызов перечитает оригинал.
+	if err != nil {
+		return fmt.Errorf("write cache entry: %w", err)
 	}
+	if err := os.Rename(f.Name(), c.path(k.Path)); err != nil {
+		return fmt.Errorf("publish cache entry: %w", err)
+	}
+	return nil
 }
 
 // cleanupInfo позволяет проверить ошибку метаданных исчезнувшей записи.
@@ -747,7 +845,6 @@ func (c *Cache) Cleanup(now time.Time) {
 			continue
 		}
 		if path != c.dir {
-			_ = os.RemoveAll(path) //nolint:ignored-error // Недоступный каталог останется до следующей уборки.
 			continue
 		}
 		entries, err := os.ReadDir(path)

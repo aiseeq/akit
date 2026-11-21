@@ -229,14 +229,15 @@ func TestCachedEventsAreQueryIndependent(t *testing.T) {
 	snapshot := c.Snapshot(path)
 	stamp, _ := time.Parse(time.RFC3339, "2026-10-25T10:00:00Z")
 	events := []transcript.Event{{Time: stamp, Role: transcript.User, Text: "hello", Raw: []byte(row)}}
-	bucket := stamp.Unix() / RecordBucketSeconds * RecordBucketSeconds
+	bucket := stamp.UnixNano()
 	from, until := stamp.Add(-time.Hour), stamp.Add(time.Hour)
-	if reason := c.StoreEvents(path, snapshot, events, []int64{bucket}, []string{"2026-10-25"}, false, from, until, transcript.Meta{}); reason != "" {
+	recordTime := RecordTime{Seconds: stamp.Unix(), Nanosecond: int32(stamp.Nanosecond()), TextDay: "2026-10-25", RecordDay: true}
+	if reason := c.StoreEventsWithRecordTimesFromLookup(path, snapshot, events, []int64{bucket}, []RecordTime{recordTime}, []string{"2026-10-25"}, false, nil, nil, from, until, transcript.Meta{}, false); reason != "" {
 		t.Fatal(reason)
 	}
 	for range 2 { // Запрос и зона не входят в ключ общего файла.
 		cached, ok, err := c.CachedEvents(path)
-		if err != nil || !ok || !cached.Covers(stamp, stamp.Add(time.Minute)) || len(cached.Events) != 1 || cached.Events[0].Text != "hello" || string(cached.Events[0].Raw) != row || len(cached.RawDays) != 1 || cached.RawDays[0] != "2026-10-25" || len(cached.RecordBuckets) != 1 || cached.RecordBuckets[0] != bucket || len(cached.BadDays) != 1 || cached.BadDays[0] != "2026-10-25" {
+		if err != nil || !ok || !cached.Covers(stamp, stamp.Add(time.Minute)) || len(cached.Events) != 1 || cached.Events[0].Text != "hello" || string(cached.Events[0].Raw) != row || len(cached.RawDays) != 1 || cached.RawDays[0] != "2026-10-25" || len(cached.RecordBuckets) != 1 || cached.RecordBuckets[0] != bucket || !reflect.DeepEqual(cached.RecordTimes, []RecordTime{recordTime}) || len(cached.BadDays) != 1 || cached.BadDays[0] != "2026-10-25" {
 			t.Fatalf("cached transcript: %+v, ok=%v", cached, ok)
 		}
 	}
@@ -245,8 +246,31 @@ func TestCachedEventsAreQueryIndependent(t *testing.T) {
 		t.Fatal(reason)
 	}
 	cached, ok, err := c.CachedEvents(path)
-	if err != nil || !ok || len(cached.Events) != 2 || !cached.Covers(from, second.Add(time.Hour)) || !reflect.DeepEqual(cached.BadDays, []string{"2026-10-25", "2026-10-26"}) {
+	if err != nil || !ok || len(cached.Events) != 2 || !cached.Covers(from, second.Add(time.Hour)) || !reflect.DeepEqual(cached.BadDays, []string{"2026-10-25", "2026-10-26"}) || !reflect.DeepEqual(cached.RecordTimes, []RecordTime{recordTime}) {
 		t.Fatalf("merged coverage and events: %+v, ok=%v, err=%v", cached, ok, err)
+	}
+}
+
+func TestStoreEventsReturnsCacheWriteFailure(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(source, []byte(row), 0600); err != nil {
+		t.Fatal(err)
+	}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("synthetic"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewForCode("synthetic-activity")
+	c.dir = blocked
+	snapshot := c.Snapshot(source)
+	stamp, _ := time.Parse(time.RFC3339, "2026-10-25T10:00:00Z")
+	reason := c.StoreEventsWithRecordTimesFromLookup(
+		source, snapshot,
+		[]transcript.Event{{Time: stamp, Role: transcript.User, Text: "hello", Raw: []byte(row)}},
+		nil, nil, nil, false, nil, nil, stamp.Add(-time.Hour), stamp.Add(time.Hour), transcript.Meta{}, false,
+	)
+	if reason == "" || !strings.Contains(reason, "save cache record") {
+		t.Fatalf("cache write failure was swallowed: reason=%q", reason)
 	}
 }
 
@@ -337,6 +361,62 @@ func TestStoreEventsCanSkipSecondLookupAfterColdMiss(t *testing.T) {
 	cached, ok, err := c.CachedEvents(path)
 	if err != nil || !ok || len(cached.Events) != 1 || cached.Events[0].Text != "second" || !cached.Covers(second, second) || cached.Covers(first, first) {
 		t.Fatalf("cold-miss replacement: events=%+v coverage=%+v ok=%v err=%v", cached.Events, cached.Coverage, ok, err)
+	}
+}
+
+func TestCachedCoverageRejectsUntilOutsideStoredInterval(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(row), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewForCode("coverage")
+	from := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	until := from.Add(time.Hour)
+	if reason := c.StoreEvents(path, c.Snapshot(path), nil, nil, nil, false, from, until, transcript.Meta{}); reason != "" {
+		t.Fatal(reason)
+	}
+	cached, ok, err := c.CachedEvents(path)
+	if err != nil || !ok || !cached.Covers(from, until) || cached.Covers(from, until.Add(time.Nanosecond)) {
+		t.Fatalf("coverage result: ok=%v err=%v ranges=%+v", ok, err, cached.Coverage)
+	}
+}
+
+func TestActivityMergeRequiresMatchingProducerCode(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(row), 0600); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	old := NewForCode("old-parser")
+	if reason := old.StoreEvents(path, old.Snapshot(path), []transcript.Event{{Time: at, Role: transcript.User, Text: "old synthetic"}}, []int64{at.UnixNano()}, nil, false, at, at, transcript.Meta{}); reason != "" {
+		t.Fatal(reason)
+	}
+	current := NewForCode("new-parser")
+	if reason := current.StoreEventsWithBadLinesFromLookup(path, current.Snapshot(path), []transcript.Event{{Time: at.Add(time.Hour), Role: transcript.User, Text: "new synthetic"}}, []int64{at.Add(time.Hour).UnixNano()}, nil, false, nil, nil, at, at.Add(time.Hour), transcript.Meta{}, true); reason != "" {
+		t.Fatal(reason)
+	}
+	cached, ok, err := current.CachedEvents(path)
+	if err != nil || !ok || len(cached.Events) != 1 || cached.Events[0].Text != "new synthetic" || len(cached.RecordBuckets) != 1 || cached.RecordBuckets[0] != at.Add(time.Hour).UnixNano() {
+		t.Fatalf("stale activity was merged across producer versions: %+v ok=%v err=%v", cached, ok, err)
+	}
+}
+
+func TestCleanupLeavesSiblingCodeDirectoryAlone(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	c := New()
+	sibling := filepath.Join(c.root, "foreign-cache-code")
+	if err := os.MkdirAll(sibling, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(sibling, "marker")
+	if err := os.WriteFile(marker, []byte("synthetic"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c.Cleanup(time.Now())
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cleanup removed another code directory: %v", err)
 	}
 }
 
@@ -713,7 +793,10 @@ func TestCleanup(t *testing.T) {
 	expired := writeEntry("expired", source, 0, now.Add(-maxAge-time.Hour))
 	orphan := writeEntry("orphan", source+"-missing", 0, now)
 	c.Cleanup(now)
-	for _, p := range []string{foreign, expired, orphan} {
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("cleanup removed a sibling code directory: %v", err)
+	}
+	for _, p := range []string{expired, orphan} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("not removed: %s, %v", p, err)
 		}
