@@ -71,6 +71,27 @@ func TestCodexScriptCallsGetTheirOwnResult(t *testing.T) {
 	}
 }
 
+func TestCodexModelFromMalformedTurnContextMatchesOldModelScan(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "rollout-synthetic.jsonl")
+	writeTranscript(t, path, strings.Join([]string{
+		`{"type":"turn_context","timestamp":123,"payload":{"model":"luna"}}`,
+		`{"timestamp":"2026-10-31T13:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"s1","name":"exec","input":"await tools.exec_command({cmd:\"tl x\"})"}}`,
+		`{"timestamp":"2026-10-31T13:00:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"s1","output":"Script completed"}}`,
+	}, "\n"))
+	since := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	u := newRun(since, since.Add(24*time.Hour), 1, filepath.Join(root, "out"), root)
+	_, models, evs, _, ok := u.readProcessTranscript(path)
+	if !ok {
+		t.Fatal("transcript not read")
+	}
+	for _, e := range evs {
+		if e.Role == transcript.Cmd && u.modelAt(models, e.Line) != "luna" {
+			t.Errorf("modelAt(command line %d) = %q, want luna as in old modelMap", e.Line, u.modelAt(models, e.Line))
+		}
+	}
+}
+
 // Without completion events the code is unknown: a utility's informational
 // line is not a refusal, an explicit refusal word still is, and a tk note
 // confirmation is a success.

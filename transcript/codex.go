@@ -29,14 +29,14 @@ type payload struct {
 	CreatorAccountID string `json:"creator_account_id"`
 	Model            string `json:"model"`
 	// event_msg: user_message, agent_message, token_count
-	Message       string                      `json:"message"`
-	Images        []json.RawMessage           `json:"images"`
-	LocalImages   []json.RawMessage           `json:"local_images"`
-	Info          *tokenInfo                  `json:"info"`
-	RateLimits    *rateLimits                 `json:"rate_limits"`
-	Item          *codexCommandItemWithOutput `json:"item"`
-	StartedAtMS   int64                       `json:"started_at_ms"`
-	CompletedAtMS int64                       `json:"completed_at_ms"`
+	Message       string            `json:"message"`
+	Images        []json.RawMessage `json:"images"`
+	LocalImages   []json.RawMessage `json:"local_images"`
+	Info          *tokenInfo        `json:"info"`
+	RateLimits    *rateLimits       `json:"rate_limits"`
+	Item          *codexCommandItem `json:"item"`
+	StartedAtMS   int64             `json:"started_at_ms"`
+	CompletedAtMS int64             `json:"completed_at_ms"`
 }
 
 // CodexCommandResult — завершение одной команды оболочки из item_completed.
@@ -95,6 +95,9 @@ type codexCommandRecordWithOutput struct {
 }
 
 func parseCodexCommandResult(raw []byte, line int) (CodexCommandResult, bool) {
+	if !bytes.Contains(raw, []byte(`"CommandExecution"`)) {
+		return CodexCommandResult{}, false
+	}
 	var rec codexCommandRecordWithOutput
 	if json.Unmarshal(raw, &rec) != nil {
 		return CodexCommandResult{}, false
@@ -105,11 +108,23 @@ func parseCodexCommandResult(raw []byte, line int) (CodexCommandResult, bool) {
 	return commandResult(line, rec.Payload.StartedAtMS, rec.Payload.CompletedAtMS, rec.Payload.Item.codexCommandItem, rec.Payload.Item.Output)
 }
 
-func codexCommandResultFromPayload(recType string, pl *payload, line int) (CodexCommandResult, bool) {
-	if recType != "event_msg" || pl == nil || pl.Type != "item_completed" || pl.Item == nil {
+func parseCodexCommandResultDiscardOutput(raw []byte, line int) (CodexCommandResult, bool) {
+	if !bytes.Contains(raw, []byte(`"CommandExecution"`)) {
 		return CodexCommandResult{}, false
 	}
-	return commandResult(line, pl.StartedAtMS, pl.CompletedAtMS, pl.Item.codexCommandItem, pl.Item.Output)
+	var rec struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Type          string            `json:"type"`
+			Item          *codexCommandItem `json:"item"`
+			StartedAtMS   int64             `json:"started_at_ms"`
+			CompletedAtMS int64             `json:"completed_at_ms"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(raw, &rec) != nil || rec.Type != "event_msg" || rec.Payload.Type != "item_completed" || rec.Payload.Item == nil {
+		return CodexCommandResult{}, false
+	}
+	return commandResult(line, rec.Payload.StartedAtMS, rec.Payload.CompletedAtMS, *rec.Payload.Item, "")
 }
 
 func commandResult(line int, started, completed int64, it codexCommandItem, output string) (CodexCommandResult, bool) {

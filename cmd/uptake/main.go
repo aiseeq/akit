@@ -727,10 +727,23 @@ func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transc
 	}
 	var evs []transcript.Event
 	var commandResults []commandResult
-	readEvent := func(e transcript.Event) {
-		if models != nil && e.Model != "" {
-			models[e.Line] = e.Model
+	model := ""
+	readLine := func(raw []byte, line int) {
+		var v struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Type  string `json:"type"`
+				Model string `json:"model"`
+			} `json:"payload"`
 		}
+		if json.Unmarshal(raw, &v) == nil && v.Type == "turn_context" && v.Payload.Model != "" {
+			model = v.Payload.Model
+		}
+		if model != "" {
+			models[line] = model
+		}
+	}
+	readEvent := func(e transcript.Event) {
 		if u.valid(e.Time) {
 			evs = append(evs, e)
 		}
@@ -740,10 +753,10 @@ func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transc
 	if isClaude {
 		meta, err = transcript.Read(path, nil, readEvent)
 	} else {
-		meta, err = transcript.ReadWithCodexCommands(path, readEvent, func(item transcript.CodexCommandResult) {
+		meta, err = transcript.ReadWithCodexCommandsAndLines(path, readEvent, func(item transcript.CodexCommandResult) {
 			commandResults = append(commandResults, commandResult{line: item.Line, at: item.Completed,
 				cmd: item.Command, code: item.ExitCode, out: item.Output})
-		})
+		}, readLine)
 	}
 	u.badLines += meta.Bad
 	if meta.Bad > 0 && u.firstBad == "" {
