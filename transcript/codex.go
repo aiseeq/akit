@@ -57,12 +57,8 @@ func CodexCommandResults(path string) ([]CodexCommandResult, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 256<<20)
-	marker := []byte(`"CommandExecution"`)
 	var results []CodexCommandResult
 	for n := 1; sc.Scan(); n++ {
-		if !bytes.Contains(sc.Bytes(), marker) {
-			continue
-		}
 		if result, ok := parseCodexCommandResult(sc.Bytes(), n); ok {
 			results = append(results, result)
 		}
@@ -95,9 +91,6 @@ type codexCommandRecordWithOutput struct {
 }
 
 func parseCodexCommandResult(raw []byte, line int) (CodexCommandResult, bool) {
-	if !bytes.Contains(raw, []byte(`"CommandExecution"`)) {
-		return CodexCommandResult{}, false
-	}
 	var rec codexCommandRecordWithOutput
 	if json.Unmarshal(raw, &rec) != nil {
 		return CodexCommandResult{}, false
@@ -108,23 +101,11 @@ func parseCodexCommandResult(raw []byte, line int) (CodexCommandResult, bool) {
 	return commandResult(line, rec.Payload.StartedAtMS, rec.Payload.CompletedAtMS, rec.Payload.Item.codexCommandItem, rec.Payload.Item.Output)
 }
 
-func parseCodexCommandResultDiscardOutput(raw []byte, line int) (CodexCommandResult, bool) {
-	if !bytes.Contains(raw, []byte(`"CommandExecution"`)) {
+func codexCommandResultFromPayload(recType string, pl *payload, line int) (CodexCommandResult, bool) {
+	if recType != "event_msg" || pl == nil || pl.Type != "item_completed" || pl.Item == nil {
 		return CodexCommandResult{}, false
 	}
-	var rec struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Type          string            `json:"type"`
-			Item          *codexCommandItem `json:"item"`
-			StartedAtMS   int64             `json:"started_at_ms"`
-			CompletedAtMS int64             `json:"completed_at_ms"`
-		} `json:"payload"`
-	}
-	if json.Unmarshal(raw, &rec) != nil || rec.Type != "event_msg" || rec.Payload.Type != "item_completed" || rec.Payload.Item == nil {
-		return CodexCommandResult{}, false
-	}
-	return commandResult(line, rec.Payload.StartedAtMS, rec.Payload.CompletedAtMS, *rec.Payload.Item, "")
+	return commandResult(line, pl.StartedAtMS, pl.CompletedAtMS, *pl.Item, "")
 }
 
 func commandResult(line int, started, completed int64, it codexCommandItem, output string) (CodexCommandResult, bool) {
@@ -233,7 +214,6 @@ func (p *codexParser) parse(rec *record) []Event {
 	}
 	for i := range events {
 		events[i].SessionID, events[i].Cwd = p.session, p.cwd
-		events[i].Model = p.model
 	}
 	return events
 }

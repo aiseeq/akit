@@ -56,8 +56,6 @@ type Event struct {
 	// Поля записи Claude Code; у codex UUID пуст, SessionID и Cwd — из session_meta, Cwd меняет turn_context.
 	// Cwd — папка сессии в момент записи: меняется внутри сессии.
 	UUID, SessionID, Cwd string
-	// Model — модель хода Codex на момент события.
-	Model string
 	// MessageID — message.id assistant-записи Claude Code.
 	MessageID string
 	// Sidechain — запись боковой ветки (суб-агент в транскрипте сессии, старый формат): не разговор сессии.
@@ -162,7 +160,7 @@ const maxLine = 256 << 20
 // разбора JSON: так поиск по гигабайтам не разбирает лишнее. Испорченная строка (файл дописывается прямо сейчас)
 // пропускается и считается в Meta.Bad.
 func Read(path string, keep func(raw []byte) bool, fn func(Event)) (Meta, error) {
-	return read(path, keep, nil, fn, nil, nil, nil)
+	return read(path, keep, nil, fn, nil)
 }
 
 // ToolNames даёт фильтру известные и возможные имена инструментов из предыдущих строк.
@@ -215,42 +213,22 @@ func RemovesReminders(raw []byte) bool {
 // ReadWithTools читает как Read, передавая фильтру также имена инструментов из предыдущих строк.
 // Если фильтр отбросил вызов Claude Code, его имена всё равно сохраняются для последующих результатов.
 func ReadWithTools(path string, keep func([]byte, ToolNames) bool, fn func(Event)) (Meta, error) {
-	return read(path, nil, keep, fn, nil, nil, nil)
-}
-
-// ReadWithCodexCommands reads transcript events and completed Codex commands in one pass.
-func ReadWithCodexCommands(path string, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
-	return ReadWithCodexCommandsAndLines(path, fn, commandFn, nil)
-}
-
-// ReadWithCodexCommandsAndLines also calls lineFn for every physical line before parsing it.
-func ReadWithCodexCommandsAndLines(path string, fn func(Event), commandFn func(CodexCommandResult), lineFn func([]byte, int)) (Meta, error) {
-	var parseCommand func([]byte, int) (CodexCommandResult, bool)
-	if commandFn != nil {
-		parseCommand = parseCodexCommandResult
-	}
-	return read(path, nil, nil, fn, parseCommand, lineFn, commandFn)
+	return read(path, nil, keep, fn, nil)
 }
 
 // ReadWithCodexCommandsDiscardOutput reads command completions without retaining their output.
 func ReadWithCodexCommandsDiscardOutput(path string, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
-	var parseCommand func([]byte, int) (CodexCommandResult, bool)
-	if commandFn != nil {
-		parseCommand = parseCodexCommandResultDiscardOutput
-	}
-	return read(path, nil, nil, fn, parseCommand, nil, commandFn)
+	return read(path, nil, nil, fn, commandFn)
 }
 
-func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event),
-	parseCommand func([]byte, int) (CodexCommandResult, bool), lineFn func([]byte, int), commandFn func(CodexCommandResult)) (Meta, error) {
+func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Meta{}, fmt.Errorf("transcript: %w", err)
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
-	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), keep: keep, keepWithTools: keepWithTools,
-		fn: fn, parseCommand: parseCommand, lineFn: lineFn, commandFn: commandFn}
+	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), keep: keep, keepWithTools: keepWithTools, fn: fn, commandFn: commandFn}
 	if keepWithTools != nil {
 		rd.toolNames = make(map[string]struct{})
 	}
@@ -276,9 +254,6 @@ func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNa
 			rd.line(raw)
 		} else if err == nil {
 			rd.lineNo++ // a blank line is still a line of the file: numbers match sed -n
-			if rd.lineFn != nil {
-				rd.lineFn(raw, rd.lineNo)
-			}
 		}
 		if err != nil {
 			rd.meta.Originator, rd.meta.Account = rd.codex.originator, rd.codex.firstAccount
@@ -314,22 +289,12 @@ type reader struct {
 	indexed       int
 	pendingBytes  int
 	fn            func(Event)
-	parseCommand  func([]byte, int) (CodexCommandResult, bool)
-	lineFn        func([]byte, int)
 	commandFn     func(CodexCommandResult)
 	lineNo        int
 }
 
 func (rd *reader) line(raw []byte) {
 	rd.lineNo++
-	if rd.lineFn != nil {
-		rd.lineFn(raw, rd.lineNo)
-	}
-	if rd.parseCommand != nil {
-		if result, ok := rd.parseCommand(raw, rd.lineNo); ok {
-			rd.commandFn(result)
-		}
-	}
 	if name, ok := agentName(raw); ok {
 		rd.meta.Name = name
 		return
@@ -358,7 +323,7 @@ func (rd *reader) line(raw []byte) {
 	var err error
 	if parsed {
 		events, codex, err = parseRecordKind(&rec, raw, rd.claude, rd.codex)
-	} else if rd.parseCommand != nil {
+	} else if rd.commandFn != nil {
 		if err = json.Unmarshal(raw, &rec); err != nil {
 			err = fmt.Errorf("not a JSON record: %w", err)
 		} else {
@@ -370,6 +335,11 @@ func (rd *reader) line(raw []byte) {
 	if err != nil {
 		rd.badLine(raw, codex, err)
 		return
+	}
+	if rd.commandFn != nil {
+		if result, ok := codexCommandResultFromPayload(rec.Type, rec.Payload, rd.lineNo); ok {
+			rd.commandFn(result)
+		}
 	}
 	rd.emitParsed(raw, codex, events)
 }

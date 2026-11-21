@@ -515,6 +515,38 @@ func TestWaitCodexUsesItemCompletionTime(t *testing.T) {
 	}
 }
 
+func TestWaitCodexCompletionRowsMatchBaseForMalformedAndEscapedTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name, completion, want string
+	}{
+		{"numeric timestamp", `{"timestamp":123,"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":%d,"item":{"type":"CommandExecution","command":["/bin/bash","-lc","tk done item"],"exit_code":0,"aggregated_output":"ok"}}}`, "8000\n"},
+		{"escaped completion type", `{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":%d,"item":{"type":"CommandExecut\u0069on","command":["/bin/bash","-lc","tk done item"],"exit_code":0,"aggregated_output":"ok"}}}`, "5000\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fakeHome(t)
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			base := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+			rows := []string{`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`}
+			for i := 1; i <= 3; i++ {
+				call := base.Add(time.Duration(i) * time.Second)
+				rows = append(rows,
+					fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c%d","name":"exec","input":%q}}`, call.Format(time.RFC3339), i, `exec_command({cmd:"tk done item"})`),
+					fmt.Sprintf(tc.completion, call.Add(time.Second).UnixMilli(), call.Add(5*time.Second).UnixMilli()),
+					fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c%d","output":"ok"}}`, call.Add(8*time.Second).Format(time.RFC3339), i),
+				)
+			}
+			path := writeWaitTranscript(t, e, "rollout-review.jsonl", strings.Join(rows, "\n")+"\n")
+			args := []string{"--wait", "tk done", "--q", "50", path}
+			for _, cacheState := range []string{"cold", "warm"} {
+				code, out, stderr := runTL(t, e, args...)
+				if code != 0 || out != tc.want || !strings.Contains(stderr, "3 wait event(s)") {
+					t.Errorf("%s cache: code=%d out=%q stderr=%q, want %q", cacheState, code, out, stderr, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestWaitCodexMatchesCommandResultsByText(t *testing.T) {
 	e := fakeHome(t)
 	base := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)

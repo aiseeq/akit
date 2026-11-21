@@ -96,9 +96,9 @@ func TestReadKeepsEventsWhenAggregatedOutputIsNotString(t *testing.T) {
 	}
 	var outputEvents []Event
 	var outputResults []CodexCommandResult
-	meta, err = ReadWithCodexCommands(path, func(e Event) { outputEvents = append(outputEvents, e) }, func(r CodexCommandResult) {
+	meta, err = ReadUptakeOnePass(path, func(e Event) { outputEvents = append(outputEvents, e) }, func(r CodexCommandResult) {
 		outputResults = append(outputResults, r)
-	})
+	}, nil)
 	if err != nil || meta.Bad != 0 || len(outputResults) != 0 || !reflect.DeepEqual(ordinary, outputEvents) {
 		t.Fatalf("with-output read: results=%+v meta=%+v err=%v; want no command result, same events and Bad=0", outputResults, meta, err)
 	}
@@ -119,9 +119,26 @@ func TestReadWithCodexCommandsKeepsCompletionWithNumericTimestamp(t *testing.T) 
 		t.Fatalf("old reader results=%+v err=%v; want one", want, err)
 	}
 	var got []CodexCommandResult
-	meta, err := ReadWithCodexCommands(path, nil, func(r CodexCommandResult) { got = append(got, r) })
+	meta, err := ReadUptakeOnePass(path, nil, func(r CodexCommandResult) { got = append(got, r) }, nil)
 	if err != nil || len(got) != 1 || got[0] != want[0] {
 		t.Fatalf("new reader results=%+v meta=%+v err=%v; want old result %+v", got, meta, err, want[0])
+	}
+}
+
+func TestReadUptakeOnePassMatchesCodexCommandResultsWithEscapedType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-synthetic.jsonl")
+	line := `{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":2000,"item":{"type":"CommandExecut\u0069on","command":["sh","-lc","tl x"],"exit_code":1,"aggregated_output":"failure"}}}`
+	if err := os.WriteFile(path, []byte(line+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	want, err := CodexCommandResults(path)
+	if err != nil || len(want) != 1 {
+		t.Fatalf("old command scan = %+v, err=%v; want one escaped type", want, err)
+	}
+	var got []CodexCommandResult
+	_, err = ReadUptakeOnePass(path, nil, func(r CodexCommandResult) { got = append(got, r) }, nil)
+	if err != nil || len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("one-pass = %+v, err=%v; want old command scan %+v", got, err, want[0])
 	}
 }
 

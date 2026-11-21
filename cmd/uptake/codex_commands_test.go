@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -44,8 +45,8 @@ func TestCodexScriptCallsGetTheirOwnResult(t *testing.T) {
 		if e.Role != transcript.Cmd {
 			continue
 		}
-		if e.Model != "gpt-old" || u.modelAt(models, e.Line) != "gpt-old" {
-			t.Errorf("command model = %q (map %q), want gpt-old", e.Model, u.modelAt(models, e.Line))
+		if u.modelAt(models, e.Line) != "gpt-old" {
+			t.Errorf("command model map = %q, want gpt-old", u.modelAt(models, e.Line))
 		}
 		o := outs[e.CallID]
 		codes = append(codes, e.Text+"="+strconv.Itoa(u.eventExitCode(o)))
@@ -56,11 +57,6 @@ func TestCodexScriptCallsGetTheirOwnResult(t *testing.T) {
 	}
 	if got := strings.Join(texts, " | "); got != "--- event aa:1 | tl: bb:2: no such session | --- event aa:1 again" {
 		t.Errorf("outputs = %s", got)
-	}
-	for _, e := range evs {
-		if e.Role == transcript.Out && e.CallID == "s1" && e.Model != "gpt-new" {
-			t.Errorf("script output model = %q, want gpt-new", e.Model)
-		}
 	}
 	u.process(path)
 	if n := len(u.refusalSamples["tl"]); n != 1 {
@@ -89,6 +85,54 @@ func TestCodexModelFromMalformedTurnContextMatchesOldModelScan(t *testing.T) {
 		if e.Role == transcript.Cmd && u.modelAt(models, e.Line) != "luna" {
 			t.Errorf("modelAt(command line %d) = %q, want luna as in old modelMap", e.Line, u.modelAt(models, e.Line))
 		}
+	}
+}
+
+func TestUptakeOnePassMatchesThreeOldPassesOnReviewRows(t *testing.T) {
+	for _, tc := range []struct {
+		name, completion string
+	}{
+		{"numeric timestamp", `{"timestamp":123,"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":5000,"item":{"type":"CommandExecution","command":["sh","-lc","tl x"],"exit_code":1,"aggregated_output":"failure"}}}`},
+		{"escaped command type", `{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":5000,"item":{"type":"CommandExecut\u0069on","command":["sh","-lc","tl x"],"exit_code":1,"aggregated_output":"failure"}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "rollout-synthetic.jsonl")
+			rows := []string{
+				`{"timestamp":"2026-10-31T13:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"s1","name":"exec","input":"await tools.exec_command({cmd:\"tl x\"})"}}`,
+				tc.completion,
+				`{"timestamp":"2026-10-31T13:00:08Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"s1","output":"failure"}}`,
+			}
+			writeTranscript(t, path, strings.Join(rows, "\n"))
+			since := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+			u := newRun(since, since.Add(24*time.Hour), 1, filepath.Join(root, "out"), root)
+			_, _, gotEvents, _, ok := u.readProcessTranscript(path)
+			if !ok {
+				t.Fatal("one-pass transcript not read")
+			}
+			var oldEvents []transcript.Event
+			_, err := transcript.Read(path, nil, func(e transcript.Event) {
+				if u.valid(e.Time) {
+					oldEvents = append(oldEvents, e)
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldResults, err := transcript.CodexCommandResults(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			commandResults := make([]commandResult, 0, len(oldResults))
+			for _, result := range oldResults {
+				commandResults = append(commandResults, commandResult{line: result.Line, at: result.Completed,
+					cmd: result.Command, code: result.ExitCode, out: result.Output})
+			}
+			oldEvents = attachCommandResults(oldEvents, commandResults)
+			if !reflect.DeepEqual(gotEvents, oldEvents) {
+				t.Errorf("one-pass events differ from Read + CodexCommandResults:\n got %#v\nwant %#v", gotEvents, oldEvents)
+			}
+		})
 	}
 }
 
