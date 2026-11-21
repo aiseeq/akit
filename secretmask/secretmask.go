@@ -101,7 +101,7 @@ var (
 	contextEnglishPasswordAtRE = regexp.MustCompile(contextEnglishPasswordPattern)
 	contextMarkdownLabelAtRE   = regexp.MustCompile(`(?i)\A((?:\*\*\*|\*\*|\*|__|_|~~|\x60|\[|«|")?)([a-z0-9]+(?:[_.-][a-z0-9]+)*)((?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?)[ \t]*(?:\r?\n[ \t]*)?(:=|=>|=|:)(?:\*\*\*|\*\*|\*|__|_|~~|\x60|\]|»|")?[ \t]*`)
 
-	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:(?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
+	headerRE = regexp.MustCompile(`(?im)(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*((?:\\*["'])?(?:bearer|basic|token|digest|negotiate)(?:[ \t]+|\r?$))?`)
 	flagRE   = regexp.MustCompile("(?i)(?:^|[ \\t\\r\\n'\"`])--?([a-z0-9_.-]+)")
 )
 
@@ -1014,13 +1014,34 @@ func jsonValueMemberSpans(text string) []contextSpan {
 
 func headerMatches(text string) []contextMatch {
 	var matches []contextMatch
-	for _, ix := range headerRE.FindAllStringIndex(text, -1) {
+	for _, ix := range headerRE.FindAllStringSubmatchIndex(text, -1) {
 		value, ok := scanValue(text, ix[1], false)
-		if ok && valueIsValue(text, value, "", "authorization", false) {
+		if ok && headerTokenValue(text[value.start:value.end], ix[2] >= 0) && valueIsValue(text, value, "", "authorization", false) {
 			matches = append(matches, contextMatch{value.start, value.end, "authorization"})
 		}
 	}
 	return matches
+}
+
+// minBareHeaderToken is the shortest credential after "Authorization:" with no scheme;
+// a shorter word there is prose ("Authorization: none").
+const minBareHeaderToken = 8
+
+// headerTokenValue reports whether an Authorization value can be a credential: it is
+// made of token characters only (RFC 7235 token68, and ':' of user:password), so prose
+// after the header name ("без Authorization: админка ходит по cookie") is not masked.
+// Without a scheme the value must also be at least minBareHeaderToken long.
+func headerTokenValue(value string, scheme bool) bool {
+	if value == "" || !scheme && len(value) < minBareHeaderToken {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if !isLetter(c) && (c < '0' || c > '9') && !strings.ContainsRune("-._~+/=:", rune(c)) {
+			return false
+		}
+	}
+	return true
 }
 
 func russianHeaderCandidateAt(text string, wordStart int) bool {

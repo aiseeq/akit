@@ -1016,3 +1016,30 @@ func TestMaskCookieShellReferences(t *testing.T) {
 		})
 	}
 }
+
+// After "Authorization:" only a credential-shaped value is masked: prose stays as written.
+func TestMaskAuthorizationProseIsNotAValue(t *testing.T) {
+	for _, in := range []string{
+		"- Чтение админки — `fetch(url, {credentials: 'include'})` без Authorization: админка ходит по cookie, а заголовок даёт ошибку",
+		"Authorization: none",
+		"Authorization: header",
+		"the Authorization: cookie flow",
+		"Authorization: required, see below",
+		"Authorization: «токен»",
+	} {
+		if got, found := Mask(in); got != in || len(found) != 0 {
+			t.Errorf("%q → %q %v; want unchanged", in, got, found)
+		}
+	}
+	token := "eyJhbGciOiJIUzI1NiJ9" + strings.Repeat("x", 4)
+	for in, want := range map[string]string{
+		"Authorization: Bearer " + token:          "Authorization: Bearer [скрыто:authorization]",
+		"Authorization: " + token:                 "Authorization: [скрыто:authorization]",
+		"Authorization: Basic dXNlcjpwYXNz":       "Authorization: Basic [скрыто:authorization]",
+		`"Authorization": "Bearer ` + token + `"`: `"Authorization": "Bearer [скрыто:authorization]"`,
+	} {
+		if got, found := Mask(in); got != want || found["authorization"] != 1 {
+			t.Errorf("%q → %q %v; want %q", in, got, found, want)
+		}
+	}
+}
