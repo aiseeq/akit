@@ -302,12 +302,25 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 			}
 		}(ch)
 	}
+	eventCheck := false
 	for {
 		for i, c := range opts.conds {
 			if met[i] {
 				continue
 			}
-			ok, err := c.check(ctx)
+			var ok bool
+			var err error
+			if eventCheck {
+				if ec, yes := c.(interface {
+					checkEvent() (bool, error)
+				}); yes {
+					ok, err = ec.checkEvent()
+				} else {
+					ok, err = c.check(ctx)
+				}
+			} else {
+				ok, err = c.check(ctx)
+			}
 			if err != nil {
 				fmt.Fprintf(stderr, "wfor: %v\n", err)
 				return exitUsage
@@ -323,7 +336,9 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, timeoutReport(opts.conds, met, start))
 			return exitTimeout
 		case <-tick.C:
+			eventCheck = false
 		case <-wake:
+			eventCheck = true
 		}
 	}
 }

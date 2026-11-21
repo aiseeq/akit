@@ -268,7 +268,15 @@ func (c *lineCond) replaced(f *os.File, st os.FileInfo) (bool, error) {
 	return false, nil
 }
 
-func (c *lineCond) check(context.Context) (bool, error) {
+func (c *lineCond) check(ctx context.Context) (bool, error) {
+	return c.checkContent(true)
+}
+
+func (c *lineCond) checkEvent() (bool, error) {
+	return c.checkContent(false)
+}
+
+func (c *lineCond) checkContent(allowIncomplete bool) (bool, error) {
 	f, err := os.Open(c.path)
 	if errors.Is(err, fs.ErrNotExist) {
 		c.absent = true
@@ -312,7 +320,7 @@ func (c *lineCond) check(context.Context) (bool, error) {
 	}
 	c.consumed(data[:end])
 	c.tail = data[end:]
-	return len(c.tail) > 0 && !c.partial && c.match(c.tail, c.lines+1), nil
+	return allowIncomplete && len(c.tail) > 0 && !c.partial && c.match(c.tail, c.lines+1), nil
 }
 
 func (c *lineCond) match(line []byte, n int) bool {
@@ -385,29 +393,47 @@ func (c *exitCond) watch(ctx context.Context) (<-chan struct{}, func()) {
 				}
 			}
 		}()
-		for {
-			for i, fd := range fds {
-				if fd < 0 {
-					continue
-				}
-				poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-				n, err := unix.Poll(poll, 250)
-				if err == unix.EINTR {
-					continue
-				}
-				if err == nil && n > 0 && poll[0].Revents != 0 {
-					select {
-					case out <- struct{}{}:
-					default:
-					}
-					_ = unix.Close(fd)
-					fds[i] = -1
-				}
-			}
+		pollfds := make([]unix.PollFd, len(fds))
+		for i, fd := range fds {
+			pollfds[i] = unix.PollFd{Fd: int32(fd), Events: unix.POLLIN}
+		}
+		for len(pollfds) > 0 {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+			}
+			active := 0
+			for _, pfd := range pollfds {
+				if pfd.Fd >= 0 {
+					active++
+				}
+			}
+			if active == 0 {
+				return
+			}
+			n, err := unix.Poll(pollfds, 25)
+			if err == unix.EINTR {
+				continue
+			}
+			if err != nil { //nolint:silent-error-handling // Polling is an optional wakeup; ticker checks remain the fallback.
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			for i := range pollfds {
+				if pollfds[i].Fd < 0 {
+					continue
+				}
+				if pollfds[i].Revents != 0 {
+					select {
+					case out <- struct{}{}:
+					default:
+					}
+					pollfds[i].Fd = -1
+					continue
+				}
 			}
 		}
 	}()

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/proc"
+	"golang.org/x/sys/unix"
 )
 
 func TestOKCondWarnsWhenCancelStopDegrades(t *testing.T) {
@@ -192,6 +193,95 @@ func TestKernelWakeFileConditions(t *testing.T) {
 			t.Fatalf("unrelated event woke condition: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
 		}
 	})
+}
+
+func TestLineEventDoesNotMatchIncompleteLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := parseArgs([]string{"line", "^READY$", path, "--every", "2s", "--timeout", "600ms"}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	done := make(chan int, 1)
+	writes := make(chan error, 2)
+	go func() { done <- run(context.Background(), opts, &out, &errOut) }()
+	time.AfterFunc(100*time.Millisecond, func() { writes <- appendFile(path, "READY") })
+	time.AfterFunc(200*time.Millisecond, func() { writes <- appendFile(path, "-not-ready\n") })
+	var code int
+	select {
+	case code = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wfor did not return at its timeout")
+	}
+	for range 2 {
+		if err := <-writes; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code != exitTimeout || !strings.Contains(out.String(), "still waiting: line") {
+		t.Fatalf("incomplete line counted: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestExitedPIDWatcherDoesNotBurnCPU(t *testing.T) {
+	child := exec.Command("bash", "-c", "sleep 0.12")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer child.Wait()
+	opts, err := parseArgs([]string{"exit", strconv.Itoa(child.Process.Pid), "file", filepath.Join(t.TempDir(), "missing"), "--timeout", "800ms"}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := processCPU(t)
+	code := run(context.Background(), opts, io.Discard, io.Discard)
+	after := processCPU(t)
+	if code != exitTimeout {
+		t.Fatalf("run code=%d, want timeout", code)
+	}
+	if used := after - before; used >= 100*time.Millisecond {
+		t.Fatalf("process CPU during wait = %s, want < 100ms", used)
+	}
+}
+
+func TestExitWatcherCancellationWithManyPIDs(t *testing.T) {
+	args := []string{"exit"}
+	children := make([]*exec.Cmd, 0, 6)
+	for range 6 {
+		child := exec.Command("bash", "-c", "sleep 0.5")
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		children = append(children, child)
+		args = append(args, strconv.Itoa(child.Process.Pid))
+	}
+	defer func() {
+		for _, child := range children {
+			_ = child.Wait()
+		}
+	}()
+	args = append(args, "file", filepath.Join(t.TempDir(), "missing"), "--timeout", "100ms")
+	opts, err := parseArgs(args, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	code := run(context.Background(), opts, io.Discard, io.Discard)
+	if elapsed := time.Since(started); code != exitTimeout || elapsed > 200*time.Millisecond {
+		t.Fatalf("run code=%d after %s, want timeout within 200ms", code, elapsed)
+	}
+}
+
+func processCPU(t *testing.T) time.Duration {
+	t.Helper()
+	var usage unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &usage); err != nil {
+		t.Fatal(err)
+	}
+	return time.Duration(usage.Utime.Sec+usage.Stime.Sec)*time.Second + time.Duration(usage.Utime.Usec+usage.Stime.Usec)*time.Microsecond
 }
 
 func TestKernelWakeExit(t *testing.T) {
