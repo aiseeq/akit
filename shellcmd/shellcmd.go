@@ -4270,17 +4270,19 @@ func restoreLiteralBraces(parts []syntax.WordPart) {
 	walk(parts)
 }
 
-// literalBraceGroups finds, as syntax.SplitBraces pairs them, the braces of the
-// groups it would return to literal text: a group without a comma or a `..` at
-// its own level and a group never closed. It returns the byte offsets by part
-// index, or nil when there are none or a Lit already holds a stand-in byte.
+// bracePosition is a brace byte: the index of its part and its offset there.
 type bracePosition struct{ part, index int }
 
+// braceGroupPosition is an open brace and whether a comma or `..` follows it at its level.
 type braceGroupPosition struct {
 	open      bracePosition
 	separated bool
 }
 
+// literalBraceGroups finds, as syntax.SplitBraces pairs them, the braces of the
+// groups it would return to literal text: a group without a comma or a `..` at
+// its own level and a group never closed. It returns the byte offsets by part
+// index, or nil when there are none or a Lit already holds a stand-in byte.
 func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
 	var open []braceGroupPosition
 	var literal []bracePosition
