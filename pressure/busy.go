@@ -70,11 +70,13 @@ var DefaultLimits = Limits{MaxIOFull: 9.6, MaxMemSome: DefaultMemSome, MaxSwapKB
 // Load — замеры машины. Непрочитанная мера — 0, её сентинел в Verdict.Skipped.
 type Load struct {
 	Runnable       int           // готовых к работе задач без читающего процесса: procs_running из /proc/stat − 1
+	Blocked        int           // задач, ждущих ввода-вывода (состояние D): procs_blocked из того же чтения /proc/stat; для записи, правило его не судит
 	Threads        int           // потоков машины: строки cpuN в /proc/stat
 	Avg1           float64       // load average за минуту из /proc/loadavg
 	CPUSome        float64       // % последних 10 с, когда хоть одна задача ждала процессор (some avg10), для справки
 	IOFull         float64       // % IOWindow, когда все задачи ждали диск, до 0,1; при источнике — его окно 5 с, без него — дельта total PSI io за окно свопа (fresh) или с прошлого Check
 	IOWindow       time.Duration // окно замера IOFull
+	IOSome         float64       // % последних 10 с, когда хоть одна задача ждала диск (some avg10), из того же чтения /proc/pressure/io; для записи, правило его не судит
 	Disk           *DiskNow      // снимок источника состояния диска; nil — источника нет или он сбоит
 	DiskFault      error         // почему источника нет или чем он сбоит; сентинел той же ошибки — в Verdict.Skipped
 	ioFullExact    float64
@@ -274,6 +276,7 @@ type Meter struct {
 	ioAt     time.Time
 	ioValid  bool
 	disk     string
+	readFile func(string) ([]byte, error) // чтение файла procRoot; nil — os.ReadFile
 	now      func() time.Time
 	sleep    func(context.Context, time.Duration) error
 }
@@ -333,7 +336,9 @@ func (m *Meter) Check(ctx context.Context, l Limits, _ string, fresh bool) (Verd
 			if err != nil {
 				return err
 			}
-			load.Runnable, load.Threads, err = ParseStat(string(stat))
+			var c statCounts
+			c, err = parseStat(string(stat))
+			load.Runnable, load.Threads, load.Blocked = c.runnable, c.threads, c.blocked
 			return err
 		}),
 		measure(ErrNoLoadAvg, func() error {
@@ -386,7 +391,7 @@ func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, fresh bool, lo
 	load.Disk, load.DiskFault = readDisk(ctx, m.socketPath(), m.now())
 	if fresh && load.Disk != nil && !skippedAny(*skipped, ErrNoMemPressure) && load.MemSome <= l.MemSomeLimit() {
 		load.SwapUnmeasured = true
-		if err := m.markBaseline(skipped); err != nil {
+		if err := m.markBaseline(load, skipped); err != nil {
 			return err
 		}
 	} else if err := m.measureSwapAndIO(ctx, l, fresh, load, skipped); err != nil {
@@ -415,17 +420,19 @@ func (m *Meter) measureSwapAndDisk(ctx context.Context, l Limits, fresh bool, lo
 
 // markBaseline reads swapping and IO pressure counters without a window, so the next Check that is
 // not fresh measures them since now, as it would after a measured window.
-func (m *Meter) markBaseline(skipped *[]error) error {
+func (m *Meter) markBaseline(load *Load, skipped *[]error) error {
 	if err := m.readSwap(); errors.Is(err, ErrNoVMStat) {
 		*skipped = append(*skipped, ErrNoVMStat)
 	} else if err != nil {
 		return err
 	}
-	total, valid, err := m.readIOTotal()
+	io, err := m.readIO()
 	if err != nil {
 		return err
 	}
-	m.ioTotal, m.ioAt, m.ioValid = total, m.now(), valid
+	load.IOSome = io.some
+	m.ioTotal, m.ioAt, m.ioValid = io.total, m.now(), io.valid
+	valid := io.valid
 	if !valid {
 		*skipped = append(*skipped, ErrNoIOPressure)
 	}
@@ -437,11 +444,11 @@ func (m *Meter) measureSwapAndIO(ctx context.Context, l Limits, fresh bool, load
 	ioStartValid := m.ioValid
 	ioStartAt := m.ioAt
 	if fresh || m.at.IsZero() {
-		var err error
-		ioStart, ioStartValid, err = m.readIOTotal()
+		start, err := m.readIO()
 		if err != nil {
 			return err
 		}
+		ioStart, ioStartValid = start.total, start.valid
 		ioStartAt = m.now()
 	}
 	swap, err := m.swapping(ctx, l.SwapWindow, fresh)
@@ -452,10 +459,12 @@ func (m *Meter) measureSwapAndIO(ctx context.Context, l Limits, fresh bool, load
 	} else {
 		load.SwapKBs = swap
 	}
-	ioEnd, ioEndValid, err := m.readIOTotal()
+	end, err := m.readIO()
 	if err != nil {
 		return err
 	}
+	ioEnd, ioEndValid := end.total, end.valid
+	load.IOSome = end.some
 	ioAt := m.now()
 	if ioEndValid {
 		baseAt, baseTotal, baseValid := m.ioAt, m.ioTotal, m.ioValid
@@ -573,7 +582,11 @@ func (m *Meter) dirtyLimit(meminfo string) (float64, error) {
 
 // read читает файл procRoot; файла нет — мера none.
 func (m *Meter) read(name string, none error) ([]byte, error) {
-	data, err := os.ReadFile(filepath.Join(m.procRoot, name))
+	readFile := m.readFile
+	if readFile == nil {
+		readFile = os.ReadFile
+	}
+	data, err := readFile(filepath.Join(m.procRoot, name))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, none
 	}
@@ -607,19 +620,31 @@ func (m *Meter) swapping(ctx context.Context, window time.Duration, fresh bool) 
 	return float64(m.pages-before) * float64(os.Getpagesize()) / 1024 / elapsed, nil
 }
 
-func (m *Meter) readIOTotal() (int64, bool, error) {
+// ioRead — одно чтение /proc/pressure/io: total строки full и some avg10; valid — файл есть.
+type ioRead struct {
+	total int64
+	some  float64
+	valid bool
+}
+
+func (m *Meter) readIO() (ioRead, error) {
 	data, err := m.read(filepath.Join("pressure", "io"), ErrNoIOPressure)
 	if errors.Is(err, ErrNoIOPressure) {
-		return 0, false, nil
+		return ioRead{}, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("IO pressure: %w", err)
+		return ioRead{}, fmt.Errorf("IO pressure: %w", err)
 	}
 	total, err := psiTotal(string(data), "full")
 	if err != nil {
-		return 0, false, fmt.Errorf("IO pressure: %w", err)
+		return ioRead{}, fmt.Errorf("IO pressure: %w", err)
 	}
-	return total, true, nil
+	r := ioRead{total: total, valid: true}
+	// some avg10 — только для записи: без строки some замер и вердикт прежние, поле 0.
+	if some, err := psiField(string(data), "some", "avg10"); err == nil {
+		r.some = some
+	}
+	return r, nil
 }
 
 func (m *Meter) readSwap() error {
@@ -663,6 +688,22 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // ParseStat достаёт из /proc/stat число готовых к работе задач без читающего процесса
 // (procs_running − 1) и число потоков (строки cpuN).
 func ParseStat(s string) (runnable, threads int, err error) {
+	c, err := parseStat(s)
+	if err != nil {
+		return 0, 0, err
+	}
+	return c.runnable, c.threads, nil
+}
+
+// statCounts — счётчики одного чтения /proc/stat.
+type statCounts struct {
+	runnable int // procs_running − 1
+	threads  int // строк cpuN
+	blocked  int // procs_blocked; строки нет — 0
+}
+
+func parseStat(s string) (statCounts, error) {
+	var c statCounts
 	seen := false
 	sc := bufio.NewScanner(strings.NewReader(s))
 	sc.Buffer(make([]byte, 64*1024), 1024*1024) // строка intr длинная
@@ -675,20 +716,26 @@ func ParseStat(s string) (runnable, threads int, err error) {
 		case f[0] == "procs_running":
 			n, err := strconv.Atoi(f[1])
 			if err != nil {
-				return 0, 0, fmt.Errorf("stat procs_running %q: %w", f[1], err)
+				return statCounts{}, fmt.Errorf("stat procs_running %q: %w", f[1], err)
 			}
-			runnable, seen = max(n-1, 0), true
+			c.runnable, seen = max(n-1, 0), true
+		case f[0] == "procs_blocked":
+			n, err := strconv.Atoi(f[1])
+			if err != nil {
+				return statCounts{}, fmt.Errorf("stat procs_blocked %q: %w", f[1], err)
+			}
+			c.blocked = n
 		case strings.HasPrefix(f[0], "cpu") && len(f[0]) > 3:
-			threads++
+			c.threads++
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return 0, 0, fmt.Errorf("stat: %w", err)
+		return statCounts{}, fmt.Errorf("stat: %w", err)
 	}
 	if !seen {
-		return 0, 0, errors.New("stat: no procs_running")
+		return statCounts{}, errors.New("stat: no procs_running")
 	}
-	return runnable, threads, nil
+	return c, nil
 }
 
 // ParseSwapPages — страниц, ушедших в своп и вернувшихся с загрузки: pswpin + pswpout из /proc/vmstat.

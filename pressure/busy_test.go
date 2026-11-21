@@ -198,7 +198,7 @@ func TestCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Load{Runnable: 3, Threads: 3, CPUSome: 40, IOFull: 9.6, IOWindow: time.Second, ioFullExact: 9.6, hasIOFullExact: true, MemSome: 12.5}
+	want := Load{Runnable: 3, Threads: 3, CPUSome: 40, IOFull: 9.6, IOSome: 1, IOWindow: time.Second, ioFullExact: 9.6, hasIOFullExact: true, MemSome: 12.5}
 	got := v.Load
 	got.DiskFault = nil
 	if v.Measure != CPU || got != want || !slices.ContainsFunc(v.Skipped, func(e error) bool { return errors.Is(e, ErrNoIOSource) }) {
@@ -213,6 +213,62 @@ func TestCheck(t *testing.T) {
 	}
 	if kbs := float64(512*os.Getpagesize()) / 1024; v.Measure != Swap || v.Load.SwapKBs != kbs {
 		t.Errorf("своп = %+v; ждали %v KB/s", v, kbs)
+	}
+}
+
+// Blocked и IOSome — из тех же чтений /proc/stat и /proc/pressure/io, что Runnable и IOFull: /proc/stat читается один раз за замер.
+func TestCheckBlockedIOSome(t *testing.T) {
+	m, _ := fakeProc(t, map[string]string{
+		"stat":        strings.Replace(stat, "procs_blocked 0", "procs_blocked 7", 1),
+		"pressure/io": "some avg10=1 avg60=2 avg300=3 total=1\nfull avg10=0.5 avg60=12.5 avg300=1 total=1\n",
+		"vmstat":      "pswpin 1\npswpout 1\n", // без свопа повторный Check снова мерил бы окно
+	})
+	// За окно some меняется: IOSome — из конечного чтения, того же, что total для IOFull.
+	m.sleep = func(context.Context, time.Duration) error {
+		writeProc(t, m.procRoot, "pressure/io", "some avg10=12.34 avg60=2 avg300=3 total=1\nfull avg10=0.5 avg60=12.5 avg300=1 total=1\n")
+		return nil
+	}
+	reads := map[string]int{}
+	m.readFile = func(path string) ([]byte, error) {
+		rel, _ := filepath.Rel(m.procRoot, path)
+		reads[rel]++
+		return os.ReadFile(path)
+	}
+	l := Limits{Runnable: 100, MaxIOFull: 100, MaxSwapKBs: 1024}
+	for _, fresh := range []bool{true, false} {
+		clear(reads)
+		v, err := m.Check(context.Background(), l, "", fresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Load.Blocked != 7 || v.Load.IOSome != 12.34 || v.Load.Runnable != 3 || v.Busy() {
+			t.Errorf("fresh=%t: Load = %+v; ждали Blocked 7, IOSome 12.34, Runnable 3, свободна", fresh, v.Load)
+		}
+		if reads["stat"] != 1 {
+			t.Errorf("fresh=%t: /proc/stat прочитан %d раз; ждали 1", fresh, reads["stat"])
+		}
+		// PSI io: свежий замер — начало и конец окна, повторный — одно чтение; some — из тех же чтений.
+		if want := map[bool]int{true: 2, false: 1}[fresh]; reads[filepath.Join("pressure", "io")] != want {
+			t.Errorf("fresh=%t: /proc/pressure/io прочитан %d раз; ждали %d", fresh, reads[filepath.Join("pressure", "io")], want)
+		}
+	}
+	// Без строки some замер прежний, IOSome 0; без procs_blocked — Blocked 0.
+	m.sleep = func(context.Context, time.Duration) error { return nil }
+	writeProc(t, m.procRoot, "pressure/io", "full avg10=0.5 avg60=12.5 avg300=1 total=1\n")
+	writeProc(t, m.procRoot, "stat", strings.Replace(stat, "procs_blocked 0\n", "", 1))
+	if v, err := m.Check(context.Background(), l, "", true); err != nil || v.Load.IOSome != 0 || v.Load.Blocked != 0 || v.Busy() {
+		t.Errorf("без some и procs_blocked = %+v, %v; ждали 0, 0, свободна", v, err)
+	}
+	// procs_blocked не число — ошибка, как у procs_running: /proc/stat не тот, что пишет ядро.
+	for _, bad := range []string{"procs_blocked x", "procs_blocked 99999999999999999999"} {
+		body := strings.Replace(stat, "procs_blocked 0", bad, 1)
+		writeProc(t, m.procRoot, "stat", body)
+		if _, err := m.Check(context.Background(), l, "", true); err == nil {
+			t.Errorf("Check с %q — ждали ошибку", bad)
+		}
+		if _, _, err := ParseStat(body); err == nil {
+			t.Errorf("ParseStat с %q — ждали ошибку", bad)
+		}
 	}
 }
 

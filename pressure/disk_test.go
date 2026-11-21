@@ -218,7 +218,7 @@ func TestFreshSwapWindowDependsOnMemoryAndDiskSource(t *testing.T) {
 // so the next one that is not fresh measures since then without waiting.
 func TestSkippedWindowMarksBaselineForNextCheck(t *testing.T) {
 	m, now := fakeProc(t, map[string]string{
-		"stat": stat, "pressure/io": "full avg10=0 avg60=0 avg300=0 total=1000\n",
+		"stat": stat, "pressure/io": "some avg10=12.34 avg60=0 avg300=0 total=1\nfull avg10=0 avg60=0 avg300=0 total=1000\n",
 		"pressure/memory": "some avg10=0.3 avg60=0 avg300=0 total=1\n",
 		"vmstat":          "pswpin 10\npswpout 10\n",
 	})
@@ -237,12 +237,12 @@ func TestSkippedWindowMarksBaselineForNextCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sleeps != 0 || !v.Load.SwapUnmeasured {
-		t.Fatalf("first Check: sleeps = %d, SwapUnmeasured = %t", sleeps, v.Load.SwapUnmeasured)
+	if sleeps != 0 || !v.Load.SwapUnmeasured || v.Load.IOSome != 12.34 {
+		t.Fatalf("first Check: sleeps = %d, SwapUnmeasured = %t, IOSome = %g", sleeps, v.Load.SwapUnmeasured, v.Load.IOSome)
 	}
 	*now = now.Add(2 * time.Second)
 	writeProc(t, m.procRoot, "vmstat", "pswpin 110\npswpout 10\n")
-	writeProc(t, m.procRoot, "pressure/io", "full avg10=0 avg60=0 avg300=0 total=21000\n")
+	writeProc(t, m.procRoot, "pressure/io", "some avg10=3.5 avg60=0 avg300=0 total=1\nfull avg10=0 avg60=0 avg300=0 total=21000\n")
 	v, err = m.Check(context.Background(), limits, "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -251,8 +251,8 @@ func TestSkippedWindowMarksBaselineForNextCheck(t *testing.T) {
 	if sleeps != 0 || v.Load.SwapUnmeasured || v.Load.SwapKBs != wantSwap {
 		t.Errorf("second Check: sleeps = %d, SwapUnmeasured = %t, SwapKBs = %g; wanted 0, false, %g", sleeps, v.Load.SwapUnmeasured, v.Load.SwapKBs, wantSwap)
 	}
-	if v.Load.IOWindow != 2*time.Second || v.Load.IOFull != 1 {
-		t.Errorf("second Check IO: window %s, full %g; wanted 2s, 1", v.Load.IOWindow, v.Load.IOFull)
+	if v.Load.IOWindow != 2*time.Second || v.Load.IOFull != 1 || v.Load.IOSome != 3.5 {
+		t.Errorf("second Check IO: window %s, full %g, some %g; wanted 2s, 1, 3.5", v.Load.IOWindow, v.Load.IOFull, v.Load.IOSome)
 	}
 	if containsError(v.Skipped, ErrNoVMStat) || containsError(v.Skipped, ErrNoIOPressure) {
 		t.Errorf("skipped = %v", v.Skipped)
