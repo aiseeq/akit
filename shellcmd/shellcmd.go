@@ -137,231 +137,16 @@ type Call struct {
 	// в исходном тексте как слова: argv0 из переменной или с подстановкой, байт скрипта из $'…'.
 	Offset int
 	// Redirs — перенаправления простой команды по порядку (у снятой обёртки — те же, что у неё).
-	Redirs []Redir
-	// Keep the private flags before slice fields so staticArgs occupies existing struct padding.
-	literalArgs uint32
+	Redirs       []Redir
+	literalArgs  uint32
+	tildeArgs    []Tilde
+	staticDirect bool
 	// Loop — вызов в теле цикла while, until, for или select (и во вложенном скрипте такого тела).
 	Loop bool
 	// Background — вызов в задании, чей оператор или объемлющий оператор заканчивается `&`.
 	Background bool
 	// ScriptInput сообщает, что оболочка исполняет неизвестный текст из stdin или process substitution.
 	ScriptInput bool
-	tildeArgs   []Tilde
-	staticArgs  *staticMask
-}
-
-type staticMask struct {
-	nonStatic []uint64
-}
-
-const staticMaskBitsPerWord = 64
-
-func staticMaskSet(mask *staticMask, index int) {
-	mask.nonStatic[index/staticMaskBitsPerWord] |= uint64(1) << uint(index%staticMaskBitsPerWord)
-}
-
-func staticMaskHas(mask *staticMask, index int) bool {
-	return mask.nonStatic[index/staticMaskBitsPerWord]&(uint64(1)<<uint(index%staticMaskBitsPerWord)) != 0
-}
-
-func staticMaskForWords(words []word) *staticMask {
-	var mask *staticMask
-	for i := range words {
-		if words[i].static {
-			continue
-		}
-		if mask == nil {
-			mask = &staticMask{nonStatic: make([]uint64, (len(words)+staticMaskBitsPerWord-1)/staticMaskBitsPerWord)}
-		}
-		staticMaskSet(mask, i)
-	}
-	return mask
-}
-
-func staticMaskTail(mask *staticMask, start, count int) *staticMask {
-	if mask == nil || start >= count {
-		return nil
-	}
-	any := false
-	for i := start; i < count; i++ {
-		if staticMaskHas(mask, i) {
-			any = true
-			break
-		}
-	}
-	if !any {
-		return nil
-	}
-	tail := &staticMask{nonStatic: make([]uint64, (count-start+staticMaskBitsPerWord-1)/staticMaskBitsPerWord)}
-	for i := start; i < count; i++ {
-		if staticMaskHas(mask, i) {
-			iTail := i - start
-			staticMaskSet(tail, iTail)
-		}
-	}
-	return tail
-}
-
-func markNonStatic(mask **staticMask, count, index int) {
-	if index < 0 || index >= count {
-		return
-	}
-	if *mask == nil {
-		*mask = &staticMask{nonStatic: make([]uint64, (count+staticMaskBitsPerWord-1)/staticMaskBitsPerWord)}
-	}
-	staticMaskSet(*mask, index)
-}
-
-func markReplacementArgs(mask **staticMask, args, replacements []string) {
-	for i, arg := range args {
-		if containsReplacement(arg, replacements) {
-			markNonStatic(mask, len(args), i)
-		}
-	}
-}
-
-func containsReplacement(arg string, replacements []string) bool {
-	for _, replacement := range replacements {
-		if replacement == parallelReplacementMarker {
-			if containsParallelReplacement(arg) {
-				return true
-			}
-		} else if replacement == unknownReplacementMarker {
-			return true
-		} else if replacement == findReplacementMarker {
-			if strings.Contains(arg, "{}") {
-				return true
-			}
-		} else if replacement != "" && strings.Contains(arg, replacement) {
-			return true
-		}
-	}
-	return false
-}
-
-const parallelReplacementMarker = "\x00parallel-replacement"
-const findReplacementMarker = "\x00find-replacement"
-const unknownReplacementMarker = "\x00unknown-replacement"
-
-var findReplacementContext = []string{findReplacementMarker}
-var parallelReplacementContext = []string{parallelReplacementMarker}
-
-func addReplacementContext(context []string, replacement string) []string {
-	if replacement == "" || slices.Contains(context, replacement) {
-		return context
-	}
-	if len(context) == 0 && replacement == findReplacementMarker {
-		return findReplacementContext
-	}
-	if len(context) == 0 && replacement == parallelReplacementMarker {
-		return parallelReplacementContext
-	}
-	return append(slices.Clone(context), replacement)
-}
-
-func containsParallelReplacement(text string) bool {
-	for start := 0; start < len(text); start++ {
-		if _, ok := parallelReplacementEnd(text, start); ok {
-			return true
-		}
-	}
-	return false
-}
-
-// replacementContextAt follows the wrapper chain leading to target and gathers
-// every replacement that can alter its arguments or nested script text.
-func replacementContextAt(c cmd, target int) []string {
-	context := c.replacements
-	name, args := c.call.Name, c.call.Args
-	for depth := 0; depth < maxNestedScripts && target >= 0; depth++ {
-		switch name {
-		case "find":
-			start, end, ok := findExecRangeAt(args, target)
-			if !ok {
-				return context
-			}
-			context = addReplacementContext(context, findReplacementMarker)
-			name = commandName(args[start])
-			args = args[start+1 : end]
-			target -= start + 1
-		case "xargs":
-			start := wrapperStart(name, args)
-			if target < start {
-				return context
-			}
-			if xargsHasUnknownReplacement(c, start) {
-				context = addReplacementContext(context, unknownReplacementMarker)
-			} else if replacement, ok := xargsReplacement(args); ok {
-				context = addReplacementContext(context, replacement)
-			}
-			name = commandName(args[start])
-			args = args[start+1:]
-			target -= start + 1
-		case "parallel":
-			start, ok := parallelCommandStart(args)
-			if !ok || target < start {
-				return context
-			}
-			end := slices.Index(args[start:], ":::")
-			if end < 0 {
-				end = slices.Index(args[start:], "::::")
-			}
-			if end < 0 || start+end < target {
-				return context
-			}
-			context = addReplacementContext(context, parallelReplacementMarker)
-			name = commandName(args[start])
-			args = args[start+1 : start+end]
-			target -= start + 1
-		default:
-			if !wrappers[name] && !baselineWrapper(name) {
-				return context
-			}
-			wrapped, ok := unwrapOnce(name, args)
-			if !ok || len(wrapped) == 0 {
-				return context
-			}
-			start := len(args) - len(wrapped)
-			if target < start {
-				return context
-			}
-			name = commandName(wrapped[0])
-			args = wrapped[1:]
-			target -= start + 1
-		}
-	}
-	return context
-}
-
-func findExecRangeAt(args []string, target int) (int, int, bool) {
-	for next := 0; next < len(args); {
-		start, end, after, ok := nextFindExec(args, next)
-		if !ok {
-			return 0, 0, false
-		}
-		if target >= start && target < after {
-			return start, end, true
-		}
-		next = after
-	}
-	return 0, 0, false
-}
-
-func nextFindExec(args []string, from int) (start, end, next int, ok bool) {
-	for i := from; i < len(args); i++ {
-		if args[i] != "-exec" && args[i] != "-execdir" && args[i] != "-ok" && args[i] != "-okdir" {
-			continue
-		}
-		start = i + 1
-		end = start
-		for end < len(args) && args[end] != ";" && args[end] != "+" {
-			end++
-		}
-		if end > start {
-			return start, end, min(end+1, len(args)), true
-		}
-	}
-	return 0, 0, len(args), false
 }
 
 // Tilde describes Bash tilde expansion in a word. Bash expands an unquoted
@@ -391,6 +176,8 @@ const (
 	TildeOther Tilde = 2
 	// TildeModeUnknown marks a word whose result can change with runtime shell options.
 	TildeModeUnknown Tilde = 4
+
+	tildeStatic Tilde = 128
 )
 
 // ArgTilde reports Bash tilde expansion in Args[i], including nested script words.
@@ -402,23 +189,14 @@ func (c Call) ArgTilde(i int) Tilde {
 	if i >= len(c.tildeArgs) {
 		return 0
 	}
-	return c.tildeArgs[i]
+	return c.tildeArgs[i] &^ tildeStatic
 }
 
-// ArgStatic reports whether Args[i] is formed only from literal characters and quoting, without expansions.
-// Nested scripts are judged by their own words: every byte must come from a literal outer part, and any
-// earlier outer expansion or wrapper replacement makes later words non-static because it can change parsing.
-// Find, xargs, and parallel replacements are carried through the full wrapper chain. Unlike ArgLiteral,
-// this does not establish that the call itself will execute (for example, an alias or function can replace it).
+// ArgStatic reports whether Args[i] is a literal word of a direct command invocation.
+// Words from scripts parsed again or arguments assembled by wrappers are not static.
 // Out-of-range indices return false.
 func (c Call) ArgStatic(i int) bool {
-	if i < 0 || i >= len(c.Args) {
-		return false
-	}
-	if c.staticArgs == nil {
-		return true
-	}
-	return !staticMaskHas(c.staticArgs, i)
+	return c.staticDirect && i >= 0 && i < len(c.Args) && i < len(c.tildeArgs) && c.tildeArgs[i]&tildeStatic != 0
 }
 
 // ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: все его
@@ -448,7 +226,6 @@ type cmd struct {
 	budget         *nestedParseBudget
 	source         string
 	expansionDepth int
-	replacements   []string
 
 	stdinInput    *syntax.Redirect
 	stdinConsumed bool
@@ -466,10 +243,7 @@ type word struct {
 	offset       int    // смещение в исходной команде; -1 — слово не литерал
 	script       string // текст, который выполнит оболочка, получив слово скриптом; "" — не виден до запуска
 	pos          []int  // pos[i] — смещение байта i текста script в исходной команде; -1 — такого байта нет
-	rawStart     []int
-	rawEnd       []int
 	subst        [][2]int
-	dynamic      [][2]int
 }
 
 // Redir — перенаправление: `> f`, `2>>log`, `<<EOF` с телом.
@@ -542,7 +316,6 @@ type nestedParseBudget struct {
 	initialBrace        bool
 	initialPosixUnknown bool
 	initialBraceUnknown bool
-	activeReplacements  []string
 	parsedShells        map[string]int
 	// modeTexts are the eval and trap texts the mode walks of all scripts read.
 	modeTexts *modeTexts
@@ -594,7 +367,7 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	if optionErr != nil {
 		return optionErr
 	}
-	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, nil, budget)
+	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
 	if err != nil {
 		return err
 	}
@@ -654,7 +427,7 @@ func checkUncertainTime(file *syntax.File, src string, lineBase int, inherited [
 	return nil
 }
 
-func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, dynamic [][2]int, budget *nestedParseBudget) error {
+func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
@@ -663,7 +436,7 @@ func walkFileWithBudget(file *syntax.File, full, src string, lineBase int, inher
 	if len(full) > len(src) {
 		walkText = full
 	}
-	err := walkCalls(file, walkText, len(src), lineBase, inherited, vars, calls, ignored, subst, dynamic, budget)
+	err := walkCalls(file, walkText, len(src), lineBase, inherited, vars, calls, ignored, subst, budget)
 	if len(full) > len(src) {
 		*calls = append((*calls)[:first], trimAppended((*calls)[first:], src)...)
 	}
@@ -1094,11 +867,11 @@ func unclosedHeredocDelimiter(text string) (string, bool) {
 	return delim, err == nil
 }
 
-func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, dynamic [][2]int, budget *nestedParseBudget) error {
+func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited []string, vars map[string]string, calls *[]Call, ignored [][2]int, subst *mapped, budget *nestedParseBudget) error {
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
 
-	walker := callWalker{src: src, sourceLen: sourceLen, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored, subst: subst, dynamic: dynamic, replacements: budget.activeReplacements}
+	walker := callWalker{src: src, sourceLen: sourceLen, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored, subst: subst}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -2742,7 +2515,7 @@ func literalEchoBody(values []string, parts []mapped) (mapped, error) {
 		}
 		values, parts = values[1:], parts[1:]
 	}
-	for i := range parts {
+	for i, part := range parts {
 		if i > 0 {
 			body.add(" ", -1)
 		}
@@ -2761,8 +2534,8 @@ func literalEchoBody(values []string, parts []mapped) (mapped, error) {
 				return body, nil
 			}
 		} else {
-			body.text = append(body.text, parts[i].text...)
-			body.pos = append(body.pos, parts[i].pos...)
+			body.text = append(body.text, part.text...)
+			body.pos = append(body.pos, part.pos...)
 		}
 	}
 	if newline {
@@ -3874,8 +3647,6 @@ type callWalker struct {
 	budget       *nestedParseBudget
 	ignoredCalls [][2]int
 	subst        *mapped
-	dynamic      [][2]int
-	replacements []string
 	parseErr     error
 	nestedErrs   []error
 }
@@ -3935,92 +3706,6 @@ func (w *callWalker) outerSubstitution(node syntax.Node) bool {
 		return w.subst.subst[i][1] > offset
 	})
 	return i < len(w.subst.subst) && offset >= w.subst.subst[i][0]
-}
-
-func mappedSourceRangeStatic(subst *mapped, dynamic [][2]int, start, end int) bool {
-	if (subst == nil || len(subst.subst) == 0) && len(dynamic) == 0 {
-		return true
-	}
-	if start < 0 || end < start || subst != nil && end > len(subst.pos) {
-		return false
-	}
-	first := int(^uint(0) >> 1)
-	for i := start; i < end; i++ {
-		offset := i
-		if subst != nil {
-			offset = outerOffset(i, subst.pos)
-		}
-		if offset < 0 {
-			return false
-		}
-		if offset < first {
-			first = offset
-		}
-		if mappedOffsetInSpan(subst, dynamic, offset) {
-			return false
-		}
-	}
-	if mappedPrefixBefore(subst, dynamic, first) {
-		return false
-	}
-	return true
-}
-
-func mappedOffsetInSpan(subst *mapped, dynamic [][2]int, offset int) bool {
-	if subst != nil {
-		for _, span := range subst.subst {
-			if offset >= sourceSpanStart(span) && offset < dynamicSpanEnd(span) {
-				return true
-			}
-		}
-	}
-	for _, span := range dynamic {
-		if offset >= sourceSpanStart(span) && offset < dynamicSpanEnd(span) {
-			return true
-		}
-	}
-	return false
-}
-
-func mappedPrefixBefore(subst *mapped, dynamic [][2]int, offset int) bool {
-	if subst != nil {
-		for _, span := range subst.subst {
-			if span[0] < 0 && sourceSpanStart(span) < offset {
-				return true
-			}
-		}
-	}
-	for _, span := range dynamic {
-		if span[0] < 0 && sourceSpanStart(span) < offset {
-			return true
-		}
-	}
-	return false
-}
-
-func dynamicSpanEnd(span [2]int) int {
-	if span[1] < 0 {
-		return -span[1] - 1
-	}
-	return span[1]
-}
-
-func sourceSpanStart(span [2]int) int {
-	if span[0] < 0 {
-		return -span[0] - 1
-	}
-	return span[0]
-}
-
-func appendDynamicSourceSpans(spans [][2]int, dynamic [][2]int) [][2]int {
-	for _, span := range dynamic {
-		if span[0] < 0 || span[1] < 0 {
-			spans = append(spans, span)
-		} else {
-			spans = append(spans, [2]int{-span[0] - 1, span[1]})
-		}
-	}
-	return spans
 }
 
 func (w *callWalker) visitRedirect(redirect *syntax.Redirect) {
@@ -4109,7 +3794,6 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		w.parseErr = fmt.Errorf("shellcmd: expand command word: %w", err)
 		return
 	}
-	inheritMappedProvenance(words, call, w.subst, w.dynamic)
 	if commandName(args[0]) == "eval" {
 		for i := 1; i < len(call.Args); i++ {
 			if !literals[i] {
@@ -4118,15 +3802,14 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 					w.parseErr = err
 					return
 				}
-				words[i].script, words[i].pos, words[i].rawStart, words[i].rawEnd, words[i].subst, words[i].dynamic = text.String(), text.pos, text.rawStart, text.rawEnd, text.subst, nil
+				words[i].script, words[i].pos, words[i].subst = text.String(), text.pos, text.subst
 			}
 		}
 	}
-	ws, tildeArgs := markedCallWords(call, words, split, w.src, w.info, w.budget.initialPosix, w.subst, w.dynamic)
-	staticArgs := staticMaskForWords(ws[1:])
+	ws, tildeArgs := markedCallWords(call, words, split, w.src, w.info, w.budget.initialPosix)
 	posixEnv := hasPosixEnvironment(call)
 	mode := shellModes{posix: w.info.posixCalls[call], posixUnknown: w.info.unknownPosix[call], brace: w.info.braceCalls[call], braceUnknown: w.info.unknownBrace[call]}
-	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticArgs: staticArgs, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], replacements: w.replacements}
+	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: len(w.inherited) == 0, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
 	for _, part := range call.Args[0].Parts {
 		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
 			c.call.Name = ""
@@ -4145,39 +3828,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	}
 }
 
-func inheritMappedProvenance(words []word, call *syntax.CallExpr, subst *mapped, dynamic [][2]int) {
-	if subst == nil && len(dynamic) == 0 {
-		return
-	}
-	start, end := int(call.Pos().Offset()), int(call.End().Offset())
-	inherited := projectMappedSpans(subst, dynamic, start, end)
-	for i := range words {
-		words[i].subst = append(words[i].subst, inherited...)
-	}
-}
-
-func projectMappedSpans(subst *mapped, dynamic [][2]int, start, end int) [][2]int {
-	if (subst == nil || len(subst.subst) == 0) && len(dynamic) == 0 || subst == nil {
-		return nil
-	}
-	var projected [][2]int
-	start = max(start, 0)
-	end = min(end, len(subst.pos))
-	for i := start; i < end; i++ {
-		offset := outerOffset(i, subst.pos)
-		if offset < 0 && i < len(subst.rawStart) && subst.rawStart[i] >= 0 {
-			offset = subst.rawStart[i]
-		}
-		if mappedOffsetInSpan(subst, dynamic, offset) {
-			projected = append(projected, [2]int{i, i + 1})
-		} else if mappedPrefixBefore(subst, dynamic, offset) {
-			projected = append(projected, [2]int{-i - 1, i + 1})
-		}
-	}
-	return projected
-}
-
-func markedCallWords(call *syntax.CallExpr, words []word, split int, src string, info *walkInfo, initialPosix bool, subst *mapped, dynamic [][2]int) ([]word, []Tilde) {
+func markedCallWords(call *syntax.CallExpr, words []word, split int, src string, info *walkInfo, initialPosix bool) ([]word, []Tilde) {
 	posix, ok := info.posixCalls[call]
 	if !ok {
 		posix = initialPosix
@@ -4188,20 +3839,169 @@ func markedCallWords(call *syntax.CallExpr, words []word, split int, src string,
 	}
 	for i := 1; i < len(call.Args); i++ {
 		words[i].tilde = wordTildeWithMode(call.Args[i], src, false, true, posix, braceExpand, info.unknownPosix[call], info.unknownBrace[call])
-		words[i].static = staticShellWord(call.Args[i], words[i].tilde, braceExpand)
-		if words[i].static && !mappedSourceRangeStatic(subst, dynamic, int(call.Args[i].Pos().Offset()), int(call.Args[i].End().Offset())) {
-			words[i].static = false
-		}
+		words[i].static = staticShellWord(call.Args[i], words[i].sourceText, words[i].tilde, braceExpand || info.unknownBrace[call])
 	}
 	ws := splitWords(words, split)
 	marks := make([]Tilde, len(ws)-1)
 	for i := 1; i < len(ws); i++ {
 		marks[i-1] = ws[i].tilde
+		if ws[i].static {
+			marks[i-1] |= tildeStatic
+		}
 	}
 	if !slices.ContainsFunc(marks, func(mark Tilde) bool { return mark != 0 }) {
 		marks = nil
 	}
 	return ws, marks
+}
+
+func staticShellWord(w *syntax.Word, source string, tilde Tilde, braceExpand bool) bool {
+	if w == nil || len(w.Parts) == 0 || tilde != 0 || braceExpand && hasBraceExpansionSource(source) || wordHasGlob(w.Parts) {
+		return false
+	}
+	for _, part := range w.Parts {
+		if !staticWordPart(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasBraceExpansionSource(source string) bool {
+	type group struct{ separated bool }
+	var groups []group
+	var quote byte
+	for i := 0; i < len(source); i++ {
+		ch := source[i]
+		if ch == '\\' && quote != '\'' && i+1 < len(source) {
+			i++
+			continue
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '{':
+			groups = append(groups, group{})
+		case ',':
+			if len(groups) > 0 {
+				groups[len(groups)-1].separated = true
+			}
+		case '.':
+			if i+1 < len(source) && source[i+1] == '.' && len(groups) > 0 {
+				groups[len(groups)-1].separated = true
+				i++
+			}
+		case '}':
+			if len(groups) > 0 {
+				separated := groups[len(groups)-1].separated
+				groups = groups[:len(groups)-1]
+				if separated {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func staticWordPart(part syntax.WordPart) bool {
+	switch p := part.(type) {
+	case *syntax.Lit:
+		return true
+	case *syntax.SglQuoted:
+		return !p.Dollar
+	case *syntax.DblQuoted:
+		if p.Dollar {
+			return false
+		}
+		for _, inner := range p.Parts {
+			if !staticWordPart(inner) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+type globClassState struct {
+	inside, first, content, pending bool
+}
+
+func wordHasGlob(parts []syntax.WordPart) bool {
+	var state globClassState
+	scanGlobParts(parts, false, &state)
+	return state.pending
+}
+
+func scanGlobParts(parts []syntax.WordPart, quoted bool, state *globClassState) {
+	for _, part := range parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			scanGlobText(p.Value, quoted, state)
+		case *syntax.SglQuoted:
+			scanGlobText(p.Value, true, state)
+		case *syntax.DblQuoted:
+			scanGlobParts(p.Parts, true, state)
+		case *syntax.BraceExp:
+			for _, elem := range p.Elems {
+				scanGlobParts(elem.Parts, quoted, state)
+			}
+		}
+	}
+}
+
+func scanGlobText(text string, quoted bool, state *globClassState) {
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if quoted {
+			if state.inside {
+				state.first, state.content = false, true
+			}
+			continue
+		}
+		if ch == '\\' {
+			if i+1 < len(text) {
+				i++
+				if state.inside {
+					state.first, state.content = false, true
+				}
+			}
+			continue
+		}
+		if state.inside {
+			if ch == ']' {
+				if !state.content {
+					state.first, state.content = false, true
+					continue
+				}
+				state.inside, state.pending = false, true
+				return
+			}
+			if state.first && (ch == '!' || ch == '^') {
+				state.first = false
+				continue
+			}
+			if ch == '*' || ch == '?' {
+				state.pending = true
+			}
+			state.first, state.content = false, true
+			continue
+		}
+		switch ch {
+		case '*', '?':
+			state.pending = true
+		case '[':
+			state.inside, state.first, state.content = true, true, false
+		}
+	}
 }
 
 func wordTildeWithMode(word *syntax.Word, src string, assignment, argumentAssignment, posix, braceExpand, posixUnknown, braceUnknown bool) Tilde {
@@ -4484,9 +4284,6 @@ const (
 // the enclosing element, so nested groups cost the square of their depth; their
 // braces are hidden from it as literalLeftBrace and literalRightBrace first.
 func splitBraces(word *syntax.Word) (syntax.Word, bool) {
-	if !wordMaySplitBraces(word.Parts) {
-		return *word, false
-	}
 	copyWord := *word
 	copyWord.Parts = slices.Clone(word.Parts)
 	literal := literalBraceGroups(word.Parts)
@@ -4516,20 +4313,6 @@ func splitBraces(word *syntax.Word) (syntax.Word, bool) {
 	return copyWord, split
 }
 
-func wordMaySplitBraces(parts []syntax.WordPart) bool {
-	for _, part := range parts {
-		switch p := part.(type) {
-		case *syntax.Lit:
-			if strings.ContainsRune(p.Value, '{') {
-				return true
-			}
-		case *syntax.BraceExp:
-			return true
-		}
-	}
-	return false
-}
-
 func restoreLiteralBraces(parts []syntax.WordPart) {
 	restore := strings.NewReplacer(string(rune(literalLeftBrace)), "{", string(rune(literalRightBrace)), "}")
 	var walk func(parts []syntax.WordPart)
@@ -4552,20 +4335,18 @@ func restoreLiteralBraces(parts []syntax.WordPart) {
 	walk(parts)
 }
 
-type braceSourcePosition struct{ part, index int }
-
-type braceSourceGroup struct {
-	open      braceSourcePosition
-	separated bool
-}
-
 // literalBraceGroups finds, as syntax.SplitBraces pairs them, the braces of the
 // groups it would return to literal text: a group without a comma or a `..` at
 // its own level and a group never closed. It returns the byte offsets by part
 // index, or nil when there are none or a Lit already holds a stand-in byte.
 func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
-	var open []braceSourceGroup
-	var literal []braceSourcePosition
+	type position struct{ part, index int }
+	type group struct {
+		open      position
+		separated bool
+	}
+	var open []group
+	var literal []position
 	for i, part := range parts {
 		lit, ok := part.(*syntax.Lit)
 		if !ok {
@@ -4574,7 +4355,34 @@ func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
 		if strings.ContainsAny(lit.Value, string([]byte{literalLeftBrace, literalRightBrace})) {
 			return nil
 		}
-		open, literal = scanLiteralBracePart(i, lit.Value, open, literal)
+		value := lit.Value
+		for j := 0; j < len(value); j++ {
+			switch value[j] {
+			case '\\':
+				j++
+			case '{':
+				open = append(open, group{open: position{i, j}})
+			case ',':
+				if len(open) > 0 {
+					open[len(open)-1].separated = true
+				}
+			case '.':
+				// A `..` separates a sequence; after a comma it is literal, but
+				// the group is separated already.
+				if len(open) > 0 && j+1 < len(value) && value[j+1] == '.' {
+					open[len(open)-1].separated = true
+				}
+			case '}':
+				if len(open) == 0 {
+					continue
+				}
+				top := open[len(open)-1]
+				open = open[:len(open)-1]
+				if !top.separated {
+					literal = append(literal, top.open, position{i, j})
+				}
+			}
+		}
 	}
 	for _, unclosed := range open {
 		literal = append(literal, unclosed.open)
@@ -4587,43 +4395,6 @@ func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
 		byPart[p.part] = append(byPart[p.part], p.index)
 	}
 	return byPart
-}
-
-func scanLiteralBracePart(part int, value string, open []braceSourceGroup, literal []braceSourcePosition) ([]braceSourceGroup, []braceSourcePosition) {
-	for i := 0; i < len(value); i++ {
-		ch := value[i]
-		if ch == '\\' {
-			if i+1 < len(value) {
-				i++
-				if value[i] == '{' || value[i] == '}' {
-					literal = append(literal, braceSourcePosition{part, i})
-				}
-			}
-			continue
-		}
-		switch ch {
-		case '{':
-			open = append(open, braceSourceGroup{open: braceSourcePosition{part, i}})
-		case ',':
-			if len(open) > 0 {
-				open[len(open)-1].separated = true
-			}
-		case '.':
-			if len(open) > 0 && i+1 < len(value) && value[i+1] == '.' {
-				open[len(open)-1].separated = true
-			}
-		case '}':
-			if len(open) == 0 {
-				continue
-			}
-			top := open[len(open)-1]
-			open = open[:len(open)-1]
-			if !top.separated {
-				literal = append(literal, top.open, braceSourcePosition{part, i})
-			}
-		}
-	}
-	return open, literal
 }
 
 func assignmentTildeBeforeBrace(word *syntax.Word, src string, chars []tildeChar) bool {
@@ -5207,26 +4978,26 @@ func literalWord(word *syntax.Word, src string) bool {
 		return false
 	}
 	for _, part := range word.Parts {
-		if !literalWordPart(part, src, false) {
+		if !literalWordPart(part, src) {
 			return false
 		}
 	}
 	return !hasUnquotedExpansion(src[start:end])
 }
 
-func literalWordPart(part syntax.WordPart, src string, argStatic bool) bool {
+func literalWordPart(part syntax.WordPart, src string) bool {
 	switch p := part.(type) {
 	case *syntax.Lit:
 		return true
 	case *syntax.SglQuoted:
-		return !p.Dollar || argStatic && !strings.Contains(p.Value, `\`)
+		return !p.Dollar
 	case *syntax.DblQuoted:
 		if p.Dollar {
 			return false
 		}
 		for _, inner := range p.Parts {
 			lit, ok := inner.(*syntax.Lit)
-			if !ok || !argStatic && !literalDoublePart(lit, src) {
+			if !ok || !literalDoublePart(lit, src) {
 				return false
 			}
 		}
@@ -5371,7 +5142,7 @@ func parseHeredocStmts(inputs []heredocShellInput, src string, lineBase int, inh
 }
 
 func preserveMappedRaw(calls []Call, first int, body mapped, src string) {
-	if len(body.pos) != len(body.text) {
+	if len(body.rawStart) != len(body.text) || len(body.rawEnd) != len(body.text) {
 		return
 	}
 	text := body.String()
@@ -5384,10 +5155,10 @@ func preserveMappedRaw(calls []Call, first int, body mapped, src string) {
 		start += searchFrom
 		end := start + len(calls[i].Raw)
 		searchFrom = end
-		if start >= end || end > len(body.pos) {
+		if start >= end || end > len(body.rawEnd) {
 			continue
 		}
-		sourceStart, sourceEnd := mappedRawOffset(body, start), mappedRawEnd(body, end-1)
+		sourceStart, sourceEnd := body.rawStart[start], body.rawEnd[end-1]
 		if !validSpan(src, sourceStart, sourceEnd) || sourceEnd <= sourceStart {
 			continue
 		}
@@ -5396,23 +5167,6 @@ func preserveMappedRaw(calls []Call, first int, body mapped, src string) {
 			calls[i].Offset = -1
 		}
 	}
-}
-
-func mappedRawOffset(body mapped, i int) int {
-	if i < len(body.rawStart) && body.rawStart[i] >= 0 {
-		return body.rawStart[i]
-	}
-	return body.pos[i]
-}
-
-func mappedRawEnd(body mapped, i int) int {
-	if i < len(body.rawEnd) && body.rawEnd[i] >= 0 {
-		return body.rawEnd[i]
-	}
-	if body.pos[i] >= 0 {
-		return body.pos[i] + 1
-	}
-	return -1
 }
 
 func dynamicFirstWord(raw string) bool {
@@ -6434,7 +6188,6 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 		return &NestedError{Script: src, Err: fmt.Errorf("shellcmd: nested parse budget exceeds %d bytes", budget.limit)}
 	}
 	budget.used += len(src)
-	subst, dynamic := splitMappedSubstitutions(subst)
 	nestedCalls := make([]Call, 0)
 	nestedVars := make(map[string]string, len(vars))
 	maps.Copy(nestedVars, vars)
@@ -6446,7 +6199,7 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 			file, full, ignored, err = budget.parseShell(src)
 		}
 		if err == nil {
-			err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, ignored, subst, dynamic, budget)
+			err = walkFileWithBudget(file, full, src, lineBase, via, nestedVars, &nestedCalls, ignored, subst, budget)
 		}
 	}
 	if err != nil {
@@ -6468,32 +6221,6 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	*calls = append(*calls, nestedCalls...)
 	maps.Copy(vars, nestedVars)
 	return err
-}
-
-func splitMappedSubstitutions(subst *mapped) (*mapped, [][2]int) {
-	if subst == nil {
-		return nil, nil
-	}
-	hasDynamic := slices.ContainsFunc(subst.subst, func(span [2]int) bool { return span[0] < 0 || span[1] < 0 })
-	if !hasDynamic {
-		return subst, nil
-	}
-	clean := *subst
-	executed := make([][2]int, 0, len(subst.subst))
-	dynamic := make([][2]int, 0, len(subst.subst))
-	for _, span := range subst.subst {
-		if span[1] < 0 {
-			dynamic = append(dynamic, span)
-		} else if span[0] < 0 {
-			dynamic = append(dynamic, span)
-		} else {
-			executed = append(executed, span)
-		}
-	}
-	sort.Slice(dynamic, func(i, j int) bool { return dynamic[i][0] < dynamic[j][0] })
-	sort.Slice(executed, func(i, j int) bool { return executed[i][1] < executed[j][1] })
-	clean.subst = executed
-	return &clean, dynamic
 }
 
 // outerOffset переводит смещение во вложенном скрипте во внешний текст по карте pos.
@@ -6577,16 +6304,12 @@ func braceWordCountWithContext(parts []syntax.WordPart, inherited bool) int {
 	for i, part := range parts {
 		present[i] = wordHasPresence([]syntax.WordPart{part})
 	}
-	before, after := make([]bool, len(parts)), make([]bool, len(parts))
-	seen := false
+	prefix, suffix := make([]bool, len(parts)+1), make([]bool, len(parts)+1)
 	for i := range parts {
-		before[i] = seen
-		seen = seen || present[i]
+		prefix[i+1] = prefix[i] || present[i]
 	}
-	seen = false
 	for i := len(parts) - 1; i >= 0; i-- {
-		after[i] = seen
-		seen = seen || present[i]
+		suffix[i] = suffix[i+1] || present[i]
 	}
 	count := 1
 	for index, part := range parts {
@@ -6594,7 +6317,7 @@ func braceWordCountWithContext(parts []syntax.WordPart, inherited bool) int {
 		if brace, ok := part.(*syntax.BraceExp); ok {
 			factor = 0
 			around := inherited
-			around = around || before[index] || after[index]
+			around = around || prefix[index] || suffix[index+1]
 			for _, elem := range brace.Elems {
 				if around || wordHasPresence(elem.Parts) {
 					factor = min(2, factor+braceWordCountWithContext(elem.Parts, around))
@@ -6647,9 +6370,6 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) ([
 		ws[i].singleQuoted = singleQuotedWord(arg)
 		ws[i].sourceText = nodeText(arg, src)
 		ws[i].name = unquotedText(arg, src)
-		if scripts {
-			ws[i].dynamic = scriptExpansionSpans(arg)
-		}
 		if len(arg.Parts) == 1 && isANSICQuoted(arg.Parts[0]) {
 			ws[i].ansiQuoted = true
 			var err error
@@ -6676,117 +6396,6 @@ func cmdWords(args []*syntax.Word, src string, scripts bool, literals []bool) ([
 		}
 	}
 	return ws, nil
-}
-
-func staticShellWord(w *syntax.Word, tilde Tilde, braceExpand bool) bool {
-	if w == nil || len(w.Parts) == 0 || tilde != 0 {
-		return false
-	}
-	if braceExpand && wordHasBraceExpansion(w) || wordHasGlob(w.Parts) {
-		return false
-	}
-	for _, part := range w.Parts {
-		if !literalWordPart(part, "", true) {
-			return false
-		}
-	}
-	return true
-}
-
-type globClassState struct {
-	inside, first, content, pending bool
-}
-
-func wordHasGlob(parts []syntax.WordPart) bool {
-	var state globClassState
-	scanGlobParts(parts, false, &state)
-	return state.pending
-}
-
-func scanGlobParts(parts []syntax.WordPart, quoted bool, state *globClassState) {
-	for _, part := range parts {
-		switch p := part.(type) {
-		case *syntax.Lit:
-			scanGlobText(p.Value, quoted, state)
-		case *syntax.SglQuoted:
-			scanGlobText(p.Value, true, state)
-		case *syntax.DblQuoted:
-			scanGlobParts(p.Parts, true, state)
-		case *syntax.BraceExp:
-			for _, elem := range p.Elems {
-				scanGlobParts(elem.Parts, quoted, state)
-			}
-		}
-	}
-}
-
-func scanGlobText(text string, quoted bool, state *globClassState) {
-	for i := 0; i < len(text); i++ {
-		ch := text[i]
-		if quoted {
-			if state.inside {
-				state.first, state.content = false, true
-			}
-			continue
-		}
-		if ch == '\\' {
-			if i+1 < len(text) {
-				i++
-				if state.inside {
-					state.first, state.content = false, true
-				}
-			}
-			continue
-		}
-		if state.inside {
-			if ch == ']' {
-				if !state.content {
-					state.first, state.content = false, true
-					continue
-				}
-				state.inside, state.pending = false, true
-				return
-			}
-			if state.first && (ch == '!' || ch == '^') {
-				state.first = false
-				continue
-			}
-			if ch == '*' || ch == '?' {
-				state.pending = true
-			}
-			state.first, state.content = false, true
-			continue
-		}
-		switch ch {
-		case '*', '?':
-			state.pending = true
-		case '[':
-			state.inside, state.first, state.content = true, true, false
-		}
-	}
-}
-
-func scriptExpansionSpans(word *syntax.Word) [][2]int {
-	var spans [][2]int
-	for _, part := range word.Parts {
-		if quoted, ok := part.(*syntax.DblQuoted); ok {
-			for _, inner := range quoted.Parts {
-				if scriptExpansionPart(inner) {
-					spans = append(spans, [2]int{int(inner.Pos().Offset()), int(inner.End().Offset())})
-				}
-			}
-		}
-	}
-	return spans
-}
-
-func scriptExpansionPart(part syntax.WordPart) bool {
-	switch part.(type) {
-	case *syntax.ParamExp, *syntax.CmdSubst, *syntax.ProcSubst, *syntax.ArithmExp:
-		return true
-	default:
-		return false
-	}
 }
 
 // wordScript returns the shell text of a word and its source offsets.
@@ -6854,24 +6463,17 @@ func litSource(lit *syntax.Lit, src string, double bool) (raw string, base int) 
 
 // mapped — текст и смещение каждого его байта в исходной команде (-1 — такого байта нет).
 type mapped struct {
-	alternate          *mapped
-	offsetsUnavailable bool
-	text               []byte
-	textString         string
-	pos                []int
-	rawStart           []int
-	rawEnd             []int
-	// subst source ranges use nonnegative starts for substitutions already run
-	// by the outer shell and negative starts for bytes produced by expansion.
+	alternate *mapped
+	text      []byte
+	pos       []int
+	rawStart  []int
+	rawEnd    []int
+	// subst are source spans of substitutions the outer shell runs while
+	// expanding a heredoc body or here-string.
 	subst [][2]int
 }
 
-func (m *mapped) String() string {
-	if m.textString != "" {
-		return m.textString
-	}
-	return string(m.text)
-}
+func (m *mapped) String() string { return string(m.text) }
 
 // addLiteral добавляет значение части слова без подстановок (её пропускает wordValue).
 func (m *mapped) addLiteral(part syntax.WordPart, src string) error {
@@ -7020,7 +6622,7 @@ func isANSICQuoted(part syntax.WordPart) bool {
 func unescapeDouble(s string) string {
 	var m mapped
 	m.unescape(s, -1, true)
-	return string(m.text)
+	return m.String()
 }
 
 // unescapeBare снимает экранирование вне кавычек: `\x` — x, `\`+перевод строки — продолжение строки.
@@ -7231,12 +6833,35 @@ func (c cmd) sub(i int, via []string) cmd {
 	if c.call.Name == "env" && envHasPosixCorrect(c.call.Args[:max(0, i-1)]) {
 		posixEnv = true
 	}
-	child := cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticArgs: staticMaskTail(c.call.staticArgs, i, len(c.call.Args)), Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
-		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0,
-		replacements: replacementContextAt(c, i-1)}
-	markReplacementArgs(&child.call.staticArgs, child.call.Args, child.replacements)
-	return child
+	staticDirect := c.call.staticDirect && !staticInsertionWrapper(c.call.Name) && !slices.ContainsFunc(via, staticInsertionWrapper) && !staticInsertionBefore(c.call.Args, i-1)
+	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0}
+}
+
+func staticInsertionWrapper(name string) bool {
+	switch name {
+	case "xargs", "find", "parallel":
+		return true
+	default:
+		return false
+	}
+}
+
+func staticInsertionBefore(args []string, end int) bool {
+	for i := 0; i < end && i < len(args); i++ {
+		switch args[i] {
+		case "xargs", "parallel":
+			return true
+		case "find":
+			for j := i + 1; j < end && j < len(args); j++ {
+				if args[j] == "-exec" || args[j] == "-execdir" || args[j] == "-ok" || args[j] == "-okdir" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func tildeArgTail(args []Tilde, start int) []Tilde {
@@ -7244,92 +6869,6 @@ func tildeArgTail(args []Tilde, start int) []Tilde {
 		return nil
 	}
 	return args[start:]
-}
-
-func xargsReplacement(args []string) (string, bool) {
-	var replacement string
-	found := false
-	for i := 0; i < len(args); {
-		arg := args[i]
-		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
-			return replacement, found
-		}
-		if value, ok := xargsReplacementOption(args, i); ok {
-			replacement, found = value, true
-		}
-		next := optionNext("xargs", args, i)
-		if next <= i {
-			next = i + 1
-		}
-		i = next
-	}
-	return replacement, found
-}
-
-func xargsHasUnknownReplacement(c cmd, commandStart int) bool {
-	if commandStart == 0 && len(c.words) > 1 && !c.words[1].static {
-		return true
-	}
-	for i := range commandStart {
-		if i+1 < len(c.words) && !c.words[i+1].static {
-			return true
-		}
-	}
-	return false
-}
-
-func xargsReplacementOption(args []string, i int) (string, bool) {
-	arg := args[i]
-	if strings.HasPrefix(arg, "--") {
-		key, value, attached := strings.Cut(arg, "=")
-		if key == "--replace" && flagOptions["xargs"][key] {
-			if attached {
-				return value, true
-			}
-			return "{}", true
-		}
-		return "", false
-	}
-	if xargsOptionalOption(arg) {
-		return xargsOptionalReplacement(arg)
-	}
-	return xargsRequiredReplacement(args, i)
-}
-
-func xargsOptionalReplacement(arg string) (string, bool) {
-	for j := 1; j < len(arg); j++ {
-		key := "-" + arg[j:j+1]
-		if key == "-i" && flagOptions["xargs"][key] {
-			if j+1 < len(arg) {
-				return arg[j+1:], true
-			}
-			return "{}", true
-		}
-		if key == "-e" || key == "-l" {
-			return "", false
-		}
-	}
-	return "", false
-}
-
-func xargsRequiredReplacement(args []string, i int) (string, bool) {
-	arg := args[i]
-	for j := 1; j < len(arg); j++ {
-		key := "-" + arg[j:j+1]
-		if key == "-I" && valueOptions["xargs"][key] {
-			if j+1 < len(arg) {
-				return arg[j+1:], true
-			}
-			if i+1 < len(args) {
-				return args[i+1], true
-			}
-			return "", false
-		}
-		if valueOptions["xargs"][key] || optionalValueOptions["xargs"][key] || !flagOptions["xargs"][key] {
-			return "", false
-		}
-	}
-	return "", false
 }
 
 func (c cmd) via(more ...string) []string {
@@ -7344,31 +6883,12 @@ func emit(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *call
 	if c.call.Name == "setsid" && setsidDynamicTarget(c.call.Args) {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: dynamic setsid command is not modeled")}
 	}
-	if c.call.Name == "xargs" {
-		start := wrapperStart("xargs", c.call.Args)
-		if xargsHasUnknownReplacement(c, start) {
-			c.replacements = addReplacementContext(c.replacements, unknownReplacementMarker)
-			markReplacementArgs(&c.call.staticArgs, c.call.Args, c.replacements)
-		}
-	}
-	for i, via := range c.call.Via {
-		if isShell(c.call.Name) && via == "tmux" && i+1 < len(c.call.Via) && (wrappers[c.call.Via[i+1]] || baselineWrapper(c.call.Via[i+1])) {
-			c.call.Offset = -1
-			break
-		}
-	}
-	previousReplacements := c.budget.activeReplacements
-	if len(c.replacements) > 0 {
-		c.budget.activeReplacements = c.replacements
-	}
 	appendCall(seen, calls, c.call)
 
-	err := emitExpanded(c, lineBase, vars, calls, seen)
-	if err == nil {
-		err = emitCompatibleRoutes(c, lineBase, vars, calls, seen)
+	if err := emitExpanded(c, lineBase, vars, calls, seen); err != nil {
+		return err
 	}
-	c.budget.activeReplacements = previousReplacements
-	return err
+	return emitCompatibleRoutes(c, lineBase, vars, calls, seen)
 }
 
 func setsidDynamicTarget(args []string) bool {
@@ -7418,9 +6938,6 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 	if err := emitMainTarget(c, main, mainVia, mainOK, lineBase, vars, calls, seen); err != nil {
 		return err
 	}
-	if err := emitUnknownXargsCommand(c, lineBase, vars, calls, seen); err != nil {
-		return err
-	}
 	if err := emitUncertainWrapper(c, lineBase, vars); err != nil {
 		return err
 	}
@@ -7433,13 +6950,6 @@ func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]
 		}
 	}
 	return nil
-}
-
-func emitUnknownXargsCommand(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
-	if c.call.Name != "xargs" || len(c.call.Args) <= 1 || len(c.words) <= 1 || c.words[1].static {
-		return nil
-	}
-	return emit(c.sub(2, c.via("xargs")), lineBase, vars, calls, seen)
 }
 
 // Explore only actual wrapper targets, never arbitrary argument suffixes.
@@ -8737,18 +8247,19 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 		args = append(args, parallelArgs[i])
 		argWord := c.words[parallelOffset+i+1]
 		words = append(words, argWord)
-		childTilts = append(childTilts, argWord.tilde)
+		mark := argWord.tilde
+		if argWord.static {
+			mark |= tildeStatic
+		}
+		childTilts = append(childTilts, mark)
 	}
 	if !slices.ContainsFunc(childTilts, func(mark Tilde) bool { return mark != 0 }) {
 		childTilts = nil
 	}
-	staticArgs := staticMaskForWords(words[1:])
-	replacements := replacementContextAt(c, globalStart)
-	markReplacementArgs(&staticArgs, args, replacements)
 	child := cmd{call: Call{Name: commandWordName(parallelArgs[start], commandWord), Args: args, Raw: c.call.Raw, Line: c.call.Line,
-		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, staticArgs: staticArgs, Loop: c.call.Loop,
+		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, staticDirect: false, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
-		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed, replacements: replacements}
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed}
 	return child, true
 }
 
@@ -8827,7 +8338,7 @@ func expandFishShell(c cmd, args []string, vars map[string]string, calls *[]Call
 	var nestedErrs []error
 	for _, invocation := range scripts {
 		script, ok := mappedScriptWords(c, []scriptArg{{index: invocation.index, offset: invocation.offset}})
-		if !ok || len(script.String()) == 0 {
+		if !ok || len(script.text) == 0 {
 			continue
 		}
 		first := len(*calls)
@@ -8909,8 +8420,7 @@ func expandShellCommand(c cmd, name string, operand int, vars map[string]string,
 	if literalShellScript(c, name, operand) {
 		c.budget.literalShell = name
 	}
-	spans := appendDynamicSourceSpans(slices.Clone(script.subst), script.dynamic)
-	err := parseNestedMapped(mapped{textString: body, pos: positions, subst: spans}, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
+	err := parseNestedWithBudget(body, positions, c.call.Line-1, c.via(name, "-c"), c.call.Loop, c.call.Background, vars, calls, c.budget)
 	c.budget.literalShell = previousLiteralShell
 	c.budget.initialPosix = previousPosix
 	c.budget.initialBrace = previousBrace
@@ -9562,7 +9072,6 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 			}
 		case *syntax.ParamExp:
 			if value, ok := knownParam(p, vars); ok {
-				m.subst = append(m.subst, [2]int{-start - 1, end})
 				for i := 0; i < len(value); i++ {
 					m.pushSpan(value[i], -1, start, end)
 				}
@@ -9576,10 +9085,13 @@ func (m *mapped) expandParts(parts []syntax.WordPart, src string, vars map[strin
 	return nil
 }
 
-// keepExpansion keeps the source text and marks the span whose bytes the outer
-// shell computes before the resulting script reaches its interpreter.
+// keepExpansion keeps the source text of an expansion and records every
+// command or process substitution the outer shell runs inside it, at any
+// depth of ${…} or $((…)), but not those nested in another substitution: the
+// outermost one is reported by the outer walk with all it contains. In a
+// heredoc body and in double quotes the parser leaves <(…) as literal text,
+// so only an unquoted here-string word holds process substitutions.
 func (m *mapped) keepExpansion(part syntax.WordPart, start, end int, src string) {
-	m.subst = append(m.subst, [2]int{-int(part.Pos().Offset()) - 1, int(part.End().Offset())})
 	syntax.Walk(part, func(node syntax.Node) bool {
 		switch node.(type) {
 		case *syntax.CmdSubst, *syntax.ProcSubst:
@@ -9670,15 +9182,8 @@ func (m *mapped) pushOffset(b byte, base, i int) {
 func (m *mapped) pushSpan(b byte, pos, rawStart, rawEnd int) {
 	m.text = append(m.text, b)
 	m.pos = append(m.pos, pos)
-	if m.rawStart != nil {
-		m.rawStart = append(m.rawStart, rawStart)
-		m.rawEnd = append(m.rawEnd, rawEnd)
-	} else if rawStart >= 0 && (pos < 0 || rawStart != pos || rawEnd != pos+1) {
-		m.rawStart = slices.Repeat([]int{-1}, len(m.text)-1)
-		m.rawEnd = slices.Repeat([]int{-1}, len(m.text)-1)
-		m.rawStart = append(m.rawStart, rawStart)
-		m.rawEnd = append(m.rawEnd, rawEnd)
-	}
+	m.rawStart = append(m.rawStart, rawStart)
+	m.rawEnd = append(m.rawEnd, rawEnd)
 }
 
 // stripLeadingTabs drops the tabs <<- removes: those at the start of a body
@@ -9692,13 +9197,7 @@ func (m mapped) stripLeadingTabs() mapped {
 			continue
 		}
 		lineStart = b == '\n' && m.pos[i] >= 0
-		rawStart, rawEnd := -1, -1
-		if i < len(m.rawStart) && i < len(m.rawEnd) {
-			rawStart, rawEnd = m.rawStart[i], m.rawEnd[i]
-		} else if m.pos[i] >= 0 {
-			rawStart, rawEnd = m.pos[i], m.pos[i]+1
-		}
-		out.pushSpan(b, m.pos[i], rawStart, rawEnd)
+		out.pushSpan(b, m.pos[i], m.rawStart[i], m.rawEnd[i])
 	}
 	return out
 }
@@ -9707,83 +9206,10 @@ func (m mapped) stripLeadingTabs() mapped {
 // The node position is mapped to the outer source before checking the spans;
 // Call.Offset can be unknown even when the node has a source position.
 func parseNestedMapped(body mapped, line int, via []string, inLoop, inBackground bool, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
-	body.subst = appendReplacementSourceSpans(body, body.subst, budget.activeReplacements)
-	pos := body.pos
 	if len(body.subst) == 0 {
-		return parseNestedWithBudget(body.String(), pos, line, via, inLoop, inBackground, vars, calls, budget)
+		return parseNestedWithBudget(body.String(), body.pos, line, via, inLoop, inBackground, vars, calls, budget)
 	}
-	mappedBody := new(mapped)
-	*mappedBody = body
-	return parseNestedFileWithBudget(nil, "", body.String(), pos, line, via, inLoop, inBackground, vars, calls, nil, mappedBody, budget)
-}
-
-func appendReplacementSourceSpans(body mapped, spans [][2]int, replacements []string) [][2]int {
-	if len(replacements) == 0 {
-		return spans
-	}
-	var dynamic [][2]int
-	text := body.String()
-	for _, replacement := range replacements {
-		if replacement == unknownReplacementMarker {
-			appendReplacementSpan(body, &dynamic, 0, len(text))
-			continue
-		}
-		if replacement == findReplacementMarker {
-			for start := 0; start+2 <= len(text); start++ {
-				if text[start:start+2] == "{}" {
-					appendReplacementSpan(body, &dynamic, start, start+2)
-				}
-			}
-			continue
-		}
-		if replacement == parallelReplacementMarker {
-			for start := 0; start < len(text); start++ {
-				end, ok := parallelReplacementEnd(text, start)
-				if !ok {
-					continue
-				}
-				appendReplacementSpan(body, &dynamic, start, end)
-				start = end - 1
-			}
-			continue
-		}
-		if replacement == "" {
-			continue
-		}
-		for start := 0; start+len(replacement) <= len(text); {
-			i := strings.Index(text[start:], replacement)
-			if i < 0 {
-				break
-			}
-			start += i
-			end := start + len(replacement)
-			// xargs replaces bytes before the nested shell parses its script. Even
-			// inside quotes, replacement text can close a quote or start a comment,
-			// so later words inherit dynamic provenance.
-			appendReplacementSpan(body, &dynamic, start, end)
-			start++
-		}
-	}
-	return append(spans, dynamic...)
-}
-
-func appendReplacementSpan(body mapped, spans *[][2]int, start, end int) {
-	for i := start; i < end && i < len(body.pos); i++ {
-		if body.pos[i] >= 0 {
-			*spans = append(*spans, [2]int{-body.pos[i] - 1, body.pos[i] + 1})
-		}
-	}
-}
-
-func parallelReplacementEnd(text string, start int) (int, bool) {
-	if start >= len(text) || text[start] != '{' {
-		return 0, false
-	}
-	end := strings.IndexByte(text[start+1:], '}')
-	if end < 0 {
-		return 0, false
-	}
-	return start + end + 2, true
+	return parseNestedFileWithBudget(nil, "", body.String(), body.pos, line, via, inLoop, inBackground, vars, calls, nil, &body, budget)
 }
 
 func relocateNestedLines(parent cmd, first int, calls *[]Call) {
@@ -9835,10 +9261,10 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 	if !ok {
 		return nil
 	}
-	if len(script.String()) > c.budget.expansionLimit-c.budget.expansionUsed {
+	if len(script.text) > c.budget.expansionLimit-c.budget.expansionUsed {
 		return &NestedError{Script: c.call.Raw, Err: fmt.Errorf("shellcmd: script expansion budget exceeds %d bytes", c.budget.expansionLimit)}
 	}
-	c.budget.expansionUsed += len(script.String())
+	c.budget.expansionUsed += len(script.text)
 	viaName := c.call.Name
 	first := len(*calls)
 	previousPosix, previousBrace := c.budget.initialPosix, c.budget.initialBrace
@@ -9861,7 +9287,6 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 		c.budget.initialPosixUnknown, c.budget.initialBraceUnknown = true, true
 	}
 	err := parseNestedMapped(script, c.call.Line-1, c.via(viaName), c.call.Loop, c.call.Background, vars, calls, c.budget)
-	setTmuxNestedOffsets(c, script, first, calls)
 	c.budget.initialPosix, c.budget.initialBrace = previousPosix, previousBrace
 	c.budget.initialPosixUnknown, c.budget.initialBraceUnknown = previousPosixUnknown, previousBraceUnknown
 	relocateNestedLines(c, first, calls)
@@ -9879,20 +9304,6 @@ func expandScriptInvocation(c cmd, vars map[string]string, calls *[]Call) error 
 		}
 	}
 	return err
-}
-
-func setTmuxNestedOffsets(c cmd, script mapped, first int, calls *[]Call) {
-	if c.call.Name != "tmux" {
-		return
-	}
-	for i := first; i < len(*calls); i++ {
-		call := &(*calls)[i]
-		viaIndex := len(c.call.Via)
-		if script.offsetsUnavailable || len(call.Via) == viaIndex+1 && slices.Equal(call.Via[:viaIndex], c.call.Via) && call.Via[viaIndex] == "tmux" ||
-			isShell(call.Name) && len(call.Via) > viaIndex && slices.Equal(call.Via[:viaIndex], c.call.Via) && call.Via[viaIndex] == "tmux" {
-			call.Offset = -1
-		}
-	}
 }
 
 type scriptArg struct {
@@ -9971,62 +9382,14 @@ func mappedScriptWords(c cmd, words []scriptArg) (mapped, bool) {
 		if w.script == "" && (c.call.Name != "eval" || w.offset < 0) || arg.offset > len(w.script) {
 			return mapped{}, false
 		}
-		if i == 0 {
-			script.textString = w.script[arg.offset:]
-			script.pos = w.pos[arg.offset:]
-			if len(w.rawStart) >= len(w.script) && len(w.rawEnd) >= len(w.script) {
-				script.rawStart = w.rawStart[arg.offset:]
-				script.rawEnd = w.rawEnd[arg.offset:]
-			}
-			script.subst = append(script.subst, w.subst...)
-			script.subst = appendDynamicSourceSpans(script.subst, w.dynamic)
-			continue
-		}
 		if i > 0 {
-			appendMappedSeparator(&script, w)
+			script.add(" ", -1)
 		}
 		script.text = append(script.text, w.script[arg.offset:]...)
 		script.pos = append(script.pos, w.pos[arg.offset:]...)
-		appendMappedRawSpans(&script, w, arg.offset)
 		script.subst = append(script.subst, w.subst...)
-		script.subst = appendDynamicSourceSpans(script.subst, w.dynamic)
-	}
-	if script.textString == "" {
-		script.textString = string(script.text)
 	}
 	return script, true
-}
-
-func appendMappedSeparator(script *mapped, next word) {
-	if script.textString != "" {
-		script.text = append(script.text, script.textString...)
-		script.textString = ""
-	}
-	script.add(" ", -1)
-	if len(script.rawStart) == 0 && len(next.rawStart) == 0 {
-		return
-	}
-	if len(script.rawStart) == 0 {
-		script.rawStart = slices.Repeat([]int{-1}, len(script.text)-1)
-		script.rawEnd = slices.Repeat([]int{-1}, len(script.rawStart))
-	}
-	script.rawStart = append(script.rawStart, -1)
-	script.rawEnd = append(script.rawEnd, -1)
-}
-
-func appendMappedRawSpans(script *mapped, word word, offset int) {
-	if len(word.rawStart) == 0 && len(word.rawEnd) == 0 {
-		return
-	}
-	for i := offset; i < len(word.script); i++ {
-		if i < len(word.rawStart) && i < len(word.rawEnd) {
-			script.rawStart = append(script.rawStart, word.rawStart[i])
-			script.rawEnd = append(script.rawEnd, word.rawEnd[i])
-			continue
-		}
-		script.rawStart = append(script.rawStart, -1)
-		script.rawEnd = append(script.rawEnd, -1)
-	}
 }
 
 func mappedShellCommandWords(c cmd, words []scriptArg) (mapped, bool) {
@@ -10043,7 +9406,6 @@ func mappedShellCommandWords(c cmd, words []scriptArg) (mapped, bool) {
 		}
 	}
 	var script mapped
-	script.offsetsUnavailable = quoteScript < 0
 	for i, arg := range words {
 		if arg.index < 0 || arg.index+1 >= len(c.words) {
 			return mapped{}, false
@@ -10053,13 +9415,10 @@ func mappedShellCommandWords(c cmd, words []scriptArg) (mapped, bool) {
 			return mapped{}, false
 		}
 		if i > 0 {
-			appendMappedSeparator(&script, w)
+			script.add(" ", -1)
 		}
-		script.subst = appendDynamicSourceSpans(script.subst, w.dynamic)
 		if i != quoteScript {
-			script.text = append(script.text, w.script[arg.offset:]...)
-			script.pos = append(script.pos, w.pos[arg.offset:]...)
-			appendMappedRawSpans(&script, w, arg.offset)
+			script.add(w.script[arg.offset:], -1)
 			continue
 		}
 		script.add("'", -1)
@@ -10074,15 +9433,10 @@ func mappedShellCommandWords(c cmd, words []scriptArg) (mapped, bool) {
 				script.add("'", -1)
 			} else {
 				script.add(w.script[j:j+1], pos)
-				if j < len(w.rawStart) {
-					script.rawStart = append(script.rawStart, w.rawStart[j])
-					script.rawEnd = append(script.rawEnd, w.rawEnd[j])
-				}
 			}
 		}
 		script.add("'", -1)
 	}
-	script.textString = string(script.text)
 	return script, true
 }
 
@@ -10449,19 +9803,25 @@ func shortOptionAt(name, arg string, offset int) (string, bool) {
 func expandFind(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
 	args := c.call.Args
 	var errs []error
-	for next := 0; next < len(args); {
-		start, end, after, ok := nextFindExec(args, next)
-		if !ok {
-			break
+	for i := 0; i < len(args); i++ {
+		if args[i] != "-exec" && args[i] != "-execdir" && args[i] != "-ok" && args[i] != "-okdir" {
+			continue
 		}
-		operator := args[start-1]
-		cmd := c.sub(start+1, c.via("find", operator))
+		start := i + 1
+		end := start
+		for end < len(args) && args[end] != ";" && args[end] != "+" {
+			end++
+		}
+		if end == start {
+			continue
+		}
+		cmd := c.sub(start+1, c.via("find", args[i]))
 		cmd.call.Args = slices.Clone(args[start+1 : end])
 		cmd.words = cmd.words[:len(cmd.call.Args)+1]
 		if err := emit(cmd, lineBase, vars, calls, seen); err != nil {
 			errs = append(errs, err)
 		}
-		next = after
+		i = end
 	}
 	return errors.Join(errs...)
 }
