@@ -974,7 +974,10 @@ func runBrief(opts options, e env, stdout, stderr io.Writer) int {
 	}
 	words := extractBriefWords(string(data), until, e.loc)
 	if opts.count {
-		fmt.Fprintf(stdout, "%d\n", len(words))
+		if _, err := fmt.Fprintf(stdout, "%d\n", len(words)); err != nil {
+			fmt.Fprintf(stderr, "user-word: write count: %v\n", err)
+			return exitUsage
+		}
 		if len(words) == 0 {
 			return exitNone
 		}

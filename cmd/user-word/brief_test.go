@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 
+	"errors"
 	"fmt"
 	"io"
 
@@ -234,7 +235,20 @@ func TestBriefCount(t *testing.T) {
 	if code != exitUsage || out != "" || !strings.Contains(errOut, "brief") {
 		t.Errorf("нет файла: code %d, stdout %q, stderr %q", code, out, errOut)
 	}
+
+	opts, err := parseArgs([]string{"--brief", brief, "--count"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := run(opts, e, failingWriter{}, &stderr); code != exitUsage || !strings.Contains(stderr.String(), "write count") {
+		t.Errorf("запись не удалась: code %d, stderr %q", code, stderr.String())
+	}
 }
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }
 
 // Образец вызова в тексте брифа (`user-word <jsonl> '<кусок>'`) — не ссылка: путь ссылки — абсолютный или от ~ и
 // кончается на .jsonl.
