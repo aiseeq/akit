@@ -275,6 +275,83 @@ func TestExitWatcherCancellationWithManyPIDs(t *testing.T) {
 	}
 }
 
+func TestExitWatcherRLimit(t *testing.T) {
+	const helperEnv = "AKIT_WFOR_RLIMIT_HELPER"
+	if os.Getenv(helperEnv) == "1" {
+		var limit unix.Rlimit
+		if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+			t.Fatal(err)
+		}
+		if limit.Cur > 32 {
+			limit.Cur = 32
+			if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+				t.Fatal(err)
+			}
+		}
+		child := exec.Command("sleep", "2")
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer child.Wait()
+		args := []string{"exit"}
+		for range 40 {
+			args = append(args, strconv.Itoa(child.Process.Pid))
+		}
+		args = append(args, "--timeout", "150ms", "--every", "1s")
+		opts, err := parseArgs(args, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := run(context.Background(), opts, io.Discard, io.Discard); code != exitTimeout {
+			t.Fatalf("run code=%d, want timeout with pidfd as an optional watcher", code)
+		}
+
+		second := exec.Command("sleep", "2")
+		if err := second.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer second.Wait()
+		var fillers []*os.File
+		defer func() {
+			for _, f := range fillers {
+				_ = f.Close()
+			}
+		}()
+		for {
+			f, err := os.Open("/dev/null")
+			if err != nil {
+				if !errors.Is(err, unix.EMFILE) {
+					t.Fatalf("fill file descriptors: %v", err)
+				}
+				break
+			}
+			fillers = append(fillers, f)
+		}
+		if len(fillers) == 0 {
+			t.Fatal("could not reserve file descriptors for the pidfd rollback case")
+		}
+		if err := fillers[len(fillers)-1].Close(); err != nil {
+			t.Fatal(err)
+		}
+		fillers = fillers[:len(fillers)-1]
+		args = []string{"exit", strconv.Itoa(child.Process.Pid), strconv.Itoa(second.Process.Pid), "--timeout", "150ms", "--every", "1s"}
+		opts, err = parseArgs(args, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := run(context.Background(), opts, io.Discard, io.Discard); code != exitTimeout {
+			t.Fatalf("run code=%d after partial pidfd open failure, want timeout after fd rollback", code)
+		}
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestExitWatcherRLimit$")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("RLIMIT helper: %v\n%s", err, output)
+	}
+}
+
 func processCPU(t *testing.T) time.Duration {
 	t.Helper()
 	var usage unix.Rusage

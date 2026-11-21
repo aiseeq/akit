@@ -367,18 +367,7 @@ type exitCond struct {
 }
 
 func (c *exitCond) watch(ctx context.Context) (<-chan struct{}, func()) {
-	var fds []int
-	for _, pid := range c.pids {
-		if _, tracked := c.start[pid]; !tracked {
-			continue
-		}
-		fd, err := unix.PidfdOpen(pid, 0)
-		if err == nil {
-			fds = append(fds, fd)
-		} else {
-			continue
-		}
-	}
+	fds := openExitPidfds(trackedExitPIDs(c))
 	if len(fds) == 0 {
 		return nil, func() {}
 	}
@@ -439,6 +428,41 @@ func (c *exitCond) watch(ctx context.Context) (<-chan struct{}, func()) {
 	}()
 	cleanup := func() { <-done }
 	return out, cleanup
+}
+
+func trackedExitPIDs(c *exitCond) []int {
+	var pids []int
+	seen := make(map[int]struct{}, len(c.start))
+	for _, pid := range c.pids {
+		if _, tracked := c.start[pid]; !tracked {
+			continue
+		}
+		if _, duplicate := seen[pid]; duplicate {
+			continue
+		}
+		seen[pid] = struct{}{}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+func openExitPidfds(pids []int) []int {
+	var limit unix.Rlimit
+	if len(pids) == 0 || unix.Getrlimit(unix.RLIMIT_NOFILE, &limit) != nil || uint64(len(pids)) > limit.Cur/2 {
+		return nil
+	}
+	var fds []int
+	for _, pid := range pids {
+		fd, err := unix.PidfdOpen(pid, 0)
+		if err != nil { //nolint:silent-error-handling // Pidfds are optional; any open failure falls back to ticker checks.
+			for _, opened := range fds {
+				_ = unix.Close(opened)
+			}
+			return nil
+		}
+		fds = append(fds, fd)
+	}
+	return fds
 }
 
 func newExitCond(pids []int) (*exitCond, error) {
