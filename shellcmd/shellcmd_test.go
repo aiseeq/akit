@@ -446,6 +446,709 @@ func TestArgLiteralContract(t *testing.T) {
 	}
 }
 
+func TestArgStatic(t *testing.T) {
+	tests := []struct {
+		name, src, program, via string
+		index                   int
+		want                    bool
+	}{
+		{"parameter", `echo ${Z}`, "echo", "", 0, false},
+		{"glob star", `echo a*`, "echo", "", 0, false},
+		{"glob bracket", `echo [ab]`, "echo", "", 0, false},
+		{"glob star in unclosed class", `echo [*`, "echo", "", 0, false},
+		{"empty negated glob class", `echo [!]`, "echo", "", 0, true},
+		{"empty caret glob class", `echo [^]`, "echo", "", 0, true},
+		{"empty glob class", `echo []`, "echo", "", 0, true},
+		{"glob class with leading close then terminator", `echo []]`, "echo", "", 0, false},
+		{"quoted leading close in glob class", `echo [']']`, "echo", "", 0, false},
+		{"glob bracket double-quoted part", `echo ["a"]`, "echo", "", 0, false},
+		{"glob bracket single-quoted part", `echo ['a']`, "echo", "", 0, false},
+		{"glob bracket mixed double quote", `echo [a"b"]`, "echo", "", 0, false},
+		{"glob bracket mixed single quote", `echo [a'b']`, "echo", "", 0, false},
+		{"unclosed bracket", `echo [a`, "echo", "", 0, true},
+		{"quoted bracket close", `echo [a']'`, "echo", "", 0, true},
+		{"unclosed bracket escaped close", "echo [a\\]", "echo", "", 0, true},
+		{"glob bracket negation", `echo [!a]`, "echo", "", 0, false},
+		{"glob bracket leading close", `echo []a]`, "echo", "", 0, false},
+		{"glob bracket escaped close", "echo [\\]]", "echo", "", 0, false},
+		{"quoted glob", `echo '*'`, "echo", "", 0, true},
+		{"double-quoted glob", `echo "*"`, "echo", "", 0, true},
+		{"escaped glob", `echo \*`, "echo", "", 0, true},
+		{"brace sequence", `echo {a..c}`, "echo", "", 0, false},
+		{"brace numbers", `echo {1..3}`, "echo", "", 0, false},
+		{"brace alternatives", `echo {a,b}`, "echo", "", 0, false},
+		{"brace trailing empty alternative", `echo {a,}`, "echo", "", 0, false},
+		{"brace no alternative", `echo {a}`, "echo", "", 0, true},
+		{"brace expansion disabled", `set +B; echo {a,b}`, "echo", "", 0, true},
+		{"brace disabled still checks expansions", `set +B; echo {a,$X}`, "echo", "", 0, false},
+		{"quoted brace separator", `echo {a'\',b}`, "echo", "", 0, false},
+		{"assignment tilde", `echo a=~`, "echo", "", 0, false},
+		{"assignment tilde", `echo a+=~`, "echo", "", 0, false},
+		{"process substitution input", `echo <(true)`, "echo", "", 0, false},
+		{"process substitution output", `echo >(true)`, "echo", "", 0, false},
+		{"process substitution suffix", `echo a<(true)`, "echo", "", 0, false},
+		{"extglob at", `shopt -s extglob; echo @(a|b)`, "echo", "", 0, false},
+		{"extglob plus", `shopt -s extglob; echo +(a)`, "echo", "", 0, false},
+		{"extglob negation", `shopt -s extglob; echo !(a)`, "echo", "", 0, false},
+		{"extglob optional", `shopt -s extglob; echo ?(a)`, "echo", "", 0, false},
+		{"extglob star", `shopt -s extglob; echo *(a)`, "echo", "", 0, false},
+		{"ANSI-C literal", `echo $'${K}op'`, "echo", "", 0, true},
+		{"ANSI-C escaped", `echo $'a\x41'`, "echo", "", 0, false},
+		{"escaped backtick in double quotes", "echo \"a\\`b\"", "echo", "", 0, true},
+		{"literal trailing dollar", `echo a$`, "echo", "", 0, true},
+		{"literal dollar in double quotes", `echo "a$"`, "echo", "", 0, true},
+		{"double quoted parameter", `echo "$X"`, "echo", "", 0, false},
+		{"double quoted variable expansion", `echo "$HOME"`, "echo", "", 0, false},
+		{"dollar followed by space", `echo "$ x"`, "echo", "", 0, true},
+		{"dollar percent", `echo $%`, "echo", "", 0, true},
+		{"mixed literal dollar", `echo '${K}op'"$"`, "echo", "", 0, true},
+		{"single quoted plus trailing dollar", `echo '${K}op'$`, "echo", "", 0, true},
+		{"ANSI quote inside double quotes", `echo a"$'x'"`, "echo", "", 0, true},
+		{"locale translated quote", `echo $"q"`, "echo", "", 0, false},
+		{"nested bash parameter", `bash -c 'podman ${K}op'`, "podman", "bash", 0, false},
+		{"nested sh single quote", `sh -c 'podman '\''${K}op'\'''`, "podman", "sh", 0, true},
+		{"nested command substitution", `bash -c "podman '$(id)'"`, "podman", "bash", 0, false},
+		{"nested escaped parameter", `bash -c "podman '\${K}op' '$HOME'"`, "podman", "bash", 0, true},
+		{"nested escaped parameter next word", `bash -c "podman '\${K}op' '$HOME'"`, "podman", "bash", 1, false},
+		{"nested eval escaped parameter", `eval "podman '\${K}op' '$HOME'"`, "podman", "eval", 0, true},
+		{"nested eval expanded parameter", `eval "podman '\${K}op' '$HOME'"`, "podman", "eval", 1, false},
+		{"nested eval outer literal expansion provenance", `eval "podman '$HOME'"`, "podman", "eval", 0, false},
+		{"nested watch outer parameter provenance", `watch "podman '$HOME'"`, "podman", "watch", 0, false},
+		{"tmux outer parameter provenance", `tmux new-session "podman '$HOME'"`, "podman", "tmux", 0, false},
+		{"nested backtick", "bash -c \"podman `echo q`\"", "podman", "bash", 0, false},
+		{"wrapper escaped backtick", "systemd-run --user podman '${K}op'\"\\`\"", "podman", "systemd-run", 0, true},
+		{"wrapper ANSI-C literal", `systemd-run --user podman $'${K}op'`, "podman", "systemd-run", 0, true},
+		{"xargs replacement braces", `echo z | xargs -I{} podman {}op`, "podman", "xargs", 0, false},
+		{"xargs separated replacement option", `echo z | xargs -I {} podman {}op`, "podman", "xargs", 0, false},
+		{"xargs joined replacement after zero flag", `echo z | xargs -0I{} podman {}op`, "podman", "xargs", 0, false},
+		{"xargs joined replacement after verbose flag", `echo z | xargs -tI{} podman {}op`, "podman", "xargs", 0, false},
+		{"xargs i replacement default", `echo z | xargs -i podman {}op`, "podman", "xargs", 0, false},
+		{"xargs i replacement joined", `echo z | xargs -i@ podman @op`, "podman", "xargs", 0, false},
+		{"xargs replace default", `echo z | xargs --replace podman {}op`, "podman", "xargs", 0, false},
+		{"xargs replacement option ends at program", `echo z | xargs podman -I{} {}op`, "podman", "xargs", 0, true},
+		{"xargs replacement-looking argument after program", `echo z | xargs podman -I{} {}op`, "podman", "xargs", 1, true},
+		{"xargs nested script replacement", `echo z | xargs -I{} sh -c "podman '\${K}op' '{}' '$HOME'"`, "podman", "xargs", 1, false},
+		{"xargs replacement separate", `echo z | xargs -I@ podman '${K}op' @`, "podman", "xargs", 0, true},
+		{"xargs replacement token", `echo z | xargs -I@ podman '${K}op' @`, "podman", "xargs", 1, false},
+		{"xargs last replacement setting", `echo Z | xargs -Ix -I{} printf '<%s>\n' x {}`, "printf", "xargs", 1, true},
+		{"xargs last replacement token", `echo Z | xargs -Ix -I{} printf '<%s>\n' x {}`, "printf", "xargs", 2, false},
+		{"xargs previous replacement token", `echo Z | xargs -I{} -Ix printf '<%s>\n' x {}`, "printf", "xargs", 1, false},
+		{"xargs last replacement keeps previous token", `echo Z | xargs -I{} -Ix printf '<%s>\n' x {}`, "printf", "xargs", 2, true},
+		{"xargs i replaced by I setting", `echo Z | xargs -i -I@ printf '<%s>\n' {} @`, "printf", "xargs", 1, true},
+		{"xargs i replaced by I token", `echo Z | xargs -i -I@ printf '<%s>\n' {} @`, "printf", "xargs", 2, false},
+		{"xargs replacement with space nested first", `echo Z | xargs -I'a b' sh -c "printf '<%s>\n' a b q"`, "printf", "xargs", 1, false},
+		{"xargs replacement with space nested second", `echo Z | xargs -I'a b' sh -c "printf '<%s>\n' a b q"`, "printf", "xargs", 2, false},
+		{"xargs delimiter value before program", `echo z | xargs -dI podman I`, "podman", "xargs", 0, true},
+		{"xargs delimiter value is not replacement option", `echo z | xargs -dI podman podman`, "podman", "xargs", 0, true},
+		{"xargs empty replacement leaves words static", `echo z | xargs -I '' printf value`, "printf", "xargs", 0, true},
+		{"xargs short replacement", `echo z | xargs -i podman {}op`, "podman", "xargs", 0, false},
+		{"xargs long replacement", `echo z | xargs --replace=STR podman STRop`, "podman", "xargs", 0, false},
+		{"find replacement", `find /tmp -exec podman '{}' \;`, "podman", "find", 0, false},
+		{"find replacement in nested shell", `find /tmp -maxdepth 0 -exec sh -c "printf '<%s>\n' '{}' x" \;`, "printf", "find", 1, false},
+		{"find replacement in nested shell word", `find /tmp -maxdepth 0 -exec bash -c 'printf "<%s>\n" {}/q y' \;`, "printf", "find", 1, false},
+		{"find suffix after quoted replacement", `find /tmp -maxdepth 0 -exec sh -c "printf '<%s>\n' '{}' x" \;`, "printf", "find", 2, false},
+		{"escaped brace expansion", `echo \{a,b}`, "echo", "", 0, true},
+		{"parallel replacement", `parallel podman {} ::: a`, "podman", "parallel", 0, false},
+		{"mixed args and list", `echo a "$X" b && cat c`, "echo", "", 0, true},
+		{"wrapper tail preserves static mask", `env echo a "$X" b`, "echo", "env", 0, true},
+		{"wrapper tail preserves dynamic mask", `env echo a "$X" b`, "echo", "env", 1, false},
+		{"wrapper tail shifts static mask", `env echo a "$X" b`, "echo", "env", 2, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			for _, call := range calls {
+				if call.Name != tt.program || tt.via != "" && !slices.Contains(call.Via, tt.via) {
+					continue
+				}
+				if got := call.ArgStatic(tt.index); got != tt.want {
+					t.Errorf("ArgStatic(%d)=%v, want %v; call=%+v", tt.index, got, tt.want, call)
+				}
+				return
+			}
+			t.Fatalf("call for %q via %q not found in %#v", tt.program, tt.via, calls)
+		})
+	}
+	long, err := Find("echo"+strings.Repeat(" x", 40), "echo")
+	if err != nil || len(long) != 1 || !long[0].ArgStatic(39) || long[0].ArgStatic(40) {
+		t.Fatalf("long call: calls=%#v err=%v", long, err)
+	}
+	allLiteral, err := Find(`echo a b c`, "echo")
+	if err != nil || len(allLiteral) != 1 || allLiteral[0].staticArgs != nil {
+		t.Fatalf("all-literal call allocated a static mask: calls=%#v err=%v", allLiteral, err)
+	}
+	wrapperLiteral, err := Find(`env echo a b c`, "echo")
+	if err != nil || len(wrapperLiteral) != 1 || wrapperLiteral[0].staticArgs != nil {
+		t.Fatalf("all-literal wrapper call allocated a static mask: calls=%#v err=%v", wrapperLiteral, err)
+	}
+	assignmentTail, err := Find(`env "A=$X" echo a b`, "echo")
+	if err != nil || len(assignmentTail) != 1 || !assignmentTail[0].ArgStatic(0) || assignmentTail[0].staticArgs != nil {
+		t.Fatalf("static tail after dynamic wrapper prefix = %#v, err=%v", assignmentTail, err)
+	}
+	if (Call{}).ArgStatic(-1) || (Call{}).ArgStatic(0) {
+		t.Fatal("ArgStatic must return false for missing arguments")
+	}
+}
+
+func TestArgStaticFindAndTmuxMappedCopies(t *testing.T) {
+	t.Run("find replacement reaches every shell copy", func(t *testing.T) {
+		src := `find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" "$1" {}x' _ {} \;`
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls: %v", err)
+		}
+		shSeen, printfSeen := false, 0
+		for _, call := range calls {
+			if call.Name == "sh" && slices.Equal(call.Via, []string{"find"}) && len(call.Args) > 3 {
+				shSeen = true
+				if call.ArgStatic(3) {
+					t.Errorf("find replacement remained static in sh copy: %+v", call)
+				}
+			}
+			if call.Name == "printf" && slices.Contains(call.Via, "find") && len(call.Args) > 2 {
+				printfSeen++
+				if call.Args[2] == "{}x" && call.ArgStatic(2) {
+					t.Errorf("find replacement remained static in nested printf copy: %+v", call)
+				}
+			}
+		}
+		if !shSeen || printfSeen == 0 {
+			t.Fatalf("missing find-generated copies: sh=%v printf=%d calls=%+v", shSeen, printfSeen, calls)
+		}
+	})
+	for _, src := range []string{
+		`tmux new-window "printf '<%s>' $(echo x) y"`,
+		`tmux new-window "printf '<%s>' $HOME y"`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "printf" || !slices.Contains(call.Via, "tmux") || len(call.Args) < 3 {
+					continue
+				}
+				found = true
+				if !call.ArgStatic(0) || call.ArgStatic(2) {
+					t.Errorf("tmux literal words lost provenance: static0=%t static2=%t call=%+v", call.ArgStatic(0), call.ArgStatic(2), call)
+				}
+				if call.Offset != -1 {
+					t.Errorf("tmux nested Offset=%d, want -1", call.Offset)
+				}
+			}
+			if !found {
+				t.Fatalf("tmux printf call missing: %+v", calls)
+			}
+		})
+	}
+	for _, src := range []string{
+		`tmux new-window bash -c 'printf a'`,
+		`tmux new-window -- sh -c 'printf "%s" a'`,
+	} {
+		t.Run("legacy Calls shape: "+src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			var names []string
+			for _, call := range calls {
+				names = append(names, call.Name)
+			}
+			want := "bash"
+			if strings.Contains(src, "-- sh ") {
+				want = "sh"
+			}
+			if !slices.Equal(names, []string{"tmux", want, "printf", want}) {
+				t.Fatalf("Calls names = %v, want [tmux %s printf %s]: %+v", names, want, want, calls)
+			}
+			if calls[1].Offset != -1 || calls[2].Offset < 0 || calls[3].Offset < 0 {
+				t.Fatalf("legacy offsets changed: %+v", calls)
+			}
+		})
+	}
+	t.Run("legacy combined tmux script offsets", func(t *testing.T) {
+		calls, err := Calls(`tmux new-window "sh -c 'printf %s x'"`)
+		if err != nil {
+			t.Fatalf("Calls: %v", err)
+		}
+		for _, call := range calls {
+			if call.Name == "printf" && slices.Contains(call.Via, "tmux") {
+				if call.Offset != -1 {
+					t.Fatalf("combined tmux script offset = %d, want -1: %+v", call.Offset, call)
+				}
+				return
+			}
+		}
+		t.Fatalf("combined tmux printf call missing: %+v", calls)
+	})
+}
+
+func TestArgStaticDynamicPrefixAndReplacementWrappers(t *testing.T) {
+	dynamicScripts := []struct {
+		src   string
+		index int
+	}{
+		{`X='"'; bash -c "printf '<%s>\\n' $X '\$HOME' $X y"`, 2},
+		{`X='"'; bash -c "printf '<%s>\\n' $X '\$HOME' $X y"`, 4},
+		{`X='a #'; bash -c "printf '<%s>\\n' $X y"`, 2},
+		{`X='a; printf [%s]\\n'; bash -c "printf '<%s>\\n' $X y"`, 2},
+		{`X='"'; tmux new-window "printf '<%s>\\n' $X '\$HOME' $X y"`, 2},
+		{`setsid -w xargs -I@ sh -c 'printf "<%s>\\n" @ y' <<< 'a #'`, 1},
+		{`xargs -I@ sh -c 'printf "<%s>\\n" @ y' <<< 'a #'`, 1},
+		{`find '/tmp/a #' -maxdepth 0 -exec sh -c 'printf "<%s>\\n" {} y' \;`, 1},
+	}
+	dynamicScripts = append(dynamicScripts,
+		struct {
+			src   string
+			index int
+		}{`setsid -w xargs -I@ sh -c 'printf "<%s>\\n" @ y' <<< 'a #'`, 2},
+		struct {
+			src   string
+			index int
+		}{`xargs -I@ sh -c 'printf "<%s>\\n" @ y' <<< 'a #'`, 2},
+		struct {
+			src   string
+			index int
+		}{`find '/tmp/a #' -maxdepth 0 -exec sh -c 'printf "<%s>\\n" {} y' \\;`, 2},
+	)
+	for _, tt := range dynamicScripts {
+		t.Run(tt.src+"/"+strconv.Itoa(tt.index), func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found, earlierStatic := false, false
+			for _, call := range calls {
+				if call.Name != "printf" || len(call.Via) == 0 {
+					continue
+				}
+				if len(call.Args) > 0 && call.ArgStatic(0) {
+					earlierStatic = true
+				}
+				if len(call.Args) > tt.index && call.ArgStatic(tt.index) {
+					found = true
+				}
+			}
+			if found {
+				t.Fatalf("a word after a dynamic script prefix was static: %#v", calls)
+			}
+			if !earlierStatic {
+				t.Fatalf("a literal word before the dynamic prefix was not static: %#v", calls)
+			}
+		})
+	}
+
+	replacementScripts := []struct {
+		src, program string
+		index        int
+	}{
+		{`setsid -w find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" "$1" {}x' _ {} \;`, "printf", 2},
+		{`taskset -c 0 xargs -I{} sh -c 'printf "<%s>\\n" {}x' <<< q`, "printf", 1},
+		{`setsid -w xargs -I{} sh -c 'printf "<%s>\\n" {}x' <<< q`, "printf", 1},
+		{`flock /tmp/l xargs -I{} sh -c 'printf "<%s>\\n" {}x' <<< q`, "printf", 1},
+		{`taskset -c 0 find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" {}x' \;`, "printf", 1},
+		{`find /tmp -maxdepth 0 -exec setsid -w sh -c 'printf "<%s>\\n" {}x' \;`, "printf", 1},
+		{`find /tmp -maxdepth 0 -execdir echo {} \;`, "echo", 0},
+		{`find /tmp -maxdepth 0 -ok echo {} \;`, "echo", 0},
+		{`find /tmp -maxdepth 0 -okdir echo {} \;`, "echo", 0},
+		{`parallel sh -c 'printf "<%s>\\n" {}x' ::: a`, "printf", 1},
+		{`parallel sh -c 'printf "<%s>\\n" {.}x' ::: a`, "printf", 1},
+		{`setsid -w parallel sh -c 'printf "<%s>\\n" {}x' ::: a`, "printf", 1},
+	}
+	for _, tt := range replacementScripts {
+		t.Run(tt.src, func(t *testing.T) {
+			calls, err := Calls(tt.src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "find" && len(call.Via) > 0 {
+					for i, arg := range call.Args {
+						if strings.Contains(arg, "{") && call.ArgStatic(i) {
+							t.Errorf("replacement remained static in wrapper-chain copy: %+v", call)
+						}
+					}
+				}
+				if call.Name != tt.program || len(call.Args) <= tt.index {
+					continue
+				}
+				if strings.Contains(call.Args[tt.index], "{") {
+					found = true
+					if call.ArgStatic(tt.index) {
+						t.Errorf("replacement word is static: %+v", call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("replacement child call missing: %#v", calls)
+			}
+		})
+	}
+	for _, src := range []string{
+		`X=foo; eval printf "'<%s>\\n'" "$X" y`,
+		"X='a #'; eval printf \"'<%s>\\n'\" \"$X\" y",
+		"X=foo; bash <<EOS\nprintf '<%s>\\n' $X y\nEOS",
+	} {
+		t.Run("known parameter provenance: "+src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name == "printf" && len(call.Args) >= 2 {
+					found = true
+					if call.ArgStatic(1) || len(call.Args) > 2 && call.ArgStatic(2) {
+						t.Errorf("known parameter value/prefix successor marked static: %+v", call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("nested printf missing: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticReplacementContextEndsAtWrapperRange(t *testing.T) {
+	for _, tc := range []struct {
+		name, src, program string
+		index              int
+	}{
+		{
+			name:    "find second exec starts after first terminator",
+			src:     `find /tmp -maxdepth 0 -exec sh -c 'printf "{}"' \; -exec sh -c 'printf y' \;`,
+			program: "printf",
+			index:   0,
+		},
+		{
+			name:    "parallel replacement ends before following args",
+			src:     `parallel sh -c 'printf {}' ::: a`,
+			program: "printf",
+			index:   0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != tc.program || !slices.Contains(call.Via, "find") && !slices.Contains(call.Via, "parallel") {
+					continue
+				}
+				if len(call.Args) <= tc.index {
+					continue
+				}
+				if tc.name == "find second exec starts after first terminator" && call.ArgStatic(tc.index) {
+					found = true
+				}
+				if tc.name == "parallel replacement ends before following args" && !call.ArgStatic(tc.index) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("wrapper range boundary classification missing: %#v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticFindEndBoundaryKeepsNextWrapper(t *testing.T) {
+	calls, err := Calls(`find /tmp -maxdepth 0 -exec echo \; -exec xargs -I@ sh -c 'printf @ y' \;`)
+	if err != nil {
+		t.Fatalf("Calls: %v", err)
+	}
+	for _, call := range calls {
+		if call.Name == "printf" && slices.Contains(call.Via, "find") && slices.Contains(call.Via, "xargs") {
+			if len(call.Args) != 2 || call.ArgStatic(0) || call.ArgStatic(1) {
+				t.Fatalf("find/xargs replacement context = %+v, want both script words dynamic", call)
+			}
+			return
+		}
+	}
+	t.Fatalf("nested printf missing: %+v", calls)
+}
+
+func TestArgStaticFindDoesNotCarryReplacementPastExecRange(t *testing.T) {
+	calls, err := Calls(`find /tmp -maxdepth 0 -exec echo \; sh -c 'printf {}'`)
+	if err != nil {
+		t.Fatalf("Calls: %v", err)
+	}
+	for _, call := range calls {
+		if call.Name == "printf" && slices.Contains(call.Via, "find") {
+			if len(call.Args) != 1 || !call.ArgStatic(0) {
+				t.Fatalf("replacement context escaped the find -exec range: %+v", call)
+			}
+			return
+		}
+	}
+	t.Fatalf("nested printf missing: %+v", calls)
+}
+
+func TestArgStaticReplacementCanChangeQuotedNestedScript(t *testing.T) {
+	for _, src := range []string{
+		`printf 'a" #\0' | xargs -0 -I@ sh -c 'printf "<%s>\\n" before "@" after'`,
+		`printf "a' #\0" | xargs -0 -I@ sh -c "printf '<%s>\\n' before '@' after"`,
+		`printf 'a" #\0' | setsid -w xargs -0 -I@ bash -c 'printf "<%s>\\n" before "@" after'`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "printf" || !slices.Contains(call.Via, "xargs") || len(call.Args) < 4 {
+					continue
+				}
+				found = true
+				if !call.ArgStatic(1) || call.ArgStatic(2) || call.ArgStatic(3) {
+					t.Errorf("quoted xargs replacement provenance = %+v, want before static and replacement/suffix dynamic", call)
+				}
+			}
+			if !found {
+				t.Fatalf("nested printf missing: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticFindReplacementQuoteContexts(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		src         string
+		afterStatic bool
+	}{
+		{
+			name:        "unsafe path may close quote and start comment",
+			src:         `find '/tmp/a" #' -maxdepth 0 -exec sh -c 'printf "<%s>\\n" before "{}" after' \;`,
+			afterStatic: false,
+		},
+		{
+			name:        "safe path and quoted replacement make suffix dynamic",
+			src:         `find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" before "{}" after' \;`,
+			afterStatic: false,
+		},
+		{
+			name:        "safe path and unquoted whole replacement affect suffix",
+			src:         `find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" before {} after' \;`,
+			afterStatic: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "printf" || !slices.Contains(call.Via, "find") || len(call.Args) < 4 {
+					continue
+				}
+				found = true
+				if !call.ArgStatic(1) || call.ArgStatic(2) || call.ArgStatic(3) != tc.afterStatic {
+					t.Errorf("find replacement provenance = %+v, want before static, replacement dynamic and suffix static=%t", call, tc.afterStatic)
+				}
+			}
+			if !found {
+				t.Fatalf("nested printf missing: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticNestedInsertionAndUnknownXargsReplacement(t *testing.T) {
+	for _, src := range []string{
+		`bash -c "sh -c 'printf \"<%s>\\n\" $X y'"`,
+		`bash -c "printf '<%s>\\n' $((1)) y"`,
+		`X='a #'; eval "sh -c 'printf \"<%s>\\n\" $X y'"`,
+		`bash -c "printf '<%s>\\n' $X; sh -c 'printf y'"`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name == "printf" && len(call.Args) > 0 && (slices.Contains(call.Via, "sh") || call.Args[len(call.Args)-1] == "y") {
+					found = true
+					if call.ArgStatic(len(call.Args) - 1) {
+						t.Errorf("word after outer insertion remained static: %+v", call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("nested printf missing: %+v", calls)
+			}
+		})
+	}
+	for _, src := range []string{
+		`printf 'a #\n' | xargs -I"$R" printf '<%s>\\n' @ y`,
+		`printf 'a #\n' | xargs $OPT sh -c 'printf y'`,
+		`printf 'a #\n' | xargs -I$(echo @) sh -c 'printf y'`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if len(call.Via) > 0 && slices.Contains(call.Via, "xargs") && len(call.Args) > 0 {
+					found = true
+					for i := range call.Args {
+						if call.ArgStatic(i) {
+							t.Errorf("unknown replacement left argument %d static: %+v", i, call)
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("xargs child missing: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticXargsOptionalReplacementStopsAtOptionalValue(t *testing.T) {
+	calls, err := Calls(`printf x | xargs -li{} printf '<%s>\\n' w{}`)
+	if err != nil {
+		t.Fatalf("Calls: %v", err)
+	}
+	for _, call := range calls {
+		if call.Name == "printf" && slices.Contains(call.Via, "xargs") {
+			if len(call.Args) != 2 || !call.ArgStatic(1) {
+				t.Fatalf("xargs -l optional value was parsed as a replacement: %+v", call)
+			}
+			return
+		}
+	}
+	t.Fatalf("nested printf missing: %+v", calls)
+}
+
+func TestArgStaticTmuxWrappedOffsetsMatchLegacy(t *testing.T) {
+	for _, src := range []string{
+		`tmux new-window env bash -c 'printf a'`,
+		`tmux new-window nice -n 1 sh -c 'printf a'`,
+		`tmux new-window timeout 5 bash -c 'printf a'`,
+		`tmux new-window setsid -w bash -c 'printf a'`,
+		`tmux new-window env -i bash -c 'printf a'`,
+		`tmux new-window xargs -I{} sh -c 'printf a'`,
+		`tmux new-window sudo bash -c 'printf a'`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if (call.Name == "bash" || call.Name == "sh") && len(call.Via) > 1 {
+					if slices.Contains(call.Via, "tmux") {
+						found = true
+						if call.Offset != -1 {
+							t.Errorf("tmux nested shell Offset=%d, want -1: %+v", call.Offset, call)
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("tmux nested shell missing: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticFindReplacementAffectsSuffixInsideWord(t *testing.T) {
+	for _, src := range []string{
+		`find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" before "pre{}post" after' \;`,
+		`find /tmp -maxdepth 0 -exec sh -c 'printf "<%s>\\n" before pre{}post after' \;`,
+		`find /tmp -maxdepth 0 -exec sh -c "printf '<%s>\\n' before 'pre{}post' after" \;`,
+		`find /tmp -maxdepth 0 -exec bash -c 'printf "<%s>\\n" before "pre{}post" after' \;`,
+		`find /tmp -maxdepth 0 -exec bash -c 'printf "<%s>\\n" before pre{}post after' \;`,
+		`find /tmp -maxdepth 0 -exec bash -c "printf '<%s>\\n' before 'pre{}post' after" \;`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatalf("Calls: %v", err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "printf" || !slices.Contains(call.Via, "find") || len(call.Args) < 4 {
+					continue
+				}
+				found = true
+				if !call.ArgStatic(1) || call.ArgStatic(2) || call.ArgStatic(3) {
+					t.Errorf("find replacement suffix provenance = %+v, want before static and replaced word/suffix dynamic", call)
+				}
+			}
+			if !found {
+				t.Fatalf("nested printf missing: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticParallelDoesNotCarryReplacementPastCommandRange(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want func(*testing.T, Call)
+	}{
+		{`parallel echo ::: a bash -c 'printf {}'`, func(t *testing.T, call Call) {
+			if len(call.Args) != 1 || !call.ArgStatic(0) {
+				t.Fatalf("parallel replacement context escaped the command range: %+v", call)
+			}
+		}},
+		{`parallel sh -c 'printf "%s" {} y' ::: a`, func(t *testing.T, call Call) {
+			if len(call.Args) != 3 || !call.ArgStatic(0) || call.ArgStatic(1) || call.ArgStatic(2) {
+				t.Fatalf("parallel insertion provenance = %+v, want prefix static and replacement/suffix dynamic", call)
+			}
+		}},
+	} {
+		calls, err := Calls(tc.src)
+		if err != nil {
+			t.Fatalf("Calls: %v", err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == "printf" && slices.Contains(call.Via, "parallel") {
+				found = true
+				tc.want(t, call)
+			}
+		}
+		if !found {
+			t.Fatalf("nested printf missing for %q: %+v", tc.src, calls)
+		}
+	}
+}
+
+func TestArgStaticNoPerWordAllocations(t *testing.T) {
+	for _, tt := range []struct {
+		src  string
+		want float64
+	}{{`echo a b c`, 102}, {"echo" + strings.Repeat(" x", 40), 404}} {
+		src, limit := tt.src, tt.want
+		allocs := testing.AllocsPerRun(3, func() {
+			if _, err := Calls(src); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if allocs > limit {
+			t.Errorf("Calls(%q) allocations = %.0f, want <= %.0f", src, allocs, limit)
+		}
+	}
+}
+
 func nestedSubstitutionScript(lines int) string {
 	const line = `x="$(printf "%%s" "it's $(echo "a)b" | tr a b)")"; y=` + "`date \"+%%s\"`" + `; z=$(( (i+1) * 2 )) # c` + "\n"
 	return "#!/bin/bash\n" + strings.Repeat(line, lines) + strings.Repeat("kill -0 \"$pid\"\n", 20)
