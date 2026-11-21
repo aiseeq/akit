@@ -3,13 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -37,7 +35,6 @@ type line struct {
 	text         string
 	match        string
 	warning      string
-	badDays      []string
 	contextHuman bool
 	moreLater    int
 }
@@ -1378,12 +1375,7 @@ const (
 
 type briefRecordHints struct {
 	kind               briefRecordKind
-	scanned            bool
-	hasToolUseResult   bool
 	user               bool
-	typeUser           bool
-	roleUser           bool
-	eventUser          bool
 	agent              bool
 	assistant          bool
 	text               bool
@@ -1427,11 +1419,11 @@ func classifyBriefRecordPrefix(raw []byte) briefRecordKind {
 func scanBriefTypeMarker(marker []byte, hints *briefRecordHints, toolUseResult *bool) {
 	switch {
 	case bytes.HasPrefix(marker, []byte(`"type":"user"`)):
-		hints.user, hints.typeUser = true, true
+		hints.user = true
 	case bytes.HasPrefix(marker, []byte(`"type":"attachment"`)):
 		hints.user, hints.attachment = true, true
 	case bytes.HasPrefix(marker, []byte(`"type":"event_msg","payload":{"type":"user_message"`)):
-		hints.user, hints.eventUser = true, true
+		hints.user = true
 	case bytes.HasPrefix(marker, []byte(`"type":"assistant"`)):
 		hints.assistant = true
 	case bytes.HasPrefix(marker, []byte(`"type":"text"`)):
@@ -1465,8 +1457,7 @@ func scanBriefRecordMarker(marker []byte, hints *briefRecordHints, toolUseResult
 	case 't':
 		scanBriefTypeMarker(marker, hints, toolUseResult)
 	case 'r':
-		hints.roleUser = bytes.HasPrefix(marker, []byte(`"role":"user"`))
-		hints.user = hints.user || hints.roleUser
+		hints.user = hints.user || bytes.HasPrefix(marker, []byte(`"role":"user"`))
 	case 'n':
 		hints.askCall = hints.askCall || bytes.HasPrefix(marker, []byte(`"name":"AskUserQuestion"`))
 	case 'a':
@@ -1488,7 +1479,7 @@ func scanBriefRecordHints(raw []byte) briefRecordHints {
 	case briefRecordAgentMessage, briefRecordEventAgentMessage:
 		h.agentMessage = true
 	case briefRecordUser:
-		h.user, h.typeUser = true, true
+		h.user = true
 	case briefRecordAttachment:
 		h.user, h.attachment = true, true
 	}
@@ -1506,7 +1497,6 @@ func scanBriefRecordHints(raw []byte) briefRecordHints {
 		}
 		scanBriefRecordMarker(raw[i:], &h, &toolUseResult)
 	}
-	h.hasToolUseResult = toolUseResult
 	h.agent = h.assistant && h.text || h.agentMessage
 	h.skipAttachment = h.kind == briefRecordAttachment && h.attachment && !h.queueAttachment
 	return h
@@ -2091,10 +2081,11 @@ func hitOnMarkerDay(h hit, word briefWord) bool {
 }
 
 type briefQuoteFilters struct {
-	from          time.Time
-	byDay         map[string][]func([]byte) bool
-	byRawDay      map[string][]func([]byte) bool
-	recordWindows map[string]markerRecordInterval
+	from               time.Time
+	byDay              map[string][]func([]byte) bool
+	byRawDay           map[string][]func([]byte) bool
+	candidateFragments map[string][]string
+	recordWindows      map[string]markerRecordInterval
 }
 
 type markerRecordInterval struct {
@@ -2110,9 +2101,10 @@ func markerRecordDayKey(day time.Time) string {
 
 func makeBriefQuoteFilters(fragments map[string][]string, recordWindows map[string]markerRecordInterval, loc *time.Location) (briefQuoteFilters, error) {
 	filters := briefQuoteFilters{
-		byDay:         make(map[string][]func([]byte) bool, len(fragments)),
-		byRawDay:      make(map[string][]func([]byte) bool),
-		recordWindows: recordWindows,
+		byDay:              make(map[string][]func([]byte) bool, len(fragments)),
+		byRawDay:           make(map[string][]func([]byte) bool),
+		candidateFragments: make(map[string][]string),
+		recordWindows:      recordWindows,
 	}
 	rawSeen := make(map[string]map[string]bool)
 	rawQuotes := make(map[string][]string)
@@ -2141,6 +2133,7 @@ func makeBriefQuoteFilters(fragments map[string][]string, recordWindows map[stri
 				}
 				rawSeen[rawDay][quote] = true
 				rawQuotes[rawDay] = append(rawQuotes[rawDay], briefQuoteFragment(quote))
+				filters.candidateFragments[rawDay] = append(filters.candidateFragments[rawDay], quote)
 			}
 		}
 	}
@@ -2168,267 +2161,253 @@ func scanBriefQuotes(inventory []briefTranscript, fragments map[string][]string,
 	}
 	foldedFragments := foldBriefQuotes(fragments)
 	paths := recentBriefTranscripts(inventory, filters.from)
-	cacheActive := cache != nil && cache.Available()
-	cacheHasEntries := cacheActive && cache.HasEntries()
-	var candidates, cacheMisses []string
-	var cachedRecordDays, cachedRecords map[string]bool
-	var cacheFailures map[string]error
-	var cachedWarnings []line
-	if cacheActive && !cacheHasEntries {
-		cacheMisses = paths
-	} else {
-		candidates, cacheMisses, cachedRecordDays, cachedWarnings, cachedRecords, cacheFailures = briefCacheCandidates(paths, filters, foldedFragments, until, loc, cache, cacheActive)
+	if cache == nil || !cache.Available() {
+		results := scanBriefTranscriptPaths(paths, filters, foldedFragments, until, loc)
+		hits, recordDays, warnings, err := mergeBriefQuoteResults(results, len(fragments), loc)
+		return hits, recordDays, warnings, err
 	}
-	results := scanBriefTranscriptPaths(candidates, filters, foldedFragments, until, loc, nil)
-	var missCache *replycache.Cache
-	if cacheActive {
-		missCache = cache
-	}
-	results = append(results, scanBriefTranscriptPathsWithCacheState(cacheMisses, filters, foldedFragments, until, loc, missCache, cachedRecords, cacheFailures)...)
-	if len(cachedWarnings) > 0 {
-		results = append(results, briefQuoteScanResult{warnings: cachedWarnings})
-	}
+	candidates, indexes := briefTranscriptCandidates(paths, filters, until, loc, cache)
+	results := scanBriefTranscriptPaths(candidates, filters, foldedFragments, until, loc)
 	hits, recordDays, warnings, err := mergeBriefQuoteResults(results, len(fragments), loc)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	for date := range cachedRecordDays {
-		recordDays[date] = true
+	selected := make(map[string]bool, len(candidates))
+	for _, path := range candidates {
+		selected[path] = true
+	}
+	var secondPass []string
+	for key, interval := range recordWindows {
+		if recordDays[key] {
+			continue
+		}
+		for path, index := range indexes {
+			if !selected[path] && activityMayHaveRecord(index, interval) {
+				selected[path] = true
+				secondPass = append(secondPass, path)
+			}
+		}
+	}
+	if len(secondPass) > 0 {
+		results = append(results, scanBriefTranscriptPaths(secondPass, filters, foldedFragments, until, loc)...)
+		hits, recordDays, warnings, err = mergeBriefQuoteResults(results, len(fragments), loc)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	return hits, recordDays, warnings, nil
 }
 
-func briefCacheCandidates(paths []string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache, active bool) ([]string, []string, map[string]bool, []line, map[string]bool, map[string]error) {
-	var candidates, misses []string
-	var warnings []line
-	recordDays := make(map[string]bool)
-	cachedRecords := make(map[string]bool)
-	cacheFailures := make(map[string]error)
-	cacheUntil := briefCacheCoverageUntil()
+func briefTranscriptCandidates(paths []string, filters briefQuoteFilters, until time.Time, loc *time.Location, cache *replycache.Cache) ([]string, map[string]replycache.ActivityIndex) {
+	candidates := make([]string, 0, len(paths))
+	indexes := make(map[string]replycache.ActivityIndex, len(paths))
 	for _, path := range paths {
-		if !active {
-			candidates = append(candidates, path)
-			continue
-		}
-		cached, complete, err := cache.CachedEvents(path)
+		state, usable, err := cache.LoadActivityIndex(path)
 		if err != nil {
-			misses = append(misses, path)
-			cacheFailures[path] = err
-			continue
+			cache.NoteIssue(err.Error())
 		}
-		if complete {
-			cachedRecords[path] = true
-		}
-		if !complete || !cached.Covers(filters.from, cacheUntil) {
-			misses = append(misses, path)
-			continue
-		}
-		candidate, candidateErr := cachedBriefCandidate(cached, filters, fragments, until, loc, recordDays)
-		if candidateErr != nil {
-			misses = append(misses, path)
-			cacheFailures[path] = candidateErr
-		} else if candidate {
-			candidates = append(candidates, path)
+		var index replycache.ActivityIndex
+		if err == nil && usable && !state.Appendable {
+			index = state.Index
+		} else if err == nil && usable && state.Appendable {
+			index, err = extendBriefActivityIndex(path, state)
 		} else {
-			warnings = append(warnings, cachedBriefWarnings(path, cached, filters, until)...)
-		}
-	}
-	return candidates, misses, recordDays, warnings, cachedRecords, cacheFailures
-}
-
-func cachedBriefWarnings(path string, cached replycache.CachedTranscript, filters briefQuoteFilters, until time.Time) []line {
-	selected := make([]replycache.BadLine, 0)
-	for _, bad := range cached.BadLines {
-		if bad.Day != "" {
-			if _, relevant := filters.byRawDay[bad.Day]; !relevant {
+			index, err = buildBriefActivityIndex(path, state)
+			if err != nil {
+				cache.NoteIssue(fmt.Sprintf("build activity index %s: %v", path, err))
+				candidates = append(candidates, path)
+				continue
+			}
+			if reason := cache.StoreActivityIndex(path, state, index); reason != "" {
+				cache.NoteIssue(reason)
+				candidates = append(candidates, path)
 				continue
 			}
 		}
-		if !bad.Time.IsZero() {
-			if bad.Time.Before(filters.from) || briefTimestampAfterParts([]byte(bad.Day), bad.Time, true, until) {
-				continue
-			}
-		}
-		selected = append(selected, bad)
-	}
-	if len(selected) == 0 {
-		return nil
-	}
-	slices.SortFunc(selected, func(a, b replycache.BadLine) int { return a.Line - b.Line })
-	first := fmt.Errorf("line %d: %s", selected[0].Line, selected[0].Message)
-	warning := malformedTranscriptWarning(len(selected), first)
-	warning.warning += " in " + path
-	for _, bad := range selected {
-		if bad.Day != "" {
-			warning.badDays = append(warning.badDays, bad.Day)
+		indexes[path] = index
+		if briefActivityCandidate(index, filters, until, loc) {
+			candidates = append(candidates, path)
 		}
 	}
-	slices.Sort(warning.badDays)
-	warning.badDays = slices.Compact(warning.badDays)
-	warning.warning = malformedTranscriptWarning(len(selected), first).warning + " in " + path
-	return []line{warning}
+	return candidates, indexes
 }
 
-const briefCacheCoverageMinUnixNano int64 = -1 << 63
-const briefCacheCoverageMaxUnixNano int64 = 1<<63 - 1
-
-func briefCacheCoverageFrom() time.Time { return time.Unix(0, briefCacheCoverageMinUnixNano).UTC() }
-
-func briefCacheCoverageUntil() time.Time { return time.Unix(0, briefCacheCoverageMaxUnixNano).UTC() }
-
-func cachedBriefCandidate(cached replycache.CachedTranscript, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, recordDays map[string]bool) (bool, error) {
-	candidate := false
-	coveredBadDays := make(map[string]bool, len(cached.BadCoverageDays))
-	for _, day := range cached.BadCoverageDays {
-		coveredBadDays[day] = true
+func briefActivityCandidate(index replycache.ActivityIndex, filters briefQuoteFilters, until time.Time, loc *time.Location) bool {
+	if index.Partial || index.Uncertain || index.NonChronological {
+		return true
 	}
-	unknownBadCovered := false
-	for _, bad := range cached.BadLines {
-		if bad.Day == "" {
-			unknownBadCovered = true
-			break
+	start := filters.from.UTC().AddDate(0, 0, -1).Format(time.DateOnly)
+	end := until.UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+	for _, day := range index.Days {
+		if (day.Bad || day.Uncertain) && day.Day >= start && day.Day <= end {
+			return true
 		}
 	}
-	if cached.BadGlobal && !unknownBadCovered {
-		candidate = true
-	}
-	startDay := filters.from.UTC().Format(time.DateOnly)
-	endDay := until.UTC().Format(time.DateOnly)
-	for _, day := range cached.BadDays {
-		if day >= startDay && day <= endDay && !coveredBadDays[day] {
-			candidate = true
-			break
-		}
-	}
-	for i := range cached.Events {
-		match, err := cachedBriefEventCandidate(&cached.Events[i], i, cached.RawDays, filters, fragments, until, loc)
-		if err != nil {
-			return true, err
-		}
-		candidate = candidate || match
-	}
-	for key, interval := range filters.recordWindows {
-		// Transcript rows at --until are included by the source scanner. Widen by
-		// one nanosecond so an activity bucket beginning exactly there is retained.
-		end := minTime(interval.end, until.Add(time.Nanosecond))
-		if cachedRecordDay(cached.RecordTimes, interval.start, end) {
-			recordDays[key] = true
-		}
-	}
-	return candidate, nil
-}
-
-func cachedBriefEventCandidate(ev *transcript.Event, index int, rawDays []string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location) (bool, error) {
-	if ev.Role != transcript.User && ev.Role != transcript.Ask {
-		return false, nil
-	}
-	rawDay := ""
-	if index < len(rawDays) {
-		rawDay = rawDays[index]
-	}
-	if rawDay != "" {
-		if briefTimestampAfterParts([]byte(rawDay), ev.Time, !ev.Time.IsZero(), until) {
-			return false, nil
-		}
-	} else if ev.Time.After(until) {
-		return false, nil
-	}
-	date := ev.Time.In(loc).Format(time.DateOnly)
-	l := line{t: ev.Time, user: true, ask: ev.Role == transcript.Ask, text: ev.Text, match: ev.Text}
-	if l.ask {
-		l.match = ev.Answer
-	}
-	if matchesBriefQuote(l, fragments[date]) {
-		return true, nil
-	}
-	if len(ev.Raw) == 0 || ev.Text != "" || ev.Answer != "" {
-		return false, nil
-	}
-	if rawDay == "" {
-		return true, nil
-	}
-	for _, filter := range filters.byRawDay[rawDay] {
-		if !filter(ev.Raw) {
-			continue
-		}
-		matched, err := cachedRawReplyMatches(ev.Raw, ev.Time, fragments, until, loc)
-		if err != nil {
-			return true, err
-		}
-		return matched, nil
-	}
-	return false, nil
-}
-
-func cachedRawReplyMatches(raw []byte, fallback time.Time, fragments map[string][]string, until time.Time, loc *time.Location) (bool, error) {
-	events, err := transcript.NewParser().Parse(raw)
-	if err != nil {
-		return false, err
-	}
-	understood := false
-	for i := range events {
-		ev := &events[i]
+	for i := range index.Events {
+		ev := &index.Events[i]
 		if ev.Role != transcript.User && ev.Role != transcript.Ask {
 			continue
 		}
-		understood = true
-		stamp := ev.Time
-		if stamp.IsZero() {
-			stamp = fallback
-		}
-		value, hasTimestamp, timestampErr := briefTimestampValue(raw)
-		if timestampErr != nil {
-			return false, timestampErr
-		}
-		past := stamp.After(until)
-		if hasTimestamp {
-			past, timestampErr = briefTimestampAfterValue(value, until)
-			if timestampErr != nil {
-				return false, timestampErr
-			}
-		}
-		if past {
+		quotes := filters.candidateFragments[ev.Time.In(loc).Format(time.DateOnly)]
+		if len(quotes) == 0 {
 			continue
 		}
-		l := line{t: stamp, user: true, ask: ev.Role == transcript.Ask, text: ev.Text, match: ev.Text}
-		if l.ask {
-			l.match = ev.Answer
+		candidateLine := line{t: ev.Time, user: true, ask: ev.Role == transcript.Ask, text: ev.Text, match: ev.Answer}
+		if !candidateLine.ask {
+			candidateLine.match = ev.Text
 		}
-		if matchesBriefQuote(l, fragments[stamp.In(loc).Format(time.DateOnly)]) {
-			return true, nil
-		}
-	}
-	if !understood {
-		// Parser state from earlier rows can affect the event role. Keep this
-		// file as a candidate and let its sequential scanner decide.
-		return true, nil
-	}
-	return false, nil
-}
-
-func cachedRecordDay(timestamps []replycache.RecordTime, start, end time.Time) bool {
-	if !end.After(start) {
-		return false
-	}
-	for _, cached := range timestamps {
-		if !cached.RecordDay {
-			continue
-		}
-		stamp := time.Unix(cached.Seconds, int64(cached.Nanosecond)).UTC()
-		// RecordDay guarantees this came from a valid UTC Z timestamp. The caller
-		// already bounds end by --until+1ns, so the exclusive interval is exact.
-		if !stamp.Before(start) && stamp.Before(end) {
+		if matchesBriefQuote(candidateLine, quotes) {
 			return true
 		}
 	}
 	return false
 }
 
-func minTime(a, b time.Time) time.Time {
-	if a.Before(b) {
-		return a
+func activityMayHaveRecord(index replycache.ActivityIndex, interval markerRecordInterval) bool {
+	start := interval.start.UTC().AddDate(0, 0, -1).Format(time.DateOnly)
+	end := interval.end.UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+	if index.Partial || index.Uncertain || index.NonChronological {
+		return true
 	}
-	return b
+	for _, day := range index.Days {
+		if day.HasRecord && day.Day >= start && day.Day <= end {
+			return true
+		}
+	}
+	return false
+}
+
+func buildBriefActivityIndex(path string, state replycache.ActivityState) (replycache.ActivityIndex, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return replycache.ActivityIndex{}, fmt.Errorf("open transcript for activity index %s: %w", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return replycache.ActivityIndex{}, fmt.Errorf("stat transcript for activity index %s: %w", path, err)
+	}
+	if !state.Snapshot.Matches(path, info) {
+		return replycache.ActivityIndex{}, errors.New("transcript changed before activity indexing")
+	}
+	index := replycache.ActivityIndex{}
+	return readBriefActivityIndex(f, path, info.Size(), 0, &index, false, state.Snapshot)
+}
+
+func extendBriefActivityIndex(path string, state replycache.ActivityState) (replycache.ActivityIndex, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return replycache.ActivityIndex{}, fmt.Errorf("open transcript for activity tail %s: %w", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return replycache.ActivityIndex{}, fmt.Errorf("stat transcript for activity tail %s: %w", path, err)
+	}
+	if !state.Snapshot.Matches(path, info) || !state.Appendable || state.ReadFrom > info.Size() {
+		return replycache.ActivityIndex{}, errors.New("transcript changed before tail indexing")
+	}
+	index := state.Index
+	return readBriefActivityIndex(f, path, info.Size(), state.ReadFrom, &index, true, state.Snapshot)
+}
+
+func readBriefActivityIndex(f *os.File, path string, size, from int64, index *replycache.ActivityIndex, tail bool, snapshot replycache.Snapshot) (replycache.ActivityIndex, error) {
+	days := make(map[string]replycache.ActivityDay, len(index.Days))
+	for _, day := range index.Days {
+		days[day.Day] = day
+	}
+	parser := transcript.NewParser()
+	reader := bufio.NewReaderSize(io.NewSectionReader(f, from, size-from), 1<<20)
+	position, indexedSize := from, from
+	for {
+		raw, err := reader.ReadBytes('\n')
+		if len(raw) > 0 {
+			complete := raw[len(raw)-1] == '\n'
+			indexBriefActivityLine(raw, parser, index, days, tail)
+			position += int64(len(raw))
+			if complete {
+				indexedSize = position
+			} else {
+				index.Partial, index.Uncertain = true, true
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return replycache.ActivityIndex{}, fmt.Errorf("read transcript for activity index %s: %w", path, err)
+		}
+	}
+	index.IndexedSize = indexedSize
+	index.Days = index.Days[:0]
+	for _, day := range days {
+		index.Days = append(index.Days, day)
+	}
+	slices.SortFunc(index.Days, func(a, b replycache.ActivityDay) int { return strings.Compare(a.Day, b.Day) })
+	tailHash, err := replycache.HashIndexedTail(f, indexedSize)
+	if err != nil {
+		return replycache.ActivityIndex{}, err
+	}
+	index.TailHash = tailHash
+	stateAfter, err := f.Stat()
+	if err != nil {
+		return replycache.ActivityIndex{}, fmt.Errorf("restat transcript after activity indexing %s: %w", path, err)
+	}
+	if stateAfter.Size() != size || !snapshot.Matches(path, stateAfter) {
+		return replycache.ActivityIndex{}, errors.New("transcript changed during activity indexing")
+	}
+	return *index, nil
+}
+
+func indexBriefActivityLine(raw []byte, parser *transcript.Parser, index *replycache.ActivityIndex, days map[string]replycache.ActivityDay, tail bool) {
+	row := bytes.TrimSuffix(raw, []byte{'\n'})
+	events, parseErr := parser.Parse(row)
+	stamp, stampErr := transcriptTimestamp(row)
+	day, timestampErr := indexBriefActivityTimestamp(stamp, stampErr, index, days, tail)
+	if timestampErr != nil || day == "" {
+		index.Uncertain = true
+	}
+	if !json.Valid(row) || parseErr != nil || stampErr != nil {
+		if day == "" {
+			index.Uncertain = true
+		} else {
+			activityDay := days[day]
+			activityDay.Day, activityDay.Bad = day, true
+			days[day] = activityDay
+		}
+	}
+	if bytes.Contains(row, []byte(`"type":"event_msg","payload":{"type":"user_message"`)) && day != "" {
+		activityDay := days[day]
+		activityDay.Day, activityDay.Uncertain = day, true
+		days[day] = activityDay
+	}
+	if tail && day == "" {
+		index.Uncertain = true
+	}
+	for i := range events {
+		if events[i].Role == transcript.User || events[i].Role == transcript.Ask {
+			index.Events = append(index.Events, events[i])
+		}
+	}
+}
+
+func indexBriefActivityTimestamp(stamp time.Time, stampErr error, index *replycache.ActivityIndex, days map[string]replycache.ActivityDay, tail bool) (string, error) {
+	if stampErr != nil {
+		return "", stampErr
+	}
+	if stamp.IsZero() {
+		return "", nil
+	}
+	day := stamp.UTC().Format(time.DateOnly)
+	activityDay := days[day]
+	activityDay.Day, activityDay.HasRecord = day, true
+	activityDay.Uncertain = activityDay.Uncertain || tail
+	days[day] = activityDay
+	if !index.LastTimestamp.IsZero() && stamp.Before(index.LastTimestamp) {
+		index.NonChronological = true
+	}
+	index.LastTimestamp = stamp
+	return day, nil
 }
 
 const briefContextLookback = 24 * time.Hour
@@ -2542,11 +2521,7 @@ func recentBriefTranscripts(inventory []briefTranscript, from time.Time) []strin
 	return paths
 }
 
-func scanBriefTranscriptPaths(paths []string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache) []briefQuoteScanResult {
-	return scanBriefTranscriptPathsWithCacheState(paths, filters, fragments, until, loc, cache, nil, nil)
-}
-
-func scanBriefTranscriptPathsWithCacheState(paths []string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache, cachedRecords map[string]bool, cacheFailures map[string]error) []briefQuoteScanResult {
+func scanBriefTranscriptPaths(paths []string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location) []briefQuoteScanResult {
 	results := make([]briefQuoteScanResult, len(paths))
 	workers := min(16, len(paths))
 	jobs := make(chan int)
@@ -2554,7 +2529,7 @@ func scanBriefTranscriptPathsWithCacheState(paths []string, filters briefQuoteFi
 	for range workers {
 		wg.Go(func() {
 			for i := range jobs {
-				results[i] = scanBriefTranscriptWithCacheFailure(paths[i], filters, fragments, until, loc, cache, cachedRecords[paths[i]], cacheFailures[paths[i]])
+				results[i] = scanBriefTranscript(paths[i], filters, fragments, until, loc)
 			}
 		})
 	}
@@ -2571,12 +2546,7 @@ type briefQuoteCollector struct {
 	fragments        map[string][]string
 	loc              *time.Location
 	until            time.Time
-	untilDate        []byte
-	untilUTC         []byte
 	parser           *transcript.Parser
-	indexParser      *transcript.Parser
-	indexStamp       time.Time
-	lastTimestamp    time.Time
 	humanStamps      map[string]bool
 	agentRaw         map[string][]byte
 	lastAgent        []byte
@@ -2594,18 +2564,7 @@ type briefQuoteCollector struct {
 	lateRawUntil     string
 	rawDay           []byte
 	recordDays       map[string]bool
-	indexBuckets     []int64
-	indexTimes       []replycache.RecordTime
-	indexDays        map[string]bool
 	recordWindowDays map[string]bool
-	indexReplies     []transcript.Event
-	indexBad         bool
-	indexBadGlobal   bool
-	indexBadErr      error
-	indexBadDays     map[string]bool
-	indexEnabled     bool
-	badLines         []replycache.BadLine
-	badLineCoverage  bool
 }
 
 type briefLateQuote struct {
@@ -2634,341 +2593,25 @@ func briefRecordWindowDays(windows map[string]markerRecordInterval) map[string]b
 	return days
 }
 
-func (c *briefQuoteCollector) setRawDay(day, raw []byte, hints briefRecordHints) {
+func (c *briefQuoteCollector) setRawDay(day, raw, timestamp []byte) {
 	c.rawDay = day
-	c.indexStamp = time.Time{}
-	if c.indexEnabled {
-		if len(day) >= len(time.DateOnly) {
-			if c.indexDays == nil {
-				c.indexDays = make(map[string]bool)
-			}
-			c.indexDays[string(day[:len(time.DateOnly)])] = true
-		}
-		if bucketErr := c.indexRecordTime(raw); bucketErr != nil {
-			c.noteIndexIssue(bucketErr)
-		}
-		c.indexRawEventsWithHints(raw, hints)
-		return
-	}
 	if len(day) < len(time.DateOnly) || !c.recordWindowDays[string(day[:len(time.DateOnly)])] {
 		return
 	}
-	c.indexRecordDay(raw)
-	c.indexRawEvents(raw, hints.kind)
-}
-
-func (c *briefQuoteCollector) indexRecordTime(raw []byte) error {
-	stamp, err := transcriptTimestamp(raw)
-	if err != nil {
-		return err
+	var stamp time.Time
+	var err error
+	if len(timestamp) > 0 {
+		stamp, err = time.Parse(time.RFC3339Nano, string(timestamp))
+	} else {
+		stamp, err = transcriptTimestamp(raw)
 	}
-	if stamp.IsZero() {
-		return nil
-	}
-	if stamp.Before(briefCacheCoverageFrom()) || stamp.After(briefCacheCoverageUntil()) {
-		return errors.New("transcript timestamp outside cache UnixNano range")
-	}
-	at := stamp.UnixNano()
-	if len(c.indexBuckets) == 0 || c.indexBuckets[len(c.indexBuckets)-1] != at {
-		c.indexBuckets = append(c.indexBuckets, at)
-	}
-	if value, found, err := briefTimestampValue(raw); err != nil {
-		return err
-	} else if found {
-		day, _ := briefTimestampTextDay(value)
-		recordTime := replycache.RecordTime{
-			Seconds: stamp.Unix(), Nanosecond: int32(stamp.Nanosecond()), TextDay: string(day), RecordDay: validUTCTimestampDate(value),
-		}
-		if len(c.indexTimes) == 0 || c.indexTimes[len(c.indexTimes)-1] != recordTime {
-			c.indexTimes = append(c.indexTimes, recordTime)
-		}
-	}
-	return nil
-}
-
-func (c *briefQuoteCollector) indexRecordDay(raw []byte) {
-	stamp, err := transcriptTimestamp(raw)
-	c.indexStamp = stamp
-	if err != nil {
-		c.noteIndexIssue(err)
-		return
-	}
-	if stamp.IsZero() || c.indexEnabled && stamp.After(c.until) {
+	if err != nil || stamp.IsZero() {
 		return
 	}
 	for key, interval := range c.filters.recordWindows {
 		if !stamp.Before(interval.start) && stamp.Before(interval.end) {
 			c.recordDays[key] = true
 		}
-	}
-}
-
-const briefCachePrefixLookahead = 512
-
-func briefCacheUserRecord(raw []byte, kind briefRecordKind) (bool, error) {
-	user, _, err := briefCacheUserRecordInfo(raw, kind)
-	return user, err
-}
-
-func briefCacheUserRecordInfo(raw []byte, kind briefRecordKind) (bool, bool, error) {
-	if bytes.HasPrefix(raw, []byte(`{"type":"event_msg","payload":{"type":"user_message"`)) {
-		return true, false, nil
-	}
-	switch kind {
-	case briefRecordAssistant, briefRecordAgentMessage, briefRecordEventAgentMessage,
-		briefRecordAPIRequest, briefRecordAPIRequestBlob:
-		return false, false, nil
-	case briefRecordUser:
-		return briefCacheHumanUserRecord(raw, briefCacheRecordHeader(raw), false)
-	case briefRecordAttachment:
-		return bytes.Contains(raw, []byte(`"type":"queued_command"`)) && bytes.Contains(raw, []byte(`"kind":"human"`)), false, nil
-	default:
-		return briefCacheUnknownUserRecordInfo(raw)
-	}
-}
-
-func briefCacheScannedUserRecordInfo(raw []byte, hints briefRecordHints) (bool, bool, error) {
-	if hints.askAnswer {
-		return true, hints.hasToolUseResult, nil
-	}
-	if hints.eventUser {
-		return true, false, nil
-	}
-	header := briefCacheRecordHeader(raw)
-	if hints.queueAttachment && hints.attachment && bytes.Contains(raw[:min(len(raw), briefCachePrefixLookahead)], []byte(`"attachment":`)) && bytes.Contains(raw, []byte(`"kind":"human"`)) {
-		return true, false, nil
-	}
-	if hints.kind == briefRecordUnknown && hints.roleUser && bytes.Contains(header, []byte(`"role":"user"`)) {
-		return true, hints.hasToolUseResult, nil
-	}
-	if hints.kind == briefRecordUser || hints.typeUser {
-		user, err := briefCacheHumanOrigin(raw, header, hints.kind == briefRecordUnknown)
-		return user, hints.hasToolUseResult, err
-	}
-	return false, false, nil
-}
-
-func briefCacheHumanUserRecord(raw, header []byte, searchWholeRecord bool) (bool, bool, error) {
-	hasToolUseResult := bytes.Contains(raw, []byte(`"toolUseResult"`))
-	if hasToolUseResult && briefAskAnswer(raw) {
-		return true, true, nil
-	}
-	user, err := briefCacheHumanOrigin(raw, header, searchWholeRecord)
-	return user, hasToolUseResult, err
-}
-
-func briefCacheUnknownUserRecordInfo(raw []byte) (bool, bool, error) {
-	header := briefCacheRecordHeader(raw)
-	if bytes.Contains(header, []byte(`"type":"event_msg","payload":{"type":"user_message"`)) {
-		return true, false, nil
-	}
-	prefix := raw[:min(len(raw), briefCachePrefixLookahead)]
-	if bytes.Contains(prefix, []byte(`"attachment":`)) &&
-		bytes.Contains(raw, []byte(`"type":"queued_command"`)) && bytes.Contains(raw, []byte(`"kind":"human"`)) {
-		return true, false, nil
-	}
-	if bytes.Contains(header, []byte(`"role":"user"`)) {
-		return true, bytes.Contains(raw, []byte(`"toolUseResult"`)), nil
-	}
-	if briefCacheHasTypeUser(raw, header) {
-		return briefCacheHumanUserRecord(raw, header, true)
-	}
-	return false, false, nil
-}
-
-func briefCacheHasTypeUser(raw, header []byte) bool {
-	marker := []byte(`"type":"user"`)
-	if bytes.Contains(header, marker) {
-		return true
-	}
-	if bytes.HasPrefix(raw, []byte(`{"type":"response_item",`)) {
-		return false
-	}
-	// Only reordered records can put the type after the message. Avoid scanning
-	// the tail of every unrelated JSON record (many contain large agent text).
-	prefix := raw[:min(len(raw), briefCachePrefixLookahead)]
-	if !bytes.Contains(prefix, []byte(`"message":`)) {
-		return false
-	}
-	tail := raw[max(0, len(raw)-(4<<10)):]
-	return bytes.Contains(tail, marker)
-}
-
-func briefCacheHumanOrigin(raw, header []byte, searchWholeRecord bool) (bool, error) {
-	_ = header
-	_ = searchWholeRecord
-	var record struct {
-		Origin struct {
-			Kind string `json:"kind"`
-		} `json:"origin"`
-	}
-	if err := json.Unmarshal(raw, &record); err != nil {
-		return false, fmt.Errorf("parse cached user origin: %w", err)
-	}
-	return record.Origin.Kind == "human", nil
-}
-
-func briefCacheRecordHeader(raw []byte) []byte {
-	header := raw[:min(len(raw), briefCachePrefixLookahead)]
-	if before, _, ok := bytes.Cut(header, []byte(`"message":`)); ok {
-		header = before
-	} else if before, _, ok := bytes.Cut(header, []byte(`"content":`)); ok {
-		header = before
-	}
-	return header
-}
-
-func (c *briefQuoteCollector) indexRawEvents(raw []byte, kind briefRecordKind) {
-	c.indexRawEventsAt(raw, briefRecordHints{kind: kind})
-}
-
-func (c *briefQuoteCollector) indexRawEventsWithHints(raw []byte, hints briefRecordHints) {
-	c.indexRawEventsAt(raw, hints)
-}
-
-func (c *briefQuoteCollector) indexRawEventsAt(raw []byte, hints briefRecordHints) {
-	if !c.indexEnabled {
-		return
-	}
-	if hints.scanned && !hints.user && !hints.askAnswer && !hints.queueAttachment && !hints.attachment {
-		return
-	}
-	var userLike, hasToolUseResult bool
-	var classifyErr error
-	if hints.scanned {
-		userLike, hasToolUseResult, classifyErr = briefCacheScannedUserRecordInfo(raw, hints)
-	} else {
-		userLike, hasToolUseResult, classifyErr = briefCacheUserRecordInfo(raw, hints.kind)
-	}
-	if classifyErr != nil {
-		c.noteIndexIssue(classifyErr)
-		return
-	}
-	if !userLike {
-		return
-	}
-	stamp := c.indexStamp
-	if stamp.IsZero() {
-		var err error
-		stamp, err = transcriptTimestamp(raw)
-		if err != nil {
-			c.noteIndexIssue(err)
-			return
-		}
-	}
-	if hasToolUseResult {
-		if handled, err := c.indexAskAnswers(raw, stamp); err != nil {
-			c.noteIndexIssue(err)
-			return
-		} else if handled {
-			return
-		}
-	}
-	canonicalEventMsg := bytes.HasPrefix(raw, []byte(`{"type":"event_msg","payload":{"type":"user_message"`))
-	if hints.kind == briefRecordUser || canonicalEventMsg {
-		// Keep standard human rows raw. Query-time candidate filtering parses only
-		// rows whose raw day and bytes can match one of the brief's quotes.
-		c.indexReplies = append(c.indexReplies, briefCachedReply(raw, stamp, transcript.User, nil))
-		return
-	}
-	if c.indexKnownRecord(raw, stamp, hints.kind, canonicalEventMsg) {
-		return
-	}
-	if !json.Valid(raw) {
-		c.noteIndexIssue(errors.New("malformed user record"))
-	}
-	// Parsing a user record can depend on tool calls and event mode from earlier
-	// in the file. Keep the compact raw event and defer parsing to candidate
-	// files, where the normal sequential scanner has the full context.
-	c.indexReplies = append(c.indexReplies, briefCachedReply(raw, stamp, transcript.User, nil))
-}
-
-func (c *briefQuoteCollector) indexAskAnswers(raw []byte, stamp time.Time) (bool, error) {
-	answers, err := briefCachedAskAnswers(raw, stamp)
-	if err != nil {
-		return false, err
-	}
-	if len(answers) == 0 {
-		return false, nil
-	}
-	c.indexReplies = append(c.indexReplies, answers...)
-	return true, nil
-}
-
-func (c *briefQuoteCollector) indexKnownRecord(raw []byte, stamp time.Time, kind briefRecordKind, canonicalEventMsg bool) bool {
-	known := kind == briefRecordUser || kind == briefRecordAttachment ||
-		bytes.HasPrefix(raw, []byte(`{"type":"response_item",`)) ||
-		briefCacheHasTypeUser(raw, briefCacheRecordHeader(raw))
-	if !known || canonicalEventMsg {
-		return false
-	}
-	if c.indexParser == nil {
-		c.indexParser = transcript.NewParser()
-	}
-	events, err := c.indexParser.Parse(raw)
-	if err != nil {
-		c.noteIndexIssue(err)
-		c.indexReplies = append(c.indexReplies, briefCachedReply(raw, stamp, transcript.User, nil))
-		return true
-	}
-	for i := range events {
-		if events[i].Role == transcript.User || events[i].Role == transcript.Ask {
-			c.indexReplies = append(c.indexReplies, briefCachedReply(raw, stamp, transcript.User, &events[i]))
-		}
-	}
-	return true
-}
-
-func briefCachedEvent(stamp time.Time, role transcript.Role, text, answer string) transcript.Event {
-	var event transcript.Event
-	event.Time, event.Role, event.Text, event.Answer = stamp, role, text, answer
-	return event
-}
-
-func briefCachedAskAnswers(raw []byte, stamp time.Time) ([]transcript.Event, error) {
-	var record struct {
-		ToolUseResult struct {
-			Answers map[string]string `json:"answers"`
-		} `json:"toolUseResult"`
-	}
-	if err := json.Unmarshal(raw, &record); err != nil {
-		return nil, fmt.Errorf("parse cached AskUserQuestion answers: %w", err)
-	}
-	questions := slices.Sorted(maps.Keys(record.ToolUseResult.Answers))
-	if len(questions) == 0 {
-		return nil, nil
-	}
-	answers := make([]string, 0, len(questions))
-	for _, question := range questions {
-		answers = append(answers, record.ToolUseResult.Answers[question])
-	}
-	return []transcript.Event{briefCachedEvent(stamp, transcript.Ask, "", strings.Join(answers, "\n"))}, nil
-}
-
-func briefCachedReply(raw []byte, stamp time.Time, role transcript.Role, parsed *transcript.Event) transcript.Event {
-	var event transcript.Event
-	if parsed != nil {
-		event = *parsed
-		event.Raw = nil
-	} else {
-		event = briefCachedEvent(stamp, role, "", "")
-		event.Raw = append([]byte(nil), raw...)
-	}
-	return event
-}
-
-func (c *briefQuoteCollector) noteIndexIssue(err error) {
-	c.indexBad = true
-	if len(c.rawDay) >= len(time.DateOnly) {
-		if c.indexBadDays == nil {
-			c.indexBadDays = make(map[string]bool)
-		}
-		c.indexBadDays[string(c.rawDay[:len(time.DateOnly)])] = true
-	} else {
-		c.indexBadGlobal = true
-	}
-	if c.indexBadErr == nil {
-		c.indexBadErr = err
 	}
 }
 
@@ -2982,15 +2625,12 @@ func (c *briefQuoteCollector) fastHintsForRecord(raw []byte) (briefRecordHints, 
 		return briefRecordHints{}, false
 	}
 	day := value[:len(time.DateOnly)]
-	kind := classifyBriefRecordPrefix(raw)
-	prefetched := briefRecordHints{rawDay: day, timestamp: value, kind: kind}
-	if kind == briefRecordUser {
-		prefetched.user, prefetched.typeUser = true, true
-	}
+	prefetched := briefRecordHints{rawDay: day, timestamp: value}
 	if _, relevant := c.filters.byRawDay[string(day)]; relevant ||
 		len(c.lateQuotes) > 0 && string(day) >= c.lateRawFrom && string(day) <= c.lateRawUntil {
 		return prefetched, false
 	}
+	kind := classifyBriefRecordPrefix(raw)
 	if kind == briefRecordAssistant || kind == briefRecordAgentMessage || kind == briefRecordEventAgentMessage {
 		hints := scanBriefRecordHints(raw)
 		hints.rawDay = day
@@ -3004,14 +2644,6 @@ func (c *briefQuoteCollector) fastHintsForRecord(raw []byte) (briefRecordHints, 
 }
 
 func (c *briefQuoteCollector) keepWithHints(raw []byte, hints briefRecordHints) bool {
-	keep, err := c.keepRecordForBriefContext(raw)
-	if err != nil {
-		c.timestampErr = err
-		return true
-	}
-	if !keep {
-		return false
-	}
 	agentFast := hints.agent && !hints.askCall && !hints.user &&
 		(hints.kind == briefRecordAssistant || hints.kind == briefRecordAgentMessage || hints.kind == briefRecordEventAgentMessage)
 	if agentFast {
@@ -3052,114 +2684,12 @@ func (c *briefQuoteCollector) keepWithHints(raw []byte, hints briefRecordHints) 
 	return c.keepLaterUser(raw, isUserRecord)
 }
 
-func (c *briefQuoteCollector) keepRecordForBriefContext(raw []byte) (bool, error) {
-	valid, err := c.indexRecordTimestampValid(raw)
-	if err != nil {
-		return false, err
-	}
-	if !valid {
-		return false, nil
-	}
-	if !c.indexEnabled {
-		return true, nil
-	}
-	if c.until.IsZero() {
-		return true, nil
-	}
-	past, err := briefTimestampAfterUntil(raw, c.until)
-	if err != nil {
-		return false, err
-	}
-	return !past, nil
-}
-
-func (c *briefQuoteCollector) indexRecordTimestampValid(raw []byte) (bool, error) {
-	if !c.indexEnabled {
-		return true, nil
-	}
-	value, found, err := briefTimestampValue(raw)
-	if err != nil || !found {
-		return err == nil, err
-	}
-	_, err = parseTranscriptTimestamp(value)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func briefTimestampAfterUntil(raw []byte, until time.Time) (bool, error) {
-	value, found, err := briefTimestampValue(raw)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, nil
-	}
-	return briefTimestampAfterValue(value, until)
-}
-
-func briefTimestampAfterValue(value []byte, until time.Time) (bool, error) {
-	if len(value) == 0 {
-		return false, nil
-	}
-	day, hasDay := briefTimestampTextDay(value)
-	if hasDay {
-		untilDay := []byte(until.UTC().Format(time.DateOnly))
-		if comparison := bytes.Compare(day, untilDay); comparison != 0 {
-			return comparison > 0, nil
-		}
-	}
-	stamp, err := parseTranscriptTimestamp(value)
-	if err != nil {
-		return false, err
-	}
-	return briefTimestampAfterParts(day, stamp, true, until), nil
-}
-
-func briefTimestampAfterParts(day []byte, stamp time.Time, hasStamp bool, until time.Time) bool {
-	if len(day) == len(time.DateOnly) {
-		untilDay := []byte(until.UTC().Format(time.DateOnly))
-		if comparison := bytes.Compare(day, untilDay); comparison != 0 {
-			return comparison > 0
-		}
-	}
-	return hasStamp && stamp.After(until)
-}
-
-func briefTimestampValue(raw []byte) ([]byte, bool, error) {
-	_, value, found := bytes.Cut(raw, []byte(`"timestamp":"`))
-	if !found {
-		return nil, false, nil
-	}
-	value, _, found = bytes.Cut(value, []byte{'"'})
-	if !found {
-		return nil, true, fmt.Errorf("transcript timestamp has no closing quote")
-	}
-	return value, true, nil
-}
-
-func briefTimestampTextDay(value []byte) ([]byte, bool) {
-	if len(value) < len(time.DateOnly) || value[4] != '-' || value[7] != '-' {
-		return nil, false
-	}
-	for _, i := range [...]int{0, 1, 2, 3, 5, 6, 8, 9} {
-		if !isDigit(value[i]) {
-			return nil, false
-		}
-	}
-	return value[:len(time.DateOnly)], true
-}
-
 func (c *briefQuoteCollector) keepQuote(raw []byte) bool {
-	events, err, parsed := c.takeParsed(raw)
-	if !parsed {
-		events, err = c.parser.Parse(raw)
-		c.parsedRaw = append(c.parsedRaw[:0], raw...)
-		c.parsedEvents = events
-		c.parsedErr = err
-		c.hasParsed = true
-	}
+	events, err := c.parser.Parse(raw)
+	c.parsedRaw = append(c.parsedRaw[:0], raw...)
+	c.parsedEvents = events
+	c.parsedErr = err
+	c.hasParsed = true
 	if err != nil {
 		return true
 	}
@@ -3208,22 +2738,14 @@ func (c *briefQuoteCollector) keepMalformed(raw []byte, isUserRecord bool) bool 
 		day = stamp[:len(time.DateOnly)]
 	}
 	_, relevant := c.filters.byRawDay[string(day[:len(time.DateOnly)])]
-	if (!relevant && !c.indexEnabled) || !isUserRecord {
+	if !relevant || !isUserRecord {
 		return false
 	}
 	if c.hasParsed && bytes.Equal(c.parsedRaw, raw) {
 		var syntaxErr *json.SyntaxError
-		bad := errors.As(c.parsedErr, &syntaxErr)
-		if bad {
-			c.noteIndexIssue(c.parsedErr)
-		}
-		return bad
+		return errors.As(c.parsedErr, &syntaxErr)
 	}
-	bad := !json.Valid(raw)
-	if bad {
-		c.noteIndexIssue(errors.New("malformed user record"))
-	}
-	return bad
+	return !json.Valid(raw)
 }
 
 func (c *briefQuoteCollector) takeParsed(raw []byte) ([]transcript.Event, error, bool) {
@@ -3287,40 +2809,12 @@ func (c *briefQuoteCollector) trackLateUser(l line) bool {
 	return keep
 }
 
-func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache, mergeCached bool) briefQuoteScanResult {
-	return scanBriefTranscriptWithCacheFailure(path, filters, fragments, until, loc, cache, mergeCached, nil)
-}
-
-// scanBriefTranscriptWithCacheFailure is the single file-level fallback boundary.
-// Any cache lookup, index, scanner, timestamp, or write failure replays the file
-// through the ordinary reader; only that reader's error can reach the caller.
-func scanBriefTranscriptWithCacheFailure(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache, mergeCached bool, cacheErr error) briefQuoteScanResult {
-	if cache == nil {
-		return scanBriefTranscriptAttempt(path, filters, fragments, until, loc, nil, false)
-	}
-	if cacheErr == nil {
-		result := scanBriefTranscriptAttempt(path, filters, fragments, until, loc, cache, mergeCached)
-		if result.err == nil {
-			return result
-		}
-		cacheErr = result.err
-	}
-	cache.NoteIssue(cacheErr.Error())
-	return scanBriefTranscriptAttempt(path, filters, fragments, until, loc, nil, false)
-}
-
-func scanBriefTranscriptAttempt(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache, mergeCached bool) briefQuoteScanResult {
-	if cache != nil && (filters.from.Before(briefCacheCoverageFrom()) || until.Before(briefCacheCoverageFrom()) || until.After(briefCacheCoverageUntil())) {
-		return briefQuoteScanResult{path: path, err: errors.New("query outside cache UnixNano coverage")}
-	}
-	snapshot := replycache.Snapshot{}
+func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location) briefQuoteScanResult {
 	collector := briefQuoteCollector{
 		filters:          filters,
 		fragments:        fragments,
 		loc:              loc,
 		until:            until,
-		untilDate:        []byte(until.UTC().Format(time.DateOnly)),
-		untilUTC:         []byte(until.UTC().Format("2006-01-02T15:04:05.000000000Z")),
 		parser:           transcript.NewParser(),
 		humanStamps:      make(map[string]bool),
 		agentRaw:         make(map[string][]byte),
@@ -3330,7 +2824,6 @@ func scanBriefTranscriptAttempt(path string, filters briefQuoteFilters, fragment
 		lateShown:        make(map[briefQuoteLineKey]map[string]bool),
 		recordDays:       make(map[string]bool),
 		recordWindowDays: briefRecordWindowDays(filters.recordWindows),
-		indexEnabled:     cache != nil,
 	}
 
 	// Один хронологический проход собирает цитаты и строки их контекста, включая прежние ответы агента.
@@ -3346,47 +2839,19 @@ func scanBriefTranscriptAttempt(path string, filters briefQuoteFilters, fragment
 	if err != nil {
 		return briefQuoteScanResult{path: path, err: err}
 	}
-	if cache != nil {
-		snapshot = cache.SnapshotFile(path, info)
-	}
-	scanFrom, scanUntil := filters.from, until
-	if cache != nil {
-		// The activity cache is query independent: index each complete transcript
-		// so future briefs and --until values can use the same file record.
-		scanFrom, scanUntil = briefCacheCoverageFrom(), briefCacheCoverageUntil()
-	}
 	lines, err := readChronologicalBriefLines(briefReadOptions{
-		path: path, file: f, size: info.Size(), from: scanFrom, until: scanUntil,
-		badLines: &collector.badLines, badLineCoverage: &collector.badLineCoverage,
+		path: path, file: f, size: info.Size(), from: filters.from, until: until,
 		keep: collector.keepWithHints, setDay: collector.setRawDay,
 		fastHints: collector.fastHintsForRecord, parsed: collector.takeParsed,
 	})
 	if err == nil && collector.timestampErr != nil {
 		err = collector.timestampErr
 	}
-	if err == nil && cache != nil && collector.indexBadErr != nil {
-		err = collector.indexBadErr
-	}
 	if errors.Is(err, fs.ErrNotExist) {
 		return briefQuoteScanResult{}
 	}
 	if err != nil {
 		return briefQuoteScanResult{path: path, err: err}
-	}
-	return completeBriefTranscriptScan(path, filters, fragments, until, loc, cache, snapshot, &collector, lines, mergeCached)
-}
-
-func completeBriefTranscriptScan(path string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location, cache *replycache.Cache, snapshot replycache.Snapshot, collector *briefQuoteCollector, lines []line, mergeCached bool) briefQuoteScanResult {
-	// Cache indexing reads through the containing activity bucket, while user
-	// visible context must retain the exact --until cutoff used by an uncached scan.
-	if cache != nil {
-		lines = briefVisibleLines(lines, until)
-		for key, interval := range filters.recordWindows {
-			end := minTime(interval.end, until.Add(time.Nanosecond))
-			if cachedRecordDay(collector.indexTimes, interval.start, end) {
-				collector.recordDays[key] = true
-			}
-		}
 	}
 	hits := matchBriefQuoteLines(path, lines, filters.byDay, fragments, until, loc, collector.quoteChecks)
 	for i := range lines {
@@ -3416,105 +2881,13 @@ func completeBriefTranscriptScan(path string, filters briefQuoteFilters, fragmen
 		}
 		hits[i].context = &briefQuoteContext{lines: contextLines}
 	}
-	warnings, badDays, unknownWarningDay := briefScanWarnings(lines, collector.indexBadDays)
-	if err := storeBriefScanCache(path, cache, snapshot, collector, warnings, badDays, unknownWarningDay, mergeCached); err != nil {
-		return briefQuoteScanResult{path: path, err: err}
-	}
-	if cache != nil {
-		warnings = cachedBriefWarnings(path, replycache.CachedTranscript{BadLines: collector.badLines}, filters, until)
+	var warnings []line
+	for _, l := range lines {
+		if l.warning != "" {
+			warnings = append(warnings, l)
+		}
 	}
 	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings, recordDays: collector.recordDays}
-}
-
-func briefVisibleLines(lines []line, until time.Time) []line {
-	visible := lines[:0]
-	for _, l := range lines {
-		if !l.t.After(until) {
-			visible = append(visible, l)
-		}
-	}
-	return visible
-}
-
-func briefScanWarnings(lines []line, indexedBadDays map[string]bool) ([]line, []string, bool) {
-	warnings := make([]line, 0)
-	badDaySet := make(map[string]bool, len(indexedBadDays))
-	unknownDay := false
-	for day := range indexedBadDays {
-		badDaySet[day] = true
-	}
-	for _, l := range lines {
-		if l.warning == "" {
-			continue
-		}
-		warnings = append(warnings, l)
-		if len(l.badDays) == 0 {
-			unknownDay = true
-		}
-		for _, day := range l.badDays {
-			badDaySet[day] = true
-		}
-	}
-	badDays := slices.Sorted(maps.Keys(badDaySet))
-	if badDays == nil {
-		badDays = []string{}
-	}
-	return warnings, badDays, unknownDay
-}
-
-func storeBriefScanCache(path string, cache *replycache.Cache, snapshot replycache.Snapshot, collector *briefQuoteCollector, warnings []line, badDays []string, unknownWarningDay, mergeCached bool) error {
-	if cache == nil {
-		return nil
-	}
-	var cacheMeta transcript.Meta
-	if collector.indexBad || len(warnings) > 0 {
-		cacheMeta.Bad = 1
-	}
-	if collector.indexBadErr != nil {
-		cacheMeta.FirstBad = collector.indexBadErr
-	} else if len(warnings) > 0 {
-		cacheMeta.FirstBad = errors.New(warnings[0].warning)
-	}
-	buckets := collector.indexBuckets
-	slices.Sort(buckets)
-	buckets = slices.Compact(buckets)
-	recordTimes := collector.indexTimes
-	slices.SortFunc(recordTimes, func(a, b replycache.RecordTime) int {
-		if n := cmp.Compare(a.Seconds, b.Seconds); n != 0 {
-			return n
-		}
-		if n := cmp.Compare(a.Nanosecond, b.Nanosecond); n != 0 {
-			return n
-		}
-		return strings.Compare(a.TextDay, b.TextDay)
-	})
-	recordTimes = slices.Compact(recordTimes)
-	badGlobal := collector.indexBadGlobal || unknownWarningDay
-	for _, bad := range collector.badLines {
-		badGlobal = badGlobal || bad.Day == ""
-		if bad.Day != "" {
-			badDays = append(badDays, bad.Day)
-		}
-	}
-	slices.Sort(badDays)
-	badDays = slices.Compact(badDays)
-	var badCoverageDays []string
-	if collector.badLineCoverage {
-		for day := range collector.indexDays {
-			badCoverageDays = append(badCoverageDays, day)
-		}
-		for _, bad := range collector.badLines {
-			if bad.Day != "" {
-				badCoverageDays = append(badCoverageDays, bad.Day)
-			}
-		}
-		slices.Sort(badCoverageDays)
-		badCoverageDays = slices.Compact(badCoverageDays)
-	}
-	if reason := cache.StoreEventsWithRecordTimesFromLookup(path, snapshot, collector.indexReplies, buckets, recordTimes, badDays, badGlobal, collector.badLines, badCoverageDays, briefCacheCoverageFrom(), briefCacheCoverageUntil(), cacheMeta, mergeCached); reason != "" {
-		return errors.New(reason)
-	}
-	return nil
 }
 
 func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line, shownForQuote map[string]bool) []line {
@@ -3703,26 +3076,20 @@ func briefUserRecord(raw []byte) bool {
 }
 
 type briefReadOptions struct {
-	path            string
-	file            *os.File
-	size            int64
-	from            time.Time
-	until           time.Time
-	filterWarnings  bool
-	warningFrom     time.Time
-	warningUntil    time.Time
-	badLines        *[]replycache.BadLine
-	badLineCoverage *bool
-	keep            func([]byte, briefRecordHints) bool
-	setDay          func([]byte, []byte, briefRecordHints)
-	fastHints       func([]byte) (briefRecordHints, bool)
-	parsed          func([]byte) ([]transcript.Event, error, bool)
+	path      string
+	file      *os.File
+	size      int64
+	from      time.Time
+	until     time.Time
+	keep      func([]byte, briefRecordHints) bool
+	setDay    func([]byte, []byte, []byte)
+	fastHints func([]byte) (briefRecordHints, bool)
+	parsed    func([]byte) ([]transcript.Event, error, bool)
 }
 
 func readChronologicalBriefLines(options briefReadOptions) ([]line, error) {
 	path, f, size, from, until := options.path, options.file, options.size, options.from, options.until
 	keep, setDay, fastHints, parsed := options.keep, options.setDay, options.fastHints, options.parsed
-	readFrom, readUntil := from, until
 	var head [4 << 10]byte
 	n, err := f.ReadAt(head[:], 0)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -3739,13 +3106,12 @@ func readChronologicalBriefLines(options briefReadOptions) ([]line, error) {
 	}
 	if !ordered {
 		trackedKeep := func(raw []byte) bool {
-			hints := scanBriefRecordHints(raw)
 			if setDay != nil {
 				if stamp, stampErr := transcriptTimestamp(raw); stampErr == nil && !stamp.IsZero() {
-					setDay([]byte(stamp.UTC().Format(time.DateOnly)), raw, hints)
+					setDay([]byte(stamp.UTC().Format(time.DateOnly)), raw, nil)
 				}
 			}
-			return keep == nil || keep(raw, hints)
+			return keep == nil || keep(raw, scanBriefRecordHints(raw))
 		}
 		lines, err := readLines(path, trackedKeep)
 		for i := range lines {
@@ -3755,15 +3121,12 @@ func readChronologicalBriefLines(options briefReadOptions) ([]line, error) {
 		}
 		return lines, err
 	}
-	if options.badLineCoverage != nil {
-		*options.badLineCoverage = true
-	}
-	if firstStamp.After(readUntil) {
+	if firstStamp.After(until) {
 		return nil, nil
 	}
 	start := int64(0)
 	if size > 256<<10 {
-		start, err = transcriptOffset(f, size, readFrom, samples)
+		start, err = transcriptOffset(f, size, from, samples)
 		if err != nil || start >= size {
 			return nil, err
 		}
@@ -3775,13 +3138,8 @@ func readChronologicalBriefLines(options briefReadOptions) ([]line, error) {
 	parser := transcript.NewParser()
 	// The line number of a malformed record counts from the file start; the
 	// lines before the seek point are counted only when a warning needs them.
-	scan := briefScan{
-		path: path, linesBefore: func() (int, error) { return countLines(f, start) }, fastHints: fastHints,
-		filterWarnings: options.filterWarnings, warningFrom: options.warningFrom, warningUntil: options.warningUntil,
-		badDays:  make(map[string]bool),
-		badLines: options.badLines,
-	}
-	return scan.lines(r, parser, readUntil, keep, setDay, parsed)
+	scan := briefScan{path: path, linesBefore: func() (int, error) { return countLines(f, start) }, fastHints: fastHints}
+	return scan.lines(r, parser, until, keep, setDay, parsed)
 }
 
 // countLines counts the line breaks in the first n bytes of f.
@@ -3805,46 +3163,42 @@ func countLines(f *os.File, n int64) (int, error) {
 // briefScan reads one chronological transcript for --brief and reports its
 // first malformed record by file line.
 type briefScan struct {
-	path             string
-	linesBefore      func() (int, error)
-	bad              int
-	badLine          int
-	badErr           error
-	badDays          map[string]bool
-	badRecords       []replycache.BadLine
-	badLines         *[]replycache.BadLine
-	lastTimestamp    time.Time
-	lastTimestampRaw []byte
-	fastHints        func([]byte) (briefRecordHints, bool)
-	filterWarnings   bool
-	warningFrom      time.Time
-	warningUntil     time.Time
+	path        string
+	linesBefore func() (int, error)
+	bad         int
+	badLine     int
+	badErr      error
+	fastHints   func([]byte) (briefRecordHints, bool)
 }
 
-func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte, briefRecordHints) bool, setDay func([]byte, []byte, briefRecordHints), parsed func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
+func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time.Time, keep func([]byte, briefRecordHints) bool, setDay func([]byte, []byte, []byte), parsed func([]byte) ([]transcript.Event, error, bool)) ([]line, error) {
 	var out []line
 	lineNo := 0
+	untilDate := []byte(until.UTC().Format(time.DateOnly))
 	for {
 		raw, hints, consumed, readErr := readBriefRecord(r, s.fastHints)
 		if consumed {
 			lineNo++
 		}
 		if len(raw) > 0 {
-			if stamp, err := transcriptTimestamp(raw); err == nil && !stamp.IsZero() {
-				s.lastTimestamp = stamp
-				if value, found, valueErr := briefTimestampValue(raw); found && valueErr == nil {
-					s.lastTimestampRaw = append(s.lastTimestampRaw[:0], value...)
-				}
-			}
-			outcome, err := s.appendRaw(&out, raw, hints, until, keep, setDay, parser, parsed)
+			rawDay, past, err := briefRecordPast(raw, hints, untilDate, until)
 			if err != nil {
 				return nil, err
 			}
-			if outcome.warning != nil {
-				s.noteBad(lineNo, outcome.warning, briefBadRecordDay(hints), raw, !s.filterWarnings || s.warningRelevant(raw))
-			}
-			if outcome.stop {
+			if past {
 				return s.finish(out)
+			}
+			if setDay != nil {
+				setDay(rawDay, raw, hints.timestamp)
+			}
+			keepRecord := keep == nil || keep(raw, hints)
+			if keepRecord {
+				events, err := parseBriefRecord(raw, parser, parsed)
+				if err != nil {
+					s.noteBad(lineNo, err)
+				} else if appendBriefEvents(&out, events, until) {
+					return s.finish(out)
+				}
 			}
 		}
 		if readErr != nil {
@@ -3856,46 +3210,6 @@ func (s *briefScan) lines(r *bufio.Reader, parser *transcript.Parser, until time
 	}
 }
 
-type briefAppendResult struct {
-	stop    bool
-	warning error
-}
-
-func (s *briefScan) appendRaw(out *[]line, raw []byte, hints briefRecordHints, until time.Time, keep func([]byte, briefRecordHints) bool, setDay func([]byte, []byte, briefRecordHints), parser *transcript.Parser, parsed func([]byte) ([]transcript.Event, error, bool)) (briefAppendResult, error) {
-	rawDay, past, err := briefRecordPast(raw, hints, until)
-	if err != nil {
-		return briefAppendResult{}, err
-	}
-	if past {
-		return briefAppendResult{stop: true}, nil
-	}
-	if setDay != nil {
-		setDay(rawDay, raw, hints)
-	}
-	if keep != nil && !keep(raw, hints) {
-		return briefAppendResult{}, nil
-	}
-	events, err := parseBriefRecord(raw, parser, parsed)
-	if err != nil {
-		return briefAppendResult{warning: err}, nil
-	}
-	return briefAppendResult{stop: appendBriefEvents(out, events, until)}, nil
-}
-
-func (s *briefScan) warningRelevant(raw []byte) bool {
-	stamp, err := transcriptTimestamp(raw)
-	if err != nil {
-		return true
-	}
-	if stamp.IsZero() {
-		stamp = s.lastTimestamp
-	}
-	if stamp.IsZero() {
-		return true
-	}
-	return !stamp.Before(s.warningFrom) && !stamp.After(s.warningUntil)
-}
-
 func parseBriefRecord(raw []byte, parser *transcript.Parser, parsed func([]byte) ([]transcript.Event, error, bool)) ([]transcript.Event, error) {
 	if parsed != nil {
 		if events, err, ok := parsed(raw); ok {
@@ -3905,94 +3219,103 @@ func parseBriefRecord(raw []byte, parser *transcript.Parser, parsed func([]byte)
 	return parser.Parse(raw)
 }
 
-// briefRecordPast applies the base reader's text-day-first --until rule.
+// briefRecordPast reports whether a record is later than until, by its day
+// when the day decides it and by its timestamp otherwise.
 
-func briefRecordPast(raw []byte, hints briefRecordHints, until time.Time) ([]byte, bool, error) {
-	rawDay := hints.rawDay
-	if len(rawDay) == 0 {
-		if _, value, ok := bytes.Cut(raw, []byte(`"timestamp":"`)); ok {
-			if value, _, ok = bytes.Cut(value, []byte{'"'}); ok && validUTCTimestampDate(value) {
-				rawDay = value[:len(time.DateOnly)]
-			}
+func briefRecordPast(raw []byte, hints briefRecordHints, untilDate []byte, until time.Time) ([]byte, bool, error) {
+	if len(hints.rawDay) == len(time.DateOnly) && len(hints.timestamp) > 0 {
+		if comparison := bytes.Compare(hints.rawDay, untilDate); comparison != 0 {
+			return hints.rawDay, comparison > 0, nil
 		}
+		if timestamp, ok := normalizeUTCTimestamp(hints.timestamp); ok {
+			cutoff := until.UTC().Format("2006-01-02T15:04:05.000000000Z")
+			return hints.rawDay, bytes.Compare(timestamp, []byte(cutoff)) > 0, nil
+		}
+		stamp, err := transcriptTimestamp(raw)
+		return hints.rawDay, !stamp.IsZero() && stamp.After(until), err
 	}
-	past, err := briefTimestampAfterUntil(raw, until)
+	rawDay, after, known, err := briefRecordStatus(raw, untilDate, until)
+	if err != nil || known {
+		return rawDay, known && after, err
+	}
+	stamp, err := transcriptTimestamp(raw)
 	if err != nil {
-		return rawDay, false, err
+		return nil, false, err
 	}
-	return rawDay, past, nil
-}
-
-func briefBadRecordDay(hints briefRecordHints) []byte {
-	if len(hints.rawDay) >= len(time.DateOnly) {
-		return hints.rawDay[:len(time.DateOnly)]
-	}
-	// Unknown-day corruption is cached globally so no day query can miss it.
-	return nil
+	return rawDay, !stamp.IsZero() && stamp.After(until), nil
 }
 
 // noteBad counts a malformed record and keeps the first one for the warning.
-func (s *briefScan) noteBad(lineNo int, err error, day, raw []byte, relevant bool) {
-	stamp, timestampErr := transcriptTimestamp(raw)
-	if timestampErr != nil || stamp.IsZero() {
-		stamp = time.Time{}
-	}
-	if stamp.IsZero() {
-		stamp = s.lastTimestamp
-	}
-	bad := replycache.BadLine{Time: stamp, Line: lineNo, Message: err.Error()}
-	if value, found, valueErr := briefTimestampValue(raw); found && valueErr == nil {
-		if sourceDay, ok := briefTimestampTextDay(value); ok {
-			bad.Day = string(sourceDay)
-		}
-	}
-	if bad.Day == "" && len(day) >= len(time.DateOnly) {
-		bad.Day = string(day[:len(time.DateOnly)])
-	} else if bad.Day == "" && len(s.lastTimestampRaw) >= len(time.DateOnly) {
-		bad.Day = string(s.lastTimestampRaw[:len(time.DateOnly)])
-	} else if bad.Day == "" && !stamp.IsZero() {
-		bad.Day = stamp.UTC().Format(time.DateOnly)
-	}
-	if bad.Day != "" {
-		if relevant {
-			s.badDays[bad.Day] = true
-		}
-	}
-	s.badRecords = append(s.badRecords, bad)
-	if relevant {
-		s.bad++
-	}
-	if relevant && s.badErr == nil {
+func (s *briefScan) noteBad(lineNo int, err error) {
+	s.bad++
+	if s.badErr == nil {
 		s.badLine, s.badErr = lineNo, err
 	}
 }
 
 func (s *briefScan) finish(out []line) ([]line, error) {
-	before := 0
-	if len(s.badRecords) > 0 {
-		var err error
-		before, err = s.linesBefore()
-		if err != nil {
-			return nil, err
-		}
-		for i := range s.badRecords {
-			s.badRecords[i].Line += before
-		}
-		if s.badLines != nil {
-			*s.badLines = append(*s.badLines, s.badRecords...)
-		}
-	}
 	if s.bad == 0 {
 		return out, nil
+	}
+	before, err := s.linesBefore()
+	if err != nil {
+		return nil, err
 	}
 	first := fmt.Errorf("line %d: %w", before+s.badLine, s.badErr)
 	warning := malformedTranscriptWarning(s.bad, first)
 	warning.warning += " in " + s.path
-	for day := range s.badDays {
-		warning.badDays = append(warning.badDays, day)
-	}
-	slices.Sort(warning.badDays)
 	return append(out, warning), nil
+}
+
+func briefRecordStatus(raw, untilDate []byte, until time.Time) ([]byte, bool, bool, error) {
+	_, value, ok := bytes.Cut(raw, []byte(`"timestamp":"`))
+	if !ok {
+		return nil, false, false, nil
+	}
+	value, _, ok = bytes.Cut(value, []byte{'"'})
+	if !ok || len(value) < len(time.DateOnly) {
+		return nil, false, false, nil
+	}
+	date := value[:len(time.DateOnly)]
+	if !validUTCTimestampDate(value) {
+		return nil, false, false, nil
+	}
+	if comparison := bytes.Compare(date, untilDate); comparison != 0 {
+		return date, comparison > 0, true, nil
+	}
+	if timestamp, ok := normalizeUTCTimestamp(value); ok {
+		cutoff := until.UTC().Format("2006-01-02T15:04:05.000000000Z")
+		return date, bytes.Compare(timestamp, []byte(cutoff)) > 0, true, nil
+	}
+	stamp, err := transcriptTimestamp(raw)
+	return date, !stamp.IsZero() && stamp.After(until), true, err
+}
+
+func normalizeUTCTimestamp(value []byte) ([]byte, bool) {
+	if len(value) < 20 || value[len(value)-1] != 'Z' || len(value) != 20 && value[19] != '.' || len(value) == 20 && value[19] != 'Z' {
+		return nil, false
+	}
+	var normalized [30]byte
+	copy(normalized[:19], value[:19])
+	normalized[19] = '.'
+	var fraction []byte
+	if len(value) > 20 {
+		fraction = value[20 : len(value)-1]
+	}
+	if len(fraction) > 9 {
+		return nil, false
+	}
+	for _, digit := range fraction {
+		if !isDigit(digit) {
+			return nil, false
+		}
+	}
+	copy(normalized[20:], fraction)
+	for i := 20 + len(fraction); i < 29; i++ {
+		normalized[i] = '0'
+	}
+	normalized[29] = 'Z'
+	return normalized[:], true
 }
 
 func validUTCTimestampDate(stamp []byte) bool {
@@ -4049,7 +3372,6 @@ func readBriefRecord(r *bufio.Reader, fastHints func([]byte) (briefRecordHints, 
 				hints = scanBriefRecordHints(raw)
 				hints.rawDay = prefetched.rawDay
 				hints.timestamp = prefetched.timestamp
-				hints.scanned = true
 			}
 			if hints.containsToolResult && !hints.containsAnswers {
 				return nil, hints, consumed, err

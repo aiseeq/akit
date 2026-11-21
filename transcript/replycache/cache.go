@@ -22,7 +22,7 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-const version = 4
+const version = 5
 const maxEntry = 256 << 20
 const maxCache = 512 << 20
 const maxAge = 30 * 24 * time.Hour
@@ -59,20 +59,33 @@ type event struct {
 }
 
 type record struct {
-	Events           []event
-	BadLines         []badLine
-	BadCoverageDays  []string
-	RecordBuckets    []int64 // Exact UnixNano timestamps of transcript activity.
-	RecordTimes      []RecordTime
-	CompleteFile     bool
-	ActivityComplete bool
-	ActivityCode     string
-	Coverage         []coverageRange
-	BadDays          []string
-	BadGlobal        bool
-	Name             string
-	Bad              int
-	FirstBad         string
+	Events                []event
+	ActivityEvents        []event
+	ActivityDays          []activityDay
+	ActivityTailHash      [32]byte
+	ActivitySize          int64
+	ActivityLastTimestamp time.Time
+	ActivityPartial       bool
+	ActivityUncertain     bool
+	ActivityUnordered     bool
+	BadLines              []badLine
+	BadCoverageDays       []string
+	RecordBuckets         []int64 // Exact UnixNano timestamps of transcript activity.
+	RecordTimes           []RecordTime
+	CompleteFile          bool
+	ActivityComplete      bool
+	ActivityCode          string
+	Coverage              []coverageRange
+	BadDays               []string
+	BadGlobal             bool
+	Name                  string
+	Bad                   int
+	FirstBad              string
+}
+
+type activityDay struct {
+	Day                       string
+	HasRecord, Bad, Uncertain bool
 }
 
 type badLine struct {
@@ -98,19 +111,60 @@ type Snapshot struct {
 	Reason string
 }
 
+// Matches reports whether an open file still has the source identity captured by this snapshot.
+func (s Snapshot) Matches(path string, info os.FileInfo) bool {
+	k, err := fileKeyFromInfo(path, info)
+	return err == nil && s.Reason == "" && s.key == k
+}
+
 // CachedTranscript is the query-independent content cached for one transcript.
 type CachedTranscript struct {
+	Events                []transcript.Event
+	ActivityEvents        []transcript.Event
+	ActivityDays          []ActivityDay
+	ActivitySize          int64
+	ActivityTailHash      [32]byte
+	ActivityLastTimestamp time.Time
+	ActivityPartial       bool
+	ActivityUncertain     bool
+	ActivityUnordered     bool
+	BadLines              []BadLine
+	BadCoverageDays       []string
+	RawDays               []string
+	Meta                  transcript.Meta
+	RecordBuckets         []int64 // Exact UnixNano timestamps of transcript activity.
+	RecordTimes           []RecordTime
+	ActivityComplete      bool
+	Coverage              []CoverageRange
+	BadDays               []string
+	BadGlobal             bool
+}
+
+// ActivityDay summarizes records for conservative transcript candidate selection.
+type ActivityDay struct {
+	Day                       string
+	HasRecord, Bad, Uncertain bool
+}
+
+// ActivityIndex contains query-independent Parser events and conservative day flags.
+type ActivityIndex struct {
 	Events           []transcript.Event
-	BadLines         []BadLine
-	BadCoverageDays  []string
-	RawDays          []string
-	Meta             transcript.Meta
-	RecordBuckets    []int64 // Exact UnixNano timestamps of transcript activity.
-	RecordTimes      []RecordTime
-	ActivityComplete bool
-	Coverage         []CoverageRange
-	BadDays          []string
-	BadGlobal        bool
+	Days             []ActivityDay
+	IndexedSize      int64
+	TailHash         [32]byte
+	LastTimestamp    time.Time
+	Partial          bool
+	Uncertain        bool
+	NonChronological bool
+}
+
+// ActivityState binds an index lookup to the source snapshot and reports a safe append point.
+type ActivityState struct {
+	Index      ActivityIndex
+	Snapshot   Snapshot
+	ReadFrom   int64
+	Reusable   bool
+	Appendable bool
 }
 
 // BadLine describes a malformed source record captured during a covered scan.
@@ -372,6 +426,180 @@ func (c *Cache) loadRecord(path string, rejectBad bool) (record, header, error) 
 	return rec, h, nil
 }
 
+// loadRecordAtPath validates a cache entry without requiring its source key to match
+// the current file. ActivityIndex uses it to verify a safe append from the previous
+// inode and indexed prefix.
+func (c *Cache) loadRecordAtPath(path string) (record, header, error) {
+	if c == nil || c.dir == "" || !privateDir(c.dir) {
+		return record{}, header{}, errors.New("no cache")
+	}
+	cachePath := c.path(path)
+	info, err := os.Lstat(cachePath)
+	if err != nil {
+		return record{}, header{}, fmt.Errorf("stat cache entry: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&otherPermissions != 0 {
+		return record{}, header{}, errors.New("unsafe cache entry")
+	}
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return record{}, header{}, fmt.Errorf("open cache entry: %w", err)
+	}
+	defer f.Close()
+	dec := gob.NewDecoder(f)
+	var h header
+	if err := dec.Decode(&h); err != nil || h.Key.Path != path || h.Length < 0 || h.Length > maxEntry {
+		return record{}, header{}, errors.New("invalid cache header")
+	}
+	var payload []byte
+	if err := dec.Decode(&payload); err != nil {
+		return record{}, header{}, fmt.Errorf("decode cache: %w", err)
+	}
+	if int64(len(payload)) != h.Length || sha256.Sum256(payload) != h.Sum {
+		return record{}, header{}, errors.New("invalid cache checksum")
+	}
+	var rec record
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&rec); err != nil {
+		return record{}, header{}, fmt.Errorf("decode cache payload: %w", err)
+	}
+	if rec.Bad != h.Bad || rec.CompleteFile != h.CompleteFile || !validCoverage(rec.Coverage) {
+		return record{}, header{}, errors.New("invalid cache diagnostics")
+	}
+	return rec, h, nil
+}
+
+// LoadActivityIndex returns a matching index, or an append point only when the
+// source is the same inode, has grown, and the indexed prefix hash still matches.
+func (c *Cache) LoadActivityIndex(path string) (ActivityState, bool, error) {
+	current, err := fileKey(path)
+	if err != nil {
+		return ActivityState{}, false, err
+	}
+	state := ActivityState{Snapshot: Snapshot{key: current}}
+	old, h, err := c.loadRecordAtPath(path)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
+		return state, false, nil
+	}
+	if err != nil {
+		return state, false, err
+	}
+	if !old.ActivityComplete || old.ActivityCode != c.activityCode || old.ActivitySize < 0 || old.ActivitySize > h.Key.Size || (!old.ActivityPartial && old.ActivitySize != h.Key.Size) {
+		return state, false, nil
+	}
+	index := unpackActivityIndex(old)
+	if h.Key == current {
+		if latest, err := fileKey(path); err != nil || latest != current {
+			return state, false, errors.New("transcript changed during activity lookup")
+		}
+		state.Index, state.Reusable = index, true
+		if !index.Partial {
+			state.ReadFrom = index.IndexedSize
+		}
+		return state, true, nil
+	}
+	index, readFrom, appendable, err := c.appendActivityIndex(path, current, h, old, index)
+	if err != nil {
+		return state, false, err
+	}
+	if !appendable {
+		return state, false, nil
+	}
+	state.Index, state.ReadFrom, state.Reusable, state.Appendable = index, readFrom, true, true
+	return state, true, nil
+}
+
+func (c *Cache) appendActivityIndex(path string, current key, h header, old record, index ActivityIndex) (ActivityIndex, int64, bool, error) {
+	if current.Dev != h.Key.Dev || current.Inode != h.Key.Inode || current.Size <= h.Key.Size || old.ActivityPartial || old.ActivitySize != h.Key.Size {
+		return ActivityIndex{}, 0, false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ActivityIndex{}, 0, false, fmt.Errorf("open transcript for append check: %w", err)
+	}
+	actual, err := HashIndexedTail(f, old.ActivitySize)
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return ActivityIndex{}, 0, false, fmt.Errorf("hash indexed transcript tail: %w", err)
+	}
+	if actual != old.ActivityTailHash {
+		return ActivityIndex{}, 0, false, nil
+	}
+	if latest, err := fileKey(path); err != nil || latest != current {
+		return ActivityIndex{}, 0, false, errors.New("transcript changed during activity lookup")
+	}
+	return index, index.IndexedSize, true, nil
+}
+
+// StoreActivityIndex atomically publishes the parser index for the exact source snapshot.
+func (c *Cache) StoreActivityIndex(path string, state ActivityState, index ActivityIndex) string {
+	if state.Snapshot.Reason != "" {
+		return state.Snapshot.Reason
+	}
+	if c == nil || c.dir == "" || state.Snapshot.key.Path != path {
+		return "activity cache unavailable or source mismatch"
+	}
+	current, err := fileKey(path)
+	if err != nil {
+		return fmt.Sprintf("restat source before activity cache write: %v", err)
+	}
+	if current != state.Snapshot.key || index.IndexedSize < 0 || index.IndexedSize > current.Size {
+		return "source changed or invalid activity index before write"
+	}
+	rec := record{ActivityComplete: true, ActivityCode: c.activityCode}
+	if old, h, err := c.loadRecord(path, false); err == nil && h.Key == current {
+		rec = old
+	}
+	rec.ActivityComplete, rec.ActivityCode = true, c.activityCode
+	rec.ActivityEvents = packEvents(index.Events)
+	rec.ActivityDays = packActivityDays(index.Days)
+	rec.ActivitySize, rec.ActivityTailHash = index.IndexedSize, index.TailHash
+	rec.ActivityLastTimestamp = index.LastTimestamp
+	rec.ActivityPartial, rec.ActivityUncertain, rec.ActivityUnordered = index.Partial, index.Uncertain, index.NonChronological
+	if err := c.save(current, rec); err != nil {
+		return fmt.Sprintf("save activity index: %v", err)
+	}
+	return ""
+}
+
+func unpackActivityIndex(rec record) ActivityIndex {
+	return ActivityIndex{
+		Events: unpackEvents(rec.ActivityEvents), Days: unpackActivityDays(rec.ActivityDays),
+		IndexedSize: rec.ActivitySize, TailHash: rec.ActivityTailHash, LastTimestamp: rec.ActivityLastTimestamp,
+		Partial: rec.ActivityPartial, Uncertain: rec.ActivityUncertain, NonChronological: rec.ActivityUnordered,
+	}
+}
+
+func packActivityDays(days []ActivityDay) []activityDay {
+	out := make([]activityDay, 0, len(days))
+	for _, day := range days {
+		out = append(out, activityDay{Day: day.Day, HasRecord: day.HasRecord, Bad: day.Bad, Uncertain: day.Uncertain})
+	}
+	return out
+}
+
+func unpackActivityDays(days []activityDay) []ActivityDay {
+	out := make([]ActivityDay, 0, len(days))
+	for _, day := range days {
+		out = append(out, ActivityDay{Day: day.Day, HasRecord: day.HasRecord, Bad: day.Bad, Uncertain: day.Uncertain})
+	}
+	return out
+}
+
+// HashIndexedTail returns the SHA-256 of the final 4 KiB of an indexed byte range.
+func HashIndexedTail(f *os.File, size int64) ([32]byte, error) {
+	start := max(int64(0), size-(4<<10))
+	data := make([]byte, size-start)
+	if len(data) > 0 {
+		if _, err := f.ReadAt(data, start); err != nil {
+			return [32]byte{}, fmt.Errorf("read indexed tail: %w", err)
+		}
+	}
+	return sha256.Sum256(data), nil
+}
+
 func validCoverage(ranges []coverageRange) bool {
 	for i, current := range ranges {
 		if current.Until < current.From {
@@ -398,18 +626,30 @@ func (c *Cache) CachedEvents(path string) (CachedTranscript, bool, error) {
 	for i := range rec.Events {
 		rawDays[i] = rec.Events[i].RawDay
 	}
+	events := rec.Events
+	if len(events) == 0 && rec.ActivityComplete && rec.ActivityCode == c.activityCode {
+		events = rec.ActivityEvents
+	}
 	return CachedTranscript{
-		Events:           unpackRaw(rec),
-		BadLines:         unpackBadLines(rec.BadLines),
-		BadCoverageDays:  slices.Clone(rec.BadCoverageDays),
-		RawDays:          rawDays,
-		Meta:             meta(rec),
-		RecordBuckets:    rec.RecordBuckets,
-		RecordTimes:      slices.Clone(rec.RecordTimes),
-		ActivityComplete: rec.ActivityComplete && rec.ActivityCode == c.activityCode,
-		Coverage:         coverage,
-		BadDays:          slices.Clone(rec.BadDays),
-		BadGlobal:        rec.BadGlobal,
+		Events:                unpackEvents(events),
+		ActivityEvents:        unpackEvents(rec.ActivityEvents),
+		ActivityDays:          unpackActivityDays(rec.ActivityDays),
+		ActivitySize:          rec.ActivitySize,
+		ActivityTailHash:      rec.ActivityTailHash,
+		ActivityLastTimestamp: rec.ActivityLastTimestamp,
+		ActivityPartial:       rec.ActivityPartial,
+		ActivityUncertain:     rec.ActivityUncertain,
+		ActivityUnordered:     rec.ActivityUnordered,
+		BadLines:              unpackBadLines(rec.BadLines),
+		BadCoverageDays:       slices.Clone(rec.BadCoverageDays),
+		RawDays:               rawDays,
+		Meta:                  meta(rec),
+		RecordBuckets:         rec.RecordBuckets,
+		RecordTimes:           slices.Clone(rec.RecordTimes),
+		ActivityComplete:      rec.ActivityComplete && rec.ActivityCode == c.activityCode,
+		Coverage:              coverage,
+		BadDays:               slices.Clone(rec.BadDays),
+		BadGlobal:             rec.BadGlobal,
 	}, true, nil
 }
 
@@ -701,6 +941,14 @@ func (c *Cache) Events(path string, rejectBad bool) ([]transcript.Event, transcr
 			rec.BadCoverageDays = old.BadCoverageDays
 			rec.BadDays = old.BadDays
 			rec.BadGlobal = old.BadGlobal
+			rec.ActivityEvents = old.ActivityEvents
+			rec.ActivityDays = old.ActivityDays
+			rec.ActivitySize = old.ActivitySize
+			rec.ActivityTailHash = old.ActivityTailHash
+			rec.ActivityLastTimestamp = old.ActivityLastTimestamp
+			rec.ActivityPartial = old.ActivityPartial
+			rec.ActivityUncertain = old.ActivityUncertain
+			rec.ActivityUnordered = old.ActivityUnordered
 		}
 		c.saveEventRecord(before, rec)
 	}
@@ -717,9 +965,13 @@ func (c *Cache) saveEventRecord(before key, rec record) {
 }
 
 func unpackRaw(rec record) []transcript.Event {
-	events := make([]transcript.Event, 0, len(rec.Events))
-	for i := range rec.Events {
-		ev := &rec.Events[i]
+	return unpackEvents(rec.Events)
+}
+
+func unpackEvents(packed []event) []transcript.Event {
+	events := make([]transcript.Event, 0, len(packed))
+	for i := range packed {
+		ev := &packed[i]
 		var at time.Time
 		if !ev.Zero {
 			at = time.Unix(0, ev.Nano).UTC()

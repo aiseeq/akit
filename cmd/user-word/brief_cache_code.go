@@ -1,3 +1,3 @@
 package main
 
-const briefCacheCode = "a30b0ff2db1ba9b44efb43f0def5c0a4c513c9bc2a43f6ce7232badcd9c78646"
+const briefCacheCode = "bc6411d41a64070f200d523bffbe86947e4b16d1ed7998281fc209809afe3159"

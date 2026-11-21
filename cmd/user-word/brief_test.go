@@ -855,11 +855,11 @@ func TestBriefFastHintsByDay(t *testing.T) {
 	}
 	user := []byte(`{"type":"user","timestamp":"2026-10-31T10:00:00Z","message":{"content":"old"}}`)
 	hints, ok := c.fastHintsForRecord(user)
-	if !ok || !hints.user || hints.agent || string(hints.rawDay) != "2026-10-31" || string(hints.timestamp) != "2026-10-31T10:00:00Z" {
+	if !ok || hints.user || hints.agent || string(hints.rawDay) != "2026-10-31" || string(hints.timestamp) != "2026-10-31T10:00:00Z" {
 		t.Fatalf("irrelevant user hints = (%+v, %v)", hints, ok)
 	}
 	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
-	gotDay, gotPast, gotErr := briefRecordPast(user, hints, until)
+	gotDay, gotPast, gotErr := briefRecordPast(user, hints, []byte(until.UTC().Format(time.DateOnly)), until)
 	if string(gotDay) != "2026-10-31" || gotPast || gotErr != nil {
 		t.Fatalf("cached record status = (%s, %v, %v), want (2026-10-31, false, nil)", gotDay, gotPast, gotErr)
 	}
@@ -977,7 +977,7 @@ func TestBriefRecordAtUntilIsNotPast(t *testing.T) {
 	raw := []byte(`{"timestamp":"2026-10-31T11:00:00Z"}`)
 	hints := briefRecordHints{rawDay: stamp[:len(time.DateOnly)], timestamp: stamp}
 	until := time.Date(2026, 10, 31, 11, 0, 0, 0, time.UTC)
-	_, past, err := briefRecordPast(raw, hints, until)
+	_, past, err := briefRecordPast(raw, hints, []byte(until.UTC().Format(time.DateOnly)), until)
 	if err != nil || past {
 		t.Fatalf("timestamp equal to until: past=%v err=%v", past, err)
 	}
@@ -995,7 +995,7 @@ func TestBriefRecordPastUsesTimeWithinTextDay(t *testing.T) {
 	} {
 		raw := []byte(`{"timestamp":"` + tc.stamp + `"}`)
 		hints := briefRecordHints{rawDay: []byte(tc.stamp[:len(time.DateOnly)]), timestamp: []byte(tc.stamp)}
-		_, past, err := briefRecordPast(raw, hints, until)
+		_, past, err := briefRecordPast(raw, hints, []byte(until.UTC().Format(time.DateOnly)), until)
 		if err != nil || past != tc.past {
 			t.Errorf("timestamp %q past=%v err=%v, want past=%v", tc.stamp, past, err, tc.past)
 		}
@@ -1013,7 +1013,7 @@ func TestBriefRecordPastComparesTextDayBeforeOffsetTime(t *testing.T) {
 	} {
 		raw := []byte(`{"timestamp":"` + tc.stamp + `"}`)
 		hints := briefRecordHints{rawDay: []byte(tc.stamp[:len(time.DateOnly)]), timestamp: []byte(tc.stamp)}
-		_, past, err := briefRecordPast(raw, hints, until)
+		_, past, err := briefRecordPast(raw, hints, []byte(until.UTC().Format(time.DateOnly)), until)
 		if err != nil || past != tc.past {
 			t.Errorf("timestamp %q past=%v err=%v, want past=%v", tc.stamp, past, err, tc.past)
 		}
