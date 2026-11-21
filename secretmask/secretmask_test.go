@@ -1029,6 +1029,7 @@ func TestMaskAuthorizationProseIsNotAValue(t *testing.T) {
 		"Authorization: authentication is required",
 		"Без Authorization: authentication не нужна",
 		"`Authorization: authentication` is optional",
+		"**Authorization:** authentication required",
 	} {
 		if got, found := Mask(in); got != in || len(found) != 0 {
 			t.Errorf("%q → %q %v; want unchanged", in, got, found)

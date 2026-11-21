@@ -1026,11 +1026,12 @@ func headerMatches(text string) []contextMatch {
 
 // headerProseWord reports whether an unquoted Authorization value with no scheme is a
 // word of prose ("Authorization: none", "без Authorization: админка ходит по cookie"):
-// letters only once the brackets and punctuation of the sentence around it are trimmed,
+// letters only once the brackets, Markdown marks and punctuation of the sentence around
+// it are trimmed (an empty rest is markup, not a value),
 // no turn from lower to upper case, and shorter than the 16 letters isPlainWord reads
 // as a token. A value with a digit or any other character stays a credential.
 func headerProseWord(value string) bool {
-	word := strings.Trim(value, "«»“”()[],.;:`")
+	word := strings.Trim(value, "«»“”()[],.;:`*_")
 	if utf8.RuneCountInString(word) >= 16 {
 		return false
 	}
