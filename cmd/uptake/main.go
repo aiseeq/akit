@@ -176,35 +176,6 @@ func (u *run) clean(s string) string {
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	return finishCell(strings.TrimSpace(s))
 }
-func (u *run) modelMap(path string) map[int]string {
-	f, e := os.Open(path)
-	if e != nil {
-		return nil
-	}
-	defer f.Close()
-	m := map[int]string{}
-	model := ""
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 256<<20)
-	n := 0
-	for sc.Scan() {
-		n++
-		var v struct {
-			Type    string `json:"type"`
-			Payload struct {
-				Type  string `json:"type"`
-				Model string `json:"model"`
-			} `json:"payload"`
-		}
-		if json.Unmarshal(sc.Bytes(), &v) == nil && v.Type == "turn_context" && v.Payload.Model != "" {
-			model = v.Payload.Model
-		}
-		if model != "" {
-			m[n] = model
-		}
-	}
-	return m
-}
 func (u *run) modelAt(m map[int]string, n int) string {
 	for n > 0 {
 		if s := m[n]; s != "" {
@@ -752,14 +723,28 @@ func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transc
 	isClaude, _ := u.extract(path)
 	models := map[int]string(nil)
 	if !isClaude {
-		models = u.modelMap(path)
+		models = map[int]string{}
 	}
 	var evs []transcript.Event
-	meta, err := transcript.Read(path, nil, func(e transcript.Event) {
+	var commandResults []commandResult
+	readEvent := func(e transcript.Event) {
+		if models != nil && e.Model != "" {
+			models[e.Line] = e.Model
+		}
 		if u.valid(e.Time) {
 			evs = append(evs, e)
 		}
-	})
+	}
+	var meta transcript.Meta
+	var err error
+	if isClaude {
+		meta, err = transcript.Read(path, nil, readEvent)
+	} else {
+		meta, err = transcript.ReadWithCodexCommands(path, readEvent, func(item transcript.CodexCommandResult) {
+			commandResults = append(commandResults, commandResult{line: item.Line, at: item.Completed,
+				cmd: item.Command, code: item.ExitCode, out: item.Output})
+		})
+	}
 	u.badLines += meta.Bad
 	if meta.Bad > 0 && u.firstBad == "" {
 		u.firstBad = path
@@ -776,16 +761,7 @@ func (u *run) readProcessTranscript(path string) (bool, map[int]string, []transc
 		return false, nil, nil, nil, false
 	}
 	if !isClaude {
-		res, err := codexCommandResults(path)
-		if err != nil {
-			slog.Error("read codex command results", "path", path, "error", err)
-			u.unreadFiles++
-			if u.firstUnread == "" {
-				u.firstUnread = path
-			}
-			return false, nil, nil, nil, false
-		}
-		evs = attachCommandResults(evs, res)
+		evs = attachCommandResults(evs, commandResults)
 	}
 	outs := map[string]transcript.Event{}
 	for i := range evs {

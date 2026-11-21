@@ -19,10 +19,11 @@ func codexScript(failed string) string {
 	done := func(cmd, status string, code int, out string) string {
 		return `{"timestamp":"2026-10-31T13:00:01Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/bash","-lc","` + cmd + `"],"status":"` + status + `","exit_code":` + strconv.Itoa(code) + `,"aggregated_output":"` + out + `"}}}`
 	}
-	lines := []string{call,
+	lines := []string{`{"timestamp":"2026-10-31T12:59:59Z","type":"turn_context","payload":{"model":"gpt-old"}}`, call,
 		done("tl aa:1", "completed", 0, "--- event aa:1\\n"),
 		done("tl bb:2", "failed", 1, failed),
 		done("tl aa:1", "completed", 0, "--- event aa:1 again\\n"),
+		`{"timestamp":"2026-10-31T13:00:01Z","type":"turn_context","payload":{"model":"gpt-new"}}`,
 		`{"timestamp":"2026-10-31T13:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"s1","output":[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"input_text","text":"--- event aa:1\n` + failed + `--- event aa:1 again\n"}]}}`,
 	}
 	return strings.Join(lines, "\n")
@@ -34,7 +35,7 @@ func TestCodexScriptCallsGetTheirOwnResult(t *testing.T) {
 	writeTranscript(t, path, codexScript(`tl: bb:2: no such session\n`))
 	since := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
 	u := newRun(since, since.Add(24*time.Hour), 1, filepath.Join(root, "out"), root)
-	_, _, evs, outs, ok := u.readProcessTranscript(path)
+	_, models, evs, outs, ok := u.readProcessTranscript(path)
 	if !ok {
 		t.Fatal("transcript not read")
 	}
@@ -42,6 +43,9 @@ func TestCodexScriptCallsGetTheirOwnResult(t *testing.T) {
 	for _, e := range evs {
 		if e.Role != transcript.Cmd {
 			continue
+		}
+		if e.Model != "gpt-old" || u.modelAt(models, e.Line) != "gpt-old" {
+			t.Errorf("command model = %q (map %q), want gpt-old", e.Model, u.modelAt(models, e.Line))
 		}
 		o := outs[e.CallID]
 		codes = append(codes, e.Text+"="+strconv.Itoa(u.eventExitCode(o)))
@@ -52,6 +56,11 @@ func TestCodexScriptCallsGetTheirOwnResult(t *testing.T) {
 	}
 	if got := strings.Join(texts, " | "); got != "--- event aa:1 | tl: bb:2: no such session | --- event aa:1 again" {
 		t.Errorf("outputs = %s", got)
+	}
+	for _, e := range evs {
+		if e.Role == transcript.Out && e.CallID == "s1" && e.Model != "gpt-new" {
+			t.Errorf("script output model = %q, want gpt-new", e.Model)
+		}
 	}
 	u.process(path)
 	if n := len(u.refusalSamples["tl"]); n != 1 {
