@@ -1026,6 +1026,9 @@ func TestMaskAuthorizationProseIsNotAValue(t *testing.T) {
 		"the Authorization: cookie flow",
 		"Authorization: required, see below",
 		"Authorization: «токен»",
+		"Authorization: authentication is required",
+		"Без Authorization: authentication не нужна",
+		"`Authorization: authentication` is optional",
 	} {
 		if got, found := Mask(in); got != in || len(found) != 0 {
 			t.Errorf("%q → %q %v; want unchanged", in, got, found)
@@ -1040,6 +1043,27 @@ func TestMaskAuthorizationProseIsNotAValue(t *testing.T) {
 	} {
 		if got, found := Mask(in); got != want || found["authorization"] != 1 {
 			t.Errorf("%q → %q %v; want %q", in, got, found, want)
+		}
+	}
+	// Values that are not a word of prose stay credentials, whatever their characters.
+	for in, secret := range map[string]string{
+		"curl -H 'Authorization: Bearer secret!abc123456789xyz' https://example.test": "secret!abc123456789xyz",
+		`{"Authorization":"Bearer secret!abc123456789xyz"}`:                           "secret!abc123456789xyz",
+		`Authorization='Bearer secret!abc123456789xyz'`:                               "secret!abc123456789xyz",
+		`Authorization: Token "abc$123*xyz!"`:                                         "abc$123*xyz!",
+		`authorization: 'abc$123*xyz!'`:                                               "abc$123*xyz!",
+		`{"Authorization":"abc$123*xyz!"}`:                                            "abc$123*xyz!",
+		`{"Authorization":"changeme"}`:                                                "changeme",
+		`Authorization: "p@ssword123!"`:                                               "p@ssword123!",
+		"Authorization: Bearer abc%2Fdef123456789abc":                                 "abc%2Fdef123456789abc",
+		"Authorization: abc123":                                                       "abc123",
+		"Authorization: Bearer abcdef123456789xyz, next":                              "abcdef123456789xyz",
+		"Authorization: Bearer abcdefgh":                                              "abcdefgh",
+		"Authorization: abcdefghijklmnopqr":                                           "abcdefghijklmnopqr",
+		"Authorization: abcDEFgh":                                                     "abcDEFgh",
+	} {
+		if got, found := Mask(in); strings.Contains(got, secret) || found["authorization"] != 1 {
+			t.Errorf("%q → %q %v; want %q masked", in, got, found, secret)
 		}
 	}
 }
