@@ -290,7 +290,7 @@ func readWindowLine(r *bufio.Reader, rd *reader, codexSource bool, roles map[Rol
 	if rd.keepWithTools != nil {
 		raw, err = readLineView(r)
 	} else if codexSource && roles != nil {
-		raw, skipped, err = readCodexRoleLine(r, roles, rd.codex.eventUser && rd.codex.eventAgent)
+		raw, skipped, err = readCodexRoleLine(r, roles, rd.codex.named)
 	} else {
 		raw, err = readLine(r)
 	}
@@ -341,6 +341,174 @@ func codexMessageLineMarkers(line []byte) (user, agent bool) {
 	return bytes.Contains(head, userMessageLine), bytes.Contains(head, agentMessageLine)
 }
 
+// readCodexRoleLine skips JSON lines that contain none of the raw
+// substrings capable of producing an event or changing Codex state. The normal
+// parser remains authoritative whenever a candidate substring exists.
+func readCodexRoleLine(r *bufio.Reader, roles map[Role]bool, named bool) ([]byte, bool, error) {
+	line, err := readLineView(r)
+	if len(line) == 0 || codexLineHasCandidateSubstring(line, roles, named) || codexLineLooksMalformed(line) {
+		return line, false, err
+	}
+	return line, true, err
+}
+
+func codexLineLooksMalformed(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return true
+	}
+	last := len(trimmed) - 2
+	for last >= 0 && (trimmed[last] == ' ' || trimmed[last] == '\t' || trimmed[last] == '\r' || trimmed[last] == '\n') {
+		last--
+	}
+	return last >= 0 && trimmed[last] == ','
+}
+
+type codexCandidateMarker uint16
+
+const (
+	candidateState codexCandidateMarker = 1 << iota
+	candidateUserMessage
+	candidateAgentMessage
+	candidateMessage
+	candidateUser
+	candidateAssistant
+	candidateTool
+	candidateNote
+	candidateClaudeBody
+	candidateBadID
+	candidateResponseItem
+)
+
+func codexLineHasCandidateSubstring(line []byte, roles map[Role]bool, named bool) bool {
+	markers := codexLineCandidateMarkers(line)
+	return codexStateCandidate(markers) || codexRoleCandidate(markers, roles, named)
+}
+
+func codexStateCandidate(markers codexCandidateMarker) bool {
+	return markers&(candidateState|candidateBadID|candidateUserMessage|candidateAgentMessage) != 0
+}
+
+func codexRoleCandidate(markers codexCandidateMarker, roles map[Role]bool, named bool) bool {
+	return codexNoteCandidate(markers, roles, named) || codexToolCandidate(markers, roles, named) ||
+		codexMessageCandidate(markers, roles, named) || codexClaudeCandidate(markers, roles)
+}
+
+func codexNoteCandidate(markers codexCandidateMarker, roles map[Role]bool, named bool) bool {
+	return (roles[Note] || named) && markers&candidateNote != 0
+}
+
+func codexToolCandidate(markers codexCandidateMarker, roles map[Role]bool, named bool) bool {
+	return (roles[Cmd] || roles[Out] || named) && markers&candidateTool != 0
+}
+
+func codexMessageCandidate(markers codexCandidateMarker, roles map[Role]bool, named bool) bool {
+	if markers&candidateMessage == 0 || markers&(candidateUser|candidateAssistant) == 0 {
+		return false
+	}
+	return roles[Note] || markers&candidateResponseItem != 0 && (roles[User] || roles[Agent] || named)
+}
+
+func codexClaudeCandidate(markers codexCandidateMarker, roles map[Role]bool) bool {
+	return (roles[Note] || roles[Peer] || roles[Attach]) && markers&candidateClaudeBody != 0
+}
+
+func codexLineCandidateMarkers(line []byte) codexCandidateMarker {
+	var markers codexCandidateMarker
+	if bytes.Contains(line, []byte(`\u`)) {
+		markers |= candidateState
+	}
+	for i := 0; i < len(line); {
+		n := bytes.IndexByte(line[i:], '"')
+		if n < 0 {
+			break
+		}
+		i += n
+		if i+1 < len(line) {
+			switch line[i+1] {
+			case 'a', 'c', 'f', 'i', 'm', 'r', 's', 't', 'u':
+				markers |= codexQuotedMarker(line[i:])
+			}
+		}
+		i++
+	}
+	return markers
+}
+
+func codexQuotedMarker(candidate []byte) codexCandidateMarker {
+	if len(candidate) < 2 {
+		return 0
+	}
+	switch candidate[1] {
+	case 'a':
+		if bytes.HasPrefix(candidate, []byte(`"agent-name"`)) || bytes.HasPrefix(candidate, []byte(`"agentName"`)) {
+			return candidateState
+		}
+	case 'i':
+		if bytes.HasPrefix(candidate, []byte(`"id":42`)) || bytes.HasPrefix(candidate, []byte(`"id": 42`)) {
+			return candidateBadID
+		}
+	case 's':
+		if bytes.HasPrefix(candidate, []byte(`"session_meta"`)) {
+			return candidateState
+		}
+	case 't':
+		if bytes.HasPrefix(candidate, []byte(`"turn_context"`)) {
+			return candidateState
+		}
+	}
+	return codexEventQuotedMarker(candidate)
+}
+
+func codexEventQuotedMarker(candidate []byte) codexCandidateMarker {
+	switch candidate[1] {
+	case 'r':
+		if bytes.HasPrefix(candidate, []byte(`"response_item"`)) {
+			return candidateResponseItem
+		}
+	case 'a':
+		if bytes.HasPrefix(candidate, []byte(`"agent_message"`)) {
+			return candidateAgentMessage
+		}
+		if bytes.HasPrefix(candidate, []byte(`"assistant"`)) {
+			return candidateAssistant
+		}
+		if bytes.HasPrefix(candidate, []byte(`"attachment"`)) {
+			return candidateClaudeBody
+		}
+	case 'c':
+		if bytes.HasPrefix(candidate, []byte(`"compacted"`)) {
+			return candidateNote
+		}
+		if bytes.HasPrefix(candidate, []byte(`"custom_tool_call"`)) {
+			return candidateTool
+		}
+		if bytes.HasPrefix(candidate, []byte(`"content"`)) {
+			return candidateClaudeBody
+		}
+	case 'f':
+		if bytes.HasPrefix(candidate, []byte(`"function_call"`)) {
+			return candidateTool
+		}
+	case 'm':
+		if bytes.HasPrefix(candidate, []byte(`"message"`)) {
+			return candidateMessage
+		}
+	case 't':
+		if bytes.HasPrefix(candidate, []byte(`"token_count"`)) {
+			return candidateNote
+		}
+	case 'u':
+		if bytes.HasPrefix(candidate, []byte(`"user_message"`)) {
+			return candidateUserMessage
+		}
+		if bytes.HasPrefix(candidate, []byte(`"user"`)) {
+			return candidateUser
+		}
+	}
+	return 0
+}
+
 func eventFilter(fn func(Event), roles map[Role]bool, since, until time.Time) func(Event) {
 	if roles == nil && since.IsZero() && until.IsZero() {
 		return fn
@@ -353,140 +521,6 @@ func eventFilter(fn func(Event), roles map[Role]bool, since, until time.Time) fu
 			return
 		}
 		fn(event)
-	}
-}
-
-func readCodexRoleLine(r *bufio.Reader, roles map[Role]bool, dropTUIDuplicates bool) ([]byte, bool, error) {
-	line, err := readLineView(r)
-	if len(line) == 0 {
-		return line, false, err
-	}
-	return line, codexLineHasNoRequestedEvents(line, roles, dropTUIDuplicates), err
-}
-
-func codexLineHasNoRequestedEvents(line []byte, roles map[Role]bool, dropTUIDuplicates bool) bool {
-	if codexLineNeedsStateParse(line) {
-		return false
-	}
-	return codexLineHasNoRequestedFacts(codexLineFactsForCandidates(line), roles, dropTUIDuplicates)
-}
-
-func codexLineNeedsStateParse(line []byte) bool {
-	return bytes.Contains(line, []byte(`\u`)) || bytes.Contains(line, []byte(`"session_meta"`)) ||
-		bytes.Contains(line, []byte(`"turn_context"`)) || bytes.HasPrefix(line, []byte(`{"type":"agent-name","agentName":"`))
-}
-
-func codexLineFactsForCandidates(line []byte) codexLineFacts {
-	var facts codexLineFacts
-	for i := 0; i < len(line); {
-		quote := bytes.IndexByte(line[i:], '"')
-		if quote < 0 {
-			break
-		}
-		i += quote
-		if i+1 < len(line) {
-			facts.addCandidate(line[i:])
-		}
-		i++
-	}
-	return facts
-}
-
-func codexLineHasNoRequestedFacts(facts codexLineFacts, roles map[Role]bool, dropTUIDuplicates bool) bool {
-	if dropTUIDuplicates && !roles[Cmd] && !roles[Out] && facts.responseItem && !facts.userMessage && !facts.agentMessage {
-		return true
-	}
-	return !codexFactsHaveRequestedEvent(facts, roles)
-}
-
-func codexFactsHaveRequestedEvent(facts codexLineFacts, roles map[Role]bool) bool {
-	return codexMessageFactsMatch(facts, roles) || codexNoteFactsMatch(facts, roles) || codexToolFactsMatch(facts, roles)
-}
-
-func codexMessageFactsMatch(facts codexLineFacts, roles map[Role]bool) bool {
-	if roles[User] && (facts.userMessage || facts.responseItem && facts.message && facts.user) {
-		return true
-	}
-	return roles[Agent] && (facts.agentMessage || facts.responseItem && facts.message && facts.assistant)
-}
-
-func codexNoteFactsMatch(facts codexLineFacts, roles map[Role]bool) bool {
-	return roles[Note] && (facts.tokenCount || facts.compacted)
-}
-
-func codexToolFactsMatch(facts codexLineFacts, roles map[Role]bool) bool {
-	if !roles[Cmd] && !roles[Out] {
-		return false
-	}
-	return facts.functionCall || facts.customToolCall || facts.functionCallOutput || facts.customToolCallOutput
-}
-
-type codexLineFacts struct {
-	responseItem, message, user, assistant                                 bool
-	userMessage, agentMessage, tokenCount, compacted                       bool
-	functionCall, customToolCall, functionCallOutput, customToolCallOutput bool
-}
-
-func (f *codexLineFacts) addCandidate(s []byte) {
-	switch s[1] {
-	case 't':
-		f.addTokenCandidate(s)
-	case 'r':
-		if bytes.HasPrefix(s, []byte(`"response_item"`)) {
-			f.responseItem = true
-		}
-	case 'm':
-		if bytes.HasPrefix(s, []byte(`"message"`)) {
-			f.message = true
-		}
-	case 'u':
-		f.addUserCandidate(s)
-	case 'a':
-		f.addAssistantCandidate(s)
-	case 'c':
-		f.addCustomToolCandidate(s)
-	case 'f':
-		f.addFunctionCallCandidate(s)
-	}
-}
-
-func (f *codexLineFacts) addTokenCandidate(s []byte) {
-	if bytes.HasPrefix(s, []byte(`"token_count"`)) {
-		f.tokenCount = true
-	}
-}
-
-func (f *codexLineFacts) addUserCandidate(s []byte) {
-	if bytes.HasPrefix(s, []byte(`"user_message"`)) {
-		f.userMessage = true
-	} else if bytes.HasPrefix(s, []byte(`"user"`)) {
-		f.user = true
-	}
-}
-
-func (f *codexLineFacts) addAssistantCandidate(s []byte) {
-	if bytes.HasPrefix(s, []byte(`"assistant"`)) {
-		f.assistant = true
-	} else if bytes.HasPrefix(s, []byte(`"agent_message"`)) {
-		f.agentMessage = true
-	}
-}
-
-func (f *codexLineFacts) addCustomToolCandidate(s []byte) {
-	if bytes.HasPrefix(s, []byte(`"compacted"`)) {
-		f.compacted = true
-	} else if bytes.HasPrefix(s, []byte(`"custom_tool_call"`)) {
-		f.customToolCall = true
-	} else if bytes.HasPrefix(s, []byte(`"custom_tool_call_output"`)) {
-		f.customToolCallOutput = true
-	}
-}
-
-func (f *codexLineFacts) addFunctionCallCandidate(s []byte) {
-	if bytes.HasPrefix(s, []byte(`"function_call_output"`)) {
-		f.functionCallOutput = true
-	} else if bytes.HasPrefix(s, []byte(`"function_call"`)) {
-		f.functionCall = true
 	}
 }
 

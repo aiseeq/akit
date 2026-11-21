@@ -56,102 +56,84 @@ func TestReadWorkerCodexWindowWithRolesDeduplicatesTUIInOnePass(t *testing.T) {
 	}
 }
 
-func TestCodexRoleFastSkipKeepsPotentialRecords(t *testing.T) {
-	all := map[Role]bool{User: true, Agent: true, Note: true, Cmd: true, Out: true}
-	cases := []struct {
-		name  string
-		line  string
-		roles map[Role]bool
-	}{
-		{"escaped type", `{"type":"session_\u006deta","payload":{"id":"s"}}`, map[Role]bool{User: true}},
-		{"session meta", `{"type":"session_meta"}`, all},
-		{"turn context", `{"type":"turn_context"}`, all},
-		{"agent name", `{"type":"agent-name","agentName":"helper"}`, all},
-		{"user event marker", `{"type":"event_msg","payload":{"type":"user_message"}}`, map[Role]bool{User: true}},
-		{"agent event marker", `{"type":"event_msg","payload":{"type":"agent_message"}}`, map[Role]bool{Agent: true}},
-		{"user response item", `{"type":"response_item","payload":{"type":"message","role":"user"}}`, map[Role]bool{User: true}},
-		{"assistant response item", `{"type":"response_item","payload":{"type":"message","role":"assistant"}}`, map[Role]bool{Agent: true}},
-		{"token note", `{"type":"event_msg","payload":{"type":"token_count"}}`, map[Role]bool{Note: true}},
-		{"compacted note", `{"type":"event_msg","payload":{"type":"compacted"}}`, map[Role]bool{Note: true}},
-		{"function call", `{"type":"response_item","payload":{"type":"function_call"}}`, map[Role]bool{Cmd: true}},
-		{"custom tool call", `{"type":"response_item","payload":{"type":"custom_tool_call"}}`, map[Role]bool{Cmd: true}},
-		{"function output", `{"type":"response_item","payload":{"type":"function_call_output"}}`, map[Role]bool{Out: true}},
-		{"custom tool output", `{"type":"response_item","payload":{"type":"custom_tool_call_output"}}`, map[Role]bool{Out: true}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if codexLineHasNoRequestedEvents([]byte(tc.line), tc.roles, false) {
-				t.Fatalf("candidate line fast-skipped: %s", tc.line)
-			}
-		})
-	}
-}
-
-func TestCodexRoleFastSkipDropsUnrequestedLines(t *testing.T) {
-	cases := []struct {
-		name  string
-		line  string
-		roles map[Role]bool
-	}{
-		{"irrelevant record", `{"type":"other","payload":{"text":"ordinary"}}`, map[Role]bool{User: true}},
-		{"unrequested note", `{"type":"event_msg","payload":{"type":"token_count"}}`, map[Role]bool{User: true}},
-		{"unrequested tool", `{"type":"response_item","payload":{"type":"function_call"}}`, map[Role]bool{User: true}},
-		{"not a response message", `{"type":"response_item","payload":{"type":"function_call","role":"assistant"}}`, map[Role]bool{Agent: true}},
-		{"message without response item", `{"type":"other","payload":{"type":"message","role":"assistant"}}`, map[Role]bool{Agent: true}},
-		{"unrequested response role", `{"type":"response_item","payload":{"type":"message","role":"developer"}}`, map[Role]bool{User: true, Agent: true}},
-		{"role outside message", `{"type":"response_item","payload":{"type":"function_call","role":"assistant"}}`, map[Role]bool{Agent: true}},
-		{"role only", `{"type":"response_item","payload":{"role":"assistant"}}`, map[Role]bool{Agent: true}},
-		{"message outside requested roles", `{"type":"other","payload":{"type":"message"}}`, map[Role]bool{Note: true}},
-		{"response message outside requested roles", `{"type":"response_item","payload":{"type":"message"}}`, map[Role]bool{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if !codexLineHasNoRequestedEvents([]byte(tc.line), tc.roles, false) {
-				t.Fatalf("unrequested line was not fast-skipped: %s", tc.line)
-			}
-		})
-	}
-}
-
-func TestReadCodexRoleLineReportsDiscardableRecord(t *testing.T) {
-	r := bufio.NewReader(strings.NewReader(`{"type":"other","payload":{"text":"skip"}}` + "\n"))
-	line, skipped, err := readCodexRoleLine(r, map[Role]bool{User: true}, false)
-	if err != nil || len(line) == 0 || !skipped {
-		t.Fatalf("readCodexRoleLine = (%q, %t, %v), want a nonempty skipped record", line, skipped, err)
-	}
-}
-
-func TestCodexRoleFastSkipDropsResponseItemsAlreadyRepresentedByTUI(t *testing.T) {
-	roles := map[Role]bool{User: true, Agent: true}
-	duplicate := []byte(`{"type":"response_item","payload":{"type":"message","role":"user"}}`)
-	if !codexLineHasNoRequestedEvents(duplicate, roles, true) {
-		t.Fatal("response item was not discarded after parser found both TUI markers")
-	}
-	if codexLineHasNoRequestedEvents(duplicate, roles, false) {
-		t.Fatal("response item was discarded without both TUI markers")
-	}
-	tui := []byte(`{"type":"event_msg","payload":{"type":"user_message"}}`)
-	if codexLineHasNoRequestedEvents(tui, roles, true) {
-		t.Fatal("TUI user message was discarded with duplicate response items")
-	}
-}
-
-func TestReadCodexRoleLineSkipKeepsPhysicalLineNumbers(t *testing.T) {
+func TestReadCodexRolesPreservesParseStateAndDiagnostics(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rollout-synthetic.jsonl")
 	rows := []string{
-		`{"type":"session_meta","payload":{"id":"s"}}`,
-		`{"type":"other","payload":{"text":"skip"}}`,
+		`{"type":"session_meta","payload":{"id":"one","cwd":"/work/akit"}}`,
+		`{"timestamp":"2026-11-18T09:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}`,
+		`{"type":"session_meta","payload":{"id":"two","cwd":"/work/other"}}`,
 		`{"timestamp":"2026-11-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"wanted"}]}}`,
+		`{"type":"noise",`,
+		`{"type":"noise",}`,
+		`{"type":"noise","payload":{"id":42}}`,
+		`{"type":"user","timestamp":"2026-11-18T10:00:00Z","message":{"role":"user","content":"mixed Claude record"}}`,
 	}
 	if err := os.WriteFile(path, []byte(joinLines(rows)), 0600); err != nil {
 		t.Fatal(err)
 	}
 	var got []Event
-	if _, err := ReadWorkerCodexWithRoles(path, map[Role]bool{User: true}, func(ev Event) { got = append(got, ev) }); err != nil {
+	meta, err := ReadWorkerCodexWithRoles(path, map[Role]bool{User: true, Agent: true, Note: true}, func(ev Event) { got = append(got, ev) })
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Line != 3 || got[0].Text != "wanted" {
-		t.Fatalf("events = %+v, want user event on physical line 3", got)
+	if meta.Bad != 3 || meta.FirstBad == nil {
+		t.Fatalf("bad lines = %d, first bad = %v; want malformed and wrong typed records counted", meta.Bad, meta.FirstBad)
+	}
+	if len(got) != 3 {
+		t.Fatalf("events = %+v, want agent, user and mixed Claude record", got)
+	}
+	if got[0].Line != 2 || got[0].Role != Agent || got[0].SessionID != "one" || got[0].Cwd != "/work/akit" {
+		t.Fatalf("first session event = %+v, want current session and cwd on line 2", got[0])
+	}
+	if got[1].Line != 4 || got[1].SessionID != "two" || got[1].Cwd != "/work/other" || got[1].Text != "wanted" {
+		t.Fatalf("session transition event = %+v, want current session and cwd on line 4", got[1])
+	}
+	if got[2].Line != 8 || got[2].Role != Note || got[2].Text != "mixed Claude record" {
+		t.Fatalf("mixed Claude event = %+v, want parsed prompt note on line 8", got[2])
+	}
+}
+
+func TestReadCodexRolesKeepsCompactedRecordAfterTUIEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-tui-compact.jsonl")
+	rows := []string{
+		`{"type":"session_meta","payload":{"id":"s"}}`,
+		`{"timestamp":"2026-11-18T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"u"}}`,
+		`{"timestamp":"2026-11-18T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"a"}}`,
+		`{"timestamp":"2026-11-18T10:00:03Z","type":"compacted","payload":{"extra":"response_item"}}`,
+	}
+	if err := os.WriteFile(path, []byte(joinLines(rows)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var got []Event
+	roles := map[Role]bool{User: true, Agent: true, Note: true}
+	if _, err := ReadWorkerCodexWithRoles(path, roles, func(ev Event) { got = append(got, ev) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Line != 2 || got[1].Line != 3 || got[2].Line != 4 || got[2].Role != Note {
+		t.Fatalf("events = %+v, want TUI messages and compact note", got)
+	}
+}
+
+func TestCodexCandidateSkipRequiresValidJSONAndNoStateMarkers(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		skip bool
+	}{
+		{"irrelevant valid record", `{"type":"event_msg","payload":{"type":"item_started"}}`, true},
+		{"malformed record", `{"type":"noise",`, false},
+		{"malformed trailing comma", `{"type":"noise",}`, false},
+		{"wrong typed payload", `{"type":"noise","payload":{"id":42}}`, false},
+		{"session transition", `{"type":"session_meta","payload":{"id":"next"}}`, false},
+		{"TUI marker", `{"type":"event_msg","payload":{"type":"user_message"}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			line, skipped, err := readCodexRoleLine(bufio.NewReader(strings.NewReader(tc.line+"\n")), map[Role]bool{User: true, Agent: true}, false)
+			if err != nil || skipped != tc.skip || len(line) == 0 {
+				t.Fatalf("readCodexRoleLine = (%q, %t, %v), want skipped=%t", line, skipped, err, tc.skip)
+			}
+		})
 	}
 }
 

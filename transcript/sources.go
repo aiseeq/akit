@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -108,40 +107,31 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 // when the worker tree contains many short lived jobs.
 func workerCodexRollouts(home string) ([]string, error) {
 	root := filepath.Join(home, ".local", "state", "worker")
-	var paths []string
-	jobs, err := readWorkerDir(root)
-	if err != nil {
-		return nil, err
-	}
-	for _, job := range jobs {
-		jobPath := filepath.Join(root, job.Name())
-		isDir, err := workerDirEntry(job, jobPath)
-		if err != nil {
-			return nil, err
-		}
-		if !isDir {
-			continue
-		}
-		more, err := workerCodexRolloutsInSessions(filepath.Join(jobPath, "codex", "sessions"))
-		if err != nil {
-			return nil, err
-		}
-		paths = append(paths, more...)
-	}
-	return paths, nil
+	return workerCodexRolloutsFast(root), nil
 }
 
-func workerCodexRolloutsInSessions(sessions string) ([]string, error) {
+func workerCodexRolloutsFast(root string) []string {
+	var paths []string
+	for _, job := range readWorkerDir(root) {
+		if strings.HasPrefix(job.Name(), ".") {
+			continue
+		}
+		jobPath := filepath.Join(root, job.Name())
+		if !workerDirEntry(job, jobPath) {
+			continue
+		}
+		paths = append(paths, workerCodexRolloutsInSessions(filepath.Join(jobPath, "codex", "sessions"))...)
+	}
+	return paths
+}
+
+func workerCodexRolloutsInSessions(sessions string) []string {
 	return workerCodexRolloutsAtDepth(sessions, 3)
 }
 
-func workerCodexRolloutsAtDepth(dir string, depth int) ([]string, error) {
+func workerCodexRolloutsAtDepth(dir string, depth int) []string {
 	var paths []string
-	entries, err := readWorkerDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	for _, entry := range entries {
+	for _, entry := range readWorkerDir(dir) {
 		path := filepath.Join(dir, entry.Name())
 		if depth == 0 {
 			name := entry.Name()
@@ -150,62 +140,48 @@ func workerCodexRolloutsAtDepth(dir string, depth int) ([]string, error) {
 			}
 			continue
 		}
-		isDir, err := workerDirEntry(entry, path)
-		if err != nil {
-			return nil, err
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
 		}
-		if isDir {
-			more, err := workerCodexRolloutsAtDepth(path, depth-1)
-			if err != nil {
-				return nil, err
-			}
-			paths = append(paths, more...)
+		if workerDirEntry(entry, path) {
+			paths = append(paths, workerCodexRolloutsAtDepth(path, depth-1)...)
 		}
 	}
-	return paths, nil
+	return paths
 }
 
-func readWorkerDir(path string) ([]fs.DirEntry, error) {
+func readWorkerDir(path string) []fs.DirEntry {
 	f, err := os.Open(path)
 	if err != nil {
-		if ignoredWorkerGlobError(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read worker transcript directory %s: %w", path, err)
+		slog.Debug("skip unreadable worker directory", "path", path, "error", err)
+		return make([]fs.DirEntry, 0)
 	}
 	entries, readErr := f.ReadDir(-1)
 	closeErr := f.Close()
-	if ignoredWorkerGlobError(readErr) {
-		return nil, nil
-	}
 	if readErr != nil {
-		return nil, fmt.Errorf("read worker transcript directory %s: %w", path, readErr)
+		slog.Debug("skip unreadable worker directory", "path", path, "error", readErr)
+		return make([]fs.DirEntry, 0)
 	}
 	if closeErr != nil {
-		return nil, fmt.Errorf("close worker transcript directory %s: %w", path, closeErr)
+		slog.Debug("skip worker directory after close error", "path", path, "error", closeErr)
+		return make([]fs.DirEntry, 0)
 	}
-	return entries, nil
+	return entries
 }
 
-func ignoredWorkerGlobError(err error) bool {
-	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.ENOTDIR)
-}
-
-func workerDirEntry(entry fs.DirEntry, path string) (bool, error) {
+func workerDirEntry(entry fs.DirEntry, path string) bool {
 	if entry.IsDir() {
-		return true, nil
+		return true
 	}
 	if entry.Type()&fs.ModeSymlink == 0 {
-		return false, nil
+		return false
 	}
 	info, err := os.Stat(path)
-	if ignoredWorkerGlobError(err) {
-		return false, nil
-	}
 	if err != nil {
-		return false, fmt.Errorf("stat worker transcript directory %s: %w", path, err)
+		slog.Debug("skip unreadable worker entry", "path", path, "error", err)
+		return false
 	}
-	return info.IsDir(), nil
+	return info.IsDir()
 }
 
 func sourceStartsAfter(path string, until time.Time) bool {
@@ -250,9 +226,9 @@ func codexCWD(path string) (string, error) {
 	s.Buffer(make([]byte, 4096), 1<<20)
 	for lines := 0; lines < 64 && s.Scan(); lines++ {
 		line := s.Bytes()
-		// Most rollout records are not session metadata. Avoid decoding them; if
-		// the line has escapes, keep the JSON path because the type may be escaped.
-		if !bytes.Contains(line, []byte("session_meta")) && bytes.IndexByte(line, '\\') < 0 {
+		// Ordinary JSON escapes cannot turn another ASCII key into "session_meta".
+		// Unicode escapes can, so decode those lines even without the literal marker.
+		if !bytes.Contains(line, []byte(`"session_meta"`)) && !bytes.Contains(line, []byte(`\u`)) {
 			continue
 		}
 		var rec struct {

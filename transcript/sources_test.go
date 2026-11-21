@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -181,6 +182,50 @@ func TestAllSourcesSkipsFileAtWorkerSessionsPath(t *testing.T) {
 	}
 	if _, err := AllSourcesWindow(home, time.Time{}, time.Time{}, "", true, false); err != nil {
 		t.Fatalf("AllSourcesWindow with sessions file: %v", err)
+	}
+}
+
+func TestAllSourcesSkipsWorkerSymlinkLoopLikeGlob(t *testing.T) {
+	home := t.TempDir()
+	workerRoot := filepath.Join(home, ".local", "state", "worker")
+	if err := os.MkdirAll(workerRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loop := filepath.Join(workerRoot, "loop")
+	if err := os.Symlink("loop", loop); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink privileges unavailable on Windows: %v", err)
+		}
+		t.Fatalf("create synthetic symlink loop: %v", err)
+	}
+	sources, err := AllSourcesWindow(home, time.Time{}, time.Time{}, "", true, false)
+	if err != nil {
+		t.Fatalf("AllSourcesWindow on worker symlink loop: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("sources = %v, want no matches", sources)
+	}
+}
+
+func TestAllSourcesWorkerGlobDoesNotMatchHiddenComponents(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".local", "state", "worker")
+	visible := filepath.Join(root, "job", "codex", "sessions", "2026", "11", "16", "rollout-visible.jsonl")
+	hidden := filepath.Join(root, ".hidden", "codex", "sessions", "2026", "11", "16", "rollout-hidden.jsonl")
+	for _, path := range []string{visible, hidden} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sources, err := AllSourcesWindow(home, time.Time{}, time.Time{}, "", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || sources[0].Path != visible {
+		t.Fatalf("sources = %+v, want only %s", sources, visible)
 	}
 }
 
