@@ -968,6 +968,7 @@ func TestArgStaticDirectLiteralArguments(t *testing.T) {
 		{`echo 'a*'`, "echo", []bool{true}},
 		{`echo "a*"`, "echo", []bool{true}},
 		{`echo [a]`, "echo", []bool{false}},
+		{`echo [*`, "echo", []bool{false}},
 		{`echo {a,b}`, "echo", []bool{false}},
 		{`echo {a..c}`, "echo", []bool{false}},
 		{`echo \{a,b}`, "echo", []bool{true}},
@@ -1026,22 +1027,136 @@ func TestArgStaticDirectLiteralArguments(t *testing.T) {
 			t.Errorf("ArgStatic(%d) = false for literal word beyond the old mask limit", i)
 		}
 	}
+
+	env := make([]string, 36)
+	for i := range env {
+		env[i] = fmt.Sprintf("-E A%d=%d", i, i)
+	}
+	calls, err = Calls("systemd-run --user " + strings.Join(env, " ") + ` podman '${K}op' -a`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.Name == "podman" {
+			if !call.ArgStatic(0) || !call.ArgStatic(1) {
+				t.Fatalf("long systemd-run argv lost static words: %+v", call)
+			}
+			return
+		}
+	}
+	t.Fatalf("podman missing from long systemd-run argv: %+v", calls)
 }
 
-func TestStaticInsertionBefore(t *testing.T) {
-	for _, tc := range []struct {
-		args []string
-		end  int
-		want bool
-	}{
-		{[]string{"find", "/tmp", "-exec", "sh"}, 4, true},
-		{[]string{"find", "/tmp", "-maxdepth", "0", "sh"}, 5, false},
-		{[]string{"xargs", "-I{}", "sh"}, 3, true},
-		{[]string{"parallel", "sh", ":::"}, 3, true},
-		{[]string{"env", "sh"}, 2, false},
-	} {
-		if got := staticInsertionBefore(tc.args, tc.end); got != tc.want {
-			t.Errorf("staticInsertionBefore(%q, %d) = %t, want %t", tc.args, tc.end, got, tc.want)
+func TestArgStaticReparsedRoutesAreNotDirect(t *testing.T) {
+	scripts := []string{
+		`eval exec -- printf '%s-' '$HOME'`,
+		`command eval exec -- printf '%s-' '$HOME'`,
+		`time eval exec -- printf '%s-' '$HOME'`,
+		`ssh host exec -- printf '%s-' '$HOME'`,
+		`watch exec -- printf '%s-' '$HOME'`,
+		`tmux new-window exec -- printf '%s-' '$HOME'`,
+		`tmux send-keys -t x exec -- printf '%s-' '$HOME' Enter`,
+		`trap exec -- printf '%s-' '$HOME' EXIT`,
+		`su root -c exec -- printf '%s-' '$HOME'`,
+		`eval bash -c 'printf "%s-" "$HOME"'`,
+		`builtin eval bash -c 'printf a'`,
+		`watch bash -c 'printf a'`,
+		`env watch bash -c 'printf a'`,
+		`tmux new-window bash -c 'printf a'`,
+		`trap bash -c 'printf a' EXIT`,
+		`su root -c 'printf a' bash -c 'printf b'`,
+		`script -c 'printf a' bash -c 'printf b'`,
+		`sshpass -p x ssh host bash -c 'printf a'`,
+		`watch -x printf x`,
+		`sudo -s printf '%s-' '$HOME'`,
+		`sudo -i printf '%s-' '$HOME'`,
+		`sudo --login printf '%s-' '$HOME'`,
+		`sudo -sE printf '%s-' '$HOME'`,
+		`nice sudo -s printf '%s-' '$HOME'`,
+		`sudo -s bash -c 'printf a'`,
+	}
+	for _, src := range scripts {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "printf" && call.Name != "bash" {
+					continue
+				}
+				if len(call.Via) == 0 {
+					continue
+				}
+				found = true
+				for i := range call.Args {
+					if call.ArgStatic(i) {
+						t.Errorf("reparsed route retained static argument %d: %+v", i, call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("no nested target call in %+v", calls)
+			}
+		})
+	}
+}
+
+func TestArgStaticTransparentWrapperControls(t *testing.T) {
+	for _, src := range []string{`printf '%s-' '$HOME'`, `sudo printf '%s-' '$HOME'`, `env printf '%s-' '$HOME'`} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name != "printf" {
+				continue
+			}
+			found = true
+			if len(call.Args) != 2 || !call.ArgStatic(0) || !call.ArgStatic(1) {
+				t.Errorf("literal argv through transparent route is not static: src=%q call=%+v", src, call)
+			}
+		}
+		if !found {
+			t.Errorf("printf missing from %q", src)
+		}
+	}
+}
+
+func TestArgStaticViaStepWhitelist(t *testing.T) {
+	for _, name := range []string{"env", "sudo", "nice", "timeout", "nohup", "setsid", "systemd-run", "stdbuf", "ionice", "command", "builtin", "exec", "time"} {
+		if !staticViaTransparent([]string{name}) {
+			t.Errorf("transparent Via step %q rejected", name)
+		}
+	}
+	for _, name := range []string{"eval", "ssh", "sshpass", "watch", "tmux", "trap", "su", "script", "parallel", "find", "xargs", "unknown"} {
+		if staticViaTransparent([]string{name}) {
+			t.Errorf("nontransparent Via step %q accepted", name)
+		}
+	}
+}
+
+func TestArgStaticEmptyGlobClasses(t *testing.T) {
+	for _, pattern := range []string{"[]", "[!]", "[^]", "['']", `[""]`, `[!'']`, "a[]b"} {
+		src := "printf '<%s>' " + pattern + " q"
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		if len(calls) == 0 || calls[0].Name != "printf" || calls[0].ArgStatic(1) {
+			t.Errorf("empty glob class remained static: %q calls=%+v", src, calls)
+		}
+	}
+	for _, pattern := range []string{"[a/]", `['/']`} {
+		src := "printf '<%s>' " + pattern + " q"
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		if len(calls) == 0 || !calls[0].ArgStatic(1) {
+			t.Errorf("non-matching bracket form was marked dynamic: %q calls=%+v", src, calls)
 		}
 	}
 }

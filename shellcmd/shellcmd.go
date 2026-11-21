@@ -3856,88 +3856,27 @@ func markedCallWords(call *syntax.CallExpr, words []word, split int, src string,
 }
 
 func staticShellWord(w *syntax.Word, source string, tilde Tilde, braceExpand bool) bool {
-	if w == nil || len(w.Parts) == 0 || tilde != 0 || braceExpand && hasBraceExpansionSource(source) || wordHasGlob(w.Parts) {
+	if w == nil || len(w.Parts) == 0 || tilde != 0 || braceExpand && wordHasBraceExpansion(w) || wordHasGlob(w.Parts) {
 		return false
 	}
 	for _, part := range w.Parts {
-		if !staticWordPart(part) {
+		if !literalWordPart(part, source, true) {
 			return false
 		}
 	}
 	return true
 }
 
-func hasBraceExpansionSource(source string) bool {
-	type group struct{ separated bool }
-	var groups []group
-	var quote byte
-	for i := 0; i < len(source); i++ {
-		ch := source[i]
-		if ch == '\\' && quote != '\'' && i+1 < len(source) {
-			i++
-			continue
-		}
-		if quote != 0 {
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		switch ch {
-		case '\'', '"':
-			quote = ch
-		case '{':
-			groups = append(groups, group{})
-		case ',':
-			if len(groups) > 0 {
-				groups[len(groups)-1].separated = true
-			}
-		case '.':
-			if i+1 < len(source) && source[i+1] == '.' && len(groups) > 0 {
-				groups[len(groups)-1].separated = true
-				i++
-			}
-		case '}':
-			if len(groups) > 0 {
-				separated := groups[len(groups)-1].separated
-				groups = groups[:len(groups)-1]
-				if separated {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func staticWordPart(part syntax.WordPart) bool {
-	switch p := part.(type) {
-	case *syntax.Lit:
-		return true
-	case *syntax.SglQuoted:
-		return !p.Dollar
-	case *syntax.DblQuoted:
-		if p.Dollar {
-			return false
-		}
-		for _, inner := range p.Parts {
-			if !staticWordPart(inner) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
-}
-
 type globClassState struct {
-	inside, first, content, pending bool
+	inside, pending, wildcardInside bool
 }
 
 func wordHasGlob(parts []syntax.WordPart) bool {
 	var state globClassState
 	scanGlobParts(parts, false, &state)
+	if state.inside && state.wildcardInside {
+		state.pending = true
+	}
 	return state.pending
 }
 
@@ -3962,44 +3901,40 @@ func scanGlobText(text string, quoted bool, state *globClassState) {
 	for i := 0; i < len(text); i++ {
 		ch := text[i]
 		if quoted {
-			if state.inside {
-				state.first, state.content = false, true
+			if ch == '/' && state.inside {
+				state.inside = false
 			}
+			continue
+		}
+		if ch == '/' {
+			if state.inside && state.wildcardInside {
+				state.pending = true
+			}
+			state.inside = false
 			continue
 		}
 		if ch == '\\' {
 			if i+1 < len(text) {
 				i++
-				if state.inside {
-					state.first, state.content = false, true
-				}
 			}
 			continue
 		}
 		if state.inside {
 			if ch == ']' {
-				if !state.content {
-					state.first, state.content = false, true
-					continue
-				}
-				state.inside, state.pending = false, true
-				return
-			}
-			if state.first && (ch == '!' || ch == '^') {
-				state.first = false
+				state.pending = true
+				state.inside, state.wildcardInside = false, false
 				continue
 			}
 			if ch == '*' || ch == '?' {
-				state.pending = true
+				state.wildcardInside = true
 			}
-			state.first, state.content = false, true
 			continue
 		}
 		switch ch {
 		case '*', '?':
 			state.pending = true
 		case '[':
-			state.inside, state.first, state.content = true, true, false
+			state.inside, state.wildcardInside = true, false
 		}
 	}
 }
@@ -4339,14 +4274,16 @@ func restoreLiteralBraces(parts []syntax.WordPart) {
 // groups it would return to literal text: a group without a comma or a `..` at
 // its own level and a group never closed. It returns the byte offsets by part
 // index, or nil when there are none or a Lit already holds a stand-in byte.
+type bracePosition struct{ part, index int }
+
+type braceGroupPosition struct {
+	open      bracePosition
+	separated bool
+}
+
 func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
-	type position struct{ part, index int }
-	type group struct {
-		open      position
-		separated bool
-	}
-	var open []group
-	var literal []position
+	var open []braceGroupPosition
+	var literal []bracePosition
 	for i, part := range parts {
 		lit, ok := part.(*syntax.Lit)
 		if !ok {
@@ -4355,34 +4292,7 @@ func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
 		if strings.ContainsAny(lit.Value, string([]byte{literalLeftBrace, literalRightBrace})) {
 			return nil
 		}
-		value := lit.Value
-		for j := 0; j < len(value); j++ {
-			switch value[j] {
-			case '\\':
-				j++
-			case '{':
-				open = append(open, group{open: position{i, j}})
-			case ',':
-				if len(open) > 0 {
-					open[len(open)-1].separated = true
-				}
-			case '.':
-				// A `..` separates a sequence; after a comma it is literal, but
-				// the group is separated already.
-				if len(open) > 0 && j+1 < len(value) && value[j+1] == '.' {
-					open[len(open)-1].separated = true
-				}
-			case '}':
-				if len(open) == 0 {
-					continue
-				}
-				top := open[len(open)-1]
-				open = open[:len(open)-1]
-				if !top.separated {
-					literal = append(literal, top.open, position{i, j})
-				}
-			}
-		}
+		literal = scanLiteralBracePart(lit.Value, i, &open, literal)
 	}
 	for _, unclosed := range open {
 		literal = append(literal, unclosed.open)
@@ -4395,6 +4305,40 @@ func literalBraceGroups(parts []syntax.WordPart) map[int][]int {
 		byPart[p.part] = append(byPart[p.part], p.index)
 	}
 	return byPart
+}
+
+func scanLiteralBracePart(value string, part int, open *[]braceGroupPosition, literal []bracePosition) []bracePosition {
+	for j := 0; j < len(value); j++ {
+		switch value[j] {
+		case '\\':
+			if j+1 < len(value) && (value[j+1] == '{' || value[j+1] == '}') {
+				literal = append(literal, bracePosition{part, j + 1})
+			}
+			j++
+		case '{':
+			*open = append(*open, braceGroupPosition{open: bracePosition{part, j}})
+		case ',':
+			if len(*open) > 0 {
+				(*open)[len(*open)-1].separated = true
+			}
+		case '.':
+			// A `..` separates a sequence; after a comma it is literal, but
+			// the group is separated already.
+			if len(*open) > 0 && j+1 < len(value) && value[j+1] == '.' {
+				(*open)[len(*open)-1].separated = true
+			}
+		case '}':
+			if len(*open) == 0 {
+				continue
+			}
+			top := (*open)[len(*open)-1]
+			*open = (*open)[:len(*open)-1]
+			if !top.separated {
+				literal = append(literal, top.open, bracePosition{part, j})
+			}
+		}
+	}
+	return literal
 }
 
 func assignmentTildeBeforeBrace(word *syntax.Word, src string, chars []tildeChar) bool {
@@ -4978,14 +4922,14 @@ func literalWord(word *syntax.Word, src string) bool {
 		return false
 	}
 	for _, part := range word.Parts {
-		if !literalWordPart(part, src) {
+		if !literalWordPart(part, src, false) {
 			return false
 		}
 	}
 	return !hasUnquotedExpansion(src[start:end])
 }
 
-func literalWordPart(part syntax.WordPart, src string) bool {
+func literalWordPart(part syntax.WordPart, src string, allowDoubleBackslash bool) bool {
 	switch p := part.(type) {
 	case *syntax.Lit:
 		return true
@@ -4997,7 +4941,7 @@ func literalWordPart(part syntax.WordPart, src string) bool {
 		}
 		for _, inner := range p.Parts {
 			lit, ok := inner.(*syntax.Lit)
-			if !ok || !literalDoublePart(lit, src) {
+			if !ok || !allowDoubleBackslash && !literalDoublePart(lit, src) {
 				return false
 			}
 		}
@@ -6833,35 +6777,57 @@ func (c cmd) sub(i int, via []string) cmd {
 	if c.call.Name == "env" && envHasPosixCorrect(c.call.Args[:max(0, i-1)]) {
 		posixEnv = true
 	}
-	staticDirect := c.call.staticDirect && !staticInsertionWrapper(c.call.Name) && !slices.ContainsFunc(via, staticInsertionWrapper) && !staticInsertionBefore(c.call.Args, i-1)
+	staticDirect := staticSubRoute(c, i, via)
 	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
 		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0}
 }
 
-func staticInsertionWrapper(name string) bool {
+func staticViaTransparent(via []string) bool {
+	for _, name := range via {
+		switch name {
+		case "env", "sudo", "nice", "timeout", "nohup", "setsid", "systemd-run", "stdbuf", "ionice", "command", "builtin", "exec", "time":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func staticSubRoute(c cmd, wordIndex int, via []string) bool {
+	if !c.call.staticDirect || !staticViaTransparent(via) {
+		return false
+	}
+	targetIndex := wordIndex - 1
+	name, args := c.call.Name, c.call.Args
+	for range maxNestedScripts {
+		if !staticWrapperName(name) || name == "sudo" && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+			return false
+		}
+		wrapped, ok := unwrapOnce(name, args)
+		if !ok || len(wrapped) == 0 {
+			return false
+		}
+		start := len(args) - len(wrapped)
+		if targetIndex < start {
+			return false
+		}
+		if targetIndex == start {
+			return true
+		}
+		targetIndex -= start + 1
+		name, args = commandName(wrapped[0]), wrapped[1:]
+	}
+	return false
+}
+
+func staticWrapperName(name string) bool {
 	switch name {
-	case "xargs", "find", "parallel":
+	case "env", "sudo", "nice", "timeout", "nohup", "setsid", "systemd-run", "stdbuf", "ionice", "command", "builtin", "exec", "time":
 		return true
 	default:
 		return false
 	}
-}
-
-func staticInsertionBefore(args []string, end int) bool {
-	for i := 0; i < end && i < len(args); i++ {
-		switch args[i] {
-		case "xargs", "parallel":
-			return true
-		case "find":
-			for j := i + 1; j < end && j < len(args); j++ {
-				if args[j] == "-exec" || args[j] == "-execdir" || args[j] == "-ok" || args[j] == "-okdir" {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 func tildeArgTail(args []Tilde, start int) []Tilde {
@@ -7303,7 +7269,9 @@ func genericShellTarget(c cmd, name string, args []string, exactStart int) (cmd,
 	if exactStart >= 0 && index+1 == exactStart {
 		return cmd{}, false
 	}
-	return c.sub(index+1, c.via(name)), true
+	target := c.sub(index+1, c.via(name))
+	target.call.staticDirect = false
+	return target, true
 }
 
 func exactWrapperTarget(c cmd, start int, via []string) (cmd, bool) {
@@ -8250,11 +8218,7 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 		args = append(args, parallelArgs[i])
 		argWord := c.words[parallelOffset+i+1]
 		words = append(words, argWord)
-		mark := argWord.tilde
-		if argWord.static {
-			mark |= tildeStatic
-		}
-		childTilts = append(childTilts, mark)
+		childTilts = append(childTilts, argWord.tilde)
 	}
 	if !slices.ContainsFunc(childTilts, func(mark Tilde) bool { return mark != 0 }) {
 		childTilts = nil
