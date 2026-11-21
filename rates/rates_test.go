@@ -51,3 +51,48 @@ func TestLatestIgnoresFutureRowsButRetainsProvider(t *testing.T) {
 		t.Fatalf("provider names including future-only row = %q", table.Providers)
 	}
 }
+
+func TestCellByColumnName(t *testing.T) {
+	table := readFixture(t, "valid_from\tprovider\tplan\tplan_usd_month\tapi_usd_week\ttier\tsource\n"+
+		"2026-01-01\tanthropic\tmax\t200\t1000\tdefault_claude_max_20x\tsurvey\n"+
+		"2026-02-01\tanthropic\tmax\t200\t1500\t\tbench\n"+
+		"2026-02-01\topenai\tpro\t200\t900\tpro_tier\tbench\n"+
+		"2026-04-01\tanthropic\tmax\t200\t9999\tlater\tfuture\n")
+	row, ok := table.Latest("anthropic", "max")
+	if !ok || row.Line != 3 {
+		t.Fatalf("latest = %+v, %v; want line 3", row, ok)
+	}
+	if !table.HasColumn("tier") || table.HasColumn("measured") {
+		t.Errorf("HasColumn tier = %v, measured = %v; want true, false", table.HasColumn("tier"), table.HasColumn("measured"))
+	}
+	if v, ok := row.Cell("tier"); !ok || v != "" {
+		t.Errorf("empty tier = %q, %v; want empty string, column present", v, ok)
+	}
+	if v, ok := row.Cell("source"); !ok || v != "bench" {
+		t.Errorf("source = %q, %v; want bench", v, ok)
+	}
+	if v, ok := row.Cell("measured"); ok || v != "" {
+		t.Errorf("missing column = %q, %v; want empty, false", v, ok)
+	}
+	// The selected row of another provider keeps its own non-empty cell.
+	if r, _ := table.Latest("openai", ""); r.Line != 4 {
+		t.Fatalf("openai latest line = %d; want 4", r.Line)
+	} else if v, ok := r.Cell("tier"); !ok || v != "pro_tier" {
+		t.Errorf("openai tier = %q, %v; want pro_tier", v, ok)
+	}
+	// A row carries its cells: a row of another table answers from its own file, a literal row has none.
+	other := readFixture(t, "valid_from\tprovider\tplan_usd_month\tapi_usd_week\ttier\n2026-01-01\tanthropic\t200\t1000\tother_tier\n")
+	if v, ok := other.Rows[0].Cell("tier"); !ok || v != "other_tier" {
+		t.Errorf("other table tier = %q, %v; want other_tier", v, ok)
+	}
+	if v, ok := (Rate{Line: 3}).Cell("tier"); ok || v != "" {
+		t.Errorf("literal row tier = %q, %v; want empty, false", v, ok)
+	}
+	// Without the column in the header, no row has it.
+	plain := readFixture(t, "valid_from\tprovider\tplan_usd_month\tapi_usd_week\n2026-01-01\topenai\t200\t1000\n")
+	if r, _ := plain.Latest("openai", ""); plain.HasColumn("tier") {
+		t.Error("HasColumn tier without the column = true")
+	} else if _, ok := r.Cell("tier"); ok {
+		t.Error("Cell tier without the column: ok = true")
+	}
+}

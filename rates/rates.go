@@ -14,7 +14,9 @@ import (
 )
 
 // Rate is one rates.tsv row. Invalid numeric fields retain their source cell
-// and line so callers can explain a bad selected rate.
+// and line so callers can explain a bad selected rate. A row carries its cells
+// for Cell, so rows of two Read calls are not == even for the same file; copies
+// of one row are.
 type Rate struct {
 	Provider, Plan               string
 	PlanUSDMonth, APIUSDWeek     float64
@@ -23,6 +25,27 @@ type Rate struct {
 	Line                         int
 	InvalidPlan, InvalidWeek     error
 	InvalidCents, InvalidCaution error
+	cells                        *rowCells // the row as written, for columns Rate has no field for; nil outside Read
+}
+
+// rowCells is one row's cells and the header that names them.
+type rowCells struct {
+	fields  []string
+	columns map[string]int
+}
+
+// Cell returns the row's cell in column name as written in the file. ok is
+// false when the file's header has no such column or the row did not come
+// from Read; an empty cell is "", true.
+func (r Rate) Cell(name string) (value string, ok bool) {
+	if r.cells == nil {
+		return "", false
+	}
+	i, ok := r.cells.columns[name]
+	if !ok {
+		return "", false
+	}
+	return r.cells.fields[i], true
 }
 
 // Table contains rows at or before now. Later rows are ignored.
@@ -30,6 +53,14 @@ type Table struct {
 	Path      string
 	Rows      []Rate
 	Providers []string
+	columns   map[string]int // header name → cell index
+}
+
+// HasColumn reports whether the header names column name, so callers can tell
+// a missing column from an empty cell.
+func (t Table) HasColumn(name string) bool {
+	_, ok := t.columns[name]
+	return ok
 }
 
 // Read reads a tab separated rates file. Row selection is left to Latest,
@@ -45,7 +76,7 @@ func Read(path string, now time.Time) (Table, error) {
 	columns := map[string]int{}
 	providerSeen := map[string]bool{}
 	width := 0
-	table := Table{Path: path}
+	table := Table{Path: path, columns: columns}
 	for lineNo := 1; scanner.Scan(); lineNo++ {
 		line := strings.TrimRight(scanner.Text(), "\r")
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
@@ -79,6 +110,7 @@ func Read(path string, now time.Time) (Table, error) {
 		if !include {
 			continue
 		}
+		row.cells = &rowCells{fields: fields, columns: columns}
 		table.Rows = append(table.Rows, row)
 	}
 	if err := scanner.Err(); err != nil {
