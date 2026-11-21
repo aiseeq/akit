@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -40,6 +41,12 @@ type waitCall struct {
 	session   string
 }
 
+type waitSample struct {
+	At           time.Time
+	Program, Sub string
+	Duration     time.Duration
+}
+
 // waitTracker сводит вызов команды с его выводом по ходу чтения одного файла: в памяти только вызовы, ждущие
 // вывода, и найденные ожидания.
 type waitTracker struct {
@@ -49,11 +56,13 @@ type waitTracker struct {
 	current   string                 // id текущего сообщения
 	seq       int                    // порядок вызовов: номер строки у нескольких вызовов одной строки совпал бы
 	waits     []time.Duration
+	waitAll   bool
+	waitRows  []waitSample
 	sessions  map[string]*waitCall
 }
 
 func newWaitTracker(opts options) *waitTracker {
-	return &waitTracker{prog: opts.waitProg, sub: opts.waitSub, calls: map[string]*waitCall{}, messages: map[string][]*waitCall{}, sessions: map[string]*waitCall{}}
+	return &waitTracker{prog: opts.waitProg, sub: opts.waitSub, waitAll: opts.waitAll, calls: map[string]*waitCall{}, messages: map[string][]*waitCall{}, sessions: map[string]*waitCall{}}
 }
 
 func (t *waitTracker) event(ev transcript.Event) {
@@ -155,7 +164,14 @@ func (t *waitTracker) trackResult(event cachedWaitEvent) {
 func (t *waitTracker) addWait(call *waitCall, end time.Time) {
 	start := call.start(t.messages[call.message], end)
 	if duration := end.Sub(start); duration >= 0 {
-		t.waits = append(t.waits, duration)
+		if t.waitAll {
+			program, sub, ok := waitCallIdentity(call)
+			if ok {
+				t.waitRows = append(t.waitRows, waitSample{At: call.at, Program: program, Sub: sub, Duration: duration})
+			}
+		} else {
+			t.waits = append(t.waits, duration)
+		}
 	}
 }
 
@@ -228,9 +244,47 @@ func reportWait(res result, opts options, stdout, stderr io.Writer) int {
 		return 3
 	}
 	fmt.Fprintf(stderr, "tl: %d wait event(s)\n", len(waits))
+	fmt.Fprintln(stdout, nearestWaitRank(waits, opts.q).Milliseconds())
+	return 0
+}
+
+func nearestWaitRank(waits []time.Duration, q int) time.Duration {
 	slices.Sort(waits)
-	index := int(math.Ceil(float64(opts.q)*float64(len(waits))/100)) - 1
-	fmt.Fprintln(stdout, waits[index].Milliseconds())
+	index := int(math.Ceil(float64(q)*float64(len(waits))/100)) - 1
+	return waits[index]
+}
+
+func reportWaitAll(res result, stdout io.Writer) int {
+	type key struct{ day, program, sub string }
+	groups := map[key][]time.Duration{}
+	for _, sample := range res.waitRows {
+		local := sample.At.In(time.Local)
+		k := key{local.Format(time.DateOnly), sample.Program, sample.Sub}
+		groups[k] = append(groups[k], sample.Duration)
+	}
+	keys := make([]key, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b key) int {
+		if a.day != b.day {
+			return strings.Compare(a.day, b.day)
+		}
+		if a.program != b.program {
+			return strings.Compare(a.program, b.program)
+		}
+		return strings.Compare(a.sub, b.sub)
+	})
+	for _, k := range keys {
+		waits := groups[k]
+		p95 := nearestWaitRank(append([]time.Duration(nil), waits...), 95)
+		max := slices.Max(waits)
+		var sum time.Duration
+		for _, wait := range waits {
+			sum += wait
+		}
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%d\t%d\t%d\n", k.day, k.program, k.sub, len(waits), sum.Milliseconds(), p95.Milliseconds(), max.Milliseconds())
+	}
 	return 0
 }
 
@@ -271,6 +325,16 @@ func matchedWaitCommand(command, prog, sub string) bool {
 	return matchedWaitCallData(calls, invalid, prog, sub)
 }
 
+func waitCallIdentity(call *waitCall) (string, string, bool) {
+	if call.parsed {
+		name, sub, ok := waitCallDataIdentity(call.calls, call.invalid, "", "")
+		return name, sub, ok
+	}
+	calls, invalid := parseWaitCalls(call.command)
+	name, sub, ok := waitCallDataIdentity(calls, invalid, "", "")
+	return name, sub, ok
+}
+
 func parseWaitCalls(command string) ([]cachedShellCall, bool) {
 	found, err := shellcmd.Calls(command)
 	var nested *shellcmd.NestedError
@@ -288,18 +352,42 @@ func parseWaitCalls(command string) ([]cachedShellCall, bool) {
 }
 
 func matchedWaitCallData(found []cachedShellCall, invalid bool, prog, sub string) bool {
+	_, _, ok := waitCallDataIdentity(found, invalid, prog, sub)
+	return ok
+}
+
+var waitSubPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,23}$`)
+
+func waitCallDataIdentity(found []cachedShellCall, invalid bool, requestedProgram, requestedSub string) (string, string, bool) {
 	if invalid {
-		return false
+		return "", "", false
 	}
+	var program cachedShellCall
 	programs := 0
 	for _, call := range found {
-		if call.Name == prog && (sub == "" || call.HasArg && call.Arg0 == sub) && !call.Background {
+		if requestedProgram != "" && call.Name == requestedProgram && (requestedSub == "" || call.HasArg && call.Arg0 == requestedSub) && !call.Background {
 			programs++
+			program = call
+			continue
+		}
+		if requestedProgram == "" && !waitWrappers[call.Name] {
+			if call.Background {
+				return "", "", false
+			}
+			programs++
+			program = call
 			continue
 		}
 		if !waitWrappers[call.Name] {
-			return false
+			return "", "", false
 		}
 	}
-	return programs == 1
+	if programs != 1 {
+		return "", "", false
+	}
+	sub := "-"
+	if program.HasArg && waitSubPattern.MatchString(program.Arg0) {
+		sub = program.Arg0
+	}
+	return program.Name, sub, true
 }

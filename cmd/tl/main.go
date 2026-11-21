@@ -91,6 +91,7 @@ path (Claude Code or codex rollout).
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
+  --wait-all    TSV wait statistics per local day, program and subcommand
   --q N         percentile for --wait, from 1 to 99 (default 50); needs at least
                 3 events for --q 50 and below, 20 above
   Large reads wait for machine capacity through graft's heavy queue.
@@ -141,6 +142,7 @@ type options struct {
 	keyGapSet     bool
 	waitProg      string
 	waitSub       string
+	waitAll       bool
 	q             int
 	qSet          bool
 	maxSet        bool
@@ -156,7 +158,7 @@ type options struct {
 var errHelp = errors.New("help")
 var errHelpJSON = errors.New("help json")
 var machineHelp = func() clihelp.Help {
-	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --no-subagents --subagents --usage --open-questions --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
+	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --no-subagents --subagents --usage --open-questions --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --wait-all --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
 	help.Commands[0].NoDashdash = true
 	return help
 }()
@@ -242,7 +244,7 @@ func parseArgs(args []string, now time.Time) (options, error) {
 			return opts, err
 		}
 	}
-	if opts.waitProg != "" {
+	if opts.waitProg != "" || opts.waitAll {
 		if !opts.rolesSet {
 			if err := setRoles(&opts, "all"); err != nil {
 				return opts, err
@@ -274,6 +276,8 @@ func setSwitch(opts *options, name string) bool {
 		opts.openQuestions = true
 	case "--worktime":
 		opts.worktime = true
+	case "--wait-all":
+		opts.waitAll = true
 	case "--version":
 		opts.version = true
 	default:
@@ -296,12 +300,18 @@ func checkCombos(opts options) error {
 	if opts.subagents && opts.all {
 		return errors.New("--subagents works with SESSION, not --all")
 	}
-	if opts.waitProg != "" {
+	if opts.waitProg != "" || opts.waitAll {
 		if opts.usage {
 			return errors.New("--wait and --usage cannot be used together")
 		}
 		if opts.rolesSet || opts.grep != "" || opts.raw != "" || opts.context > 0 || opts.maxSet || opts.widthSet {
 			return errors.New("--wait cannot be used with event output options")
+		}
+		if opts.waitAll && opts.waitProg != "" {
+			return errors.New("--wait-all and --wait cannot be used together")
+		}
+		if opts.waitAll && opts.qSet {
+			return errors.New("--q works with --wait")
 		}
 	} else if opts.qSet {
 		return errors.New("--q works with --wait")
@@ -320,7 +330,7 @@ func checkOpenQuestionsCombos(opts options) error {
 }
 
 func openQuestionsOutputOptionsSet(opts options) bool {
-	return opts.all || opts.subagents || opts.usage || opts.worktime || opts.waitProg != "" || opts.qSet ||
+	return opts.all || opts.subagents || opts.usage || opts.worktime || opts.waitProg != "" || opts.waitAll || opts.qSet ||
 		opts.rolesSet || !opts.since.IsZero() || !opts.until.IsZero() || opts.grep != "" || opts.raw != "" ||
 		opts.maxSet || opts.widthSet
 }
@@ -335,7 +345,7 @@ func checkWorktimeCombos(opts options) error {
 	if opts.worktime && opts.usage {
 		return errors.New("--worktime and --usage cannot be used together")
 	}
-	if opts.worktime && opts.waitProg != "" {
+	if opts.worktime && (opts.waitProg != "" || opts.waitAll) {
 		return errors.New("--worktime and --wait cannot be used together")
 	}
 	if !opts.worktime && opts.gapSet {
@@ -527,7 +537,7 @@ func writeMasked(w io.Writer, text string) error {
 var newReplyCache = replycache.New
 
 func replyCacheFor(opts options, now time.Time) *replycache.Cache {
-	if !opts.all || opts.usage || opts.waitProg != "" || opts.raw != "" || len(opts.roles) == 0 {
+	if !opts.all || opts.usage || opts.waitProg != "" || opts.waitAll || opts.raw != "" || len(opts.roles) == 0 {
 		return nil
 	}
 	for role := range opts.roles {
@@ -573,7 +583,7 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	if opts.waitProg != "" {
+	if opts.waitProg != "" || opts.waitAll {
 		opts.waitCache = newWaitCache(stderr)
 		opts.waitCache.cleanup(e.now)
 	}
@@ -601,11 +611,14 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	if opts.waitProg != "" {
+	if opts.waitProg != "" || opts.waitAll {
 		if n := opts.waitCache.misses.Load(); n > 0 {
 			// Причина промаха — для того, кто разбирает медленный вызов: запись под этот код ещё не писалась или
 			// транскрипт с тех пор дописан.
 			fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
+		}
+		if opts.waitAll {
+			return reportWaitAll(res, stdout)
 		}
 		return reportWait(res, opts, stdout, stderr)
 	}

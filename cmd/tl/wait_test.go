@@ -97,6 +97,121 @@ func TestWaitClaudePercentilesAndFiltering(t *testing.T) {
 	}
 }
 
+func TestWaitLegacyCanSelectWrapperProgram(t *testing.T) {
+	if !matchedWaitCommand("head -n 1", "head", "") {
+		t.Fatal("--wait wrapper program matching changed")
+	}
+}
+
+type waitAllTestSpec struct {
+	id, command string
+	delay       time.Duration
+	bg, refused bool
+}
+
+func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
+	base := time.Date(2026, 10, 25, 23, 59, 50, 0, time.Local)
+	specs := []waitAllTestSpec{
+		{"a", "alpha build x | head", 2 * time.Second, false, false},
+		{"b", "beta ./path", 3 * time.Second, false, false}, // path is not a bare subcommand
+		{"c", "alpha test", 4 * time.Second, false, false},
+		{"d", "beta test | grep ok", 5 * time.Second, false, false},
+		{"e", "alpha build", 6 * time.Second, false, false},
+		{"f", "beta run", 7 * time.Second, false, false},
+		{"g", "alpha build", 8 * time.Second, true, false},               // background
+		{"h", "beta run", 9 * time.Second, false, true},                  // refusal
+		{"i", "alpha build && beta run", 10 * time.Second, false, false}, // two programs
+	}
+	all := newWaitTracker(options{waitAll: true})
+	for _, s := range specs {
+		at := base
+		for _, prior := range specs {
+			if prior.id == s.id {
+				break
+			}
+			at = at.Add(prior.delay)
+		}
+		raw := []byte(nil)
+		if s.refused {
+			raw = []byte(`{"error":"permission denied by user"}`)
+		}
+		all.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: s.id, Time: at, Who: "Bash", Command: s.command, BG: s.bg})
+		all.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: s.id, Time: at.Add(s.delay), Error: s.refused, Raw: raw})
+	}
+	groups := map[string][]time.Duration{}
+	byProgramDay := map[string][]time.Duration{}
+	for _, row := range all.waitRows {
+		day := row.At.In(time.Local).Format(time.DateOnly)
+		groups[day+"\x00"+row.Program+"\x00"+row.Sub] = append(groups[day+"\x00"+row.Program+"\x00"+row.Sub], row.Duration)
+		byProgramDay[day+"\x00"+row.Program] = append(byProgramDay[day+"\x00"+row.Program], row.Duration)
+	}
+	for _, key := range []string{"alpha\x00build", "alpha\x00test", "beta\x00test"} {
+		program, sub, _ := strings.Cut(key, "\x00")
+		for day, want := range groups {
+			fields := strings.Split(day, "\x00")
+			if len(fields) != 3 || fields[1]+"\x00"+fields[2] != key {
+				continue
+			}
+			got := runWaitTrackerForSpecs(base, specs, program, sub, fields[0])
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s %s: --wait=%v, wait-all=%v", fields[0], key, got, want)
+			}
+		}
+	}
+	for key, want := range byProgramDay {
+		day, program, _ := strings.Cut(key, "\x00")
+		got := runWaitTrackerForSpecs(base, specs, program, "", day)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s %s: --wait=%v, wait-all=%v", day, program, got, want)
+		}
+	}
+	if len(all.waitRows) != 6 {
+		t.Fatalf("wait-all samples = %d, want 6: %+v", len(all.waitRows), all.waitRows)
+	}
+	// The calls span local midnight; the rows include one-event groups and sort by day/program/subcommand.
+	var out strings.Builder
+	reportWaitAll(result{waitRows: all.waitRows}, &out)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != len(all.waitRows) {
+		t.Fatalf("daily lines = %q", out.String())
+	}
+	if !strings.HasPrefix(lines[0], base.Format(time.DateOnly)+"\talpha\tbuild\t") {
+		t.Errorf("first TSV row = %q", lines[0])
+	}
+	if !strings.Contains(out.String(), "\tbeta\t-\t1\t") {
+		t.Errorf("path subcommand not normalized: %q", out.String())
+	}
+	var percentileRows []waitSample
+	for i := 1; i <= 20; i++ {
+		percentileRows = append(percentileRows, waitSample{At: base, Program: "rank", Sub: "run", Duration: time.Duration(i) * time.Millisecond})
+	}
+	out.Reset()
+	reportWaitAll(result{waitRows: percentileRows}, &out)
+	if !strings.Contains(out.String(), "\t20\t210\t19\t20\n") {
+		t.Errorf("p95 did not use --wait nearest-rank: %q", out.String())
+	}
+}
+
+func runWaitTrackerForSpecs(base time.Time, specs []waitAllTestSpec, program, sub, day string) []time.Duration {
+	filtered := newWaitTracker(options{waitProg: program, waitSub: sub})
+	for i, s := range specs {
+		at := base
+		for j := range i {
+			at = at.Add(specs[j].delay)
+		}
+		if at.In(time.Local).Format(time.DateOnly) != day {
+			continue
+		}
+		raw := []byte(nil)
+		if s.refused {
+			raw = []byte(`{"error":"permission denied by user"}`)
+		}
+		filtered.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: s.id, Time: at, Who: "Bash", Command: s.command, BG: s.bg})
+		filtered.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: s.id, Time: at.Add(s.delay), Error: s.refused, Raw: raw})
+	}
+	return filtered.waits
+}
+
 func TestWaitStartsAfterEarlierSerialCallInSameMessage(t *testing.T) {
 	e := fakeHome(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
@@ -112,7 +227,7 @@ func TestWaitStartsAfterEarlierSerialCallInSameMessage(t *testing.T) {
 	}
 	path := writeWaitTranscript(t, e, "sequential.jsonl", strings.Join(rows, "\n")+"\n")
 	roles := map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}
-	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{Path: path})
+	_, waits, _, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +318,7 @@ func readWaits(t *testing.T, e env, name string, rows []string) []time.Duration 
 	t.Helper()
 	path := writeWaitTranscript(t, e, name, strings.Join(rows, "\n")+"\n")
 	roles := map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}
-	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{Path: path})
+	_, waits, _, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: roles}}).file(source{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +655,7 @@ func TestWaitCodexMatchesCommandResultsByText(t *testing.T) {
 	addDone("tk done alpha", base, base.Add(time.Second))
 	addDone("tk done beta", base, base.Add(2*time.Second))
 	path := writeWaitTranscript(t, e, "rollout-result-matching.jsonl", strings.Join(rows, "\n")+"\n")
-	_, waits, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}}}).file(source{Path: path})
+	_, waits, _, _, err := (&filter{opts: options{waitProg: "tk", waitSub: "done", roles: map[transcript.Role]bool{transcript.Cmd: true, transcript.Out: true}}}).file(source{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -763,6 +878,7 @@ func TestWaitUsageErrors(t *testing.T) {
 		{"--wait", "tk", "--usage"}, {"--wait", "tk", "--role", "cmd"},
 		{"--wait", "tk", "--max", "5"}, {"--q", "50"},
 		{"--wait", "tk", "--q", "100"}, {"--wait", "a b c"},
+		{"--wait-all", "--wait", "tk"}, {"--wait-all", "--q", "95"}, {"--wait-all", "--grep", "x"},
 	} {
 		if _, err := parseArgs(args, fakeHome(t).now); err == nil {
 			t.Errorf("%q accepted", args)

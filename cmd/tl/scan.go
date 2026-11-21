@@ -25,7 +25,8 @@ type hit struct {
 
 type result struct {
 	hits        []hit
-	waits       []time.Duration   // --wait: ожидания вывода, сведённые по ходу чтения файлов
+	waits       []time.Duration // --wait: ожидания вывода, сведённые по ходу чтения файлов
+	waitRows    []waitSample
 	names       map[string]string // path → имя сессии
 	linkIDs     map[string]string // path → уникальный id для ссылок в этой выборке
 	searchPaths []string          // all transcript names reachable by find
@@ -628,19 +629,19 @@ func (f *filter) match(ev transcript.Event) bool {
 
 // file читает один файл и отдаёт отобранные события с окрестностью -C; в режиме --wait вместо событий — ожидания
 // вывода: события в памяти не копятся.
-func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, error) {
+func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcript.Meta, error) {
 	var keep func([]byte, transcript.ToolNames) bool
 	if len(f.needles) > 0 || f.rawRE != nil {
 		keep = f.keepWithState
 	}
 	var wt *waitTracker
-	if f.opts.waitProg != "" {
+	if f.opts.waitProg != "" || f.opts.waitAll {
 		wt = newWaitTracker(f.opts)
 	}
 	if wt != nil && (f.opts.waitCache != nil || isCodexRollout(src.Path)) {
 		events, err := f.waitEvents(src.Path)
 		if err != nil {
-			return nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
+			return nil, nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
 		}
 		for i := range events {
 			event := &events[i]
@@ -648,7 +649,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 				wt.cachedEvent(*event)
 			}
 		}
-		return nil, wt.waits, transcript.Meta{}, nil
+		return nil, wt.waits, wt.waitRows, transcript.Meta{}, nil
 	}
 	var (
 		out    []hit
@@ -683,13 +684,15 @@ func (f *filter) file(src source) ([]hit, []time.Duration, transcript.Meta, erro
 	}
 	meta, err := f.readEvents(src.Path, keep, consume)
 	var waits []time.Duration
+	var waitRows []waitSample
 	if wt != nil {
 		waits = wt.waits
+		waitRows = wt.waitRows
 	}
 	if err != nil {
-		return out, waits, meta, fmt.Errorf("read %s: %w", src.Path, err)
+		return out, waits, waitRows, meta, fmt.Errorf("read %s: %w", src.Path, err)
 	}
-	return out, waits, meta, nil
+	return out, waits, waitRows, meta, nil
 }
 
 // readEvents сохраняет прежний читатель для промахов и его диагностику ошибок.
@@ -735,10 +738,11 @@ func scan(sources []source, opts options, home string) (result, error) {
 	liveNames, liveErr := liveSessionNames(home)
 	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home, liveNames), searchPaths: allPaths, liveNames: liveNames, liveErr: liveErr, files: len(sources)}
 	type fileResult struct {
-		hits  []hit
-		waits []time.Duration
-		meta  transcript.Meta
-		err   error
+		hits     []hit
+		waits    []time.Duration
+		waitRows []waitSample
+		meta     transcript.Meta
+		err      error
 	}
 	results := make([]fileResult, len(sources))
 	var (
@@ -748,8 +752,8 @@ func scan(sources []source, opts options, home string) (result, error) {
 	for range scanWorkerCount() {
 		wg.Go(func() {
 			for i := range jobs {
-				hits, waits, meta, err := f.file(sources[i])
-				results[i] = fileResult{hits, waits, meta, err}
+				hits, waits, waitRows, meta, err := f.file(sources[i])
+				results[i] = fileResult{hits, waits, waitRows, meta, err}
 			}
 		})
 	}
@@ -763,6 +767,7 @@ func scan(sources []source, opts options, home string) (result, error) {
 		src := sources[i]
 		res.hits = append(res.hits, item.hits...)
 		res.waits = append(res.waits, item.waits...)
+		res.waitRows = append(res.waitRows, item.waitRows...)
 		res.bad += item.meta.Bad
 		if item.meta.FirstBad != nil && res.firstBad == nil {
 			res.firstBad = fmt.Errorf("%s %w", res.linkIDs[src.Path], item.meta.FirstBad)
