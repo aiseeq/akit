@@ -426,13 +426,13 @@ func staticArgManipulationText(src string) bool {
 func staticCallsSafe(calls []Call) bool {
 	for i := range calls {
 		call := &calls[i]
+		if !staticWrapperOptionsSafe(call.Raw) {
+			return false
+		}
 		if call.staticName && call.Name == "time" && len(call.Args) == 0 {
 			continue
 		}
-		if !call.staticName || staticUnsafeCommandName(call.Name) {
-			return false
-		}
-		if strings.Contains(call.Raw, "command -p") || strings.Contains(call.Raw, "exec -a") {
+		if !call.staticName || strings.HasPrefix(call.Name, "-") || staticUnsafeCommandName(call.Name) {
 			return false
 		}
 		if call.Name == "set" && unsafeSetCall(call) {
@@ -442,8 +442,110 @@ func staticCallsSafe(calls []Call) bool {
 	return true
 }
 
+func staticWrapperOptionsSafe(src string) bool {
+	if !containsShellWord(src, "command") && !containsShellWord(src, "builtin") && !containsShellWord(src, "exec") && !containsShellWord(src, "time") {
+		return true
+	}
+	file, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+	if err != nil || file == nil {
+		return false
+	}
+	timed := timeClauseCalls(file)
+	safe := true
+	syntax.Walk(file, func(node syntax.Node) bool {
+		call, ok := node.(*syntax.CallExpr)
+		if ok && unsafeStaticWrapperCall(call, timed[call]) {
+			safe = false
+			return false
+		}
+		return true
+	})
+	return safe
+}
+
+func containsShellWord(src, word string) bool {
+	for start := 0; start < len(src); {
+		rel := strings.Index(src[start:], word)
+		if rel < 0 {
+			return false
+		}
+		start += rel
+		end := start + len(word)
+		left := start == 0 || shellWordBoundary(src[start-1])
+		right := end == len(src) || shellWordBoundary(src[end])
+		if left && right {
+			return true
+		}
+		start++
+	}
+	return false
+}
+
+func shellWordBoundary(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\'', '"', ';', '|', '&', '(', ')', '<', '>':
+		return true
+	default:
+		return false
+	}
+}
+
+func unsafeStaticWrapperCall(call *syntax.CallExpr, timed bool) bool {
+	words := call.Args
+	if timed && len(words) > 0 {
+		if option, literal := wordValue(words[0]); literal && option == "--" {
+			words = words[1:]
+		}
+	}
+	if len(words) == 0 {
+		return false
+	}
+	if name, _ := syntaxCallName(words); name == "" {
+		return true
+	}
+	name, literal := wordValue(words[0])
+	if !literal || strings.HasPrefix(name, "-") {
+		return true
+	}
+	if name == "command" {
+		return wrapperHasUnsafeOption(words[1:], 'p')
+	}
+	if name == "exec" {
+		return wrapperHasUnsafeOption(words[1:], 'a')
+	}
+	return false
+}
+
+func wrapperHasUnsafeOption(words []*syntax.Word, flag byte) bool {
+	for _, word := range words {
+		option, literal := wordValue(word)
+		if !literal || option == "--" || !strings.HasPrefix(option, "-") {
+			return false
+		}
+		if strings.ContainsRune(option[1:], rune(flag)) {
+			return true
+		}
+	}
+	return false
+}
+
+func timeClauseCalls(file *syntax.File) map[*syntax.CallExpr]bool {
+	timed := make(map[*syntax.CallExpr]bool)
+	syntax.Walk(file, func(node syntax.Node) bool {
+		clause, ok := node.(*syntax.TimeClause)
+		if ok && clause.Stmt != nil {
+			if call, ok := clause.Stmt.Cmd.(*syntax.CallExpr); ok {
+				timed[call] = true
+			}
+		}
+		return true
+	})
+	return timed
+}
+
 func staticUnsafeArgManipulation(file *syntax.File, src string) bool {
 	unsafe := false
+	timed := timeClauseCalls(file)
 	syntax.Walk(file, func(node syntax.Node) bool {
 		if param, ok := node.(*syntax.ParamExp); ok && param.Excl && param.Exp != nil &&
 			(param.Exp.Op == syntax.AssignUnset || param.Exp.Op == syntax.AssignUnsetOrNull) {
@@ -458,7 +560,16 @@ func staticUnsafeArgManipulation(file *syntax.File, src string) bool {
 		if !ok || len(call.Args) == 0 {
 			return true
 		}
-		name, args := syntaxCallName(call.Args)
+		words := call.Args
+		if timed[call] {
+			if option, literal := wordValue(words[0]); literal && option == "--" {
+				words = words[1:]
+			}
+		}
+		if len(words) == 0 {
+			return true
+		}
+		name, args := syntaxCallName(words)
 		if name == "" {
 			return true
 		}
@@ -502,32 +613,77 @@ func unsafeDeclarationClause(decl *syntax.DeclClause, src string) bool {
 
 func syntaxCallName(words []*syntax.Word) (string, []*syntax.Word) {
 	name, ok := wordValue(words[0])
-	if !ok {
+	if !ok || strings.HasPrefix(name, "-") {
 		return "", nil
 	}
 	for (name == "command" || name == "builtin" || name == "exec" || name == "time") && len(words) > 1 {
-		wrapper := name
-		words = words[1:]
-		for len(words) > 0 {
-			option, literal := wordValue(words[0])
-			if !literal {
-				return "", nil
-			}
-			if option == "--" || wrapper == "time" && option == "-p" {
-				words = words[1:]
-				continue
-			}
-			break
+		words, ok = skipSyntaxWrapperOptions(name, words[1:])
+		if !ok {
+			return "", nil
 		}
 		if len(words) == 0 {
 			return "", nil
 		}
 		name, ok = wordValue(words[0])
-		if !ok {
+		if !ok || strings.HasPrefix(name, "-") {
 			return "", nil
 		}
 	}
 	return commandName(name), words[1:]
+}
+
+func skipSyntaxWrapperOptions(wrapper string, words []*syntax.Word) ([]*syntax.Word, bool) {
+	for len(words) > 0 {
+		option, literal := wordValue(words[0])
+		if !literal {
+			return nil, false
+		}
+		if option == "--" || wrapper == "time" && option == "-p" || wrapper == "command" && commandWrapperOption(option) {
+			words = words[1:]
+			continue
+		}
+		if wrapper == "exec" && execWrapperOption(option) {
+			if execOptionNeedsArg(option) {
+				if len(words) < 2 {
+					return nil, false
+				}
+				words = words[2:]
+			} else {
+				words = words[1:]
+			}
+			continue
+		}
+		break
+	}
+	return words, true
+}
+
+func execOptionNeedsArg(option string) bool {
+	return strings.Contains(option[1:], "a") && strings.IndexByte(option[1:], 'a') == len(option)-2
+}
+
+func commandWrapperOption(option string) bool {
+	if len(option) < 2 || option[0] != '-' {
+		return false
+	}
+	for _, r := range option[1:] {
+		if r != 'p' && r != 'v' && r != 'V' {
+			return false
+		}
+	}
+	return true
+}
+
+func execWrapperOption(option string) bool {
+	if len(option) < 2 || option[0] != '-' {
+		return false
+	}
+	for _, r := range option[1:] {
+		if r != 'a' && r != 'c' && r != 'l' {
+			return false
+		}
+	}
+	return true
 }
 
 func declarationCommand(name string) bool {

@@ -1520,6 +1520,84 @@ func TestArgStaticRound19WrappedBuiltinArguments(t *testing.T) {
 	}
 }
 
+func TestArgStaticRound20WrapperOptions(t *testing.T) {
+	for _, src := range []string{
+		`command "-p" printf %s '$HOME'`,
+		`exec "-a" x -- printf %s '$HOME'`,
+		`command "-p" read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`command -pv read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`command  -p read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`'command' -p read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`exec -a x -- read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`time -p -- read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`"time" -p read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`command -- -- read -r "$X$Y" <<<1; printf %s '$HOME'`,
+		`command -p -- builtin -- read -r "$X$Y" <<<1; printf %s '$HOME'`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		for _, call := range calls {
+			for i := range call.Args {
+				if call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = true for %q: %+v", i, src, call)
+				}
+			}
+		}
+	}
+
+	for _, src := range []string{
+		`builtin -- printf %s '$HOME'`,
+		`command -- printf %s '$HOME'`,
+		`exec -- printf %s '$HOME'`,
+		`time -p printf %s '$HOME'`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name != "printf" && call.Name != "command" {
+				continue
+			}
+			found = true
+			for i := range call.Args {
+				if !call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = false for safe option control %q: %+v", i, src, call)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("printf missing for option control %q", src)
+		}
+	}
+
+	for _, src := range []string{
+		`command -- -- printf %s '$HOME'`,
+		`exec -- -x printf %s '$HOME'`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		if len(calls) == 0 {
+			t.Errorf("Calls(%q) returned no calls", src)
+		}
+		for _, call := range calls {
+			if len(call.Args) == 0 {
+				continue
+			}
+			for i := range call.Args {
+				if call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = true for invalid wrapped name %q: %+v", i, src, call)
+				}
+			}
+		}
+	}
+}
+
 func TestArgStaticUnaffectedByInPlaceCallFilter(t *testing.T) {
 	for _, src := range []string{
 		`eval true; printf %s '$HOME'`,
