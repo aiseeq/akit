@@ -273,13 +273,15 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 			cleanup()
 		}
 	}()
-	for _, c := range opts.conds {
-		wc, ok := c.(wakeCond)
-		if !ok {
-			continue
-		}
-		ch, cleanup := wc.watch(wakeCtx)
-		cleanupWatches = append(cleanupWatches, cleanup)
+	fileEvents, cleanupFiles := watchFiles(wakeCtx, opts.conds)
+	cleanupWatches = append(cleanupWatches, cleanupFiles)
+	reservedFDs := 0
+	if fileEvents != nil {
+		reservedFDs = 2
+	}
+	exitEvents, cleanupExits := watchExits(wakeCtx, opts.conds, reservedFDs)
+	cleanupWatches = append(cleanupWatches, cleanupExits)
+	for _, ch := range []<-chan struct{}{fileEvents, exitEvents} {
 		if ch == nil {
 			continue
 		}

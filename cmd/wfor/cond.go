@@ -29,20 +29,11 @@ type cond interface {
 	state() string
 }
 
-// wakeCond supplies hints that a condition may have changed. check remains authoritative.
-type wakeCond interface {
-	watch(context.Context) (<-chan struct{}, func())
-}
-
 // fileCond — файл есть и не пуст.
 type fileCond struct {
 	path string
 	size int64
 	seen bool
-}
-
-func (c *fileCond) watch(ctx context.Context) (<-chan struct{}, func()) {
-	return watchFile(ctx, c.path)
 }
 
 func (c *fileCond) check(context.Context) (bool, error) {
@@ -116,64 +107,154 @@ type lineCond struct {
 	partial bool
 }
 
-func (c *lineCond) watch(ctx context.Context) (<-chan struct{}, func()) {
-	return watchFile(ctx, c.path)
-}
-
-// watchFile watches the containing directory so creation and atomic replacement are visible.
-func watchFile(ctx context.Context, path string) (<-chan struct{}, func()) {
+// watchFiles shares one inotify descriptor across every file and line condition.
+func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func()) {
+	dirs := fileWatchDirs(conds)
+	if len(dirs) == 0 {
+		return nil, func() {}
+	}
 	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
 	if err != nil { //nolint:silent-error-handling // Event support is optional; ticker checks remain the fallback.
 		return nil, func() {}
 	}
-	if _, err := unix.InotifyAddWatch(fd, filepath.Dir(path), unix.IN_CREATE|unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO|unix.IN_ATTRIB); err != nil { //nolint:silent-error-handling // Missing/unavailable parent paths fall back to ticker checks.
+	byWD := addInotifyWatches(fd, dirs)
+	if len(byWD) == 0 {
+		_ = unix.Close(fd)
+		return nil, func() {}
+	}
+	cancelFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil { //nolint:silent-error-handling // Cancellation support is optional; ticker checks remain the fallback.
 		_ = unix.Close(fd)
 		return nil, func() {}
 	}
 	out := make(chan struct{}, 1)
 	done := make(chan struct{})
-	name := filepath.Base(path)
-	go func() {
-		defer close(done)
-		buf := make([]byte, 4096)
+	stop := cancelPollOnContext(ctx, cancelFD)
+	go watchInotify(fd, cancelFD, byWD, out, done)
+	cleanup := func() {
+		stop()
+		signalEventFD(cancelFD)
+		closeAfterWatcher(done, func() {
+			_ = unix.Close(fd)
+			_ = unix.Close(cancelFD)
+		})
+	}
+	return out, cleanup
+}
+
+func fileWatchDirs(conds []cond) map[string]map[string]struct{} {
+	dirs := map[string]map[string]struct{}{}
+	for _, c := range conds {
+		var path string
+		switch fc := c.(type) {
+		case *fileCond:
+			path = fc.path
+		case *lineCond:
+			path = fc.path
+		default:
+			continue
+		}
+		dir, name := filepath.Dir(path), filepath.Base(path)
+		if dirs[dir] == nil {
+			dirs[dir] = map[string]struct{}{}
+		}
+		dirs[dir][name] = struct{}{}
+	}
+	return dirs
+}
+
+func addInotifyWatches(fd int, dirs map[string]map[string]struct{}) map[int]map[string]struct{} {
+	byWD := map[int]map[string]struct{}{}
+	for dir, names := range dirs {
+		wd, addErr := unix.InotifyAddWatch(fd, dir, unix.IN_CREATE|unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO|unix.IN_ATTRIB)
+		if addErr != nil { //nolint:silent-error-handling // Unavailable paths retain ticker checks.
+			continue
+		}
+		if byWD[wd] == nil {
+			byWD[wd] = map[string]struct{}{}
+		}
+		for name := range names {
+			byWD[wd][name] = struct{}{}
+		}
+	}
+	return byWD
+}
+
+func watchInotify(fd, cancelFD int, byWD map[int]map[string]struct{}, out chan<- struct{}, done chan<- struct{}) {
+	defer close(done)
+	buf := make([]byte, 4096)
+	for waitInotify(fd, cancelFD) {
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
+			n, err := unix.Read(fd, buf)
+			if err == unix.EAGAIN {
+				break
 			}
-			n, readErr := unix.Read(fd, buf)
-			if readErr == unix.EAGAIN || readErr == unix.EINTR {
-				timer := time.NewTimer(10 * time.Millisecond)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
+			if err == unix.EINTR {
 				continue
 			}
-			if readErr != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
+			if err != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
 				return
 			}
-			for off := 0; off+unix.SizeofInotifyEvent <= n; {
-				length := int(binary.LittleEndian.Uint32(buf[off+12 : off+16]))
-				if off+unix.SizeofInotifyEvent+length > n {
-					break
-				}
-				eventName := string(bytes.TrimRight(buf[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
-				if eventName == name {
-					select {
-					case out <- struct{}{}:
-					default:
-					}
-				}
-				off += unix.SizeofInotifyEvent + length
+			emitInotifyEvents(buf[:n], byWD, out)
+		}
+	}
+}
+
+func waitInotify(fd, cancelFD int) bool {
+	pollfds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}, {Fd: int32(cancelFD), Events: unix.POLLIN}}
+	for {
+		_, err := unix.Poll(pollfds, -1)
+		if err == unix.EINTR {
+			continue
+		}
+		return err == nil && pollfds[1].Revents == 0
+	}
+}
+
+func emitInotifyEvents(data []byte, byWD map[int]map[string]struct{}, out chan<- struct{}) {
+	for off := 0; off+unix.SizeofInotifyEvent <= len(data); {
+		wd := int(int32(binary.LittleEndian.Uint32(data[off : off+4])))
+		length := int(binary.LittleEndian.Uint32(data[off+12 : off+16]))
+		if off+unix.SizeofInotifyEvent+length > len(data) {
+			return
+		}
+		name := string(bytes.TrimRight(data[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
+		_, knownWD := byWD[wd]
+		_, knownName := byWD[wd][name]
+		if wd == -1 || knownWD && knownName {
+			select {
+			case out <- struct{}{}:
+			default:
 			}
 		}
-	}()
-	cleanup := func() { _ = unix.Close(fd); <-done }
-	return out, cleanup
+		off += unix.SizeofInotifyEvent + length
+	}
+}
+
+func signalEventFD(fd int) {
+	var value [8]byte
+	value[0] = 1
+	if _, err := unix.Write(fd, value[:]); err != nil && err != unix.EAGAIN {
+		return
+	}
+}
+
+func cancelPollOnContext(ctx context.Context, fd int) func() {
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		signalEventFD(fd)
+		close(finished)
+	})
+	return func() {
+		if !stop() {
+			<-finished
+		}
+	}
+}
+
+func closeAfterWatcher(done <-chan struct{}, closeFDs func()) {
+	<-done
+	closeFDs()
 }
 
 // markLen — сколько байт начала и края прочитанного сверяется, чтобы узнать перезапись на месте.
@@ -366,68 +447,95 @@ type exitCond struct {
 	absent []int // не было уже на старте: опечатка в pid выглядит так же, как конец процесса
 }
 
-func (c *exitCond) watch(ctx context.Context) (<-chan struct{}, func()) {
-	fds := openExitPidfds(trackedExitPIDs(c))
+func watchExits(ctx context.Context, conds []cond, reserved int) (<-chan struct{}, func()) {
+	fds := openExitPidfds(trackedExitPIDsFromConds(conds), reserved+1) // include this watcher's cancellation eventfd in the shared budget
 	if len(fds) == 0 {
+		return nil, func() {}
+	}
+	cancelFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil { //nolint:silent-error-handling // Pidfd watching is optional; the ticker remains the fallback.
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
 		return nil, func() {}
 	}
 	out := make(chan struct{}, 1)
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer func() {
-			for _, fd := range fds {
-				if fd >= 0 {
-					_ = unix.Close(fd)
-				}
-			}
-		}()
-		pollfds := make([]unix.PollFd, len(fds))
-		for i, fd := range fds {
-			pollfds[i] = unix.PollFd{Fd: int32(fd), Events: unix.POLLIN}
-		}
-		for len(pollfds) > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			active := 0
-			for _, pfd := range pollfds {
-				if pfd.Fd >= 0 {
-					active++
-				}
-			}
-			if active == 0 {
-				return
-			}
-			n, err := unix.Poll(pollfds, 25)
-			if err == unix.EINTR {
-				continue
-			}
-			if err != nil { //nolint:silent-error-handling // Polling is an optional wakeup; ticker checks remain the fallback.
-				return
-			}
-			if n == 0 {
-				continue
-			}
-			for i := range pollfds {
-				if pollfds[i].Fd < 0 {
-					continue
-				}
-				if pollfds[i].Revents != 0 {
-					select {
-					case out <- struct{}{}:
-					default:
-					}
-					pollfds[i].Fd = -1
-					continue
-				}
-			}
-		}
-	}()
-	cleanup := func() { <-done }
+	stop := cancelPollOnContext(ctx, cancelFD)
+	go watchPidfds(fds, cancelFD, out, done)
+	cleanup := func() {
+		stop()
+		signalEventFD(cancelFD)
+		closeAfterWatcher(done, func() { _ = unix.Close(cancelFD) })
+	}
 	return out, cleanup
+}
+
+func trackedExitPIDsFromConds(conds []cond) []int {
+	var pids []int
+	seen := map[int]struct{}{}
+	for _, condition := range conds {
+		ec, ok := condition.(*exitCond)
+		if !ok {
+			continue
+		}
+		for _, pid := range trackedExitPIDs(ec) {
+			if _, ok := seen[pid]; !ok {
+				seen[pid] = struct{}{}
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
+}
+
+func watchPidfds(fds []int, cancelFD int, out chan<- struct{}, done chan<- struct{}) {
+	defer close(done)
+	defer closeFDs(fds)
+	pollfds := make([]unix.PollFd, len(fds))
+	for i, fd := range fds {
+		pollfds[i] = unix.PollFd{Fd: int32(fd), Events: unix.POLLIN}
+	}
+	pollfds = append(pollfds, unix.PollFd{Fd: int32(cancelFD), Events: unix.POLLIN})
+	for activePollFDs(pollfds) > 0 {
+		_, err := unix.Poll(pollfds, -1)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil { //nolint:silent-error-handling // Polling is an optional wakeup; ticker checks remain the fallback.
+			return
+		}
+		if pollfds[len(pollfds)-1].Revents != 0 {
+			return
+		}
+		for i := 0; i < len(pollfds)-1; i++ {
+			if pollfds[i].Fd >= 0 && pollfds[i].Revents != 0 {
+				select {
+				case out <- struct{}{}:
+				default:
+				}
+				pollfds[i].Fd = -1
+			}
+		}
+	}
+}
+
+func activePollFDs(pollfds []unix.PollFd) int {
+	active := 0
+	for _, pfd := range pollfds[:len(pollfds)-1] {
+		if pfd.Fd >= 0 {
+			active++
+		}
+	}
+	return active
+}
+
+func closeFDs(fds []int) {
+	for _, fd := range fds {
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
+	}
 }
 
 func trackedExitPIDs(c *exitCond) []int {
@@ -446,9 +554,9 @@ func trackedExitPIDs(c *exitCond) []int {
 	return pids
 }
 
-func openExitPidfds(pids []int) []int {
+func openExitPidfds(pids []int, reserved int) []int {
 	var limit unix.Rlimit
-	if len(pids) == 0 || unix.Getrlimit(unix.RLIMIT_NOFILE, &limit) != nil || uint64(len(pids)) > limit.Cur/2 {
+	if len(pids) == 0 || unix.Getrlimit(unix.RLIMIT_NOFILE, &limit) != nil || !pidfdBudgetFits(len(pids), reserved, limit.Cur) {
 		return nil
 	}
 	var fds []int
@@ -463,6 +571,10 @@ func openExitPidfds(pids []int) []int {
 		fds = append(fds, fd)
 	}
 	return fds
+}
+
+func pidfdBudgetFits(pidfds, reserved int, nofileLimit uint64) bool {
+	return pidfds >= 0 && reserved >= 0 && uint64(pidfds+reserved) <= nofileLimit/2
 }
 
 func newExitCond(pids []int) (*exitCond, error) {

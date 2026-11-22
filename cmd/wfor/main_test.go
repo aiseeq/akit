@@ -195,6 +195,127 @@ func TestKernelWakeFileConditions(t *testing.T) {
 	})
 }
 
+func TestFileConditionsShareInotifyFDAndCloseAfterWatcherStops(t *testing.T) {
+	dir := t.TempDir()
+	conds := make([]cond, 27)
+	for i := range conds {
+		conds[i] = &lineCond{path: filepath.Join(dir, fmt.Sprintf("log-%d", i))}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, cleanup := watchFiles(ctx, conds)
+	if events == nil {
+		t.Fatal("file watcher unavailable")
+	}
+	if got := countInotifyFDs(t); got != 1 {
+		t.Fatalf("inotify descriptors = %d, want one shared descriptor", got)
+	}
+	cancel()
+	cleanup()
+	if got := countInotifyFDs(t); got != 0 {
+		t.Fatalf("inotify descriptors after cleanup = %d, want zero", got)
+	}
+}
+
+func TestWatcherFDsCloseOnlyAfterReaderStops(t *testing.T) {
+	done := make(chan struct{})
+	closed := make(chan struct{})
+	go closeAfterWatcher(done, func() { close(closed) })
+	select {
+	case <-closed:
+		t.Fatal("descriptor closed before watcher stopped")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(done)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("descriptor was not closed after watcher stopped")
+	}
+}
+
+func TestPIDFDsShareDescriptorBudgetWithInotify(t *testing.T) {
+	if pidfdBudgetFits(14, 3, 32) {
+		t.Fatal("14 pidfds plus the inotify and cancellation descriptors exceed half of RLIMIT_NOFILE=32")
+	}
+	if !pidfdBudgetFits(13, 3, 32) {
+		t.Fatal("13 pidfds plus watcher descriptors should fit the shared budget")
+	}
+}
+
+func TestFileWatcherIdleDoesNotPoll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quiet")
+	opts, err := parseArgs([]string{"line", "NEVER", path, "--every", "5s", "--timeout", "4s"}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, opts, io.Discard, io.Discard) }()
+	deadline := time.Now().Add(time.Second)
+	for countInotifyFDs(t) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if countInotifyFDs(t) == 0 {
+		cancel()
+		<-done
+		t.Fatal("inotify watcher did not start")
+	}
+	before := processContextSwitches(t)
+	window := time.NewTimer(2 * time.Second)
+	<-window.C
+	after := processContextSwitches(t)
+	cancel()
+	if code := <-done; code != exitTimeout {
+		t.Fatalf("run code=%d, want cancellation timeout", code)
+	}
+	if switches := after - before; switches > 150 {
+		t.Fatalf("idle watcher caused %d context switches in 2s, want at most 150", switches)
+	}
+}
+
+func processContextSwitches(t *testing.T) int {
+	t.Helper()
+	tasks, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, task := range tasks {
+		data, err := os.ReadFile(filepath.Join("/proc/self/task", task.Name(), "status"))
+		if err != nil {
+			t.Fatalf("read context switches for task %s: %v", task.Name(), err)
+		}
+		for line := range strings.SplitSeq(string(data), "\n") {
+			if strings.HasPrefix(line, "voluntary_ctxt_switches:") || strings.HasPrefix(line, "nonvoluntary_ctxt_switches:") {
+				fields := strings.Fields(line)
+				if len(fields) == 2 {
+					count, parseErr := strconv.Atoi(fields[1])
+					if parseErr == nil {
+						total += count
+					}
+				}
+			}
+		}
+	}
+	return total
+}
+
+func countInotifyFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err == nil && strings.HasPrefix(target, "anon_inode:inotify") {
+			count++
+		}
+	}
+	return count
+}
+
 func TestLineEventDoesNotMatchIncompleteLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
