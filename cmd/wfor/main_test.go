@@ -195,6 +195,127 @@ func TestKernelWakeFileConditions(t *testing.T) {
 	})
 }
 
+func TestLineWatcherWakesWhileWriterKeepsFileOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "held-open.log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := newLineCond("DONE", path, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, cleanup, err := watchFiles(ctx, []cond{line})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events == nil {
+		t.Fatal("file watcher unavailable")
+	}
+	defer func() {
+		cancel()
+		cleanup()
+	}()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("DONE\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IN_MODIFY did not wake the line watcher while the writer held the file open")
+	}
+	matched, err := line.checkEvent()
+	if err != nil || !matched {
+		t.Fatalf("line check while writer held file: matched=%v err=%v", matched, err)
+	}
+}
+
+func TestLineWatcherCoalescesWritesToWatchedFile(t *testing.T) {
+	const helperEnv = "AKIT_WFOR_BUSY_LINE_HELPER"
+	if watched := os.Getenv(helperEnv); watched != "" {
+		opts, err := parseArgs([]string{"line", "NEVER", watched, "--timeout", "3s", "--every", "10s"}, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := run(context.Background(), opts, io.Discard, io.Discard); code != exitTimeout {
+			t.Fatalf("helper run code=%d, want timeout", code)
+		}
+		return
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "watched.log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	helper := exec.Command(os.Args[0], "-test.run=^TestLineWatcherCoalescesWritesToWatchedFile$")
+	helper.Env = append(os.Environ(), helperEnv+"="+path)
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForInotifyFD(helper.Process.Pid, time.Second); err != nil {
+		_, _ = proc.StopChild(helper.Process.Pid, 0, nil)
+		_ = helper.Wait()
+		t.Fatal(err)
+	}
+	before := processCPUTicksForPID(t, helper.Process.Pid)
+	beforeSwitches := processContextSwitchesForPID(t, helper.Process.Pid)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		_, _ = proc.StopChild(helper.Process.Pid, 0, nil)
+		_ = helper.Wait()
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := f.WriteString("other\n"); err != nil {
+			_ = f.Close()
+			_, _ = proc.StopChild(helper.Process.Pid, 0, nil)
+			_ = helper.Wait()
+			t.Fatal(err)
+		}
+		timer := time.NewTimer(time.Millisecond)
+		<-timer.C
+	}
+	_ = f.Close()
+	after := processCPUTicksForPID(t, helper.Process.Pid)
+	afterSwitches := processContextSwitchesForPID(t, helper.Process.Pid)
+	if err := helper.Wait(); err != nil {
+		t.Fatalf("busy line watcher helper: %v", err)
+	}
+	if ticks := after - before; ticks > 10 {
+		t.Fatalf("watched-file writes used %d CPU ticks in 1.5s, want at most 10", ticks)
+	}
+	if switches := afterSwitches - beforeSwitches; switches > 500 {
+		t.Fatalf("watched-file writes caused %d context switches in 1.5s, want at most 500", switches)
+	}
+}
+
+func processCPUTicksForPID(t *testing.T, pid int) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 16 {
+		t.Fatalf("process %d stat has %d fields", pid, len(fields))
+	}
+	user, err := strconv.Atoi(fields[13])
+	if err != nil {
+		t.Fatal(err)
+	}
+	system, err := strconv.Atoi(fields[14])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return user + system
+}
+
 func TestFileConditionsShareInotifyFDAndCloseAfterWatcherStops(t *testing.T) {
 	dir := t.TempDir()
 	conds := make([]cond, 27)
@@ -202,7 +323,10 @@ func TestFileConditionsShareInotifyFDAndCloseAfterWatcherStops(t *testing.T) {
 		conds[i] = &lineCond{path: filepath.Join(dir, fmt.Sprintf("log-%d", i))}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	events, cleanup := watchFiles(ctx, conds)
+	events, cleanup, err := watchFiles(ctx, conds)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if events == nil {
 		t.Fatal("file watcher unavailable")
 	}
@@ -213,6 +337,127 @@ func TestFileConditionsShareInotifyFDAndCloseAfterWatcherStops(t *testing.T) {
 	cleanup()
 	if got := countInotifyFDs(t); got != 0 {
 		t.Fatalf("inotify descriptors after cleanup = %d, want zero", got)
+	}
+}
+
+func TestFileWatcherIgnoresWritesToUnrelatedFiles(t *testing.T) {
+	const helperEnv = "AKIT_WFOR_FILE_WATCH_HELPER"
+	if watched := os.Getenv(helperEnv); watched != "" {
+		opts, err := parseArgs([]string{"line", "NEVER", watched, "--timeout", "2500ms", "--every", "10s"}, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := run(context.Background(), opts, io.Discard, io.Discard); code != exitTimeout {
+			t.Fatalf("helper run code=%d, want timeout", code)
+		}
+		return
+	}
+	dir := t.TempDir()
+	watched := filepath.Join(dir, "watched")
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(watched, []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	helper := exec.Command(os.Args[0], "-test.run=^TestFileWatcherIgnoresWritesToUnrelatedFiles$")
+	helper.Env = append(os.Environ(), helperEnv+"="+watched)
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForInotifyFD(helper.Process.Pid, time.Second); err != nil {
+		_, _ = proc.StopChild(helper.Process.Pid, 0, nil)
+		_ = helper.Wait()
+		t.Fatal(err)
+	}
+	before := processContextSwitchesForPID(t, helper.Process.Pid)
+	f, err := os.OpenFile(other, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		_, _ = proc.StopChild(helper.Process.Pid, 0, nil)
+		_ = helper.Wait()
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := f.Write([]byte("x\n")); err != nil {
+			_ = f.Close()
+			_, _ = proc.StopChild(helper.Process.Pid, 0, nil)
+			_ = helper.Wait()
+			t.Fatal(err)
+		}
+		timer := time.NewTimer(time.Millisecond)
+		<-timer.C
+	}
+	_ = f.Close()
+	after := processContextSwitchesForPID(t, helper.Process.Pid)
+	if err := helper.Wait(); err != nil {
+		t.Fatalf("file watcher helper: %v", err)
+	}
+	if switches := after - before; switches > 500 {
+		t.Fatalf("unrelated writes caused %d wfor context switches in 1.5s, want at most 500", switches)
+	}
+}
+
+func waitForInotifyFD(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		if err != nil {
+			return fmt.Errorf("read helper descriptors: %w", err)
+		}
+		for _, entry := range entries {
+			target, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", entry.Name()))
+			if err == nil && strings.HasPrefix(target, "anon_inode:inotify") {
+				return nil
+			}
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		<-timer.C
+	}
+	return fmt.Errorf("helper %d did not start its inotify watcher within %s", pid, timeout)
+}
+
+func TestDirectoryWatchMaskOnlyTracksNames(t *testing.T) {
+	if directoryWatchMask&(unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_ATTRIB) != 0 {
+		t.Fatalf("directory watch mask includes content/metadata events: %#x", directoryWatchMask)
+	}
+	want := unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM
+	if directoryWatchMask&want != want {
+		t.Fatalf("directory watch mask misses name lifecycle events: %#x", directoryWatchMask)
+	}
+}
+
+type retryFDCheck struct {
+	t     *testing.T
+	calls int
+}
+
+func (c *retryFDCheck) check(context.Context) (bool, error) {
+	c.calls++
+	if c.calls == 1 {
+		return false, unix.EMFILE
+	}
+	if got := countInotifyFDs(c.t); got != 0 {
+		return false, fmt.Errorf("inotify descriptors after EMFILE retry = %d", got)
+	}
+	return true, nil
+}
+
+func (*retryFDCheck) String() string { return "retry-fd-check" }
+func (*retryFDCheck) state() string  { return "waiting" }
+
+func TestRunRetriesEMFILEWithoutWatchers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	base, err := parseArgs([]string{"line", "NEVER", path, "--timeout", "1s"}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := &retryFDCheck{t: t}
+	base.conds = append([]cond{check}, base.conds...)
+	base.any = true
+	if code := run(context.Background(), base, io.Discard, io.Discard); code != 0 {
+		t.Fatalf("run after EMFILE retry = %d, want 0", code)
+	}
+	if check.calls != 2 {
+		t.Fatalf("condition checks = %d, want retry once", check.calls)
 	}
 }
 
@@ -234,11 +479,11 @@ func TestWatcherFDsCloseOnlyAfterReaderStops(t *testing.T) {
 }
 
 func TestPIDFDsShareDescriptorBudgetWithInotify(t *testing.T) {
-	if pidfdBudgetFits(14, 3, 32) {
-		t.Fatal("14 pidfds plus the inotify and cancellation descriptors exceed half of RLIMIT_NOFILE=32")
+	if pidfdBudgetFits(14, 3, 16) {
+		t.Fatal("14 pidfds plus reserved descriptors exceed 16 available descriptors")
 	}
-	if !pidfdBudgetFits(13, 3, 32) {
-		t.Fatal("13 pidfds plus watcher descriptors should fit the shared budget")
+	if !pidfdBudgetFits(13, 3, 16) {
+		t.Fatal("13 pidfds plus reserved descriptors should fit 16 available descriptors")
 	}
 }
 
@@ -275,13 +520,18 @@ func TestFileWatcherIdleDoesNotPoll(t *testing.T) {
 
 func processContextSwitches(t *testing.T) int {
 	t.Helper()
-	tasks, err := os.ReadDir("/proc/self/task")
+	return processContextSwitchesForPID(t, os.Getpid())
+}
+
+func processContextSwitchesForPID(t *testing.T, pid int) int {
+	t.Helper()
+	tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
 	if err != nil {
 		t.Fatal(err)
 	}
 	total := 0
 	for _, task := range tasks {
-		data, err := os.ReadFile(filepath.Join("/proc/self/task", task.Name(), "status"))
+		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "task", task.Name(), "status"))
 		if err != nil {
 			t.Fatalf("read context switches for task %s: %v", task.Name(), err)
 		}

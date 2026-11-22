@@ -21,6 +21,7 @@ import (
 	"github.com/aiseeq/akit/clihelp"
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/timearg"
+	"golang.org/x/sys/unix"
 )
 
 const usage = `wfor — wait for conditions in one call, with a timeout.
@@ -264,70 +265,34 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	defer tick.Stop()
 	wakeCtx, stopWatches := context.WithCancel(ctx)
 	wake := make(chan struct{}, 1)
-	var cleanupWatches []func()
 	var wakeReaders sync.WaitGroup
-	defer func() {
-		stopWatches()
-		wakeReaders.Wait()
-		for _, cleanup := range cleanupWatches {
-			cleanup()
-		}
-	}()
-	fileEvents, cleanupFiles := watchFiles(wakeCtx, opts.conds)
-	cleanupWatches = append(cleanupWatches, cleanupFiles)
-	reservedFDs := 0
-	if fileEvents != nil {
-		reservedFDs = 2
-	}
-	exitEvents, cleanupExits := watchExits(wakeCtx, opts.conds, reservedFDs)
-	cleanupWatches = append(cleanupWatches, cleanupExits)
-	for _, ch := range []<-chan struct{}{fileEvents, exitEvents} {
-		if ch == nil {
-			continue
-		}
-		wakeReaders.Add(1)
-		go func(events <-chan struct{}) {
-			defer wakeReaders.Done()
-			for {
-				select {
-				case <-wakeCtx.Done():
-					return
-				case _, open := <-events:
-					if !open {
-						return
-					}
-					select {
-					case wake <- struct{}{}:
-					default:
-					}
-				}
+	cleanupWatches := setupWakeWatchers(wakeCtx, opts.conds, wake, &wakeReaders, stderr)
+	var cleanupOnce sync.Once
+	watchersDisabled := false
+	cleanupAll := func() {
+		cleanupOnce.Do(func() {
+			watchersDisabled = true
+			stopWatches()
+			wakeReaders.Wait()
+			for _, cleanup := range cleanupWatches {
+				cleanup()
 			}
-		}(ch)
+		})
 	}
+	defer func() {
+		cleanupAll()
+	}()
 	eventCheck := false
 	for {
-		for i, c := range opts.conds {
-			if met[i] {
+		retryWithoutWatchers, checkErr := checkConditions(ctx, opts.conds, met, eventCheck, watchersDisabled)
+		if checkErr != nil {
+			if retryWithoutWatchers {
+				cleanupAll()
+				eventCheck = false
 				continue
 			}
-			var ok bool
-			var err error
-			if eventCheck {
-				if ec, yes := c.(interface {
-					checkEvent() (bool, error)
-				}); yes {
-					ok, err = ec.checkEvent()
-				} else {
-					ok, err = c.check(ctx)
-				}
-			} else {
-				ok, err = c.check(ctx)
-			}
-			if err != nil {
-				fmt.Fprintf(stderr, "wfor: %v\n", err)
-				return exitUsage
-			}
-			met[i] = ok
+			fmt.Fprintf(stderr, "wfor: %v\n", checkErr)
+			return exitUsage
 		}
 		if done(met, opts.any) {
 			fmt.Fprintf(stdout, "wfor: done in %s: %s\n", since(start), describe(opts.conds, met, true))
@@ -340,8 +305,95 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 		case <-tick.C:
 			eventCheck = false
 		case <-wake:
+			if !waitEventDebounce(ctx) {
+				fmt.Fprintln(stdout, timeoutReport(opts.conds, met, start))
+				return exitTimeout
+			}
 			eventCheck = true
 		}
+	}
+}
+
+func setupWakeWatchers(ctx context.Context, conds []cond, wake chan<- struct{}, readers *sync.WaitGroup, stderr io.Writer) []func() {
+	fileEvents, cleanupFiles, watchErr := watchFiles(ctx, conds)
+	if watchErr != nil {
+		fmt.Fprintf(stderr, "wfor: file event watcher unavailable; using periodic checks: %v\n", watchErr)
+	}
+	cleanups := []func(){cleanupFiles}
+	reservedFDs := 0
+	if fileEvents != nil {
+		reservedFDs = 2
+	}
+	exitEvents, cleanupExits, watchErr := watchExits(ctx, conds, reservedFDs)
+	if watchErr != nil {
+		fmt.Fprintf(stderr, "wfor: process event watcher unavailable; using periodic checks: %v\n", watchErr)
+	}
+	cleanups = append(cleanups, cleanupExits)
+	for _, events := range []<-chan struct{}{fileEvents, exitEvents} {
+		if events == nil {
+			continue
+		}
+		readers.Add(1)
+		go forwardWakeEvents(ctx, events, wake, readers)
+	}
+	return cleanups
+}
+
+func forwardWakeEvents(ctx context.Context, events <-chan struct{}, wake chan<- struct{}, readers *sync.WaitGroup) {
+	defer readers.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, open := <-events:
+			if !open {
+				return
+			}
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func checkConditions(ctx context.Context, conds []cond, met []bool, eventCheck, watchersDisabled bool) (bool, error) {
+	for i, c := range conds {
+		if met[i] {
+			continue
+		}
+		ok, err := checkCondition(ctx, c, eventCheck)
+		if err != nil {
+			if !watchersDisabled && (errors.Is(err, unix.EMFILE) || errors.Is(err, unix.ENFILE)) {
+				if oc, ok := c.(*okCond); ok {
+					oc.next = time.Time{}
+				}
+				return true, err
+			}
+			return false, err
+		}
+		met[i] = ok
+	}
+	return false, nil
+}
+
+func checkCondition(ctx context.Context, c cond, eventCheck bool) (bool, error) {
+	if eventCheck {
+		if eventCond, ok := c.(interface{ checkEvent() (bool, error) }); ok {
+			return eventCond.checkEvent()
+		}
+	}
+	return c.check(ctx)
+}
+
+func waitEventDebounce(ctx context.Context) bool {
+	timer := time.NewTimer(inotifyCheckInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

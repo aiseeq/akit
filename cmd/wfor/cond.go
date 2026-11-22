@@ -107,30 +107,39 @@ type lineCond struct {
 	partial bool
 }
 
+const inotifyCheckInterval = 200 * time.Millisecond
+
 // watchFiles shares one inotify descriptor across every file and line condition.
-func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func()) {
+func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func(), error) {
 	dirs := fileWatchDirs(conds)
 	if len(dirs) == 0 {
-		return nil, func() {}
+		return nil, func() {}, nil
+	}
+	available, err := availableFDs()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if available < 8 {
+		return nil, func() {}, nil
 	}
 	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
 	if err != nil { //nolint:silent-error-handling // Event support is optional; ticker checks remain the fallback.
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
-	byWD := addInotifyWatches(fd, dirs)
+	byWD, fileMasks, paths, dirWDs := addInotifyWatches(fd, dirs)
 	if len(byWD) == 0 {
 		_ = unix.Close(fd)
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	cancelFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
 	if err != nil { //nolint:silent-error-handling // Cancellation support is optional; ticker checks remain the fallback.
 		_ = unix.Close(fd)
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	out := make(chan struct{}, 1)
 	done := make(chan struct{})
 	stop := cancelPollOnContext(ctx, cancelFD)
-	go watchInotify(fd, cancelFD, byWD, out, done)
+	go watchInotify(ctx, fd, cancelFD, byWD, fileMasks, paths, dirWDs, out, done)
 	cleanup := func() {
 		stop()
 		signalEventFD(cancelFD)
@@ -139,11 +148,11 @@ func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func()) {
 			_ = unix.Close(cancelFD)
 		})
 	}
-	return out, cleanup
+	return out, cleanup, nil
 }
 
-func fileWatchDirs(conds []cond) map[string]map[string]struct{} {
-	dirs := map[string]map[string]struct{}{}
+func fileWatchDirs(conds []cond) map[string]map[string]uint32 {
+	dirs := map[string]map[string]uint32{}
 	for _, c := range conds {
 		var path string
 		switch fc := c.(type) {
@@ -156,31 +165,61 @@ func fileWatchDirs(conds []cond) map[string]map[string]struct{} {
 		}
 		dir, name := filepath.Dir(path), filepath.Base(path)
 		if dirs[dir] == nil {
-			dirs[dir] = map[string]struct{}{}
+			dirs[dir] = map[string]uint32{}
 		}
-		dirs[dir][name] = struct{}{}
+		mask := uint32(unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM)
+		switch c.(type) {
+		case *lineCond:
+			mask |= unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
+		case *fileCond:
+			mask |= unix.IN_CLOSE_WRITE | unix.IN_ATTRIB | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
+		}
+		dirs[dir][name] |= mask
 	}
 	return dirs
 }
 
-func addInotifyWatches(fd int, dirs map[string]map[string]struct{}) map[int]map[string]struct{} {
+const directoryWatchMask = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM
+
+func addInotifyWatches(fd int, dirs map[string]map[string]uint32) (map[int]map[string]struct{}, map[int]uint32, map[string]map[string]uint32, map[int]string) {
 	byWD := map[int]map[string]struct{}{}
+	fileMasks := map[int]uint32{}
+	paths := map[string]map[string]uint32{}
+	dirWDs := map[int]string{}
 	for dir, names := range dirs {
-		wd, addErr := unix.InotifyAddWatch(fd, dir, unix.IN_CREATE|unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO|unix.IN_ATTRIB)
+		wd, addErr := unix.InotifyAddWatch(fd, dir, directoryWatchMask)
 		if addErr != nil { //nolint:silent-error-handling // Unavailable paths retain ticker checks.
 			continue
 		}
 		if byWD[wd] == nil {
 			byWD[wd] = map[string]struct{}{}
 		}
-		for name := range names {
+		dirWDs[wd] = dir
+		for name, fileMask := range names {
 			byWD[wd][name] = struct{}{}
+			path := filepath.Join(dir, name)
+			if paths[dir] == nil {
+				paths[dir] = map[string]uint32{}
+			}
+			paths[dir][name] = fileMask
+			addFileInotifyWatch(fd, path, fileMask, byWD, fileMasks)
 		}
 	}
-	return byWD
+	return byWD, fileMasks, paths, dirWDs
 }
 
-func watchInotify(fd, cancelFD int, byWD map[int]map[string]struct{}, out chan<- struct{}, done chan<- struct{}) {
+func addFileInotifyWatch(fd int, path string, mask uint32, byWD map[int]map[string]struct{}, fileMasks map[int]uint32) {
+	wd, err := unix.InotifyAddWatch(fd, path, mask)
+	if err == nil {
+		if byWD[wd] == nil {
+			byWD[wd] = map[string]struct{}{}
+		}
+		byWD[wd][""] = struct{}{}
+		fileMasks[wd] |= mask
+	}
+}
+
+func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, paths map[string]map[string]uint32, dirWDs map[int]string, out chan<- struct{}, done chan<- struct{}) {
 	defer close(done)
 	buf := make([]byte, 4096)
 	for waitInotify(fd, cancelFD) {
@@ -195,8 +234,24 @@ func watchInotify(fd, cancelFD int, byWD map[int]map[string]struct{}, out chan<-
 			if err != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
 				return
 			}
-			emitInotifyEvents(buf[:n], byWD, out)
+			emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, paths, dirWDs, out)
+			// Let the kernel collect a burst instead of waking this reader for every write.
+			if !waitInotifyCooldown(ctx) {
+				return
+			}
+			break
 		}
+	}
+}
+
+func waitInotifyCooldown(ctx context.Context) bool {
+	timer := time.NewTimer(inotifyCheckInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -211,23 +266,40 @@ func waitInotify(fd, cancelFD int) bool {
 	}
 }
 
-func emitInotifyEvents(data []byte, byWD map[int]map[string]struct{}, out chan<- struct{}) {
+func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, paths map[string]map[string]uint32, dirWDs map[int]string, out chan<- struct{}) {
+	notify := false
 	for off := 0; off+unix.SizeofInotifyEvent <= len(data); {
 		wd := int(int32(binary.LittleEndian.Uint32(data[off : off+4])))
+		mask := binary.LittleEndian.Uint32(data[off+4 : off+8])
 		length := int(binary.LittleEndian.Uint32(data[off+12 : off+16]))
 		if off+unix.SizeofInotifyEvent+length > len(data) {
 			return
 		}
 		name := string(bytes.TrimRight(data[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
-		_, knownWD := byWD[wd]
-		_, knownName := byWD[wd][name]
-		if wd == -1 || knownWD && knownName {
-			select {
-			case out <- struct{}{}:
-			default:
+		_, fileWatch := byWD[wd][""]
+		if mask&unix.IN_IGNORED != 0 {
+			delete(byWD, wd)
+			delete(fileMasks, wd)
+			delete(dirWDs, wd)
+		} else if fileWatch && name == "" {
+			notify = notify || mask&fileMasks[wd] != 0
+		} else if names, ok := byWD[wd]; ok {
+			if _, relevant := names[name]; relevant {
+				// The event's watch descriptor identifies the directory; rearm the target file after create/rename.
+				dir := dirWDs[wd]
+				if fileMask, exists := paths[dir][name]; exists && mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 {
+					addFileInotifyWatch(fd, filepath.Join(dir, name), fileMask, byWD, fileMasks)
+				}
+				notify = true
 			}
 		}
 		off += unix.SizeofInotifyEvent + length
+	}
+	if notify {
+		select {
+		case out <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -447,17 +519,20 @@ type exitCond struct {
 	absent []int // не было уже на старте: опечатка в pid выглядит так же, как конец процесса
 }
 
-func watchExits(ctx context.Context, conds []cond, reserved int) (<-chan struct{}, func()) {
-	fds := openExitPidfds(trackedExitPIDsFromConds(conds), reserved+1) // include this watcher's cancellation eventfd in the shared budget
+func watchExits(ctx context.Context, conds []cond, reserved int) (<-chan struct{}, func(), error) {
+	fds, err := openExitPidfds(trackedExitPIDsFromConds(conds), reserved+1) // include this watcher's cancellation eventfd in the shared budget
+	if err != nil {
+		return nil, func() {}, err
+	}
 	if len(fds) == 0 {
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	cancelFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
 	if err != nil { //nolint:silent-error-handling // Pidfd watching is optional; the ticker remains the fallback.
 		for _, fd := range fds {
 			_ = unix.Close(fd)
 		}
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	out := make(chan struct{}, 1)
 	done := make(chan struct{})
@@ -468,7 +543,7 @@ func watchExits(ctx context.Context, conds []cond, reserved int) (<-chan struct{
 		signalEventFD(cancelFD)
 		closeAfterWatcher(done, func() { _ = unix.Close(cancelFD) })
 	}
-	return out, cleanup
+	return out, cleanup, nil
 }
 
 func trackedExitPIDsFromConds(conds []cond) []int {
@@ -554,27 +629,58 @@ func trackedExitPIDs(c *exitCond) []int {
 	return pids
 }
 
-func openExitPidfds(pids []int, reserved int) []int {
-	var limit unix.Rlimit
-	if len(pids) == 0 || unix.Getrlimit(unix.RLIMIT_NOFILE, &limit) != nil || !pidfdBudgetFits(len(pids), reserved, limit.Cur) {
-		return nil
+func openExitPidfds(pids []int, reserved int) ([]int, error) {
+	if len(pids) == 0 {
+		return nil, nil
+	}
+	available, err := availableFDs()
+	if err != nil {
+		return nil, err
+	}
+	if available <= reserved+5 {
+		return nil, nil
+	}
+	maxPIDFDs := available - reserved - 5 // keep room for the exit cancellation fd and condition checks
+	if len(pids) > maxPIDFDs {
+		pids = pids[:maxPIDFDs]
 	}
 	var fds []int
 	for _, pid := range pids {
 		fd, err := unix.PidfdOpen(pid, 0)
-		if err != nil { //nolint:silent-error-handling // Pidfds are optional; any open failure falls back to ticker checks.
-			for _, opened := range fds {
-				_ = unix.Close(opened)
-			}
-			return nil
+		if err != nil { //nolint:silent-error-handling // Keep successfully opened pidfds; this PID remains covered by ticker checks.
+			continue
 		}
 		fds = append(fds, fd)
 	}
-	return fds
+	return fds, nil
 }
 
 func pidfdBudgetFits(pidfds, reserved int, nofileLimit uint64) bool {
-	return pidfds >= 0 && reserved >= 0 && uint64(pidfds+reserved) <= nofileLimit/2
+	return pidfds >= 0 && reserved >= 0 && uint64(pidfds+reserved) <= nofileLimit
+}
+
+// availableFDs counts descriptors that can be opened now, including inherited descriptors.
+func availableFDs() (int, error) {
+	var limit unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+		return 0, fmt.Errorf("get descriptor limit: %w", err)
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return 0, fmt.Errorf("count open descriptors: %w", err)
+	}
+	used := uint64(len(entries))
+	if used > 0 { // ReadDir itself owns one fd, closed before this function returns.
+		used--
+	}
+	if limit.Cur <= used {
+		return 0, nil
+	}
+	free := limit.Cur - used
+	if free > uint64(^uint(0)>>1) {
+		return int(^uint(0) >> 1), nil
+	}
+	return int(free), nil
 }
 
 func newExitCond(pids []int) (*exitCond, error) {
