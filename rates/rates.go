@@ -14,7 +14,9 @@ import (
 )
 
 // Rate is one rates.tsv row. Invalid numeric fields retain their source cell
-// and line so callers can explain a bad selected rate. A row carries its cells
+// and line so callers can explain a bad selected rate; a numeric column the
+// header lacks (only valid_from and provider are required) is such an error too.
+// ValidFrom of a date-only cell is midnight in the zone of the now given to Read. A row carries its cells
 // for Cell, so rows of two Read calls are not == even for the same file; copies
 // of one row are.
 type Rate struct {
@@ -88,7 +90,7 @@ func Read(path string, now time.Time) (Table, error) {
 			for i, name := range fields {
 				columns[name] = i
 			}
-			for _, name := range []string{"valid_from", "provider", "plan_usd_month", "api_usd_week"} {
+			for _, name := range []string{"valid_from", "provider"} {
 				if _, ok := columns[name]; !ok {
 					return Table{}, fmt.Errorf("%s: header missing %s", path, name)
 				}
@@ -123,7 +125,7 @@ func Read(path string, now time.Time) (Table, error) {
 }
 
 func parseRow(path string, lineNo int, fields []string, columns map[string]int, now time.Time) (Rate, bool, error) {
-	valid, err := parseDate(fields[columns["valid_from"]])
+	valid, err := parseDate(fields[columns["valid_from"]], now.Location())
 	if err != nil {
 		return Rate{}, false, fmt.Errorf("%s:%d:valid_from: invalid date", path, lineNo)
 	}
@@ -131,8 +133,8 @@ func parseRow(path string, lineNo int, fields []string, columns map[string]int, 
 		return Rate{}, false, nil
 	}
 	row := Rate{Provider: fields[columns["provider"]], ValidFrom: valid, Line: lineNo}
-	row.PlanUSDMonth, row.InvalidPlan = rateNumber(path, lineNo, "plan_usd_month", fields[columns["plan_usd_month"]])
-	row.APIUSDWeek, row.InvalidWeek = rateNumber(path, lineNo, "api_usd_week", fields[columns["api_usd_week"]])
+	row.PlanUSDMonth, row.InvalidPlan = rateColumn(path, lineNo, "plan_usd_month", fields, columns)
+	row.APIUSDWeek, row.InvalidWeek = rateColumn(path, lineNo, "api_usd_week", fields, columns)
 	if i, ok := columns["plan"]; ok {
 		row.Plan = fields[i]
 	}
@@ -178,6 +180,16 @@ func (t Table) PlansAtLatest(provider string) []string {
 	return slices.Sorted(maps.Keys(seen))
 }
 
+// rateColumn parses a numeric column the header may lack: a missing column is
+// an error only for the caller that reads the value.
+func rateColumn(path string, line int, column string, fields []string, columns map[string]int) (float64, error) {
+	i, ok := columns[column]
+	if !ok {
+		return 0, fmt.Errorf("%s:%d:%s: header missing %s", path, line, column, column)
+	}
+	return rateNumber(path, line, column, fields[i])
+}
+
 func rateNumber(path string, line int, column, value string) (float64, error) {
 	n, err := strconv.ParseFloat(value, 64)
 	if err != nil {
@@ -189,8 +201,10 @@ func rateNumber(path string, line int, column, value string) (float64, error) {
 	return n, nil
 }
 
-func parseDate(value string) (time.Time, error) {
-	if date, err := time.ParseInLocation(time.DateOnly, value, time.Local); err == nil {
+// parseDate reads a date in loc, the zone of the caller's now: a process serving
+// requests from other zones compares the date in the requester's zone.
+func parseDate(value string, loc *time.Location) (time.Time, error) {
+	if date, err := time.ParseInLocation(time.DateOnly, value, loc); err == nil {
 		return date, nil
 	}
 	return time.Parse(time.RFC3339, value)
