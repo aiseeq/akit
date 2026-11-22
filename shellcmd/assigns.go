@@ -2,6 +2,7 @@ package shellcmd
 
 import (
 	"maps"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -24,10 +25,9 @@ type Assign struct {
 	Tilde Tilde
 	// Append marks `S+=x`: Value is added to the previous value.
 	Append bool
-	// Unknown marks a possible assignment whose value cannot be determined statically, such as
-	// an array assignment or a call to a function that may change the variable. This analysis does
-	// not track writes through read, printf -v, mapfile, ${S:=…}, (( S=1 )), let, source or ., aliases,
-	// namerefs, eval assignments such as eval 'S=…', or unset.
+	// Unknown marks a possible assignment whose value cannot be determined statically, including
+	// arithmetic and nameref writes, literal executable strings, and uncertain control flow. Dynamic
+	// executable strings, indirect nameref targets, source contents and unset are not resolved.
 	Unknown bool
 	// Offset is the byte offset of the assignment in the command.
 	Offset int
@@ -104,10 +104,10 @@ func (a Assign) VisibleAt(off int) bool {
 // changes a variable. A dynamic command word may also call any such function. Scripts passed as
 // quoted arguments (`bash -c '…'`) and declarations behind another
 // word (`command export S=x`) are not read. `command f` and `builtin f` are treated as calls to
-// those command names, not as calls to f. Writes through `read`, `printf -v`, `mapfile`, `${S:=…}`,
-// `(( S=1 ))`, `let`, `source` or `.`, aliases, namerefs, eval assignment strings, and `unset` are
-// not tracked. Trap, mapfile -C, aliases and lastpipe are left to consumers of
-// Scopes, which reports the command regions and their kinds.
+// those command names, not as calls to f. Arithmetic, nameref writes, literal executable strings,
+// conditional branches, loops and here-document expansions are conservatively tracked. Dynamic
+// executable strings and indirect nameref targets cannot be resolved; source contents and unset
+// are not tracked.
 func Assigns(cmd string) ([]Assign, error) {
 	file, full, err := parseShellVariant(cmd, false)
 	if err != nil {
@@ -118,10 +118,17 @@ func Assigns(cmd string) ([]Assign, error) {
 	ctx.assignmentModes = assignmentShellModes(file, full)
 	ctx.declarations = declarationAssignments(file)
 	uncertainRedirects := uncertainRedirectStatements(file)
+	hereDocExec := hereDocAssignmentExecutions(file, ctx, cmd)
 	var out []Assign
 	syntax.Walk(file, func(node syntax.Node) bool {
 		assignments := assignmentsForNode(node, full, ctx)
 		for i := range assignments {
+			if execution, ok := hereDocExec[assignments[i].Offset]; ok {
+				assignments[i].Offset = execution.offset
+				if execution.scopeStart != -2 {
+					assignments[i].ScopeStart, assignments[i].ScopeEnd = execution.scopeStart, execution.scopeEnd
+				}
+			}
 			if insideAny(uncertainRedirects, assignments[i].Offset) {
 				assignments[i].Value = ""
 				assignments[i].Tilde = 0
@@ -132,8 +139,367 @@ func Assigns(cmd string) ([]Assign, error) {
 		out = append(out, assignments...)
 		return true
 	})
+	out = append(out, implicitAndDeferredAssignments(file, cmd, ctx, uncertainRedirects)...)
 	slices.SortStableFunc(out, func(a, b Assign) int { return a.Offset - b.Offset })
 	return out, nil
+}
+
+var arithmeticWrite = regexp.MustCompile(`(?:^|[^[:alnum:]_])([[:alpha:]_][[:alnum:]_]*)\s*(?:\+\+|--|[+*/%&|^~-]?=)`)
+var namerefDeclaration = regexp.MustCompile(`(?:declare|local|typeset)\s+-[[:alnum:]]*n[[:alnum:]]*\s+([[:alpha:]_][[:alnum:]_]*)=([^[:space:];]+)`)
+var literalAssignmentName = regexp.MustCompile(`(?:^|[;[:space:]])([[:alpha:]_][[:alnum:]_]*)\s*=`)
+var variableName = regexp.MustCompile(`^[[:alpha:]_][[:alnum:]_]*$`)
+
+func isBuiltinCommand(name string) bool {
+	switch name {
+	case ".", ":", "[", "[[", "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd", "command", "compgen", "complete", "continue", "declare", "dirs", "disown", "echo", "enable", "eval", "exec", "exit", "export", "false", "fc", "fg", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "logout", "mapfile", "printf", "pushd", "pwd", "read", "readarray", "readonly", "return", "set", "shift", "shopt", "source", "suspend", "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "wait":
+		return true
+	default:
+		return false
+	}
+}
+
+func lastpipeEnabledAt(src string, off int) bool {
+	if off > len(src) {
+		off = len(src)
+	}
+	prefix := src[:off]
+	enable := strings.LastIndex(prefix, "shopt -s lastpipe")
+	disable := strings.LastIndex(prefix, "shopt -u lastpipe")
+	return enable >= 0 && enable > disable
+}
+
+type hereDocExecution struct{ offset, scopeStart, scopeEnd int }
+
+func hereDocAssignmentExecutions(file *syntax.File, ctx assignContext, src string) map[int]hereDocExecution {
+	result := make(map[int]hereDocExecution)
+	syntax.Walk(file, func(n syntax.Node) bool {
+		stmt, ok := n.(*syntax.Stmt)
+		if !ok || len(stmt.Redirs) == 0 {
+			return true
+		}
+		start := int(stmt.Pos().Offset())
+		child := false
+		if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && len(call.Args) > 0 {
+			name, literal := wordValue(call.Args[0])
+			child = literal && !isBuiltinCommand(name) && !ctx.functionNameSet[name]
+		}
+		for _, redir := range stmt.Redirs {
+			if redir.Hdoc == nil || redir.Op == syntax.WordHdoc {
+				continue
+			}
+			docStart, docEnd := int(redir.Hdoc.Pos().Offset()), int(redir.Hdoc.End().Offset())
+			// A builtin redirect can precede another command on the same command line;
+			// in that case its expansion runs before the later command's argument expansion.
+			deferToCommand := !child && start <= docStart && docStart <= len(src) && strings.Contains(src[start:docStart], ";")
+			if !child && !deferToCommand {
+				continue
+			}
+			syntax.Walk(stmt, func(childNode syntax.Node) bool {
+				a, ok := childNode.(*syntax.Assign)
+				if !ok {
+					return true
+				}
+				off := int(a.Pos().Offset())
+				if docStart <= off && off < docEnd {
+					scopeStart, scopeEnd := -1, -1
+					if child {
+						scopeStart, scopeEnd = docStart, docEnd
+					} else {
+						scopeStart, scopeEnd = -2, -2
+					}
+					execOffset := off
+					if deferToCommand {
+						execOffset = start
+					}
+					result[off] = hereDocExecution{offset: execOffset, scopeStart: scopeStart, scopeEnd: scopeEnd}
+				}
+				return true
+			})
+		}
+		return true
+	})
+	return result
+}
+
+// implicitAndDeferredAssignments adds conservative writes whose execution point differs from
+// their textual position. Nameref targets are only resolved when the declaration names a literal
+// variable; dynamic target expressions conservatively mark the reference variable itself.
+func implicitAndDeferredAssignments(file *syntax.File, src string, ctx assignContext, uncertainRedirects []span) []Assign {
+	ordinary := collectOrdinaryAssignments(file, src, ctx)
+	var out []Assign
+	out = append(out, namerefWrites(src, ordinary, ctx)...)
+	out = append(out, literalCommandWrites(file, src, ordinary, ctx)...)
+	hereDocs := hereDocSpans(file)
+	out = append(out, arithmeticWrites(file, src)...)
+	out = append(out, uncertainFlowWrites(file, ordinary, uncertainRedirects, hereDocs)...)
+	return out
+}
+
+func collectOrdinaryAssignments(file *syntax.File, src string, ctx assignContext) []Assign {
+	var out []Assign
+	syntax.Walk(file, func(n syntax.Node) bool { out = append(out, assignmentsForNode(n, src, ctx)...); return true })
+	return out
+}
+
+func namerefWrites(src string, ordinary []Assign, ctx assignContext) []Assign {
+	refs := map[string]string{}
+	for _, m := range namerefDeclaration.FindAllStringSubmatch(src, -1) {
+		target := ""
+		if variableName.MatchString(m[2]) {
+			target = m[2]
+		}
+		refs[m[1]] = target
+	}
+	var out []Assign
+	for _, a := range ordinary {
+		if target, isRef := refs[a.Name]; isRef && !a.Unknown {
+			name := target
+			if name == "" {
+				name = a.Name
+			}
+			start, end := assignmentScope(ctx, name, a.Offset, false)
+			out = append(out, unknownAssign(name, a.Offset, start, end))
+		}
+	}
+	return out
+}
+
+func literalCommandWrites(file *syntax.File, src string, ordinary []Assign, ctx assignContext) []Assign {
+	var out []Assign
+	syntax.Walk(file, func(n syntax.Node) bool {
+		call, ok := n.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		name, literal := wordValue(call.Args[0])
+		if !literal {
+			return true
+		}
+		off := int(call.Args[0].Pos().Offset())
+		if name == "bash" || name == "sh" {
+			out = append(out, bashCStringWrites(call, off, ordinary)...)
+			return true
+		}
+		script, ok := executableString(name, call.Args)
+		if !ok || script == "" {
+			return true
+		}
+		inner := literalScriptAssignments(script)
+		for _, a := range inner {
+			start, end := assignmentScope(ctx, a.Name, off, false)
+			if lastpipeEnabledAt(src, off) && ctx.lastPipeIndex.contains(off) {
+				start, end = -1, -1
+			}
+			out = append(out, unknownAssign(a.Name, off, start, end))
+		}
+		return true
+	})
+	return out
+}
+
+func literalScriptAssignments(script string) []Assign {
+	seen := map[string]bool{}
+	for _, match := range literalAssignmentName.FindAllStringSubmatch(script, -1) {
+		seen[match[1]] = true
+	}
+	for _, match := range arithmeticWrite.FindAllStringSubmatch(script, -1) {
+		seen[match[1]] = true
+	}
+	refs := map[string]string{}
+	for _, match := range namerefDeclaration.FindAllStringSubmatch(script, -1) {
+		refs[match[1]] = match[2]
+	}
+	for ref, target := range refs {
+		if strings.Contains(script, ref+"=") {
+			if variableName.MatchString(target) {
+				seen[target] = true
+			} else {
+				seen[ref] = true
+			}
+		}
+	}
+	unknown := make([]Assign, 0, len(seen))
+	for _, name := range slices.Sorted(maps.Keys(seen)) {
+		unknown = append(unknown, unknownAssign(name, 0, -1, -1))
+	}
+	return unknown
+}
+
+func executableString(name string, args []*syntax.Word) (string, bool) {
+	switch name {
+	case "eval":
+		var parts []string
+		for _, arg := range args[1:] {
+			value, ok := wordValue(arg)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, value)
+		}
+		return strings.Join(parts, " "), len(parts) > 0
+	case "alias":
+		for _, arg := range args[1:] {
+			value, ok := wordValue(arg)
+			if !ok {
+				continue
+			}
+			if _, rhs, found := strings.Cut(value, "="); found {
+				return rhs, true
+			}
+		}
+	case "trap":
+		if len(args) > 1 {
+			return wordValue(args[1])
+		}
+	case "mapfile", "readarray":
+		for i, arg := range args {
+			value, ok := wordValue(arg)
+			if ok && value == "-C" && i+1 < len(args) {
+				return wordValue(args[i+1])
+			}
+		}
+	}
+	return "", false
+}
+
+func bashCStringWrites(call *syntax.CallExpr, cmdOff int, ordinary []Assign) []Assign {
+	for i, arg := range call.Args {
+		value, ok := wordValue(arg)
+		if !ok || value != "-c" || i+1 == len(call.Args) {
+			continue
+		}
+		word := call.Args[i+1]
+		start, end := int(word.Pos().Offset()), int(word.End().Offset())
+		seen := map[string]bool{}
+		for _, a := range ordinary {
+			if a.Offset < cmdOff {
+				seen[a.Name] = true
+			}
+		}
+		var out []Assign
+		for _, name := range slices.Sorted(maps.Keys(seen)) {
+			out = append(out, unknownAssign(name, start, start, end))
+		}
+		return out
+	}
+	return nil
+}
+
+func arithmeticWrites(file *syntax.File, src string) []Assign {
+	var out []Assign
+	syntax.Walk(file, func(n syntax.Node) bool {
+		switch n.(type) {
+		case *syntax.ArithmCmd, *syntax.ArithmExp, *syntax.LetClause:
+			lo, hi := int(n.Pos().Offset()), int(n.End().Offset())
+			if lo >= 0 && hi <= len(src) && lo < hi {
+				for _, m := range arithmeticWrite.FindAllStringSubmatch(src[lo:hi], -1) {
+					out = append(out, unknownAssign(m[1], lo, -1, -1))
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func uncertainFlowWrites(file *syntax.File, ordinary []Assign, redirects, hereDocs []span) []Assign {
+	var out []Assign
+	syntax.Walk(file, func(n syntax.Node) bool {
+		switch node := n.(type) {
+		case *syntax.IfClause, *syntax.CaseClause, *syntax.WhileClause, *syntax.ForClause:
+			out = append(out, constructWrites(n, ordinary, redirects, hereDocs)...)
+		case *syntax.BinaryCmd:
+			if node.Op == syntax.AndStmt || node.Op == syntax.OrStmt {
+				out = append(out, andOrWrites(file, node, ordinary, redirects, hereDocs)...)
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func constructWrites(n syntax.Node, ordinary []Assign, redirects, hereDocs []span) []Assign {
+	lo, hi := int(n.Pos().Offset()), int(n.End().Offset())
+	loopNameOff := -1
+	_, whileLoop := n.(*syntax.WhileClause)
+	loop, forLoop := n.(*syntax.ForClause)
+	if forLoop {
+		if iter, ok := loop.Loop.(*syntax.WordIter); ok && iter.Name != nil {
+			loopNameOff = int(iter.Name.Pos().Offset())
+		}
+	}
+	names := map[string]bool{}
+	for _, a := range ordinary {
+		if a.Offset >= lo && a.Offset < hi && a.Offset != loopNameOff {
+			names[a.Name] = true
+		}
+	}
+	var out []Assign
+	if whileLoop || forLoop {
+		for _, name := range slices.Sorted(maps.Keys(names)) {
+			out = append(out, unknownAssign(name, lo, lo, hi))
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(names)) {
+		if !hasDeferredRedirectedWrite(ordinary, name, lo, hi, redirects, hereDocs) {
+			out = append(out, unknownAssign(name, hi, -1, -1))
+		}
+	}
+	return out
+}
+
+func andOrWrites(file *syntax.File, node *syntax.BinaryCmd, ordinary []Assign, redirects, hereDocs []span) []Assign {
+	lo, hi := int(node.Y.Pos().Offset()), int(node.Y.End().Offset())
+	var out []Assign
+	for _, a := range ordinary {
+		if a.Offset < lo || a.Offset >= hi || insideAny(redirects, a.Offset) || insideAny(hereDocs, a.Offset) || assignmentOnlyInFailingRedirect(file, a.Offset) {
+			continue
+		}
+		out = append(out, unknownAssign(a.Name, int(node.End().Offset()), -1, -1))
+	}
+	return out
+}
+
+func unknownAssign(name string, off, start, end int) Assign {
+	return Assign{Name: name, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end}
+}
+
+func hereDocSpans(file *syntax.File) []span {
+	var out []span
+	syntax.Walk(file, func(n syntax.Node) bool {
+		if r, ok := n.(*syntax.Redirect); ok && r.Hdoc != nil {
+			out = append(out, span{int(r.Hdoc.Pos().Offset()), int(r.Hdoc.End().Offset())})
+		}
+		return true
+	})
+	return out
+}
+
+func assignmentOnlyInFailingRedirect(file *syntax.File, offset int) bool {
+	found := false
+	syntax.Walk(file, func(n syntax.Node) bool {
+		stmt, ok := n.(*syntax.Stmt)
+		if !ok || offset < int(stmt.Pos().Offset()) || offset >= int(stmt.End().Offset()) || !stmtHasNoCommand(stmt) {
+			return true
+		}
+		for _, redir := range stmt.Redirs {
+			if !redirectDefinitelySucceeds(redir) {
+				found = true
+				break
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+func hasDeferredRedirectedWrite(assignments []Assign, name string, start, end int, uncertainRedirects, hereDocs []span) bool {
+	for _, a := range assignments {
+		if a.Name == name && a.Offset >= start && a.Offset < end && (insideAny(uncertainRedirects, a.Offset) || insideAny(hereDocs, a.Offset)) {
+			return true
+		}
+	}
+	return false
 }
 
 type assignContext struct {
@@ -150,6 +516,7 @@ type assignContext struct {
 	functionDocIndex  spanIndex
 	functionDocBySpan map[span]functionDocScope
 	deferredIndex     spanIndex
+	lastPipeIndex     spanIndex
 	// assignmentModes and declarations give the tilde mark of a value: the
 	// shell modes at the assignment and whether a declaration command makes it.
 	assignmentModes map[*syntax.Assign]shellModes
@@ -189,6 +556,7 @@ func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
 		functionNames:     slices.Sorted(maps.Keys(functionChanges)),
 		functionNameSet:   functionNameSet(functionChanges),
 		deferredIndex:     newSpanIndex(regions.index.deferredCalls),
+		lastPipeIndex:     newSpanIndex(lastPipeSpans(regions.scopes)),
 		functionDocBySpan: make(map[span]functionDocScope, len(regions.functionDocs)),
 		uncertainDecls:    uncertainDecls,
 	}
@@ -1130,6 +1498,16 @@ type scopeSet struct {
 	functionDocs           []functionDocScope
 	functionDocsByFunction map[*syntax.FuncDecl][]functionDocScope
 	index                  *syntaxIndex
+}
+
+func lastPipeSpans(scopes []Scope) []span {
+	var out []span
+	for _, scope := range scopes {
+		if scope.Kind == ScopePipePart && scope.Last {
+			out = append(out, span{scope.Start, scope.End})
+		}
+	}
+	return out
 }
 
 type syntaxIndex struct {

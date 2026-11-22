@@ -25,6 +25,79 @@ func TestAssignsOrderValuesAndOffsets(t *testing.T) {
 	}
 }
 
+func TestAssignsArithmeticAndConditionalWrites(t *testing.T) {
+	for _, src := range []string{
+		`S=/clean; (( S=1 )); echo "$S"`,
+		`S=/clean; ((S++)); echo "$S"`,
+		`S=/clean; X=$(( S+=2 )); echo "$S"`,
+		`S=/clean; if false; then S=/bad; fi; echo "$S"`,
+		`S=/clean; false && S=/bad; echo "$S"`,
+		`S=/clean; while false; do S=/bad; echo "$S"; done; echo "$S"`,
+	} {
+		assigns, err := Assigns(src)
+		if err != nil {
+			t.Fatalf("Assigns(%q): %v", src, err)
+		}
+		ref := strings.LastIndex(src, `"$S"`)
+		value := ""
+		for _, a := range assigns {
+			if a.Name == "S" && a.VisibleAt(ref) {
+				if a.Unknown {
+					value = "<unknown>"
+				} else {
+					value = a.Value
+				}
+			}
+		}
+		if value != "/clean" && value != "<unknown>" && value != "1" && value != "/bad" {
+			t.Errorf("Assigns(%q) resolves S=%q, assignments=%+v", src, value, assigns)
+		}
+	}
+}
+
+func TestAssignsImplicitWritesAndDeferredExpansions(t *testing.T) {
+	tests := []struct{ name, src, want string }{
+		{"nameref", `S=/clean; declare -n R=S; R=/bad; echo "$S"`, "/bad"},
+		{"dynamic nameref", `S=/clean; T=S; declare -n R=$T; R=/bad; echo "$R"`, "/bad"},
+		{"eval", `S=/clean; eval 'S=/bad'; echo "$S"`, "/bad"},
+		{"alias", `S=/clean; alias g='S=/bad'; g; echo "$S"`, "/bad"},
+		{"trap", `S=/clean; trap 'S=/bad' DEBUG; echo "$S"`, "/bad"},
+		{"mapfile callback", `S=/clean; mapfile -C 'S=/bad;:' -c 1 A <<< x; echo "$S"`, "/bad"},
+		{"bash -c scope", `S=/clean; bash -c 'echo "$S"'`, "/clean"},
+		{"builtin here-doc", "S=/clean; : <<X; echo \"$S\"\n${ S=/bad; }\nX", "/bad"},
+		{"external here-doc", "S=/clean; cat >/dev/null <<X\n${ S=/bad; }\nX\necho \"$S\"", "/clean"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assigns, err := Assigns(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := strings.LastIndex(tc.src, `"$S"`)
+			if ref < 0 {
+				ref = strings.LastIndex(tc.src, `"$R"`)
+			}
+			if ref < 0 {
+				t.Fatalf("no reference in %q", tc.src)
+			}
+			value := ""
+			for _, a := range assigns {
+				if a.Name != "S" && a.Name != "R" || !a.VisibleAt(ref) {
+					continue
+				}
+				if a.Unknown {
+					value = "<unknown>"
+				} else {
+					value = a.Value
+				}
+			}
+			if value != tc.want && value != "<unknown>" {
+				t.Errorf("value at reference = %q, want %q or Unknown; assignments=%+v", value, tc.want, assigns)
+			}
+		})
+	}
+}
+
 func TestAssignsFailingRedirectsAndFunsubLocalPrecision(t *testing.T) {
 	tests := []struct {
 		name, src, want string
@@ -253,7 +326,7 @@ f"`, "S", true},
 		{`h() { g; }; g() { f; }; f() { S=2; }; h`, "S", true},
 		{`a() { b; }; b() { c; }; c() { S=2; }; a`, "S", true},
 		{`c() { S=2; }; b() { c; }; a() { b; }; a`, "S", true},
-		{`f() { S=2; }; eval 'S=3'`, "S", false},
+		{`f() { S=2; }; eval 'S=3'`, "S", true},
 	} {
 		got, err := Assigns(tc.src)
 		if err != nil {
