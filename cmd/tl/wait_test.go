@@ -103,6 +103,16 @@ func TestWaitLegacyCanSelectWrapperProgram(t *testing.T) {
 	}
 }
 
+func TestWaitAllUsesFirstWrapperWhenCommandHasNoProgram(t *testing.T) {
+	for _, command := range []string{"head -n 1 f", "cat f | head"} {
+		calls, invalid := parseWaitCalls(command)
+		program, _, ok := waitCallDataIdentity(calls, invalid, "", "")
+		if !ok || program != strings.Fields(command)[0] {
+			t.Errorf("identity(%q) = %q, %v; want first program", command, program, ok)
+		}
+	}
+}
+
 type waitAllTestSpec struct {
 	id, command string
 	delay       time.Duration
@@ -189,6 +199,42 @@ func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
 	reportWaitAll(result{waitRows: percentileRows}, &out)
 	if !strings.Contains(out.String(), "\t20\t210\t19\t20\n") {
 		t.Errorf("p95 did not use --wait nearest-rank: %q", out.String())
+	}
+}
+
+func TestWaitAllKeepsMidnightCrossingOnStartDay(t *testing.T) {
+	start := time.Date(2026, 10, 25, 23, 59, 59, 0, time.Local)
+	tracker := newWaitTracker(options{waitAll: true})
+	tracker.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "cross", Time: start, Command: "alpha build"})
+	tracker.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "cross", Time: start.Add(3 * time.Second)})
+	if len(tracker.waitRows) != 1 || tracker.waitRows[0].At.In(time.Local).Format(time.DateOnly) != start.Format(time.DateOnly) {
+		t.Fatalf("midnight wait rows = %+v; want one row on start day %s", tracker.waitRows, start.Format(time.DateOnly))
+	}
+}
+
+func TestWaitAllReadErrorMatchesWait(t *testing.T) {
+	e := fakeHome(t)
+	path := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", "unreadable.jsonl")
+	if err := os.Mkdir(path, 0o755); err != nil { // a directory at the transcript path reliably fails to read, including as root
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"--wait", "alpha"}, {"--wait-all"}} {
+		opts, err := parseArgs(append(args, path), e.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := scan([]source{{Path: path}}, opts, e.home)
+		if err != nil || len(res.errs) != 1 {
+			t.Fatalf("scan %v: errs=%v, err=%v; want one unreadable transcript", args, res.errs, err)
+		}
+	}
+	waitCode, waitOut, waitErr := runTL(t, e, "--wait", "alpha", path)
+	allCode, allOut, allErr := runTL(t, e, "--wait-all", path)
+	if allCode != waitCode || allOut != waitOut || allErr != waitErr {
+		t.Fatalf("--wait-all read error = (%d, %q, %q), --wait = (%d, %q, %q)", allCode, allOut, allErr, waitCode, waitOut, waitErr)
+	}
+	if allCode == 0 || allErr == "" {
+		t.Fatalf("read error was not reported: code=%d stderr=%q", allCode, allErr)
 	}
 }
 

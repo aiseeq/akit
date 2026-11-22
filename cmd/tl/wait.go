@@ -362,27 +362,8 @@ func waitCallDataIdentity(found []cachedShellCall, invalid bool, requestedProgra
 	if invalid {
 		return "", "", false
 	}
-	var program cachedShellCall
-	programs := 0
-	for _, call := range found {
-		if requestedProgram != "" && call.Name == requestedProgram && (requestedSub == "" || call.HasArg && call.Arg0 == requestedSub) && !call.Background {
-			programs++
-			program = call
-			continue
-		}
-		if requestedProgram == "" && !waitWrappers[call.Name] {
-			if call.Background {
-				return "", "", false
-			}
-			programs++
-			program = call
-			continue
-		}
-		if !waitWrappers[call.Name] {
-			return "", "", false
-		}
-	}
-	if programs != 1 {
+	program := selectWaitProgram(found, requestedProgram, requestedSub)
+	if program.Name == "" {
 		return "", "", false
 	}
 	sub := "-"
@@ -390,4 +371,55 @@ func waitCallDataIdentity(found []cachedShellCall, invalid bool, requestedProgra
 		sub = program.Arg0
 	}
 	return program.Name, sub, true
+}
+
+func selectWaitProgram(found []cachedShellCall, requestedProgram, requestedSub string) cachedShellCall {
+	if requestedProgram != "" {
+		return selectNamedWaitProgram(found, requestedProgram, requestedSub)
+	}
+	return selectAnyWaitProgram(found)
+}
+
+func selectNamedWaitProgram(found []cachedShellCall, requestedProgram, requestedSub string) cachedShellCall {
+	var program cachedShellCall
+	count := 0
+	for _, call := range found {
+		if isRequestedWaitProgram(call, requestedProgram, requestedSub) {
+			count++
+			program = call
+			continue
+		}
+		if !waitWrappers[call.Name] {
+			return cachedShellCall{}
+		}
+	}
+	if count != 1 {
+		return cachedShellCall{}
+	}
+	return program
+}
+
+func selectAnyWaitProgram(found []cachedShellCall) cachedShellCall {
+	var program, firstWrapper cachedShellCall
+	for _, call := range found {
+		if waitWrappers[call.Name] {
+			if firstWrapper.Name == "" && !call.Background {
+				firstWrapper = call
+			}
+			continue
+		}
+		if call.Background || program.Name != "" {
+			return cachedShellCall{}
+		}
+		program = call
+	}
+	if program.Name != "" {
+		return program
+	}
+	return firstWrapper
+}
+
+func isRequestedWaitProgram(call cachedShellCall, requestedProgram, requestedSub string) bool {
+	return call.Name == requestedProgram &&
+		(requestedSub == "" || call.HasArg && call.Arg0 == requestedSub) && !call.Background
 }

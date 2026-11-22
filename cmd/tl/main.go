@@ -91,7 +91,7 @@ path (Claude Code or codex rollout).
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
-  --wait-all    TSV wait statistics per local day, program and subcommand
+  --wait-all    TSV per start day, program and subcommand; wrapper-only commands use their first program
   --q N         percentile for --wait, from 1 to 99 (default 50); needs at least
                 3 events for --q 50 and below, 20 above
   Large reads wait for machine capacity through graft's heavy queue.
@@ -294,12 +294,26 @@ func checkCombos(opts options) error {
 	if err := checkEventOutputCombos(opts); err != nil {
 		return err
 	}
+	if err := checkScopeCombos(opts); err != nil {
+		return err
+	}
+	if err := checkWaitCombos(opts); err != nil {
+		return err
+	}
+	return checkOpenQuestionsCombos(opts)
+}
+
+func checkScopeCombos(opts options) error {
 	if (opts.codex || opts.project != "" || opts.noSubagents) && !opts.all {
 		return errors.New("--codex, --project and --no-subagents work with --all")
 	}
 	if opts.subagents && opts.all {
 		return errors.New("--subagents works with SESSION, not --all")
 	}
+	return nil
+}
+
+func checkWaitCombos(opts options) error {
 	if opts.waitProg != "" || opts.waitAll {
 		if opts.usage {
 			return errors.New("--wait and --usage cannot be used together")
@@ -315,9 +329,6 @@ func checkCombos(opts options) error {
 		}
 	} else if opts.qSet {
 		return errors.New("--q works with --wait")
-	}
-	if err := checkOpenQuestionsCombos(opts); err != nil {
-		return err
 	}
 	return nil
 }
@@ -565,19 +576,27 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if len(refs) > 0 {
-		// REF — событие целиком; режет его только явный --width, не ширина списка по умолчанию.
-		width := 0
-		if opts.widthSet {
-			width = opts.width
-		}
-		code := 0
-		for _, ref := range refs {
-			if result := showRef(ref.id, ref.line, width, e, stdout, stderr); result > code {
-				code = result
-			}
-		}
-		return code
+		return reportRefs(refs, opts, e, stdout, stderr)
 	}
+	return runOutputSessions(opts, e, stdout, stderr)
+}
+
+func reportRefs(refs []eventRef, opts options, e env, stdout, stderr io.Writer) int {
+	// REF — событие целиком; режет его только явный --width, не ширина списка по умолчанию.
+	width := 0
+	if opts.widthSet {
+		width = opts.width
+	}
+	code := 0
+	for _, ref := range refs {
+		if result := showRef(ref.id, ref.line, width, e, stdout, stderr); result > code {
+			code = result
+		}
+	}
+	return code
+}
+
+func runOutputSessions(opts options, e env, stdout, stderr io.Writer) int {
 	sources, err := resolve(opts, e)
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
@@ -612,18 +631,21 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if opts.waitProg != "" || opts.waitAll {
-		if n := opts.waitCache.misses.Load(); n > 0 {
-			// Причина промаха — для того, кто разбирает медленный вызов: запись под этот код ещё не писалась или
-			// транскрипт с тех пор дописан.
-			fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
-		}
-		if opts.waitAll {
-			return reportWaitAll(res, stdout)
-		}
-		return reportWait(res, opts, stdout, stderr)
+		return reportWaitOutput(res, sources, opts, stdout, stderr)
 	}
 	if opts.usage {
 		return reportUsage(res, sources, opts, e, stdout)
 	}
 	return report(res, opts, e, stdout)
+}
+
+func reportWaitOutput(res result, sources []source, opts options, stdout, stderr io.Writer) int {
+	if n := opts.waitCache.misses.Load(); n > 0 {
+		// Причина промаха — запись под этот код ещё не писалась или транскрипт после неё дописан.
+		fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
+	}
+	if opts.waitAll && len(res.errs) == 0 {
+		return reportWaitAll(res, stdout)
+	}
+	return reportWait(res, opts, stdout, stderr)
 }
