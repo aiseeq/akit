@@ -40,24 +40,27 @@ func AllSources(home string, since time.Time, project string, codex, includeSubs
 	return AllSourcesWindow(home, since, time.Time{}, project, codex, includeSubs)
 }
 
-// AllSourcesWindow lists transcripts modified since, excluding sources that began after until.
-func AllSourcesWindow(home string, since, until time.Time, project string, codex, includeSubs bool) ([]Source, error) {
+// SourcePatterns — glob-шаблоны файлов, которые перечисляет AllSources: транскрипты Claude Code, при includeSubs —
+// суб-агентов, при codex — rollouts бойцов worker. Тому, кто следит за появлением файлов сам.
+func SourcePatterns(home string, codex, includeSubs bool) []string {
 	projects := filepath.Join(home, ".claude", "projects")
-	paths, err := filepath.Glob(filepath.Join(projects, "*", "*.jsonl"))
-	if err != nil {
-		return nil, fmt.Errorf("list transcripts: %w", err)
-	}
+	out := []string{filepath.Join(projects, "*", "*.jsonl")}
 	if includeSubs {
-		subs, e := filepath.Glob(filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"))
-		if e != nil {
-			return nil, fmt.Errorf("list subagent transcripts: %w", e)
-		}
-		paths = append(paths, subs...)
+		out = append(out, filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"))
 	}
 	if codex {
-		more, e := filepath.Glob(filepath.Join(WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"))
-		if e != nil {
-			return nil, fmt.Errorf("list codex transcripts: %w", e)
+		out = append(out, filepath.Join(WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"))
+	}
+	return out
+}
+
+// AllSourcesWindow lists transcripts modified since, excluding sources that began after until.
+func AllSourcesWindow(home string, since, until time.Time, project string, codex, includeSubs bool) ([]Source, error) {
+	var paths []string
+	for _, pattern := range SourcePatterns(home, codex, includeSubs) {
+		more, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("list transcripts %s: %w", pattern, err)
 		}
 		paths = append(paths, more...)
 	}
