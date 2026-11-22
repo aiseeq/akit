@@ -2982,7 +2982,7 @@ func needsWalkInfo(src string) bool {
 	if strings.ContainsAny(src, "<>&|") || strings.Contains(src, "/dev/") || strings.Contains(src, "/proc/") {
 		return true
 	}
-	for _, name := range []string{"bash", "zsh", "sh", "dash", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "for", "while", "until", "select"} {
+	for _, name := range []string{"bash", "zsh", "sh", "dash", "timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "unbuffer", "time", "command", "builtin", "exec", "xargs", "eval", "watch", "trap", "su", "runuser", "flock", "script", "tmux", "ssh", "find", "source", "for", "while", "until", "select"} {
 		if strings.Contains(src, name) {
 			return true
 		}
@@ -10036,7 +10036,7 @@ func commandIsLookup(args []string) bool {
 }
 
 // wrappers — программы, которые запускают программу из своих аргументов.
-var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "time", "command", "builtin", "exec", "xargs", "taskset", "chrt", "strace", "setpriv", "unshare", "flock", "busybox", "systemd-run", "parallel", "runuser", "doas", "su", "setsid", "prlimit", "systemd-inhibit", "dbus-run-session", "run0", "pkexec", "chroot", "setarch", "nsenter", "ssh-agent", "linux32", "linux64", "i386", "x86_64", "uname26")
+var wrappers = set("timeout", "env", "sudo", "nohup", "nice", "ionice", "stdbuf", "unbuffer", "time", "command", "builtin", "exec", "xargs", "taskset", "chrt", "strace", "setpriv", "unshare", "flock", "busybox", "systemd-run", "parallel", "runuser", "doas", "su", "setsid", "prlimit", "systemd-inhibit", "dbus-run-session", "run0", "pkexec", "chroot", "setarch", "nsenter", "ssh-agent", "linux32", "linux64", "i386", "x86_64", "uname26")
 
 // valueOptions — опции обёрток и ssh, следующее слово после которых — их значение, а не программа.
 var valueOptions = map[string]map[string]bool{
@@ -10082,6 +10082,7 @@ var flagOptions = map[string]map[string]bool{
 	"sudo":             set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
 	"timeout":          set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
 	"nohup":            set("--help", "--version"),
+	"unbuffer":         set("-p"),
 	"taskset":          set("-a", "--all-tasks", "-c", "--cpu-list"),
 	"setsid":           set("-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V", "--version"),
 	"chrt":             set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks", "-m", "--max", "-v", "--verbose"),
