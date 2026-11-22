@@ -7551,6 +7551,9 @@ func wrapperOptionStep(name string, args []string, i int) (int, bool) {
 	if arg == "--" {
 		return len(args), false
 	}
+	if next, ok := dashWordOption(name, args, i); ok {
+		return next, false
+	}
 	if strings.HasPrefix(arg, "--") {
 		return longWrapperOptionStep(name, args, i)
 	}
@@ -9583,6 +9586,9 @@ func optionNext(name string, args []string, i int) int {
 		}
 		return i + 1
 	}
+	if next, ok := dashWordOption(name, args, i); ok {
+		return next
+	}
 	for j := 1; j < len(arg); j++ {
 		key, takesValue := shortOptionAt(name, arg, j)
 		if optionalValueOptions[name][key] {
@@ -9596,6 +9602,23 @@ func optionNext(name string, args []string, i int) int {
 		}
 	}
 	return i + 1
+}
+
+// dashWordOption reads a whole word that names a multi-letter option after
+// one dash (unbuffer -noecho, -ignore SIG): it is that option, not a cluster
+// of one-letter options. It returns the index after the option and its value.
+func dashWordOption(name string, args []string, i int) (int, bool) {
+	arg := args[i]
+	if len(arg) <= 2 || arg[1] == '-' {
+		return i, false
+	}
+	if valueOptions[name][arg] {
+		return min(i+2, len(args)), true
+	}
+	if flagOptions[name][arg] {
+		return i + 1, true
+	}
+	return i, false
 }
 
 func shortOptionAt(name, arg string, offset int) (string, bool) {
@@ -10044,6 +10067,7 @@ var valueOptions = map[string]map[string]bool{
 	"env":              set("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0"),
 	"sudo":             set("-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-R", "--chroot"),
 	"nice":             set("-n", "--adjustment"),
+	"unbuffer":         set("-ignore"),
 	"ionice":           set("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"),
 	"stdbuf":           set("-i", "--input", "-o", "--output", "-e", "--error"),
 	"time":             set("-f", "--format", "-o", "--output"),
@@ -10082,7 +10106,7 @@ var flagOptions = map[string]map[string]bool{
 	"sudo":             set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
 	"timeout":          set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
 	"nohup":            set("--help", "--version"),
-	"unbuffer":         set("-p"),
+	"unbuffer":         set("-p", "-console", "-noecho", "-nottycopy", "-nottyinit"),
 	"taskset":          set("-a", "--all-tasks", "-c", "--cpu-list"),
 	"setsid":           set("-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V", "--version"),
 	"chrt":             set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks", "-m", "--max", "-v", "--verbose"),

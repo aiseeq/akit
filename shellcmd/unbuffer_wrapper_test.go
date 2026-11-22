@@ -13,6 +13,9 @@ func TestUnbufferIsWrapper(t *testing.T) {
 		{`unbuffer kill -9 1`, []string{"unbuffer", "kill"}},
 		{`unbuffer -p rm -rf /x`, []string{"unbuffer", "rm"}},
 		{`unbuffer make test`, []string{"unbuffer", "make"}},
+		{`unbuffer -noecho rm -rf /x`, []string{"unbuffer", "rm"}},
+		{`unbuffer -p -nottycopy rm -rf /x`, []string{"unbuffer", "rm"}},
+		{`unbuffer -ignore HUP rm -rf /x`, []string{"unbuffer", "rm"}},
 		{`printf x | unbuffer -p kill -9 1`, []string{"printf", "unbuffer", "kill"}},
 	} {
 		calls, err := Calls(tc.src)
@@ -26,8 +29,8 @@ func TestUnbufferIsWrapper(t *testing.T) {
 		if !slices.Equal(got, tc.want) {
 			t.Errorf("%s: calls %v, want %v", tc.src, got, tc.want)
 		}
-		if !wrapperOptionsKnown("unbuffer", []string{"-p", "kill"}) {
-			t.Errorf("unbuffer -p: flag rejected")
-		}
+	}
+	if !wrapperOptionsKnown("unbuffer", []string{"-p", "-ignore", "HUP", "kill"}) {
+		t.Errorf("unbuffer -p -ignore HUP: options rejected")
 	}
 }
