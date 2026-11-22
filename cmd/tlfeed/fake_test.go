@@ -28,6 +28,10 @@ type fakeCH struct {
 	// pass: inserts into these tables let through before fail applies; tried: inserts refused by fail
 	pass, tried map[string]int
 	down        bool
+	kills       int // KILL QUERY statements
+	// hold: inserts into these tables are kept unapplied and refused, to be sent again later (late)
+	hold map[string]int
+	late []*http.Request
 }
 
 // sent — one insert as the server got it.
@@ -39,7 +43,7 @@ type sent struct {
 
 func newFake(t *testing.T) (*fakeCH, *server) {
 	f := &fakeCH{rows: map[string][][]string{}, tokens: map[string]map[string]bool{}, fail: map[string]int{}, lose: map[string]int{},
-		pass: map[string]int{}, tried: map[string]int{}}
+		pass: map[string]int{}, tried: map[string]int{}, hold: map[string]int{}}
 	ts := httptest.NewServer(f)
 	t.Cleanup(ts.Close)
 	srv, err := newServer(ts.URL)
@@ -51,7 +55,9 @@ func newFake(t *testing.T) (*fakeCH, *server) {
 
 var (
 	insertRe   = regexp.MustCompile(`^INSERT INTO \w+\.(\w+) \(`)
-	deleteRe   = regexp.MustCompile(`^DELETE FROM \w+\.(\w+) WHERE file_id = (\d+)(?: AND line > (\d+))?$`)
+	deleteRe   = regexp.MustCompile(`^DELETE FROM \w+\.(\w+) WHERE file_id = (\d+)(?: AND line > (\d+))?(?: AND file_id IN .*)?$`)
+	fenceRe    = regexp.MustCompile(`\(file_id, gen\) IN \(((?:\(\d+,\d+\),?)+)\)`)
+	pairRe     = regexp.MustCompile(`\((\d+),(\d+)\)`)
 	filesSelRe = regexp.MustCompile(`^SELECT file_id, path, .* FROM \w+\.files FINAL`)
 )
 
@@ -71,6 +77,15 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case insertRe.MatchString(q):
 		table := insertRe.FindStringSubmatch(q)[1]
+		if f.hold[table] > 0 {
+			f.hold[table]--
+			f.tried[table]++
+			late := r.Clone(r.Context())
+			late.Body = io.NopCloser(bytes.NewReader(body))
+			f.late = append(f.late, late)
+			http.Error(w, "Code: 999. held", http.StatusInternalServerError)
+			return
+		}
 		if f.pass[table] > 0 {
 			f.pass[table]--
 		} else if f.fail[table] > 0 {
@@ -84,7 +99,7 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for k := range r.URL.Query() {
 			settings[k] = r.URL.Query().Get(k)
 		}
-		rows := tsvRows(body)
+		rows := f.fenced(q, table, tsvRows(body))
 		f.inserts = append(f.inserts, sent{table: table, token: tok, rows: rows, settings: settings})
 		if f.tokens[table] == nil {
 			f.tokens[table] = map[string]bool{}
@@ -98,8 +113,13 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Code: 999. answer lost", http.StatusInternalServerError)
 		}
 	case strings.HasPrefix(q, "CREATE "):
+	case strings.HasPrefix(q, "KILL QUERY "):
+		f.kills++
 	case deleteRe.MatchString(q):
 		m := deleteRe.FindStringSubmatch(q)
+		if !f.genHolds(q) {
+			return
+		}
 		f.deletes = append(f.deletes, m[1]+":"+m[2])
 		from, _ := strconv.Atoi(m[3]) // no line condition: from 0, all rows
 		idCol, lineCol := 0, 1        // raw
@@ -213,6 +233,67 @@ func (f *fakeCH) sentTo(table string) []sent {
 		}
 	}
 	return out
+}
+
+// genHolds — the generation condition of a statement holds: every file it names has that gen in its latest row.
+func (f *fakeCH) genHolds(q string) bool {
+	m := fenceRe.FindStringSubmatch(q)
+	if m == nil {
+		return true
+	}
+	allowed := f.allowed(m[1])
+	for _, p := range pairRe.FindAllStringSubmatch(m[1], -1) {
+		if !allowed[p[1]] {
+			return false
+		}
+	}
+	return true
+}
+
+// allowed — the files of pairs (id,gen) whose latest row has that gen.
+func (f *fakeCH) allowed(pairs string) map[string]bool {
+	gen := map[string]string{}
+	for _, row := range f.latestFiles() {
+		gen[row[fileCol["file_id"]]] = row[fileCol["gen"]]
+	}
+	ok := map[string]bool{}
+	for _, p := range pairRe.FindAllStringSubmatch(pairs, -1) {
+		if gen[p[1]] == p[2] {
+			ok[p[1]] = true
+		}
+	}
+	return ok
+}
+
+// fenced keeps the rows of an INSERT ... SELECT FROM input() WHERE <generation condition> that pass it.
+func (f *fakeCH) fenced(q, table string, rows [][]string) [][]string {
+	m := fenceRe.FindStringSubmatch(q)
+	if m == nil || !strings.Contains(q, "FROM input()") {
+		return rows
+	}
+	allowed := f.allowed(m[1])
+	idCol := 0
+	if table == "events" {
+		idCol = 1
+	}
+	var out [][]string
+	for _, r := range rows {
+		if allowed[r[idCol]] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// sendLate applies the held inserts now, as a server that runs the request of a stopped client late.
+func (f *fakeCH) sendLate() {
+	f.mu.Lock()
+	late := f.late
+	f.late = nil
+	f.mu.Unlock()
+	for _, r := range late {
+		f.ServeHTTP(httptest.NewRecorder(), r)
+	}
 }
 
 func (f *fakeCH) triedFailing(table string) int {

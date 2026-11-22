@@ -137,6 +137,13 @@ func (f *Follow) scan(data []byte, at int) (head []byte, user, agent bool, err e
 	return head, user, agent, nil
 }
 
+// MessageEvents — пишет ли rollout события user_message и agent_message, по строкам, уже пришедшим через Prescan
+// и Feed: от этого зависят события всех его строк (см. ErrFollowRestart).
+func (f *Follow) MessageEvents() (user, agent bool) {
+	codex := bytes.Contains(f.head, []byte(`"type":"session_meta"`))
+	return codex && f.user, codex && f.agent
+}
+
 // Lines — сколько строк файла уже разобрано.
 func (f *Follow) Lines() int { return f.rd.lineNo }
 

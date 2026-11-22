@@ -298,3 +298,18 @@ func TestLiveStopBeforeFilesRow(t *testing.T) {
 		t.Fatalf("%s raw lines twice", got)
 	}
 }
+
+// Against a live server: a raw line stored twice is a problem --check reports.
+func TestLiveCheckFindsDuplicateRaw(t *testing.T) {
+	srv, db := liveServer(t)
+	h := &harness{t: t, home: t.TempDir()}
+	write(t, claudePath(h.home), sample(t, "claude.jsonl"))
+	h.liveLoader(srv, db)
+	verifyAll(t, srv, db, h.home)
+	scalar(t, srv, fmt.Sprintf("INSERT INTO %s.raw SELECT * FROM %s.raw WHERE line = 2", db, db))
+	var out bytes.Buffer
+	ok, err := (&checker{srv: srv, db: db, home: h.home, out: &out}).check()
+	if err != nil || ok || !strings.Contains(out.String(), "a line is there twice") {
+		t.Fatalf("check with a raw line twice: ok %t, %v, %s", ok, err, out.String())
+	}
+}
