@@ -1417,6 +1417,84 @@ func TestArgStaticRound17VariableWrites(t *testing.T) {
 	}
 }
 
+func TestArgStaticRound18BuiltinArguments(t *testing.T) {
+	for _, src := range []string{
+		`read -t 1 -r "$X$Y"; printf %s '$HOME'`,
+		`read -N 1 -r "$X$Y"; printf %s '$HOME'`,
+		`read -u 0 -r "$X$Y"; printf %s '$HOME'`,
+		`read -i v "$X$Y"; printf %s '$HOME'`,
+		`read -p '' -r x "$X$Y"; printf %s '$HOME'`,
+		`read -rd '' "$X$Y"; printf %s '$HOME'`,
+		`read -r x "$X$Y"; printf %s '$HOME'`,
+		`printf -v"$X$Y" 1; printf %s '$HOME'`,
+		`printf -v x -v "$X$Y" 1; printf %s '$HOME'`,
+		`printf %s x -v"$X$Y"; printf %s '$HOME'`,
+		`printf -- "$X"`,
+		`printf -av "$X$Y" 1; printf %s '$HOME'`,
+		`mapfile -t "$X$Y"; printf %s '$HOME'`,
+		`readarray -t "$X$Y"; printf %s '$HOME'`,
+		`getopts "$X$Y" opt; printf %s '$HOME'`,
+		`wait -p "$X$Y"; printf %s '$HOME'`,
+		`: "${!Z:=1}"; printf %s '$HOME'`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		for _, call := range calls {
+			for i := range call.Args {
+				if call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = true for %q: %+v", i, src, call)
+				}
+			}
+		}
+	}
+
+	for _, src := range []string{
+		`printf %s "$X"`,
+		`printf -e %s "$X"`,
+		`printf -e`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		if len(calls) != 1 || !calls[0].ArgStatic(0) {
+			t.Errorf("literal printf format should stay static for %q: %+v", src, calls)
+		}
+	}
+}
+
+func TestArgStaticUnaffectedByInPlaceCallFilter(t *testing.T) {
+	for _, src := range []string{
+		`eval true; printf %s '$HOME'`,
+		`alias x=y; printf %s '$HOME'`,
+	} {
+		fresh, err := Calls(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fresh[len(fresh)-1].ArgStatic(1)
+
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept := calls[:0]
+		for _, call := range calls {
+			if call.Name == "printf" {
+				kept = append(kept, call)
+			}
+		}
+		if len(kept) != 1 {
+			t.Fatalf("filtered calls for %q = %+v", src, kept)
+		}
+		if got := kept[0].ArgStatic(1); got != want {
+			t.Errorf("ArgStatic changed after in-place filtering %q: got %t, want %t", src, got, want)
+		}
+	}
+}
+
 func TestArgStaticRound16ScriptWhitelist(t *testing.T) {
 	falseScripts := []string{
 		"f() { :; }; printf %s '$HOME'",

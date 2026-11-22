@@ -212,10 +212,9 @@ func (info *walkInfo) argStaticSafe(offset int) bool {
 		_, alias, backquotes := staticScriptContext(info.staticFile, info.staticSource)
 		info.staticBackquotes = backquotes
 		info.staticSafe = staticArgScriptText(info.staticSource) && !alias &&
-			staticScriptSafe(info.staticFile, info.staticSource, info.staticCalls)
+			staticScriptSafe(info.staticFile, info.staticSource, info.staticCallsSafe)
 		info.staticFile = nil
 		info.staticSource = ""
-		info.staticCalls = nil
 	})
 	return info.staticSafe && !nestedBacktickOffset(offset, info.staticBackquotes)
 }
@@ -396,7 +395,7 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 	return checkUncertainTime(file, src, lineBase, inherited, vars, budget)
 }
 
-func staticScriptSafe(file *syntax.File, src string, calls []Call) bool {
+func staticScriptSafe(file *syntax.File, src string, callsSafe bool) bool {
 	if strings.Contains(src, "BASH_") || strings.Contains(src, "POSIXLY_CORRECT") {
 		return false
 	}
@@ -412,7 +411,7 @@ func staticScriptSafe(file *syntax.File, src string, calls []Call) bool {
 	if unsafe {
 		return false
 	}
-	return staticCallsSafe(calls)
+	return callsSafe
 }
 
 func staticArgManipulationText(src string) bool {
@@ -446,6 +445,11 @@ func staticCallsSafe(calls []Call) bool {
 func staticUnsafeArgManipulation(file *syntax.File, src string) bool {
 	unsafe := false
 	syntax.Walk(file, func(node syntax.Node) bool {
+		if param, ok := node.(*syntax.ParamExp); ok && param.Excl && param.Exp != nil &&
+			(param.Exp.Op == syntax.AssignUnset || param.Exp.Op == syntax.AssignUnsetOrNull) {
+			unsafe = true
+			return false
+		}
 		if decl, ok := node.(*syntax.DeclClause); ok && unsafeDeclarationClause(decl, src) {
 			unsafe = true
 			return false
@@ -458,7 +462,7 @@ func staticUnsafeArgManipulation(file *syntax.File, src string) bool {
 		if name == "" {
 			return true
 		}
-		if declarationCommand(name) && unsafeDeclarationWords(name, args, src) || unsafeReceiveWord(name, args, src) || unsafeCallbackWords(name, args) {
+		if declarationCommand(name) && unsafeDeclarationWords(name, args, src) || unsafeBuiltinArguments(name, args, src) || unsafeCallbackWords(name, args) {
 			unsafe = true
 			return false
 		}
@@ -554,53 +558,83 @@ func unsafeCallbackWords(name string, args []*syntax.Word) bool {
 	return false
 }
 
-func unsafeReceiveWord(name string, args []*syntax.Word, src string) bool {
-	index := -1
+func unsafeBuiltinArguments(name string, args []*syntax.Word, src string) bool {
 	switch name {
-	case "read":
-		index = syntaxOptionReceiver(args, false)
-	case "mapfile", "readarray":
-		index = syntaxOptionReceiver(args, true)
-	case "getopts":
-		index = 1
+	case "read", "mapfile", "readarray", "getopts", "wait":
+		for _, word := range args {
+			if !literalWord(word, src) {
+				return true
+			}
+		}
 	case "printf":
-		index = syntaxOptionValueIndex(args, "-v")
-	case "wait":
-		index = syntaxOptionValueIndex(args, "-p")
+		setVariable := false
+		for _, word := range args {
+			value, ok := wordValue(word)
+			if ok && printfVariableOption(value) || printfVariableOptionPrefix(sourceWord(word, src)) {
+				setVariable = true
+				break
+			}
+		}
+		if setVariable {
+			for _, word := range args {
+				if !literalWord(word, src) {
+					return true
+				}
+			}
+			return false
+		}
+		format := 0
+		for format < len(args) {
+			if !literalWord(args[format], src) {
+				return true
+			}
+			value, ok := wordValue(args[format])
+			if !ok {
+				return true
+			}
+			if value == "-e" || value == "-E" || value == "--" {
+				format++
+				continue
+			}
+			break
+		}
+		return format < len(args) && !literalWord(args[format], src)
 	}
-	return index >= 0 && index < len(args) && !literalWord(args[index], src)
+	return false
 }
 
-func syntaxOptionValueIndex(args []*syntax.Word, option string) int {
-	for i, word := range args {
-		if value, ok := wordValue(word); ok && value == option {
-			return i + 1
+func printfVariableOption(value string) bool {
+	if value == "-v" || strings.HasPrefix(value, "-v") {
+		return true
+	}
+	if len(value) < 3 || value[0] != '-' {
+		return false
+	}
+	for _, r := range value[1:] {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+		if r == 'v' {
+			return true
 		}
 	}
-	return -1
+	return false
 }
 
-func syntaxOptionReceiver(args []*syntax.Word, mapfile bool) int {
-	for i, word := range args {
-		arg, ok := wordValue(word)
-		if !ok {
-			return i
+func printfVariableOptionPrefix(source string) bool {
+	source = strings.TrimLeft(source, `"'`)
+	if len(source) < 3 || source[0] != '-' {
+		return false
+	}
+	for _, r := range source[1:] {
+		if r == 'v' {
+			return true
 		}
-		if arg == "--" {
-			return i + 1
-		}
-		if arg == "-" || !strings.HasPrefix(arg, "-") {
-			return i
-		}
-		takesValue := arg == "-d" || arg == "-n" || arg == "-N" || arg == "-p" || arg == "-t" || arg == "-u"
-		if mapfile {
-			takesValue = arg == "-C" || arg == "-c" || arg == "-O" || arg == "-u"
-		}
-		if takesValue {
-			i++
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
 		}
 	}
-	return -1
+	return false
 }
 
 func sourceWord(word *syntax.Word, src string) string {
@@ -1254,7 +1288,7 @@ func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited
 	*calls = append((*calls)[:baseCalls], dedupeCalls((*calls)[baseCalls:], walker.seen)...)
 	info.staticFile = file
 	info.staticSource = src
-	info.staticCalls = (*calls)[baseCalls:]
+	info.staticCallsSafe = staticCallsSafe((*calls)[baseCalls:])
 	return errors.Join(nestedErrs...)
 }
 
@@ -1321,7 +1355,7 @@ type walkInfo struct {
 	staticSafe                 bool
 	staticFile                 *syntax.File
 	staticSource               string
-	staticCalls                []Call
+	staticCallsSafe            bool
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) *walkInfo {
