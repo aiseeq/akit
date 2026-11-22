@@ -91,7 +91,8 @@ path (Claude Code or codex rollout).
   --wait PROG [SUB]  nearest-rank percentile of program wait time in milliseconds
                 (default --q 50; example: --all --since 24h --wait 'tk done' --q 95)
                 Completed calls are cached in $XDG_CACHE_HOME/akit/tl-wait (or the user cache directory)
-  --wait-all    TSV per start day, program and subcommand; wrapper-only commands use their first program
+  --wait-all    TSV per start day, program and subcommand; wrapper-only commands use their first program;
+                subcommand * is the row over all calls of the program that day
   --q N         percentile for --wait, from 1 to 99 (default 50); needs at least
                 3 events for --q 50 and below, 20 above
   Large reads wait for machine capacity through graft's heavy queue.

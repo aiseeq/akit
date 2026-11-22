@@ -359,7 +359,12 @@ func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
 	// The calls span local midnight; the rows include one-event groups and sort by day/program/subcommand.
 	var out strings.Builder
 	reportWaitAll(result{waitRows: all.waitRows}, &out)
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	var lines []string
+	for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
+		if strings.Split(line, "\t")[2] != waitAllProgramTotal {
+			lines = append(lines, line)
+		}
+	}
 	if len(lines) != len(groups) {
 		t.Fatalf("daily lines = %q; groups=%d", out.String(), len(groups))
 	}

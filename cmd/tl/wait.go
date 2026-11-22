@@ -277,6 +277,9 @@ func nearestWaitRank(waits []time.Duration, q int) time.Duration {
 	return waits[index]
 }
 
+// waitAllProgramTotal is the subcommand of the --wait-all row over all calls of a program.
+const waitAllProgramTotal = "*"
+
 func reportWaitAll(res result, stdout io.Writer) int {
 	type key struct{ day, program, sub string }
 	groups := map[key][]time.Duration{}
@@ -284,6 +287,10 @@ func reportWaitAll(res result, stdout io.Writer) int {
 		local := sample.At.In(time.Local)
 		k := key{local.Format(time.DateOnly), sample.Program, sample.Sub}
 		groups[k] = append(groups[k], sample.Duration)
+		// "*" sums every call of the program that day: a positional argument
+		// (a session id, a query word) otherwise splits one program into many rows.
+		total := key{k.day, k.program, waitAllProgramTotal}
+		groups[total] = append(groups[total], sample.Duration)
 	}
 	keys := make([]key, 0, len(groups))
 	for k := range groups {
