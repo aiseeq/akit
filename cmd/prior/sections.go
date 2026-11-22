@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,8 +164,9 @@ func readCard(path string, q query) (card, error) {
 			c.what = l
 		}
 		hit := 0
+		folded := foldText(l)
 		for j := range q.words {
-			if q.matchWord(j, l) {
+			if q.matchWordFolded(j, l, folded) {
 				seen[j] = true
 				hit++
 			}
@@ -204,20 +204,9 @@ type runMatch struct {
 
 // runs — отчёты ночного разбора с совпадением: путь от runs и первая совпавшая строка.
 func runs(w io.Writer, q query, dir string) {
-	var files []string
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// нечитаемая папка отчётов не мешает искать в остальных, но в выводе видна
-			fmt.Fprintf(w, "(%v)\n", err)
-			return nil
-		}
-		if !d.IsDir() && strings.HasSuffix(p, ".md") {
-			files = append(files, p)
-		}
-		return nil
-	})
-	if err != nil {
-		fmt.Fprintf(w, "(отчёты не прочитались: %v)\n", err)
+	files, walkErrors := runMarkdownFiles(dir)
+	for _, err := range walkErrors {
+		fmt.Fprintf(w, "(%v)\n", err)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(files)))
 
@@ -254,6 +243,61 @@ func runs(w io.Writer, q query, dir string) {
 	if omitted := len(matches) - shown; omitted > 0 {
 		fmt.Fprintf(w, "… ещё %d с совпадением, старейший: %s\n", omitted, oldestOmitted(matches, selected, dir))
 	}
+}
+
+// runMarkdownFiles lists reports without sorting every directory. The result is sorted once by runs;
+// non-Markdown entries are inspected only as directory entries, never statted or opened as files.
+func runMarkdownFiles(root string) ([]string, []error) {
+	var files []string
+	var walkErrors []runWalkError
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, []error{err}
+	}
+	if !info.IsDir() {
+		if strings.HasSuffix(root, ".md") {
+			files = append(files, root)
+		}
+		return files, nil
+	}
+	var walk func(string)
+	walk = func(dir string) {
+		f, err := os.Open(dir)
+		if err != nil {
+			walkErrors = append(walkErrors, runWalkError{path: dir, err: err})
+			return
+		}
+		entries, err := f.ReadDir(-1)
+		closeErr := f.Close()
+		if err != nil {
+			walkErrors = append(walkErrors, runWalkError{path: dir, err: err})
+			return
+		}
+		if closeErr != nil {
+			walkErrors = append(walkErrors, runWalkError{path: dir, err: closeErr})
+			return
+		}
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				walk(path)
+			} else if strings.HasSuffix(entry.Name(), ".md") {
+				files = append(files, path)
+			}
+		}
+	}
+	walk(root)
+	sort.Slice(walkErrors, func(i, j int) bool { return walkErrors[i].path < walkErrors[j].path })
+	errors := make([]error, len(walkErrors))
+	for i, walkErr := range walkErrors {
+		errors[i] = walkErr.err
+	}
+	return files, errors
+}
+
+type runWalkError struct {
+	path string
+	err  error
 }
 
 // matchRunFiles читает отчёты параллельно, сохраняя результаты в порядке входного списка.
@@ -326,8 +370,31 @@ func firstMatchFiltered(q query, path string, filter []runNeedle) (string, error
 	if err != nil {
 		return "", fmt.Errorf("отчёт не прочитался: %w", err)
 	}
-	if matches := matchingLines(q, data, filter); len(matches) > 0 {
-		return matches[0].text, nil
+	if filter == nil {
+		filter = q.runs
+	}
+	for at := 0; at < len(data); {
+		end := bytes.IndexByte(data[at:], '\n')
+		if end < 0 {
+			end = len(data) - at
+		}
+		line := data[at : at+end]
+		// The cheap literal filter rejects most lines before the regexp processes its alternatives.
+		if len(filter) > 0 && !runMayMatchASCII(string(line), filter) {
+			if at+end == len(data) {
+				break
+			}
+			at += end + 1
+			continue
+		}
+		folded := foldText(string(line))
+		if (len(filter) == 0 || runMayMatch(folded, filter)) && q.any.Match(line) {
+			return string(line), nil
+		}
+		if at+end == len(data) {
+			break
+		}
+		at += end + 1
 	}
 	return "", nil
 }
@@ -376,12 +443,13 @@ func replyBlocks(data string, q query) []replyHit {
 		} else if first == "" && l != "" {
 			first = l
 		}
-		if !matchFiltered(q.any, q.runs, l) {
+		folded := foldText(l)
+		if !matchFilteredFolded(q.any, q.runs, l, folded) {
 			continue
 		}
 		matched = true
 		for i := range q.words {
-			if !seen[i] && q.matchWord(i, l) {
+			if !seen[i] && q.matchWordFolded(i, l, folded) {
 				seen[i] = true
 				cur.words++
 			}
@@ -414,8 +482,12 @@ func replies(w io.Writer, q query, s paths) {
 		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы в блоке (вопрос агента и ответ), при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
 		hits = topReplies(hits)
 	}
+	var transcripts transcriptIndex
 	for _, h := range hits {
-		ref, err := replyRef(s.projects, h.head)
+		if replyHeader.MatchString(h.head) && transcripts == nil {
+			transcripts = indexTranscripts(s.projects)
+		}
+		ref, err := replyRef(h.head, transcripts)
 		if err != nil {
 			ref = " · tl: " + err.Error()
 		}
@@ -454,15 +526,38 @@ func topReplies(hits []replyHit) []replyHit {
 
 // replyRef — ссылка tl на запись пользователя в транскрипте claude: журнал хранит время и сессию, номер строки
 // ищется по времени записи. Не нашлась - ошибка, её печатают вместо ссылки, а не молчат.
-func replyRef(projects, head string) (string, error) {
+type transcriptIndex map[string][]string
+
+// indexTranscripts walks project directories once per prior call. The old per-reply glob reopened every
+// project directory for each of up to eight references.
+func indexTranscripts(projects string) transcriptIndex {
+	index := make(transcriptIndex)
+	projectsDirs, err := os.ReadDir(projects)
+	if err != nil { //nolint:silent-error-handling // The previous filepath.Glob returned zero matches for an unreadable root.
+		return index
+	}
+	for _, project := range projectsDirs {
+		path := filepath.Join(projects, project.Name())
+		files, err := os.ReadDir(path)
+		if err != nil { //nolint:silent-error-handling // filepath.Glob skipped unreadable project directories.
+			continue // filepath.Glob ignored unreadable project directories too.
+		}
+		for _, file := range files {
+			name := file.Name()
+			if len(name) >= 8 && filepath.Ext(name) == ".jsonl" {
+				index[name[:8]] = append(index[name[:8]], filepath.Join(path, name))
+			}
+		}
+	}
+	return index
+}
+
+func replyRef(head string, transcripts transcriptIndex) (string, error) {
 	m := replyHeader.FindStringSubmatch(head)
 	if m == nil {
 		return "", nil
 	}
-	files, err := filepath.Glob(filepath.Join(projects, "*", m[2]+"*.jsonl"))
-	if err != nil {
-		return "", fmt.Errorf("поиск транскрипта сессии %s: %w", m[2], err)
-	}
+	files := transcripts[m[2]]
 	if len(files) != 1 {
 		return "", fmt.Errorf("транскриптов сессии %s найдено %d", m[2], len(files))
 	}

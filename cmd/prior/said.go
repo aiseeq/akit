@@ -89,8 +89,9 @@ func saidHits(data string, q query) (hits []*saidEntry, bad, firstBad int) {
 		if e.name == "" {
 			e.name = shortID(f[1])
 		}
+		wordsFolded, quoteFolded := foldText(f[6]), foldText(e.quote)
 		for i := range q.words {
-			if q.matchWord(i, f[6]) || q.matchWord(i, e.quote) {
+			if q.matchWordFolded(i, f[6], wordsFolded) || q.matchWordFolded(i, e.quote, quoteFolded) {
 				e.words++
 			}
 		}

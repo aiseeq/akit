@@ -103,11 +103,39 @@ func foldRune(r rune) rune {
 	return folded
 }
 
+var bmpFold = buildBMPFold()
+
+func buildBMPFold() [1 << 16]rune {
+	var table [1 << 16]rune
+	for r := range table {
+		table[r] = foldRune(rune(r))
+	}
+	return table
+}
+
+func foldRuneFast(r rune) rune {
+	if r >= 0 && r <= 0xFFFF {
+		return bmpFold[r]
+	}
+	return foldRune(r)
+}
+
 func foldText(text string) string {
 	var folded strings.Builder
 	folded.Grow(len(text))
-	for _, r := range text {
-		folded.WriteRune(foldRune(r))
+	for i, r := range text {
+		if r < utf8.RuneSelf {
+			b := text[i]
+			if b >= 'a' && b <= 'z' {
+				b -= 'a' - 'A'
+			}
+			folded.WriteByte(b)
+			continue
+		}
+		r = foldRuneFast(r)
+		var encoded [utf8.UTFMax]byte
+		n := utf8.EncodeRune(encoded[:], r)
+		_, _ = folded.Write(encoded[:n])
 	}
 	return folded.String()
 }
@@ -129,6 +157,72 @@ func runMayMatch(data string, literals []runNeedle) bool {
 			}
 		}
 		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// runMayMatchASCII rejects lines that lack a required ASCII literal before Unicode
+// folding. Non-ASCII literals are left to runMayMatch, so this filter cannot reject
+// a possible Unicode case-fold match.
+func runMayMatchASCII(data string, literals []runNeedle) bool {
+	for _, needle := range literals {
+		possible := true
+		for _, variants := range needle {
+			allASCII := true
+			found := false
+			for _, variant := range variants {
+				if !safeFoldedASCII(variant) {
+					allASCII = false
+					break
+				}
+				if containsFoldedASCII(data, variant) {
+					found = true
+				}
+			}
+			if allASCII && !found {
+				possible = false
+				break
+			}
+		}
+		if possible {
+			return true
+		}
+	}
+	return false
+}
+
+func safeFoldedASCII(text string) bool {
+	for _, r := range text {
+		if r >= utf8.RuneSelf {
+			return false
+		}
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next >= utf8.RuneSelf {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func containsFoldedASCII(text, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(text); i++ {
+		j := 0
+		for ; j < len(needle); j++ {
+			a, b := text[i+j], needle[j]
+			if a >= 'a' && a <= 'z' {
+				a -= 'a' - 'A'
+			}
+			if a != b {
+				break
+			}
+		}
+		if j == len(needle) {
 			return true
 		}
 	}

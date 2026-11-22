@@ -9,6 +9,26 @@ import (
 	"testing"
 )
 
+func TestFoldRuneFastMatchesBMP(t *testing.T) {
+	for r := rune(0); r <= 0xFFFF; r++ {
+		if got, want := foldRuneFast(r), foldRune(r); got != want {
+			t.Fatalf("foldRuneFast(%U) = %U, want %U", r, got, want)
+		}
+	}
+}
+
+func TestFoldTextSpecialCaseFolds(t *testing.T) {
+	for _, input := range []string{"ASCII ascii", "КИРИЛЛИЦА кириллица", "ёЁ", "İiI", "Σσς", "KK"} {
+		var want strings.Builder
+		for _, r := range input {
+			want.WriteRune(foldRune(r))
+		}
+		if got := foldText(input); got != want.String() {
+			t.Errorf("foldText(%q) = %q, want %q", input, got, want.String())
+		}
+	}
+}
+
 func TestRunFilterMatchesLineSearch(t *testing.T) {
 	cases := []struct {
 		pattern string
@@ -83,6 +103,9 @@ func TestFilteredRegexpMatchesRegexpOnSameLines(t *testing.T) {
 				got, want := matchFiltered(re, filter, line), re.MatchString(line)
 				if got != want {
 					t.Errorf("matchFiltered(%q) = %v, regexp = %v", line, got, want)
+				}
+				if want && len(filter) > 0 && !runMayMatchASCII(line, filter) {
+					t.Errorf("ASCII prefilter rejected matching line %q", line)
 				}
 			}
 		})

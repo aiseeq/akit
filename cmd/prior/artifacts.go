@@ -20,9 +20,23 @@ const (
 
 // distinct — сколько разных слов запроса нашлось в текстах.
 func distinct(q query, texts ...string) int {
+	matched := make([]bool, len(q.words))
+	remaining := len(q.words)
+	for _, text := range texts {
+		if remaining == 0 {
+			break
+		}
+		folded := foldText(text)
+		for i := range q.words {
+			if !matched[i] && q.matchWordFolded(i, text, folded) {
+				matched[i] = true
+				remaining--
+			}
+		}
+	}
 	n := 0
-	for i := range q.words {
-		if slices.ContainsFunc(texts, func(text string) bool { return q.matchWord(i, text) }) {
+	for _, ok := range matched {
+		if ok {
 			n++
 		}
 	}

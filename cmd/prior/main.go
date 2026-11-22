@@ -156,6 +156,10 @@ func (q query) matchWord(i int, text string) bool {
 	return matchFiltered(q.words[i], q.wordRuns[i], text)
 }
 
+func (q query) matchWordFolded(i int, text, folded string) bool {
+	return matchFilteredFolded(q.words[i], q.wordRuns[i], text, folded)
+}
+
 // width — потолок строки вывода в рунах.
 const width = 400
 
