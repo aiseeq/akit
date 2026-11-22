@@ -133,6 +133,24 @@ func TestWaitAllCLIWindowIncludesCompletionAfterUntil(t *testing.T) {
 	}
 }
 
+func TestWaitAllCLIWindowIncludesCodexSessionPollAfterUntil(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	rows := []string{
+		`{"timestamp":"2026-10-25T23:59:10Z","type":"response_item","payload":{"type":"function_call","call_id":"a","name":"exec_command","arguments":"{\"cmd\":\"alpha build\"}"}}`,
+		`{"timestamp":"2026-10-25T23:59:40Z","type":"response_item","payload":{"type":"function_call_output","call_id":"a","output":"Process running with session ID 4242\nOutput:\nrunning"}}`,
+		`{"timestamp":"2026-10-26T00:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"b","name":"write_stdin","arguments":"{\"session_id\":4242,\"chars\":\"\"}"}}`,
+		`{"timestamp":"2026-10-26T00:00:10Z","type":"response_item","payload":{"type":"function_call_output","call_id":"b","output":"Process exited with code 0\nOutput:\ndone"}}`,
+	}
+	path := writeWaitTranscript(t, e, "rollout-cross.jsonl", strings.Join(rows, "\n")+"\n")
+	code, out, errOut := runTL(t, e, "--wait-all", "--since", "2026-10-25T00:00:00Z", "--until", "2026-10-26T00:00:00Z", path)
+	start, _ := time.Parse(time.RFC3339, "2026-10-25T23:59:10Z")
+	want := start.Local().Format(time.DateOnly) + "\talpha\tbuild\t1\t60000\t60000\t60000"
+	if code != 0 || !strings.Contains(out, want) || strings.Contains(errOut, "read "+path) {
+		t.Fatalf("windowed codex wait-all = (%d, %q, %q), want start-day 60000ms row", code, out, errOut)
+	}
+}
+
 func TestWaitAllCLIReadErrorKeepsReadableRowsAndWaitExitCode(t *testing.T) {
 	e := fakeHome(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())

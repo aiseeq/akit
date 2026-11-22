@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
+	transcriptwaits "github.com/aiseeq/akit/transcript/waits"
 )
 
 // hit — событие с его файлом.
@@ -647,9 +648,10 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 		after  int                // сколько событий после найденного ещё показать
 	)
 	includedCalls := make(map[string]bool)
+	includedSessions := make(map[string]bool)
 	consume := func(ev transcript.Event) {
 		if wt != nil && f.opts.waitAll {
-			if !f.waitAllEventInWindow(ev, includedCalls) {
+			if !f.waitAllEventInWindow(ev, includedCalls, includedSessions) {
 				return
 			}
 		} else if !f.inWindow(ev) {
@@ -696,9 +698,10 @@ func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Dura
 		return nil, nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
 	}
 	includedCalls := make(map[string]bool)
+	includedSessions := make(map[string]bool)
 	for i := range events {
 		event := &events[i]
-		if f.cachedWaitEventInWindow(event, includedCalls) {
+		if f.cachedWaitEventInWindow(event, includedCalls, includedSessions) {
 			wt.cachedEvent(*event)
 		}
 	}
@@ -729,13 +732,17 @@ func (f *filter) waitEvents(path string) ([]cachedWaitEvent, error) {
 	return readWaitEvents(path, codex)
 }
 
-func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent, includedCalls map[string]bool) bool {
-	ev := transcript.Event{Role: event.Role, Text: event.Text, Time: event.Time, CallID: event.CallID, Line: event.Line,
+func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent, includedCalls, includedSessions map[string]bool) bool {
+	text := event.Text
+	if event.Role == transcript.Cmd {
+		text = event.Command
+	}
+	ev := transcript.Event{Role: event.Role, Text: text, Time: event.Time, CallID: event.CallID, Line: event.Line,
 		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw}
-	return f.waitAllEventInWindow(ev, includedCalls)
+	return f.waitAllEventInWindow(ev, includedCalls, includedSessions)
 }
 
-func (f *filter) waitAllEventInWindow(ev transcript.Event, includedCalls map[string]bool) bool {
+func (f *filter) waitAllEventInWindow(ev transcript.Event, includedCalls, includedSessions map[string]bool) bool {
 	if !f.opts.waitAll {
 		return f.inWindow(ev)
 	}
@@ -744,7 +751,24 @@ func (f *filter) waitAllEventInWindow(ev transcript.Event, includedCalls map[str
 		includedCalls[ev.CallID] = true
 	}
 	if ev.Role == transcript.Out && includedCalls[ev.CallID] {
+		if transcriptwaits.CodexShell(ev.Who) {
+			if session, running := transcriptwaits.Running(ev.Text); running {
+				includedSessions[session] = true
+			}
+		}
 		return true
+	}
+	if ev.Role == transcript.Cmd {
+		command, _ := waitCommand(ev)
+		if session, poll := waitPollSession(cachedWaitEvent{
+			Role: ev.Role, CallID: ev.CallID, Text: ev.Text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
+			Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: ev.Raw, Command: command,
+		}); poll && includedSessions[session] {
+			if ev.CallID != "" {
+				includedCalls[ev.CallID] = true
+			}
+			return true
+		}
 	}
 	return inWindow
 }
