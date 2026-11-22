@@ -212,7 +212,7 @@ func (info *walkInfo) argStaticSafe(offset int) bool {
 		_, alias, backquotes := staticScriptContext(info.staticFile, info.staticSource)
 		info.staticBackquotes = backquotes
 		info.staticSafe = staticArgScriptText(info.staticSource) && !alias &&
-			staticScriptSafe(info.staticFile, info.staticSource, info.staticCallsSafe)
+			staticScriptSafe(info.staticFile, info.staticSource, info.staticCallsSafe) && staticWrapperOptionsSafe(info.staticFile)
 		info.staticFile = nil
 		info.staticSource = ""
 	})
@@ -426,9 +426,6 @@ func staticArgManipulationText(src string) bool {
 func staticCallsSafe(calls []Call) bool {
 	for i := range calls {
 		call := &calls[i]
-		if !staticWrapperOptionsSafe(call.Raw) {
-			return false
-		}
 		if call.staticName && call.Name == "time" && len(call.Args) == 0 {
 			continue
 		}
@@ -442,14 +439,7 @@ func staticCallsSafe(calls []Call) bool {
 	return true
 }
 
-func staticWrapperOptionsSafe(src string) bool {
-	if !containsShellWord(src, "command") && !containsShellWord(src, "builtin") && !containsShellWord(src, "exec") && !containsShellWord(src, "time") {
-		return true
-	}
-	file, err := syntax.NewParser().Parse(strings.NewReader(src), "")
-	if err != nil || file == nil {
-		return false
-	}
+func staticWrapperOptionsSafe(file *syntax.File) bool {
 	timed := timeClauseCalls(file)
 	safe := true
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -461,33 +451,6 @@ func staticWrapperOptionsSafe(src string) bool {
 		return true
 	})
 	return safe
-}
-
-func containsShellWord(src, word string) bool {
-	for start := 0; start < len(src); {
-		rel := strings.Index(src[start:], word)
-		if rel < 0 {
-			return false
-		}
-		start += rel
-		end := start + len(word)
-		left := start == 0 || shellWordBoundary(src[start-1])
-		right := end == len(src) || shellWordBoundary(src[end])
-		if left && right {
-			return true
-		}
-		start++
-	}
-	return false
-}
-
-func shellWordBoundary(b byte) bool {
-	switch b {
-	case ' ', '\t', '\n', '\r', '\'', '"', ';', '|', '&', '(', ')', '<', '>':
-		return true
-	default:
-		return false
-	}
 }
 
 func unsafeStaticWrapperCall(call *syntax.CallExpr, timed bool) bool {
