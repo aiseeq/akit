@@ -9,6 +9,7 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"sync"
 
 	"strconv"
 	"strings"
@@ -142,6 +143,7 @@ type Call struct {
 	tildeArgs    []Tilde
 	staticDirect bool
 	staticName   bool
+	staticState  *walkInfo
 	// Loop — вызов в теле цикла while, until, for или select (и во вложенном скрипте такого тела).
 	Loop bool
 	// Background — вызов в задании, чей оператор или объемлющий оператор заканчивается `&`.
@@ -195,9 +197,27 @@ func (c Call) ArgTilde(i int) Tilde {
 
 // ArgStatic reports whether Args[i] is a literal word of a direct command invocation.
 // Words from scripts parsed again or arguments assembled by wrappers are not static.
-// Out-of-range indices return false.
+// Model: script text is not written by an adversary; true means no script write changes
+// Bash word parsing (aliases, modes, or functions). Environment setup before Bash starts
+// (BASH_ENV, BASH_FUNC_*, SHELLOPTS, BASHOPTS) is outside the model and is the launcher’s
+// responsibility. A variable name assembled from pieces inside arithmetic, such as ((Z)),
+// is also outside the model. Out-of-range indices return false.
 func (c Call) ArgStatic(i int) bool {
-	return c.staticDirect && i >= 0 && i < len(c.Args) && i < len(c.tildeArgs) && c.tildeArgs[i]&tildeStatic != 0
+	return c.staticDirect && i >= 0 && i < len(c.Args) && i < len(c.tildeArgs) &&
+		c.tildeArgs[i]&tildeStatic != 0 && (c.staticState == nil || c.staticState.argStaticSafe(c.Offset))
+}
+
+func (info *walkInfo) argStaticSafe(offset int) bool {
+	info.staticOnce.Do(func() {
+		_, alias, backquotes := staticScriptContext(info.staticFile, info.staticSource)
+		info.staticBackquotes = backquotes
+		info.staticSafe = staticArgScriptText(info.staticSource) && !alias &&
+			staticScriptSafe(info.staticFile, info.staticSource, info.staticCalls)
+		info.staticFile = nil
+		info.staticSource = ""
+		info.staticCalls = nil
+	})
+	return info.staticSafe && !nestedBacktickOffset(offset, info.staticBackquotes)
 }
 
 // ArgLiteral сообщает, что Args[i] — литеральное слово в простом скрипте: все его
@@ -210,8 +230,8 @@ func (c Call) ArgStatic(i int) bool {
 // Управляющий байт в тексте скрипта, кроме перевода строки и табуляции, даёт false для всего
 // скрипта: парсер и bash по-разному читают `\r` (bash считает его литерой слова) и NUL. Так же
 // действует обратная косая перед переводом строки: в конце комментария bash её не продолжает.
-// Всё прочее даёт false. Не учитываются изменения извне: окружение (BASH_ENV, PATH,
-// экспортированные функции), rc-файлы и содержимое source-файлов.
+// Всё прочее даёт false. Не учитываются изменения извне: окружение, rc-файлы и содержимое
+// source-файлов.
 func (c Call) ArgLiteral(i int) bool {
 	return i >= 0 && i < 32 && c.literalArgs&(uint32(1)<<uint(i)) != 0
 }
@@ -333,7 +353,6 @@ func parse(src string, lineBase int, inherited []string, vars map[string]string,
 }
 
 func parseWithBudget(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
-	firstCall := len(*calls)
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
@@ -371,11 +390,6 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 		return optionErr
 	}
 	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
-	if !staticScriptSafe(file, src, (*calls)[firstCall:]) {
-		for i := firstCall; i < len(*calls); i++ {
-			(*calls)[i].staticDirect = false
-		}
-	}
 	if err != nil {
 		return err
 	}
@@ -383,9 +397,15 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 }
 
 func staticScriptSafe(file *syntax.File, src string, calls []Call) bool {
+	if strings.Contains(src, "BASH_") || strings.Contains(src, "POSIXLY_CORRECT") {
+		return false
+	}
+	if staticArgManipulationText(src) && staticUnsafeArgManipulation(file, src) {
+		return false
+	}
 	unsafe := false
 	checkFunctions := strings.Contains(src, "(") || strings.Contains(src, "function")
-	checkAssignments := strings.Contains(src, "BASH_") || strings.Contains(src, "POSIXLY_CORRECT")
+	checkAssignments := false
 	if (checkFunctions || checkAssignments) && staticUnsafeDeclaration(file, checkFunctions, checkAssignments) {
 		unsafe = true
 	}
@@ -393,6 +413,15 @@ func staticScriptSafe(file *syntax.File, src string, calls []Call) bool {
 		return false
 	}
 	return staticCallsSafe(calls)
+}
+
+func staticArgManipulationText(src string) bool {
+	for _, name := range [...]string{"declare", "typeset", "export", "readonly", "local", "read", "printf", "mapfile", "readarray", "getopts", "wait"} {
+		if strings.Contains(src, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func staticCallsSafe(calls []Call) bool {
@@ -404,10 +433,192 @@ func staticCallsSafe(calls []Call) bool {
 		if !call.staticName || staticUnsafeCommandName(call.Name) {
 			return false
 		}
-		if unsafeAssignmentCommand(call) {
+		if strings.Contains(call.Raw, "command -p") || strings.Contains(call.Raw, "exec -a") {
 			return false
 		}
 		if call.Name == "set" && unsafeSetCall(call) {
+			return false
+		}
+	}
+	return true
+}
+
+func staticUnsafeArgManipulation(file *syntax.File, src string) bool {
+	unsafe := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if decl, ok := node.(*syntax.DeclClause); ok && unsafeDeclarationClause(decl, src) {
+			unsafe = true
+			return false
+		}
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		name, args := syntaxCallName(call.Args)
+		if name == "" {
+			return true
+		}
+		if declarationCommand(name) && unsafeDeclarationWords(name, args, src) || unsafeReceiveWord(name, args, src) || unsafeCallbackWords(name, args) {
+			unsafe = true
+			return false
+		}
+		return true
+	})
+	return unsafe
+}
+
+func unsafeDeclarationClause(decl *syntax.DeclClause, src string) bool {
+	name := ""
+	if decl.Variant != nil {
+		name = decl.Variant.Value
+	}
+	for _, arg := range decl.Args {
+		if arg.Name != nil {
+			if staticUnsafeVariable(arg.Name.Value) {
+				return true
+			}
+			if arg.Naked && strings.HasPrefix(arg.Name.Value, "-") &&
+				(strings.Contains(arg.Name.Value, "n") || name == "export" && strings.Contains(arg.Name.Value, "f")) {
+				return true
+			}
+			continue
+		}
+		if arg.Value != nil {
+			if !literalWord(arg.Value, src) {
+				return true
+			}
+			if option, ok := wordValue(arg.Value); ok && strings.HasPrefix(option, "-") &&
+				(strings.Contains(option, "n") || name == "export" && strings.Contains(option, "f")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func syntaxCallName(words []*syntax.Word) (string, []*syntax.Word) {
+	name, ok := wordValue(words[0])
+	if !ok {
+		return "", nil
+	}
+	for (name == "command" || name == "builtin" || name == "exec" || name == "time") && len(words) > 1 {
+		words = words[1:]
+		name, ok = wordValue(words[0])
+		if !ok {
+			return "", nil
+		}
+	}
+	return commandName(name), words[1:]
+}
+
+func declarationCommand(name string) bool {
+	return slices.Contains(declarationCommands[:], name)
+}
+
+func unsafeDeclarationWords(command string, args []*syntax.Word, src string) bool {
+	for _, word := range args {
+		value, literal := wordValue(word)
+		raw := sourceWord(word, src)
+		if literal && strings.HasPrefix(value, "-") && !strings.Contains(value, "=") {
+			if strings.Contains(value, "n") || command == "export" && strings.Contains(value, "f") {
+				return true
+			}
+			continue
+		}
+		if lhs, _, hasEqual := strings.Cut(raw, "="); hasEqual {
+			if !literalPrefix(lhs) {
+				return true
+			}
+			if staticUnsafeVariable(lhs) {
+				return true
+			}
+			continue
+		}
+		if !literalWord(word, src) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeCallbackWords(name string, args []*syntax.Word) bool {
+	if name != "mapfile" && name != "readarray" {
+		return false
+	}
+	for _, word := range args {
+		value, ok := wordValue(word)
+		if ok && (value == "-C" || len(value) > 1 && strings.HasPrefix(value, "-") && strings.Contains(value[1:], "C")) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeReceiveWord(name string, args []*syntax.Word, src string) bool {
+	index := -1
+	switch name {
+	case "read":
+		index = syntaxOptionReceiver(args, false)
+	case "mapfile", "readarray":
+		index = syntaxOptionReceiver(args, true)
+	case "getopts":
+		index = 1
+	case "printf":
+		index = syntaxOptionValueIndex(args, "-v")
+	case "wait":
+		index = syntaxOptionValueIndex(args, "-p")
+	}
+	return index >= 0 && index < len(args) && !literalWord(args[index], src)
+}
+
+func syntaxOptionValueIndex(args []*syntax.Word, option string) int {
+	for i, word := range args {
+		if value, ok := wordValue(word); ok && value == option {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func syntaxOptionReceiver(args []*syntax.Word, mapfile bool) int {
+	for i, word := range args {
+		arg, ok := wordValue(word)
+		if !ok {
+			return i
+		}
+		if arg == "--" {
+			return i + 1
+		}
+		if arg == "-" || !strings.HasPrefix(arg, "-") {
+			return i
+		}
+		takesValue := arg == "-d" || arg == "-n" || arg == "-N" || arg == "-p" || arg == "-t" || arg == "-u"
+		if mapfile {
+			takesValue = arg == "-C" || arg == "-c" || arg == "-O" || arg == "-u"
+		}
+		if takesValue {
+			i++
+		}
+	}
+	return -1
+}
+
+func sourceWord(word *syntax.Word, src string) string {
+	start, end := int(word.Pos().Offset()), int(word.End().Offset())
+	if !validSpan(src, start, end) {
+		return ""
+	}
+	return src[start:end]
+}
+
+func literalPrefix(source string) bool {
+	name, _, ok := strings.Cut(source, "=")
+	if !ok || name == "" {
+		return false
+	}
+	name = strings.ReplaceAll(strings.ReplaceAll(name, "'", ""), `"`, "")
+	for i, r := range name {
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9' || r == '[' || r == ']' || r == '+') {
 			return false
 		}
 	}
@@ -434,34 +645,11 @@ func staticUnsafeDeclaration(file *syntax.File, checkFunctions, checkAssignments
 
 func staticUnsafeCommandName(name string) bool {
 	switch name {
-	case "eval", "source", ".", "alias", "unalias", "hash", "trap", "shopt", "enable":
+	case "eval", "source", ".", "alias", "unalias", "hash", "history", "trap", "shopt", "enable":
 		return true
 	default:
 		return false
 	}
-}
-
-func unsafeAssignmentCommand(call *Call) bool {
-	isDeclaration := false
-	for i := range declarationCommands {
-		if declarationCommands[i] == call.Name {
-			isDeclaration = true
-			break
-		}
-	}
-	if !isDeclaration {
-		return false
-	}
-	for i, arg := range call.Args {
-		if i >= len(call.tildeArgs) || call.tildeArgs[i]&tildeStatic == 0 {
-			return true
-		}
-		name, _, ok := strings.Cut(arg, "=")
-		if ok && staticUnsafeVariable(name) {
-			return true
-		}
-	}
-	return false
 }
 
 func staticUnsafeVariable(name string) bool {
@@ -657,6 +845,22 @@ func staticScriptContext(file *syntax.File, src string) ([]string, bool, [][2]in
 		return true
 	})
 	return functions, aliasCall, backquotes
+}
+
+func staticFunctionNames(file *syntax.File, src string) []string {
+	if !strings.Contains(src, "()") && !strings.Contains(src, "function") {
+		return nil
+	}
+	var functions []string
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if decl, ok := node.(*syntax.FuncDecl); ok {
+			for _, name := range funcDeclNames(decl) {
+				functions = append(functions, name.Value)
+			}
+		}
+		return true
+	})
+	return functions
 }
 
 func nestedBacktickOffset(offset int, spans [][2]int) bool {
@@ -1035,7 +1239,7 @@ func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited
 	baseCalls := len(*calls)
 	info := collectWalkInfo(file, src, vars, budget)
 
-	walker := callWalker{src: src, sourceLen: sourceLen, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: &info, ignoredCalls: ignored, subst: subst}
+	walker := callWalker{src: src, sourceLen: sourceLen, lineBase: lineBase, inherited: inherited, vars: vars, calls: calls, seen: newCallSet(), budget: budget, info: info, ignoredCalls: ignored, subst: subst}
 	syntax.Walk(file, walker.visit)
 	if walker.parseErr != nil {
 		return fmt.Errorf("shellcmd: walk syntax tree: %w", walker.parseErr)
@@ -1048,6 +1252,9 @@ func walkCalls(file *syntax.File, src string, sourceLen, lineBase int, inherited
 		nestedErrs = append(nestedErrs, err)
 	}
 	*calls = append((*calls)[:baseCalls], dedupeCalls((*calls)[baseCalls:], walker.seen)...)
+	info.staticFile = file
+	info.staticSource = src
+	info.staticCalls = (*calls)[baseCalls:]
 	return errors.Join(nestedErrs...)
 }
 
@@ -1109,34 +1316,33 @@ type walkInfo struct {
 	shellScriptInputCandidates bool
 	literalSimple              bool
 	staticFunctions            []string
-	staticAlias                bool
 	staticBackquotes           [][2]int
-	staticText                 bool
+	staticOnce                 sync.Once
+	staticSafe                 bool
+	staticFile                 *syntax.File
+	staticSource               string
+	staticCalls                []Call
 }
 
-func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
-	staticFunctions, staticAlias, staticBackquotes := staticScriptContext(file, src)
-	staticText := staticArgScriptText(src)
+func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) *walkInfo {
+	staticFunctions := staticFunctionNames(file, src)
 	initial := shellModes{posix: budget.initialPosix, posixUnknown: budget.initialPosixUnknown, brace: budget.initialBrace, braceUnknown: budget.initialBraceUnknown}
 	if budget.modeTexts == nil {
 		budget.modeTexts = newModeTexts()
 	}
 	posixCalls, unknownPosix, braceCalls, unknownBrace := parsedShellModes(file, src, initial, budget.modeTexts)
 	if !needsWalkInfo(src) {
-		info := walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), posixCalls: posixCalls, braceCalls: braceCalls, unknownPosix: unknownPosix, unknownBrace: unknownBrace, literalSimple: literalScriptSimple(file, src), staticFunctions: staticFunctions, staticAlias: staticAlias, staticBackquotes: staticBackquotes, staticText: staticText}
+		info := &walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), posixCalls: posixCalls, braceCalls: braceCalls, unknownPosix: unknownPosix, unknownBrace: unknownBrace, literalSimple: literalScriptSimple(file, src), staticFunctions: staticFunctions}
 		info.collectTopLevelCalls(file)
 		return info
 	}
-	info := walkInfo{
+	info := &walkInfo{
 		posixCalls:                 posixCalls,
 		braceCalls:                 braceCalls,
 		unknownPosix:               unknownPosix,
 		unknownBrace:               unknownBrace,
 		literalSimple:              literalScriptText(src),
 		staticFunctions:            staticFunctions,
-		staticAlias:                staticAlias,
-		staticBackquotes:           staticBackquotes,
-		staticText:                 staticText,
 		trackWork:                  budget.trackWork,
 		hasInputRedir:              strings.Contains(src, "<"),
 		hasProcessSubstitutionText: strings.Contains(src, "<(") || strings.Contains(src, ">("),
@@ -1159,11 +1365,11 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 	}
 	knownPipes := make(map[*syntax.BinaryCmd]bool)
 	visit := func(node syntax.Node) {
-		collectWalkNode(node, file, src, vars, &info, knownPipes)
+		collectWalkNode(node, file, src, vars, info, knownPipes)
 		if info.literalSimple && !literalScriptNodeSimple(node, src) {
 			info.literalSimple = false
 		}
-		collectCallContextNode(node, &info)
+		collectCallContextNode(node, info)
 	}
 	if info.trackWork {
 		syntax.Walk(file, func(node syntax.Node) bool {
@@ -1187,14 +1393,14 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 			}
 			source, relevant := processSubstitutionCallKind(call.call, src, vars)
 			if relevant {
-				collectCallWalkInfo(call.call, source, src, vars, &info)
+				collectCallWalkInfo(call.call, source, src, vars, info)
 			}
 		}
 		for _, stmt := range info.processSubstitutions.stmts {
-			collectStmtProcessSubstitutionWalkInfo(stmt, src, vars, &info)
+			collectStmtProcessSubstitutionWalkInfo(stmt, src, vars, info)
 		}
 		for _, stmt := range info.processSubstitutions.pipelines {
-			markPipeline(stmt, src, vars, &info)
+			markPipeline(stmt, src, vars, info)
 		}
 	}
 	info.collectTopLevelCalls(file)
@@ -3983,9 +4189,9 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	ws, tildeArgs := markedCallWords(call, words, split, w.src, w.info, w.budget.initialPosix)
 	posixEnv := hasPosixEnvironment(call)
 	mode := shellModes{posix: w.info.posixCalls[call], posixUnknown: w.info.unknownPosix[call], brace: w.info.braceCalls[call], braceUnknown: w.info.unknownBrace[call]}
-	staticDirect := staticCallDirect(w.info, w.inherited, start, commandName(args[0]), ws[0].static)
+	staticDirect := staticCallDirect(w.inherited, ws[0].static)
 	callName := commandWordName(args[0], ws[0])
-	c := cmd{call: Call{Name: callName, Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: staticDirect, staticName: ws[0].static, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], staticFunctions: w.info.staticFunctions}
+	c := cmd{call: Call{Name: callName, Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: staticDirect, staticName: ws[0].static, staticState: w.info, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], staticFunctions: w.info.staticFunctions}
 	for _, part := range call.Args[0].Parts {
 		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
 			c.call.Name = ""
@@ -6398,9 +6604,8 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	return err
 }
 
-func staticCallDirect(info *walkInfo, inherited []string, offset int, name string, staticName bool) bool {
-	return staticName && len(inherited) == 0 && info.staticText && !info.staticAlias &&
-		!slices.Contains(info.staticFunctions, name) && !nestedBacktickOffset(offset, info.staticBackquotes)
+func staticCallDirect(inherited []string, staticName bool) bool {
+	return staticName && len(inherited) == 0
 }
 
 // outerOffset переводит смещение во вложенном скрипте во внешний текст по карте pos.
@@ -7015,7 +7220,7 @@ func (c cmd) sub(i int, via []string) cmd {
 	}
 	staticDirect := staticSubRoute(c, i, via)
 	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, staticName: c.words[i].static, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, staticName: c.words[i].static, staticState: c.call.staticState, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0, staticFunctions: c.staticFunctions}
 }
 
@@ -8501,7 +8706,7 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 		}
 	}
 	child := cmd{call: Call{Name: childName, Args: args, Raw: c.call.Raw, Line: c.call.Line,
-		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, staticDirect: false, staticName: commandWord.static, Loop: c.call.Loop,
+		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, staticDirect: false, staticName: commandWord.static, staticState: c.call.staticState, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed}
 	return child, true

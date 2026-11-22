@@ -20,6 +20,17 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
+func callsEqual(a, b []Call) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	for i := range a {
+		a[i].staticState = nil
+	}
+	for i := range b {
+		b[i].staticState = nil
+	}
+	return reflect.DeepEqual(a, b)
+}
+
 func TestHeredocPartlyQuoted(t *testing.T) {
 	cases := []struct{ name, src string }{
 		{"double prefix", "zr <<\"E\"x\nb \\\nEx\nzk 6"},
@@ -441,8 +452,8 @@ func TestArgLiteralContract(t *testing.T) {
 	if !foundTarget {
 		t.Fatalf("eval function target not found in %#v", calls)
 	}
-	if got := unsafe.Sizeof(Call{}); got != 160 {
-		t.Errorf("sizeof Call = %d, want 160", got)
+	if got := unsafe.Sizeof(Call{}); got != 176 {
+		t.Errorf("sizeof Call = %d, want 176", got)
 	}
 }
 
@@ -877,7 +888,7 @@ E
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(got, expected) {
+			if !callsEqual(got, expected) {
 				t.Fatalf("Find = %#v; filtered Calls = %#v", got, expected)
 			}
 		})
@@ -930,7 +941,7 @@ func TestFindMatchesCallsOnRiskForms(t *testing.T) {
 					want = append(want, call)
 				}
 			}
-			if !reflect.DeepEqual(got, want) {
+			if !callsEqual(got, want) {
 				t.Fatalf("Find = %#v; filtered Calls = %#v", got, want)
 			}
 			for _, call := range all {
@@ -1354,6 +1365,58 @@ func TestArgStaticRound15ConservativeCases(t *testing.T) {
 	}
 }
 
+func TestArgStaticRound17VariableWrites(t *testing.T) {
+	for _, src := range []string{
+		`# POSIXLY_CORRECT appears only in a comment` + "\n" + `printf %s '$HOME'`,
+		`printf -v POSIXLY_CORRECT 1; printf %s '$HOME'`,
+		`declare "POSIXLY_CORRECT=1"; printf %s '$HOME'`,
+		`declare "$X"; printf %s '$HOME'`,
+		`declare -n ref=VALUE; printf %s '$HOME'`,
+		`read -r "$name"; printf %s '$HOME'`,
+		`printf -v "$name" x; printf %s '$HOME'`,
+		`mapfile -t -C callback -c 1 values <<<x; printf %s '$HOME'`,
+		`readarray -t -C callback -c 1 values <<<x; printf %s '$HOME'`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		for _, call := range calls {
+			for i := range call.Args {
+				if call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = true for %q: %+v", i, src, call)
+				}
+			}
+		}
+	}
+	for _, src := range []string{
+		`declare "X=1"; printf %s '$HOME'`,
+		`set -euo pipefail; printf %s '$HOME'`,
+		`cd x && go test | tee; printf %s '$HOME'`,
+		`export PATH="$HOME/bin:$PATH"; printf %s x`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name != "printf" {
+				continue
+			}
+			found = true
+			for i := range call.Args {
+				if !call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = false for control %q: %+v", i, src, call)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("printf missing for control %q", src)
+		}
+	}
+}
+
 func TestArgStaticRound16ScriptWhitelist(t *testing.T) {
 	falseScripts := []string{
 		"f() { :; }; printf %s '$HOME'",
@@ -1468,7 +1531,7 @@ func TestFindKeepsNonliteralCommandName(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := Find(src, "kill")
-	if err != nil || !reflect.DeepEqual(got, calls) {
+	if err != nil || !callsEqual(got, calls) {
 		t.Fatalf("Find = %#v, Calls = %#v, err=%v", got, calls, err)
 	}
 }
