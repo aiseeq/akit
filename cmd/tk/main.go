@@ -2321,7 +2321,13 @@ func matchesID(t task, id string) bool {
 	if t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id {
 		return true
 	}
-	for _, old := range factsForTask(t).RenamedFrom {
+	var renamed []string
+	if t.facts != nil {
+		renamed = t.facts.RenamedFrom
+	} else if strings.Contains(t.body, " переименован — ") {
+		renamed = renamedFrom(t.body)
+	}
+	for _, old := range renamed {
 		if old == id || strings.TrimSuffix(old, ".md") == id {
 			return true
 		}
@@ -2512,7 +2518,7 @@ func printTask(out io.Writer, t task, label string, errout io.Writer) {
 	if label != "" {
 		label += " "
 	}
-	wait := factsForTask(t).Waits
+	wait := taskWait(t)
 	if wait != "" {
 		shown := wait
 		if at, ok := waitTimeDeadline(wait, time.Now()); ok {
@@ -4726,16 +4732,18 @@ func gateVisible(t task, gate queuegate.Scope) bool {
 }
 
 func eligibleForNext(t task, actor string) bool {
-	facts := factsForTask(t)
+	if t.status != "открыт" && t.status != "в работе" && t.status != "ждёт" {
+		return false
+	}
 	waitDueNow := false
 	if t.status == "ждёт" {
-		at, ok := waitTimeDeadline(facts.Waits, time.Now())
+		at, ok := waitTimeDeadline(taskWait(t), time.Now())
 		waitDueNow = ok && !at.After(time.Now())
 	}
 	if isJournal(t) && !waitDueNow {
 		return false
 	}
-	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(facts.Executor, actor) {
+	if t.status == "открыт" || t.status == "в работе" && strings.EqualFold(taskExecutor(t), actor) {
 		return true
 	}
 	if t.status != "ждёт" {
@@ -4744,7 +4752,26 @@ func eligibleForNext(t task, actor string) bool {
 	return waitDueNow
 }
 
-func isJournal(t task) bool { return factsForTask(t).Journal }
+func isJournal(t task) bool {
+	if t.facts != nil {
+		return t.facts.Journal
+	}
+	return lineValue(t.body, "Вид: ") == "журнал"
+}
+
+func taskWait(t task) string {
+	if t.facts != nil {
+		return t.facts.Waits
+	}
+	return waiting(t.body)
+}
+
+func taskExecutor(t task) string {
+	if t.facts != nil {
+		return t.facts.Executor
+	}
+	return executor(t.body)
+}
 
 // nextGroup orders the queue. Work already begun under a closed pair stays in the
 // queue without pushing out CRIT and HIGH, and goes ahead of new work.
@@ -4756,7 +4783,7 @@ func nextGroup(t task, actor string, gate queuegate.Scope) int {
 	if t.status != "открыт" && !gate.Passes(t.prio, t.diff) {
 		return 3
 	}
-	if t.status == "в работе" && strings.EqualFold(factsForTask(t).Executor, actor) {
+	if t.status == "в работе" && strings.EqualFold(taskExecutor(t), actor) {
 		return 1
 	}
 	if prio == "HIGH" {
@@ -4802,7 +4829,13 @@ func orderedNextCandidatesUsing(tasks []task, actor string, gate queuegate.Scope
 		}
 		visiting[t.slug] = true
 		maxDepth := 0
-		for _, ref := range factsForTask(*t).BlockedBy {
+		var blockedBy []string
+		if t.facts != nil {
+			blockedBy = t.facts.BlockedBy
+		} else {
+			blockedBy = headerLinks(t.body, blockedPrefix)
+		}
+		for _, ref := range blockedBy {
 			target, found := bySlug[ref]
 			if strings.Contains(ref, "/") || !found {
 				if maxDepth < 1 && blockMark(taskProject(t.path), ref, io.Discard) != "" {
