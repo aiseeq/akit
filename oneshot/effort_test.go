@@ -29,4 +29,13 @@ func TestEffortDefaultsToHighAndRefusesLower(t *testing.T) {
 			t.Errorf("effort %q: err = %v, want below high", e, err)
 		}
 	}
+	if _, err := Ask(context.Background(), Request{Model: "sol", Effort: "auto", Input: "вопрос", Approved: approved(t)}); err == nil {
+		t.Error("effort auto: no error, want not one of high, xhigh, max, ultra")
+	}
+	if _, err := Ask(context.Background(), Request{Model: "sol", Effort: " XHigh ", Input: "вопрос", Approved: approved(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if args := read(t, codex+"/args"); !strings.Contains(args, "model_reasoning_effort=\"xhigh\"\n") {
+		t.Errorf("codex args lack normalized xhigh:\n%s", args)
+	}
 }
