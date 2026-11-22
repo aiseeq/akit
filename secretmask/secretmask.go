@@ -696,74 +696,32 @@ func englishPasswordLabelsOnly(labels []englishAnchorStart) bool {
 }
 
 func maskEnglishPasswordOnly(text string, m *masking, labels []englishAnchorStart) string {
-	var out strings.Builder
-	var last int
-	count := 0
+	spans := make([]contextSpan, 0, len(labels))
+	last := 0
 	forEachEnglishPasswordMatch(text, labels, func(match contextMatch) {
 		if match.start < last || match.end <= match.start {
 			return
 		}
-		out.WriteString(text[last:match.start])
 		last = match.end
-		count++
-		if m.tagger != nil && m.isPlaceholder(text[match.start:match.end]) {
-			out.WriteString(text[match.start:match.end])
-			return
-		}
-		out.WriteString(maskMarker)
-		out.WriteString(match.kind)
-		if m.tagger != nil {
-			out.WriteString(m.ph.value)
-			out.WriteString(strconv.Itoa(len(m.values)))
-			m.values = append(m.values, m.original(text[match.start:match.end]))
-		}
-		out.WriteByte(']')
+		spans = append(spans, contextSpan{match.start, match.end, match.kind})
 	})
-	if count == 0 {
-		return text
-	}
-	out.WriteString(text[last:])
-	m.found["password"] += count
-	return out.String()
+	return replaceSpans(text, spans, m)
 }
 
 func replaceContextMatches(text string, matches []contextMatch, m *masking) string {
 	if len(matches) == 0 {
 		return text
 	}
-	var out strings.Builder
-	out.Grow(len(text))
+	spans := make([]contextSpan, 0, len(matches))
 	last := 0
-	passwordCount := 0
 	for _, match := range matches {
 		if match.start < last || match.end <= match.start {
 			continue
 		}
-		out.WriteString(text[last:match.start])
 		last = match.end
-		if match.kind == "password" {
-			passwordCount++
-		} else {
-			m.found[match.kind]++
-		}
-		if m.tagger != nil && m.isPlaceholder(text[match.start:match.end]) {
-			out.WriteString(text[match.start:match.end])
-			continue
-		}
-		out.WriteString(maskMarker)
-		out.WriteString(match.kind)
-		if m.tagger != nil {
-			out.WriteString(m.ph.value)
-			out.WriteString(strconv.Itoa(len(m.values)))
-			m.values = append(m.values, m.original(text[match.start:match.end]))
-		}
-		out.WriteByte(']')
+		spans = append(spans, contextSpan{match.start, match.end, match.kind})
 	}
-	out.WriteString(text[last:])
-	if passwordCount != 0 {
-		m.found["password"] += passwordCount
-	}
-	return out.String()
+	return replaceSpans(text, spans, m)
 }
 
 // maskJSONContext hides values that JSON keeps apart from their name: an
@@ -3072,6 +3030,13 @@ func replaceSpans(text string, spans []contextSpan, m *masking) string {
 			m.values = append(m.values, m.original(text[span.start:span.end]))
 		}
 		out.WriteByte(']')
+		for i := span.start; i < span.end; i++ {
+			if text[i] == '\r' && i+1 < span.end && text[i+1] == '\n' {
+				out.WriteByte('\r')
+			} else if text[i] == '\n' {
+				out.WriteByte('\n')
+			}
+		}
 	}
 	out.WriteString(text[last:])
 	return out.String()

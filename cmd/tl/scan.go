@@ -968,11 +968,17 @@ func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 		if ev.Who != "" {
 			who = " " + ev.Who
 		}
-		text := ev.Shown()
+		text := maskEventText(ev.Shown())
 		if width > 0 && utf8.RuneCountInString(text) > width {
 			text = maskedShort(text, width)
 		}
 		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), ref, ev.Line, ev.Role, who, text)
 	}
 	return 0
+}
+
+// maskEventText sees the complete event, including any embedded line breaks.
+func maskEventText(text string) string {
+	masked, _ := hide(text)
+	return masked
 }

@@ -485,8 +485,8 @@ func setRoles(opts *options, list string) error {
 }
 
 // run prints what runOutput prints with secret values masked: an event quoted verbatim may hold a key a
-// user pasted, and tl output goes on to other agents and models. The output is buffered whole, so a
-// private key block across lines is masked as one.
+// user pasted, and tl output goes on to other agents and models. Event text that is printed across
+// lines is masked as one event; the one-line listing is masked one line at a time.
 func run(opts options, e env, stdout, stderr io.Writer) int {
 	var out, errs bytes.Buffer
 	code := runOutput(opts, e, &out, &errs)
@@ -498,12 +498,30 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 }
 
 func writeMasked(w io.Writer, text string) error {
-	if text == "" {
-		return nil
+	for len(text) > 0 {
+		end := strings.IndexByte(text, '\n')
+		if end < 0 {
+			masked, _ := hide(text)
+			_, err := io.WriteString(w, masked)
+			if err != nil {
+				return fmt.Errorf("write masked text: %w", err)
+			}
+			return nil
+		}
+		line, newline := text[:end], "\n"
+		if before, ok := strings.CutSuffix(line, "\r"); ok {
+			line, newline = before, "\r\n"
+		}
+		masked, _ := hide(line)
+		if _, err := io.WriteString(w, masked); err != nil {
+			return fmt.Errorf("write masked line: %w", err)
+		}
+		if _, err := io.WriteString(w, newline); err != nil {
+			return fmt.Errorf("write line ending: %w", err)
+		}
+		text = text[end+1:]
 	}
-	masked, _ := hide(text)
-	_, err := io.WriteString(w, masked)
-	return err
+	return nil
 }
 
 var newReplyCache = replycache.New

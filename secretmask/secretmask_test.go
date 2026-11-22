@@ -32,7 +32,11 @@ func TestMaskEachKind(t *testing.T) {
 		if strings.Contains(got, value) {
 			t.Errorf("%s: the value is still in the text", kind)
 		}
-		if want := "before [скрыто:" + kind + "] after"; got != want {
+		want := "before [скрыто:" + kind + "] after"
+		if kind == "private-key" {
+			want = "before [скрыто:" + kind + "]\n\n after"
+		}
+		if got != want {
 			t.Errorf("%s: masked text differs from %q (length %d)", kind, want, len(got))
 		}
 		if !maps.Equal(found, map[string]int{kind: 1}) {
@@ -52,8 +56,11 @@ func TestMaskGluedKeysPreservesPrefix(t *testing.T) {
 				text := prefix + value
 				got, found := Mask(text)
 				want := prefix + "[скрыто:" + kind + "]"
+				if kind == "private-key" {
+					want += "\n\n"
+				}
 				if got != want || !maps.Equal(found, map[string]int{kind: 1}) {
-					t.Errorf("masked text or count differs: got length %d, counts %v", len(got), found)
+					t.Errorf("masked text or count differs: got %q want %q, counts %v", got, want, found)
 				}
 			})
 		}
@@ -527,6 +534,59 @@ func TestMaskCommandContextLeavesNonValues(t *testing.T) {
 	}
 }
 
+func TestMaskCommandContextVariableReferences(t *testing.T) {
+	for _, in := range []string{`curl -u "$USER:$JIRA_API_TOKEN"`, `TOKEN=$JIRA_API_TOKEN`} {
+		got, found := Mask(in)
+		if got != in || len(found) != 0 {
+			t.Errorf("variable reference changed: %q -> %q (%v)", in, got, found)
+		}
+	}
+	got, found := Mask("password=hunter2")
+	if got != "password=[скрыто:password]" || found["password"] != 1 {
+		t.Errorf("password value not masked: %q (%v)", got, found)
+	}
+}
+
+func TestMaskCrossLineSecretContextsPreserveLineBreaks(t *testing.T) {
+	value := "Zq314XvSyntheticValue"
+	inputs := []string{
+		"curl -s \\\n  -u admin:" + value + " \\\n  https://example.test/\n",
+		"mysql -h db \\\n  -p" + value + " app\n",
+		"{\n  \"name\": \"DB_PASSWORD\",\n  \"value\": \"" + value + "\"\n}\n",
+		"**Password**\n: " + value + "\n",
+		"password\n: " + value + "\n",
+		"[\"curl\",\n\"-u\",\n\"admin:" + value + "\"]\n",
+		"password=\"a\n" + value + "\"\n",
+	}
+	for i, input := range inputs {
+		got, found := Mask(input)
+		if strings.Contains(got, value) || len(found) == 0 {
+			t.Errorf("case %d did not hide synthetic value: found=%v", i, found)
+		}
+		gotBreaks := strings.Map(func(r rune) rune {
+			if r == '\r' {
+				return 'R'
+			}
+			if r == '\n' {
+				return 'N'
+			}
+			return -1
+		}, got)
+		inputBreaks := strings.Map(func(r rune) rune {
+			if r == '\r' {
+				return 'R'
+			}
+			if r == '\n' {
+				return 'N'
+			}
+			return -1
+		}, input)
+		if gotBreaks != inputBreaks {
+			t.Errorf("case %d changed line breaks: input %q output %q; masked=%q", i, inputBreaks, gotBreaks, got)
+		}
+	}
+}
+
 func TestMaskContextReviewForms(t *testing.T) {
 	tests := []struct {
 		name, input, want string
@@ -673,7 +733,7 @@ func TestMaskNewEscapedContexts(t *testing.T) {
 func TestMaskUnterminatedPrivateKey(t *testing.T) {
 	text := "key:\n-----BEGIN " + "PRIVATE KEY-----\n" + strings.Repeat("Zz9", 30)
 	got, found := Mask(text)
-	if got != "key:\n[скрыто:private-key]" || found["private-key"] != 1 {
+	if got != "key:\n[скрыто:private-key]\n" || found["private-key"] != 1 {
 		t.Fatalf("unterminated block: counts %v, masked length %d", found, len(got))
 	}
 }
@@ -725,7 +785,7 @@ func TestMaskPGPPrivateKeyBlock(t *testing.T) {
 		}
 	}
 	got, found := Mask("before\n" + begin + body + end + "\nafter")
-	if got != "before\n[скрыто:private-key]\nafter" || found["private-key"] != 1 {
+	if got != "before\n[скрыто:private-key]\n\n\n\n\nafter" || found["private-key"] != 1 {
 		t.Errorf("text around a closed block changed: counts %v, output length %d", found, len(got))
 	}
 	public := "-----BEGIN PGP PUBLIC KEY BLOCK-----" + body + "-----END PGP PUBLIC KEY BLOCK-----"
@@ -1066,5 +1126,13 @@ func TestMaskAuthorizationProseIsNotAValue(t *testing.T) {
 		if got, found := Mask(in); strings.Contains(got, secret) || found["authorization"] != 1 {
 			t.Errorf("%q → %q %v; want %q masked", in, got, found, secret)
 		}
+	}
+}
+
+func TestMaskKeepsOnlyCRLFBreaksOfMaskedValue(t *testing.T) {
+	text := "key:\n-----BEGIN " + "PRIVATE KEY-----\r" + strings.Repeat("Zz9", 30) + "\r\n" + strings.Repeat("Qq8", 30)
+	got, found := Mask(text)
+	if got != "key:\n[скрыто:private-key]\r\n" || found["private-key"] != 1 {
+		t.Fatalf("lone carriage return inside a masked value became a line break: counts %v, masked %q", found, got)
 	}
 }
