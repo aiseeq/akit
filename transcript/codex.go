@@ -91,11 +91,11 @@ type codexCommandRecordWithOutput struct {
 }
 
 func parseCodexCommandResult(raw []byte, line int) (CodexCommandResult, bool) {
-	var rec codexCommandRecordWithOutput
-	if json.Unmarshal(raw, &rec) != nil {
+	if !bytes.Contains(raw, []byte(`"CommandExecution"`)) {
 		return CodexCommandResult{}, false
 	}
-	if rec.Type != "event_msg" || rec.Payload.Type != "item_completed" || rec.Payload.Item == nil {
+	var rec codexCommandRecordWithOutput
+	if json.Unmarshal(raw, &rec) != nil || rec.Type != "event_msg" || rec.Payload.Type != "item_completed" || rec.Payload.Item == nil {
 		return CodexCommandResult{}, false
 	}
 	return commandResult(line, rec.Payload.StartedAtMS, rec.Payload.CompletedAtMS, rec.Payload.Item.codexCommandItem, rec.Payload.Item.Output)
@@ -165,6 +165,11 @@ type codexParser struct {
 	firstAccount          string
 	eventUser, eventAgent bool
 	named                 bool
+	deferMessages         bool
+	currentLine           int
+	pendingFallback       map[int]Role
+	deferredMessages      []Event
+	modelUpdates          uint64
 }
 
 func newCodexParser() *codexParser { return &codexParser{tools: map[string]string{}} }
@@ -209,7 +214,8 @@ func codexMessages(f *os.File) (user, agent bool, err error) {
 
 func (p *codexParser) parse(rec *record) []Event {
 	events := p.events(rec)
-	if len(events) > 0 {
+	fallback := p.deferMessages && p.pendingFallback[p.currentLine] != ""
+	if len(events) > 0 && !fallback {
 		p.named = false
 	}
 	for i := range events {
@@ -253,6 +259,7 @@ func (p *codexParser) events(rec *record) []Event {
 		}
 		if pl.Model != "" {
 			p.model = pl.Model
+			p.modelUpdates++
 		}
 		return nil
 	case "compacted":
@@ -282,7 +289,8 @@ func (p *codexParser) responseItem(pl *payload, ev func(Role, string, string) []
 			if p.eventAgent {
 				return nil
 			}
-			return withImages(ev(Agent, "", text))
+			events := withImages(ev(Agent, "", text))
+			return p.deferFallback(events)
 		case "user":
 			if p.eventUser {
 				return nil
@@ -292,7 +300,8 @@ func (p *codexParser) responseItem(pl *payload, ev func(Role, string, string) []
 					return nil
 				}
 			}
-			return withImages(ev(User, "", text))
+			events := withImages(ev(User, "", text))
+			return p.deferFallback(events)
 		}
 	case "custom_tool_call":
 		p.tools[pl.CallID] = pl.Name
@@ -321,6 +330,9 @@ func (p *codexParser) responseItem(pl *payload, ev func(Role, string, string) []
 func (p *codexParser) eventMsg(pl *payload, ev func(Role, string, string) []Event) []Event {
 	switch pl.Type {
 	case "user_message":
+		if p.deferMessages {
+			p.eventUser = true
+		}
 		if !p.eventUser {
 			return nil
 		}
@@ -334,6 +346,9 @@ func (p *codexParser) eventMsg(pl *payload, ev func(Role, string, string) []Even
 		}
 		return out
 	case "agent_message":
+		if p.deferMessages {
+			p.eventAgent = true
+		}
 		if !p.eventAgent {
 			return nil
 		}
@@ -356,6 +371,41 @@ func (p *codexParser) eventMsg(pl *payload, ev func(Role, string, string) []Even
 		return []Event{{Role: Note, Who: "token_count", Text: t.String(), Tokens: t}}
 	}
 	return nil
+}
+
+func (p *codexParser) deferFallback(events []Event) []Event {
+	if !p.deferMessages || len(events) == 0 {
+		return events
+	}
+	if p.pendingFallback == nil {
+		p.pendingFallback = make(map[int]Role)
+	}
+	p.pendingFallback[p.currentLine] = events[0].Role
+	return events
+}
+
+func (p *codexParser) queueFallback(event Event) bool {
+	if !p.deferMessages || p.pendingFallback[event.Line] != event.Role {
+		return false
+	}
+	delete(p.pendingFallback, event.Line)
+	p.deferredMessages = append(p.deferredMessages, event)
+	return true
+}
+
+func (p *codexParser) finishUptake() []Event {
+	if !p.deferMessages {
+		return nil
+	}
+	kept := p.deferredMessages[:0]
+	for i := range p.deferredMessages {
+		event := &p.deferredMessages[i]
+		if (event.Role == User && p.eventUser) || (event.Role == Agent && p.eventAgent) {
+			continue
+		}
+		kept = append(kept, *event)
+	}
+	return kept
 }
 
 const (

@@ -497,7 +497,7 @@ func (rd *reader) decodeCall(index int) {
 	if call.decoded {
 		return
 	}
-	tmp := reader{claude: newClaudeParser(), toolNames: make(map[string]struct{})}
+	tmp := reader{claude: newClaudeParser(), codex: newCodexParser(), toolNames: make(map[string]struct{})}
 	tmp.rememberTools(call.raw)
 	for id, name := range tmp.claude.tools {
 		call.changes = append(call.changes, savedCall{id, name})

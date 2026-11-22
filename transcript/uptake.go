@@ -7,56 +7,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
-	"strings"
-)
-
-type uptakeRecord struct {
-	Type      string         `json:"type"`
-	Timestamp string         `json:"timestamp"`
-	Payload   *uptakePayload `json:"payload"`
-}
-
-type uptakePayload struct {
-	payload
-	Item *uptakeCommandItem `json:"item"`
-}
-
-type uptakeCommandItem struct {
-	codexCommandItem
-	AggregatedOutput json.RawMessage `json:"aggregated_output"`
-}
-
-var (
-	uptakeCommandItemMarker        = []byte(`"CommandExecution"`)
-	uptakeEscapedCommandItemMarker = []byte(`"CommandExecut\u0069on"`)
 )
 
 // ReadUptakeOnePass reads events, current turn models, and completed commands for uptake in one file pass.
 func ReadUptakeOnePass(path string, fn func(Event), commandFn func(CodexCommandResult), modelFn func(string, int)) (Meta, error) {
-	f, err := os.Open(path)
+	f, r, rd, codex, err := openUptake(path)
 	if err != nil {
-		return Meta{}, fmt.Errorf("transcript: %w", err)
+		return Meta{}, err
 	}
 	defer f.Close()
-	r := bufio.NewReaderSize(f, 1<<20)
-	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), fn: fn}
-	head, err := r.Peek(codexHead)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
-	}
-	if bytes.Contains(head, []byte(`"type":"session_meta"`)) {
-		rd.codex.eventUser, rd.codex.eventAgent, err = codexMessages(f)
-		if err != nil {
-			return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
-		}
-	}
+	events := queueUptakeEvents(rd, fn, codex)
 	model := ""
 	for {
 		raw, readErr := readLine(r)
 		if len(raw) > 0 {
-			rd.lineNo++
-			model = uptakeLine(raw, &rd, model, commandFn, modelFn)
+			model = uptakeLine(raw, rd, codex, model, commandFn, modelFn)
 		} else if readErr == nil {
 			rd.lineNo++
 			if modelFn != nil {
@@ -66,6 +33,7 @@ func ReadUptakeOnePass(path string, fn func(Event), commandFn func(CodexCommandR
 		if readErr != nil {
 			rd.meta.Originator, rd.meta.Account = rd.codex.originator, rd.codex.firstAccount
 			if errors.Is(readErr, io.EOF) {
+				finishUptakeEvents(events, fn, rd, codex)
 				return rd.meta, nil
 			}
 			return rd.meta, fmt.Errorf("transcript %s: %w", path, readErr)
@@ -73,111 +41,114 @@ func ReadUptakeOnePass(path string, fn func(Event), commandFn func(CodexCommandR
 	}
 }
 
-func uptakeLine(raw []byte, rd *reader, model string, commandFn func(CodexCommandResult), modelFn func(string, int)) string {
-	if name, ok := agentName(raw); ok {
-		rd.meta.Name = name
-		if modelFn != nil {
-			modelFn(model, rd.lineNo)
-		}
-		return model
+func openUptake(path string) (*os.File, *bufio.Reader, *reader, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, nil, false, fmt.Errorf("transcript: %w", err)
 	}
-	if skipLine(raw) {
-		if modelFn != nil {
-			modelFn(model, rd.lineNo)
-		}
-		return model
+	r := bufio.NewReaderSize(f, 1<<20)
+	head, err := r.Peek(codexHead)
+	if err != nil && !errors.Is(err, io.EOF) {
+		f.Close()
+		return nil, nil, nil, false, fmt.Errorf("transcript %s: %w", path, err)
 	}
+	codex := bytes.Contains(head, []byte(`"type":"session_meta"`))
+	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), commandFn: func(CodexCommandResult) {}}
+	rd.codex.deferMessages = codex
+	return f, r, &rd, codex, nil
+}
 
-	commandCandidate := commandFn != nil && (bytes.Contains(raw, uptakeCommandItemMarker) || bytes.Contains(raw, uptakeEscapedCommandItemMarker))
-	rec, parsed, err := decodeUptakeRecord(raw, commandCandidate)
-	if err != nil { //nolint:silent-error-handling // Preserve a turn_context model; rd.badLine below reports the malformed row.
-		if next, ok := modelFromRawLine(raw); ok {
+func queueUptakeEvents(rd *reader, fn func(Event), codex bool) *[]Event {
+	if fn == nil {
+		rd.fn = func(Event) {}
+		return nil
+	}
+	if !codex {
+		rd.fn = fn
+		return nil
+	}
+	events := make([]Event, 0)
+	queue := &events
+	rd.fn = func(event Event) {
+		if !rd.codex.queueFallback(event) {
+			*queue = append(*queue, event)
+		}
+	}
+	return queue
+}
+
+func uptakeLine(raw []byte, rd *reader, codex bool, model string, commandFn func(CodexCommandResult), modelFn func(string, int)) string {
+	if codex {
+		noteCodexMessages(raw, rd.codex)
+		rd.codex.currentLine = rd.lineNo + 1
+	}
+	if commandFn != nil {
+		if result, ok := parseCodexCommandResult(raw, rd.lineNo+1); ok {
+			commandFn(result)
+		}
+	}
+	modelUpdates, bad := rd.codex.modelUpdates, rd.meta.Bad
+	rd.line(raw)
+	if rd.codex.modelUpdates != modelUpdates {
+		model = rd.codex.model
+	} else if rd.meta.Bad != bad {
+		if next := modelFromMalformedRecord(raw); next != "" {
 			model = next
 		}
-	} else if rec.Type == "turn_context" && rec.Payload != nil && rec.Payload.Model != "" {
-		model = rec.Payload.Model
 	}
 	if modelFn != nil {
 		modelFn(model, rd.lineNo)
 	}
-	if commandCandidate && parsed.Payload != nil && uptakeCommandResultAllowed(parsed.Payload, err) {
-		if result, ok := uptakeCommandResult(parsed.Payload, rd.lineNo); ok {
-			commandFn(result)
-		}
-	}
-	if err != nil {
-		rd.badLine(raw, false, err)
-		return model
-	}
-
-	events, codex, parseErr := parseRecordKind(&rec, raw, rd.claude, rd.codex)
-	if parseErr != nil {
-		rd.badLine(raw, codex, parseErr)
-		return model
-	}
-	rd.emitParsed(raw, codex, events)
 	return model
 }
 
-func decodeUptakeRecord(raw []byte, commandCandidate bool) (record, uptakeRecord, error) {
-	if !commandCandidate {
-		var rec record
-		err := json.Unmarshal(raw, &rec)
-		return rec, uptakeRecord{}, err
-	}
-	var parsed uptakeRecord
-	err := json.Unmarshal(raw, &parsed)
-	if parsed.Payload == nil {
-		return record{}, parsed, err
-	}
-	p := parsed.Payload.payload
-	if parsed.Payload.Item != nil {
-		item := parsed.Payload.Item.codexCommandItem
-		p.Item = &item
-	}
-	return record{Type: parsed.Type, Timestamp: parsed.Timestamp, Payload: &p}, parsed, err
+func noteCodexMessages(raw []byte, codex *codexParser) {
+	head := raw[:min(len(raw), codexHead)]
+	codex.eventUser = codex.eventUser || bytes.Contains(head, userMessageLine)
+	codex.eventAgent = codex.eventAgent || bytes.Contains(head, agentMessageLine)
 }
 
-func uptakeCommandResultAllowed(pl *uptakePayload, decodeErr error) bool {
-	if pl == nil || pl.Type != "item_completed" || pl.Item == nil {
-		return false
+func modelFromMalformedRecord(raw []byte) string {
+	if !bytes.Contains(raw, []byte(`"turn_context"`)) {
+		return ""
 	}
-	if decodeErr == nil {
-		return true
+	var rec record
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		slog.Debug("decode malformed turn context for uptake model", "error", err)
 	}
-	var typeErr *json.UnmarshalTypeError
-	if !errors.As(decodeErr, &typeErr) {
-		return false
+	if rec.Type == "turn_context" && rec.Payload != nil && rec.Payload.Model != "" {
+		return rec.Payload.Model
 	}
-	field := strings.ToLower(typeErr.Field)
-	switch field {
-	case "timestamp":
-		return true
-	case "type", "payload.type", "payload.started_at_ms", "payload.completed_at_ms":
-		return false
-	}
-	return !strings.HasPrefix(field, "payload.item")
+	return ""
 }
 
-func uptakeCommandResult(pl *uptakePayload, line int) (CodexCommandResult, bool) {
-	it := pl.Item
-	output := ""
-	if len(it.AggregatedOutput) > 0 && json.Unmarshal(it.AggregatedOutput, &output) != nil {
-		return CodexCommandResult{}, false
+func finishUptakeEvents(queue *[]Event, fn func(Event), rd *reader, codex bool) {
+	if fn == nil {
+		return
 	}
-	return commandResult(line, pl.StartedAtMS, pl.CompletedAtMS, it.codexCommandItem, output)
+	if queue == nil {
+		return
+	}
+	if codex {
+		*queue = mergeUptakeEvents(*queue, rd.codex.finishUptake())
+	}
+	for i := range *queue {
+		fn((*queue)[i])
+	}
 }
 
-func modelFromRawLine(raw []byte) (string, bool) {
-	var v struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Type  string `json:"type"`
-			Model string `json:"model"`
-		} `json:"payload"`
+func mergeUptakeEvents(events, deferred []Event) []Event {
+	merged := make([]Event, 0, len(events)+len(deferred))
+	i, j := 0, 0
+	for i < len(events) && j < len(deferred) {
+		if events[i].Line <= deferred[j].Line {
+			merged = append(merged, events[i])
+			i++
+		} else {
+			merged = append(merged, deferred[j])
+			j++
+		}
 	}
-	if json.Unmarshal(raw, &v) == nil && v.Type == "turn_context" && v.Payload.Model != "" {
-		return v.Payload.Model, true
-	}
-	return "", false
+	merged = append(merged, events[i:]...)
+	return append(merged, deferred[j:]...)
 }

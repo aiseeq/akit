@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -132,13 +133,49 @@ func TestReadUptakeOnePassMatchesCodexCommandResultsWithEscapedType(t *testing.T
 		t.Fatal(err)
 	}
 	want, err := CodexCommandResults(path)
-	if err != nil || len(want) != 1 {
-		t.Fatalf("old command scan = %+v, err=%v; want one escaped type", want, err)
+	if err != nil || len(want) != 0 {
+		t.Fatalf("old command scan = %+v, err=%v; want escaped type to be skipped", want, err)
 	}
 	var got []CodexCommandResult
 	_, err = ReadUptakeOnePass(path, nil, func(r CodexCommandResult) { got = append(got, r) }, nil)
-	if err != nil || len(got) != 1 || got[0] != want[0] {
-		t.Fatalf("one-pass = %+v, err=%v; want old command scan %+v", got, err, want[0])
+	if err != nil || len(got) != 0 {
+		t.Fatalf("one-pass = %+v, err=%v; want escaped type to be skipped", got, err)
+	}
+}
+
+func TestReadUptakeOnePassMatchesThreeReadersOnReviewCases(t *testing.T) {
+	rows := []string{
+		`{"type":"response_item","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}}}`,
+		`{"timestamp":123,"type":"event_msg","payload":{"type":"item_completed","started_at_ms":"bad","item":{"type":"CommandExecution","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}}}`,
+		`{"timestamp":"2026-10-31T13:00:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}},"message":42}`,
+		`{"timestamp":"2026-10-31T13:00:00Z","type":"system","content":{"type":"CommandExecution"}}`,
+		`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":2000,"item":{"type":"CommandExecut\u0069on","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}}}`,
+	}
+	for i, row := range rows {
+		t.Run(fmt.Sprintf("case_%d", i+1), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rollout.jsonl")
+			if err := os.WriteFile(path, []byte(row+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wantCommands, err := CodexCommandResults(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotCommands []CodexCommandResult
+			var gotEvents []Event
+			meta, err := ReadUptakeOnePass(path, func(e Event) { gotEvents = append(gotEvents, e) }, func(r CodexCommandResult) { gotCommands = append(gotCommands, r) }, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wantEvents []Event
+			wantMeta, err := Read(path, nil, func(e Event) { wantEvents = append(wantEvents, e) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotCommands, wantCommands) || !reflect.DeepEqual(gotEvents, wantEvents) || meta.Bad != wantMeta.Bad {
+				t.Fatalf("uptake commands=%+v events=%+v bad=%d; old commands=%+v events=%+v bad=%d", gotCommands, gotEvents, meta.Bad, wantCommands, wantEvents, wantMeta.Bad)
+			}
+		})
 	}
 }
 
