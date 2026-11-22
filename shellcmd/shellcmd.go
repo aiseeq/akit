@@ -10067,7 +10067,7 @@ var valueOptions = map[string]map[string]bool{
 	"env":              set("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0"),
 	"sudo":             set("-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-R", "--chroot"),
 	"nice":             set("-n", "--adjustment"),
-	"unbuffer":         set("-ignore"),
+	"unbuffer":         set("-ig", "-ign", "-igno", "-ignor", "-ignore"),
 	"ionice":           set("-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"),
 	"stdbuf":           set("-i", "--input", "-o", "--output", "-e", "--error"),
 	"time":             set("-f", "--format", "-o", "--output"),
@@ -10100,13 +10100,15 @@ var valueOptions = map[string]map[string]bool{
 }
 
 var flagOptions = map[string]map[string]bool{
-	"time":             set("-p", "--portability", "-v", "--verbose", "-a", "--append", "-q", "--quiet"),
-	"env":              set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug", "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"),
-	"exec":             set("-c", "-l"),
-	"sudo":             set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
-	"timeout":          set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
-	"nohup":            set("--help", "--version"),
-	"unbuffer":         set("-p", "-console", "-noecho", "-nottycopy", "-nottyinit"),
+	"time":    set("-p", "--portability", "-v", "--verbose", "-a", "--append", "-q", "--quiet"),
+	"env":     set("-i", "--ignore-environment", "-0", "--null", "-v", "--debug", "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"),
+	"exec":    set("-c", "-l"),
+	"sudo":    set("-A", "--askpass", "-B", "--bell", "-P", "--preserve-groups", "-n", "--non-interactive", "-E", "--preserve-env", "-H", "--set-home", "-S", "--stdin", "-b", "--background", "-k", "--reset-timestamp", "-K", "--remove-timestamp", "-l", "--list", "-V", "--version", "-s", "--shell", "-i", "--login", "-e", "--edit", "-q", "--quiet", "-N", "--no-update"),
+	"timeout": set("-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"),
+	"nohup":   set("--help", "--version"),
+	// Tcl takes any unambiguous prefix of a spawn option.
+	"unbuffer": set("-p", "-co", "-con", "-cons", "-conso", "-consol", "-console", "-noe", "-noec", "-noech", "-noecho",
+		"-nottyc", "-nottyco", "-nottycop", "-nottycopy", "-nottyi", "-nottyin", "-nottyini", "-nottyinit"),
 	"taskset":          set("-a", "--all-tasks", "-c", "--cpu-list"),
 	"setsid":           set("-c", "--ctty", "-f", "--fork", "-w", "--wait", "-h", "--help", "-V", "--version"),
 	"chrt":             set("-o", "--other", "-f", "--fifo", "-r", "--rr", "-b", "--batch", "-i", "--idle", "-d", "--deadline", "-R", "--reset-on-fork", "-a", "--all-tasks", "-m", "--max", "-v", "--verbose"),

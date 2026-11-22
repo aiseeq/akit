@@ -16,6 +16,7 @@ func TestUnbufferIsWrapper(t *testing.T) {
 		{`unbuffer -noecho rm -rf /x`, []string{"unbuffer", "rm"}},
 		{`unbuffer -p -nottycopy rm -rf /x`, []string{"unbuffer", "rm"}},
 		{`unbuffer -ignore HUP rm -rf /x`, []string{"unbuffer", "rm"}},
+		{`unbuffer -ign HUP -noe rm -rf /x`, []string{"unbuffer", "rm"}},
 		{`printf x | unbuffer -p kill -9 1`, []string{"printf", "unbuffer", "kill"}},
 	} {
 		calls, err := Calls(tc.src)
