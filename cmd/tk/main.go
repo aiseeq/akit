@@ -186,7 +186,7 @@ func factsFromBody(body string) *taskFacts {
 	return &taskFacts{
 		Back: headerValue(body, "Заказчик: "), Why: lineValue(body, "Причина: "),
 		Executor: executor(body), Opener: opener(body), Waits: waiting(body),
-		NoCheck: noCheck(body), Journal: lineValue(body, "Вид: ") == "журнал",
+		NoCheck: noCheck(body), Journal: journalFromBody(body),
 		Checker: checker, Check: check, CheckerSession: checkerSession,
 		Plan: planItems(body), Blocks: headerLinks(body, blocksPrefix),
 		BlockedBy: headerLinks(body, blockedPrefix), Actors: journalActors(body), RenamedFrom: renamedFrom(body),
@@ -194,6 +194,9 @@ func factsFromBody(body string) *taskFacts {
 }
 
 func renamedFrom(body string) []string {
+	if !strings.Contains(body, " переименован — ") {
+		return nil
+	}
 	var names []string
 	for _, record := range journalLines(body) {
 		if match := renameHistoryRE.FindStringSubmatch(journalRecordHeader(record)); match != nil {
@@ -201,6 +204,10 @@ func renamedFrom(body string) []string {
 		}
 	}
 	return names
+}
+
+func journalFromBody(body string) bool {
+	return lineValue(body, "Вид: ") == "журнал"
 }
 
 func factsForTask(t task) *taskFacts {
@@ -2321,13 +2328,7 @@ func matchesID(t task, id string) bool {
 	if t.slug == id || base == id || strings.TrimSuffix(base, ".md") == id {
 		return true
 	}
-	var renamed []string
-	if t.facts != nil {
-		renamed = t.facts.RenamedFrom
-	} else if strings.Contains(t.body, " переименован — ") {
-		renamed = renamedFrom(t.body)
-	}
-	for _, old := range renamed {
+	for _, old := range taskRenamedFrom(t) {
 		if old == id || strings.TrimSuffix(old, ".md") == id {
 			return true
 		}
@@ -4756,7 +4757,7 @@ func isJournal(t task) bool {
 	if t.facts != nil {
 		return t.facts.Journal
 	}
-	return lineValue(t.body, "Вид: ") == "журнал"
+	return journalFromBody(t.body)
 }
 
 func taskWait(t task) string {
@@ -4771,6 +4772,20 @@ func taskExecutor(t task) string {
 		return t.facts.Executor
 	}
 	return executor(t.body)
+}
+
+func taskRenamedFrom(t task) []string {
+	if t.facts != nil {
+		return t.facts.RenamedFrom
+	}
+	return renamedFrom(t.body)
+}
+
+func taskBlockedBy(t task) []string {
+	if t.facts != nil {
+		return t.facts.BlockedBy
+	}
+	return headerLinks(t.body, blockedPrefix)
 }
 
 // nextGroup orders the queue. Work already begun under a closed pair stays in the
@@ -4829,13 +4844,7 @@ func orderedNextCandidatesUsing(tasks []task, actor string, gate queuegate.Scope
 		}
 		visiting[t.slug] = true
 		maxDepth := 0
-		var blockedBy []string
-		if t.facts != nil {
-			blockedBy = t.facts.BlockedBy
-		} else {
-			blockedBy = headerLinks(t.body, blockedPrefix)
-		}
-		for _, ref := range blockedBy {
+		for _, ref := range taskBlockedBy(*t) {
 			target, found := bySlug[ref]
 			if strings.Contains(ref, "/") || !found {
 				if maxDepth < 1 && blockMark(taskProject(t.path), ref, io.Discard) != "" {
