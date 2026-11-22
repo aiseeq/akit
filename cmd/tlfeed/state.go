@@ -56,12 +56,6 @@ func (s *status) setError(text string) {
 	s.mu.Unlock()
 }
 
-func (s *status) snapshotErr() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.err
-}
-
 func (s *status) rowsLoaded(at time.Time) {
 	s.mu.Lock()
 	s.lastRow = at

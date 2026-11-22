@@ -40,7 +40,7 @@ Flags:
   --state FILE     state file for a supervisor, rewritten every --beat; '' — none
                    (default $XDG_STATE_HOME/akit/tlfeed/state.json, ~/.local/state when unset)
   --tick D         pass period (default 1s)
-  --idle D         a file that has not grown this long releases its parser (default 15m)
+  --idle D         a file that has not grown this long releases its parser (default 1h)
   --sweep D        every known file is looked at once per D, changed or not (default 5m)
   --rescan D       full listing of the transcripts (default 1h)
   --beat D         state file period, at most 60s (default 10s)
@@ -76,7 +76,7 @@ func parse(args []string) (options, error) {
 	fs.IntVar(&o.verify, "verify", 0, "")
 	fs.BoolVar(&o.check, "check", false, "")
 	fs.DurationVar(&o.cfg.tick, "tick", time.Second, "")
-	fs.DurationVar(&o.cfg.idle, "idle", 15*time.Minute, "")
+	fs.DurationVar(&o.cfg.idle, "idle", time.Hour, "")
 	fs.DurationVar(&o.cfg.sweep, "sweep", 5*time.Minute, "")
 	fs.DurationVar(&o.cfg.rescan, "rescan", time.Hour, "")
 	fs.DurationVar(&o.beat, "beat", 10*time.Second, "")

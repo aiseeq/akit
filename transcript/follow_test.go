@@ -209,3 +209,57 @@ func TestFollowPrescan(t *testing.T) {
 		t.Fatal("Prescan после Feed принят")
 	}
 }
+
+// Follow, пропустивший первые n строк, отдаёт для следующих те же события, что Read, на любом n и любом шаге.
+func TestFollowSkipEqualsRead(t *testing.T) {
+	for _, name := range []string{"claude.jsonl", "codex.jsonl"} {
+		data, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		all, meta := readPrefix(t, data, len(data))
+		ends := cuts(data)
+		for skip := 0; skip <= len(ends); skip++ {
+			for _, step := range []int{1, 3, len(ends)} {
+				f := NewFollow()
+				if err := f.Prescan(data); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.SkipThrough(skip); err != nil {
+					t.Fatal(err)
+				}
+				var got []Event
+				done := 0
+				for i := step - 1; done < len(data); i += step {
+					end := ends[min(i, len(ends)-1)]
+					if err := f.Feed(data[done:end], func(e Event) { got = append(got, e) }); err != nil {
+						t.Fatal(err)
+					}
+					done = end
+				}
+				var want []Event
+				for _, e := range all {
+					if e.Line > skip {
+						want = append(want, e)
+					}
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("%s, пропуск %d, шаг %d: события\n%v\nждали\n%v", name, skip, step, got, want)
+				}
+				if m := f.Meta(); m.Name != meta.Name || m.Originator != meta.Originator || m.Account != meta.Account {
+					t.Fatalf("%s, пропуск %d: Meta %+v, ждали %+v", name, skip, m, meta)
+				}
+			}
+		}
+	}
+	if err := NewFollow().SkipThrough(1); err != nil {
+		t.Fatal(err)
+	}
+	f := NewFollow()
+	if err := f.Feed([]byte("{}\n"), func(Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	if f.SkipThrough(1) == nil {
+		t.Fatal("пропуск после Feed принят")
+	}
+}

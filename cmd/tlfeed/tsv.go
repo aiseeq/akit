@@ -107,8 +107,10 @@ const (
 	rawColumns   = "file_id, line, off, raw"
 	eventColumns = "ts, file_id, session, kind, project, line, role, who, text, images, error, subtype, model, reply_id, " +
 		"request_id, in_tok, out_tok, cache_read, cache_write, cwd"
-	fileColumns = "file_id, path, kind, project, session, parent, name, size, ingested, lines, mtime, inode, first_ts, " +
-		"last_ts, bad, tail, gen, ver"
+	fileColumns = "file_id, path, kind, project, session, parent, name, size, ingested, lines, ev_lines, mtime, inode, " +
+		"first_ts, last_ts, bad, tail, gen, dirty, ver"
+	// usageColumns — the columns of usage as usage_mv fills them from events
+	usageColumns = "file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write"
 )
 
 // rawRow — one line of a file, without its '\n'.
@@ -154,8 +156,14 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 	r.last(e.Cwd)
 }
 
-// fileRow — the state of a file after this pass.
-func fileRow(b *bytes.Buffer, f *file, ver uint64) {
+// fileRow — the state of a file after this pass. A dirty row is written before rows past its lines and ev_lines
+// are sent: if the loader stops before the clean row, the next start deletes them and loads them again. Its size
+// is 0, so that the next start looks at the file whatever its size.
+func fileRow(b *bytes.Buffer, f *file, ver uint64, dirty bool) {
+	size, flag := uint64(max(f.size, 0)), uint64(0)
+	if dirty {
+		size, flag = 0, 1
+	}
 	r := row{b}
 	r.num(f.id)
 	r.str(f.src.Path)
@@ -164,9 +172,10 @@ func fileRow(b *bytes.Buffer, f *file, ver uint64) {
 	r.str(f.src.ID)
 	r.str(f.src.ParentID)
 	r.str(f.name)
-	r.num(uint64(max(f.size, 0)))
+	r.num(size)
 	r.num(uint64(f.ingested))
 	r.num(uint64(f.lines))
+	r.num(uint64(f.evLines))
 	r.seconds(f.mtime)
 	r.num(f.inode)
 	r.ms(f.first)
@@ -174,6 +183,7 @@ func fileRow(b *bytes.Buffer, f *file, ver uint64) {
 	r.num(uint64(max(f.bad, 0)))
 	r.num(f.tail)
 	r.num(uint64(f.gen))
+	r.num(flag)
 	r.b.WriteString(strconv.FormatUint(ver, 10))
 	r.end()
 }

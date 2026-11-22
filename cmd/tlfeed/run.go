@@ -12,21 +12,36 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-// parseFileRow reads one row of the files table (columns in fileColumns order).
-func parseFileRow(home string, r []string) (*file, uint64, error) {
+// fileCol — the position of each column of fileColumns.
+var fileCol = func() map[string]int {
+	m := map[string]int{}
+	for i, name := range strings.Split(fileColumns, ",") {
+		m[strings.TrimSpace(name)] = i
+	}
+	return m
+}()
+
+// parseFileRow reads one row of the files table (columns in fileColumns order); dirty — rows past its lines may
+// be in the tables.
+func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err error) {
 	if len(r) != strings.Count(fileColumns, ",")+1 {
-		return nil, 0, fmt.Errorf("files row with %d fields", len(r))
+		return nil, 0, false, fmt.Errorf("files row with %d fields", len(r))
 	}
 	p := &fields{row: r}
-	f := &file{id: p.uint(0), name: r[6], size: int64(p.uint(7)), ingested: int64(p.uint(8)), lines: p.int(9), mtime: p.time(10),
-		inode: p.uint(11), first: p.time(12), last: p.time(13), bad: p.int(14), tail: p.uint(15), gen: uint32(p.uint(16))}
-	ver := p.uint(len(r) - 1) // ver is the last column
+	c := func(name string) int { return fileCol[name] }
+	f = &file{id: p.uint(c("file_id")), name: r[c("name")], size: int64(p.uint(c("size"))), ingested: int64(p.uint(c("ingested"))),
+		lines: p.int(c("lines")), evLines: p.int(c("ev_lines")), mtime: p.time(c("mtime")), inode: p.uint(c("inode")),
+		first: p.time(c("first_ts")), last: p.time(c("last_ts")), bad: p.int(c("bad")), tail: p.uint(c("tail")),
+		gen: uint32(p.uint(c("gen")))}
+	dirty = p.uint(c("dirty")) != 0
+	ver = p.uint(c("ver"))
 	if p.err != nil {
-		return nil, 0, fmt.Errorf("files row: %w", p.err)
+		return nil, 0, false, fmt.Errorf("files row: %w", p.err)
 	}
-	f.describe(home, transcript.Source{Path: r[1], ID: r[4], ParentID: r[5]})
-	f.evLines, f.acked, f.complete = f.lines, f.ingested, f.ingested
-	return f, ver, nil
+	f.describe(home, transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")]})
+	f.complete = f.ingested
+	f.commit()
+	return f, ver, dirty, nil
 }
 
 // start brings the loader to the state of the tables and lists every transcript; it returns the paths to look at.
@@ -96,6 +111,9 @@ func (l *loader) follow() error {
 	}
 }
 
+// recentDirs — how long a folder whose mtime moved stays polled every pass.
+const recentDirs = 15 * time.Minute
+
 // pass looks at what may have changed: watched and recently changed folders, files with a parser, a slice of the
 // rest (the sweep) and, when full, the whole listing; then it releases the parsers of files that went quiet.
 func (l *loader) pass(full bool) error {
@@ -107,12 +125,12 @@ func (l *loader) pass(full bool) error {
 			want[p] = true
 		}
 	}
-	for _, d := range l.dirs.hot(now, l.cfg.idle, l.held(want)) {
+	for _, d := range l.dirs.hot(now, min(l.cfg.idle, recentDirs), l.held(want)) {
 		for _, p := range l.dirs.poll(d, now) {
 			want[p] = true
 		}
 	}
-	l.sweepSlice(want)
+	l.sweepSlice(want, now)
 	if full || lost {
 		if paths, err := l.listAll(); err != nil {
 			l.logf("list transcripts: %v", err)
@@ -125,7 +143,7 @@ func (l *loader) pass(full bool) error {
 	if err := l.visitAll(slices.Sorted(maps.Keys(want))); err != nil {
 		return err
 	}
-	for _, f := range l.files {
+	for f := range l.parsers {
 		if f.follow != nil && now.Sub(f.grown) > l.cfg.idle {
 			f.follow, f.parsed = nil, 0
 		}
@@ -137,8 +155,10 @@ func (l *loader) pass(full bool) error {
 // held adds the files with a parser to want and returns the folders where their growth and their subagents show.
 func (l *loader) held(want map[string]bool) []string {
 	var extra []string
-	for p, f := range l.files {
-		if f.follow == nil {
+	for f := range l.parsers {
+		p := f.src.Path
+		if f.follow == nil || l.files[p] != f {
+			delete(l.parsers, f)
 			continue
 		}
 		want[p] = true
@@ -151,14 +171,21 @@ func (l *loader) held(want map[string]bool) []string {
 	return extra
 }
 
-// sweepSlice adds the next known files to want, so that every one is looked at once per sweep period.
-func (l *loader) sweepSlice(want map[string]bool) {
-	n := len(l.all)
-	if n == 0 {
-		return
+// sweepSlice adds the next known files and folders to want, so that every file is looked at once per sweep period;
+// the folders too, or once per rescan period when inotify watches every one of them.
+func (l *loader) sweepSlice(want map[string]bool, now time.Time) {
+	part := func(n int, period time.Duration) int {
+		return int(int64(n)*int64(l.cfg.tick)/int64(max(period, l.cfg.tick))) + 1
 	}
-	per := int(int64(n)*int64(l.cfg.tick)/int64(max(l.cfg.sweep, l.cfg.tick))) + 1
-	for i := 0; i < per && i < n; i++ {
+	period := l.cfg.sweep
+	if l.dirs.w.complete() {
+		period = max(l.cfg.rescan, l.cfg.sweep)
+	}
+	for _, p := range l.dirs.sweep(part(len(l.dirs.order), period), now) {
+		want[p] = true
+	}
+	n := len(l.all)
+	for i := 0; i < part(n, l.cfg.sweep) && i < n; i++ {
 		l.sweep = (l.sweep + 1) % n
 		if f := l.all[l.sweep]; !f.gone {
 			want[f.src.Path] = true

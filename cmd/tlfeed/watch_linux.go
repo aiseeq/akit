@@ -128,4 +128,10 @@ func (w *inotify) active() bool {
 	return w.dead == nil
 }
 
+func (w *inotify) complete() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dead == nil && !w.full
+}
+
 func (w *inotify) close() { w.f.Close() }

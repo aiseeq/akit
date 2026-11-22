@@ -12,6 +12,8 @@ type watcher interface {
 	// drain returns the events since the last call; overflow — some were lost, a full listing is due
 	drain() (events []watchEvent, overflow bool)
 	active() bool
+	// complete — active, and every folder asked for is watched (the kernel's limit was not reached)
+	complete() bool
 	close()
 }
 
@@ -21,4 +23,5 @@ type noWatch struct{}
 func (noWatch) add(string)                  {}
 func (noWatch) drain() ([]watchEvent, bool) { return nil, false }
 func (noWatch) active() bool                { return false }
+func (noWatch) complete() bool              { return false }
 func (noWatch) close()                      {}
