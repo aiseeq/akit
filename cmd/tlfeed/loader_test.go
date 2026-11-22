@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +73,16 @@ func newHarness(t *testing.T) *harness {
 // loader — a new loader over the same home and server, as after a restart; started, first pass done.
 func (h *harness) loader(stop chan struct{}) *loader {
 	h.t.Helper()
+	l, paths := h.started(stop)
+	if err := l.visitAll(paths); err != nil {
+		h.t.Fatal(err)
+	}
+	return l
+}
+
+// started — a new loader that has read its state and listed the transcripts; the paths are to visit.
+func (h *harness) started(stop chan struct{}) (*loader, []string) {
+	h.t.Helper()
 	cfg := config{home: h.home, db: "tq", tick: time.Second, idle: time.Hour, sweep: time.Second, rescan: time.Hour, batch: 32 << 20}
 	if stop == nil {
 		stop = make(chan struct{})
@@ -83,10 +94,7 @@ func (h *harness) loader(stop chan struct{}) *loader {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	if err := l.visitAll(paths); err != nil {
-		h.t.Fatal(err)
-	}
-	return l
+	return l, paths
 }
 
 func (h *harness) pass(l *loader) {
@@ -199,7 +207,7 @@ func TestRewind(t *testing.T) {
 	if f.id != id || f.gen != 1 {
 		t.Fatalf("id %d gen %d after rewind, want id %d gen 1", f.id, f.gen, id)
 	}
-	if len(h.fake.deletes) != 3 {
+	if len(h.fake.deletes) != 4 { // events, replies, usage, raw
 		t.Fatalf("deletes %v", h.fake.deletes)
 	}
 	raws := h.fake.sentTo("raw")
@@ -294,37 +302,80 @@ func TestRestart(t *testing.T) {
 	}
 }
 
-// A loader stopped between the raw and files inserts: the next one takes the lines already in raw, sends their
-// events only if they are missing, and loses nothing.
-func TestRestartAfterCrashBetweenInserts(t *testing.T) {
-	for _, failing := range []string{"events", "files"} {
-		t.Run(failing, func(t *testing.T) {
-			h := newHarness(t)
-			data := sample(t, "claude.jsonl")
-			path := claudePath(h.home)
-			half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
-			write(t, path, data[:half])
-			stop := make(chan struct{})
-			l := h.loader(stop)
-			appendTo(t, path, data[half:])
-			h.fake.set(func(f *fakeCH) { f.fail[failing] = 1 << 30 })
-			go func() {
-				for len(h.fake.sentTo("raw")) < 2 {
-					time.Sleep(10 * time.Millisecond)
-				}
-				close(stop)
-			}()
-			if err := l.pass(false); err != errStopped {
-				t.Fatalf("pass: %v, want errStopped", err)
+// A loader stopped at any point of sending a batch — after the dirty files row, after raw, after events — and
+// started again: what went past the stored lines is deleted and loaded again, nothing is lost or twice, for a file
+// seen before and for a new one, alone in its pass or with another new file.
+func TestRestartAfterStopInBatch(t *testing.T) {
+	for _, failing := range []string{"raw", "events", "files"} {
+		for _, fresh := range []bool{false, true} {
+			for _, other := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/new-%t/other-%t", failing, fresh, other), func(t *testing.T) {
+					restartAfterStop(t, failing, fresh, other)
+				})
 			}
-			h.fake.set(func(f *fakeCH) { f.fail[failing] = 0 })
-			l2 := h.loader(nil)
-			h.same(l2, path)
-			if !strings.Contains(h.log.String(), "lines in raw past files, taken") {
-				t.Fatalf("log %q", h.log.String())
+		}
+	}
+}
+
+func restartAfterStop(t *testing.T, failing string, fresh, other bool) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+	stop := make(chan struct{})
+	var l *loader
+	var paths []string
+	arm := func() {
+		h.fake.set(func(f *fakeCH) {
+			f.fail[failing] = 1 << 30
+			if failing == "files" {
+				f.pass["files"] = 1 // the dirty row goes, the clean one does not
 			}
 		})
 	}
+	if fresh {
+		write(t, path, data[:half])
+		arm()
+		l, paths = h.started(stop)
+	} else {
+		write(t, path, data[:half])
+		l = h.loader(stop)
+		appendTo(t, path, data[half:len(data)-40])
+		arm()
+	}
+	go func() {
+		for h.fake.triedFailing(failing) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		close(stop)
+	}()
+	if fresh {
+		if err := l.visitAll(paths); err != errStopped {
+			t.Fatalf("first run: %v, want errStopped", err)
+		}
+	} else if err := l.pass(false); err != errStopped {
+		t.Fatalf("pass: %v, want errStopped", err)
+	}
+	h.fake.set(func(f *fakeCH) { f.fail[failing], f.pass["files"] = 0, 0 })
+	if fresh {
+		appendTo(t, path, data[half:])
+	} else {
+		appendTo(t, path, data[len(data)-40:])
+	}
+	var second string
+	if other {
+		second = filepath.Join(h.home, ".claude", "projects", testProject, "22222222-2222-4333-8444-555555555555.jsonl")
+		write(t, second, data)
+	}
+	l2 := h.loader(nil)
+	h.same(l2, path)
+	if other {
+		h.same(l2, second)
+	}
+	if again := h.loader(nil); len(again.files) == 0 {
+		t.Fatal("no files after a third start")
+	}
+	h.same(l2, path)
 }
 
 // Many files in one pass go in one insert per table; the token lists every file, and a long list is hashed.
@@ -431,38 +482,44 @@ func TestStateFile(t *testing.T) {
 	}
 }
 
-// The state of a follow run: lag is zero once the server confirmed every complete line, and the error shows
-// while the server is down.
+// The state file of a follow run: lag is zero once the server confirmed every complete line; while the server is
+// down, the file shows the error and the bytes waiting for it.
 func TestStateOfLoader(t *testing.T) {
 	h := newHarness(t)
 	data := sample(t, "claude.jsonl")
 	path := claudePath(h.home)
 	write(t, path, data[:len(data)-30])
 	l := h.loader(nil)
+	state := filepath.Join(t.TempDir(), "state.json")
+	l.st = newStatus(state)
 	l.report()
 	if lag, n := l.lag(); lag != 0 || n != 1 {
 		t.Fatalf("lag %d files %d after a pass", lag, n)
 	}
-	stop := make(chan struct{})
+	stop, beatDone := make(chan struct{}), make(chan struct{})
+	go l.st.beat(time.Millisecond, stop, beatDone, time.Now, func(string, ...any) {})
 	l.stop = stop
 	h.fake.set(func(f *fakeCH) { f.down = true })
 	appendTo(t, path, data[len(data)-30:])
-	go func() {
-		for l.st.snapshotErr() == "" {
-			time.Sleep(5 * time.Millisecond)
+	want := int64(len(data) - bytes.LastIndexByte(data[:len(data)-30], '\n') - 1) // the last line, now complete
+	passDone := make(chan error)
+	go func() { passDone <- l.pass(false) }()
+	var got stateFile
+	deadline := time.Now().Add(10 * time.Second)
+	for got.LagBytes != want || !strings.Contains(got.Error, "insert") {
+		if time.Now().After(deadline) {
+			t.Fatalf("state file while the server is down: %+v, want lag_bytes %d and the error", got, want)
 		}
-		close(stop)
-	}()
-	if err := l.pass(false); err != errStopped {
+		time.Sleep(time.Millisecond)
+		if raw, err := os.ReadFile(state); err == nil {
+			_ = json.Unmarshal(raw, &got)
+		}
+	}
+	close(stop)
+	if err := <-passDone; err != errStopped {
 		t.Fatalf("pass %v", err)
 	}
-	want := int64(len(data) - bytes.LastIndexByte(data[:len(data)-30], '\n') - 1) // the last line, now complete
-	if lag, _ := l.lag(); lag != want {
-		t.Fatalf("lag %d while the server is down, want %d", lag, want)
-	}
-	if e := l.st.snapshotErr(); !strings.Contains(e, "insert raw") {
-		t.Fatalf("state error %q", e)
-	}
+	<-beatDone
 }
 
 func TestArgs(t *testing.T) {
@@ -495,5 +552,138 @@ func TestEscape(t *testing.T) {
 	escapeString(&b, in)
 	if unescape(b.String()) != in || strings.ContainsAny(b.String(), "\t\n\r") {
 		t.Fatalf("escape %q", b.String())
+	}
+}
+
+// A rename without growth: the files row gets the new path, though no line is new.
+func TestRenameWithoutGrowth(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	write(t, path, data)
+	l := h.loader(nil)
+	id := h.same(l, path).id
+	moved := filepath.Join(h.home, ".claude", "projects", testProject, "99999999-2222-4333-8444-555555555555.jsonl")
+	if err := os.Rename(path, moved); err != nil {
+		t.Fatal(err)
+	}
+	h.pass(l)
+	if f := l.files[moved]; f == nil || f.id != id {
+		t.Fatal("not followed under the new path")
+	}
+	if files := h.fake.latestFiles(); len(files) != 1 || files[0][1] != moved {
+		t.Fatalf("files row %v, want path %s", files, moved)
+	}
+}
+
+// Growth by an incomplete line only: the files row records the new size; no parser is built for it.
+func TestGrowthByPartialLine(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	write(t, path, data)
+	l := h.loader(nil)
+	h.same(l, path)
+	l.cfg.idle = time.Nanosecond // the parser goes
+	h.pass(l)
+	appendTo(t, path, []byte(`{"partial`))
+	h.pass(l)
+	files := h.fake.latestFiles()
+	if want := strconv.Itoa(len(data) + len(`{"partial`)); files[0][7] != want {
+		t.Fatalf("files size %s, file %s", files[0][7], want)
+	}
+	if l.files[path].follow != nil {
+		t.Fatal("a parser built for an incomplete line")
+	}
+}
+
+// A known worker task starts a session on another day: the rollout in the new day folder is found within a few
+// passes, with inotify and by polling alone.
+func TestNewDayFolderInKnownTask(t *testing.T) {
+	for _, useInotify := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inotify-%t", useInotify), func(t *testing.T) {
+			h := newHarness(t)
+			data := sample(t, "codex.jsonl")
+			month := filepath.Join(h.home, ".local", "state", "worker", "job1", "codex", "sessions", "2026", "11")
+			first := filepath.Join(month, "21", "rollout-2026-11-21T23-52-00-01a172ac-0000-7000-8000-000000000001.jsonl")
+			write(t, first, data)
+			l, paths := h.started(nil)
+			if useInotify {
+				w, err := newWatcher(l.logf)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer w.close()
+				l.dirs.w = w
+				l.dirs.known, l.dirs.order = map[string]time.Time{}, nil
+				for _, f := range l.all {
+					l.dirs.addFileDir(f.src.Path)
+				}
+				for _, p := range paths {
+					l.dirs.addFileDir(p)
+				}
+				l.dirs.watchClaude()
+				l.cfg.sweep = time.Hour // inotify alone
+			}
+			if err := l.visitAll(paths); err != nil {
+				t.Fatal(err)
+			}
+			l.cfg.idle = time.Nanosecond // the first session is quiet: its parser and folders are not polled
+			h.pass(l)
+			second := filepath.Join(month, "22", "rollout-2026-11-22T04-38-00-01a172ac-0000-7000-8000-000000000002.jsonl")
+			write(t, second, data)
+			deadline := time.Now().Add(5 * time.Second)
+			for passes := 0; l.files[second] == nil || passes < 3; passes++ {
+				if time.Now().After(deadline) {
+					t.Fatalf("rollout in a new day folder of a known task not found after %d passes", passes)
+				}
+				h.pass(l)
+				time.Sleep(time.Millisecond)
+			}
+			h.same(l, second)
+		})
+	}
+}
+
+// A file that cannot be read when it is first seen is looked at again on the next pass, though its size and time
+// did not change.
+func TestUnreadableFileLookedAgain(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a file without permissions")
+	}
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	write(t, path, data)
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	l := h.loader(nil)
+	if n := len(h.fake.sentTo("raw")); n != 0 {
+		t.Fatalf("%d raw inserts from an unreadable file", n)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.pass(l)
+	h.same(l, path)
+}
+
+// A parser released after idle is built again without parsing the lines whose events are loaded: the events of
+// the new lines are the same, bad lines keep their count.
+func TestParserRebuiltSkipsLoadedLines(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	half := bytes.Index(data, []byte(`"parentUuid":"j"`)) - 1 // past the broken line: it is among the skipped
+	write(t, path, data[:half])
+	l := h.loader(nil)
+	l.cfg.idle = time.Nanosecond
+	h.pass(l)
+	appendTo(t, path, data[half:])
+	h.pass(l)
+	f := h.same(l, path)
+	if meta, _ := transcript.Read(path, nil, func(transcript.Event) {}); f.bad != meta.Bad {
+		t.Fatalf("bad %d, transcript.Read %d", f.bad, meta.Bad)
 	}
 }

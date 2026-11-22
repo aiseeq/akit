@@ -21,6 +21,32 @@ type Follow struct {
 	user, agent bool
 	// fed и prescanned — сколько байт с начала файла пришло через Feed и через Prescan
 	fed, prescanned int
+	// skip — строки с первой по эту только ведут состояние разбора, без событий (SkipThrough)
+	skip int
+}
+
+// SkipThrough — строки с первой по n-ю (их события у вызывающего уже есть) Follow не разбирает целиком, а только
+// ведёт по ним состояние, как ReadWithTools для отброшенных фильтром строк: имена инструментов по id вызова и
+// состояние codex. События этих строк не отдаются, у следующих — те же, что дал бы полный разбор. Meta.Bad считает
+// только строки после n-й. Только до первого Feed.
+func (f *Follow) SkipThrough(n int) error {
+	if f.rd.lineNo > 0 {
+		return errors.New("transcript: skip after the first feed")
+	}
+	if n <= 0 {
+		return nil
+	}
+	f.skip = n
+	f.rd.toolNames = map[string]struct{}{}
+	f.rd.keepWithTools = func([]byte, ToolNames) bool { return false }
+	f.rd.skipping = true
+	return nil
+}
+
+// endSkip — пропуск кончился: отложенные вызовы применяются по порядку строк, дальше разбор как у Read.
+func (f *Follow) endSkip() {
+	f.rd.flushCalls()
+	f.rd.keepWithTools, f.rd.toolNames, f.rd.skipping, f.skip = nil, nil, false, 0
 }
 
 // NewFollow — разбор файла с его первой строки.
@@ -51,6 +77,9 @@ func (f *Follow) Feed(data []byte, fn func(Event)) error {
 	f.rd.fn = fn
 	defer func() { f.rd.fn = nil }()
 	for rest := data; len(rest) > 0; {
+		if f.skip > 0 && f.rd.lineNo >= f.skip {
+			f.endSkip()
+		}
 		line, tail, _ := bytes.Cut(rest, []byte{'\n'})
 		// как bufio.Reader.ReadLine у Read: конец строки — "\n" или "\r\n"
 		line = bytes.TrimSuffix(line, []byte{'\r'})
@@ -60,6 +89,10 @@ func (f *Follow) Feed(data []byte, fn func(Event)) error {
 			f.rd.lineNo++ // пустая строка — тоже строка файла
 		}
 		rest = tail
+	}
+	if f.skip > 0 {
+		// отложенные вызовы держат копии строк: применённые сейчас, они не копятся в памяти между порциями
+		f.rd.flushCalls()
 	}
 	return nil
 }

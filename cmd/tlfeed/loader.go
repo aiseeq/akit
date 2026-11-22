@@ -37,13 +37,15 @@ type loader struct {
 	now   func() time.Time
 	files map[string]*file // by path
 	all   []*file          // every file known, gone ones too: ids, renames, the sweep
-	ids   map[uint64]bool
-	dirs  *dirs
-	st    *status
-	batch batch
-	buf   []byte
-	ver   uint64
-	sweep int
+	// parsers — the files that got a parser; one that has let it go stays until the next pass looks
+	parsers map[*file]bool
+	ids     map[uint64]bool
+	dirs    *dirs
+	st      *status
+	batch   batch
+	buf     []byte
+	ver     uint64
+	sweep   int
 	// errText is the last error of a retried call; it is cleared when a call succeeds
 	errText string
 	backoff time.Duration // first wait of a retry
@@ -53,7 +55,7 @@ type loader struct {
 }
 
 func newLoader(cfg config, srv *server, stop <-chan struct{}, log io.Writer, st *status) *loader {
-	l := &loader{cfg: cfg, srv: srv, stop: stop, log: log, now: time.Now, files: map[string]*file{}, ids: map[uint64]bool{}, st: st,
+	l := &loader{cfg: cfg, srv: srv, stop: stop, log: log, now: time.Now, files: map[string]*file{}, parsers: map[*file]bool{}, ids: map[uint64]bool{}, st: st,
 		backoff: time.Second}
 	l.dirs = newDirs(cfg.home, l.logf)
 	return l
@@ -82,6 +84,7 @@ func (l *loader) retry(what string, fn func() error) error {
 		}
 		l.errText = text
 		l.st.setError(text)
+		l.report() // the state file shows the lag growing while the server is away
 		select {
 		case <-l.stop:
 			return errStopped
@@ -108,8 +111,9 @@ func (l *loader) ensureSchema() error {
 	return nil
 }
 
-// loadKnown reads the state of every file from the files table and checks it against raw: a crash between the
-// inserts of one pass leaves raw or events ahead of files, and the next pass must neither repeat nor lose lines.
+// loadKnown reads the state of every file from the files table. A file whose latest row is dirty was being sent
+// when the loader stopped: rows past its stored lines may be in raw and events, in part; they are deleted and
+// loaded again.
 func (l *loader) loadKnown() error {
 	var rows [][]string
 	if err := l.retry("read files", func() error {
@@ -119,89 +123,24 @@ func (l *loader) loadKnown() error {
 	}); err != nil {
 		return err
 	}
+	var dirty []*file
 	for _, r := range rows {
-		f, ver, err := parseFileRow(l.cfg.home, r)
+		f, ver, d, err := parseFileRow(l.cfg.home, r)
 		if err != nil {
 			return err
 		}
 		l.ver = max(l.ver, ver)
 		l.add(f)
-	}
-	var maxLines [][]string
-	if err := l.retry("read raw lines", func() error {
-		data, err := l.srv.query(context.Background(), "SELECT file_id, max(line) FROM "+l.cfg.db+".raw GROUP BY file_id FORMAT TabSeparated", 10*time.Minute)
-		maxLines = tsvRows(data)
-		return err
-	}); err != nil {
-		return err
-	}
-	inRaw := map[uint64]int{}
-	for _, r := range maxLines {
-		p := &fields{row: r}
-		id, n := p.uint(0), p.int(1)
-		if p.err != nil {
-			return fmt.Errorf("raw lines: %w", p.err)
+		if d {
+			dirty = append(dirty, f)
 		}
-		inRaw[id] = n
 	}
-	for _, f := range l.all {
-		if n := inRaw[f.id]; n != f.lines {
-			if err := l.recover(f, n); err != nil {
-				return err
-			}
+	for _, f := range dirty {
+		if err := l.truncate(f, fmt.Sprintf("stopped while sending lines past %d", f.lines)); err != nil {
+			return err
 		}
 	}
 	return nil
-}
-
-// recover — raw holds n lines of the file where files says f.lines. More: the pass that wrote them stopped before
-// files; the lines are taken if they still equal the file, and events continue after the last line they have.
-// Fewer, or lines that differ: the file is loaded again.
-func (l *loader) recover(f *file, n int) error {
-	if n > f.lines {
-		var rows bytes.Buffer
-		q := fmt.Sprintf("SELECT raw FROM %s.raw WHERE file_id = %d AND line > %d ORDER BY line FORMAT LineAsString", l.cfg.db, f.id, f.lines)
-		if err := l.retry("read raw tail", func() error {
-			rows.Reset()
-			return l.srv.post(context.Background(), q, nil, nil, &rows, 10*time.Minute)
-		}); err != nil {
-			return err
-		}
-		disk := make([]byte, rows.Len())
-		fd, err := os.Open(f.src.Path)
-		if err == nil {
-			_, err = fd.ReadAt(disk, f.ingested)
-			fd.Close()
-		}
-		if err == nil && bytes.Equal(disk, rows.Bytes()) {
-			var ev [][]string
-			q := fmt.Sprintf("SELECT max(line) FROM %s.events WHERE file_id = %d FORMAT TabSeparated", l.cfg.db, f.id)
-			if err := l.retry("read event lines", func() error {
-				data, err := l.srv.query(context.Background(), q, 10*time.Minute)
-				ev = tsvRows(data)
-				return err
-			}); err != nil {
-				return err
-			}
-			evMax := 0
-			if len(ev) == 1 {
-				p := &fields{row: ev[0]}
-				if evMax = p.int(0); p.err != nil {
-					return fmt.Errorf("event lines: %w", p.err)
-				}
-			}
-			end := f.ingested + int64(rows.Len())
-			sum, _, err := tailAt(f.src.Path, end)
-			if err != nil {
-				return l.rewind(f, err.Error())
-			}
-			l.logf("%s: %d lines in raw past files, taken (events after line %d)", f.src.Path, n-f.lines, max(evMax, f.lines))
-			f.evLines = max(evMax, f.lines)
-			f.lines, f.ingested, f.acked, f.complete, f.tail = n, end, end, end, sum
-			return nil
-		}
-	}
-	return l.rewind(f, fmt.Sprintf("raw has %d lines, files %d", n, f.lines))
 }
 
 func (l *loader) add(f *file) {
@@ -246,7 +185,7 @@ func (l *loader) visit(path string) error {
 		l.logf("%v", err)
 		return nil
 	}
-	if st.Size() == f.size && st.ModTime().Unix() == f.mtime.Unix() && inodeOf(st) == f.inode && f.complete <= f.ingested && f.evLines >= f.lines {
+	if st.Size() == f.size && st.ModTime().Unix() == f.mtime.Unix() && inodeOf(st) == f.inode && f.complete <= f.ingested && f.evLines >= f.lines && !f.stale {
 		return nil
 	}
 	if err := l.checkTail(f, st.Size()); err != nil {
@@ -270,7 +209,7 @@ func (l *loader) fileErr(path string, err error) {
 // vanished — the path is no longer a file: its parser goes, the file waits to come back or to be found renamed.
 func (l *loader) vanished(path string) {
 	if f := l.files[path]; f != nil {
-		f.gone, f.follow, f.parsed, f.complete = true, nil, 0, f.acked
+		f.gone, f.follow, f.parsed, f.complete = true, nil, 0, f.ack.ingested
 		delete(l.files, path)
 	}
 }
@@ -304,7 +243,8 @@ func (l *loader) checkTail(f *file, size int64) error {
 	}
 	sum, ok, err := tailAt(f.src.Path, f.ingested)
 	if err != nil {
-		l.fileErr(f.src.Path, err) // gone between stat and read: the next pass sees it
+		l.fileErr(f.src.Path, err) // gone between stat and read, or a read error: the next pass looks again
+		f.stale = true
 		return nil
 	}
 	if ok && sum == f.tail {
@@ -375,54 +315,79 @@ func (l *loader) alive(old string, ino uint64) bool {
 }
 
 // rewind — the file is shorter than what is loaded, or the loaded bytes changed: its rows go and it is loaded
-// again. The new generation is stored before the delete, so a token of the old one is never sent again.
+// again.
 func (l *loader) rewind(f *file, why string) error {
-	l.logf("%s: rewind (%s): reloading id %d", f.src.Path, why, f.id)
 	if err := l.flush(); err != nil {
 		return err
 	}
-	f.gen++
-	f.lines, f.evLines, f.ingested, f.acked, f.complete, f.tail = 0, 0, 0, 0, 0, 0
-	f.first, f.last, f.bad, f.name, f.follow, f.parsed = time.Time{}, time.Time{}, 0, "", nil, 0
-	if err := l.storeFile(f); err != nil {
-		return err
-	}
-	return l.deleteRows(f, "raw", "events", "replies")
+	f.lines, f.evLines, f.ingested, f.complete, f.tail = 0, 0, 0, 0, 0
+	f.first, f.last, f.bad, f.badBase, f.name, f.follow, f.parsed = time.Time{}, time.Time{}, 0, 0, "", nil, 0
+	return l.truncate(f, "rewind ("+why+")")
 }
 
 // reloadEvents — a rollout began to write message events, so the events of its earlier lines change (see
 // transcript.ErrFollowRestart): they are deleted and parsed again from the first line; raw stays.
 func (l *loader) reloadEvents(f *file) error {
-	l.logf("%s: message events appeared: reloading the events of id %d", f.src.Path, f.id)
+	if err := l.flush(); err != nil {
+		return err
+	}
+	f.evLines, f.follow, f.parsed, f.first, f.last, f.badBase = 0, nil, 0, time.Time{}, time.Time{}, 0
+	return l.truncate(f, "message events appeared")
+}
+
+// truncate makes the tables hold the file up to its lines (raw) and evLines (events) and no more. The rows past
+// them are deleted under a dirty files row of a new generation: the tokens of the next inserts differ from those
+// of the deleted rows, which the server still remembers, and a loader stopped in the middle does it again at its
+// next start. usage has rows merged over the parts of a reply, so the file's rows there are made again from events.
+func (l *loader) truncate(f *file, why string) error {
+	l.logf("%s: %s: rows of id %d past line %d (events past %d) deleted", f.src.Path, why, f.id, f.lines, f.evLines)
 	if err := l.flush(); err != nil {
 		return err
 	}
 	f.gen++
-	f.evLines, f.follow, f.parsed, f.first, f.last = 0, nil, 0, time.Time{}, time.Time{}
-	if err := l.storeFile(f); err != nil {
+	if err := l.storeFile(f, true); err != nil {
 		return err
 	}
-	return l.deleteRows(f, "events", "replies")
-}
-
-func (l *loader) deleteRows(f *file, tables ...string) error {
-	for _, t := range tables {
-		q := fmt.Sprintf("DELETE FROM %s.%s WHERE file_id = %d", l.cfg.db, t, f.id)
-		if err := l.exec("delete rows of a rewound file", q); err != nil {
+	db := l.cfg.db
+	for _, q := range []string{
+		fmt.Sprintf("DELETE FROM %s.events WHERE file_id = %d AND line > %d", db, f.id, f.evLines),
+		fmt.Sprintf("DELETE FROM %s.replies WHERE file_id = %d AND line > %d", db, f.id, f.evLines),
+		fmt.Sprintf("DELETE FROM %s.usage WHERE file_id = %d", db, f.id),
+		fmt.Sprintf("DELETE FROM %s.raw WHERE file_id = %d AND line > %d", db, f.id, f.lines),
+	} {
+		if err := l.exec("delete rows past the stored lines", q); err != nil {
 			return err
 		}
 	}
+	if f.evLines > 0 {
+		q := fmt.Sprintf("INSERT INTO %s.usage (%s) SELECT %s FROM %s.events WHERE file_id = %d AND reply_id != ''",
+			db, usageColumns, usageColumns, db, f.id)
+		if err := l.retry("usage of the kept events", func() error {
+			settings := url.Values{"insert_deduplication_token": {fmt.Sprintf("usage:%d:g%d", f.id, f.gen)}, "async_insert": {"0"}}
+			return l.srv.post(context.Background(), q, nil, settings, nil, 10*time.Minute)
+		}); err != nil {
+			return err
+		}
+	}
+	if err := l.storeFile(f, false); err != nil {
+		return err
+	}
+	f.commit()
 	return nil
 }
 
-// storeFile writes the row of one file now, outside a batch.
-func (l *loader) storeFile(f *file) error {
+// storeFile writes the row of one file now, outside a batch; its size is 0, so a start before the next batch
+// looks at the file again.
+func (l *loader) storeFile(f *file, dirty bool) error {
 	if f.id == 0 {
 		return nil
 	}
 	var b bytes.Buffer
-	fileRow(&b, f, l.nextVer())
-	return l.insert("files", fileColumns, &b, fmt.Sprintf("%d:%d:g%d:file", f.id, f.lines, f.gen))
+	c := *f
+	c.size = 0
+	ver := l.nextVer()
+	fileRow(&b, &c, ver, dirty)
+	return l.insert("files", fileColumns, &b, fmt.Sprintf("files:v%d", ver))
 }
 
 func (l *loader) nextVer() uint64 {
@@ -450,15 +415,35 @@ func (l *loader) load(f *file) error {
 
 func (l *loader) loadOnce(f *file) error {
 	path, size := f.src.Path, f.size
+	if f.follow == nil && f.evLines >= f.lines {
+		has, err := lineAfter(path, f.ingested, size)
+		if err != nil {
+			l.fileErr(path, err)
+			f.stale = true
+			return nil
+		}
+		if !has { // only an incomplete line was added: no parser is built for it
+			f.complete = f.ingested
+			return nil
+		}
+	}
 	if f.follow == nil {
-		// a new parser starts at line 1; it learns from all lines it will get which events the file writes
-		f.follow, f.parsed = transcript.NewFollow(), 0
+		// a new parser starts at line 1; it learns from all lines it will get which events the file writes, and
+		// it only keeps the state over the lines whose events are already in the table
+		f.follow, f.parsed, f.badBase = transcript.NewFollow(), 0, f.bad
+		l.parsers[f] = true
 		if _, err := pieces(path, 0, size, l.cfg.batch, &l.buf, func(data []byte, _ int64) error {
 			return f.follow.Prescan(data)
 		}); err != nil {
 			l.fileErr(path, err)
-			f.follow = nil
+			f.follow, f.stale = nil, true
 			return nil // unreadable now: the next pass tries again
+		}
+		if err := f.follow.SkipThrough(f.evLines); err != nil {
+			return err
+		}
+		if f.evLines == 0 {
+			f.badBase = 0
 		}
 	}
 	end, err := pieces(path, f.parsed, size, l.cfg.batch, &l.buf, func(data []byte, at int64) error {
@@ -469,10 +454,11 @@ func (l *loader) loadOnce(f *file) error {
 			return err
 		}
 		l.logf("%s: %v", path, err)
-		f.follow, f.parsed = nil, 0
+		f.follow, f.parsed, f.stale = nil, 0, true
 		return nil
 	}
 	f.complete = max(end, f.ingested)
+	f.stale = false
 	return nil
 }
 
@@ -491,7 +477,7 @@ func (l *loader) feed(f *file, data []byte, at int64) error {
 	}
 	f.parsed = at + int64(len(data))
 	m := f.follow.Meta()
-	f.name, f.bad = m.Name, m.Bad
+	f.name, f.bad = m.Name, f.badBase+m.Bad
 	if f.id == 0 {
 		// the first event with a time in the lines seen so far; none yet (a file cut before its first event) — mtime
 		start := f.mtime
@@ -616,6 +602,18 @@ func (l *loader) flush() error {
 	if len(b.touched) == 0 {
 		return nil
 	}
+	if b.rawRows > 0 || b.evRows > 0 {
+		// the stored state of the files, marked dirty: a loader stopped before the clean rows below deletes
+		// what went past it at its next start
+		var dirty bytes.Buffer
+		ver := l.nextVer()
+		for _, f := range b.touched {
+			fileRow(&dirty, f.committed(), ver, true)
+		}
+		if err := l.insert("files", fileColumns, &dirty, fmt.Sprintf("files:v%d", ver)); err != nil {
+			return err
+		}
+	}
 	if b.rawRows > 0 {
 		if err := l.insert("raw", rawColumns, &b.raw, token(b.rawTok)); err != nil {
 			return err
@@ -626,18 +624,17 @@ func (l *loader) flush() error {
 			return err
 		}
 	}
+	// the token of a files insert is its ver: a row of the same lines is new when the path or the size changed
 	var files bytes.Buffer
 	ver := l.nextVer()
-	var parts []string
 	for _, f := range b.touched {
-		fileRow(&files, f, ver)
-		parts = append(parts, fmt.Sprintf("%d:%d:%d", f.id, f.lines, f.gen))
+		fileRow(&files, f, ver, false)
 	}
-	if err := l.insert("files", fileColumns, &files, token(parts)); err != nil {
+	if err := l.insert("files", fileColumns, &files, fmt.Sprintf("files:v%d", ver)); err != nil {
 		return err
 	}
 	for _, f := range b.touched {
-		f.acked = f.ingested
+		f.commit()
 	}
 	if b.rawRows > 0 {
 		l.st.rowsLoaded(l.now())
@@ -670,7 +667,7 @@ func (l *loader) lag() (lag int64, n int) {
 			continue
 		}
 		n++
-		lag += max(f.complete-f.acked, 0)
+		lag += max(f.complete-f.ack.ingested, 0)
 	}
 	return lag, n
 }

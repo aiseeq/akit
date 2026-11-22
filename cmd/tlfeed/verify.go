@@ -101,7 +101,7 @@ func (c *checker) check() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	files, err := c.rows("SELECT path, file_id, ingested, lines FROM " + c.db + ".files FINAL FORMAT TabSeparated")
+	files, err := c.rows("SELECT path, file_id, ingested, lines, dirty, ev_lines FROM " + c.db + ".files FINAL FORMAT TabSeparated")
 	if err != nil {
 		return false, err
 	}
@@ -131,40 +131,8 @@ func (c *checker) check() (bool, error) {
 			c.problem("missing\t%s", s.Path)
 			continue
 		}
-		id, ingested := r[1], r[2]
-		p := &fields{row: r}
-		lines := p.int(3)
-		if p.err != nil {
-			return false, fmt.Errorf("files: %w", p.err)
-		}
-		end, err := lastLineEnd(s.Path)
-		if err != nil {
-			c.problem("unreadable\t%s: %v", s.Path, err)
-			continue
-		}
-		if strconv.FormatInt(end, 10) != ingested {
-			c.problem("ingested\t%s\tfiles %s, complete lines end at %d", s.Path, ingested, end)
-			continue
-		}
-		if lines > 0 && rawOf[id] != [2]string{r[3], r[3]} {
-			c.problem("raw\t%s\t%d lines, raw has %s rows up to line %s", s.Path, lines, rawOf[id][0], rawOf[id][1])
-			continue
-		}
-		n := 0
-		if _, err := transcript.Read(s.Path, nil, func(e transcript.Event) {
-			if e.Line <= lines {
-				n++
-			}
-		}); err != nil {
-			c.problem("unreadable\t%s: %v", s.Path, err)
-			continue
-		}
-		db := evOf[id]
-		if db == "" {
-			db = "0"
-		}
-		if db != strconv.Itoa(n) {
-			c.problem("events\t%s\tevents %s, transcript.Read %d", s.Path, db, n)
+		if err := c.checkFile(s.Path, r, rawOf[r[1]], evOf[r[1]]); err != nil {
+			return false, err
 		}
 	}
 	fmt.Fprintf(c.out, "check: %d transcripts: ok=%d problems=%d\n", len(srcs), len(srcs)-c.bad, c.bad)
@@ -219,5 +187,48 @@ func (c *checker) materialize() error {
 		time.Sleep(5 * time.Second)
 	}
 	fmt.Fprintf(c.out, "materialize: index hay_ng of %s.events built in %s\n", c.db, time.Since(start).Round(time.Second))
+	return nil
+}
+
+// checkFile — one transcript against its files row r, its raw rows (count, max line) and its event count.
+func (c *checker) checkFile(path string, r []string, raw [2]string, events string) error {
+	ingested := r[2]
+	p := &fields{row: r}
+	lines, dirty, evLines := p.int(3), p.int(4), p.int(5)
+	if p.err != nil {
+		return fmt.Errorf("files: %w", p.err)
+	}
+	if dirty != 0 || evLines < lines {
+		c.problem("state\t%s\tdirty %d, events loaded up to line %d of %d", path, dirty, evLines, lines)
+		return nil
+	}
+	end, err := lastLineEnd(path)
+	if err != nil {
+		c.problem("unreadable\t%s: %v", path, err)
+		return nil
+	}
+	if strconv.FormatInt(end, 10) != ingested {
+		c.problem("ingested\t%s\tfiles %s, complete lines end at %d", path, ingested, end)
+		return nil
+	}
+	if lines > 0 && raw != [2]string{r[3], r[3]} {
+		c.problem("raw\t%s\t%d lines, raw has %s rows up to line %s", path, lines, raw[0], raw[1])
+		return nil
+	}
+	n := 0
+	if _, err := transcript.Read(path, nil, func(e transcript.Event) {
+		if e.Line <= lines {
+			n++
+		}
+	}); err != nil {
+		c.problem("unreadable\t%s: %v", path, err)
+		return nil
+	}
+	if events == "" {
+		events = "0"
+	}
+	if events != strconv.Itoa(n) {
+		c.problem("events\t%s\tevents %s, transcript.Read %d", path, events, n)
+	}
 	return nil
 }

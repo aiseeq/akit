@@ -31,19 +31,41 @@ type file struct {
 	size          int64
 	mtime         time.Time
 	ingested      int64 // bytes of complete lines in raw
-	acked         int64 // ingested as the server has confirmed it
-	complete      int64 // end of the last complete line seen in the file
-	lines         int   // lines in raw
-	evLines       int   // lines whose events are in events (below lines only after a crash between the inserts)
-	tail          uint64
-	gen           uint32
-	name          string
-	bad           int
-	first, last   time.Time
-	follow        *transcript.Follow
-	parsed        int64 // bytes the parser has read
-	grown         time.Time
-	gone          bool
+
+	complete    int64 // end of the last complete line seen in the file
+	lines       int   // lines in raw
+	evLines     int   // lines whose events are in events (below lines only after a crash between the inserts)
+	tail        uint64
+	gen         uint32
+	name        string
+	bad         int
+	first, last time.Time
+	follow      *transcript.Follow
+	parsed      int64 // bytes the parser has read
+	badBase     int   // bad lines among those the parser skipped (transcript.Follow.SkipThrough)
+	grown       time.Time
+	gone        bool
+	stale       bool   // the last look could not read the file: the next pass looks again
+	ack         stored // as the files table has it: the server confirmed this much
+}
+
+// stored — the state of a file as the files table has it, for the dirty row of a batch that sends more.
+type stored struct {
+	lines, evLines int
+	ingested       int64
+	tail           uint64
+}
+
+// commit records the present state as the one in the files table.
+func (f *file) commit() {
+	f.ack = stored{lines: f.lines, evLines: f.evLines, ingested: f.ingested, tail: f.tail}
+}
+
+// committed — the file as the files table has it.
+func (f *file) committed() *file {
+	c := *f
+	c.lines, c.evLines, c.ingested, c.tail = f.ack.lines, f.ack.evLines, f.ack.ingested, f.ack.tail
+	return &c
 }
 
 // describe sets the source fields that come from the path.
@@ -118,6 +140,30 @@ func tailAt(path string, end int64) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("tail sum: %w", err)
 	}
 	return tailSum(b), true, nil
+}
+
+// lineAfter tells whether a line ends between off and size in the file.
+func lineAfter(path string, off, size int64) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("read transcript: %w", err)
+	}
+	defer f.Close()
+	b := make([]byte, 64<<10)
+	for off < size {
+		n, err := f.ReadAt(b[:min(int64(len(b)), size-off)], off)
+		if bytes.IndexByte(b[:n], '\n') >= 0 {
+			return true, nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return false, nil
+			}
+			return false, fmt.Errorf("read transcript: %w", err)
+		}
+		off += int64(n)
+	}
+	return false, nil
 }
 
 // pieces reads the file from off up to size in pieces of about n bytes, each ending at a line end, and gives

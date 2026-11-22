@@ -282,6 +282,7 @@ type reader struct {
 	keep          func([]byte) bool
 	keepWithTools func([]byte, ToolNames) bool
 	toolNames     map[string]struct{}
+	skipping      bool // строки до Follow.SkipThrough: вызовы запоминаются сразу (skipCall)
 	plainType     bool
 	noUnicode     bool
 	pending       []pendingCall
@@ -305,7 +306,11 @@ func (rd *reader) line(raw []byte) {
 	rd.plainType, rd.noUnicode = false, false
 	if rd.keepWithTools != nil && !rd.keepWithTools(raw, ToolNames{rd.toolNames, &rd.plainType, &rd.noUnicode}) {
 		rd.rememberCodex(raw)
-		rd.deferCall(raw, rd.plainType, rd.noUnicode)
+		if rd.skipping {
+			rd.skipCall(raw, rd.plainType)
+		} else {
+			rd.deferCall(raw, rd.plainType, rd.noUnicode)
+		}
 		return
 	}
 	var rec record

@@ -25,7 +25,9 @@ type fakeCH struct {
 	// fail: the next inserts into these tables are refused before they are applied (the server is down);
 	// lose: the next inserts are applied but the answer is an error (the answer was lost)
 	fail, lose map[string]int
-	down       bool
+	// pass: inserts into these tables let through before fail applies; tried: inserts refused by fail
+	pass, tried map[string]int
+	down        bool
 }
 
 // sent — one insert as the server got it.
@@ -36,7 +38,8 @@ type sent struct {
 }
 
 func newFake(t *testing.T) (*fakeCH, *server) {
-	f := &fakeCH{rows: map[string][][]string{}, tokens: map[string]map[string]bool{}, fail: map[string]int{}, lose: map[string]int{}}
+	f := &fakeCH{rows: map[string][][]string{}, tokens: map[string]map[string]bool{}, fail: map[string]int{}, lose: map[string]int{},
+		pass: map[string]int{}, tried: map[string]int{}}
 	ts := httptest.NewServer(f)
 	t.Cleanup(ts.Close)
 	srv, err := newServer(ts.URL)
@@ -48,9 +51,7 @@ func newFake(t *testing.T) (*fakeCH, *server) {
 
 var (
 	insertRe   = regexp.MustCompile(`^INSERT INTO \w+\.(\w+) \(`)
-	deleteRe   = regexp.MustCompile(`^DELETE FROM \w+\.(\w+) WHERE file_id = (\d+)$`)
-	rawTailRe  = regexp.MustCompile(`^SELECT raw FROM \w+\.raw WHERE file_id = (\d+)(?: AND line > (\d+))? ORDER BY line FORMAT LineAsString$`)
-	evMaxRe    = regexp.MustCompile(`^SELECT max\(line\) FROM \w+\.events WHERE file_id = (\d+)`)
+	deleteRe   = regexp.MustCompile(`^DELETE FROM \w+\.(\w+) WHERE file_id = (\d+)(?: AND line > (\d+))?$`)
 	filesSelRe = regexp.MustCompile(`^SELECT file_id, path, .* FROM \w+\.files FINAL`)
 )
 
@@ -70,8 +71,11 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case insertRe.MatchString(q):
 		table := insertRe.FindStringSubmatch(q)[1]
-		if f.fail[table] > 0 {
+		if f.pass[table] > 0 {
+			f.pass[table]--
+		} else if f.fail[table] > 0 {
 			f.fail[table]--
+			f.tried[table]++
 			http.Error(w, "Code: 999. refused", http.StatusInternalServerError)
 			return
 		}
@@ -97,13 +101,14 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case deleteRe.MatchString(q):
 		m := deleteRe.FindStringSubmatch(q)
 		f.deletes = append(f.deletes, m[1]+":"+m[2])
-		var kept [][]string
-		col := 0
-		if m[1] != "raw" {
-			col = 1 // events and replies: ts first
+		from, _ := strconv.Atoi(m[3]) // no line condition: from 0, all rows
+		idCol, lineCol := 0, 1        // raw
+		if m[1] == "events" {
+			idCol, lineCol = 1, 5
 		}
+		var kept [][]string
 		for _, row := range f.rows[m[1]] {
-			if row[col] != m[2] {
+			if n, _ := strconv.Atoi(row[lineCol]); row[idCol] != m[2] || n <= from {
 				kept = append(kept, row)
 			}
 		}
@@ -112,32 +117,6 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for _, row := range f.latestFiles() {
 			fmt.Fprintln(w, escapeRow(row))
 		}
-	case strings.HasPrefix(q, "SELECT file_id, max(line) FROM"):
-		mx := map[string]int{}
-		for _, row := range f.rows["raw"] {
-			n, _ := strconv.Atoi(row[1])
-			mx[row[0]] = max(mx[row[0]], n)
-		}
-		for id, n := range mx {
-			fmt.Fprintf(w, "%s\t%d\n", id, n)
-		}
-	case rawTailRe.MatchString(q):
-		m := rawTailRe.FindStringSubmatch(q)
-		from, _ := strconv.Atoi(m[2])
-		for _, row := range f.fileRaw(m[1]) {
-			if n, _ := strconv.Atoi(row[1]); n > from {
-				fmt.Fprintln(w, row[3])
-			}
-		}
-	case evMaxRe.MatchString(q):
-		id := evMaxRe.FindStringSubmatch(q)[1]
-		mx := 0
-		for _, row := range f.rows["events"] {
-			if n, _ := strconv.Atoi(row[5]); row[1] == id {
-				mx = max(mx, n)
-			}
-		}
-		fmt.Fprintln(w, mx)
 	default:
 		http.Error(w, "fake: unknown statement "+q, http.StatusBadRequest)
 	}
@@ -234,6 +213,12 @@ func (f *fakeCH) sentTo(table string) []sent {
 		}
 	}
 	return out
+}
+
+func (f *fakeCH) triedFailing(table string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tried[table]
 }
 
 func (f *fakeCH) set(fn func(*fakeCH)) {

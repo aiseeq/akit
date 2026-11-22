@@ -22,13 +22,15 @@ CREATE TABLE IF NOT EXISTS {db}.files
     size UInt64,                          -- file size at the last pass
     ingested UInt64,                      -- bytes up to the last complete line already in raw
     lines UInt32,                         -- complete lines already in raw
+    ev_lines UInt32,                      -- lines whose events are already in events
     mtime DateTime('UTC'),
     inode UInt64,
     first_ts DateTime64(3, 'UTC'),
     last_ts DateTime64(3, 'UTC'),
     bad UInt32,                           -- lines the parser could not read
     tail UInt64,                          -- first 8 bytes of sha256 of the last 256 ingested bytes
-    gen UInt32,                           -- how many times the file was loaded again after a rewind
+    gen UInt32,                           -- how many times rows of the file were deleted to be loaded again
+    dirty UInt8,                          -- 1: rows past lines and ev_lines may be in raw and events; size is 0 then
     ver UInt64                            -- write order: the latest row of a file wins
 )
 ENGINE = ReplacingMergeTree(ver)
@@ -100,6 +102,7 @@ WHERE role IN ('user', 'ask') AND kind = 'claude';
 
 CREATE TABLE IF NOT EXISTS {db}.usage
 (
+    file_id UInt64,
     ts DateTime64(3, 'UTC'),
     session String,
     project LowCardinality(String),
@@ -117,7 +120,7 @@ ORDER BY (session, reply_id, request_id)
 SETTINGS non_replicated_deduplication_window = 10000;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.usage_mv TO {db}.usage AS
-SELECT ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write
+SELECT file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write
 FROM {db}.events
 WHERE reply_id != '';
 `

@@ -21,8 +21,29 @@ type dirs struct {
 	claude string
 	known  map[string]time.Time // folder → mtime when last listed; zero — not stat'ed yet
 	recent map[string]time.Time // folders whose mtime moved lately: polled every pass
+	order  []string             // the folders of known in the order they became known: the sweep goes over them in turn
+	next   int
+	worker string // the worker tree: tasks of codex sessions
 	w      watcher
 	logf   func(string, ...any)
+}
+
+// set records the mtime of a folder.
+func (d *dirs) set(dir string, mt time.Time) {
+	if _, ok := d.known[dir]; !ok {
+		d.order = append(d.order, dir)
+	}
+	d.known[dir] = mt
+}
+
+// sweep polls the next n known folders: a change the watches and the hot folders missed is found within a sweep.
+func (d *dirs) sweep(n int, now time.Time) []string {
+	var out []string
+	for i := 0; i < n && i < len(d.order); i++ {
+		d.next = (d.next + 1) % len(d.order)
+		out = append(out, d.poll(d.order[d.next], now)...)
+	}
+	return out
 }
 
 func newDirs(home string, logf func(string, ...any)) *dirs {
@@ -31,7 +52,8 @@ func newDirs(home string, logf func(string, ...any)) *dirs {
 		d.pats = append(d.pats, strings.Split(p, string(filepath.Separator)))
 	}
 	d.claude = filepath.Join(home, ".claude", "projects")
-	d.roots = []string{d.claude, filepath.Join(home, ".local", "state", "worker")}
+	d.worker = filepath.Join(home, ".local", "state", "worker")
+	d.roots = []string{d.claude, d.worker}
 	return d
 }
 
@@ -73,9 +95,9 @@ func (d *dirs) addFileDir(path string) {
 		st, err := os.Stat(dir)
 		if err != nil {
 			d.failed(err)
-			d.known[dir] = time.Time{}
+			d.set(dir, time.Time{})
 		} else {
-			d.known[dir] = st.ModTime()
+			d.set(dir, st.ModTime())
 		}
 		if d.watched(dir, path) {
 			d.w.add(dir)
@@ -84,10 +106,16 @@ func (d *dirs) addFileDir(path string) {
 }
 
 // watched — folders inotify watches: the roots, the Claude project tree (a few thousand folders: new sessions and
-// subagents appear there) and the folder of every transcript (appends to it). The worker tree above the rollout
-// folders is watched only for folders that appear while the loader runs.
+// subagents appear there), the folder of every transcript (appends to it) and, in the worker tree, the folders
+// from codex/sessions down (a known task starts a session on another day or month). The task folders above them
+// are watched only when they appear while the loader runs.
 func (d *dirs) watched(dir, file string) bool {
-	return dir == filepath.Dir(file) || strings.HasPrefix(dir+string(filepath.Separator), d.claude+string(filepath.Separator)) || d.isRoot(dir)
+	sep := string(filepath.Separator)
+	if dir == filepath.Dir(file) || strings.HasPrefix(dir+sep, d.claude+sep) || d.isRoot(dir) {
+		return true
+	}
+	rel, ok := strings.CutPrefix(dir, d.worker+sep)
+	return ok && strings.Contains(rel+sep, sep+filepath.Join("codex", "sessions")+sep)
 }
 
 func (d *dirs) isRoot(dir string) bool { return slices.Contains(d.roots, dir) }
@@ -123,14 +151,14 @@ func (d *dirs) watchClaude() {
 				continue
 			}
 			if st.IsDir() {
-				d.known[p] = st.ModTime()
+				d.set(p, st.ModTime())
 				d.w.add(p)
 			}
 		}
 	}
 	for _, r := range d.roots {
 		if _, ok := d.known[r]; !ok {
-			d.known[r] = time.Time{}
+			d.set(r, time.Time{})
 		}
 		d.w.add(r)
 	}
@@ -150,7 +178,7 @@ func (d *dirs) poll(dir string, now time.Time) []string {
 		return nil
 	}
 	was, ok := d.known[dir]
-	d.known[dir] = st.ModTime()
+	d.set(dir, st.ModTime())
 	if ok && was.Equal(st.ModTime()) || ok && was.IsZero() {
 		return nil
 	}
@@ -191,7 +219,7 @@ func (d *dirs) appeared(dir string, now time.Time) []string {
 		d.failed(err)
 		return nil
 	}
-	d.known[dir] = st.ModTime()
+	d.set(dir, st.ModTime())
 	d.recent[dir] = st.ModTime()
 	d.w.add(dir)
 	return d.scan(dir, now)

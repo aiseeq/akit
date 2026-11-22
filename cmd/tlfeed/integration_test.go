@@ -188,3 +188,113 @@ func TestLiveServer(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// replyLine — an assistant reply with its usage, as Claude Code writes it.
+func replyLine(id string, sec int) string {
+	return fmt.Sprintf(`{"type":"assistant","requestId":"r%s","timestamp":"2026-10-25T10:00:%02dZ","message":{"id":"%s","model":"m1",`+
+		`"content":[{"type":"text","text":"reply %s"}],"usage":{"input_tokens":5,"output_tokens":9}}}`+"\n", id, sec, id, id)
+}
+
+// Against a live server: a rewind that drops replies drops their usage too, and a rename without growth moves
+// the files row to the new path, so --check finds the file.
+func TestLiveUsageAndRename(t *testing.T) {
+	srv, db := liveServer(t)
+	h := &harness{t: t, home: t.TempDir()}
+	path := claudePath(h.home)
+	user := `{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:00:00.000Z","message":{"role":"user","content":"hi"}}` + "\n"
+	write(t, path, []byte(user+replyLine("m1", 1)+replyLine("m2", 2)+replyLine("m3", 3)))
+	l := h.liveLoader(srv, db)
+	q := func(s string) string { return scalar(t, srv, fmt.Sprintf(s, db)) }
+	if got := q("SELECT sum(out_tok) FROM %s.usage FINAL"); got != "27" {
+		t.Fatalf("usage out_tok %s, want 27", got)
+	}
+	write(t, path, []byte(user+replyLine("m1", 1)+replyLine("m4", 4)))
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	if got := q("SELECT arrayStringConcat(arraySort(groupArray(reply_id)), ',') FROM %s.usage FINAL"); got != "m1,m4" {
+		t.Fatalf("usage after rewind: %s, want m1,m4", got)
+	}
+	verifyAll(t, srv, db, h.home)
+
+	f := l.files[path]
+	moved := filepath.Join(filepath.Dir(path), "99999999-2222-4333-8444-555555555555.jsonl")
+	if err := os.Rename(path, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalar(t, srv, fmt.Sprintf("SELECT path FROM %s.files FINAL WHERE file_id = %d", db, f.id)); got != moved {
+		t.Fatalf("files path %s after a rename without growth", got)
+	}
+	verifyAll(t, srv, db, h.home)
+}
+
+// filesGate passes requests to a server and refuses the inserts into files after the first `allow` of them while
+// it is on.
+type filesGate struct {
+	proxy        *httputil.ReverseProxy
+	on           atomic.Bool
+	allow, seen  atomic.Int32
+	refusedFiles atomic.Int32
+}
+
+func (p *filesGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.URL.Query().Get("query"), ".files (") && p.on.Load() && p.seen.Add(1) > p.allow.Load() {
+		p.refusedFiles.Add(1)
+		http.Error(w, "files refused", http.StatusBadGateway)
+		return
+	}
+	p.proxy.ServeHTTP(w, r)
+}
+
+// Against a live server: a new file whose raw and events are in, the loader stopped before its clean files row;
+// the next start, with the file grown and another new file in the same pass, rebuilds both byte for byte.
+func TestLiveStopBeforeFilesRow(t *testing.T) {
+	direct, db := liveServer(t)
+	target, _ := url.Parse(direct.base)
+	gate := &filesGate{proxy: httputil.NewSingleHostReverseProxy(target)}
+	gate.allow.Store(1) // the dirty row goes
+	ts := httptest.NewServer(gate)
+	t.Cleanup(ts.Close)
+	srv, err := newServer(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{t: t, home: t.TempDir()}
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+	write(t, path, data[:half])
+	gate.on.Store(true)
+	stop := make(chan struct{})
+	go func() {
+		for gate.refusedFiles.Load() < 1 {
+			time.Sleep(time.Millisecond)
+		}
+		close(stop)
+	}()
+	cfg := config{home: h.home, db: db, tick: time.Second, idle: time.Hour, sweep: time.Second, rescan: time.Hour, batch: 32 << 20}
+	l := newLoader(cfg, srv, stop, &h.log, newStatus(""))
+	l.dirs.w = noWatch{}
+	l.backoff = time.Millisecond
+	paths, err := l.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.visitAll(paths); err != errStopped {
+		t.Fatalf("first run: %v", err)
+	}
+	if n := scalar(t, direct, "SELECT count() FROM "+db+".raw"); n == "0" {
+		t.Fatal("the first run sent no raw rows")
+	}
+	gate.on.Store(false)
+	appendTo(t, path, data[half:])
+	write(t, filepath.Join(filepath.Dir(path), "22222222-2222-4333-8444-555555555555.jsonl"), data)
+	h.liveLoader(direct, db)
+	verifyAll(t, direct, db, h.home)
+	if got := scalar(t, direct, "SELECT count() - uniqExact(file_id, line) FROM "+db+".raw"); got != "0" {
+		t.Fatalf("%s raw lines twice", got)
+	}
+}
