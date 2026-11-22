@@ -355,7 +355,7 @@ func TestLineWithLongLines(t *testing.T) {
 	}
 }
 
-func TestLineWithTimestampUsesChronologicalSearch(t *testing.T) {
+func TestLineWithTimestampFindsMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "chronological.jsonl")
 	write(t, path,
 		`{"timestamp":"2026-10-01T10:00:00.000Z"}`+"\n"+
@@ -368,7 +368,7 @@ func TestLineWithTimestampUsesChronologicalSearch(t *testing.T) {
 	}
 }
 
-func TestLineWithTimestampFallsBackForUnorderedTranscript(t *testing.T) {
+func TestLineWithTimestampFindsFirstMatchInUnorderedTranscript(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unordered.jsonl")
 	write(t, path,
 		`{"timestamp":"2026-10-01T10:00:00.000Z"}`+"\n"+
@@ -377,6 +377,54 @@ func TestLineWithTimestampFallsBackForUnorderedTranscript(t *testing.T) {
 	needle := []byte(`"timestamp":"2026-10-02T10:00:00.000Z"`)
 	if n, err := lineWith(path, needle); err != nil || n != 3 {
 		t.Fatalf("unordered fallback: line %d, err %v; want line 3", n, err)
+	}
+}
+
+func TestLineWithTimestampFindsFirstMatchDespiteSparseOrderedSamples(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unordered-samples.jsonl")
+	days := []int{1, 5, 2, 7, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10}
+	var content strings.Builder
+	for _, day := range days {
+		fmt.Fprintf(&content, `{"timestamp":"2026-01-%02dT00:00:00.000Z"}`+"\n", day)
+	}
+	write(t, path, content.String())
+	needle := []byte(`"timestamp":"2026-01-05T00:00:00.000Z"`)
+	if n, err := lineWith(path, needle); err != nil || n != 2 {
+		t.Fatalf("unordered lookup: line %d, err %v; want first match at line 2", n, err)
+	}
+}
+
+func TestLineWithTimestampDoesNotMatchAcrossLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "split-match.jsonl")
+	write(t, path, "{\"a\":1}\n{\"timestamp\":\"2026-01-05T00:00:00.000Z\"}\n")
+	needle := []byte(`"timestamp":"2026-01-05T00:00:00.000Z"`)
+	if n, err := lineWith(path, needle); err != nil || n != 2 {
+		t.Fatalf("split lookup: line %d, err %v; want line 2", n, err)
+	}
+}
+
+func TestPriorReplyLinkUsesFirstTranscriptMatch(t *testing.T) {
+	days := []int{1, 5, 2, 7, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10}
+	var unordered strings.Builder
+	for _, day := range days {
+		fmt.Fprintf(&unordered, `{"timestamp":"2026-01-%02dT00:00:00.000Z"}`+"\n", day)
+	}
+	for _, tc := range []struct {
+		name, transcript string
+	}{
+		{"sparse samples do not prove ordering", unordered.String()},
+		{"timestamp on next line stays on that line", "{\"a\":1}\n{\"timestamp\":\"2026-01-05T00:00:00.000Z\"}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			write(t, filepath.Join(home, ".claude/projects/-p/1234abcd-0000-0000-0000-000000000001.jsonl"), tc.transcript)
+			write(t, filepath.Join(home, ".claude/user-replies.md"),
+				"### 2026-01-05T00:00:00Z (05.01 00:00 UTC) · ~/x · claude 1234abcd-0000-0000-0000-000000000001\nключслово\n")
+			got := sectionOf(runPrior(t, home, "ключслово"), "реплики")
+			if len(got) < 2 || !strings.HasSuffix(got[1], "· tl 1234abcd:2") {
+				t.Fatalf("prior reply link = %q, want first match tl 1234abcd:2", got)
+			}
+		})
 	}
 }
 

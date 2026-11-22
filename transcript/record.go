@@ -42,10 +42,14 @@ func RecordAt(f *os.File, offset, size int64) (int64, []byte, int64, error) {
 		}
 		pos = start
 	}
-	// Keep the prefix stable while the buffer is reused to find the record end.
+	// Clamp to this record before copying: the read window may include following records.
+	lineEnd := bytes.IndexByte(lineData, '\n')
+	if lineEnd >= 0 {
+		lineData = lineData[:lineEnd]
+	}
 	prefix := bytes.Clone(lineData[:min(len(lineData), 4096)])
-	if end := bytes.IndexByte(lineData, '\n'); end >= 0 {
-		return pos, prefix, pos + int64(end+1), nil
+	if lineEnd >= 0 {
+		return pos, prefix, pos + int64(lineEnd+1), nil
 	}
 	end := pos + int64(len(lineData))
 	for end < size {
