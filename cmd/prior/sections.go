@@ -264,19 +264,18 @@ func runMarkdownFiles(root string) ([]string, []error) {
 	walk = func(dir string) {
 		f, err := os.Open(dir)
 		if err != nil {
-			walkErrors = append(walkErrors, runWalkError{path: dir, err: err})
+			walkErrors = append(walkErrors, runWalkError{err: err})
 			return
 		}
 		entries, err := f.ReadDir(-1)
 		closeErr := f.Close()
 		if err != nil {
-			walkErrors = append(walkErrors, runWalkError{path: dir, err: err})
-			return
+			walkErrors = append(walkErrors, runWalkError{err: err})
 		}
 		if closeErr != nil {
-			walkErrors = append(walkErrors, runWalkError{path: dir, err: closeErr})
-			return
+			walkErrors = append(walkErrors, runWalkError{err: closeErr})
 		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 		for _, entry := range entries {
 			path := filepath.Join(dir, entry.Name())
 			if entry.IsDir() {
@@ -287,7 +286,6 @@ func runMarkdownFiles(root string) ([]string, []error) {
 		}
 	}
 	walk(root)
-	sort.Slice(walkErrors, func(i, j int) bool { return walkErrors[i].path < walkErrors[j].path })
 	errors := make([]error, len(walkErrors))
 	for i, walkErr := range walkErrors {
 		errors[i] = walkErr.err
@@ -296,8 +294,7 @@ func runMarkdownFiles(root string) ([]string, []error) {
 }
 
 type runWalkError struct {
-	path string
-	err  error
+	err error
 }
 
 // matchRunFiles читает отчёты параллельно, сохраняя результаты в порядке входного списка.
@@ -524,8 +521,6 @@ func topReplies(hits []replyHit) []replyHit {
 	return top
 }
 
-// replyRef — ссылка tl на запись пользователя в транскрипте claude: журнал хранит время и сессию, номер строки
-// ищется по времени записи. Не нашлась - ошибка, её печатают вместо ссылки, а не молчат.
 type transcriptIndex map[string][]string
 
 // indexTranscripts walks project directories once per prior call. The old per-reply glob reopened every
@@ -552,6 +547,8 @@ func indexTranscripts(projects string) transcriptIndex {
 	return index
 }
 
+// replyRef — ссылка tl на запись пользователя в транскрипте claude: журнал хранит время и сессию, номер строки
+// ищется по времени записи. Не нашлась - ошибка, её печатают вместо ссылки, а не молчат.
 func replyRef(head string, transcripts transcriptIndex) (string, error) {
 	m := replyHeader.FindStringSubmatch(head)
 	if m == nil {

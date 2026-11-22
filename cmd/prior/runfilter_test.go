@@ -34,8 +34,8 @@ func TestRunFilterMatchesLineSearch(t *testing.T) {
 		pattern string
 		data    string
 	}{
-		{`kelvin`, "before\nKELVIN\nafter"},
-		{`secret`, "before\nſECRET\nafter"},
+		{`kelvin`, "before\nKELVIN\nKelvin\nKelvin\nafter"},
+		{`secret`, "before\nſECRET\nSecret\nſecret\nafter"},
 		{`σίσυφος`, "ΣΊΣΥΦΟΣ"},
 		{`^start`, "no\nSTART here\n"},
 		{`end$`, "no\nhere END"},
@@ -65,12 +65,76 @@ func TestRunFilterMatchesLineSearch(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.data), 0600); err != nil {
 				t.Fatal(err)
 			}
-			want, wantErr := firstMatch(q, path)
+			want := ""
+			for line := range strings.SplitSeq(tc.data, "\n") {
+				if q.any.MatchString(line) {
+					want = line
+					break
+				}
+			}
 			got, gotErr := firstMatchFiltered(q, path, q.runs)
-			if got != want || (gotErr == nil) != (wantErr == nil) {
-				t.Fatalf("got %q, %v; want %q, %v", got, gotErr, want, wantErr)
+			if got != want || gotErr != nil {
+				t.Fatalf("got %q, %v; regexp lines want %q", got, gotErr, want)
 			}
 		})
+	}
+}
+
+func TestFoldTextEquivalentAllRunes(t *testing.T) {
+	for r := rune(0); r <= 0x10FFFF+1; r++ {
+		input := string(r)
+		var want strings.Builder
+		for _, folded := range input {
+			want.WriteRune(foldRune(folded))
+		}
+		if got := foldText(input); got != want.String() {
+			t.Fatalf("rune %U: foldText = %q, want %q", r, got, want.String())
+		}
+	}
+	for b := range 256 {
+		for c := range 256 {
+			input := string([]byte{byte(b), byte(c), 'a'})
+			var want strings.Builder
+			for _, folded := range input {
+				want.WriteRune(foldRune(folded))
+			}
+			if got := foldText(input); got != want.String() {
+				t.Fatalf("bytes %02x %02x: foldText = %q, want %q", b, c, got, want.String())
+			}
+		}
+	}
+}
+
+func TestReviewRunsUnreadableOrder(t *testing.T) {
+	dir := t.TempDir()
+	for _, s := range []string{"a/b", "a-c"} {
+		if err := os.MkdirAll(filepath.Join(dir, s), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a-c", "x.md"), []byte("needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "a", "b"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "a-c"), 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(filepath.Join(dir, "a", "b"), 0o755)
+	defer os.Chmod(filepath.Join(dir, "a-c"), 0o755)
+	_, errs := runMarkdownFiles(dir)
+	if len(errs) == 0 {
+		t.Skip("process can read directories after chmod 000")
+	}
+	if len(errs) != 2 {
+		t.Fatalf("got %d directory errors, want 2: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), filepath.Join("a", "b")) {
+		t.Fatalf("first directory error = %v, want a/b", errs[0])
+	}
+	if !strings.Contains(errs[1].Error(), "a-c") {
+		t.Fatalf("second directory error = %v, want a-c", errs[1])
 	}
 }
 
