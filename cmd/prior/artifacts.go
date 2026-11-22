@@ -21,8 +21,8 @@ const (
 // distinct — сколько разных слов запроса нашлось в текстах.
 func distinct(q query, texts ...string) int {
 	n := 0
-	for _, re := range q.words {
-		if slices.ContainsFunc(texts, re.MatchString) {
+	for i := range q.words {
+		if slices.ContainsFunc(texts, func(text string) bool { return q.matchWord(i, text) }) {
 			n++
 		}
 	}

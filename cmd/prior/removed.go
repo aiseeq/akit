@@ -69,7 +69,7 @@ func removed(w io.Writer, q query, path string) {
 	rules := parseRemoved(string(data))
 	for i := len(rules) - 1; i >= 0; i-- {
 		r := rules[i]
-		if q.any.MatchString(strings.Join([]string{r.where, r.class, r.reason, r.quote}, "\n")) {
+		if matchFiltered(q.any, q.runs, strings.Join([]string{r.where, r.class, r.reason, r.quote}, "\n")) {
 			hits = append(hits, r)
 		}
 	}

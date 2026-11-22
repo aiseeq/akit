@@ -102,8 +102,9 @@ func parseArgs(args []string) ([]string, error) {
 
 // query — слова поиска: каждое отдельно (для карточек важно, сколько разных слов совпало) и все вместе.
 type query struct {
-	words []*regexp.Regexp
-	any   *regexp.Regexp
+	words    []*regexp.Regexp
+	any      *regexp.Regexp
+	wordRuns [][]runNeedle
 	// runs — литералы, без которых q.any не совпадёт; по ним отчёты отсеиваются до построчной проверки.
 	runs []runNeedle
 	// phrases — аргументы, где фраза из phraseWords слов и больше: каждый ищется одной фразой целиком, и слова
@@ -133,6 +134,11 @@ func newQuery(words []string) (query, error) {
 			return q, fmt.Errorf("слово %q: %w", w, err)
 		}
 		q.words = append(q.words, re)
+		literals, err := newRunFilter(re)
+		if err != nil {
+			return q, err
+		}
+		q.wordRuns = append(q.wordRuns, literals)
 		if phraseLen(w) >= phraseWords {
 			q.phrases = append(q.phrases, w)
 		}
@@ -144,6 +150,10 @@ func newQuery(words []string) (query, error) {
 	}
 	q.runs = runs
 	return q, nil
+}
+
+func (q query) matchWord(i int, text string) bool {
+	return matchFiltered(q.words[i], q.wordRuns[i], text)
 }
 
 // width — потолок строки вывода в рунах.
@@ -312,17 +322,40 @@ type queryLine struct {
 
 // matchingLines is the shared file prefilter, line prefilter, and query matcher.
 func matchingLines(q query, data []byte, filter []runNeedle) []queryLine {
-	if len(filter) > 0 && !runMayMatch(data, filter) {
+	if filter == nil {
+		filter = q.runs
+	}
+	text := string(data)
+	folded := text
+	if len(filter) > 0 {
+		folded = foldText(text)
+	}
+	if len(filter) > 0 && !runMayMatch(folded, filter) {
 		return nil
 	}
 	var matches []queryLine
 	number := 0
-	for line := range strings.Lines(string(data)) {
+	textAt, foldedAt := 0, 0
+	for textAt < len(text) {
+		lineEnd := strings.IndexByte(text[textAt:], '\n')
+		foldedEnd := strings.IndexByte(folded[foldedAt:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(text) - textAt
+		}
+		if foldedEnd < 0 {
+			foldedEnd = len(folded) - foldedAt
+		}
+		line := text[textAt : textAt+lineEnd]
+		foldedLine := folded[foldedAt : foldedAt+foldedEnd]
 		number++
-		line = strings.TrimSuffix(line, "\n")
-		if (len(filter) == 0 || runMayMatch([]byte(line), filter)) && q.any.MatchString(line) {
+		if matchFilteredFolded(q.any, filter, line, foldedLine) {
 			matches = append(matches, queryLine{number: number, text: line})
 		}
+		if textAt+lineEnd == len(text) {
+			break
+		}
+		textAt += lineEnd + 1
+		foldedAt += foldedEnd + 1
 	}
 	return matches
 }

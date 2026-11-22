@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -48,6 +49,41 @@ func TestRunFilterMatchesLineSearch(t *testing.T) {
 			got, gotErr := firstMatchFiltered(q, path, q.runs)
 			if got != want || (gotErr == nil) != (wantErr == nil) {
 				t.Fatalf("got %q, %v; want %q, %v", got, gotErr, want, wantErr)
+			}
+		})
+	}
+}
+
+func TestFilteredRegexpMatchesRegexpOnSameLines(t *testing.T) {
+	cases := []struct {
+		pattern string
+		lines   []string
+	}{
+		{`(?i)простое решение`, []string{"ПРОСТОЕ РЕШЕНИЕ", "простая правка", "xпростое\tрешение"}},
+		{`(?i)(костыль|механизм)`, []string{"КОСТЫЛЬ", "МЕХАНИЗМ", "решение"}},
+		{`(?i)фриз[а-я]*`, []string{"ФРИЗ", "фризы", "диск"}},
+		{`(?i)foo|бар[а-я]+`, []string{"FOO", "БАРЫ", "baz"}},
+		{`(?i)foo|^`, []string{"любой текст", "FOO"}},
+		{`(?i)\d{2,4}`, []string{"12", "12345", "нет цифр"}},
+		{`(?i)(?:x{0,2})?`, []string{"", "anything", "xxx"}},
+		{`(?i)σίσυφος`, []string{"ΣΊΣΥΦΟΣ", "другое"}},
+		{`(?i)Kelvin`, []string{"KELVIN", "kelvin", "other"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.pattern, func(t *testing.T) {
+			re, err := regexp.Compile(tc.pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			filter, err := newRunFilter(re)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range tc.lines {
+				got, want := matchFiltered(re, filter, line), re.MatchString(line)
+				if got != want {
+					t.Errorf("matchFiltered(%q) = %v, regexp = %v", line, got, want)
+				}
 			}
 		})
 	}

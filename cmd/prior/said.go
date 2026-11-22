@@ -89,8 +89,8 @@ func saidHits(data string, q query) (hits []*saidEntry, bad, firstBad int) {
 		if e.name == "" {
 			e.name = shortID(f[1])
 		}
-		for _, re := range q.words {
-			if re.MatchString(f[6]) || re.MatchString(e.quote) {
+		for i := range q.words {
+			if q.matchWord(i, f[6]) || q.matchWord(i, e.quote) {
 				e.words++
 			}
 		}

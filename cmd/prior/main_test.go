@@ -355,6 +355,31 @@ func TestLineWithLongLines(t *testing.T) {
 	}
 }
 
+func TestLineWithTimestampUsesChronologicalSearch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chronological.jsonl")
+	write(t, path,
+		`{"timestamp":"2026-10-01T10:00:00.000Z"}`+"\n"+
+			`{"timestamp":"2026-10-02T10:00:00.000Z"}`+"\n"+
+			`{"timestamp":"2026-10-03T10:00:00.000Z"}`+"\n"+
+			`{"timestamp":"2026-10-04T10:00:00.000Z"}`+"\n")
+	needle := []byte(`"timestamp":"2026-10-03T10:00:00.000Z"`)
+	if n, err := lineWith(path, needle); err != nil || n != 3 {
+		t.Fatalf("chronological lookup: line %d, err %v; want line 3", n, err)
+	}
+}
+
+func TestLineWithTimestampFallsBackForUnorderedTranscript(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unordered.jsonl")
+	write(t, path,
+		`{"timestamp":"2026-10-01T10:00:00.000Z"}`+"\n"+
+			`{"timestamp":"2026-10-03T10:00:00.000Z"}`+"\n"+
+			`{"timestamp":"2026-10-02T10:00:00.000Z"}`+"\n")
+	needle := []byte(`"timestamp":"2026-10-02T10:00:00.000Z"`)
+	if n, err := lineWith(path, needle); err != nil || n != 3 {
+		t.Fatalf("unordered fallback: line %d, err %v; want line 3", n, err)
+	}
+}
+
 // Блок журнала — одно место в выводе, даже если совпали и фраза агента, и ответ; ранг — разные слова темы во всём
 // блоке: короткий ответ «да» на вопрос агента ровно по теме не вытесняется ответами с одним словом, а под совпавшей
 // фразой агента видна первая строка ответа.

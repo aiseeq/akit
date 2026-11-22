@@ -3304,64 +3304,16 @@ func transcriptOffset(f *os.File, size int64, target time.Time, samples []transc
 	return hi, nil
 }
 
-const transcriptRecordReadBuffer = 68 << 10
-
 func transcriptRecordAt(f *os.File, offset, size int64) (int64, time.Time, int64, error) {
-	if offset >= size {
-		return size, time.Time{}, size, nil
-	}
-	var chunk [transcriptRecordReadBuffer]byte
-	pos := offset
-	var lineData []byte
-	for {
-		start := max(int64(0), pos-(64<<10))
-		readSize := min(int64(len(chunk)), size-start)
-		n, err := f.ReadAt(chunk[:readSize], start)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return 0, time.Time{}, 0, err
-		}
-		boundary := min(int64(n), pos-start)
-		if i := bytes.LastIndexByte(chunk[:boundary], '\n'); i >= 0 {
-			lineData = chunk[i+1 : n]
-			pos = start + int64(i+1)
-			break
-		}
-		if start == 0 {
-			lineData = chunk[:n]
-			pos = 0
-			break
-		}
-		if n == 0 {
-			return size, time.Time{}, size, nil
-		}
-		pos = start
-	}
-	prefix := lineData
-	if len(prefix) > 4096 {
-		prefix = prefix[:4096]
+	pos, prefix, end, err := transcript.RecordAt(f, offset, size)
+	if err != nil || pos >= size {
+		return pos, time.Time{}, end, err
 	}
 	stamp, err := transcriptTimestampPrefix(prefix)
 	if err != nil {
 		return 0, time.Time{}, 0, err
 	}
-	if end := bytes.IndexByte(lineData, '\n'); end >= 0 {
-		return pos, stamp, pos + int64(end+1), nil
-	}
-	end := pos + int64(len(lineData))
-	for end < size {
-		count, readErr := f.ReadAt(chunk[:], end)
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return 0, time.Time{}, 0, readErr
-		}
-		if i := bytes.IndexByte(chunk[:count], '\n'); i >= 0 {
-			return pos, stamp, end + int64(i+1), nil
-		}
-		end += int64(count)
-		if count == 0 {
-			break
-		}
-	}
-	return pos, stamp, size, nil
+	return pos, stamp, end, nil
 }
 
 func briefLinkHitsUntil(word briefWord, e env, contexts map[string][]line, until time.Time) ([]hit, string, error) {

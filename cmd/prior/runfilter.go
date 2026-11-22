@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"regexp"
 	"regexp/syntax"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -73,51 +73,52 @@ func runNeedleSize(needle runNeedle) int {
 	return size
 }
 
-// runLiteralVariants делит литерал на фрагменты до четырёх рун и перечисляет их свёртки. RuneError пропускается:
+// runLiteralVariants сворачивает обязательный литерал по Unicode SimpleFold. RuneError разделяет литерал:
 // regexp видит его и в некорректных байтах UTF-8, которые нельзя искать как буквальную кодировку этой руны.
 func runLiteralVariants(runes []rune) runNeedle {
 	var needle runNeedle
-	variants := []string{""}
-	count := 0
+	var part strings.Builder
 	flush := func() {
-		if count > 0 {
-			needle = append(needle, variants)
-			variants, count = []string{""}, 0
+		if part.Len() > 0 {
+			needle = append(needle, []string{part.String()})
+			part.Reset()
 		}
 	}
-	for i := len(runes) - 1; i >= 0; i-- {
-		r := runes[i]
+	for _, r := range runes {
 		if r == utf8.RuneError {
 			flush()
 			continue
 		}
-		forms := []rune{r}
-		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
-			forms = append(forms, next)
-		}
-		if count == 4 || len(forms)*len(variants) > 32 {
-			flush()
-		}
-		var expanded []string
-		for _, form := range forms {
-			for _, suffix := range variants {
-				expanded = append(expanded, string(form)+suffix)
-			}
-		}
-		variants = expanded
-		count++
+		part.WriteRune(foldRune(r))
 	}
 	flush()
 	return needle
 }
 
-func runMayMatch(data []byte, literals []runNeedle) bool {
+func foldRune(r rune) rune {
+	folded := r
+	for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+		folded = min(folded, next)
+	}
+	return folded
+}
+
+func foldText(text string) string {
+	var folded strings.Builder
+	folded.Grow(len(text))
+	for _, r := range text {
+		folded.WriteRune(foldRune(r))
+	}
+	return folded.String()
+}
+
+func runMayMatch(data string, literals []runNeedle) bool {
 	for _, needle := range literals {
 		found := true
 		for _, variants := range needle {
 			part := false
 			for _, variant := range variants {
-				if bytes.Contains(data, []byte(variant)) {
+				if strings.Contains(data, variant) {
 					part = true
 					break
 				}
@@ -132,4 +133,14 @@ func runMayMatch(data []byte, literals []runNeedle) bool {
 		}
 	}
 	return false
+}
+
+// matchFiltered rejects only strings that cannot match the regexp. The regexp remains
+// authoritative for every candidate, including expressions with no provable literal.
+func matchFiltered(re *regexp.Regexp, literals []runNeedle, text string) bool {
+	return matchFilteredFolded(re, literals, text, foldText(text))
+}
+
+func matchFilteredFolded(re *regexp.Regexp, literals []runNeedle, text, folded string) bool {
+	return (len(literals) == 0 || runMayMatch(folded, literals)) && re.MatchString(text)
 }
