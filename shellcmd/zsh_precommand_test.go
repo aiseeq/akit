@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// zsh precommand modifiers noglob and nocorrect run the next word as the command.
+// zsh precommand modifiers noglob, nocorrect and - run the next word as the command.
 func TestZshPrecommandModifiersAreWrappers(t *testing.T) {
 	for _, tc := range []struct {
 		src, name, via string
@@ -15,6 +15,12 @@ func TestZshPrecommandModifiersAreWrappers(t *testing.T) {
 		{`noglob cd /tmp`, "cd", "noglob"},
 		{`zsh -c 'noglob kill -9 1'`, "kill", "noglob"},
 		{`nocorrect noglob rm -rf /x`, "rm", "noglob"},
+		// zsh precommand modifier - (argv[0] with a leading dash) also runs the next word.
+		{`noglob - kill -9 1`, "kill", "noglob"},
+		{`nocorrect - rm -rf /x`, "rm", "nocorrect"},
+		{`noglob - - kill 1`, "kill", "noglob"},
+		{`noglob exec - kill 1`, "kill", "exec"},
+		{`zsh -c 'noglob - kill -9 1'`, "kill", "noglob"},
 	} {
 		calls, err := Calls(tc.src)
 		if err != nil {
