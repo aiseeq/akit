@@ -54,7 +54,7 @@ func TestClaude(t *testing.T) {
 		`"cache_creation_input_tokens":100,"cache_read_input_tokens":2000,"output_tokens":7}}`)
 	t.Setenv("CLAUDE_PID", "123")
 	t.Setenv("CLAUDECODE", "1")
-	res, err := Ask(context.Background(), Request{Model: "opus", Effort: "low", System: "будь краток",
+	res, err := Ask(context.Background(), Request{Model: "opus", Effort: "xhigh", System: "будь краток",
 		Input: "вопрос", Approved: approved(t)})
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +64,7 @@ func TestClaude(t *testing.T) {
 		t.Errorf("got %+v", res)
 	}
 	args := read(t, dir+"/args")
-	for _, a := range []string{"--system-prompt\nбудь краток\n", "--effort\nlow\n", "--tools\n\n", "--model\nopus\n"} {
+	for _, a := range []string{"--system-prompt\nбудь краток\n", "--effort\nxhigh\n", "--tools\n\n", "--model\nopus\n"} {
 		if !strings.Contains(args, a) {
 			t.Errorf("args lack %q:\n%s", a, args)
 		}

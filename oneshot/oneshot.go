@@ -24,7 +24,8 @@ import (
 type Request struct {
 	// Model — имя из списка одобренных (opus, sol, luna); id для CLI берётся оттуда же.
 	Model string
-	// Effort — усилие рассуждения как его понимает CLI модели (low, medium, high…); пусто — по умолчанию CLI.
+	// Effort — усилие рассуждения как его понимает CLI модели (high, xhigh, max…); пусто — high. Ниже high
+	// (none, minimal, low, medium) — ошибка: умолчание CLI бывает ниже, и пустое поле не должно его включать.
 	Effort string
 	// System — системный промпт; у codex — файлом model_instructions_file вместо встроенных инструкций.
 	System string
@@ -71,6 +72,9 @@ func Ask(ctx context.Context, req Request) (Result, error) {
 	if !ok {
 		return Result{}, fmt.Errorf("oneshot: model %q is not in %s", req.Model, path)
 	}
+	if req.Effort, err = effort(req.Effort); err != nil {
+		return Result{}, err
+	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
@@ -94,6 +98,17 @@ func Ask(ctx context.Context, req Request) (Result, error) {
 		res.Text, res.Usage, err = askCodex(ctx, req, id, tmp)
 	}
 	return res, err
+}
+
+// effort — усилие вызова: пусто — high, ниже high — ошибка.
+func effort(e string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(e)) {
+	case "":
+		return "high", nil
+	case "none", "minimal", "low", "medium":
+		return "", fmt.Errorf("oneshot: effort %q is below high", e)
+	}
+	return e, nil
 }
 
 // Approved читает список одобренных моделей: строки «<имя> <id>», комментарии с «#». Модели вне списка не
