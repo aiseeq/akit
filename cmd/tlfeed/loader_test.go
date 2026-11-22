@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -615,12 +616,12 @@ func TestNewDayFolderInKnownTask(t *testing.T) {
 				}
 				defer w.close()
 				l.dirs.w = w
-				l.dirs.known, l.dirs.order = map[string]time.Time{}, nil
+				l.dirs.known, l.dirs.order, l.dirs.on, l.dirs.polled = map[string]time.Time{}, nil, map[string]bool{}, nil
 				for _, f := range l.all {
-					l.dirs.addFileDir(f.src.Path)
+					l.dirs.addFileDir(f.src.Path, f.mtime)
 				}
 				for _, p := range paths {
-					l.dirs.addFileDir(p)
+					l.dirs.addFileDir(p, time.Time{})
 				}
 				l.dirs.watchClaude()
 				l.cfg.sweep = time.Hour // inotify alone
@@ -686,4 +687,173 @@ func TestParserRebuiltSkipsLoadedLines(t *testing.T) {
 	if meta, _ := transcript.Read(path, nil, func(transcript.Event) {}); f.bad != meta.Bad {
 		t.Fatalf("bad %d, transcript.Read %d", f.bad, meta.Bad)
 	}
+}
+
+// An empty --state keeps no state file; without --state the file is in the state folder of the home.
+func TestStateFlag(t *testing.T) {
+	home := t.TempDir()
+	o, err := parse([]string{"--home", home, "--state", ""})
+	if err != nil || o.cfg.state != "" {
+		t.Fatalf("--state '': state %q, err %v", o.cfg.state, err)
+	}
+	o, err = parse([]string{"--home", home})
+	if err != nil || o.cfg.state != defaultStatePath(home) {
+		t.Fatalf("no --state: state %q, err %v", o.cfg.state, err)
+	}
+}
+
+// A loader stopped while the server still holds its insert: the server applies it only after the next start has
+// cleaned up and loaded the file again. The late rows are turned away by the generation, nothing is twice.
+func TestLateInsertOfStoppedLoader(t *testing.T) {
+	for _, table := range []string{"raw", "events"} {
+		for _, fresh := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/new-%t", table, fresh), func(t *testing.T) {
+				h := newHarness(t)
+				data := sample(t, "claude.jsonl")
+				path := claudePath(h.home)
+				half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+				stop := make(chan struct{})
+				write(t, path, data[:half])
+				var l *loader
+				var paths []string
+				if fresh {
+					l, paths = h.started(stop)
+				} else {
+					l = h.loader(stop)
+					appendTo(t, path, data[half:])
+				}
+				h.fake.set(func(f *fakeCH) { f.hold[table] = 1 << 30 }) // every try is held, to come late
+				go func() {
+					for h.fake.triedFailing(table) == 0 {
+						time.Sleep(time.Millisecond)
+					}
+					close(stop)
+				}()
+				var err error
+				if fresh {
+					err = l.visitAll(paths)
+				} else {
+					err = l.pass(false)
+				}
+				if err != errStopped {
+					t.Fatalf("first run: %v, want errStopped", err)
+				}
+				h.fake.set(func(f *fakeCH) { f.hold[table] = 0 })
+				if fresh {
+					appendTo(t, path, data[half:])
+				}
+				l2 := h.loader(nil)
+				if h.fake.kills != 1 {
+					t.Fatalf("%d KILL QUERY at the start after a stop in a batch, want 1", h.fake.kills)
+				}
+				h.fake.sendLate()
+				h.same(l2, path)
+			})
+		}
+	}
+}
+
+// A rollout whose first message events come while it has no parser (after a restart or an idle release): the
+// rebuilt parser sees them in the whole file, so the events of the earlier lines, made without them, are made again.
+func TestMessageEventsBeganWithoutParser(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart-%t", restart), func(t *testing.T) {
+			h := newHarness(t)
+			path := filepath.Join(h.home, ".local", "state", "worker", "job1", "codex", "sessions", "2026", "10", "25",
+				"rollout-2026-10-25T10-47-55-01a172ac-0000-7000-8000-000000000001.jsonl")
+			write(t, path, sample(t, "codex.jsonl"))
+			l := h.loader(nil)
+			l.cfg.idle = time.Nanosecond // the parser goes
+			h.pass(l)
+			appendTo(t, path, []byte(`{"timestamp":"2026-10-25T10:51:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"second question","images":[]}}`+"\n"+
+				`{"timestamp":"2026-10-25T10:51:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"second answer"}}`+"\n"))
+			if restart {
+				l = h.loader(nil)
+			} else {
+				h.pass(l)
+			}
+			h.same(l, path)
+			if !strings.Contains(h.log.String(), "message events began past the stored events") {
+				t.Fatalf("log %q", h.log.String())
+			}
+		})
+	}
+}
+
+// Only worker tasks written to lately have their session folders watched; an old task that starts a session on a
+// new day is found by the sweep of the folders not watched, and from then on its folders are watched.
+func TestOldWorkerTaskFoldersPolled(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "codex.jsonl")
+	task := func(name, day string) (string, string) {
+		dir := filepath.Join(h.home, ".local", "state", "worker", name, "codex", "sessions", "2026", "11")
+		return filepath.Join(dir, day, "rollout-2026-11-"+day+"T10-00-00-01a172ac-0000-7000-8000-00000000000"+name[len(name)-1:]+".jsonl"),
+			filepath.Join(dir, day)
+	}
+	oldFile, oldDay := task("old1", "01")
+	newFile, newDay := task("new2", "22")
+	write(t, oldFile, data)
+	write(t, newFile, data)
+	long := time.Now().Add(-10 * 24 * time.Hour)
+	for _, p := range []string{oldFile, oldDay, filepath.Dir(oldDay)} {
+		if err := os.Chtimes(p, long, long); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.loader(nil) // the files table now has both, the old one with its old mtime
+	l, paths := h.started(nil)
+	w, err := newWatcher(l.logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	l.dirs.w = w
+	l.dirs.known, l.dirs.order, l.dirs.on, l.dirs.polled = map[string]time.Time{}, nil, map[string]bool{}, nil
+	for _, f := range l.all {
+		l.dirs.addFileDir(f.src.Path, f.mtime)
+	}
+	l.dirs.watchClaude()
+	if err := l.visitAll(paths); err != nil {
+		t.Fatal(err)
+	}
+	if !l.dirs.on[newDay] || !l.dirs.on[filepath.Dir(newDay)] {
+		t.Fatalf("folders of the recent task not watched: %v", l.dirs.on)
+	}
+	if l.dirs.on[oldDay] || l.dirs.on[filepath.Dir(oldDay)] {
+		t.Fatalf("folders of the old task watched")
+	}
+	l.cfg.sweep = l.cfg.tick // every folder not watched is swept each pass
+	resumed, _ := task("old1", "23")
+	write(t, resumed, data)
+	// the sweep of all known folders, one a pass here, polls next the one past the changed month folder
+	l.dirs.next = slices.Index(l.dirs.order, filepath.Dir(oldDay))
+	h.pass(l)
+	h.same(l, resumed)
+	if !l.dirs.on[filepath.Dir(resumed)] {
+		t.Fatal("the folders of the resumed task are not watched")
+	}
+}
+
+// A loader stopped after a files row took the grown size of a file but before its new lines were loaded (here a
+// rollout whose message events began: its events are made again after that row): the next start finds the file
+// as large as the row says and still loads the lines past ingested.
+func TestStoppedAfterSizeStoredBeforeLines(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+	write(t, path, data[:half])
+	l := h.loader(nil)
+	appendTo(t, path, data[half:])
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := l.files[path]
+	f.size, f.mtime, f.inode = st.Size(), st.ModTime(), inodeOf(st)
+	l.batch.touch(f)
+	if err := l.flush(); err != nil {
+		t.Fatal(err)
+	}
+	h.same(h.loader(nil), path)
 }

@@ -105,7 +105,7 @@ func (c *checker) check() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	raw, err := c.rows("SELECT file_id, count(), max(line) FROM " + c.db + ".raw GROUP BY file_id FORMAT TabSeparated")
+	raw, err := c.rows("SELECT file_id, count(), max(line), uniqExact(line) FROM " + c.db + ".raw GROUP BY file_id FORMAT TabSeparated")
 	if err != nil {
 		return false, err
 	}
@@ -120,6 +120,9 @@ func (c *checker) check() (bool, error) {
 	rawOf := map[string][2]string{}
 	for _, r := range raw {
 		rawOf[r[0]] = [2]string{r[1], r[2]}
+		if r[1] != r[3] {
+			c.problem("raw\tfile_id %s\t%s rows of %s lines: a line is there twice", r[0], r[1], r[3])
+		}
 	}
 	evOf := map[string]string{}
 	for _, r := range events {

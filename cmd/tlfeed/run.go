@@ -172,14 +172,18 @@ func (l *loader) held(want map[string]bool) []string {
 }
 
 // sweepSlice adds the next known files and folders to want, so that every file is looked at once per sweep period;
-// the folders too, or once per rescan period when inotify watches every one of them.
+// the folders too, or, with inotify watching every folder given to it, the watched ones once per rescan period.
 func (l *loader) sweepSlice(want map[string]bool, now time.Time) {
 	part := func(n int, period time.Duration) int {
 		return int(int64(n)*int64(l.cfg.tick)/int64(max(period, l.cfg.tick))) + 1
 	}
 	period := l.cfg.sweep
 	if l.dirs.w.complete() {
+		// the watched folders tell their changes; the others are swept within --sweep
 		period = max(l.cfg.rescan, l.cfg.sweep)
+		for _, p := range l.dirs.sweepPolled(part(len(l.dirs.polled), l.cfg.sweep), now) {
+			want[p] = true
+		}
 	}
 	for _, p := range l.dirs.sweep(part(len(l.dirs.order), period), now) {
 		want[p] = true

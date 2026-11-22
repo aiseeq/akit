@@ -41,7 +41,9 @@ Flags:
                    (default $XDG_STATE_HOME/akit/tlfeed/state.json, ~/.local/state when unset)
   --tick D         pass period (default 1s)
   --idle D         a file that has not grown this long releases its parser (default 1h)
-  --sweep D        every known file is looked at once per D, changed or not (default 5m)
+  --sweep D        every known file and every folder inotify does not watch is looked at once per D,
+                   changed or not (default 5m); inotify watches the Claude projects and the codex
+                   sessions of worker tasks written to within 48h
   --rescan D       full listing of the transcripts (default 1h)
   --beat D         state file period, at most 60s (default 10s)
   --no-inotify     find changes by polling only
@@ -110,7 +112,9 @@ func parse(args []string) (options, error) {
 		return o, fmt.Errorf("--once, --materialize, --verify and --check do not go together")
 	}
 	o.cfg.home = filepath.Clean(o.cfg.home)
-	if o.cfg.state == "" {
+	stateGiven := false
+	fs.Visit(func(f *flag.Flag) { stateGiven = stateGiven || f.Name == "state" })
+	if !stateGiven { // --state '' keeps no state file
 		o.cfg.state = defaultStatePath(o.cfg.home)
 	}
 	return o, nil
