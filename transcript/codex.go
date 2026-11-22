@@ -188,6 +188,11 @@ var (
 	agentMessageLine = []byte(`"type":"event_msg","payload":{"type":"agent_message"`)
 )
 
+func noteCodexMessageMarkers(raw []byte, user, agent bool) (bool, bool) {
+	head := raw[:min(len(raw), codexHead)]
+	return user || bytes.Contains(head, userMessageLine), agent || bytes.Contains(head, agentMessageLine)
+}
+
 // codexMessages — есть ли в rollout события user_message и agent_message. Их пишет только TUI: в rollout exec
 // реплики и текст агента есть лишь в response_item, а в TUI response_item дублирует их со вставками обвязки
 // (<turn_aborted>, заглушки картинок) и метками на 1 мс позже. Файл читается по смещениям, его позиция не меняется.
@@ -199,9 +204,7 @@ func codexMessages(f *os.File) (user, agent bool, err error) {
 	r := bufio.NewReaderSize(io.NewSectionReader(f, 0, st.Size()), 1<<20)
 	for !user || !agent {
 		line, err := readLine(r)
-		head := line[:min(len(line), codexHead)]
-		user = user || bytes.Contains(head, userMessageLine)
-		agent = agent || bytes.Contains(head, agentMessageLine)
+		user, agent = noteCodexMessageMarkers(line, user, agent)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -215,7 +218,7 @@ func codexMessages(f *os.File) (user, agent bool, err error) {
 func (p *codexParser) parse(rec *record) []Event {
 	events := p.events(rec)
 	fallback := p.deferMessages && p.pendingFallback[p.currentLine] != ""
-	if len(events) > 0 && !fallback {
+	if len(events) > 0 && (!fallback || rec.Type == "response_item") {
 		p.named = false
 	}
 	for i := range events {

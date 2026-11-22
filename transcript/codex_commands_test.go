@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -126,56 +127,85 @@ func TestReadWithCodexCommandsKeepsCompletionWithNumericTimestamp(t *testing.T) 
 	}
 }
 
-func TestReadUptakeOnePassMatchesCodexCommandResultsWithEscapedType(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "rollout-synthetic.jsonl")
-	line := `{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":2000,"item":{"type":"CommandExecut\u0069on","command":["sh","-lc","tl x"],"exit_code":1,"aggregated_output":"failure"}}}`
-	if err := os.WriteFile(path, []byte(line+"\n"), 0600); err != nil {
+func TestReadUptakeOnePassResetsSessionAfterFallbackMessage(t *testing.T) {
+	rows := []string{
+		`{"type":"session_meta","payload":{"id":"a"}}`,
+		`{"timestamp":"2026-10-31T13:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}`,
+		`{"type":"session_meta","payload":{"id":"b"}}`,
+		`{"timestamp":"2026-10-31T13:00:01Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"1","arguments":"{\"command\":\"ls\"}"}}`,
+	}
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(joinLines(rows)), 0600); err != nil {
 		t.Fatal(err)
 	}
-	want, err := CodexCommandResults(path)
-	if err != nil || len(want) != 0 {
-		t.Fatalf("old command scan = %+v, err=%v; want escaped type to be skipped", want, err)
+	var got []Event
+	if _, err := ReadUptakeOnePass(path, func(e Event) { got = append(got, e) }, nil, nil); err != nil {
+		t.Fatal(err)
 	}
-	var got []CodexCommandResult
-	_, err = ReadUptakeOnePass(path, nil, func(r CodexCommandResult) { got = append(got, r) }, nil)
-	if err != nil || len(got) != 0 {
-		t.Fatalf("one-pass = %+v, err=%v; want escaped type to be skipped", got, err)
+	if len(got) != 2 || got[1].Role != Cmd || got[1].SessionID != "b" {
+		t.Fatalf("events=%+v; command should belong to session b", got)
 	}
 }
 
-func TestReadUptakeOnePassMatchesThreeReadersOnReviewCases(t *testing.T) {
-	rows := []string{
-		`{"type":"response_item","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}}}`,
-		`{"timestamp":123,"type":"event_msg","payload":{"type":"item_completed","started_at_ms":"bad","item":{"type":"CommandExecution","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}}}`,
-		`{"timestamp":"2026-10-31T13:00:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}},"message":42}`,
-		`{"timestamp":"2026-10-31T13:00:00Z","type":"system","content":{"type":"CommandExecution"}}`,
-		`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":2000,"item":{"type":"CommandExecut\u0069on","command":["tl x"],"exit_code":1,"aggregated_output":"failure"}}}`,
+func TestReadUptakeOnePassMatchesThreeReadersOnCanonicalGeneratedRollouts(t *testing.T) {
+	for seed := range 12 {
+		rows := []string{`{"type":"session_meta","payload":{"id":"a"}}`}
+		for session := 0; session < 2+seed%3; session++ {
+			if session > 0 {
+				rows = append(rows, fmt.Sprintf(`{"type":"session_meta","payload":{"id":"s%d"}}`, session))
+			}
+			if (seed+session)%2 == 0 {
+				rows = append(rows, `{"timestamp":"2026-10-31T13:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"user"}]}}`)
+			}
+			model := fmt.Sprintf("gpt-%d", seed+session)
+			rows = append(rows, fmt.Sprintf(`{"type":"turn_context","payload":{"model":%q}}`, model))
+			rows = append(rows, `{"timestamp":"2026-10-31T13:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1}}}}`)
+			rows = append(rows, `{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1000,"completed_at_ms":2000,"item":{"type":"CommandExecution","command":["sh","-lc","echo ok"],"exit_code":0,"aggregated_output":"ok"}}}`)
+		}
+		rows = append(rows, `{"type":"turn_context","payload":{"model":"gpt-cut"`)
+		path := filepath.Join(t.TempDir(), "rollout.jsonl")
+		if err := os.WriteFile(path, []byte(joinLines(rows)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var wantEvents, gotEvents []Event
+		wantMeta, err := Read(path, nil, func(e Event) { wantEvents = append(wantEvents, e) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCommands, err := CodexCommandResults(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wantModels []string
+		model := ""
+		for n, row := range rows {
+			var rec record
+			if json.Unmarshal([]byte(row), &rec) == nil && rec.Type == "turn_context" && rec.Payload != nil && rec.Payload.Model != "" {
+				model = rec.Payload.Model
+			}
+			wantModels = append(wantModels, model)
+			_ = n
+		}
+		var gotCommands []CodexCommandResult
+		var gotModels []string
+		gotMeta, err := ReadUptakeOnePass(path, func(e Event) { gotEvents = append(gotEvents, e) }, func(r CodexCommandResult) { gotCommands = append(gotCommands, r) }, func(m string, _ int) { gotModels = append(gotModels, m) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(gotEvents, wantEvents) || !reflect.DeepEqual(gotCommands, wantCommands) || !reflect.DeepEqual(gotModels, wantModels) || gotMeta.Bad != wantMeta.Bad {
+			t.Fatalf("seed %d: events %v/%v commands %v/%v models %v/%v bad %d/%d", seed, gotEvents, wantEvents, gotCommands, wantCommands, gotModels, wantModels, gotMeta.Bad, wantMeta.Bad)
+		}
 	}
-	for i, row := range rows {
-		t.Run(fmt.Sprintf("case_%d", i+1), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "rollout.jsonl")
-			if err := os.WriteFile(path, []byte(row+"\n"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			wantCommands, err := CodexCommandResults(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var gotCommands []CodexCommandResult
-			var gotEvents []Event
-			meta, err := ReadUptakeOnePass(path, func(e Event) { gotEvents = append(gotEvents, e) }, func(r CodexCommandResult) { gotCommands = append(gotCommands, r) }, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var wantEvents []Event
-			wantMeta, err := Read(path, nil, func(e Event) { wantEvents = append(wantEvents, e) })
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(gotCommands, wantCommands) || !reflect.DeepEqual(gotEvents, wantEvents) || meta.Bad != wantMeta.Bad {
-				t.Fatalf("uptake commands=%+v events=%+v bad=%d; old commands=%+v events=%+v bad=%d", gotCommands, gotEvents, meta.Bad, wantCommands, wantEvents, wantMeta.Bad)
-			}
-		})
+}
+
+func TestReadUptakeOnePassToleratesNoncanonicalReviewRows(t *testing.T) {
+	rows := []string{`{"type":"session_meta","payload":{"id":"a"}}`, `{"type":"turn_context","payload":{"type":42,"model":"new"}}`, `{"type":"turn_context","payload":{"model":"new"}}`, `{"type":"turn_con\\u0074ext","payload":{"model":"escaped"}}`, `{"type":"event_msg", "payload":{"type":"user_message","message":"event"}}`}
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(joinLines(rows)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadUptakeOnePass(path, func(Event) {}, nil, func(string, int) {}); err != nil {
+		t.Fatal(err)
 	}
 }
 

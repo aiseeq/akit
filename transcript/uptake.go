@@ -3,11 +3,9 @@ package transcript
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 )
 
@@ -87,14 +85,10 @@ func uptakeLine(raw []byte, rd *reader, codex bool, model string, commandFn func
 			commandFn(result)
 		}
 	}
-	modelUpdates, bad := rd.codex.modelUpdates, rd.meta.Bad
+	modelUpdates := rd.codex.modelUpdates
 	rd.line(raw)
 	if rd.codex.modelUpdates != modelUpdates {
 		model = rd.codex.model
-	} else if rd.meta.Bad != bad {
-		if next := modelFromMalformedRecord(raw); next != "" {
-			model = next
-		}
 	}
 	if modelFn != nil {
 		modelFn(model, rd.lineNo)
@@ -103,23 +97,7 @@ func uptakeLine(raw []byte, rd *reader, codex bool, model string, commandFn func
 }
 
 func noteCodexMessages(raw []byte, codex *codexParser) {
-	head := raw[:min(len(raw), codexHead)]
-	codex.eventUser = codex.eventUser || bytes.Contains(head, userMessageLine)
-	codex.eventAgent = codex.eventAgent || bytes.Contains(head, agentMessageLine)
-}
-
-func modelFromMalformedRecord(raw []byte) string {
-	if !bytes.Contains(raw, []byte(`"turn_context"`)) {
-		return ""
-	}
-	var rec record
-	if err := json.Unmarshal(raw, &rec); err != nil {
-		slog.Debug("decode malformed turn context for uptake model", "error", err)
-	}
-	if rec.Type == "turn_context" && rec.Payload != nil && rec.Payload.Model != "" {
-		return rec.Payload.Model
-	}
-	return ""
+	codex.eventUser, codex.eventAgent = noteCodexMessageMarkers(raw, codex.eventUser, codex.eventAgent)
 }
 
 func finishUptakeEvents(queue *[]Event, fn func(Event), rd *reader, codex bool) {
