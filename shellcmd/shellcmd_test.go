@@ -1255,6 +1255,105 @@ func TestArgStaticBraceFormAllocations(t *testing.T) {
 	}
 }
 
+func TestArgStaticRound15ConservativeCases(t *testing.T) {
+	for _, args := range [][]string{
+		{"-Ssh", "-c", "echo"},
+		{"--split-string=sh", "-c", "echo"},
+		{"-vSsh", "-c", "echo"},
+		{"-uX", "-Ssh", "-c", "echo"},
+	} {
+		if got := wrapperStart("env", args); got != len(args) {
+			t.Errorf("wrapperStart(env, %q) = %d, want %d to suppress split-string argv routing", args, got, len(args))
+		}
+	}
+	falseScripts := []struct {
+		src  string
+		name string
+	}{
+		{`env -Ssh -c 'printf %s "$HOME"'`, "printf"},
+		{`env --split-string=sh -c 'printf %s "$HOME"'`, "printf"},
+		{`env -vSsh -c 'printf %s "$HOME"'`, "printf"},
+		{`env -uX -Ssh -c 'printf %s "$HOME"'`, "printf"},
+		{`env -S"sh -c" 'printf %s "$HOME"'`, "printf"},
+		{`timeout 5 env -Ssh -c 'printf %s "$HOME"'`, "printf"},
+		{`nice env -S'sh -c' 'printf %s "$HOME"'`, "printf"},
+		{`env -Sprintf %s '$HOME'`, "printf"},
+		{"timeout() { shift; eval \"$@\"; }; timeout 5 echo '$HOME'", "echo"},
+		{"echo() { eval \"$@\"; }; echo '$HOME'", "echo"},
+		{"env() { eval \"$@\"; }; env echo '$HOME'", "echo"},
+		{"command() { eval \"$@\"; }; command echo '$HOME'", "echo"},
+		{"nohup() { eval \"$@\"; }; nohup echo '$HOME'", "echo"},
+		{"alias; echo '$HOME'", "echo"},
+		{"echo '$HOME'; alias ll=':'", "echo"},
+		{"outer=`echo \\`printf '%s' '$HOME'\\``", "printf"},
+		{"printf '$HOME'\x01\n", "printf"},
+		{"printf '$HOME'\x7f\n", "printf"},
+	}
+	for _, tc := range falseScripts {
+		t.Run(fmt.Sprintf("false/%q", tc.src), func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != tc.name {
+					continue
+				}
+				found = true
+				for i := range call.Args {
+					if call.ArgStatic(i) {
+						t.Errorf("ArgStatic(%d) = true: %+v", i, call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("target command %q missing: %+v", tc.name, calls)
+			}
+		})
+	}
+
+	trueScripts := []struct {
+		src  string
+		name string
+	}{
+		{`env A=1 printf %s '$HOME'`, "printf"},
+		{`timeout 5 echo '$HOME'`, "echo"},
+		{`echo ` + "`printf '%s' '$HOME'`", "printf"},
+		{`printf '$HOME'` + "\n" + `echo fine`, "printf"},
+	}
+	for _, tc := range trueScripts {
+		t.Run(fmt.Sprintf("true/%q", tc.src), func(t *testing.T) {
+			calls, err := Calls(tc.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name == tc.name {
+					found = true
+					for i := range call.Args {
+						if !call.ArgStatic(i) {
+							t.Errorf("ArgStatic(%d) = false: %+v", i, call)
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("target command missing: %+v", calls)
+			}
+		})
+	}
+
+	calls, err := Calls(`printf %s x=\{a,b}:~`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) == 0 || calls[0].ArgTilde(1)&TildeHome == 0 {
+		t.Fatalf("ArgTilde for x=\\{a,b}:~ = %v, want TildeHome", calls)
+	}
+}
+
 func TestFindKeepsNestedErrorWithoutRequestedNames(t *testing.T) {
 	_, err := Find("echo exec -- bash -c 'if'")
 	var nested *NestedError

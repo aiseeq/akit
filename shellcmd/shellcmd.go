@@ -227,8 +227,9 @@ type cmd struct {
 	source         string
 	expansionDepth int
 
-	stdinInput    *syntax.Redirect
-	stdinConsumed bool
+	stdinInput      *syntax.Redirect
+	stdinConsumed   bool
+	staticFunctions []string
 }
 
 // word — место слова в исходной команде и его текст как скрипта.
@@ -503,6 +504,47 @@ func collectCommentNodes(file *syntax.File) commentNodes {
 		return true
 	})
 	return nodes
+}
+
+func staticScriptContext(file *syntax.File, src string) ([]string, bool, [][2]int) {
+	// Most scripts cannot contain any of these constructs; avoid another AST walk
+	// and its allocations on the common static-word path.
+	if !strings.Contains(src, "alias") && !strings.Contains(src, "()") && !strings.Contains(src, "function") && !strings.Contains(src, "`") {
+		return nil, false, nil
+	}
+	var functions []string
+	aliasCall := false
+	var backquotes [][2]int
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.FuncDecl:
+			for _, name := range funcDeclNames(n) {
+				functions = append(functions, name.Value)
+			}
+		case *syntax.CallExpr:
+			if len(n.Args) != 0 {
+				if name, ok := wordValue(n.Args[0]); ok && commandName(name) == "alias" {
+					aliasCall = true
+				}
+			}
+		case *syntax.CmdSubst:
+			if n.Backquotes {
+				backquotes = append(backquotes, [2]int{int(n.Pos().Offset()), int(n.End().Offset())})
+			}
+		}
+		return true
+	})
+	return functions, aliasCall, backquotes
+}
+
+func nestedBacktickOffset(offset int, spans [][2]int) bool {
+	depth := 0
+	for _, span := range spans {
+		if span[0] <= offset && offset < span[1] {
+			depth++
+		}
+	}
+	return depth > 1
 }
 
 func continuedCommentLine(src string, start, end int) (slash, continuedAt, commentEnd int) {
@@ -944,16 +986,22 @@ type walkInfo struct {
 	hasProcessSubstitutionText bool
 	shellScriptInputCandidates bool
 	literalSimple              bool
+	staticFunctions            []string
+	staticAlias                bool
+	staticBackquotes           [][2]int
+	staticText                 bool
 }
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
+	staticFunctions, staticAlias, staticBackquotes := staticScriptContext(file, src)
+	staticText := literalScriptText(src)
 	initial := shellModes{posix: budget.initialPosix, posixUnknown: budget.initialPosixUnknown, brace: budget.initialBrace, braceUnknown: budget.initialBraceUnknown}
 	if budget.modeTexts == nil {
 		budget.modeTexts = newModeTexts()
 	}
 	posixCalls, unknownPosix, braceCalls, unknownBrace := parsedShellModes(file, src, initial, budget.modeTexts)
 	if !needsWalkInfo(src) {
-		info := walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), posixCalls: posixCalls, braceCalls: braceCalls, unknownPosix: unknownPosix, unknownBrace: unknownBrace, literalSimple: literalScriptSimple(file, src)}
+		info := walkInfo{redirs: make(map[*syntax.CallExpr][]Redir), posixCalls: posixCalls, braceCalls: braceCalls, unknownPosix: unknownPosix, unknownBrace: unknownBrace, literalSimple: literalScriptSimple(file, src), staticFunctions: staticFunctions, staticAlias: staticAlias, staticBackquotes: staticBackquotes, staticText: staticText}
 		info.collectTopLevelCalls(file)
 		return info
 	}
@@ -963,6 +1011,10 @@ func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budg
 		unknownPosix:               unknownPosix,
 		unknownBrace:               unknownBrace,
 		literalSimple:              literalScriptText(src),
+		staticFunctions:            staticFunctions,
+		staticAlias:                staticAlias,
+		staticBackquotes:           staticBackquotes,
+		staticText:                 staticText,
 		trackWork:                  budget.trackWork,
 		hasInputRedir:              strings.Contains(src, "<"),
 		hasProcessSubstitutionText: strings.Contains(src, "<(") || strings.Contains(src, ">("),
@@ -3809,7 +3861,8 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	ws, tildeArgs := markedCallWords(call, words, split, w.src, w.info, w.budget.initialPosix)
 	posixEnv := hasPosixEnvironment(call)
 	mode := shellModes{posix: w.info.posixCalls[call], posixUnknown: w.info.unknownPosix[call], brace: w.info.braceCalls[call], braceUnknown: w.info.unknownBrace[call]}
-	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: len(w.inherited) == 0, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call]}
+	staticDirect := staticCallDirect(w.info, w.inherited, start, commandName(args[0]))
+	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: staticDirect, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], staticFunctions: w.info.staticFunctions}
 	for _, part := range call.Args[0].Parts {
 		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
 			c.call.Name = ""
@@ -5048,7 +5101,7 @@ func singleQuotedWord(word *syntax.Word) bool {
 // косую перед переводом строки: `\r` и NUL парсер читает не так, как bash, а `\` с переводом строки
 // в конце комментария парсер считает продолжением строки, bash — нет.
 func literalScriptText(src string) bool {
-	return !strings.Contains(src, "\\\n") && !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' })
+	return !strings.Contains(src, "\\\n") && !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' || r == 0x7f })
 }
 
 func literalScriptSimple(file *syntax.File, src string) bool {
@@ -6218,6 +6271,11 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	return err
 }
 
+func staticCallDirect(info *walkInfo, inherited []string, offset int, name string) bool {
+	return len(inherited) == 0 && info.staticText && !info.staticAlias &&
+		!slices.Contains(info.staticFunctions, name) && !nestedBacktickOffset(offset, info.staticBackquotes)
+}
+
 // outerOffset переводит смещение во вложенном скрипте во внешний текст по карте pos.
 func outerOffset(offset int, pos []int) int {
 	if offset < 0 || offset >= len(pos) {
@@ -6831,7 +6889,7 @@ func (c cmd) sub(i int, via []string) cmd {
 	staticDirect := staticSubRoute(c, i, via)
 	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
 		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
-		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0}
+		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0, staticFunctions: c.staticFunctions}
 }
 
 func staticViaTransparent(via []string) bool {
@@ -6860,8 +6918,13 @@ func staticSubRoute(c cmd, wordIndex int, via []string) bool {
 	targetIndex := wordIndex - 1
 	name, args := c.call.Name, c.call.Args
 	for range maxNestedScripts {
-		if !staticWrapperName(name) {
+		if !staticWrapperName(name) || slices.Contains(c.staticFunctions, name) {
 			return false
+		}
+		if name == "env" {
+			if _, split := envSplitArg(args); split {
+				return false
+			}
 		}
 		wrapped, ok := unwrapOnce(name, args)
 		if !ok || len(wrapped) == 0 {
@@ -6875,7 +6938,7 @@ func staticSubRoute(c cmd, wordIndex int, via []string) bool {
 			return false
 		}
 		if targetIndex == start {
-			return true
+			return !slices.Contains(c.staticFunctions, commandName(wrapped[0]))
 		}
 		targetIndex -= start + 1
 		name, args = commandName(wrapped[0]), wrapped[1:]
@@ -10171,6 +10234,9 @@ func shortGroupExitsWithoutCommand(name, arg string) bool {
 }
 
 func wrapperStart(name string, args []string) int {
+	if start := envSplitWrapperStart(name, args); start > 0 {
+		return start
+	}
 	switch name {
 	case "command":
 		return commandTargetStart(args)
@@ -10229,6 +10295,15 @@ func commandTargetStart(args []string) int {
 		return i
 	}
 	return len(args)
+}
+
+func envSplitWrapperStart(name string, args []string) int {
+	if name == "env" {
+		if _, split := envSplitArg(args); split {
+			return len(args)
+		}
+	}
+	return 0
 }
 
 func hasOption(name string, args []string, options ...string) bool {
