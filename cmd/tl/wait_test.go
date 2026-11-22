@@ -151,6 +151,78 @@ func TestWaitAllCLIWindowIncludesCodexSessionPollAfterUntil(t *testing.T) {
 	}
 }
 
+func TestWaitAllWindowDoesNotAssignReusedCodexSessionToEarlierCall(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	rows := []string{
+		`{"timestamp":"2026-10-25T23:59:10Z","type":"response_item","payload":{"type":"function_call","call_id":"a","name":"exec_command","arguments":"{\"cmd\":\"alpha build\"}"}}`,
+		`{"timestamp":"2026-10-25T23:59:40Z","type":"response_item","payload":{"type":"function_call_output","call_id":"a","output":"Process running with session ID 4242\\nOutput:\\nrunning"}}`,
+		`{"timestamp":"2026-10-26T00:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"b","name":"exec_command","arguments":"{\"cmd\":\"beta build\"}"}}`,
+		`{"timestamp":"2026-10-26T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"b","output":"Process running with session ID 4242\\nOutput:\\nrunning"}}`,
+		`{"timestamp":"2026-10-26T00:00:03Z","type":"response_item","payload":{"type":"function_call","call_id":"c","name":"write_stdin","arguments":"{\"session_id\":4242,\"chars\":\"\"}"}}`,
+		`{"timestamp":"2026-10-26T00:00:10Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"Process exited with code 0\\nOutput:\\ndone"}}`,
+	}
+	path := writeWaitTranscript(t, e, "rollout-reused.jsonl", strings.Join(rows, "\n")+"\n")
+	code, out, errOut := runTL(t, e, "--wait-all", "--since", "2026-10-25T00:00:00Z", "--until", "2026-10-26T00:00:00Z", path)
+	if code != 0 || out != "" || strings.Contains(errOut, "read "+path) {
+		t.Fatalf("reused session window = (%d, %q, %q), want no alpha row", code, out, errOut)
+	}
+}
+
+func TestWaitAllWindowMatchesDayRowsFromUnwindowedMixedTranscripts(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	claude := writeWaitTranscript(t, e, "claude.jsonl", claudeWaitRows([]struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}{{command: "claude-task run", delay: 1, output: true}}))
+	codexRows := []string{
+		`{"timestamp":"2026-10-25T23:59:10Z","type":"response_item","payload":{"type":"function_call","call_id":"a","name":"exec_command","arguments":"{\"cmd\":\"alpha build\"}"}}`,
+		`{"timestamp":"2026-10-25T23:59:40Z","type":"response_item","payload":{"type":"function_call_output","call_id":"a","output":"Process running with session ID 4242\\nOutput:\\nrunning"}}`,
+		`{"timestamp":"2026-10-26T00:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"b","name":"exec_command","arguments":"{\"cmd\":\"beta build\"}"}}`,
+		`{"timestamp":"2026-10-26T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"b","output":"Process running with session ID 4242\\nOutput:\\nrunning"}}`,
+		`{"timestamp":"2026-10-26T00:00:03Z","type":"response_item","payload":{"type":"function_call","call_id":"c","name":"write_stdin","arguments":"{\"session_id\":4242,\"chars\":\"\"}"}}`,
+		`{"timestamp":"2026-10-26T00:00:10Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"Process exited with code 0\\nOutput:\\ndone"}}`,
+		`{"timestamp":"2026-10-26T23:59:50Z","type":"response_item","payload":{"type":"function_call","call_id":"d","name":"exec_command","arguments":"{\"cmd\":\"gamma test\"}"}}`,
+		`{"timestamp":"2026-10-27T00:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"d","output":"done"}}`,
+	}
+	codex := writeWaitTranscript(t, e, "rollout-mixed.jsonl", strings.Join(codexRows, "\n")+"\n")
+	allCode, allOut, allErr := runTL(t, e, "--wait-all", claude, codex)
+	if allCode != 0 || strings.Contains(allErr, "read "+claude) || strings.Contains(allErr, "read "+codex) {
+		t.Fatalf("unwindowed mixed wait-all = (%d, %q, %q)", allCode, allOut, allErr)
+	}
+	for _, day := range []string{"2026-10-25", "2026-10-26", "2026-10-27"} {
+		var want []string
+		for line := range strings.SplitSeq(strings.TrimSpace(allOut), "\n") {
+			if strings.HasPrefix(line, day+"\t") {
+				want = append(want, line)
+			}
+		}
+		code, got, errOut := runTL(t, e, "--wait-all", "--since", localMidnight(day), "--until", localMidnight(nextDate(day)), claude, codex)
+		if code != 0 || strings.Contains(errOut, "read "+claude) || strings.Contains(errOut, "read "+codex) || strings.TrimSpace(got) != strings.Join(want, "\n") {
+			t.Errorf("window %s = (%d, %q, %q), unwindowed day rows = %q", day, code, got, errOut, strings.Join(want, "\n"))
+		}
+	}
+}
+
+func nextDate(day string) string {
+	date, err := time.Parse(time.DateOnly, day)
+	if err != nil {
+		panic(err)
+	}
+	return date.AddDate(0, 0, 1).Format(time.DateOnly)
+}
+
+func localMidnight(day string) string {
+	date, err := time.Parse(time.DateOnly, day)
+	if err != nil {
+		panic(err)
+	}
+	return time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.Local).Format(time.RFC3339)
+}
+
 func TestWaitAllCLIReadErrorKeepsReadableRowsAndWaitExitCode(t *testing.T) {
 	e := fakeHome(t)
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())

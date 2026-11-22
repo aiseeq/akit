@@ -15,7 +15,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
-	transcriptwaits "github.com/aiseeq/akit/transcript/waits"
 )
 
 // hit — событие с его файлом.
@@ -647,18 +646,15 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 		before []transcript.Event // последние -C событий окна до найденного
 		after  int                // сколько событий после найденного ещё показать
 	)
-	includedCalls := make(map[string]bool)
-	includedSessions := make(map[string]bool)
 	consume := func(ev transcript.Event) {
-		if wt != nil && f.opts.waitAll {
-			if !f.waitAllEventInWindow(ev, includedCalls, includedSessions) {
+		if wt != nil {
+			if !f.opts.waitAll && !f.inWindow(ev) {
 				return
 			}
-		} else if !f.inWindow(ev) {
+			wt.event(ev)
 			return
 		}
-		if wt != nil {
-			wt.event(ev)
+		if !f.inWindow(ev) {
 			return
 		}
 		switch {
@@ -684,7 +680,7 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 	var waitRows []waitSample
 	if wt != nil {
 		waits = wt.waits
-		waitRows = wt.waitRows
+		waitRows = f.waitRowsInWindow(wt.waitRows)
 	}
 	if err != nil {
 		return out, waits, waitRows, meta, fmt.Errorf("read %s: %w", src.Path, err)
@@ -697,15 +693,37 @@ func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Dura
 	if err != nil {
 		return nil, nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
 	}
-	includedCalls := make(map[string]bool)
-	includedSessions := make(map[string]bool)
 	for i := range events {
-		event := &events[i]
-		if f.cachedWaitEventInWindow(event, includedCalls, includedSessions) {
-			wt.cachedEvent(*event)
+		if !f.opts.waitAll && !f.cachedWaitEventInWindow(&events[i]) {
+			continue
+		}
+		wt.cachedEvent(events[i])
+	}
+	return nil, wt.waits, f.waitRowsInWindow(wt.waitRows), transcript.Meta{}, nil
+}
+
+func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent) bool {
+	text := event.Text
+	if event.Role == transcript.Cmd {
+		text = event.Command
+	}
+	return f.inWindow(transcript.Event{
+		Role: event.Role, Text: text, Time: event.Time, CallID: event.CallID, Line: event.Line,
+		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw,
+	})
+}
+
+func (f *filter) waitRowsInWindow(rows []waitSample) []waitSample {
+	if !f.opts.waitAll {
+		return rows
+	}
+	selected := make([]waitSample, 0, len(rows))
+	for _, row := range rows {
+		if f.inWindow(transcript.Event{Role: transcript.Cmd, Time: row.At}) {
+			selected = append(selected, row)
 		}
 	}
-	return nil, wt.waits, wt.waitRows, transcript.Meta{}, nil
+	return selected
 }
 
 // readEvents сохраняет прежний читатель для промахов и его диагностику ошибок.
@@ -730,47 +748,6 @@ func (f *filter) waitEvents(path string) ([]cachedWaitEvent, error) {
 		return f.opts.waitCache.events(path, codex)
 	}
 	return readWaitEvents(path, codex)
-}
-
-func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent, includedCalls, includedSessions map[string]bool) bool {
-	text := event.Text
-	if event.Role == transcript.Cmd {
-		text = event.Command
-	}
-	ev := transcript.Event{Role: event.Role, Text: text, Time: event.Time, CallID: event.CallID, Line: event.Line,
-		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw}
-	return f.waitAllEventInWindow(ev, includedCalls, includedSessions)
-}
-
-func (f *filter) waitAllEventInWindow(ev transcript.Event, includedCalls, includedSessions map[string]bool) bool {
-	if !f.opts.waitAll {
-		return f.inWindow(ev)
-	}
-	inWindow := f.inWindow(ev)
-	if ev.Role == transcript.Cmd && inWindow && ev.CallID != "" {
-		includedCalls[ev.CallID] = true
-	}
-	if ev.Role == transcript.Out && includedCalls[ev.CallID] {
-		if transcriptwaits.CodexShell(ev.Who) {
-			if session, running := transcriptwaits.Running(ev.Text); running {
-				includedSessions[session] = true
-			}
-		}
-		return true
-	}
-	if ev.Role == transcript.Cmd {
-		command, _ := waitCommand(ev)
-		if session, poll := waitPollSession(cachedWaitEvent{
-			Role: ev.Role, CallID: ev.CallID, Text: ev.Text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
-			Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: ev.Raw, Command: command,
-		}); poll && includedSessions[session] {
-			if ev.CallID != "" {
-				includedCalls[ev.CallID] = true
-			}
-			return true
-		}
-	}
-	return inWindow
 }
 
 // scan читает файлы параллельно; ошибка одного файла не мешает остальным и уходит в итог (result.errs).
