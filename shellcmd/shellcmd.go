@@ -3837,8 +3837,14 @@ func markedCallWords(call *syntax.CallExpr, words []word, split int, src string,
 	if !ok {
 		braceExpand = true
 	}
-	for i := 1; i < len(call.Args); i++ {
-		words[i].tilde = wordTildeWithMode(call.Args[i], src, false, true, posix, braceExpand, info.unknownPosix[call], info.unknownBrace[call])
+	for i := 0; i < len(call.Args); i++ {
+		if i == 0 {
+			if strings.HasPrefix(words[i].sourceText, "~") {
+				words[i].tilde = TildeHome
+			}
+		} else {
+			words[i].tilde = wordTildeWithMode(call.Args[i], src, false, true, posix, braceExpand, info.unknownPosix[call], info.unknownBrace[call])
+		}
 		words[i].static = staticShellWord(call.Args[i], words[i].sourceText, words[i].tilde, braceExpand || info.unknownBrace[call])
 	}
 	ws := splitWords(words, split)
@@ -3856,7 +3862,7 @@ func markedCallWords(call *syntax.CallExpr, words []word, split int, src string,
 }
 
 func staticShellWord(w *syntax.Word, source string, tilde Tilde, braceExpand bool) bool {
-	if w == nil || len(w.Parts) == 0 || tilde != 0 || braceExpand && wordHasBraceExpansion(w) || wordHasGlob(w.Parts) {
+	if w == nil || len(w.Parts) == 0 || tilde != 0 || braceExpand && braceExpansionSource(source) || wordHasGlob(w.Parts) {
 		return false
 	}
 	for _, part := range w.Parts {
@@ -3865,6 +3871,51 @@ func staticShellWord(w *syntax.Word, source string, tilde Tilde, braceExpand boo
 		}
 	}
 	return true
+}
+
+// braceExpansionSource avoids copying/splitting words with literal or quoted
+// braces (notably find's `{}`). It only recognizes separators outside quotes.
+func braceExpansionSource(source string) bool {
+	depth := 0
+	var quote byte
+	for i := 0; i < len(source); i++ {
+		ch := source[i]
+		if quote == '\'' {
+			if ch == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			if ch == '"' {
+				quote = 0
+			} else if ch == '\\' && i+1 < len(source) && strings.ContainsRune(`$\"\n`, rune(source[i+1])) {
+				i++
+			}
+			continue
+		}
+		switch ch {
+		case '\\':
+			i++
+		case '\'', '"':
+			quote = ch
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth > 0 {
+				return true
+			}
+		case '.':
+			if depth > 0 && i+1 < len(source) && source[i+1] == '.' {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type globClassState struct {
@@ -3901,16 +3952,9 @@ func scanGlobText(text string, quoted bool, state *globClassState) {
 	for i := 0; i < len(text); i++ {
 		ch := text[i]
 		if quoted {
-			if ch == '/' && state.inside {
-				state.inside = false
-			}
 			continue
 		}
 		if ch == '/' {
-			if state.inside && state.wildcardInside {
-				state.pending = true
-			}
-			state.inside = false
 			continue
 		}
 		if ch == '\\' {
@@ -6805,10 +6849,18 @@ func staticSubRoute(c cmd, wordIndex int, via []string) bool {
 	if !c.call.staticDirect || !staticViaTransparent(via) {
 		return false
 	}
+	if wordIndex < 0 || wordIndex >= len(c.words) {
+		return false
+	}
+	for i := 0; i <= wordIndex; i++ {
+		if !c.words[i].static {
+			return false
+		}
+	}
 	targetIndex := wordIndex - 1
 	name, args := c.call.Name, c.call.Args
 	for range maxNestedScripts {
-		if !staticWrapperName(name) || name == "sudo" && hasOption("sudo", args, "-s", "--shell", "-i", "--login") {
+		if !staticWrapperName(name) {
 			return false
 		}
 		wrapped, ok := unwrapOnce(name, args)
@@ -6816,6 +6868,9 @@ func staticSubRoute(c cmd, wordIndex int, via []string) bool {
 			return false
 		}
 		start := len(args) - len(wrapped)
+		if name == "sudo" && !staticSudoOptions(args[:start]) {
+			return false
+		}
 		if targetIndex < start {
 			return false
 		}
@@ -6826,6 +6881,22 @@ func staticSubRoute(c cmd, wordIndex int, via []string) bool {
 		name, args = commandName(wrapped[0]), wrapped[1:]
 	}
 	return false
+}
+
+func staticSudoOptions(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-u", "--user", "-g", "--group":
+			i++
+			if i >= len(args) {
+				return false
+			}
+		case "-E", "--preserve-env", "-H", "--set-home", "-n", "--non-interactive", "-k", "--reset-timestamp", "-P", "--preserve-groups":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func staticWrapperName(name string) bool {

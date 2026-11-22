@@ -1149,15 +1149,109 @@ func TestArgStaticEmptyGlobClasses(t *testing.T) {
 			t.Errorf("empty glob class remained static: %q calls=%+v", src, calls)
 		}
 	}
-	for _, pattern := range []string{"[a/]", `['/']`} {
+	for _, pattern := range []string{"[a/]"} {
 		src := "printf '<%s>' " + pattern + " q"
 		calls, err := Calls(src)
 		if err != nil {
 			t.Fatalf("Calls(%q): %v", src, err)
 		}
-		if len(calls) == 0 || !calls[0].ArgStatic(1) {
-			t.Errorf("non-matching bracket form was marked dynamic: %q calls=%+v", src, calls)
+		if len(calls) == 0 || calls[0].ArgStatic(1) {
+			t.Errorf("bracket pair containing slash remained static: %q calls=%+v", src, calls)
 		}
+	}
+	for _, pattern := range []string{`[a'/'b]`, `['/']`, `[x"/"y]`, `[a'/']`, `a['/']b`, `[*'/'x`, `[?"/"`, `a[*'/']`} {
+		src := "printf '<%s>' " + pattern + " q"
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		if len(calls) == 0 || calls[0].Name != "printf" || calls[0].ArgStatic(1) {
+			t.Errorf("bracket pair with quoted slash remained static: %q calls=%+v", src, calls)
+		}
+	}
+}
+
+func TestArgStaticRequiresLiteralWrapperWords(t *testing.T) {
+	sources := []string{
+		`T='5 sh -c eval$IFS$0$IFS$1'; timeout $T pa '${K}op'`,
+		`U=5; nice -n $U pa '${K}op'`,
+		`U=root; sudo -u $U pa '${K}op'`,
+		`X=PATH; env -u $X pa '${K}op'`,
+		`O=0; stdbuf -o $O pa '${K}op'`,
+		`C=1; ionice -c $C pa '${K}op'`,
+		`V=K=st; systemd-run --user -E $V pa '${K}op'`,
+		`timeout {5,6} pa '${K}op'`,
+		`timeout 5* pa '${K}op'`,
+		`timeout $(echo 5) pa '${K}op'`,
+		`E=eval; true || E=env; $E pa '${K}op'`,
+		`E=eval; (E=env); $E pa '${K}op'`,
+		`E=eval; f() { E=env; }; $E pa '${K}op'`,
+		`E=eval; if false; then E=env; fi; $E pa '${K}op'`,
+		`E=eval; $(E=env); $E pa '${K}op'`,
+		`E=eval; { E=env; } | cat; $E pa '${K}op'`,
+		`W=eval; (W='env A=1'); $W pa '${K}op'`,
+		`sudo --lo printf x`,
+		`sudo --log printf x`,
+		`sudo --logi printf x`,
+		`sudo -u root --log printf x`,
+	}
+	for _, src := range sources {
+		t.Run(src, func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "pa" && call.Name != "printf" {
+					continue
+				}
+				if len(call.Via) == 0 && call.Name == "printf" {
+					continue
+				}
+				found = true
+				for i := range call.Args {
+					if call.ArgStatic(i) {
+						t.Errorf("wrapper route retained static argument %d: %+v", i, call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("target call not found: %+v", calls)
+			}
+		})
+	}
+	for _, src := range []string{
+		`timeout 5 pa '${K}op'`,
+		`sudo -u root printf '%s' '$HOME'`,
+		`env A=1 printf '%s' '$HOME'`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, call := range calls {
+			if call.Name == "pa" || call.Name == "printf" {
+				found = true
+				for i := range call.Args {
+					if !call.ArgStatic(i) {
+						t.Errorf("literal wrapper route lost static argument %d: %q call=%+v", i, src, call)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("target call missing from %q: %+v", src, calls)
+		}
+	}
+}
+
+func TestArgStaticBraceFormAllocations(t *testing.T) {
+	src := `cp file{,.bak} && echo {a,b}{c,d} x{y}z \{q\}`
+	allocs := testing.AllocsPerRun(100, func() { _, _ = Calls(src) })
+	if allocs > 230 {
+		t.Fatalf("Calls(%q) allocations = %.0f, want <= 230 (8c3e593 baseline)", src, allocs)
 	}
 }
 
