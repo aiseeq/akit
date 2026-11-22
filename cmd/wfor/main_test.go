@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -729,6 +730,165 @@ func TestLineTickMatchesIncompleteLiteralAfterEventScan(t *testing.T) {
 	}
 	if matched, err := line.check(context.Background()); err != nil || !matched {
 		t.Fatalf("tick missed incomplete literal line: matched=%v err=%v", matched, err)
+	}
+}
+
+func TestLineLiteralFindsSameInodePartialRewrite(t *testing.T) {
+	for _, tc := range []struct {
+		name, before, after, expr, want string
+	}{
+		{"same-length", "WAIT", "DONE", "DONE", "DONE"},
+		{"longer", "RUNNING", "DONE_OK!", "DONE", "DONE_OK!"},
+		{"later-line", "x\nWAIT", "x\nDONE", "DONE", "DONE"},
+		{"literal-prefix-regexp", "WAIT", "DONE", "DON[E]", "DONE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "log")
+			if err := os.WriteFile(path, []byte(tc.before), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			line, err := newLineCond(tc.expr, path, false, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if matched, err := line.check(context.Background()); err != nil || matched {
+				t.Fatalf("before rewrite: matched=%v err=%v", matched, err)
+			}
+			if err := os.WriteFile(path, []byte(tc.after), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if matched, err := line.check(context.Background()); err != nil || !matched || line.hit != tc.want {
+				t.Fatalf("after rewrite: matched=%v hit=%q err=%v", matched, line.hit, err)
+			}
+		})
+	}
+}
+
+func TestLineTruncateResetsConsumedOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, []byte("long old line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := newLineCond("DONE", path, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched, err := line.check(context.Background()); err != nil || matched {
+		t.Fatalf("initial check: matched=%v err=%v", matched, err)
+	}
+	if err := os.WriteFile(path, []byte("DONE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if matched, err := line.check(context.Background()); err != nil || !matched {
+		t.Fatalf("after truncate: matched=%v err=%v", matched, err)
+	}
+}
+
+func TestLineReplaceDetectsTruncateBeforeEventOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, []byte("old partial line"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := &lineCond{path: path, off: 0, eventOff: st.Size(), file: st}
+	if err := os.WriteFile(path, []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err = f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced, err := line.replaced(f, st); err != nil || !replaced {
+		t.Fatalf("truncate before event offset: replaced=%v err=%v", replaced, err)
+	}
+}
+
+func TestLineWatcherResubscribesAfterRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "log")
+	if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := newLineCond("DONE", path, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, cleanup, err := watchFiles(ctx, []cond{line})
+	if err != nil || events == nil {
+		t.Fatalf("watchFiles: events=%v err=%v", events, err)
+	}
+	defer func() { cancel(); cleanup() }()
+	tmp := filepath.Join(dir, "new")
+	if err := os.WriteFile(tmp, []byte("pending\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Fatal("rename did not wake watcher")
+	}
+	if err := appendFile(path, "DONE\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not resubscribe to renamed file")
+	}
+}
+
+func TestInotifyOverflowRebuildsSubscriptions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	dirs := map[string]map[string]uint32{dir: {"log": unix.IN_MODIFY | unix.IN_ATTRIB}}
+	byWD, fileMasks, filePaths, paths, dirWDs := addInotifyWatches(fd, dirs)
+	var event [unix.SizeofInotifyEvent]byte
+	binary.LittleEndian.PutUint32(event[0:4], ^uint32(0))
+	binary.LittleEndian.PutUint32(event[4:8], unix.IN_Q_OVERFLOW)
+	out := make(chan fileEvent, 1)
+	_, _, overflow := emitInotifyEventsForFiles(fd, event[:], byWD, fileMasks, filePaths, paths, dirWDs, out)
+	if !overflow {
+		t.Fatal("IN_Q_OVERFLOW was not reported")
+	}
+	select {
+	case got := <-out:
+		if _, ok := got.paths[path]; !ok {
+			t.Fatalf("overflow check paths = %v, missing %s", got.paths, path)
+		}
+	default:
+		t.Fatal("overflow did not request condition check")
+	}
+	byWD, fileMasks, filePaths, paths, dirWDs = rebuildInotifyWatches(fd, paths)
+	if err := appendFile(path, "changed"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, err := unix.Read(fd, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relevant, _, _ := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out); !relevant {
+		t.Fatal("rebuilt subscription missed write")
 	}
 }
 

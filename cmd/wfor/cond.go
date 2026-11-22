@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,6 +117,8 @@ type fileEvent struct{ paths map[string]struct{} }
 
 const inotifyCheckInterval = 100 * time.Millisecond
 const inotifyReadCooldown = 600 * time.Millisecond
+
+// Writes may arrive in bursts; this cooldown caps wakeups during sustained writes at one per 10 seconds.
 const inotifyWriteCooldown = 10 * time.Second
 const inotifyNoiseCooldown = 250 * time.Millisecond
 
@@ -249,7 +252,10 @@ func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string
 			if err != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
 				return
 			}
-			relevant, writeOnly := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out)
+			relevant, writeOnly, overflow := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out)
+			if overflow {
+				byWD, fileMasks, filePaths, paths, dirWDs = rebuildInotifyWatches(fd, paths)
+			}
 			// Let the kernel collect a burst instead of waking this reader for every write.
 			cooldown := inotifyNoiseCooldown
 			if relevant {
@@ -288,46 +294,22 @@ func waitInotify(fd, cancelFD int) bool {
 	}
 }
 
-func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) (bool, bool) {
+func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) (bool, bool, bool) {
 	changed := map[string]struct{}{}
 	writeOnly := true
+	overflow := false
 	for off := 0; off+unix.SizeofInotifyEvent <= len(data); {
 		wd := int(int32(binary.LittleEndian.Uint32(data[off : off+4])))
 		mask := binary.LittleEndian.Uint32(data[off+4 : off+8])
 		length := int(binary.LittleEndian.Uint32(data[off+12 : off+16]))
 		if off+unix.SizeofInotifyEvent+length > len(data) {
-			return false, false
+			return false, false, false
 		}
 		name := string(bytes.TrimRight(data[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
-		_, fileWatch := byWD[wd][""]
-		if mask&unix.IN_IGNORED != 0 {
-			delete(byWD, wd)
-			delete(fileMasks, wd)
-			delete(filePaths, wd)
-			delete(dirWDs, wd)
-		} else if fileWatch && name == "" {
-			if mask&fileMasks[wd] != 0 {
-				if mask&^uint32(unix.IN_MODIFY) != 0 {
-					writeOnly = false
-				}
-				for path := range filePaths[wd] {
-					changed[path] = struct{}{}
-				}
-			}
-		} else if names, ok := byWD[wd]; ok {
-			if _, relevant := names[name]; relevant {
-				writeOnly = false
-				// The event's watch descriptor identifies the directory; rearm the target file after create/rename.
-				dir := dirWDs[wd]
-				if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
-					removeFileInotifyWatch(fd, filepath.Join(dir, name), byWD, fileMasks, filePaths)
-				}
-				if fileMask, exists := paths[dir][name]; exists && mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 {
-					removeFileInotifyWatch(fd, filepath.Join(dir, name), byWD, fileMasks, filePaths)
-					addFileInotifyWatch(fd, filepath.Join(dir, name), fileMask, byWD, fileMasks, filePaths)
-				}
-				changed[filepath.Join(dirWDs[wd], name)] = struct{}{}
-			}
+		eventOverflow, eventWriteOnly := recordInotifyEvent(fd, wd, mask, name, byWD, fileMasks, filePaths, paths, dirWDs, changed)
+		overflow = overflow || eventOverflow
+		if !eventWriteOnly {
+			writeOnly = false
 		}
 		off += unix.SizeofInotifyEvent + length
 	}
@@ -348,7 +330,65 @@ func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]stru
 			}
 		}
 	}
-	return len(changed) > 0, len(changed) > 0 && writeOnly
+	return len(changed) > 0, len(changed) > 0 && writeOnly, overflow
+}
+
+func recordInotifyEvent(fd, wd int, mask uint32, name string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, changed map[string]struct{}) (bool, bool) {
+	_, fileWatch := byWD[wd][""]
+	if mask&unix.IN_Q_OVERFLOW != 0 {
+		for dir, names := range paths {
+			for targetName := range names {
+				changed[filepath.Join(dir, targetName)] = struct{}{}
+			}
+		}
+		return true, false
+	}
+	if mask&unix.IN_IGNORED != 0 {
+		delete(byWD, wd)
+		delete(fileMasks, wd)
+		delete(filePaths, wd)
+		delete(dirWDs, wd)
+		return false, true
+	}
+	if fileWatch && name == "" {
+		if mask&fileMasks[wd] == 0 {
+			return false, true
+		}
+		if mask&^uint32(unix.IN_MODIFY) != 0 {
+			for path := range filePaths[wd] {
+				changed[path] = struct{}{}
+			}
+			return false, false
+		}
+		for path := range filePaths[wd] {
+			changed[path] = struct{}{}
+		}
+		return false, true
+	}
+	names, ok := byWD[wd]
+	if !ok {
+		return false, true
+	}
+	if _, relevant := names[name]; !relevant {
+		return false, true
+	}
+	dir := dirWDs[wd]
+	if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
+		removeFileInotifyWatch(fd, filepath.Join(dir, name), byWD, fileMasks, filePaths)
+	}
+	if fileMask, exists := paths[dir][name]; exists && mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 {
+		removeFileInotifyWatch(fd, filepath.Join(dir, name), byWD, fileMasks, filePaths)
+		addFileInotifyWatch(fd, filepath.Join(dir, name), fileMask, byWD, fileMasks, filePaths)
+	}
+	changed[filepath.Join(dir, name)] = struct{}{}
+	return false, false
+}
+
+func rebuildInotifyWatches(fd int, paths map[string]map[string]uint32) (map[int]map[string]struct{}, map[int]uint32, map[int]map[string]struct{}, map[string]map[string]uint32, map[int]string) {
+	dirs := make(map[string]map[string]uint32, len(paths))
+	maps.Copy(dirs, paths)
+	byWD, fileMasks, filePaths, _, dirWDs := addInotifyWatches(fd, dirs)
+	return byWD, fileMasks, filePaths, paths, dirWDs
 }
 
 func removeFileInotifyWatch(fd int, path string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}) {
@@ -535,25 +575,18 @@ func (c *lineCond) checkContent(allowIncomplete bool) (bool, error) {
 		c.off, c.eventOff, c.tailOff, c.lines, c.tail, c.head, c.edge, c.partial = 0, 0, 0, 0, nil, nil, nil, false
 	}
 	c.file = st
-	if !allowIncomplete && c.skipIncompleteEvent(f, st) {
-		return false, nil
+	if len(c.tail) > 0 {
+		previous := make([]byte, len(c.tail))
+		n, readErr := f.ReadAt(previous, c.off)
+		if readErr != nil && readErr != io.EOF {
+			return false, fmt.Errorf("%s: %w", c, readErr)
+		}
+		if n != len(c.tail) || !bytes.Equal(previous, c.tail) {
+			c.tailOff = c.off
+			c.tail = nil
+		}
 	}
 	return c.scanContent(f, allowIncomplete)
-}
-
-func (c *lineCond) skipIncompleteEvent(f *os.File, st os.FileInfo) bool {
-	if st.Size() <= max(c.off, c.eventOff) {
-		return true
-	}
-	var last [1]byte
-	n, err := f.ReadAt(last[:], st.Size()-1)
-	if err != nil && err != io.EOF || n != 1 {
-		return false
-	}
-	if last[0] == '\n' {
-		return false
-	}
-	return true
 }
 
 func (c *lineCond) scanContent(f *os.File, allowIncomplete bool) (bool, error) {
@@ -644,6 +677,15 @@ func (c *lineCond) matchLiteralTail(f *os.File, end int64) (bool, error) {
 		}
 		data = data[:n]
 	}
+	fullTail := make([]byte, max(int64(0), end-c.off))
+	if len(fullTail) > 0 {
+		n, err := f.ReadAt(fullTail, c.off)
+		if err != nil && err != io.EOF {
+			return false, fmt.Errorf("%s: %w", c, err)
+		}
+		fullTail = fullTail[:n]
+	}
+	c.tail = fullTail
 	c.tailOff = end
 	if !bytes.Contains(data, []byte(c.literal)) {
 		return false, nil
