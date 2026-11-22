@@ -10681,11 +10681,7 @@ func unwrapOnce(name string, args []string) ([]string, bool) {
 	if name == "env" {
 		i = envCommandStart(args, i)
 	}
-	// zsh: the precommand modifier - (run with a dash before argv[0]) may follow another modifier.
-	// Bash reports "-: not found" there, so reading the next word as the command only over-refuses.
-	for zshPrecommandModifier(name) && i < len(args) && args[i] == "-" {
-		i++
-	}
+	i = skipZshDashModifier(name, args, i)
 	if i >= len(args) {
 		return nil, false
 	}
@@ -11022,6 +11018,15 @@ func (c Call) ShadowedByFunction(cmd string) (bool, error) {
 		return !shadowed
 	})
 	return shadowed, nil
+}
+
+// skipZshDashModifier skips the zsh precommand modifier - (run with a dash before argv[0]) after another
+// modifier. Bash reports "-: not found" there, so reading the next word as the command only over-refuses.
+func skipZshDashModifier(name string, args []string, i int) int {
+	for zshPrecommandModifier(name) && i < len(args) && args[i] == "-" {
+		i++
+	}
+	return i
 }
 
 // zshPrecommandModifier reports a zsh precommand modifier that runs the following words as a command.
