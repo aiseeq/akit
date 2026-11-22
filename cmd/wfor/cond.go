@@ -116,7 +116,8 @@ type fileEvent struct{ paths map[string]struct{} }
 
 const inotifyCheckInterval = 100 * time.Millisecond
 const inotifyReadCooldown = 600 * time.Millisecond
-const inotifyNoiseCooldown = 100 * time.Millisecond
+const inotifyWriteCooldown = 10 * time.Second
+const inotifyNoiseCooldown = 250 * time.Millisecond
 
 // watchFiles shares one inotify descriptor across every file and line condition.
 func watchFiles(ctx context.Context, conds []cond) (<-chan fileEvent, func(), error) {
@@ -248,11 +249,14 @@ func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string
 			if err != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
 				return
 			}
-			relevant := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out)
+			relevant, writeOnly := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out)
 			// Let the kernel collect a burst instead of waking this reader for every write.
 			cooldown := inotifyNoiseCooldown
 			if relevant {
 				cooldown = inotifyReadCooldown
+			}
+			if writeOnly {
+				cooldown = inotifyWriteCooldown
 			}
 			if !waitContext(ctx, cooldown) {
 				return
@@ -284,14 +288,15 @@ func waitInotify(fd, cancelFD int) bool {
 	}
 }
 
-func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) bool {
+func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) (bool, bool) {
 	changed := map[string]struct{}{}
+	writeOnly := true
 	for off := 0; off+unix.SizeofInotifyEvent <= len(data); {
 		wd := int(int32(binary.LittleEndian.Uint32(data[off : off+4])))
 		mask := binary.LittleEndian.Uint32(data[off+4 : off+8])
 		length := int(binary.LittleEndian.Uint32(data[off+12 : off+16]))
 		if off+unix.SizeofInotifyEvent+length > len(data) {
-			return false
+			return false, false
 		}
 		name := string(bytes.TrimRight(data[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
 		_, fileWatch := byWD[wd][""]
@@ -302,12 +307,16 @@ func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]stru
 			delete(dirWDs, wd)
 		} else if fileWatch && name == "" {
 			if mask&fileMasks[wd] != 0 {
+				if mask&^uint32(unix.IN_MODIFY) != 0 {
+					writeOnly = false
+				}
 				for path := range filePaths[wd] {
 					changed[path] = struct{}{}
 				}
 			}
 		} else if names, ok := byWD[wd]; ok {
 			if _, relevant := names[name]; relevant {
+				writeOnly = false
 				// The event's watch descriptor identifies the directory; rearm the target file after create/rename.
 				dir := dirWDs[wd]
 				if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
@@ -339,7 +348,7 @@ func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]stru
 			}
 		}
 	}
-	return len(changed) > 0
+	return len(changed) > 0, len(changed) > 0 && writeOnly
 }
 
 func removeFileInotifyWatch(fd int, path string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}) {
@@ -484,6 +493,18 @@ func (c *lineCond) replaced(f *os.File, st os.FileInfo) (bool, error) {
 }
 
 func (c *lineCond) check(ctx context.Context) (bool, error) {
+	st, err := os.Stat(c.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		c.absent = true
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	if c.file != nil && !c.partial && c.eventOff <= c.off && st.Size() == c.off && os.SameFile(c.file, st) && c.file.Size() == st.Size() && c.file.ModTime().Equal(st.ModTime()) {
+		c.absent = false
+		return false, nil
+	}
 	return c.checkContent(true)
 }
 
