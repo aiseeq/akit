@@ -4203,8 +4203,13 @@ func wordHasBraceExpansion(word *syntax.Word) bool {
 	if word == nil {
 		return false
 	}
-	_, split := splitBraces(word)
-	return split
+	for _, part := range word.Parts {
+		if lit, ok := part.(*syntax.Lit); ok && strings.ContainsAny(lit.Value, "{}") {
+			_, split := splitBraces(word)
+			return split
+		}
+	}
+	return false
 }
 
 // Bytes that stand for the braces of a group syntax.SplitBraces would return to
