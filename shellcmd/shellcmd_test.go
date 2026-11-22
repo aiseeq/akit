@@ -1354,6 +1354,105 @@ func TestArgStaticRound15ConservativeCases(t *testing.T) {
 	}
 }
 
+func TestArgStaticRound16ScriptWhitelist(t *testing.T) {
+	falseScripts := []string{
+		"f() { :; }; printf %s '$HOME'",
+		"f ( ) { :; }; printf %s '$HOME'",
+		"f (\t) { :; }; printf %s '$HOME'",
+		"function f { :; }; printf %s '$HOME'",
+		"if true; then f() ( : ); fi; printf %s '$HOME'",
+		"( f() { :; }; ); printf %s '$HOME'",
+		"command alias ll=':'; printf %s '$HOME'",
+		"builtin source /dev/null; printf %s '$HOME'",
+		"command . /dev/null; printf %s '$HOME'",
+		"builtin unalias ll; printf %s '$HOME'",
+		"builtin hash -p /usr/bin/bash nohup; nohup -c 'echo x'; printf %s '$HOME'",
+		"command hash -r; printf %s '$HOME'",
+		"builtin trap ':' EXIT; printf %s '$HOME'",
+		"command shopt -u nullglob; printf %s '$HOME'",
+		"builtin enable -n printf; printf %s '$HOME'",
+		"shopt -s expand_aliases; builtin alias printf='eval builtin printf'; printf %s '$HOME'",
+		"shopt -s expand_aliases; command alias printf='eval builtin printf'; printf %s '$HOME'",
+		"shopt -s expand_aliases; A=alias; $A printf='eval builtin printf'; printf %s '$HOME'",
+		"eval 'echo x'; printf %s '$HOME'",
+		"C=echo; $C hi",
+		"C=printf; $C; printf %s '$HOME'",
+		"$(printf %s echo) hi",
+		"set -k; printf %s '$HOME'",
+		"set -o keyword; printf %s '$HOME'",
+		"set +o posix; printf %s '$HOME'",
+		"O=-k; set $O; printf %s '$HOME'",
+		"BASH_X=1; printf %s '$HOME'",
+		"declare BASH_X=1; printf %s '$HOME'",
+		"typeset BASH_X=1; printf %s '$HOME'",
+		"export BASH_X=1; printf %s '$HOME'",
+		"local BASH_X=1; printf %s '$HOME'",
+		"readonly BASH_X=1; printf %s '$HOME'",
+		"BASH_CMDS[nohup]=/bin/echo; printf %s '$HOME'",
+		"hash -p /usr/bin/bash nohup; nohup -c 'echo x'; printf %s '$HOME'",
+		"set -k; timeout -k A=1 5 3 printf %s '$HOME'",
+		"POSIXLY_CORRECT=1; printf %s '$HOME'",
+	}
+	for _, src := range falseScripts {
+		t.Run(fmt.Sprintf("false/%q", src), func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(calls) == 0 {
+				t.Fatalf("Calls(%q) returned no calls", src)
+			}
+			for _, call := range calls {
+				for i := range call.Args {
+					if call.ArgStatic(i) {
+						t.Errorf("ArgStatic(%d) = true: %+v", i, call)
+					}
+				}
+			}
+		})
+	}
+
+	for _, src := range []string{
+		"set -euo pipefail; printf %s '$HOME'",
+		"set -x; printf %s '$HOME' | cat",
+	} {
+		t.Run(fmt.Sprintf("control/%q", src), func(t *testing.T) {
+			calls, err := Calls(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, call := range calls {
+				if call.Name != "printf" {
+					continue
+				}
+				found = true
+				for i := range call.Args {
+					if !call.ArgStatic(i) {
+						t.Errorf("ArgStatic(%d) = false: %+v", i, call)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("printf call missing: %+v", calls)
+			}
+		})
+	}
+
+	withControl := "printf '$HOME'" + string([]byte{0x7f})
+	baseCalls, err := Calls("printf '$HOME'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlCalls, err := Calls(withControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(baseCalls) != len(controlCalls) || baseCalls[0].ArgLiteral(0) != controlCalls[0].ArgLiteral(0) {
+		t.Fatalf("ArgLiteral changed for control byte: base=%+v byte=%+v", baseCalls, controlCalls)
+	}
+}
+
 func TestFindKeepsNestedErrorWithoutRequestedNames(t *testing.T) {
 	_, err := Find("echo exec -- bash -c 'if'")
 	var nested *NestedError

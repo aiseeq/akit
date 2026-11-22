@@ -141,6 +141,7 @@ type Call struct {
 	literalArgs  uint32
 	tildeArgs    []Tilde
 	staticDirect bool
+	staticName   bool
 	// Loop — вызов в теле цикла while, until, for или select (и во вложенном скрипте такого тела).
 	Loop bool
 	// Background — вызов в задании, чей оператор или объемлющий оператор заканчивается `&`.
@@ -332,6 +333,7 @@ func parse(src string, lineBase int, inherited []string, vars map[string]string,
 }
 
 func parseWithBudget(src string, lineBase int, inherited []string, vars map[string]string, calls *[]Call, budget *nestedParseBudget) error {
+	firstCall := len(*calls)
 	if budget.trackWork {
 		budget.parsedBytes += len(src)
 	}
@@ -369,10 +371,130 @@ func parseWithBudget(src string, lineBase int, inherited []string, vars map[stri
 		return optionErr
 	}
 	err = walkFileWithBudget(file, full, src, lineBase, inherited, vars, calls, ignored, nil, budget)
+	if !staticScriptSafe(file, src, (*calls)[firstCall:]) {
+		for i := firstCall; i < len(*calls); i++ {
+			(*calls)[i].staticDirect = false
+		}
+	}
 	if err != nil {
 		return err
 	}
 	return checkUncertainTime(file, src, lineBase, inherited, vars, budget)
+}
+
+func staticScriptSafe(file *syntax.File, src string, calls []Call) bool {
+	unsafe := false
+	checkFunctions := strings.Contains(src, "(") || strings.Contains(src, "function")
+	checkAssignments := strings.Contains(src, "BASH_") || strings.Contains(src, "POSIXLY_CORRECT")
+	if (checkFunctions || checkAssignments) && staticUnsafeDeclaration(file, checkFunctions, checkAssignments) {
+		unsafe = true
+	}
+	if unsafe {
+		return false
+	}
+	return staticCallsSafe(calls)
+}
+
+func staticCallsSafe(calls []Call) bool {
+	for i := range calls {
+		call := &calls[i]
+		if call.staticName && call.Name == "time" && len(call.Args) == 0 {
+			continue
+		}
+		if !call.staticName || staticUnsafeCommandName(call.Name) {
+			return false
+		}
+		if unsafeAssignmentCommand(call) {
+			return false
+		}
+		if call.Name == "set" && unsafeSetCall(call) {
+			return false
+		}
+	}
+	return true
+}
+
+func staticUnsafeDeclaration(file *syntax.File, checkFunctions, checkAssignments bool) bool {
+	unsafe := false
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.FuncDecl:
+			if checkFunctions {
+				unsafe = true
+			}
+		case *syntax.Assign:
+			if checkAssignments && n.Name != nil && staticUnsafeVariable(n.Name.Value) {
+				unsafe = true
+			}
+		}
+		return !unsafe
+	})
+	return unsafe
+}
+
+func staticUnsafeCommandName(name string) bool {
+	switch name {
+	case "eval", "source", ".", "alias", "unalias", "hash", "trap", "shopt", "enable":
+		return true
+	default:
+		return false
+	}
+}
+
+func unsafeAssignmentCommand(call *Call) bool {
+	isDeclaration := false
+	for i := range declarationCommands {
+		if declarationCommands[i] == call.Name {
+			isDeclaration = true
+			break
+		}
+	}
+	if !isDeclaration {
+		return false
+	}
+	for i, arg := range call.Args {
+		if i >= len(call.tildeArgs) || call.tildeArgs[i]&tildeStatic == 0 {
+			return true
+		}
+		name, _, ok := strings.Cut(arg, "=")
+		if ok && staticUnsafeVariable(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func staticUnsafeVariable(name string) bool {
+	name = strings.TrimSuffix(name, "+")
+	if i := strings.IndexByte(name, '['); i >= 0 {
+		name = name[:i]
+	}
+	return name == "POSIXLY_CORRECT" || name == "BASH_ALIASES" || name == "BASH_CMDS" || strings.HasPrefix(name, "BASH_")
+}
+
+func unsafeSetCall(call *Call) bool {
+	options := true
+	for i, arg := range call.Args {
+		if i >= len(call.tildeArgs) || call.tildeArgs[i]&tildeStatic == 0 {
+			return true
+		}
+		if !options {
+			continue
+		}
+		if arg == "--" {
+			options = false
+			continue
+		}
+		if len(arg) > 1 && (arg[0] == '+' || arg[0] == '-' && arg != "--") {
+			if strings.ContainsRune(arg[1:], 'k') {
+				return true
+			}
+			if (arg == "-o" || arg == "+o") && i+1 < len(call.Args) && (call.Args[i+1] == "keyword" || call.Args[i+1] == "posix") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // A shell time clause can also be read as the external time wrapper. Keep the
@@ -994,7 +1116,7 @@ type walkInfo struct {
 
 func collectWalkInfo(file *syntax.File, src string, vars map[string]string, budget *nestedParseBudget) walkInfo {
 	staticFunctions, staticAlias, staticBackquotes := staticScriptContext(file, src)
-	staticText := literalScriptText(src)
+	staticText := staticArgScriptText(src)
 	initial := shellModes{posix: budget.initialPosix, posixUnknown: budget.initialPosixUnknown, brace: budget.initialBrace, braceUnknown: budget.initialBraceUnknown}
 	if budget.modeTexts == nil {
 		budget.modeTexts = newModeTexts()
@@ -3803,7 +3925,7 @@ func (w *callWalker) addTime(clause *syntax.TimeClause) {
 		w.parseErr = fmt.Errorf("shellcmd: invalid source span for time clause")
 		return
 	}
-	*w.calls = append(*w.calls, Call{Name: "time", Raw: w.src[start:end], Line: int(clause.Pos().Line()) + w.lineBase, Via: append([]string(nil), w.inherited...), Offset: start})
+	*w.calls = append(*w.calls, Call{Name: "time", Raw: w.src[start:end], Line: int(clause.Pos().Line()) + w.lineBase, Via: append([]string(nil), w.inherited...), Offset: start, staticName: true})
 }
 
 func (w *callWalker) visitStmt(stmt *syntax.Stmt) {
@@ -3861,8 +3983,9 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	ws, tildeArgs := markedCallWords(call, words, split, w.src, w.info, w.budget.initialPosix)
 	posixEnv := hasPosixEnvironment(call)
 	mode := shellModes{posix: w.info.posixCalls[call], posixUnknown: w.info.unknownPosix[call], brace: w.info.braceCalls[call], braceUnknown: w.info.unknownBrace[call]}
-	staticDirect := staticCallDirect(w.info, w.inherited, start, commandName(args[0]))
-	c := cmd{call: Call{Name: commandWordName(args[0], ws[0]), Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: staticDirect, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], staticFunctions: w.info.staticFunctions}
+	staticDirect := staticCallDirect(w.info, w.inherited, start, commandName(args[0]), ws[0].static)
+	callName := commandWordName(args[0], ws[0])
+	c := cmd{call: Call{Name: callName, Args: args[1:], Raw: w.src[start:end], Line: int(call.Pos().Line()) + w.lineBase, Via: via, Offset: ws[0].offset, Redirs: w.info.redirs[call], tildeArgs: tildeArgs, staticDirect: staticDirect, staticName: ws[0].static, Loop: w.info.loopCalls[call], Background: w.info.backgroundCalls[call], ScriptInput: w.info.scriptInputs[call]}, posixEnv: posixEnv, mode: mode, words: ws, budget: w.budget, source: w.src, stdinInput: w.info.stdinInputs[call], staticFunctions: w.info.staticFunctions}
 	for _, part := range call.Args[0].Parts {
 		if proc, ok := part.(*syntax.ProcSubst); ok && w.outerSubstitution(proc) {
 			c.call.Name = ""
@@ -5101,7 +5224,11 @@ func singleQuotedWord(word *syntax.Word) bool {
 // косую перед переводом строки: `\r` и NUL парсер читает не так, как bash, а `\` с переводом строки
 // в конце комментария парсер считает продолжением строки, bash — нет.
 func literalScriptText(src string) bool {
-	return !strings.Contains(src, "\\\n") && !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' || r == 0x7f })
+	return !strings.Contains(src, "\\\n") && !strings.ContainsFunc(src, func(r rune) bool { return r < ' ' && r != '\n' && r != '\t' })
+}
+
+func staticArgScriptText(src string) bool {
+	return literalScriptText(src) && !strings.ContainsRune(src, 0x7f)
 }
 
 func literalScriptSimple(file *syntax.File, src string) bool {
@@ -6271,8 +6398,8 @@ func parseNestedFileWithBudget(file *syntax.File, full, src string, pos []int, l
 	return err
 }
 
-func staticCallDirect(info *walkInfo, inherited []string, offset int, name string) bool {
-	return len(inherited) == 0 && info.staticText && !info.staticAlias &&
+func staticCallDirect(info *walkInfo, inherited []string, offset int, name string, staticName bool) bool {
+	return staticName && len(inherited) == 0 && info.staticText && !info.staticAlias &&
 		!slices.Contains(info.staticFunctions, name) && !nestedBacktickOffset(offset, info.staticBackquotes)
 }
 
@@ -6888,7 +7015,7 @@ func (c cmd) sub(i int, via []string) cmd {
 	}
 	staticDirect := staticSubRoute(c, i, via)
 	return cmd{call: Call{Name: commandWordName(c.call.Args[i-1], c.words[i]), Args: c.call.Args[i:], Raw: c.call.Raw, Line: c.call.Line,
-		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
+		Via: via, Offset: c.words[i].offset, Redirs: c.call.Redirs, tildeArgs: tildeArgTail(c.call.tildeArgs, i), staticDirect: staticDirect, staticName: c.words[i].static, Loop: c.call.Loop, Background: c.call.Background, ScriptInput: c.call.ScriptInput}, mode: c.mode, words: c.words[i:], budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed || c.call.Name == "xargs", expansionDepth: c.expansionDepth + 1, posixEnv: posixEnv, argv0: argv0, staticFunctions: c.staticFunctions}
 }
 
@@ -8364,8 +8491,17 @@ func parallelChild(c cmd, wrapperVia []string) (cmd, bool) {
 	if !slices.ContainsFunc(childTilts, func(mark Tilde) bool { return mark != 0 }) {
 		childTilts = nil
 	}
-	child := cmd{call: Call{Name: commandWordName(parallelArgs[start], commandWord), Args: args, Raw: c.call.Raw, Line: c.call.Line,
-		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, staticDirect: false, Loop: c.call.Loop,
+	childName := commandWordName(parallelArgs[start], commandWord)
+	if childName == "set" && len(childTilts) == 0 && len(args) > 0 {
+		childTilts = make([]Tilde, len(args))
+	}
+	for i := range childTilts {
+		if words[i+1].static {
+			childTilts[i] |= tildeStatic
+		}
+	}
+	child := cmd{call: Call{Name: childName, Args: args, Raw: c.call.Raw, Line: c.call.Line,
+		Via: c.via(wrapperVia...), Offset: commandWord.offset, Redirs: c.call.Redirs, tildeArgs: childTilts, staticDirect: false, staticName: commandWord.static, Loop: c.call.Loop,
 		Background: c.call.Background, ScriptInput: c.call.ScriptInput}, words: words, budget: c.budget, source: c.source,
 		stdinInput: c.stdinInput, stdinConsumed: c.stdinConsumed}
 	return child, true
