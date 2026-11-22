@@ -32,6 +32,22 @@ type fakeCH struct {
 	// hold: inserts into these tables are kept unapplied and refused, to be sent again later (late)
 	hold map[string]int
 	late []*http.Request
+	// pause: the next insert into the table waits until released
+	pause map[string]*pause
+}
+
+type pause struct{ arrived, release chan struct{} }
+
+// pauseNext makes the next insert into table wait; arrived closes when it comes, release lets it go on.
+func (f *fakeCH) pauseNext(table string) *pause {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := &pause{arrived: make(chan struct{}), release: make(chan struct{})}
+	if f.pause == nil {
+		f.pause = map[string]*pause{}
+	}
+	f.pause[table] = p
+	return p
 }
 
 // sent — one insert as the server got it.
@@ -62,14 +78,24 @@ var (
 )
 
 func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	body, _ := io.ReadAll(r.Body)
 	q := r.URL.Query().Get("query")
 	if q == "" {
 		q = string(body)
 		body = nil
 	}
+	if m := insertRe.FindStringSubmatch(q); m != nil {
+		f.mu.Lock()
+		p := f.pause[m[1]]
+		delete(f.pause, m[1])
+		f.mu.Unlock()
+		if p != nil { // the request waits, the client alive, until the test lets it go on
+			close(p.arrived)
+			<-p.release
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.down {
 		http.Error(w, "Code: 210. connection refused", http.StatusServiceUnavailable)
 		return
@@ -100,6 +126,7 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			settings[k] = r.URL.Query().Get(k)
 		}
 		rows := f.fenced(q, table, tsvRows(body))
+		w.Header().Set("X-ClickHouse-Summary", fmt.Sprintf(`{"read_rows":"0","written_rows":"%d"}`, len(rows)))
 		f.inserts = append(f.inserts, sent{table: table, token: tok, rows: rows, settings: settings})
 		if f.tokens[table] == nil {
 			f.tokens[table] = map[string]bool{}
@@ -115,6 +142,17 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(q, "CREATE "):
 	case strings.HasPrefix(q, "KILL QUERY "):
 		f.kills++
+	case q == "SELECT serverUUID()":
+		fmt.Fprintln(w, "00000000-0000-4000-8000-0000000000fa")
+	case genSelRe.MatchString(q):
+		m := genSelRe.FindStringSubmatch(q)
+		n := 0
+		for _, row := range f.latestFiles() {
+			if row[fileCol["file_id"]] == m[1] && row[fileCol["gen"]] == m[2] {
+				n++
+			}
+		}
+		fmt.Fprintln(w, n)
 	case deleteRe.MatchString(q):
 		m := deleteRe.FindStringSubmatch(q)
 		if !f.genHolds(q) {
@@ -141,6 +179,8 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "fake: unknown statement "+q, http.StatusBadRequest)
 	}
 }
+
+var genSelRe = regexp.MustCompile(`^SELECT count\(\) FROM \w+\.files FINAL WHERE file_id = (\d+) AND gen = (\d+)$`)
 
 func escapeRow(row []string) string {
 	var b bytes.Buffer

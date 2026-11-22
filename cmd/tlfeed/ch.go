@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -42,6 +44,32 @@ func (e *chError) Error() string {
 // post runs one statement. With body, the statement goes in the URL and body is its data (an INSERT); without,
 // the statement is the body. The answer is copied to out when given. timeout 0 — no limit.
 func (s *server) post(ctx context.Context, query string, body io.Reader, settings url.Values, out io.Writer, timeout time.Duration) error {
+	_, err := s.send(ctx, query, body, settings, out, timeout)
+	return err
+}
+
+// insert runs an INSERT and returns how many rows the server wrote, from its X-ClickHouse-Summary: the rows a
+// WHERE of the INSERT SELECT let through, a repeat dropped by the deduplication token counted as written.
+func (s *server) insert(ctx context.Context, query string, body io.Reader, settings url.Values, timeout time.Duration) (int64, error) {
+	h, err := s.send(ctx, query, body, settings, nil, timeout)
+	if err != nil {
+		return 0, err
+	}
+	var sum struct {
+		Written string `json:"written_rows"`
+	}
+	raw := h.Get("X-ClickHouse-Summary")
+	if err := json.Unmarshal([]byte(raw), &sum); err != nil {
+		return 0, fmt.Errorf("clickhouse: insert answered without a summary of written rows (%q): %w", shorten(raw, 100), err)
+	}
+	n, err := strconv.ParseInt(sum.Written, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("clickhouse: written_rows %q: %w", sum.Written, err)
+	}
+	return n, nil
+}
+
+func (s *server) send(ctx context.Context, query string, body io.Reader, settings url.Values, out io.Writer, timeout time.Duration) (http.Header, error) {
 	params := url.Values{}
 	maps.Copy(params, settings)
 	if body == nil {
@@ -56,11 +84,11 @@ func (s *server) post(ctx context.Context, query string, body io.Reader, setting
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.base+"?"+params.Encode(), body)
 	if err != nil {
-		return fmt.Errorf("clickhouse request: %w", err)
+		return nil, fmt.Errorf("clickhouse request: %w", err)
 	}
 	resp, err := s.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("clickhouse: %w", err)
+		return nil, fmt.Errorf("clickhouse: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -69,15 +97,15 @@ func (s *server) post(ctx context.Context, query string, body io.Reader, setting
 			msg = append(msg, " (answer cut: "+rerr.Error()+")"...)
 		}
 		first, _, _ := strings.Cut(strings.TrimSpace(string(msg)), "\n")
-		return &chError{status: resp.StatusCode, code: resp.Header.Get("X-ClickHouse-Exception-Code"), msg: shorten(first, 300)}
+		return nil, &chError{status: resp.StatusCode, code: resp.Header.Get("X-ClickHouse-Exception-Code"), msg: shorten(first, 300)}
 	}
 	if out == nil {
 		out = io.Discard
 	}
 	if _, err := io.Copy(out, resp.Body); err != nil {
-		return fmt.Errorf("clickhouse answer: %w", err)
+		return nil, fmt.Errorf("clickhouse answer: %w", err)
 	}
-	return nil
+	return resp.Header, nil
 }
 
 // query runs a statement and returns its answer.
