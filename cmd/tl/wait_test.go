@@ -111,6 +111,89 @@ func TestWaitAllUsesFirstWrapperWhenCommandHasNoProgram(t *testing.T) {
 			t.Errorf("identity(%q) = %q, %v; want first program", command, program, ok)
 		}
 	}
+	calls, invalid := parseWaitCalls("head -n 1 f | head -n 1")
+	program, _, ok := waitCallDataIdentity(calls, invalid, "", "")
+	if ok || matchedWaitCallData(calls, invalid, "head", "") {
+		t.Errorf("repeated wrapper selected as %q (ok=%v), but --wait head rejects it", program, ok)
+	}
+}
+
+func TestWaitAllCLIWindowIncludesCompletionAfterUntil(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	path := writeWaitTranscript(t, e, "midnight.jsonl", strings.Join([]string{
+		`{"type":"assistant","timestamp":"2026-10-25T23:59:59Z","message":{"id":"m","content":[{"type":"tool_use","id":"cross","name":"Bash","input":{"command":"alpha build"}}]}}`,
+		`{"type":"user","timestamp":"2026-10-26T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"cross","content":"ok"}]}}`,
+	}, "\n")+"\n")
+	code, out, errOut := runTL(t, e, "--wait-all", "--since", "2026-10-25T00:00:00Z", "--until", "2026-10-26T00:00:00Z", path)
+	start, _ := time.Parse(time.RFC3339, "2026-10-25T23:59:59Z")
+	want := start.Local().Format(time.DateOnly) + "\talpha\tbuild\t1\t3000\t3000\t3000"
+	if code != 0 || !strings.Contains(out, want) || strings.Contains(errOut, "read "+path) {
+		t.Fatalf("windowed midnight wait-all = (%d, %q, %q), want start-day 3000ms row", code, out, errOut)
+	}
+}
+
+func TestWaitAllCLIReadErrorKeepsReadableRowsAndWaitExitCode(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	var specs []struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}
+	for i := 1; i <= 20; i++ {
+		specs = append(specs, struct {
+			command string
+			delay   int
+			bg      bool
+			output  bool
+		}{command: "alpha build", delay: i, output: true})
+	}
+	good := writeWaitTranscript(t, e, "good.jsonl", claudeWaitRows(specs))
+	bad := filepath.Join(t.TempDir(), "bad.jsonl")
+	if err := os.Mkdir(bad, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	waitCode, waitOut, _ := runTL(t, e, "--wait", "alpha", "--q", "95", good, bad)
+	allCode, allOut, allErr := runTL(t, e, "--wait-all", good, bad)
+	if waitCode != 0 || waitOut != "19000\n" {
+		t.Fatalf("baseline --wait = (%d, %q), want 0/19000", waitCode, waitOut)
+	}
+	if allCode != waitCode || !strings.Contains(allOut, "\talpha\tbuild\t20\t210000\t19000\t20000\n") {
+		t.Fatalf("partial --wait-all = (%d, %q), want readable rows and code %d", allCode, allOut, waitCode)
+	}
+	if lines := strings.Split(strings.TrimSpace(allErr), "\n"); len(lines) != 1 || !strings.Contains(allErr, bad) || !strings.Contains(allErr, "read") {
+		t.Fatalf("--wait-all error diagnostic = %q, want one line with path and cause", allErr)
+	}
+}
+
+func TestWaitAllRepeatedWrapperUsesUnclassifiedRow(t *testing.T) {
+	e := fakeHome(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	specs := make([]struct {
+		command string
+		delay   int
+		bg      bool
+		output  bool
+	}, 20)
+	for i := range specs {
+		specs[i] = struct {
+			command string
+			delay   int
+			bg      bool
+			output  bool
+		}{command: "head -n 1 f | head -n 1", delay: 1, output: true}
+	}
+	path := writeWaitTranscript(t, e, "wrappers.jsonl", claudeWaitRows(specs))
+	waitCode, waitOut, _ := runTL(t, e, "--wait", "head", "--q", "95", path)
+	allCode, allOut, errOut := runTL(t, e, "--wait-all", path)
+	if waitCode != 3 || waitOut != "" {
+		t.Fatalf("--wait head = (%d, %q), want no samples", waitCode, waitOut)
+	}
+	if allCode != 0 || !strings.Contains(allOut, "\t-\t-\t20\t20000\t1000\t1000\n") || strings.Contains(allOut, "\thead\t") {
+		t.Fatalf("repeated-wrapper wait-all = (%d, %q, %q), want unclassified row", allCode, allOut, errOut)
+	}
 }
 
 type waitAllTestSpec struct {
@@ -131,6 +214,8 @@ func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
 		{"g", "alpha build", 8 * time.Second, true, false},               // background
 		{"h", "beta run", 9 * time.Second, false, true},                  // refusal
 		{"i", "alpha build && beta run", 10 * time.Second, false, false}, // two programs
+		{"j", "head -n 1 f", 11 * time.Second, false, false},
+		{"k", "head -n 1 f | head -n 1", 12 * time.Second, false, false},
 	}
 	all := newWaitTracker(options{waitAll: true})
 	for _, s := range specs {
@@ -170,20 +255,23 @@ func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
 	}
 	for key, want := range byProgramDay {
 		day, program, _ := strings.Cut(key, "\x00")
+		if program == "-" {
+			continue
+		}
 		got := runWaitTrackerForSpecs(base, specs, program, "", day)
 		if fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Errorf("%s %s: --wait=%v, wait-all=%v", day, program, got, want)
 		}
 	}
-	if len(all.waitRows) != 6 {
-		t.Fatalf("wait-all samples = %d, want 6: %+v", len(all.waitRows), all.waitRows)
+	if len(all.waitRows) != 8 {
+		t.Fatalf("wait-all samples = %d, want 8: %+v", len(all.waitRows), all.waitRows)
 	}
 	// The calls span local midnight; the rows include one-event groups and sort by day/program/subcommand.
 	var out strings.Builder
 	reportWaitAll(result{waitRows: all.waitRows}, &out)
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) != len(all.waitRows) {
-		t.Fatalf("daily lines = %q", out.String())
+	if len(lines) != len(groups) {
+		t.Fatalf("daily lines = %q; groups=%d", out.String(), len(groups))
 	}
 	if !strings.HasPrefix(lines[0], base.Format(time.DateOnly)+"\talpha\tbuild\t") {
 		t.Errorf("first TSV row = %q", lines[0])
@@ -228,13 +316,13 @@ func TestWaitAllReadErrorMatchesWait(t *testing.T) {
 			t.Fatalf("scan %v: errs=%v, err=%v; want one unreadable transcript", args, res.errs, err)
 		}
 	}
-	waitCode, waitOut, waitErr := runTL(t, e, "--wait", "alpha", path)
+	waitCode, waitOut, _ := runTL(t, e, "--wait", "alpha", path)
 	allCode, allOut, allErr := runTL(t, e, "--wait-all", path)
-	if allCode != waitCode || allOut != waitOut || allErr != waitErr {
-		t.Fatalf("--wait-all read error = (%d, %q, %q), --wait = (%d, %q, %q)", allCode, allOut, allErr, waitCode, waitOut, waitErr)
+	if allCode != waitCode || allOut != waitOut {
+		t.Fatalf("--wait-all read error = (%d, %q), --wait = (%d, %q)", allCode, allOut, waitCode, waitOut)
 	}
-	if allCode == 0 || allErr == "" {
-		t.Fatalf("read error was not reported: code=%d stderr=%q", allCode, allErr)
+	if lines := strings.Split(strings.TrimSpace(allErr), "\n"); len(lines) != 1 || !strings.Contains(allErr, path) || !strings.Contains(allErr, "read") {
+		t.Fatalf("read error diagnostic = %q, want one line with path and cause", allErr)
 	}
 }
 

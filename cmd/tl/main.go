@@ -640,11 +640,21 @@ func runOutputSessions(opts options, e env, stdout, stderr io.Writer) int {
 }
 
 func reportWaitOutput(res result, sources []source, opts options, stdout, stderr io.Writer) int {
+	if opts.waitAll {
+		if len(res.errs) > 0 {
+			reportWaitAll(res, stdout)
+			fmt.Fprintln(stderr, res.errs[0])
+			if len(res.waitRows) < minWaitEvents(opts.q) {
+				return 3
+			}
+			return 0
+		}
+	}
 	if n := opts.waitCache.misses.Load(); n > 0 {
 		// Причина промаха — запись под этот код ещё не писалась или транскрипт после неё дописан.
 		fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
 	}
-	if opts.waitAll && len(res.errs) == 0 {
+	if opts.waitAll {
 		return reportWaitAll(res, stdout)
 	}
 	return reportWait(res, opts, stdout, stderr)

@@ -639,25 +639,20 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 		wt = newWaitTracker(f.opts)
 	}
 	if wt != nil && (f.opts.waitCache != nil || isCodexRollout(src.Path)) {
-		events, err := f.waitEvents(src.Path)
-		if err != nil {
-			return nil, nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
-		}
-		for i := range events {
-			event := &events[i]
-			if f.cachedWaitEventInWindow(event) {
-				wt.cachedEvent(*event)
-			}
-		}
-		return nil, wt.waits, wt.waitRows, transcript.Meta{}, nil
+		return f.cachedWaitFile(src, wt)
 	}
 	var (
 		out    []hit
 		before []transcript.Event // последние -C событий окна до найденного
 		after  int                // сколько событий после найденного ещё показать
 	)
+	includedCalls := make(map[string]bool)
 	consume := func(ev transcript.Event) {
-		if !f.inWindow(ev) {
+		if wt != nil && f.opts.waitAll {
+			if !f.waitAllEventInWindow(ev, includedCalls) {
+				return
+			}
+		} else if !f.inWindow(ev) {
 			return
 		}
 		if wt != nil {
@@ -695,6 +690,21 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 	return out, waits, waitRows, meta, nil
 }
 
+func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Duration, []waitSample, transcript.Meta, error) {
+	events, err := f.waitEvents(src.Path)
+	if err != nil {
+		return nil, nil, nil, transcript.Meta{}, fmt.Errorf("read %s: %w", src.Path, err)
+	}
+	includedCalls := make(map[string]bool)
+	for i := range events {
+		event := &events[i]
+		if f.cachedWaitEventInWindow(event, includedCalls) {
+			wt.cachedEvent(*event)
+		}
+	}
+	return nil, wt.waits, wt.waitRows, transcript.Meta{}, nil
+}
+
 // readEvents сохраняет прежний читатель для промахов и его диагностику ошибок.
 func (f *filter) readEvents(path string, keep func([]byte, transcript.ToolNames) bool, consume func(transcript.Event)) (transcript.Meta, error) {
 	if f.opts.replyCache != nil {
@@ -719,9 +729,24 @@ func (f *filter) waitEvents(path string) ([]cachedWaitEvent, error) {
 	return readWaitEvents(path, codex)
 }
 
-func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent) bool {
-	return f.inWindow(transcript.Event{Role: event.Role, Text: event.Text, Time: event.Time, CallID: event.CallID, Line: event.Line,
-		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw})
+func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent, includedCalls map[string]bool) bool {
+	ev := transcript.Event{Role: event.Role, Text: event.Text, Time: event.Time, CallID: event.CallID, Line: event.Line,
+		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw}
+	return f.waitAllEventInWindow(ev, includedCalls)
+}
+
+func (f *filter) waitAllEventInWindow(ev transcript.Event, includedCalls map[string]bool) bool {
+	if !f.opts.waitAll {
+		return f.inWindow(ev)
+	}
+	inWindow := f.inWindow(ev)
+	if ev.Role == transcript.Cmd && inWindow && ev.CallID != "" {
+		includedCalls[ev.CallID] = true
+	}
+	if ev.Role == transcript.Out && includedCalls[ev.CallID] {
+		return true
+	}
+	return inWindow
 }
 
 // scan читает файлы параллельно; ошибка одного файла не мешает остальным и уходит в итог (result.errs).

@@ -149,16 +149,38 @@ func (t *waitTracker) trackResult(event cachedWaitEvent) {
 	if session, running := transcriptwaits.Running(event.Text); running && call.codex {
 		// Сессию с тем же номером получила новая команда: брошенное ожидание прежней не кончится её опросом.
 		delete(t.sessions, session)
-		if call.command != "" && call.count == 1 && !call.bg && !call.refused && call.matches(t.prog, t.sub) {
+		if call.command != "" && call.count == 1 && !call.bg && !call.refused && t.matches(call) {
 			call.session = session
 			t.sessions[session] = call
 		}
 		return
 	}
-	if call.command == "" || call.count != 1 || call.bg || call.refused || !call.matches(t.prog, t.sub) {
+	if call.command == "" || call.count != 1 || call.bg || call.refused || !t.matches(call) {
 		return
 	}
 	t.addWait(call, event.Time)
+}
+
+func (t *waitTracker) matches(call *waitCall) bool {
+	if call.matches(t.prog, t.sub) {
+		return true
+	}
+	if !t.waitAll {
+		return false
+	}
+	calls, invalid := call.calls, call.invalid
+	if !call.parsed {
+		calls, invalid = parseWaitCalls(call.command)
+	}
+	if invalid || len(calls) == 0 {
+		return false
+	}
+	for _, command := range calls {
+		if !waitWrappers[command.Name] {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *waitTracker) addWait(call *waitCall, end time.Time) {
@@ -166,9 +188,10 @@ func (t *waitTracker) addWait(call *waitCall, end time.Time) {
 	if duration := end.Sub(start); duration >= 0 {
 		if t.waitAll {
 			program, sub, ok := waitCallIdentity(call)
-			if ok {
-				t.waitRows = append(t.waitRows, waitSample{At: call.at, Program: program, Sub: sub, Duration: duration})
+			if !ok {
+				program, sub = "-", "-"
 			}
+			t.waitRows = append(t.waitRows, waitSample{At: call.at, Program: program, Sub: sub, Duration: duration})
 		} else {
 			t.waits = append(t.waits, duration)
 		}
@@ -400,12 +423,9 @@ func selectNamedWaitProgram(found []cachedShellCall, requestedProgram, requested
 }
 
 func selectAnyWaitProgram(found []cachedShellCall) cachedShellCall {
-	var program, firstWrapper cachedShellCall
+	var program cachedShellCall
 	for _, call := range found {
 		if waitWrappers[call.Name] {
-			if firstWrapper.Name == "" && !call.Background {
-				firstWrapper = call
-			}
 			continue
 		}
 		if call.Background || program.Name != "" {
@@ -414,9 +434,21 @@ func selectAnyWaitProgram(found []cachedShellCall) cachedShellCall {
 		program = call
 	}
 	if program.Name != "" {
-		return program
+		if selected := selectNamedWaitProgram(found, program.Name, ""); selected.Name != "" {
+			return selected
+		}
 	}
-	return firstWrapper
+	var first cachedShellCall
+	for _, call := range found {
+		if !call.Background {
+			first = call
+			break
+		}
+	}
+	if first.Name != "" && selectNamedWaitProgram(found, first.Name, "").Name != "" {
+		return first
+	}
+	return cachedShellCall{}
 }
 
 func isRequestedWaitProgram(call cachedShellCall, requestedProgram, requestedSub string) bool {
