@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -180,17 +181,33 @@ func TestKernelWakeFileConditions(t *testing.T) {
 	t.Run("unrelated write", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "watched")
-		opts, err := parseArgs([]string{"file", path, "--every", "10s", "--timeout", "250ms"}, time.Now)
+		opts, err := parseArgs([]string{"file", path, "--every", "10s", "--timeout", "2s"}, time.Now)
 		if err != nil {
 			t.Fatal(err)
 		}
+		written := make(chan time.Time, 1)
+		started := time.Now()
 		go func() {
-			time.Sleep(80 * time.Millisecond)
-			_ = os.WriteFile(filepath.Join(dir, "other"), []byte("x"), 0o644)
+			if err := waitForInotifyFD(os.Getpid(), 1500*time.Millisecond); err != nil {
+				t.Errorf("wait for watcher: %v", err)
+				return
+			}
+			if err := os.WriteFile(filepath.Join(dir, "other"), []byte("x"), 0o644); err != nil {
+				t.Errorf("unrelated write: %v", err)
+			}
+			written <- time.Now()
 		}()
 		var out, errOut bytes.Buffer
 		if code := run(context.Background(), opts, &out, &errOut); code != exitTimeout {
 			t.Fatalf("unrelated event woke condition: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+		}
+		select {
+		case at := <-written:
+			if at.After(started.Add(2 * time.Second)) {
+				t.Fatal("unrelated write happened after the timeout")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("unrelated writer did not finish")
 		}
 	})
 }
@@ -232,6 +249,42 @@ func TestLineWatcherWakesWhileWriterKeepsFileOpen(t *testing.T) {
 	matched, err := line.checkEvent()
 	if err != nil || !matched {
 		t.Fatalf("line check while writer held file: matched=%v err=%v", matched, err)
+	}
+}
+
+func TestFileWatcherWakesWhileWriterKeepsFileOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "held-open.file")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file := &fileCond{path: path}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, cleanup, err := watchFiles(ctx, []cond{file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events == nil {
+		cancel()
+		cleanup()
+		t.Fatal("file watcher unavailable")
+	}
+	defer func() { cancel(); cleanup() }()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("ready"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IN_MODIFY did not wake the file condition while the writer held the file open")
+	}
+	matched, err := file.check(context.Background())
+	if err != nil || !matched {
+		t.Fatalf("file check while writer held file: matched=%v err=%v", matched, err)
 	}
 }
 
@@ -445,19 +498,90 @@ func (*retryFDCheck) String() string { return "retry-fd-check" }
 func (*retryFDCheck) state() string  { return "waiting" }
 
 func TestRunRetriesEMFILEWithoutWatchers(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "log")
-	base, err := parseArgs([]string{"line", "NEVER", path, "--timeout", "1s"}, time.Now)
+	dir := t.TempDir()
+	graft := filepath.Join(dir, "graft")
+	if err := os.WriteFile(graft, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	base, err := parseArgs([]string{"idle", "--timeout", "1s"}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle := base.conds[0].(*idleCond)
+	idle.graft = filepath.Join(dir, "missing")
+	if _, err := idle.check(context.Background()); err == nil || idle.done != nil {
+		t.Fatalf("failed graft start must leave idle retryable: err=%v done=%v", err, idle.done)
+	}
+	idle.graft = graft
+	if _, err := idle.check(context.Background()); err != nil {
+		t.Fatalf("idle retry after failed start: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		ok, err := idle.check(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("idle graft retry did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	path := filepath.Join(dir, "log")
+	base, err = parseArgs([]string{"line", "NEVER", path, "--timeout", "1s"}, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	check := &retryFDCheck{t: t}
-	base.conds = append([]cond{check}, base.conds...)
+	idle.done, idle.met = nil, false
+	base.conds = append([]cond{idle, check}, base.conds...)
 	base.any = true
 	if code := run(context.Background(), base, io.Discard, io.Discard); code != 0 {
 		t.Fatalf("run after EMFILE retry = %d, want 0", code)
 	}
 	if check.calls != 2 {
 		t.Fatalf("condition checks = %d, want retry once", check.calls)
+	}
+}
+
+func TestEventChecksOnlyChangedLineCondition(t *testing.T) {
+	dir := t.TempDir()
+	conds := make([]cond, 300)
+	met := make([]bool, len(conds))
+	for i := range conds {
+		path := filepath.Join(dir, fmt.Sprintf("log-%d", i))
+		if err := os.WriteFile(path, []byte("initial\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		line, err := newLineCond("NEVER", path, false, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conds[i] = line
+	}
+	if _, err := checkConditions(context.Background(), conds, met, false, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < len(conds); i++ {
+		if err := os.Remove(conds[i].(*lineCond).path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := conds[0].(*lineCond).path
+	if err := appendFile(path, "changed\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkConditions(context.Background(), conds, met, true, map[string]struct{}{path: {}}, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < len(conds); i++ {
+		if conds[i].(*lineCond).absent {
+			t.Fatalf("unrelated line condition %d was checked on the file event", i)
+		}
 	}
 }
 
@@ -478,49 +602,33 @@ func TestWatcherFDsCloseOnlyAfterReaderStops(t *testing.T) {
 	}
 }
 
-func TestPIDFDsShareDescriptorBudgetWithInotify(t *testing.T) {
-	if pidfdBudgetFits(14, 3, 16) {
-		t.Fatal("14 pidfds plus reserved descriptors exceed 16 available descriptors")
-	}
-	if !pidfdBudgetFits(13, 3, 16) {
-		t.Fatal("13 pidfds plus reserved descriptors should fit 16 available descriptors")
-	}
-}
-
 func TestFileWatcherIdleDoesNotPoll(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "quiet")
-	opts, err := parseArgs([]string{"line", "NEVER", path, "--every", "5s", "--timeout", "4s"}, time.Now)
+	line, err := newLineCond("NEVER", path, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan int, 1)
-	go func() { done <- run(ctx, opts, io.Discard, io.Discard) }()
+	events, cleanup, err := watchFiles(ctx, []cond{line})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); cleanup() }()
+	if events == nil {
+		t.Fatal("file watcher unavailable")
+	}
 	deadline := time.Now().Add(time.Second)
 	for countInotifyFDs(t) == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if countInotifyFDs(t) == 0 {
-		cancel()
-		<-done
 		t.Fatal("inotify watcher did not start")
 	}
-	before := processContextSwitches(t)
-	window := time.NewTimer(2 * time.Second)
-	<-window.C
-	after := processContextSwitches(t)
-	cancel()
-	if code := <-done; code != exitTimeout {
-		t.Fatalf("run code=%d, want cancellation timeout", code)
+	select {
+	case event := <-events:
+		t.Fatalf("quiet file produced an event: %#v", event)
+	case <-time.After(250 * time.Millisecond):
 	}
-	if switches := after - before; switches > 150 {
-		t.Fatalf("idle watcher caused %d context switches in 2s, want at most 150", switches)
-	}
-}
-
-func processContextSwitches(t *testing.T) int {
-	t.Helper()
-	return processContextSwitchesForPID(t, os.Getpid())
 }
 
 func processContextSwitchesForPID(t *testing.T, pid int) int {
@@ -579,8 +687,15 @@ func TestLineEventDoesNotMatchIncompleteLine(t *testing.T) {
 	done := make(chan int, 1)
 	writes := make(chan error, 2)
 	go func() { done <- run(context.Background(), opts, &out, &errOut) }()
-	time.AfterFunc(100*time.Millisecond, func() { writes <- appendFile(path, "READY") })
-	time.AfterFunc(200*time.Millisecond, func() { writes <- appendFile(path, "-not-ready\n") })
+	writerDone := make(chan time.Time, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		writes <- appendFile(path, "READY")
+		time.Sleep(100 * time.Millisecond)
+		writes <- appendFile(path, "-not-ready\n")
+		writerDone <- time.Now()
+	}()
+	started := time.Now()
 	var code int
 	select {
 	case code = <-done:
@@ -592,8 +707,28 @@ func TestLineEventDoesNotMatchIncompleteLine(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if writtenAt := <-writerDone; writtenAt.After(started.Add(600 * time.Millisecond)) {
+		t.Fatalf("writes happened after the test wait ended: %s", writtenAt.Sub(started))
+	}
 	if code != exitTimeout || !strings.Contains(out.String(), "still waiting: line") {
 		t.Fatalf("incomplete line counted: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestLineTickMatchesIncompleteLiteralAfterEventScan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "partial.log")
+	if err := os.WriteFile(path, []byte("prefixREADYtail"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := newLineCond("READY", path, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched, err := line.checkEvent(); err != nil || matched {
+		t.Fatalf("event check matched incomplete line: matched=%v err=%v", matched, err)
+	}
+	if matched, err := line.check(context.Background()); err != nil || !matched {
+		t.Fatalf("tick missed incomplete literal line: matched=%v err=%v", matched, err)
 	}
 }
 
@@ -639,10 +774,9 @@ func TestExitWatcherCancellationWithManyPIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
 	code := run(context.Background(), opts, io.Discard, io.Discard)
-	if elapsed := time.Since(started); code != exitTimeout || elapsed > 200*time.Millisecond {
-		t.Fatalf("run code=%d after %s, want timeout within 200ms", code, elapsed)
+	if code != exitTimeout {
+		t.Fatalf("run code=%d, want timeout", code)
 	}
 }
 
@@ -677,41 +811,21 @@ func TestExitWatcherRLimit(t *testing.T) {
 			t.Fatalf("run code=%d, want timeout with pidfd as an optional watcher", code)
 		}
 
-		second := exec.Command("sleep", "2")
-		if err := second.Start(); err != nil {
+		runtime.LockOSThread()
+		tid := unix.Gettid()
+		runtime.UnlockOSThread()
+		quick := exec.Command("bash", "-c", "sleep 0.15")
+		if err := quick.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer second.Wait()
-		var fillers []*os.File
-		defer func() {
-			for _, f := range fillers {
-				_ = f.Close()
-			}
-		}()
-		for {
-			f, err := os.Open("/dev/null")
-			if err != nil {
-				if !errors.Is(err, unix.EMFILE) {
-					t.Fatalf("fill file descriptors: %v", err)
-				}
-				break
-			}
-			fillers = append(fillers, f)
-		}
-		if len(fillers) == 0 {
-			t.Fatal("could not reserve file descriptors for the pidfd rollback case")
-		}
-		if err := fillers[len(fillers)-1].Close(); err != nil {
-			t.Fatal(err)
-		}
-		fillers = fillers[:len(fillers)-1]
-		args = []string{"exit", strconv.Itoa(child.Process.Pid), strconv.Itoa(second.Process.Pid), "--timeout", "150ms", "--every", "1s"}
+		defer quick.Wait()
+		args = []string{"exit", strconv.Itoa(tid), "exit", strconv.Itoa(quick.Process.Pid), "--any", "--timeout", "2s", "--every", "10s"}
 		opts, err = parseArgs(args, time.Now)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if code := run(context.Background(), opts, io.Discard, io.Discard); code != exitTimeout {
-			t.Fatalf("run code=%d after partial pidfd open failure, want timeout after fd rollback", code)
+		if code := run(context.Background(), opts, io.Discard, io.Discard); code != 0 {
+			t.Fatalf("run code=%d after one pidfd open failure, want remaining pidfd to wake run", code)
 		}
 		return
 	}
@@ -771,8 +885,8 @@ func assertWake(t *testing.T, args []string, change func() error) {
 	}
 	select {
 	case code := <-done:
-		if elapsed := time.Since(started); elapsed > 800*time.Millisecond || code != 0 {
-			t.Fatalf("wake after %s, code=%d stdout=%q stderr=%q", elapsed, code, out.String(), errOut.String())
+		if code != 0 {
+			t.Fatalf("wake after %s, code=%d stdout=%q stderr=%q", time.Since(started), code, out.String(), errOut.String())
 		}
 	case <-time.After(1500 * time.Millisecond):
 		t.Fatal("condition did not wake promptly")

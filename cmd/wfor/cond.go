@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/proc"
 	"golang.org/x/sys/unix"
@@ -90,27 +91,35 @@ func (c *goneCond) state() string {
 // lineCond — в файле есть строка по регулярному выражению. Файл читается с места прошлой проверки; заменён (mv,
 // перезапись на месте) — читается сначала. Недописанная последняя строка тоже проверяется.
 type lineCond struct {
-	re      *regexp.Regexp
-	path    string
-	off     int64       // сколько байт файла уже прочитано целыми строками
-	file    os.FileInfo // прочитанный файл: другой inode — файл заменён
-	head    []byte      // начало прочитанного и
-	edge    []byte      // байты перед off: не совпали — файл перезаписан на месте
-	lines   int         // номер последней целой строки
-	tail    []byte      // недописанная последняя строка
-	last    string      // последняя непустая строка — для ответа
-	hit     string
-	hitLine int
-	absent  bool
-	skipped bool // начато с --new или --after: повтор вызова должен продолжить с той же строки
+	re        *regexp.Regexp
+	path      string
+	literal   string
+	literalRE bool
+	off       int64       // сколько байт файла уже прочитано целыми строками
+	eventOff  int64       // сколько байт уже проверено на перевод строки между тиками
+	tailOff   int64       // сколько байт неполной строки проверено на literal RE между тиками
+	file      os.FileInfo // прочитанный файл: другой inode — файл заменён
+	head      []byte      // начало прочитанного и
+	edge      []byte      // байты перед off: не совпали — файл перезаписан на месте
+	lines     int         // номер последней целой строки
+	tail      []byte      // недописанная последняя строка
+	last      string      // короткая последняя непустая строка — для ответа
+	hit       string
+	hitLine   int
+	absent    bool
+	skipped   bool // начато с --new или --after: повтор вызова должен продолжить с той же строки
 	// partial — с --new файл кончался неполной строкой: она начата до старта и не в счёт, пока не кончится
 	partial bool
 }
 
-const inotifyCheckInterval = 200 * time.Millisecond
+type fileEvent struct{ paths map[string]struct{} }
+
+const inotifyCheckInterval = 100 * time.Millisecond
+const inotifyReadCooldown = 600 * time.Millisecond
+const inotifyNoiseCooldown = 100 * time.Millisecond
 
 // watchFiles shares one inotify descriptor across every file and line condition.
-func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func(), error) {
+func watchFiles(ctx context.Context, conds []cond) (<-chan fileEvent, func(), error) {
 	dirs := fileWatchDirs(conds)
 	if len(dirs) == 0 {
 		return nil, func() {}, nil
@@ -126,7 +135,7 @@ func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func(), err
 	if err != nil { //nolint:silent-error-handling // Event support is optional; ticker checks remain the fallback.
 		return nil, func() {}, nil
 	}
-	byWD, fileMasks, paths, dirWDs := addInotifyWatches(fd, dirs)
+	byWD, fileMasks, filePaths, paths, dirWDs := addInotifyWatches(fd, dirs)
 	if len(byWD) == 0 {
 		_ = unix.Close(fd)
 		return nil, func() {}, nil
@@ -136,10 +145,10 @@ func watchFiles(ctx context.Context, conds []cond) (<-chan struct{}, func(), err
 		_ = unix.Close(fd)
 		return nil, func() {}, nil
 	}
-	out := make(chan struct{}, 1)
+	out := make(chan fileEvent, 1)
 	done := make(chan struct{})
 	stop := cancelPollOnContext(ctx, cancelFD)
-	go watchInotify(ctx, fd, cancelFD, byWD, fileMasks, paths, dirWDs, out, done)
+	go watchInotify(ctx, fd, cancelFD, byWD, fileMasks, filePaths, paths, dirWDs, out, done)
 	cleanup := func() {
 		stop()
 		signalEventFD(cancelFD)
@@ -172,7 +181,7 @@ func fileWatchDirs(conds []cond) map[string]map[string]uint32 {
 		case *lineCond:
 			mask |= unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
 		case *fileCond:
-			mask |= unix.IN_CLOSE_WRITE | unix.IN_ATTRIB | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
+			mask |= unix.IN_MODIFY | unix.IN_CLOSE_WRITE | unix.IN_ATTRIB | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
 		}
 		dirs[dir][name] |= mask
 	}
@@ -181,9 +190,10 @@ func fileWatchDirs(conds []cond) map[string]map[string]uint32 {
 
 const directoryWatchMask = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM
 
-func addInotifyWatches(fd int, dirs map[string]map[string]uint32) (map[int]map[string]struct{}, map[int]uint32, map[string]map[string]uint32, map[int]string) {
+func addInotifyWatches(fd int, dirs map[string]map[string]uint32) (map[int]map[string]struct{}, map[int]uint32, map[int]map[string]struct{}, map[string]map[string]uint32, map[int]string) {
 	byWD := map[int]map[string]struct{}{}
 	fileMasks := map[int]uint32{}
+	filePaths := map[int]map[string]struct{}{}
 	paths := map[string]map[string]uint32{}
 	dirWDs := map[int]string{}
 	for dir, names := range dirs {
@@ -202,13 +212,13 @@ func addInotifyWatches(fd int, dirs map[string]map[string]uint32) (map[int]map[s
 				paths[dir] = map[string]uint32{}
 			}
 			paths[dir][name] = fileMask
-			addFileInotifyWatch(fd, path, fileMask, byWD, fileMasks)
+			addFileInotifyWatch(fd, path, fileMask, byWD, fileMasks, filePaths)
 		}
 	}
-	return byWD, fileMasks, paths, dirWDs
+	return byWD, fileMasks, filePaths, paths, dirWDs
 }
 
-func addFileInotifyWatch(fd int, path string, mask uint32, byWD map[int]map[string]struct{}, fileMasks map[int]uint32) {
+func addFileInotifyWatch(fd int, path string, mask uint32, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}) {
 	wd, err := unix.InotifyAddWatch(fd, path, mask)
 	if err == nil {
 		if byWD[wd] == nil {
@@ -216,10 +226,14 @@ func addFileInotifyWatch(fd int, path string, mask uint32, byWD map[int]map[stri
 		}
 		byWD[wd][""] = struct{}{}
 		fileMasks[wd] |= mask
+		if filePaths[wd] == nil {
+			filePaths[wd] = map[string]struct{}{}
+		}
+		filePaths[wd][path] = struct{}{}
 	}
 }
 
-func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, paths map[string]map[string]uint32, dirWDs map[int]string, out chan<- struct{}, done chan<- struct{}) {
+func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent, done chan<- struct{}) {
 	defer close(done)
 	buf := make([]byte, 4096)
 	for waitInotify(fd, cancelFD) {
@@ -234,9 +248,13 @@ func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string
 			if err != nil { //nolint:silent-error-handling // A dead watcher falls back to the periodic condition check.
 				return
 			}
-			emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, paths, dirWDs, out)
+			relevant := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out)
 			// Let the kernel collect a burst instead of waking this reader for every write.
-			if !waitInotifyCooldown(ctx) {
+			cooldown := inotifyNoiseCooldown
+			if relevant {
+				cooldown = inotifyReadCooldown
+			}
+			if !waitContext(ctx, cooldown) {
 				return
 			}
 			break
@@ -244,8 +262,8 @@ func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string
 	}
 }
 
-func waitInotifyCooldown(ctx context.Context) bool {
-	timer := time.NewTimer(inotifyCheckInterval)
+func waitContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -266,39 +284,77 @@ func waitInotify(fd, cancelFD int) bool {
 	}
 }
 
-func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, paths map[string]map[string]uint32, dirWDs map[int]string, out chan<- struct{}) {
-	notify := false
+func emitInotifyEventsForFiles(fd int, data []byte, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) bool {
+	changed := map[string]struct{}{}
 	for off := 0; off+unix.SizeofInotifyEvent <= len(data); {
 		wd := int(int32(binary.LittleEndian.Uint32(data[off : off+4])))
 		mask := binary.LittleEndian.Uint32(data[off+4 : off+8])
 		length := int(binary.LittleEndian.Uint32(data[off+12 : off+16]))
 		if off+unix.SizeofInotifyEvent+length > len(data) {
-			return
+			return false
 		}
 		name := string(bytes.TrimRight(data[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+length], "\x00"))
 		_, fileWatch := byWD[wd][""]
 		if mask&unix.IN_IGNORED != 0 {
 			delete(byWD, wd)
 			delete(fileMasks, wd)
+			delete(filePaths, wd)
 			delete(dirWDs, wd)
 		} else if fileWatch && name == "" {
-			notify = notify || mask&fileMasks[wd] != 0
+			if mask&fileMasks[wd] != 0 {
+				for path := range filePaths[wd] {
+					changed[path] = struct{}{}
+				}
+			}
 		} else if names, ok := byWD[wd]; ok {
 			if _, relevant := names[name]; relevant {
 				// The event's watch descriptor identifies the directory; rearm the target file after create/rename.
 				dir := dirWDs[wd]
-				if fileMask, exists := paths[dir][name]; exists && mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 {
-					addFileInotifyWatch(fd, filepath.Join(dir, name), fileMask, byWD, fileMasks)
+				if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
+					removeFileInotifyWatch(fd, filepath.Join(dir, name), byWD, fileMasks, filePaths)
 				}
-				notify = true
+				if fileMask, exists := paths[dir][name]; exists && mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 {
+					removeFileInotifyWatch(fd, filepath.Join(dir, name), byWD, fileMasks, filePaths)
+					addFileInotifyWatch(fd, filepath.Join(dir, name), fileMask, byWD, fileMasks, filePaths)
+				}
+				changed[filepath.Join(dirWDs[wd], name)] = struct{}{}
 			}
 		}
 		off += unix.SizeofInotifyEvent + length
 	}
-	if notify {
+	if len(changed) > 0 {
 		select {
-		case out <- struct{}{}:
+		case out <- fileEvent{paths: changed}:
 		default:
+			select {
+			case previous := <-out:
+				for path := range previous.paths {
+					changed[path] = struct{}{}
+				}
+			default:
+			}
+			select {
+			case out <- fileEvent{paths: changed}:
+			default:
+			}
+		}
+	}
+	return len(changed) > 0
+}
+
+func removeFileInotifyWatch(fd int, path string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}) {
+	for wd, watched := range filePaths {
+		if _, ok := watched[path]; !ok {
+			continue
+		}
+		delete(watched, path)
+		if len(watched) == 0 {
+			if _, err := unix.InotifyRmWatch(fd, uint32(wd)); err != nil && err != unix.EINVAL {
+				continue // Keep the old mapping if the kernel could not remove the watch.
+			}
+			delete(filePaths, wd)
+			delete(fileMasks, wd)
+			delete(byWD, wd)
 		}
 	}
 }
@@ -339,7 +395,8 @@ func newLineCond(expr, path string, onlyNew bool, after int) (*lineCond, error) 
 	if err != nil {
 		return nil, fmt.Errorf("line %q: %w", expr, err)
 	}
-	c := &lineCond{re: re, path: path}
+	literal, complete := re.LiteralPrefix()
+	c := &lineCond{re: re, path: path, literal: literal, literalRE: complete && literal != ""}
 	if onlyNew || after > 0 {
 		c.skipped = true
 		if err := c.skipLines(onlyNew, after); err != nil {
@@ -380,9 +437,11 @@ func (c *lineCond) skipLines(all bool, n int) error {
 	c.file, c.lines = st, lines
 	c.partial = end < len(data) && (all || n > lines)
 	c.consumed(data[:end])
+	c.eventOff = max(c.eventOff, c.off)
+	c.tailOff = c.off
 	// последняя строка пропущенного — в ответ по таймауту, пока не дописано новое
 	for line := range bytes.Lines(data[:end]) {
-		if s := strings.TrimSpace(string(line)); s != "" {
+		if s := shortBytes(line); s != "" {
 			c.last = s
 		}
 	}
@@ -398,12 +457,15 @@ func (c *lineCond) consumed(chunk []byte) {
 		c.head = bytes.Clone(chunk[:min(markLen, len(chunk))])
 	}
 	c.off += int64(len(chunk))
+	if c.eventOff < c.off {
+		c.eventOff = c.off
+	}
 	c.edge = bytes.Clone(chunk[max(0, len(chunk)-markLen):])
 }
 
 // replaced — файл уже не тот, что читали: другой inode, короче прочитанного или другие байты начала и края.
 func (c *lineCond) replaced(f *os.File, st os.FileInfo) (bool, error) {
-	if c.file != nil && !os.SameFile(c.file, st) || st.Size() < c.off {
+	if c.file != nil && !os.SameFile(c.file, st) || st.Size() < c.off || st.Size() < c.eventOff {
 		return true, nil
 	}
 	for _, m := range []struct {
@@ -449,10 +511,45 @@ func (c *lineCond) checkContent(allowIncomplete bool) (bool, error) {
 		return false, err
 	}
 	if replaced {
-		c.off, c.lines, c.tail, c.head, c.edge, c.partial = 0, 0, nil, nil, nil, false
+		c.off, c.eventOff, c.tailOff, c.lines, c.tail, c.head, c.edge, c.partial = 0, 0, 0, 0, nil, nil, nil, false
 	}
 	c.file = st
-	if _, err := f.Seek(c.off, io.SeekStart); err != nil {
+	if !allowIncomplete && c.skipIncompleteEvent(f, st) {
+		return false, nil
+	}
+	return c.scanContent(f, allowIncomplete)
+}
+
+func (c *lineCond) skipIncompleteEvent(f *os.File, st os.FileInfo) bool {
+	if st.Size() <= max(c.off, c.eventOff) {
+		return true
+	}
+	var last [1]byte
+	n, err := f.ReadAt(last[:], st.Size()-1)
+	if err != nil && err != io.EOF || n != 1 {
+		return false
+	}
+	if last[0] == '\n' {
+		return false
+	}
+	return true
+}
+
+func (c *lineCond) scanContent(f *os.File, allowIncomplete bool) (bool, error) {
+	scanAt := max(c.eventOff, c.off)
+	if _, err := f.Seek(scanAt, io.SeekStart); err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	newData, err := io.ReadAll(f)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	c.eventOff = scanAt + int64(len(newData))
+	if !bytes.Contains(newData, []byte{'\n'}) {
+		return c.checkIncomplete(f, allowIncomplete)
+	}
+	startOff := c.off
+	if _, err := f.Seek(startOff, io.SeekStart); err != nil {
 		return false, fmt.Errorf("%s: %w", c, err)
 	}
 	data, err := io.ReadAll(f)
@@ -473,11 +570,77 @@ func (c *lineCond) checkContent(allowIncomplete bool) (bool, error) {
 	}
 	c.consumed(data[:end])
 	c.tail = data[end:]
-	return allowIncomplete && len(c.tail) > 0 && !c.partial && c.match(c.tail, c.lines+1), nil
+	c.eventOff = max(c.eventOff, startOff+int64(len(data)))
+	c.tailOff = c.off
+	if allowIncomplete && len(c.tail) > 0 && !c.partial {
+		if c.literalRE {
+			return c.matchLiteralTail(f, c.eventOff)
+		}
+		return c.match(c.tail, c.lines+1), nil
+	}
+	return false, nil
+}
+
+func (c *lineCond) checkIncomplete(f *os.File, allow bool) (bool, error) {
+	if !allow || c.partial {
+		if c.partial {
+			c.tailOff = c.eventOff
+		}
+		return false, nil
+	}
+	if c.literalRE {
+		return c.matchLiteralTail(f, c.eventOff)
+	}
+	if _, err := f.Seek(c.off, io.SeekStart); err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	c.tail = data
+	return len(c.tail) > 0 && c.match(c.tail, c.lines+1), nil
+}
+
+func (c *lineCond) matchLiteralTail(f *os.File, end int64) (bool, error) {
+	stateLen := min(int64(4096), max(int64(0), end-c.off))
+	if stateLen > 0 {
+		state := make([]byte, int(stateLen))
+		n, err := f.ReadAt(state, c.off)
+		if err != nil && err != io.EOF {
+			return false, fmt.Errorf("%s: %w", c, err)
+		}
+		if n > 0 {
+			c.last = shortBytes(state[:n])
+		}
+	}
+	start := min(max(c.off, c.tailOff-int64(len(c.literal))+1), end)
+	data := make([]byte, end-start)
+	if len(data) > 0 {
+		n, err := f.ReadAt(data, start)
+		if err != nil && err != io.EOF {
+			return false, fmt.Errorf("%s: %w", c, err)
+		}
+		data = data[:n]
+	}
+	c.tailOff = end
+	if !bytes.Contains(data, []byte(c.literal)) {
+		return false, nil
+	}
+	if _, err := f.Seek(c.off, io.SeekStart); err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	line, err := io.ReadAll(f)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", c, err)
+	}
+	c.hit, c.hitLine = string(line), c.lines+1
+	c.last = shortBytes(line)
+	return true, nil
 }
 
 func (c *lineCond) match(line []byte, n int) bool {
-	if s := strings.TrimSpace(string(line)); s != "" {
+	if s := shortBytes(line); s != "" {
 		c.last = s
 	}
 	if !c.re.Match(line) {
@@ -505,9 +668,9 @@ func (c *lineCond) state() string {
 		return "file absent"
 	}
 	if c.partial {
-		return fmt.Sprintf("%d lines and one begun before the start, last: %s", c.lines, short(c.last))
+		return fmt.Sprintf("%d lines and one begun before the start, last: %s", c.lines, c.last)
 	}
-	return fmt.Sprintf("%d lines, last: %s", c.lines, short(c.last))
+	return fmt.Sprintf("%d lines, last: %s", c.lines, c.last)
 }
 
 // exitCond — процессы завершились. Процесс сверяется по времени старта: pid, занятый новым процессом, — уже конец.
@@ -653,10 +816,6 @@ func openExitPidfds(pids []int, reserved int) ([]int, error) {
 		fds = append(fds, fd)
 	}
 	return fds, nil
-}
-
-func pidfdBudgetFits(pidfds, reserved int, nofileLimit uint64) bool {
-	return pidfds >= 0 && reserved >= 0 && uint64(pidfds+reserved) <= nofileLimit
 }
 
 // availableFDs counts descriptors that can be opened now, including inherited descriptors.
@@ -854,6 +1013,25 @@ func short(s string) string {
 	return string(r[:200]) + fmt.Sprintf("…(+%d)", len(r)-200)
 }
 
+func shortBytes(b []byte) string {
+	b = bytes.TrimSpace(b)
+	end := 0
+	for range 200 {
+		if end == len(b) {
+			return string(b)
+		}
+		_, size := utf8.DecodeRune(b[end:])
+		end += size
+	}
+	if end == len(b) {
+		return string(b)
+	}
+	if len(b) <= 4096 {
+		return string(b[:end]) + fmt.Sprintf("…(+%d)", utf8.RuneCount(b)-200)
+	}
+	return string(b[:end]) + "…"
+}
+
 // idleCond — машина разгрузилась по правилу graft: одна копия правила, в graft.
 // --local: иначе при remote_heavy проекта graft ждал бы разгрузки другой машины. graft ждёт сам, поэтому он
 // запускается один раз в фоне, а check только смотрит, вышел ли он.
@@ -887,10 +1065,12 @@ func (c *idleCond) check(ctx context.Context) (bool, error) {
 		c.done = make(chan error, 1)
 		cmd := exec.CommandContext(ctx, c.graft, "exec", "--heavy", "--local", "--", "true")
 		if err := proc.CancelByStop(cmd, 2*time.Second, syscall.SIGTERM); err != nil {
+			c.done = nil
 			return false, fmt.Errorf("idle: %w", err)
 		}
 		cmd.Stdout, cmd.Stderr = &c.out, &c.out
 		if err := cmd.Start(); err != nil {
+			c.done = nil
 			return false, fmt.Errorf("idle: %w", err)
 		}
 		go func() { c.done <- cmd.Wait() }()

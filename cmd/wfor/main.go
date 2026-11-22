@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -264,7 +265,7 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 	tick := time.NewTicker(opts.every)
 	defer tick.Stop()
 	wakeCtx, stopWatches := context.WithCancel(ctx)
-	wake := make(chan struct{}, 1)
+	wake := make(chan fileEvent, 1)
 	var wakeReaders sync.WaitGroup
 	cleanupWatches := setupWakeWatchers(wakeCtx, opts.conds, wake, &wakeReaders, stderr)
 	var cleanupOnce sync.Once
@@ -283,12 +284,14 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 		cleanupAll()
 	}()
 	eventCheck := false
+	var changedPaths map[string]struct{}
 	for {
-		retryWithoutWatchers, checkErr := checkConditions(ctx, opts.conds, met, eventCheck, watchersDisabled)
+		retryWithoutWatchers, checkErr := checkConditions(ctx, opts.conds, met, eventCheck, changedPaths, watchersDisabled)
 		if checkErr != nil {
 			if retryWithoutWatchers {
 				cleanupAll()
 				eventCheck = false
+				changedPaths = nil
 				continue
 			}
 			fmt.Fprintf(stderr, "wfor: %v\n", checkErr)
@@ -304,17 +307,19 @@ func run(ctx context.Context, opts options, stdout, stderr io.Writer) int {
 			return exitTimeout
 		case <-tick.C:
 			eventCheck = false
-		case <-wake:
+			changedPaths = nil
+		case event := <-wake:
 			if !waitEventDebounce(ctx) {
 				fmt.Fprintln(stdout, timeoutReport(opts.conds, met, start))
 				return exitTimeout
 			}
 			eventCheck = true
+			changedPaths = event.paths
 		}
 	}
 }
 
-func setupWakeWatchers(ctx context.Context, conds []cond, wake chan<- struct{}, readers *sync.WaitGroup, stderr io.Writer) []func() {
+func setupWakeWatchers(ctx context.Context, conds []cond, wake chan<- fileEvent, readers *sync.WaitGroup, stderr io.Writer) []func() {
 	fileEvents, cleanupFiles, watchErr := watchFiles(ctx, conds)
 	if watchErr != nil {
 		fmt.Fprintf(stderr, "wfor: file event watcher unavailable; using periodic checks: %v\n", watchErr)
@@ -329,17 +334,37 @@ func setupWakeWatchers(ctx context.Context, conds []cond, wake chan<- struct{}, 
 		fmt.Fprintf(stderr, "wfor: process event watcher unavailable; using periodic checks: %v\n", watchErr)
 	}
 	cleanups = append(cleanups, cleanupExits)
-	for _, events := range []<-chan struct{}{fileEvents, exitEvents} {
-		if events == nil {
-			continue
-		}
+	if fileEvents != nil {
 		readers.Add(1)
-		go forwardWakeEvents(ctx, events, wake, readers)
+		go forwardWakeEvents(ctx, fileEvents, wake, readers)
+	}
+	if exitEvents != nil {
+		readers.Add(1)
+		go forwardExitWakeEvents(ctx, exitEvents, wake, readers)
 	}
 	return cleanups
 }
 
-func forwardWakeEvents(ctx context.Context, events <-chan struct{}, wake chan<- struct{}, readers *sync.WaitGroup) {
+func forwardWakeEvents(ctx context.Context, events <-chan fileEvent, wake chan<- fileEvent, readers *sync.WaitGroup) {
+	defer readers.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			select {
+			case wake <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func forwardExitWakeEvents(ctx context.Context, events <-chan struct{}, wake chan<- fileEvent, readers *sync.WaitGroup) {
 	defer readers.Done()
 	for {
 		select {
@@ -350,17 +375,33 @@ func forwardWakeEvents(ctx context.Context, events <-chan struct{}, wake chan<- 
 				return
 			}
 			select {
-			case wake <- struct{}{}:
-			default:
+			case wake <- fileEvent{}:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}
 }
 
-func checkConditions(ctx context.Context, conds []cond, met []bool, eventCheck, watchersDisabled bool) (bool, error) {
+func checkConditions(ctx context.Context, conds []cond, met []bool, eventCheck bool, changedPaths map[string]struct{}, watchersDisabled bool) (bool, error) {
 	for i, c := range conds {
 		if met[i] {
 			continue
+		}
+		if eventCheck {
+			if changedPaths == nil {
+				if _, isExit := c.(*exitCond); !isExit {
+					continue
+				}
+			} else {
+				path := conditionFilePath(c)
+				if path == "" {
+					continue
+				}
+				if _, changed := changedPaths[path]; !changed {
+					continue
+				}
+			}
 		}
 		ok, err := checkCondition(ctx, c, eventCheck)
 		if err != nil {
@@ -377,6 +418,17 @@ func checkConditions(ctx context.Context, conds []cond, met []bool, eventCheck, 
 	return false, nil
 }
 
+func conditionFilePath(c cond) string {
+	switch fc := c.(type) {
+	case *fileCond:
+		return filepath.Clean(fc.path)
+	case *lineCond:
+		return filepath.Clean(fc.path)
+	default:
+		return ""
+	}
+}
+
 func checkCondition(ctx context.Context, c cond, eventCheck bool) (bool, error) {
 	if eventCheck {
 		if eventCond, ok := c.(interface{ checkEvent() (bool, error) }); ok {
@@ -387,14 +439,7 @@ func checkCondition(ctx context.Context, c cond, eventCheck bool) (bool, error) 
 }
 
 func waitEventDebounce(ctx context.Context) bool {
-	timer := time.NewTimer(inotifyCheckInterval)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
+	return waitContext(ctx, inotifyCheckInterval)
 }
 
 // timeoutReport — чего ещё ждём и что видно сейчас; выполненное — следом; как ждать дальше. Таймаут по умолчанию
