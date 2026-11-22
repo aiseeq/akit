@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -46,6 +47,9 @@ func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err
 
 // start brings the loader to the state of the tables and lists every transcript; it returns the paths to look at.
 func (l *loader) start() ([]string, error) {
+	if err := l.lock(); err != nil {
+		return nil, err
+	}
 	if err := l.ensureSchema(); err != nil {
 		return nil, err
 	}
@@ -195,4 +199,25 @@ func (l *loader) sweepSlice(want map[string]bool, now time.Time) {
 			want[f.src.Path] = true
 		}
 	}
+}
+
+// lock takes the lock of the database before the first write; held by another loader — errLocked.
+func (l *loader) lock() error {
+	if l.cfg.lock == "" || l.lockFile != nil {
+		return nil
+	}
+	var id string
+	if err := l.retry("server id", func() error {
+		var err error
+		id, err = serverID(context.Background(), l.srv)
+		return err
+	}); err != nil {
+		return err
+	}
+	f, err := takeLock(lockPath(l.cfg.lock, id, l.cfg.db))
+	if err != nil {
+		return err
+	}
+	l.lockFile = f
+	return nil
 }

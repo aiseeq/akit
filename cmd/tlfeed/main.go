@@ -9,6 +9,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +34,10 @@ Usage:
 Sources are the files tl --all --codex reads: Claude Code transcripts with subagents and the
 rollouts of worker codex sessions under --home.
 
+One loader per database: follow, --once and --materialize hold a lock (flock) on
+tlfeed-<db>-<serverUUID>.lock beside the state file, or in $XDG_RUNTIME_DIR/akit/tlfeed without
+one; a second loader exits at once with the pid of the holder. --verify and --check take no lock.
+
 Flags:
   --url URL        ClickHouse HTTP interface (default http://127.0.0.1:18123)
   --db NAME        database (default tr); the tables are created if missing
@@ -43,7 +48,8 @@ Flags:
   --idle D         a file that has not grown this long releases its parser (default 1h)
   --sweep D        every known file and every folder inotify does not watch is looked at once per D,
                    changed or not (default 5m); inotify watches the Claude projects and the codex
-                   sessions of worker tasks written to within 48h
+                   sessions of worker tasks written to within 48h, so a line added to a transcript
+                   of an older task is loaded only by the sweep, up to D late
   --rescan D       full listing of the transcripts (default 1h)
   --beat D         state file period, at most 60s (default 10s)
   --no-inotify     find changes by polling only
@@ -117,6 +123,7 @@ func parse(args []string) (options, error) {
 	if !stateGiven { // --state '' keeps no state file
 		o.cfg.state = defaultStatePath(o.cfg.home)
 	}
+	o.cfg.lock = lockDir(o.cfg.state)
 	return o, nil
 }
 
@@ -144,6 +151,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	c := &checker{srv: srv, db: o.cfg.db, home: o.cfg.home, out: stdout}
 	switch {
 	case o.materialize:
+		id, err := serverID(context.Background(), srv)
+		if err != nil {
+			return result(err, false, stderr)
+		}
+		held, err := takeLock(lockPath(o.cfg.lock, id, o.cfg.db))
+		if err != nil {
+			return result(err, false, stderr)
+		}
+		defer held.Close()
 		return result(c.materialize(), true, stderr)
 	case o.verify > 0:
 		ok, err := c.verify(o.verify)

@@ -27,6 +27,7 @@ type config struct {
 	rescan, sweep   time.Duration // full listing period; every known file and folder is looked at once per sweep
 	batch           int           // raw bytes per insert
 	inotify         bool
+	lock            string // folder of the lock files; "" — no lock (tests)
 }
 
 // loader keeps the files in the tables in step with the files on disk.
@@ -39,16 +40,17 @@ type loader struct {
 	files map[string]*file // by path
 	all   []*file          // every file known, gone ones too: ids, renames, the sweep
 	// parsers — the files that got a parser; one that has let it go stays until the next pass looks
-	parsers map[*file]bool
-	ids     map[uint64]bool
-	dirs    *dirs
-	st      *status
-	batch   batch
-	buf     []byte
-	ver     uint64
-	sweep   int
-	run     string // id of this run in the query_id of its writes
-	seq     int
+	parsers  map[*file]bool
+	ids      map[uint64]bool
+	dirs     *dirs
+	lockFile *os.File // the lock of the database, held for the life of the process
+	st       *status
+	batch    batch
+	buf      []byte
+	ver      uint64
+	sweep    int
+	run      string // id of this run in the query_id of its writes
+	seq      int
 	// errText is the last error of a retried call; it is cleared when a call succeeds
 	errText string
 	backoff time.Duration // first wait of a retry
@@ -436,6 +438,7 @@ func (l *loader) purge(f *file, why string) error {
 			return err
 		}
 	}
+	// the statements above did nothing if the file has a newer generation; then the clean row is turned away too
 	if err := l.storeFiles([]*file{f}, false); err != nil {
 		return err
 	}
@@ -448,6 +451,7 @@ func (l *loader) purge(f *file, why string) error {
 func (l *loader) storeFiles(fs []*file, dirty bool) error {
 	var b bytes.Buffer
 	ver := l.nextVer()
+	n := 0
 	for _, f := range fs {
 		if f.id == 0 {
 			continue
@@ -455,11 +459,16 @@ func (l *loader) storeFiles(fs []*file, dirty bool) error {
 		c := *f
 		c.size = 0
 		fileRow(&b, &c, ver, dirty)
+		n++
 	}
-	if b.Len() == 0 {
+	if n == 0 {
 		return nil
 	}
-	return l.insert("files", fileColumns, &b, fmt.Sprintf("files:v%d", ver), nil)
+	var fence []*file
+	if !dirty {
+		fence = fs // a clean row only over the dirty one of the same generation
+	}
+	return l.insert("files", fileColumns, &b, n, fmt.Sprintf("files:v%d", ver), fence)
 }
 
 func (l *loader) nextVer() uint64 {
@@ -722,17 +731,17 @@ func (l *loader) flush() error {
 		for _, f := range b.touched {
 			fileRow(&dirty, f.committed(), ver, true)
 		}
-		if err := l.insert("files", fileColumns, &dirty, fmt.Sprintf("files:v%d", ver), nil); err != nil {
+		if err := l.insert("files", fileColumns, &dirty, len(b.touched), fmt.Sprintf("files:v%d", ver), nil); err != nil {
 			return err
 		}
 	}
 	if b.rawRows > 0 {
-		if err := l.insert("raw", rawColumns, &b.raw, token(b.rawTok), b.touched); err != nil {
+		if err := l.insert("raw", rawColumns, &b.raw, b.rawRows, token(b.rawTok), b.touched); err != nil {
 			return err
 		}
 	}
 	if b.evRows > 0 {
-		if err := l.insert("events", eventColumns, &b.events, token(b.evTok), b.touched); err != nil {
+		if err := l.insert("events", eventColumns, &b.events, b.evRows, token(b.evTok), b.touched); err != nil {
 			return err
 		}
 	}
@@ -742,7 +751,8 @@ func (l *loader) flush() error {
 	for _, f := range b.touched {
 		fileRow(&files, f, ver, false)
 	}
-	if err := l.insert("files", fileColumns, &files, fmt.Sprintf("files:v%d", ver), nil); err != nil {
+	// the clean rows only for files that still have this generation: the batch is in the tables only then
+	if err := l.insert("files", fileColumns, &files, len(b.touched), fmt.Sprintf("files:v%d", ver), b.touched); err != nil {
 		return err
 	}
 	for _, f := range b.touched {
@@ -760,22 +770,36 @@ func (l *loader) flush() error {
 
 // insert sends rows in TSV under a dedup token. With fence, only the rows of those files go, and only while each
 // keeps its generation (genIs): a late insert of a stopped loader adds nothing after the next start's cleanup.
-func (l *loader) insert(table, columns string, body *bytes.Buffer, tok string, fence []*file) error {
+func (l *loader) insert(table, columns string, body *bytes.Buffer, rows int, tok string, fence []*file) error {
 	q := fmt.Sprintf("INSERT INTO %s.%s (%s) FORMAT TabSeparated", l.cfg.db, table, columns)
 	if len(fence) > 0 {
 		q = fmt.Sprintf("INSERT INTO %s.%s (%s) SELECT * FROM input() WHERE %s FORMAT TabSeparated", l.cfg.db, table, columns, l.genIs(fence...))
 	}
-	settings := url.Values{"insert_deduplication_token": {tok}, "async_insert": {"0"}}
+	// wait_end_of_query: the answer, with its summary of written rows, comes once the insert is over
+	settings := url.Values{"insert_deduplication_token": {tok}, "async_insert": {"0"}, "wait_end_of_query": {"1"}}
 	if l.cfg.once && table == "events" {
 		// the text index of a first load is built afterwards in one pass (--materialize): building it during
 		// a large insert does not fit the server's memory
 		settings.Set("exclude_materialize_skip_indexes_on_insert", "hay_ng")
 	}
 	data := body.Bytes()
-	return l.retry("insert "+table, func() error {
+	var written int64
+	if err := l.retry("insert "+table, func() error {
 		settings.Set("query_id", l.queryID())
-		return l.srv.post(context.Background(), q, bytes.NewReader(data), settings, nil, 10*time.Minute)
-	})
+		var err error
+		written, err = l.srv.insert(context.Background(), q, bytes.NewReader(data), settings, 10*time.Minute)
+		return err
+	}); err != nil {
+		return err
+	}
+	// written_rows counts the rows the materialized views write too: only raw and files have none
+	if table != "events" && written != int64(rows) {
+		// rows the generation filter turned away: another loader has taken the files on; nothing more is
+		// written, so no clean files row claims them
+		return fmt.Errorf("insert %s: the server wrote %d of %d rows: a file of the batch has a newer generation, "+
+			"another loader works on %s", table, written, rows, l.cfg.db)
+	}
+	return nil
 }
 
 // lag — bytes of complete lines in known files that the server has not confirmed.

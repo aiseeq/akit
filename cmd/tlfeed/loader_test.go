@@ -857,3 +857,80 @@ func TestStoppedAfterSizeStoredBeforeLines(t *testing.T) {
 	}
 	h.same(h.loader(nil), path)
 }
+
+// A second loader on a database another one works on (follow, --once or --materialize) ends at once with the pid
+// of the holder; --check and --verify take no lock. Without a state file the lock is in the runtime folder.
+func TestLockOneLoaderPerDatabase(t *testing.T) {
+	for _, noState := range []bool{false, true} {
+		t.Run(fmt.Sprintf("no-state-%t", noState), func(t *testing.T) {
+			h := newHarness(t)
+			write(t, claudePath(h.home), sample(t, "claude.jsonl"))
+			runtime := t.TempDir()
+			t.Setenv("XDG_RUNTIME_DIR", runtime)
+			state := filepath.Join(t.TempDir(), "st", "state.json")
+			args := []string{"--url", h.srv.base, "--db", "tq", "--home", h.home, "--state", state}
+			dir := filepath.Dir(state)
+			if noState {
+				args[len(args)-1], dir = "", filepath.Join(runtime, "akit", "tlfeed")
+			}
+			held, err := takeLock(lockPath(dir, "00000000-0000-4000-8000-0000000000fa", "tq"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, mode := range [][]string{{"--once"}, {"--materialize"}, {"--tick", "1ms"}} {
+				var out, errOut bytes.Buffer
+				code := run(append(slices.Clone(args), mode...), &out, &errOut)
+				want := fmt.Sprintf("another loader works on this database: pid %d holds", os.Getpid())
+				if code == 0 || !strings.Contains(errOut.String(), want) {
+					t.Fatalf("%v with the lock held: exit %d, %q", mode, code, errOut.String())
+				}
+			}
+			if len(h.fake.inserts) != 0 {
+				t.Fatalf("the second loader wrote: %d inserts", len(h.fake.inserts))
+			}
+			var out, errOut bytes.Buffer
+			if code := run(append(slices.Clone(args), "--check"), &out, &errOut); strings.Contains(errOut.String(), "another loader") {
+				t.Fatalf("--check took the lock: exit %d, %q", code, errOut.String())
+			}
+			held.Close()
+			out.Reset()
+			errOut.Reset()
+			if code := run(append(slices.Clone(args), "--once"), &out, &errOut); code != 0 {
+				t.Fatalf("--once after the lock is free: exit %d, %q", code, errOut.String())
+			}
+		})
+	}
+}
+
+// A loader waits on its insert, alive, while another one starts on the same database (as with a lock in another
+// folder): the second takes the files on with a new generation, the insert of the first is turned away, and the
+// first stops instead of writing a clean files row over them.
+func TestTwinLoaderInsertTurnedAway(t *testing.T) {
+	for _, table := range []string{"raw", "events"} {
+		t.Run(table, func(t *testing.T) {
+			h := newHarness(t)
+			data := sample(t, "claude.jsonl")
+			path := claudePath(h.home)
+			half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+			write(t, path, data[:half])
+			l1 := h.loader(nil)
+			appendTo(t, path, data[half:])
+			p := h.fake.pauseNext(table)
+			errc := make(chan error, 1)
+			go func() { errc <- l1.pass(false) }()
+			select {
+			case <-p.arrived:
+			case err := <-errc:
+				t.Fatalf("first loader ended before its %s insert: %v", table, err)
+			case <-time.After(time.Minute):
+				t.Fatalf("no %s insert of the first loader within a minute", table)
+			}
+			h.loader(nil)
+			close(p.release)
+			if err := <-errc; err == nil || !strings.Contains(err.Error(), "newer generation") {
+				t.Fatalf("first loader after its insert was turned away: %v", err)
+			}
+			h.same(h.loader(nil), path)
+		})
+	}
+}
