@@ -1974,6 +1974,9 @@ func nameMatchAt(text string, ix []int) (contextMatch, bool) {
 	if !markdownPassword && !value.quoted {
 		value = extendInvalidKeywordAssignment(text, value, delimiter)
 	}
+	if !markdownPassword && !value.quoted && codeReferenceExpression(text, value, ix[2], name, kind, delimiter) {
+		return contextMatch{}, false
+	}
 	secret := namedValueIsSecret(text, ix[2], name, kind, delimiter, value)
 	if markdownPassword {
 		secret = englishPasswordValueIsSecret(text, ix[2], name, kind, delimiter, value)
@@ -1985,6 +1988,10 @@ func nameMatchAt(text string, ix []int) (contextMatch, bool) {
 }
 
 func namedValueIsSecret(text string, nameAt int, name, kind, delimiter string, value contextValue) bool {
+	shortValue := strings.TrimRight(text[value.start:value.end], ",;")
+	if !value.quoted && strings.EqualFold(name, "credentials") && len(shortValue) <= 2 && isPlainWord(shortValue) {
+		return false
+	}
 	if valueIsStructure(text, value) || plainValueFor(name, text[value.start:value.end]) || nonSecretValueForm(text, value, name) {
 		return false
 	}
@@ -1999,6 +2006,291 @@ func namedValueIsSecret(text string, nameAt int, name, kind, delimiter string, v
 		return false
 	}
 	return valueIsValue(text, value, name, kind, delimiter == ":" || delimiter == ":=")
+}
+
+// codeReferenceExpression recognizes only the narrow reference grammar that
+// is safe to leave unmasked. Invalid values use the ordinary matcher unchanged.
+func codeReferenceExpression(text string, value contextValue, nameAt int, name, kind, delimiter string) bool {
+	limit := min(len(text), value.start+256)
+	parts, at, dotted, ok := codeExpressionPath(text, value.start, limit)
+	if !ok || at >= limit || text[at] != '(' && text[at] != '[' {
+		return false
+	}
+	for _, part := range parts {
+		if codePathNameHasMixedCaseDigits(text[part.start:part.end]) {
+			return false
+		}
+		if codeCodePartLooksSecret(text, nameAt, name, kind, delimiter, part, false) {
+			return false
+		}
+	}
+	containerParts := parts
+	if dotted && len(parts) > 1 && text[parts[len(parts)-1].start:parts[len(parts)-1].end] == "get" {
+		containerParts = parts[:len(parts)-1]
+	}
+	if len(containerParts) == 1 && !codeSinglePartContainerAllowed(text[containerParts[0].start:containerParts[0].end]) {
+		return false
+	}
+	open := text[at]
+	close := byte(')')
+	if open == '[' {
+		close = ']'
+	}
+	end, ok := codeClosingDelimiter(text, at, limit, open, close)
+	if !ok || !codeExpressionEndsAtDelimiter(text, end+1) {
+		return false
+	}
+	if open == '[' {
+		return codeSingleKeyArgument(text, at+1, end, nameAt, name, kind, delimiter)
+	}
+	last := parts[len(parts)-1]
+	if len(parts) > 1 && text[last.start:last.end] == "get" {
+		return codeGetCallIsReference(text, at+1, end, nameAt, name, kind, delimiter)
+	}
+	return codeSingleKeyArgument(text, at+1, end, nameAt, name, kind, delimiter)
+}
+
+func codeExpressionPath(text string, at, limit int) ([]contextValue, int, bool, bool) {
+	if at >= limit || !codeIdentifierStart(text[at]) {
+		return nil, at, false, false
+	}
+	var parts []contextValue
+	dotted := false
+	for {
+		start := at
+		at++
+		for at < limit && codeIdentifierByte(text[at]) {
+			at++
+		}
+		parts = append(parts, contextValue{start: start, end: at})
+		if at >= limit || text[at] != '.' {
+			return parts, at, dotted, true
+		}
+		dotted = true
+		at++
+		if at >= limit || !codeIdentifierStart(text[at]) {
+			return nil, at, dotted, false
+		}
+	}
+}
+
+func codeSingleKeyArgument(text string, at, end, nameAt int, name, kind, delimiter string) bool {
+	key, next, ok := codeQuotedKey(text, at, end)
+	return ok && skipCodeSpace(text, next, end) == end && !codeCodePartLooksSecret(text, nameAt, name, kind, delimiter, key, true)
+}
+
+func codeGetCallIsReference(text string, at, end, nameAt int, name, kind, delimiter string) bool {
+	key, next, ok := codeQuotedKey(text, at, end)
+	if !ok || codeCodePartLooksSecret(text, nameAt, name, kind, delimiter, key, true) {
+		return false
+	}
+	next = skipCodeSpace(text, next, end)
+	if next == end {
+		return true
+	}
+	if next >= end || text[next] != ',' {
+		return false
+	}
+	next = skipCodeSpace(text, next+1, end)
+	if next >= end {
+		return false
+	}
+	if text[next] == '"' || text[next] == '\'' {
+		fallback, after, ok := codeQuotedString(text, next, end)
+		if !ok || codeCodePartLooksSecret(text, nameAt, name, kind, delimiter, fallback, true) {
+			return false
+		}
+		next = after
+	} else {
+		_, next, ok = codeParseIdentifier(text, next, end)
+		if !ok {
+			return false
+		}
+	}
+	return skipCodeSpace(text, next, end) == end
+}
+
+func codeCodePartLooksSecret(text string, nameAt int, name, kind, delimiter string, part contextValue, quoted bool) bool {
+	value := text[part.start:part.end]
+	if quoted {
+		if isCodeIdentifierWord(value) {
+			return false
+		}
+		part.quoted = true
+		return namedValueIsSecret(text, nameAt, name, kind, delimiter, part)
+	}
+	if codePathNameCanBeIdentifier(value) {
+		return false
+	}
+	if equalSecretName(value, name) {
+		return true
+	}
+	return valueIsValue(text, part, name, kind, false)
+}
+
+func isCodeIdentifierWord(value string) bool {
+	if value == "" || !codeIdentifierStart(value[0]) {
+		return false
+	}
+	hasDigit := false
+	hasUnderscore := false
+	for i := 0; i < len(value); i++ {
+		if !codeIdentifierByte(value[i]) {
+			return false
+		}
+		if value[i] >= '0' && value[i] <= '9' {
+			hasDigit = true
+		}
+		if value[i] == '_' {
+			hasUnderscore = true
+		}
+	}
+	return !codePathNameHasMixedCaseDigits(value) && (!hasDigit || len(value) <= 4 || hasUnderscore)
+}
+
+func codePathNameHasMixedCaseDigits(value string) bool {
+	hasDigit := false
+	hasUpper := false
+	hasLower := false
+	for i := 0; i < len(value); i++ {
+		switch {
+		case value[i] >= '0' && value[i] <= '9':
+			hasDigit = true
+		case value[i] >= 'A' && value[i] <= 'Z':
+			hasUpper = true
+		case value[i] >= 'a' && value[i] <= 'z':
+			hasLower = true
+		}
+	}
+	return hasDigit && hasUpper && hasLower
+}
+
+func codeSinglePartContainerAllowed(value string) bool {
+	if len(value) <= 4 || strings.Contains(value, "_") {
+		return true
+	}
+	return codePathNameHasContainerSuffix(value)
+}
+
+func codePathNameCanBeIdentifier(value string) bool {
+	if len(value) <= 4 || codePathNameHasContainerSuffix(value) {
+		return true
+	}
+	return strings.Contains(value, "_") && hasCodeDigit(value) && !codePathNameHasMixedCaseDigits(value)
+}
+
+func hasCodeDigit(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] >= '0' && value[i] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+func codePathNameHasContainerSuffix(value string) bool {
+	lower := strings.ToLower(value)
+	for _, suffix := range []string{
+		"env", "environ", "config", "conf", "cfg", "settings", "secrets", "creds", "credentials",
+		"data", "opts", "options", "params", "kwargs", "args", "vars", "row", "item", "obj",
+		"payload", "resp", "response", "json", "dict", "map", "store", "vault",
+	} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func codeQuotedKey(text string, at, end int) (contextValue, int, bool) {
+	value, next, ok := codeQuotedString(text, at, end)
+	if !ok || value.start >= value.end || !codeIdentifierStart(text[value.start]) {
+		return contextValue{}, at, false
+	}
+	for i := value.start + 1; i < value.end; i++ {
+		if !codeIdentifierByte(text[i]) && text[i] != '.' && text[i] != '-' {
+			return contextValue{}, at, false
+		}
+	}
+	return value, next, true
+}
+
+func codeQuotedString(text string, at, end int) (contextValue, int, bool) {
+	if at >= end || text[at] != '"' && text[at] != '\'' {
+		return contextValue{}, at, false
+	}
+	quote := text[at]
+	start := at + 1
+	for at = start; at < end; at++ {
+		if text[at] == quote {
+			return contextValue{start: start, end: at}, at + 1, true
+		}
+		if text[at] == '\\' {
+			return contextValue{}, at, false
+		}
+	}
+	return contextValue{}, at, false
+}
+
+func codeParseIdentifier(text string, at, end int) (contextValue, int, bool) {
+	if at >= end || !codeIdentifierStart(text[at]) {
+		return contextValue{}, at, false
+	}
+	start := at
+	for at < end && codeIdentifierByte(text[at]) {
+		at++
+	}
+	return contextValue{start: start, end: at}, at, true
+}
+
+func codeClosingDelimiter(text string, start, limit int, open, close byte) (int, bool) {
+	depth := 0
+	var quote byte
+	for at := start; at < limit; at++ {
+		c := text[at]
+		if quote != 0 {
+			if c == '\\' {
+				at++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			quote = c
+			continue
+		}
+		if c == open {
+			depth++
+		} else if c == close {
+			depth--
+			if depth == 0 {
+				return at, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func codeExpressionEndsAtDelimiter(text string, at int) bool {
+	return at == len(text) || strings.ContainsRune(" \t\r\n,);", rune(text[at]))
+}
+
+func codeIdentifierStart(c byte) bool {
+	return c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+func codeIdentifierByte(c byte) bool {
+	return codeIdentifierStart(c) || c >= '0' && c <= '9'
+}
+
+func skipCodeSpace(text string, at, end int) int {
+	for at < end && (text[at] == ' ' || text[at] == '\t' || text[at] == '\r' || text[at] == '\n') {
+		at++
+	}
+	return at
 }
 
 // codeAssignmentExpression leaves common unquoted assignment expressions alone.
