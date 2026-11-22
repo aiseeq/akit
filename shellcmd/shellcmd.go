@@ -506,7 +506,22 @@ func syntaxCallName(words []*syntax.Word) (string, []*syntax.Word) {
 		return "", nil
 	}
 	for (name == "command" || name == "builtin" || name == "exec" || name == "time") && len(words) > 1 {
+		wrapper := name
 		words = words[1:]
+		for len(words) > 0 {
+			option, literal := wordValue(words[0])
+			if !literal {
+				return "", nil
+			}
+			if option == "--" || wrapper == "time" && option == "-p" {
+				words = words[1:]
+				continue
+			}
+			break
+		}
+		if len(words) == 0 {
+			return "", nil
+		}
 		name, ok = wordValue(words[0])
 		if !ok {
 			return "", nil
@@ -679,7 +694,7 @@ func staticUnsafeDeclaration(file *syntax.File, checkFunctions, checkAssignments
 
 func staticUnsafeCommandName(name string) bool {
 	switch name {
-	case "eval", "source", ".", "alias", "unalias", "hash", "history", "trap", "shopt", "enable":
+	case "eval", "source", ".", "alias", "unalias", "hash", "history", "fc", "trap", "shopt", "enable":
 		return true
 	default:
 		return false

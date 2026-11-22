@@ -1465,6 +1465,61 @@ func TestArgStaticRound18BuiltinArguments(t *testing.T) {
 	}
 }
 
+func TestArgStaticRound19WrappedBuiltinArguments(t *testing.T) {
+	for _, src := range []string{
+		`command -- read -r "$X$Y" <<<1`,
+		`command -- printf -v "$X$Y" 1`,
+		`builtin -- printf -v "$X$Y" 1`,
+		`exec -- read -r "$X$Y" <<<1`,
+		`time -- read -r "$X$Y" <<<1`,
+		`time -p -- read -r "$X$Y" <<<1`,
+		`set -o history; fc -s`,
+	} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", src, err)
+		}
+		for _, call := range calls {
+			if call.Name != "read" && call.Name != "printf" && call.Name != "fc" {
+				continue
+			}
+			for i := range call.Args {
+				if call.ArgStatic(i) {
+					t.Errorf("ArgStatic(%d) = true for %q: %+v", i, src, call)
+				}
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		src  string
+		name string
+	}{
+		{`builtin printf -v x lit`, "printf"},
+		{`command read -r x`, "read"},
+	} {
+		calls, err := Calls(tc.src)
+		if err != nil {
+			t.Fatalf("Calls(%q): %v", tc.src, err)
+		}
+		var target *Call
+		for i := range calls {
+			if calls[i].Name == tc.name {
+				target = &calls[i]
+				break
+			}
+		}
+		if target == nil {
+			t.Fatalf("Calls(%q) = %+v, missing %s", tc.src, calls, tc.name)
+		}
+		for i := range target.Args {
+			if !target.ArgStatic(i) {
+				t.Errorf("ArgStatic(%d) = false for control %q: %+v", i, tc.src, target)
+			}
+		}
+	}
+}
+
 func TestArgStaticUnaffectedByInPlaceCallFilter(t *testing.T) {
 	for _, src := range []string{
 		`eval true; printf %s '$HOME'`,
