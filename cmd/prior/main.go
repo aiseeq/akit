@@ -144,11 +144,7 @@ func newQuery(words []string) (query, error) {
 		}
 	}
 	q.any = regexp.MustCompile("(?i)(?:" + strings.Join(words, ")|(?:") + ")") // каждое слово уже скомпилировалось
-	runs, err := newRunFilter(q.any)
-	if err != nil {
-		return q, err
-	}
-	q.runs = runs
+	q.runs = queryRunFilter(words, q.wordRuns)
 	return q, nil
 }
 

@@ -19,30 +19,35 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 )
 
 const (
-	runCacheVersion        = 3
-	transcriptCacheVersion = 5
+	runCacheVersion        = 5
+	transcriptCacheVersion = 6
 	cacheDirMode           = 0700
-	runBloomBytes          = 1536
+	runBloomBytes          = 768
 	runHeaderBytes         = 24 + runBloomBytes
 	runIndexKeyBytes       = 32
-	runIndexRecordBytes    = runIndexKeyBytes + 20 + runBloomBytes
+	runIndexMetadataBytes  = 36
+	runIndexRecordBytes    = runIndexKeyBytes + runIndexMetadataBytes + runBloomBytes
 	bloomFnvPrime          = uint64(1099511628211)
 )
 
-var runCacheMagic = [4]byte{'P', 'R', 'V', '3'}
-var replyCacheMagic = [4]byte{'R', 'P', 'L', '1'}
-var runIndexMagic = [8]byte{'P', 'R', 'I', 'D', 'X', '0', '0', '7'}
+var runCacheMagic = [4]byte{'P', 'R', 'V', '5'}
+var replyCacheMagic = [4]byte{'R', 'P', 'L', '2'}
+var runIndexMagic = [8]byte{'P', 'R', 'I', 'D', 'X', '0', '0', '9'}
+var openPriorSource = os.Open
 
 type transcriptLinesCache struct {
 	Version      int            `json:"version"`
 	Path         string         `json:"path"`
 	Size         int64          `json:"size"`
 	ModTime      int64          `json:"mtime"`
+	Device       uint64         `json:"device"`
+	Inode        uint64         `json:"inode"`
 	ScannedBytes int64          `json:"scanned_bytes"`
-	PrefixTail   []byte         `json:"prefix_tail"`
+	PrefixHash   []byte         `json:"prefix_hash"`
 	LineCount    int            `json:"line_count"`
 	Lines        map[string]int `json:"lines"`
 }
@@ -52,8 +57,10 @@ type replyPrewarmCache struct {
 	Path         string `json:"path"`
 	Size         int64  `json:"size"`
 	ModTime      int64  `json:"mtime"`
+	Device       uint64 `json:"device"`
+	Inode        uint64 `json:"inode"`
 	ScannedBytes int64  `json:"scanned_bytes"`
-	PrefixTail   []byte `json:"prefix_tail"`
+	PrefixHash   []byte `json:"prefix_hash"`
 }
 
 type runIndexManifest struct {
@@ -64,8 +71,59 @@ type runIndexManifest struct {
 type runIndexEntry struct {
 	Size    int64  `json:"size"`
 	ModTime int64  `json:"mtime"`
+	Device  uint64 `json:"device"`
+	Inode   uint64 `json:"inode"`
 	Bloom   []byte `json:"bloom"`
 	CRC     uint32 `json:"crc"`
+}
+
+func fileIdentity(info os.FileInfo) (device, inode uint64, ok bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return uint64(stat.Dev), stat.Ino, true
+}
+
+func filePrefixHash(source io.ReaderAt, size int64) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("размер префикса файла отрицательный")
+	}
+	h := sha256.New()
+	if size == 0 {
+		return h.Sum(nil), nil
+	}
+	const window = int64(4096)
+	maxStart := max(int64(0), size-window)
+	starts := []int64{0, size / 4, size / 2, (size * 3) / 4, maxStart}
+	seen := make(map[int64]struct{}, len(starts))
+	for _, start := range starts {
+		start = min(start, maxStart)
+		if _, ok := seen[start]; ok {
+			continue
+		}
+		seen[start] = struct{}{}
+		length := min(window, size-start)
+		var meta [16]byte
+		binary.LittleEndian.PutUint64(meta[:8], uint64(start))
+		binary.LittleEndian.PutUint64(meta[8:], uint64(length))
+		_, _ = h.Write(meta[:])
+		buf := make([]byte, length)
+		n, err := source.ReadAt(buf, start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("окно префикса файла не прочиталось: %w", err)
+		}
+		if int64(n) != length {
+			return nil, io.ErrUnexpectedEOF
+		}
+		_, _ = h.Write(buf)
+	}
+	return h.Sum(nil), nil
+}
+
+func sameFileIdentity(info os.FileInfo, device, inode uint64) bool {
+	actualDevice, actualInode, ok := fileIdentity(info)
+	return ok && actualDevice == device && actualInode == inode
 }
 
 func cachePath(name string) string {
@@ -122,7 +180,7 @@ func loadTranscriptLines(path string) (transcriptLinesCache, bool, error) {
 	}
 	if cache.Version != transcriptCacheVersion || cache.Path != path || cache.Lines == nil ||
 		cache.Size < 0 || cache.ScannedBytes < 0 || cache.ScannedBytes > cache.Size || cache.LineCount < 0 ||
-		len(cache.PrefixTail) != int(min(int64(64), cache.ScannedBytes)) {
+		len(cache.PrefixHash) != sha256.Size || cache.Device == 0 || cache.Inode == 0 {
 		return transcriptLinesCache{}, false, fmt.Errorf("версия или данные индекса транскрипта не подходят")
 	}
 	return cache, true, nil
@@ -156,16 +214,42 @@ func loadReplyPrewarmCache() (replyPrewarmCache, bool, error) {
 	if err := json.Unmarshal(data, &cache); err != nil {
 		return replyPrewarmCache{}, false, fmt.Errorf("индекс прогрева реплик повреждён: %w", err)
 	}
-	if cache.Version != 1 || cache.Size < 0 || cache.ScannedBytes < 0 || cache.ScannedBytes > cache.Size ||
-		len(cache.PrefixTail) != int(min(int64(64), cache.ScannedBytes)) {
+	if cache.Version != 2 || cache.Size < 0 || cache.ScannedBytes < 0 || cache.ScannedBytes > cache.Size ||
+		len(cache.PrefixHash) != sha256.Size || cache.Device == 0 || cache.Inode == 0 {
 		return replyPrewarmCache{}, false, fmt.Errorf("версия или данные индекса прогрева реплик не подходят")
 	}
 	return cache, true, nil
 }
 
 func saveReplyPrewarmCache(cache replyPrewarmCache) error {
-	cache.Version = 1
+	cache.Version = 2
 	return saveJSONCache(cachePath("reply-prewarm.json"), "индекс прогрева реплик", cache)
+}
+
+func canWritePriorCache() bool {
+	root := filepath.Dir(cachePath(".write-probe"))
+	if root == "." || root == "" {
+		return false
+	}
+	if err := os.MkdirAll(root, cacheDirMode); err != nil {
+		logCacheError(err)
+		return false
+	}
+	f, err := os.CreateTemp(root, ".prior-probe-*.tmp")
+	if err != nil {
+		logCacheError(err)
+		return false
+	}
+	name := f.Name()
+	_, writeErr := f.Write(make([]byte, 64<<10))
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	removeErr := os.Remove(name)
+	if err := errors.Join(writeErr, syncErr, closeErr, removeErr); err != nil {
+		logCacheError(err)
+		return false
+	}
+	return true
 }
 
 func saveCacheBytes(path string, data []byte) (err error) {
@@ -204,56 +288,104 @@ func saveCacheBytes(path string, data []byte) (err error) {
 }
 
 func readCachedReplies(path string) ([]byte, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("журнал ответов не stat-нулся: %w", err)
-	}
 	cacheFile := replyCachePath(path)
+	for range 3 {
+		source, err := openPriorSource(path)
+		if err != nil {
+			return nil, fmt.Errorf("журнал ответов не прочитался: %w", err)
+		}
+		info, err := source.Stat()
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("журнал ответов не прочитался: %w", err), source.Close())
+		}
+		device, inode, identityOK := fileIdentity(info)
+		if !identityOK || !info.Mode().IsRegular() {
+			data, readErr := io.ReadAll(source)
+			closeErr := source.Close()
+			if readErr != nil {
+				return nil, fmt.Errorf("журнал ответов не прочитался: %w", readErr)
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("журнал ответов не закрылся: %w", closeErr)
+			}
+			return data, nil
+		}
+		beforeHash, err := filePrefixHash(source, info.Size())
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("журнал ответов не прочитался: %w", err), source.Close())
+		}
+		data, err := replyDataFromSource(source, cacheFile, info, device, inode)
+		if err != nil {
+			return nil, errors.Join(err, source.Close())
+		}
+		stable, stableErr := replySourceStable(path, source, info, data, beforeHash)
+		closeErr := source.Close()
+		if closeErr != nil {
+			return nil, fmt.Errorf("журнал ответов не закрылся: %w", closeErr)
+		}
+		if stableErr != nil {
+			return nil, stableErr
+		}
+		if !stable {
+			continue
+		}
+		if cacheFile != "" {
+			logCacheError(writeReplyCache(cacheFile, info, device, inode, beforeHash, data))
+		}
+		return data, nil
+	}
+	return nil, fmt.Errorf("журнал ответов менялся во время чтения")
+}
+
+func replyDataFromSource(source *os.File, cacheFile string, info os.FileInfo, device, inode uint64) ([]byte, error) {
+	var data []byte
 	if cacheFile != "" {
-		state, cacheErr := readReplyCache(cacheFile, info)
+		state, cacheErr := readReplyCache(cacheFile, source, info, device, inode)
 		logCacheError(cacheErr)
 		if state.Valid {
 			return state.Data, nil
 		}
-		if state.Size > 0 && state.Size < info.Size() && len(state.Data) > 0 && state.Data[len(state.Data)-1] == '\n' {
-			data, appended, appendErr := appendReplyTail(path, info.Size(), state.Size, state.Data)
-			logCacheError(appendErr)
-			if appended {
-				logCacheError(writeReplyCache(cacheFile, info, data))
-				return data, nil
-			}
+		if state.PrefixValid && state.Size < info.Size() && len(state.Data) > 0 && state.Data[len(state.Data)-1] == '\n' {
+			data, cacheErr = appendReplyTailFile(source, info.Size(), state.Size, state.Data)
+			logCacheError(cacheErr)
 		}
 	}
-	data, err := os.ReadFile(path)
+	if data != nil {
+		return data, nil
+	}
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("журнал ответов не позиционировался: %w", err)
+	}
+	data, err := io.ReadAll(source)
 	if err != nil {
 		return nil, fmt.Errorf("журнал ответов не прочитался: %w", err)
-	}
-	if cacheFile != "" {
-		logCacheError(writeReplyCache(cacheFile, info, data))
 	}
 	return data, nil
 }
 
-func appendReplyTail(path string, size, offset int64, prefix []byte) ([]byte, bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false, fmt.Errorf("журнал для дописывания не открылся: %w", err)
+func replySourceStable(path string, source *os.File, info os.FileInfo, data, beforeHash []byte) (bool, error) {
+	after, statErr := source.Stat()
+	pathInfo, pathErr := os.Stat(path)
+	afterHash, hashErr := filePrefixHash(source, info.Size())
+	if err := errors.Join(statErr, pathErr, hashErr); err != nil {
+		return false, err
 	}
+	return os.SameFile(info, after) && os.SameFile(info, pathInfo) && after.Size() == info.Size() &&
+		after.ModTime().Equal(info.ModTime()) && int64(len(data)) == info.Size() && bytes.Equal(beforeHash, afterHash), nil
+}
+
+func appendReplyTailFile(f *os.File, size, offset int64, prefix []byte) ([]byte, error) {
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, false, errors.Join(fmt.Errorf("журнал не позиционировался: %w", err), f.Close())
+		return nil, fmt.Errorf("журнал не позиционировался: %w", err)
 	}
 	tail, readErr := io.ReadAll(io.LimitReader(f, size-offset+1))
-	closeErr := f.Close()
 	if readErr != nil {
-		return nil, false, fmt.Errorf("дописанный журнал не прочитался: %w", readErr)
-	}
-	if closeErr != nil {
-		return nil, false, fmt.Errorf("журнал не закрылся: %w", closeErr)
+		return nil, fmt.Errorf("дописанный журнал не прочитался: %w", readErr)
 	}
 	if int64(len(tail)) != size-offset {
-		return nil, false, nil
+		return nil, nil
 	}
-	return append(prefix, tail...), true, nil
+	return append(prefix, tail...), nil
 }
 
 func replyCachePath(path string) string {
@@ -262,12 +394,15 @@ func replyCachePath(path string) string {
 }
 
 type replyCacheState struct {
-	Data  []byte
-	Size  int64
-	Valid bool
+	Data        []byte
+	Size        int64
+	Valid       bool
+	PrefixValid bool
 }
 
-func readReplyCache(path string, sourceInfo os.FileInfo) (replyCacheState, error) {
+const replyCacheHeaderBytes = 68
+
+func readReplyCache(path string, source *os.File, sourceInfo os.FileInfo, device, inode uint64) (replyCacheState, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return replyCacheState{}, nil
@@ -275,7 +410,7 @@ func readReplyCache(path string, sourceInfo os.FileInfo) (replyCacheState, error
 	if err != nil {
 		return replyCacheState{}, fmt.Errorf("кэш журнала не открылся: %w", err)
 	}
-	header := make([]byte, 20)
+	header := make([]byte, replyCacheHeaderBytes)
 	if _, err := io.ReadFull(f, header); err != nil {
 		return replyCacheState{}, errors.Join(fmt.Errorf("заголовок кэша журнала не прочитался: %w", err), f.Close())
 	}
@@ -284,9 +419,24 @@ func readReplyCache(path string, sourceInfo os.FileInfo) (replyCacheState, error
 	}
 	size := int64(binary.LittleEndian.Uint64(header[4:12]))
 	mtime := int64(binary.LittleEndian.Uint64(header[12:20]))
-	if size < 0 || size > sourceInfo.Size() || (size == sourceInfo.Size() && mtime != sourceInfo.ModTime().UnixNano()) {
+	cacheDevice := binary.LittleEndian.Uint64(header[20:28])
+	cacheInode := binary.LittleEndian.Uint64(header[28:36])
+	if size < 0 || size > sourceInfo.Size() || cacheDevice != device || cacheInode != inode {
 		if err := f.Close(); err != nil {
 			return replyCacheState{}, fmt.Errorf("кэш журнала не закрылся: %w", err)
+		}
+		return replyCacheState{}, nil
+	}
+	prefixHash := make([]byte, sha256.Size)
+	copy(prefixHash, header[36:replyCacheHeaderBytes])
+	actualHash, hashErr := filePrefixHash(source, size)
+	if hashErr != nil {
+		return replyCacheState{}, errors.Join(hashErr, f.Close())
+	}
+	if !bytes.Equal(prefixHash, actualHash) || (size == sourceInfo.Size() && mtime != sourceInfo.ModTime().UnixNano()) {
+		closeErr := f.Close()
+		if closeErr != nil {
+			return replyCacheState{}, fmt.Errorf("кэш журнала не закрылся: %w", closeErr)
 		}
 		return replyCacheState{}, nil
 	}
@@ -302,10 +452,10 @@ func readReplyCache(path string, sourceInfo os.FileInfo) (replyCacheState, error
 	if err != nil || int64(len(data)) != size {
 		return replyCacheState{}, fmt.Errorf("кэш журнала повреждён")
 	}
-	return replyCacheState{Data: data, Size: size, Valid: size == sourceInfo.Size() && mtime == sourceInfo.ModTime().UnixNano()}, nil
+	return replyCacheState{Data: data, Size: size, PrefixValid: true, Valid: size == sourceInfo.Size() && mtime == sourceInfo.ModTime().UnixNano()}, nil
 }
 
-func writeReplyCache(path string, info os.FileInfo, data []byte) error {
+func writeReplyCache(path string, info os.FileInfo, device, inode uint64, prefixHash, data []byte) error {
 	var compressed bytes.Buffer
 	gz, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
 	if err != nil {
@@ -319,10 +469,16 @@ func writeReplyCache(path string, info os.FileInfo, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("кэш журнала не сжался: %w", err)
 	}
-	header := make([]byte, 20)
+	if len(prefixHash) != sha256.Size {
+		return fmt.Errorf("хеш префикса журнала недопустим")
+	}
+	header := make([]byte, replyCacheHeaderBytes)
 	copy(header[:4], replyCacheMagic[:])
 	binary.LittleEndian.PutUint64(header[4:12], uint64(info.Size()))
 	binary.LittleEndian.PutUint64(header[12:20], uint64(info.ModTime().UnixNano()))
+	binary.LittleEndian.PutUint64(header[20:28], device)
+	binary.LittleEndian.PutUint64(header[28:36], inode)
+	copy(header[36:], prefixHash)
 	return saveCacheBytes(path, append(header, compressed.Bytes()...))
 }
 
@@ -338,7 +494,7 @@ func runIndexKey(path string) string {
 
 func loadRunIndex() (runIndexManifest, error) {
 	index := runIndexManifest{Version: runCacheVersion, Files: make(map[string]runIndexEntry)}
-	path := cachePath("runs-index-v6.bin")
+	path := cachePath("runs-index-v7.bin")
 	if path == "" {
 		return index, nil
 	}
@@ -376,7 +532,7 @@ func loadRunIndex() (runIndexManifest, error) {
 			return index, fmt.Errorf("размер записи отчётного индекса недопустим")
 		}
 		pathHash := make([]byte, runIndexKeyBytes)
-		metadata := make([]byte, 20)
+		metadata := make([]byte, runIndexMetadataBytes)
 		bloom := make([]byte, runBloomBytes)
 		if _, err := io.ReadFull(r, pathHash); err != nil {
 			return index, fmt.Errorf("хеш пути отчётного индекса не прочитался: %w", err)
@@ -389,7 +545,8 @@ func loadRunIndex() (runIndexManifest, error) {
 		}
 		entry := runIndexEntry{
 			Size: int64(binary.LittleEndian.Uint64(metadata[:8])), ModTime: int64(binary.LittleEndian.Uint64(metadata[8:16])),
-			CRC: binary.LittleEndian.Uint32(metadata[16:20]), Bloom: bloom,
+			Device: binary.LittleEndian.Uint64(metadata[16:24]), Inode: binary.LittleEndian.Uint64(metadata[24:32]),
+			CRC: binary.LittleEndian.Uint32(metadata[32:36]), Bloom: bloom,
 		}
 		if entry.Size < 0 || crc32.ChecksumIEEE(bloom) != entry.CRC {
 			return index, fmt.Errorf("запись отчётного индекса повреждена")
@@ -407,7 +564,7 @@ func loadRunIndex() (runIndexManifest, error) {
 }
 
 func saveRunIndex(index runIndexManifest) error {
-	path := cachePath("runs-index-v6.bin")
+	path := cachePath("runs-index-v7.bin")
 	if path == "" {
 		return nil
 	}
@@ -423,10 +580,12 @@ func saveRunIndex(index runIndexManifest) error {
 			return fmt.Errorf("запись отчётного индекса недопустима")
 		}
 		data = append(data, pathHash...)
-		metadata := make([]byte, 20)
+		metadata := make([]byte, runIndexMetadataBytes)
 		binary.LittleEndian.PutUint64(metadata[:8], uint64(entry.Size))
 		binary.LittleEndian.PutUint64(metadata[8:16], uint64(entry.ModTime))
-		binary.LittleEndian.PutUint32(metadata[16:20], entry.CRC)
+		binary.LittleEndian.PutUint64(metadata[16:24], entry.Device)
+		binary.LittleEndian.PutUint64(metadata[24:32], entry.Inode)
+		binary.LittleEndian.PutUint32(metadata[32:36], entry.CRC)
 		data = append(data, metadata...)
 		data = append(data, entry.Bloom...)
 	}
@@ -473,31 +632,71 @@ func matchRunFilesCached(q query, files []string) []runFileResult {
 }
 
 func matchRunFileCached(q query, path string, index runIndexManifest, changed *atomic.Bool) (string, runIndexEntry, bool, error) {
-	info, err := os.Stat(path)
+	source, err := openPriorSource(path)
 	if err != nil {
 		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
+	}
+	device, inode, identityOK := fileIdentity(info)
+	if !identityOK || !info.Mode().IsRegular() {
+		data, readErr := io.ReadAll(source)
+		if readErr != nil {
+			return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", readErr)
+		}
+		return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
 	}
 	entryPath := runEntryPath(path)
-	if entryPath != "" {
-		if entry, ok := index.Files[runIndexKey(path)]; ok && runIndexMetadataMatches(entry, info) {
-			line, valid, cacheErr := readRunEntry(q, entryPath, entry, info)
-			if cacheErr != nil {
-				logCacheError(cacheErr)
-				changed.Store(true)
-			}
-			if valid {
-				return line, entry, true, nil
-			}
-		} else {
-			changed.Store(true)
-		}
+	if line, entry, hit := cachedRunFileHit(q, path, index, changed, source, info, device, inode); hit {
+		return line, entry, true, nil
 	}
-	data, err := os.ReadFile(path)
+	return readRunSource(q, source, entryPath, changed)
+}
+
+func cachedRunFileHit(q query, path string, index runIndexManifest, changed *atomic.Bool, source *os.File, info os.FileInfo, device, inode uint64) (string, runIndexEntry, bool) {
+	entryPath := runEntryPath(path)
+	if entryPath == "" {
+		return "", runIndexEntry{}, false
+	}
+	entry, ok := index.Files[runIndexKey(path)]
+	if !ok || !runIndexMetadataMatches(entry, info, device, inode) {
+		changed.Store(true)
+		return "", runIndexEntry{}, false
+	}
+	line, valid, cacheErr := readRunEntry(q, entryPath, entry, info)
+	if cacheErr != nil {
+		logCacheError(cacheErr)
+		changed.Store(true)
+	}
+	current, statErr := source.Stat()
+	if valid && statErr == nil && os.SameFile(info, current) && info.Size() == current.Size() && info.ModTime().Equal(current.ModTime()) {
+		return line, entry, true
+	}
+	return "", runIndexEntry{}, false
+}
+
+func readRunSource(q query, source *os.File, entryPath string, changed *atomic.Bool) (string, runIndexEntry, bool, error) {
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не позиционировался: %w", err)
+	}
+	data, err := io.ReadAll(source)
 	if err != nil {
 		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
 	}
+	info, err := source.Stat()
+	if err != nil {
+		return "", runIndexEntry{}, false, fmt.Errorf("отчёт после чтения не stat-нулся: %w", err)
+	}
+	device, inode, identityOK := fileIdentity(info)
+	if !identityOK || int64(len(data)) != info.Size() {
+		changed.Store(true)
+		return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
+	}
 	if entryPath != "" {
-		entry, cacheErr := writeRunEntry(entryPath, info, data)
+		entry, cacheErr := writeRunEntry(entryPath, info, device, inode, data)
 		if cacheErr != nil {
 			logCacheError(cacheErr)
 			changed.Store(true)
@@ -509,9 +708,9 @@ func matchRunFileCached(q query, path string, index runIndexManifest, changed *a
 	return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
 }
 
-func runIndexMetadataMatches(entry runIndexEntry, info os.FileInfo) bool {
+func runIndexMetadataMatches(entry runIndexEntry, info os.FileInfo, device, inode uint64) bool {
 	return entry.Size == info.Size() && entry.ModTime == info.ModTime().UnixNano() &&
-		len(entry.Bloom) == runBloomBytes && crc32.ChecksumIEEE(entry.Bloom) == entry.CRC
+		entry.Device == device && entry.Inode == inode && len(entry.Bloom) == runBloomBytes && crc32.ChecksumIEEE(entry.Bloom) == entry.CRC
 }
 
 func readRunEntry(q query, path string, entry runIndexEntry, info os.FileInfo) (string, bool, error) {
@@ -560,7 +759,7 @@ func readRunEntry(q query, path string, entry runIndexEntry, info os.FileInfo) (
 	return line, true, nil
 }
 
-func writeRunEntry(path string, info os.FileInfo, data []byte) (runIndexEntry, error) {
+func writeRunEntry(path string, info os.FileInfo, device, inode uint64, data []byte) (runIndexEntry, error) {
 	var compressed bytes.Buffer
 	gz, err := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
 	if err != nil {
@@ -586,7 +785,7 @@ func writeRunEntry(path string, info os.FileInfo, data []byte) (runIndexEntry, e
 	if err := saveCacheBytes(path, append(header, compressed.Bytes()...)); err != nil {
 		return runIndexEntry{}, err
 	}
-	return runIndexEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Bloom: bloom, CRC: crc}, nil
+	return runIndexEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Device: device, Inode: inode, Bloom: bloom, CRC: crc}, nil
 }
 
 func runTextBloom(data []byte) []byte {

@@ -21,6 +21,20 @@ func newRunFilter(re *regexp.Regexp) ([]runNeedle, error) {
 	return requiredRunLiterals(parsed), nil
 }
 
+func queryRunFilter(words []string, wordFilters [][]runNeedle) []runNeedle {
+	var filters []runNeedle
+	for i, word := range words {
+		if regexp.QuoteMeta(word) == word {
+			if folded := foldText(word); folded != "" {
+				filters = append(filters, runNeedle{{folded}})
+				continue
+			}
+		}
+		filters = append(filters, wordFilters[i]...)
+	}
+	return filters
+}
+
 func requiredRunLiterals(re *syntax.Regexp) []runNeedle {
 	switch re.Op {
 	case syntax.OpLiteral:

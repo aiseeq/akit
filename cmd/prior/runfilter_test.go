@@ -295,6 +295,28 @@ func TestFilteredRegexpMatchesRegexpOnSameLines(t *testing.T) {
 	}
 }
 
+func TestQueryRunFilterIncludesEveryAlternative(t *testing.T) {
+	q, err := newQuery([]string{"замок", "загрузчик", "tlfeed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q.runs) != 3 {
+		t.Fatalf("run filter has %d alternatives: %#v", len(q.runs), q.runs)
+	}
+	for _, word := range []string{"ЗАМОК", "ЗАГРУЗЧИК", "TLFEED"} {
+		found := false
+		for _, needle := range q.runs {
+			if len(needle) == 1 && len(needle[0]) == 1 && needle[0][0] == word {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("run filter does not contain %q: %#v", word, q.runs)
+		}
+	}
+}
+
 func TestRunFilterReadError(t *testing.T) {
 	q, err := newQuery([]string{"missing"})
 	if err != nil {

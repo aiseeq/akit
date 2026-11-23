@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -712,6 +713,173 @@ func TestCachedRepliesAppendAndInvalidation(t *testing.T) {
 	got, err = readCachedReplies(path)
 	if err != nil || string(got) != replacement {
 		t.Fatalf("broken cache rebuild = %q, %v; want %q", got, err, replacement)
+	}
+}
+
+func TestCachedRepliesRejectsRewrittenPrefixBeforeAppend(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "user-replies.md")
+	var old strings.Builder
+	for i := range 31 {
+		fmt.Fprintf(&old, "### 2026-01-01T00:%02d:00Z lead\nzebra ответ %d\n\n", i, i+1)
+	}
+	write(t, path, old.String())
+	if _, err := readCachedReplies(path); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt := strings.Replace(old.String(), "zebra ответ 5", "horse ответ 5 исправлено", 1) +
+		"### 2026-01-02T00:00:00Z lead\nzebra ответ 33\n\n"
+	if err := os.WriteFile(path, []byte(rebuilt), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readCachedReplies(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) || strings.Count(string(got), "zebra ответ 33") != 1 || strings.Contains(string(got), "zebra ответ 5") {
+		t.Fatalf("cached journal differs from rebuilt source; zebra33 count=%d", strings.Count(string(got), "zebra ответ 33"))
+	}
+}
+
+func TestTranscriptCacheRejectsLongRewrittenPrefixAndAppend(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "long-prefix.jsonl")
+	var original strings.Builder
+	for day := 1; day <= 6; day++ {
+		fmt.Fprintf(&original, `{"timestamp":"2026-01-%02dT00:00:00.000Z","pad":"%s"}`+"\n", day, strings.Repeat("x", 80))
+	}
+	target := `"timestamp":"2026-01-05T00:00:00.000Z"`
+	write(t, path, original.String())
+	got, err := transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 5 {
+		t.Fatalf("initial target line=%d err=%v; want 5", got[target], err)
+	}
+	changed := []byte(original.String())
+	padAt := bytes.Index(changed, []byte(`"pad":"`)) + len(`"pad":"`)
+	if padAt < len(`"pad":"`) || changed[padAt] != 'x' {
+		t.Fatal("test prefix marker not found")
+	}
+	changed[padAt] = '\n' // same byte length, adds a line before the target
+	changed = append(changed, []byte(`{"timestamp":"2026-01-07T00:00:00.000Z"}`+"\n")...)
+	if err := os.WriteFile(path, changed, 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 6 {
+		t.Fatalf("rewritten-prefix target line=%d err=%v; want 6", got[target], err)
+	}
+}
+
+func TestTranscriptCacheLongSameSizeMTimeChangeAndLargeLine(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "long-line.jsonl")
+	target := `"timestamp":"2026-01-02T00:00:00.000Z"`
+	first := `{"timestamp":"2026-01-01T00:00:00.000Z","pad":"` + strings.Repeat("x", (1<<20)+64) + `"}` + "\n"
+	second := `{"timestamp":"2026-01-02T00:00:00.000Z"}` + "\n"
+	write(t, path, first+second)
+	got, err := transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 2 {
+		t.Fatalf("large-line lookup=%d err=%v; want 2", got[target], err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := []byte(first + second)
+	changed[bytes.Index(changed, []byte("xxxx"))+(16<<10)] = 'y'
+	if err := os.WriteFile(path, changed, 0644); err != nil {
+		t.Fatal(err)
+	}
+	changedTime := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, changedTime, changedTime); err != nil {
+		t.Fatal(err)
+	}
+	var scanned int64
+	transcriptScanAfterLineHook = func(gotPath string, offset int64) {
+		if gotPath == path {
+			scanned = offset
+		}
+	}
+	t.Cleanup(func() { transcriptScanAfterLineHook = nil })
+	got, err = transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 2 || scanned != int64(len(changed)) {
+		t.Fatalf("same-size mtime lookup=%d err=%v scanned=%d; want line 2 and full %d-byte rebuild", got[target], err, scanned, len(changed))
+	}
+}
+
+func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
+	t.Run("replies", func(t *testing.T) {
+		t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+		path := filepath.Join(t.TempDir(), "user-replies.md")
+		write(t, path, "cached reply\n")
+		if _, err := readCachedReplies(path); err != nil {
+			t.Fatal(err)
+		}
+		previous := openPriorSource
+		openPriorSource = func(got string) (*os.File, error) {
+			if got == path {
+				return nil, fmt.Errorf("forced source open failure")
+			}
+			return os.Open(got)
+		}
+		t.Cleanup(func() { openPriorSource = previous })
+		if _, err := readCachedReplies(path); err == nil || !strings.Contains(err.Error(), "forced source open failure") {
+			t.Fatalf("cached journal hid source open error: %v", err)
+		}
+	})
+	t.Run("report", func(t *testing.T) {
+		t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+		q, err := newQuery([]string{"needle"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "2026-01-01", "report.md")
+		write(t, path, "needle cached\n")
+		index := runIndexManifest{Version: runCacheVersion, Files: make(map[string]runIndexEntry)}
+		changed := atomic.Bool{}
+		_, entry, ok, err := matchRunFileCached(q, path, index, &changed)
+		if err != nil || !ok {
+			t.Fatalf("warm source result=%v cache=%v err=%v", ok, entry, err)
+		}
+		index.Files[runIndexKey(path)] = entry
+		previous := openPriorSource
+		openPriorSource = func(got string) (*os.File, error) {
+			if got == path {
+				return nil, fmt.Errorf("forced source open failure")
+			}
+			return os.Open(got)
+		}
+		t.Cleanup(func() { openPriorSource = previous })
+		if _, _, _, err := matchRunFileCached(q, path, index, &changed); err == nil || !strings.Contains(err.Error(), "forced source open failure") {
+			t.Fatalf("cached report hid source open error: %v", err)
+		}
+	})
+}
+
+func TestReplyPrewarmSkipsWhenCacheCannotBeWritten(t *testing.T) {
+	root := t.TempDir()
+	cacheRoot := filepath.Join(root, "cache-file")
+	write(t, cacheRoot, "not a directory")
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", cacheRoot)
+	repliesPath := filepath.Join(root, "user-replies.md")
+	transcript := filepath.Join(root, "1234abcd-0000-0000-0000-000000000001.jsonl")
+	header := "### 2026-01-01T00:00:00Z (01.01 00:00 UTC) · claude 1234abcd-0000-0000-0000-000000000001\n"
+	write(t, repliesPath, header)
+	write(t, transcript, `{"timestamp":"2026-01-01T00:00:00.000Z"}`+"\n")
+	var scans int
+	transcriptScanAfterLineHook = func(path string, _ int64) {
+		if path == transcript {
+			scans++
+		}
+	}
+	t.Cleanup(func() { transcriptScanAfterLineHook = nil })
+	prewarmReplyTranscripts(repliesPath, header, transcriptIndex{"1234abcd": {transcript}})
+	if scans != 0 {
+		t.Fatalf("nonwritable cache caused %d prewarm scans", scans)
 	}
 }
 

@@ -584,13 +584,26 @@ func topReplies(hits []replyHit) []replyHit {
 }
 
 func prewarmReplyTranscripts(repliesPath, data string, transcripts transcriptIndex) {
-	info, err := os.Stat(repliesPath)
+	source, err := os.Open(repliesPath)
 	if err != nil {
 		logCacheError(err)
 		return
 	}
-	start, completeEnd, skip := replyPrewarmRange(repliesPath, data, info)
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		logCacheError(err)
+		return
+	}
+	device, inode, identityOK := fileIdentity(info)
+	if !identityOK || !info.Mode().IsRegular() || int64(len(data)) != info.Size() {
+		return
+	}
+	start, completeEnd, skip := replyPrewarmRange(repliesPath, data, source, info, device, inode)
 	if skip {
+		return
+	}
+	if !canWritePriorCache() {
 		return
 	}
 	needlesByPath := replyTranscriptNeedles(data[start:completeEnd], transcripts)
@@ -599,24 +612,30 @@ func prewarmReplyTranscripts(repliesPath, data string, transcripts transcriptInd
 			logCacheError(err)
 		}
 	}
-	if endInfo, statErr := os.Stat(repliesPath); statErr == nil && endInfo.Size() == int64(len(data)) {
+	if endInfo, statErr := source.Stat(); statErr == nil && endInfo.Size() == int64(len(data)) &&
+		endInfo.ModTime().Equal(info.ModTime()) && sameFileIdentity(endInfo, device, inode) {
+		endPathInfo, pathErr := os.Stat(repliesPath)
+		prefixHash, hashErr := filePrefixHash(source, completeEnd)
+		if pathErr != nil || hashErr != nil || !os.SameFile(info, endPathInfo) {
+			logCacheError(errors.Join(pathErr, hashErr))
+			return
+		}
 		next := replyPrewarmCache{
-			Path: repliesPath, Size: endInfo.Size(), ModTime: endInfo.ModTime().UnixNano(), ScannedBytes: completeEnd,
-			PrefixTail: appendTranscriptPrefixTail(nil, []byte(data[:completeEnd])),
+			Path: repliesPath, Size: endInfo.Size(), ModTime: endInfo.ModTime().UnixNano(), Device: device, Inode: inode,
+			ScannedBytes: completeEnd, PrefixHash: prefixHash,
 		}
 		logCacheError(saveReplyPrewarmCache(next))
 	}
 }
 
-func replyPrewarmRange(path, data string, info os.FileInfo) (start, end int64, skip bool) {
+func replyPrewarmRange(path, data string, source *os.File, info os.FileInfo, device, inode uint64) (start, end int64, skip bool) {
 	cache, valid, err := loadReplyPrewarmCache()
 	logCacheError(err)
-	if valid && cache.Path == path && cache.Size == info.Size() && cache.ModTime == info.ModTime().UnixNano() &&
-		transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail) {
+	identityValid := valid && replyPrewarmIdentityValid(path, source, cache, device, inode)
+	if identityValid && cache.Size == info.Size() && cache.ModTime == info.ModTime().UnixNano() {
 		return 0, 0, true
 	}
-	if valid && cache.Path == path && cache.Size < info.Size() && cache.ScannedBytes <= int64(len(data)) &&
-		transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail) {
+	if identityValid && cache.Size < info.Size() && cache.ScannedBytes <= int64(len(data)) {
 		start = cache.ScannedBytes
 	}
 	end = int64(strings.LastIndexByte(data, '\n') + 1)
@@ -624,6 +643,14 @@ func replyPrewarmRange(path, data string, info os.FileInfo) (start, end int64, s
 		start, end = 0, int64(len(data))
 	}
 	return start, end, false
+}
+
+func replyPrewarmIdentityValid(path string, source *os.File, cache replyPrewarmCache, device, inode uint64) bool {
+	if cache.Path != path || cache.Device != device || cache.Inode != inode {
+		return false
+	}
+	prefix, err := filePrefixHash(source, cache.ScannedBytes)
+	return err == nil && bytes.Equal(prefix, cache.PrefixHash)
 }
 
 func replyTranscriptNeedles(segment string, transcripts transcriptIndex) map[string]map[string]struct{} {
@@ -730,39 +757,57 @@ func transcriptTimestampLines(path string, needles map[string]struct{}) (map[str
 }
 
 func transcriptTimestampLinesAttempt(path string, needles map[string]struct{}) (map[string]int, bool, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, false, fmt.Errorf("транскрипт не открылся: %w", err)
 	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf("транскрипт не открылся: %w", err)
+	}
+	device, inode, identityOK := fileIdentity(info)
+	if !identityOK || !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("транскрипт не является обычным файлом")
+	}
 	cache, ok, cacheErr := loadTranscriptLines(path)
 	logCacheError(cacheErr)
-	cache = prepareTranscriptTimestampCache(path, info, cache, ok)
+	cache = prepareTranscriptTimestampCache(path, f, info, device, inode, cache, ok)
 	if cache.Lines == nil {
 		cache.Lines = make(map[string]int)
 	}
+	priorScannedBytes := cache.ScannedBytes
+	priorPrefixHash := append([]byte(nil), cache.PrefixHash...)
+	if priorScannedBytes == 0 {
+		priorPrefixHash, err = filePrefixHash(f, 0)
+		if err != nil {
+			return nil, false, fmt.Errorf("пустой префикс транскрипта не проверился: %w", err)
+		}
+	}
 	partial := make(map[string]int)
 	if !timestampsFound(cache.Lines, needles) && cache.ScannedBytes < info.Size() {
-		f, err := os.Open(path)
-		if err != nil {
-			return nil, false, fmt.Errorf("транскрипт не открылся: %w", err)
-		}
 		partial, err = scanTranscriptTimestamps(path, f, &cache)
-		closeErr := f.Close()
 		if err != nil {
 			return nil, false, err
 		}
-		if closeErr != nil {
-			return nil, false, fmt.Errorf("транскрипт не прочитался: %w", closeErr)
-		}
 	}
-	after, err := os.Stat(path)
+	after, err := f.Stat()
 	if err != nil {
 		return nil, false, fmt.Errorf("транскрипт после чтения не stat-нулся: %w", err)
 	}
-	if !transcriptCacheReadStable(info, after, path, cache) {
+	pathInfo, pathErr := os.Stat(path)
+	if pathErr != nil {
+		return nil, false, fmt.Errorf("транскрипт после чтения не stat-нулся: %w", pathErr)
+	}
+	if !transcriptCacheReadStable(f, info, after, pathInfo, device, inode, cache.ScannedBytes, priorScannedBytes, priorPrefixHash) {
 		return nil, false, nil
 	}
 	cache.Size, cache.ModTime = after.Size(), after.ModTime().UnixNano()
+	cache.Device, cache.Inode = device, inode
+	cache.PrefixHash, err = filePrefixHash(f, cache.ScannedBytes)
+	if err != nil {
+		return nil, false, fmt.Errorf("префикс транскрипта не проверился: %w", err)
+	}
 	logCacheError(saveTranscriptLines(cache))
 	result := make(map[string]int, len(needles))
 	for needle := range needles {
@@ -775,53 +820,32 @@ func transcriptTimestampLinesAttempt(path string, needles map[string]struct{}) (
 	return result, true, nil
 }
 
-func transcriptCacheReadStable(before, after os.FileInfo, path string, cache transcriptLinesCache) bool {
-	if after.Size() < cache.ScannedBytes || (after.Size() == before.Size() && !after.ModTime().Equal(before.ModTime())) {
+func transcriptCacheReadStable(f *os.File, before, after, pathInfo os.FileInfo, device, inode uint64, scannedBytes, priorScannedBytes int64, priorPrefixHash []byte) bool {
+	if after.Size() < scannedBytes || (after.Size() == before.Size() && !after.ModTime().Equal(before.ModTime())) ||
+		!sameFileIdentity(after, device, inode) || !os.SameFile(before, pathInfo) {
 		return false
 	}
-	return transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail)
+	hash, err := filePrefixHash(f, priorScannedBytes)
+	if err != nil {
+		logCacheError(err)
+		return false
+	}
+	return bytes.Equal(hash, priorPrefixHash)
 }
 
-func prepareTranscriptTimestampCache(path string, info os.FileInfo, cache transcriptLinesCache, ok bool) transcriptLinesCache {
+func prepareTranscriptTimestampCache(path string, f *os.File, info os.FileInfo, device, inode uint64, cache transcriptLinesCache, ok bool) transcriptLinesCache {
 	if !ok || cache.Size > info.Size() || (cache.Size == info.Size() && cache.ModTime != info.ModTime().UnixNano()) {
 		return transcriptLinesCache{Version: transcriptCacheVersion, Path: path, Lines: make(map[string]int)}
 	}
-	if !transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail) {
+	if cache.Device != device || cache.Inode != inode {
+		return transcriptLinesCache{Version: transcriptCacheVersion, Path: path, Lines: make(map[string]int)}
+	}
+	hash, err := filePrefixHash(f, cache.ScannedBytes)
+	if err != nil || !bytes.Equal(hash, cache.PrefixHash) {
+		logCacheError(err)
 		return transcriptLinesCache{Version: transcriptCacheVersion, Path: path, Lines: make(map[string]int)}
 	}
 	return cache
-}
-
-func transcriptPrefixMatches(path string, scannedBytes int64, tail []byte) bool {
-	if scannedBytes < 0 || len(tail) != int(min(int64(64), scannedBytes)) {
-		return false
-	}
-	if scannedBytes == 0 {
-		return len(tail) == 0
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		logCacheError(fmt.Errorf("транскрипт для проверки префикса не открылся: %w", err))
-		return false
-	}
-	defer f.Close()
-	actual := make([]byte, len(tail))
-	if _, err := f.ReadAt(actual, scannedBytes-int64(len(actual))); err != nil {
-		logCacheError(fmt.Errorf("префикс транскрипта не прочитался: %w", err))
-		return false
-	}
-	return bytes.Equal(actual, tail)
-}
-
-func appendTranscriptPrefixTail(tail, line []byte) []byte {
-	if len(line) >= 64 {
-		return append(tail[:0], line[len(line)-64:]...)
-	}
-	combined := append(append([]byte(nil), tail...), line...)
-	if len(combined) > 64 {
-		combined = combined[len(combined)-64:]
-	}
-	return combined
 }
 
 func timestampsFound(lines map[string]int, needles map[string]struct{}) bool {
@@ -855,7 +879,6 @@ func scanTranscriptTimestamps(path string, f *os.File, cache *transcriptLinesCac
 			cache.LineCount++
 			indexTimestampLine(line, cache, prefix)
 			cache.ScannedBytes = offset
-			cache.PrefixTail = appendTranscriptPrefixTail(cache.PrefixTail, line)
 			if transcriptScanAfterLineHook != nil {
 				transcriptScanAfterLineHook(path, cache.ScannedBytes)
 			}
