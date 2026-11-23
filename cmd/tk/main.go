@@ -26,6 +26,7 @@ import (
 
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/queuegate"
+	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/timearg"
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -3156,6 +3157,12 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 			fmt.Fprintf(errout, "tk: required plan command has invalid bash syntax: %v\n", err)
 			return exitUsage
 		}
+	}
+	if err := validatePlanCommandNameAt(command, filepath.Dir(filepath.Dir(filepath.Dir(t.path)))); err != nil {
+		fmt.Fprintf(errout, "tk: %v\n", err)
+		return exitUsage
+	}
+	if o.required {
 		entry = fmt.Sprintf("- %s план — %s: добавлен обязательный пункт %s: %s", time.Now().Format("2006-01-02 15:04"), o.by, name, command)
 	}
 	t.body = insertPlanLine(t.body, line)
@@ -3165,6 +3172,77 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 	}
 	fmt.Fprintf(out, "%s plan added\n", t.slug)
 	return 0
+}
+
+func validatePlanCommandNameAt(command, root string) error {
+	calls, err := shellcmd.Calls(command)
+	if err != nil {
+		var nestedErr *shellcmd.NestedError
+		if !errors.As(err, &nestedErr) || len(calls) == 0 {
+			var syntaxErr syntax.ParseError
+			if !errors.As(err, &syntaxErr) {
+				return fmt.Errorf("cannot parse plan command: %w", err)
+			}
+			return validateUnparsedPlanCommand(command, root)
+		}
+	}
+	if len(calls) == 0 {
+		return errors.New(`plan item must start with a command (e.g. "go test ./...")`)
+	}
+	name := calls[0].Name
+	word := planCommandWord(command, calls[0].Offset)
+	if strings.ContainsRune(word, os.PathSeparator) {
+		if word != "" {
+			path := word
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(root, path)
+			}
+			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+				return nil
+			}
+		}
+	} else if name != "" && shellcmd.IsBashBuiltinOrKeyword(name) {
+		return nil
+	} else if name != "" {
+		if _, err := exec.LookPath(name); err == nil {
+			return nil
+		}
+	}
+	return errors.New(`plan item must start with a command available in PATH, a Bash builtin, or an existing file (e.g. "go test ./...")`)
+}
+
+func validateUnparsedPlanCommand(command, root string) error {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return errors.New(`plan item must start with a command (e.g. "go test ./...")`)
+	}
+	word := strings.Trim(fields[0], `"'`)
+	if shellcmd.IsBashBuiltinOrKeyword(word) {
+		return nil
+	}
+	if strings.ContainsRune(word, os.PathSeparator) {
+		path := word
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+			return nil
+		}
+	} else if _, lookErr := exec.LookPath(word); lookErr == nil {
+		return nil
+	}
+	return errors.New(`plan item must start with a command available in PATH, a Bash builtin, or an existing file (e.g. "go test ./...")`)
+}
+
+func planCommandWord(command string, offset int) string {
+	if offset < 0 || offset >= len(command) {
+		return ""
+	}
+	word := command[offset:]
+	if end := strings.IndexAny(word, " \t\r\n;&|<>()"); end >= 0 {
+		word = word[:end]
+	}
+	return strings.Trim(word, `\"'`)
 }
 
 func checkPlanSyntax(command string) error {

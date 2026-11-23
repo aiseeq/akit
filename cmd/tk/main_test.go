@@ -1124,6 +1124,44 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 	}
 }
 
+func TestPlanAddRequiresCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repo := filepath.Join(home, "work", "current")
+	dir := filepath.Join(repo, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\nСтатус: в работе\n\n## План\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(repo)
+	for _, command := range []string{"дамп по корпусу — 0 строк", "Start, End по корпусу"} {
+		var stdout, stderr bytes.Buffer
+		code := runMain([]string{"plan", "task", "--add", "x: " + command, "--required", "--by", "worker"}, time.Now(), &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "must start with a command") {
+			t.Errorf("prose %q: code=%d stderr=%q", command, code, stderr.String())
+		}
+	}
+	for _, command := range []string{"bash /tmp/a.sh", "go test ./...", "A=1 go test ./...", "test -s f", `[ -n "$X" ]`} {
+		var stdout, stderr bytes.Buffer
+		code := runMain([]string{"plan", "task", "--add", "x: " + command, "--required", "--by", "worker"}, time.Now(), &stdout, &stderr)
+		if code != 0 {
+			t.Errorf("command %q: code=%d stderr=%q", command, code, stderr.String())
+		}
+		updated, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(updated), "- x: "+command) {
+			t.Errorf("command %q was not added: err=%v body=%s", command, err, updated)
+		}
+		body = string(updated)
+		if err := os.WriteFile(path, []byte("# Task\n\nСтатус: в работе\n\n## План\n\n## Журнал\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestInvalidPlanItemAppearsInJSON(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "docs", "tasks", "20200101-1200-MEDIUM-task.md")
@@ -2177,6 +2215,10 @@ func TestRequiredPlanItemTextEdits(t *testing.T) {
 	path := filepath.Join(dir, "20200101-1200-MEDIUM-task.md")
 	body := cases["нет раздела"]
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	if err := os.WriteFile(filepath.Join(root, "accept.sh"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer

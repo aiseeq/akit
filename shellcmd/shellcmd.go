@@ -113,6 +113,12 @@ while
 
 var bashBuiltinAndKeywordSet = literalWordSet(bashBuiltinAndKeywordNames)
 
+// IsBashBuiltinOrKeyword reports whether name is a Bash builtin or reserved word.
+func IsBashBuiltinOrKeyword(name string) bool {
+	_, ok := bashBuiltinAndKeywordSet[name]
+	return ok
+}
+
 // test и [ с -v вычисляют индекс массива в имени переменной (подстановка, присваивание);
 // wait -p присваивает переменную — они вне списка.
 var literalBuiltinAllowSet = literalWordSet(`kill echo true false : pwd exit`)
