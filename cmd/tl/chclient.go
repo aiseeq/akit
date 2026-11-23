@@ -50,8 +50,17 @@ func newCHClient(base, db string) (*chClient, error) {
 	if db == "" || strings.Trim(db, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != "" {
 		return nil, fmt.Errorf("bad TL_CLICKHOUSE_DB %q: want a plain name", db)
 	}
-	return &chClient{base: strings.TrimRight(base, "/") + "/", db: db, hc: &http.Client{}}, nil
+	tr := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		ResponseHeaderTimeout: headerTimeout, IdleConnTimeout: 90 * time.Second}
+	return &chClient{base: strings.TrimRight(base, "/") + "/", db: db, hc: &http.Client{Transport: tr}}, nil
 }
+
+// dialTimeout and headerTimeout bound a server that does not take the connection or does not start the answer:
+// a query that sorts sends its header after the sort, which takes seconds over days of events.
+const (
+	dialTimeout   = 3 * time.Second
+	headerTimeout = 30 * time.Second
+)
 
 // errUnavailable marks an answer that did not come: no connection, a refused or cut one, or the time ran out.
 var errUnavailable = errors.New("database unavailable")

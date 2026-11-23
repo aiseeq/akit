@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -296,6 +297,13 @@ func slotFree(dir, prefix string, n int) (bool, error) {
 	return false, nil
 }
 
+// heldSlots keep the slots holdSlot took reachable: a dropped release lets the collector close the file, and
+// the lock goes with it.
+var (
+	heldMu    sync.Mutex
+	heldSlots []func()
+)
+
 // holdSlot takes one of the n slots named prefix for the life of the process; false — all are held.
 func holdSlot(dir, prefix string, n int) (bool, error) {
 	for i := range n {
@@ -304,6 +312,9 @@ func holdSlot(dir, prefix string, n int) (bool, error) {
 			return false, err
 		}
 		if release != nil {
+			heldMu.Lock()
+			heldSlots = append(heldSlots, release)
+			heldMu.Unlock()
 			return true, nil
 		}
 	}

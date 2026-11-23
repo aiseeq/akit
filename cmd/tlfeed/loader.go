@@ -247,14 +247,14 @@ func (l *loader) visit(path string) error {
 		l.logf("%v", err)
 		return nil
 	}
-	if st.Size() == f.size && st.ModTime().Unix() == f.mtime.Unix() && inodeOf(st) == f.inode && f.complete <= f.ingested && f.evLines >= f.lines && !f.stale {
+	if st.Size() == f.size && st.ModTime().Unix() == f.mtime.Unix() && transcript.Inode(st) == f.inode && f.complete <= f.ingested && f.evLines >= f.lines && !f.stale {
 		return nil
 	}
 	if err := l.checkTail(f, st.Size()); err != nil {
 		return err
 	}
-	changed := f.inode != inodeOf(st) || f.mtime.Unix() != st.ModTime().Unix() || f.size != st.Size()
-	f.size, f.mtime, f.inode = st.Size(), st.ModTime(), inodeOf(st)
+	changed := f.inode != transcript.Inode(st) || f.mtime.Unix() != st.ModTime().Unix() || f.size != st.Size()
+	f.size, f.mtime, f.inode = st.Size(), st.ModTime(), transcript.Inode(st)
 	if changed && l.now().Sub(f.mtime) < recentTask {
 		l.dirs.activate(path) // a worker task written to again: its session folders are watched from now
 	}
@@ -287,7 +287,7 @@ func (l *loader) lookup(path string, st os.FileInfo) (*file, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-		if f = l.renamed(src, inodeOf(st), st.Size()); f == nil {
+		if f = l.renamed(src, transcript.Inode(st), st.Size()); f == nil {
 			f = &file{}
 			f.describe(l.cfg.home, src)
 			l.add(f)
@@ -376,7 +376,7 @@ func (l *loader) alive(old string, ino uint64) bool {
 		l.logf("%s: %v", old, err)
 		return true
 	}
-	return inodeOf(st) == ino
+	return transcript.Inode(st) == ino
 }
 
 // rewind — the file is shorter than what is loaded, or the loaded bytes changed: its rows go and it is loaded

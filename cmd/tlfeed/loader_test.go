@@ -855,7 +855,7 @@ func TestStoppedAfterSizeStoredBeforeLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := l.files[path]
-	f.size, f.mtime, f.inode = st.Size(), st.ModTime(), inodeOf(st)
+	f.size, f.mtime, f.inode = st.Size(), st.ModTime(), transcript.Inode(st)
 	l.batch.touch(f)
 	if err := l.flush(); err != nil {
 		t.Fatal(err)

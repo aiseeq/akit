@@ -8,10 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -35,9 +35,9 @@ const (
 // dbQueryTimeout bounds one call through the database; past it the call reads the files.
 const dbQueryTimeout = 60 * time.Second
 
-// mtimeSlack widens the database's modification times of files: the loader stats a file when it reads it, so
-// its time may lag the file's own; the file's own time decides afterwards.
-const mtimeSlack = time.Hour
+// filesTimeout bounds the first query, the list of files: it takes well under a second, so a server that hangs
+// sends the call to the files in seconds rather than at dbQueryTimeout.
+var filesTimeout = 10 * time.Second
 
 // tailMargin — how long after a line's event its record may still be written: a file the loader read past until
 // plus this has no unread line with an event inside the window.
@@ -61,20 +61,21 @@ type dbFile struct {
 	ingested int64
 	lines    int
 	evLines  int
-	mtime    time.Time
 	loaded   time.Time // when the loader wrote this row
 	bad      int       // lines the loader could not parse
+	inode    uint64
 }
 
 type dbPath struct {
-	c     *chClient
-	ctx   context.Context
-	opts  options
-	e     env
-	f     *filter
-	files map[string]*dbFile
-	names []string // transcript names find knows, from the files table
-	trace io.Writer
+	c      *chClient
+	ctx    context.Context
+	opts   options
+	e      env
+	f      *filter
+	files  map[string]*dbFile
+	names  []string // transcript names find knows, from the folders as the file path lists them
+	listed bool     // names is listed
+	trace  io.Writer
 }
 
 // runDB answers the call through the database into stdout and stderr; an error means no answer was printed and
@@ -128,9 +129,11 @@ func (d *dbPath) tracef(what string, start time.Time, n int) {
 	}
 }
 
-func (d *dbPath) query(q chQuery) ([][]string, error) {
+func (d *dbPath) query(q chQuery) ([][]string, error) { return d.queryIn(d.ctx, q) }
+
+func (d *dbPath) queryIn(ctx context.Context, q chQuery) ([][]string, error) {
 	start := time.Now()
-	rows, err := d.c.selectTSV(d.ctx, q)
+	rows, err := d.c.selectTSV(ctx, q)
 	if d.trace != nil {
 		fmt.Fprintf(d.trace, "tl: db %s %d ms, %d rows, err %v\n", q.name, time.Since(start).Milliseconds(), len(rows), err)
 	}
@@ -138,20 +141,21 @@ func (d *dbPath) query(q chQuery) ([][]string, error) {
 }
 
 func (d *dbPath) loadFiles() error {
-	rows, err := d.query(chQuery{name: "files", sql: "SELECT file_id, path, name, ingested, lines, ev_lines, toUnixTimestamp(mtime), " +
-		"intDiv(ver, 1000000), bad FROM files FINAL"})
+	ctx, cancel := context.WithTimeout(d.ctx, filesTimeout)
+	defer cancel()
+	rows, err := d.queryIn(ctx, chQuery{name: "files", sql: "SELECT file_id, path, name, ingested, lines, ev_lines, " +
+		"intDiv(ver, 1000000), bad, inode FROM files FINAL"})
 	if err != nil {
 		return err
 	}
 	d.files = make(map[string]*dbFile, len(rows))
-	patterns := transcriptPatterns(d.e.home)
 	for _, row := range rows {
 		if len(row) != 9 {
 			return fmt.Errorf("files: %d fields in a row, want 9", len(row))
 		}
 		p := fields{row: row}
 		f := &dbFile{id: p.uint(0), path: row[1], name: row[2], ingested: int64(p.uint(3)), lines: p.int(4), evLines: p.int(5),
-			mtime: time.Unix(int64(p.uint(6)), 0), loaded: time.UnixMilli(int64(p.uint(7))), bad: p.int(8)}
+			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), inode: p.uint(8)}
 		if p.err != nil {
 			return fmt.Errorf("files: %w", p.err)
 		}
@@ -159,32 +163,32 @@ func (d *dbPath) loadFiles() error {
 		if old := d.files[f.path]; old != nil && old.loaded.After(f.loaded) {
 			continue
 		}
-		if d.files[f.path] == nil {
-			ok, err := matchesAny(patterns, f.path)
-			if err != nil {
-				return err
-			}
-			if ok {
-				d.names = append(d.names, f.path)
-			}
-		}
 		d.files[f.path] = f
 	}
-	slices.Sort(d.names)
 	return nil
 }
 
-func matchesAny(patterns []string, path string) (bool, error) {
-	for _, pattern := range patterns {
-		ok, err := filepath.Match(pattern, path)
-		if err != nil {
-			return false, fmt.Errorf("transcript pattern %s: %w", pattern, err)
-		}
-		if ok {
-			return true, nil
-		}
+// stored is what the files table has of the file at path now: nothing when the file there is another one than
+// the loader read — a new inode, or shorter than what it stored — or is gone, and the file is read instead.
+func (d *dbPath) stored(path string) (*dbFile, error) {
+	f := d.files[path]
+	if f == nil {
+		return nil, nil
 	}
-	return false, nil
+	st, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if st.Size() < f.ingested {
+		return nil, nil
+	}
+	if ino := transcript.Inode(st); ino != 0 && f.inode != 0 && ino != f.inode {
+		return nil, nil
+	}
+	return f, nil
 }
 
 // fields reads typed fields of one answer row; the first that does not parse is kept in err.
@@ -203,38 +207,27 @@ func (p *fields) uint(i int) uint64 {
 
 func (p *fields) int(i int) int { return int(p.uint(i)) }
 
-// resolve is resolve of the file path over the names in the files table.
+// resolve is resolve of the file path: the window and the sessions are what the folders hold now, so a file
+// deleted or moved since the loader read it is not answered from its rows, and one the loader has not reached
+// yet is read from the file.
 func (d *dbPath) resolve() ([]source, error) {
-	return resolveWith(d.opts, d.e, d.window, d.find)
-}
-
-// window is the choice of AllSourcesWindow among the files the table knows, in the same order: by pattern, sorted
-// inside each. A file's time there may lag its own (mtimeSlack); the file decides.
-func (d *dbPath) window(since time.Time) ([]source, error) {
-	var candidates []string
-	for _, pattern := range transcript.SourcePatterns(d.e.home, d.opts.codex, !d.opts.noSubagents) {
-		for _, path := range d.names {
-			if d.files[path].mtime.Before(since.Add(-mtimeSlack)) {
-				continue
-			}
-			ok, err := filepath.Match(pattern, path)
-			if err != nil {
-				return nil, fmt.Errorf("list transcripts %s: %w", pattern, err)
-			}
-			if ok {
-				candidates = append(candidates, path)
-			}
-		}
-	}
-	sources, err := transcript.SelectSources(candidates, since, d.opts.until, d.opts.project)
-	if err != nil {
-		return nil, fmt.Errorf("list transcripts: %w", err)
-	}
-	return sources, nil
+	return resolve(d.opts, d.e)
 }
 
 func (d *dbPath) find(arg string) (string, error) {
-	return findIn(arg, d.e.home, func() ([]string, error) { return d.names, nil })
+	return findIn(arg, d.e.home, func() ([]string, error) { return d.listNames() })
+}
+
+// listNames are the transcript names find knows, listed once per call.
+func (d *dbPath) listNames() ([]string, error) {
+	if !d.listed {
+		names, err := transcriptPaths(d.e.home)
+		if err != nil {
+			return nil, fmt.Errorf("list transcript names: %w", err)
+		}
+		d.names, d.listed = names, true
+	}
+	return d.names, nil
 }
 
 // kindOfSource is the kind column of the events of a source.
@@ -255,17 +248,7 @@ type where struct {
 	settings url.Values
 }
 
-// grepMode — how --grep is asked: through hyperscan over the lower-case text, through RE2 over it when hyperscan
-// does not take the pattern, through RE2 over the text as written when the pattern has case-sensitive parts.
-type grepMode int
-
-const (
-	grepFast grepMode = iota
-	grepRE2
-	grepAsWritten
-)
-
-func (d *dbPath) where(ids []uint64, kinds []string, mode grepMode) (where, error) {
+func (d *dbPath) where(ids []uint64, kinds []string) (where, error) {
 	opts := d.opts
 	w := where{params: map[string]string{}, settings: url.Values{}}
 	roles := make([]string, 0, len(opts.roles))
@@ -292,7 +275,7 @@ func (d *dbPath) where(ids []uint64, kinds []string, mode grepMode) (where, erro
 		conds = append(conds, "ts <= {until:DateTime64(3, 'UTC')}")
 	}
 	if opts.grep != "" {
-		cond, params, err := grepCondition(opts.grep, mode)
+		cond, params, err := grepCondition(opts.grep)
 		if err != nil {
 			return w, err
 		}
@@ -325,7 +308,11 @@ func (d *dbPath) result(sources []source) (result, error) {
 	liveNames, liveErr := liveSessionNames(d.e.home)
 	d.tracef("live names", start, len(liveNames))
 	start = time.Now()
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, d.names, d.e.home, liveNames), searchPaths: d.names,
+	names, err := d.listNames()
+	if err != nil {
+		return result{}, err
+	}
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, liveNames), searchPaths: names,
 		liveNames: liveNames, liveErr: liveErr, files: len(sources)}
 	d.tracef("link ids", start, len(res.linkIDs))
 	var (
@@ -333,7 +320,10 @@ func (d *dbPath) result(sources []source) (result, error) {
 		local []source // not in the files table yet: read as the file path does
 	)
 	for _, src := range sources {
-		f := d.files[src.Path]
+		f, err := d.stored(src.Path)
+		if err != nil {
+			return res, err
+		}
 		if f == nil {
 			local = append(local, src)
 			continue
@@ -689,34 +679,15 @@ func (d *dbPath) wholeTexts(hits []sortedHit, idx []int) error {
 	return nil
 }
 
-// selectEvents runs a query over the events of the files, asking --grep in the fastest form the server takes.
+// selectEvents runs a query over the events of the files the call filters.
 func (d *dbPath) selectEvents(name string, build func(where) chQuery, ids []uint64, kinds []string) ([][]string, error) {
-	mode := grepFast
-	if d.opts.grep != "" {
-		sensitive, err := caseSensitiveParts(d.opts.grep)
-		if err != nil {
-			return nil, err
-		}
-		if sensitive {
-			mode = grepAsWritten
-		}
+	w, err := d.where(ids, kinds)
+	if err != nil {
+		return nil, err
 	}
-	for {
-		w, err := d.where(ids, kinds, mode)
-		if err != nil {
-			return nil, err
-		}
-		q := build(w)
-		q.name = name
-		rows, err := d.query(q)
-		var serverErr *chServerError
-		if err != nil && mode == grepFast && d.opts.grep != "" && errors.As(err, &serverErr) {
-			// hyperscan refuses some patterns RE2 takes: too large, or a construct it lacks
-			mode = grepRE2
-			continue
-		}
-		return rows, err
-	}
+	q := build(w)
+	q.name = name
+	return d.query(q)
 }
 
 func msToTime(ms int64) time.Time {
@@ -851,7 +822,10 @@ func (d *dbPath) showRef(ref eventRef, width int, w, stderr io.Writer) (int, err
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage, nil
 	}
-	f := d.files[path]
+	f, err := d.stored(path)
+	if err != nil {
+		return 0, err
+	}
 	var found []sortedHit
 	if f == nil || ref.line > f.evLines {
 		// not stored yet: the file has it

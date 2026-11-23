@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -167,5 +168,34 @@ func TestShadowKeyDiff(t *testing.T) {
 	res.hits[1].ev.Time, res.hits[1].ev.Line = at.Add(time.Minute), 2
 	if keys := answerKeys(&answer{res: res}, opts, at.Add(time.Second)); !slices.Equal(keys, []string{"/p/a.jsonl:1"}) {
 		t.Errorf("keys %q", keys)
+	}
+}
+
+// A slot holdSlot took stays held for the life of the process, through garbage collection: the lock is the open
+// file's, and a file nothing refers to is closed by the collector.
+func TestHoldSlotSurvivesGC(t *testing.T) {
+	dir := t.TempDir()
+	held, err := holdSlot(dir, "form", 1)
+	if err != nil || !held {
+		t.Fatalf("holdSlot %v %v", held, err)
+	}
+	t.Cleanup(func() {
+		heldMu.Lock()
+		defer heldMu.Unlock()
+		for _, release := range heldSlots {
+			release()
+		}
+		heldSlots = nil
+	})
+	// the collector closes a dropped file from its finalizer goroutine: give it a few turns
+	for range 20 {
+		runtime.GC()
+		time.Sleep(5 * time.Millisecond)
+		if free, err := slotFree(dir, "form", 1); err != nil || free {
+			t.Fatalf("after GC the held slot is free %v (%v)", free, err)
+		}
+	}
+	if held, err := holdSlot(dir, "form", 1); err != nil || held {
+		t.Errorf("a second hold of the only slot %v %v", held, err)
 	}
 }

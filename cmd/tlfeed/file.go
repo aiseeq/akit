@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
@@ -103,13 +102,6 @@ func newID(path string, at time.Time, taken func(uint64) bool) uint64 {
 		id++
 	}
 	return id
-}
-
-func inodeOf(st os.FileInfo) uint64 {
-	if s, ok := st.Sys().(*syscall.Stat_t); ok {
-		return s.Ino
-	}
-	return 0
 }
 
 // tailSum — the sum of the tailBytes bytes before end.

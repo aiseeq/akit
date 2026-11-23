@@ -8,106 +8,90 @@ import (
 	"unicode"
 )
 
-// grepCondition is --grep over the events table. hay is lowerUTF8(who + ' ' + text), the string the file path
-// matches with (?i): a pattern of one literal is LIKE over it, any other goes to multiMatchAny (hyperscan) with its
-// literals in lower case. Only the literals: \S, \W or \D in lower case would change their meaning, and character
-// classes already hold both cases after (?i). multiMatchAny takes the text index only from a pattern without
-// (?i), which is why the pattern is lowered rather than flagged. A pattern hyperscan refuses goes to match (RE2)
-// over the same hay; one with case-sensitive parts, to match over the text as written.
-func grepCondition(pattern string, mode grepMode) (string, map[string]string, error) {
-	if mode == grepAsWritten {
-		return "match(concat(who, ' ', text), {grep:String})", map[string]string{"grep": chString("(?i)" + pattern)}, nil
-	}
-	lowered, literal, err := lowerPattern(pattern)
+// grepCondition is --grep over the events table: match (RE2, the syntax and case folding of Go's regexp) over
+// who + ' ' + text as written decides, as the file path's regexp does; (?-s) turns off the server's default of a
+// dot matching a newline, which Go's regexp does not. Before it, LIKE over hay — lowerUTF8 of the same string,
+// with the ngram index — keeps the rows that hold the literals every match has (hayPrefilter).
+func grepCondition(pattern string) (string, map[string]string, error) {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("--grep: %w", err)
 	}
-	if literal != "" {
-		return "hay LIKE {grep:String}", map[string]string{"grep": chString("%" + likeEscape(literal) + "%")}, nil
-	}
-	if mode == grepRE2 {
-		return "match(hay, {grep:String})", map[string]string{"grep": chString(lowered)}, nil
-	}
-	return "multiMatchAny(hay, {grep:Array(String)})", map[string]string{"grep": chStrings([]string{lowered})}, nil
-}
-
-// lowerPattern is the pattern with (?i) applied and its literals lowered; literal is set when the whole pattern
-// is one literal.
-func lowerPattern(pattern string) (lowered, literal string, err error) {
-	re, err := syntax.Parse("(?i)"+pattern, syntax.Perl)
-	if err != nil {
-		return "", "", fmt.Errorf("--grep: %w", err)
-	}
-	lowerLiterals(re)
-	if re.Op == syntax.OpLiteral {
-		return re.String(), string(re.Rune), nil
-	}
-	return re.String(), "", nil
-}
-
-func lowerLiterals(re *syntax.Regexp) {
-	if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 {
-		for i, r := range re.Rune {
-			re.Rune[i] = unicode.ToLower(r)
+	params := map[string]string{"grep": chString("(?-s)(?i)" + pattern)}
+	var conds []string
+	for i, group := range hayPrefilter(parsed) {
+		var likes []string
+		for j, like := range group {
+			name := fmt.Sprintf("hay%d_%d", i, j)
+			params[name] = chString(like)
+			likes = append(likes, fmt.Sprintf("hay LIKE {%s:String}", name))
 		}
-		re.Flags &^= syntax.FoldCase
+		conds = append(conds, "("+strings.Join(likes, " OR ")+")")
 	}
-	for _, sub := range re.Sub {
-		lowerLiterals(sub)
-	}
+	conds = append(conds, "match(concat(who, ' ', text), {grep:String})")
+	return strings.Join(conds, " AND "), params, nil
 }
 
-// maxClassCheck — how many characters of a class caseSensitiveParts looks at: a larger class comes from (?i)
-// itself or from a negation, and holds both cases.
-const maxClassCheck = 4096
-
-// caseSensitiveParts tells whether (?-i) turns case folding off in a part of the pattern: a literal or a class
-// there holds a letter without its other case, and lower-case hay cannot match it.
-func caseSensitiveParts(pattern string) (bool, error) {
-	re, err := syntax.Parse("(?i)"+pattern, syntax.Perl)
-	if err != nil {
-		return false, fmt.Errorf("--grep: %w", err)
-	}
-	return foldIncomplete(re), nil
-}
-
-func foldIncomplete(re *syntax.Regexp) bool {
-	switch re.Op {
-	case syntax.OpLiteral:
-		if re.Flags&syntax.FoldCase == 0 && slices.ContainsFunc(re.Rune, func(r rune) bool { return unicode.SimpleFold(r) != r }) {
-			return true
-		}
-	case syntax.OpCharClass:
-		if classFoldIncomplete(re.Rune) {
-			return true
-		}
-	}
-	return slices.ContainsFunc(re.Sub, foldIncomplete)
-}
-
-func classFoldIncomplete(ranges []rune) bool {
-	in := func(r rune) bool {
-		for i := 0; i+1 < len(ranges); i += 2 {
-			if r >= ranges[i] && r <= ranges[i+1] {
-				return true
+// hayPrefilter is the LIKE patterns over hay that every match passes: groups that all hold, each of choices one
+// of which holds. A literal goes in lowered rune by rune; a rune whose case folding lowerUTF8 may not bring to
+// one rune — ſ and s, the Kelvin sign and k, σ and ς, İ — becomes %, so a match with any of its forms passes.
+// A group whose choices are all wildcards is left out.
+func hayPrefilter(re *syntax.Regexp) [][]string {
+	var out [][]string
+	for _, group := range requiredLiterals(re) {
+		var likes []string
+		for _, choice := range group {
+			like, ok := hayLike(choice)
+			if !ok {
+				likes = nil
+				break
 			}
+			likes = append(likes, like)
 		}
-		return false
-	}
-	seen := 0
-	for i := 0; i+1 < len(ranges); i += 2 {
-		for r := ranges[i]; r <= ranges[i+1]; r++ {
-			if seen++; seen > maxClassCheck {
-				return false
-			}
-			for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-				if !in(f) {
-					return true
-				}
-			}
+		if len(likes) > 0 {
+			out = append(out, likes)
 		}
 	}
-	return false
+	return out
+}
+
+// hayLike is the LIKE pattern over hay of one literal; ok is false when no rune of it is kept.
+func hayLike(literal string) (string, bool) {
+	var b strings.Builder
+	b.WriteByte('%')
+	kept := false
+	for _, r := range literal {
+		lower, ok := foldsToOneLower(r)
+		if !ok {
+			if !strings.HasSuffix(b.String(), "%") {
+				b.WriteByte('%')
+			}
+			continue
+		}
+		b.WriteString(likeEscape(string(lower)))
+		kept = true
+	}
+	if !strings.HasSuffix(b.String(), "%") {
+		b.WriteByte('%')
+	}
+	return b.String(), kept
+}
+
+// foldsToOneLower is the lower case of every rune case folding matches r with, when it is one rune: a rune
+// without case, or a pair of an upper and a lower case.
+func foldsToOneLower(r rune) (rune, bool) {
+	orbit := []rune{r}
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		orbit = append(orbit, f)
+	}
+	lower := unicode.ToLower(r)
+	switch len(orbit) {
+	case 1:
+		return r, lower == r
+	case 2:
+		return lower, unicode.ToLower(orbit[0]) == lower && unicode.ToLower(orbit[1]) == lower && slices.Contains(orbit, lower)
+	}
+	return 0, false
 }
 
 // likeEscape escapes the LIKE wildcards of a literal.

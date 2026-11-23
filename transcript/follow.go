@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 )
 
 // ErrFollowRestart — rollout codex впервые записал событие user_message или agent_message: по Read реплики и текст
@@ -179,4 +180,12 @@ func LineEndsAfter(path string, off, size int64) (bool, error) {
 		off += int64(n)
 	}
 	return false, nil
+}
+
+// Inode is the inode of a stat: a file written anew at the same path has another one. 0 where the system has none.
+func Inode(st os.FileInfo) uint64 {
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		return s.Ino
+	}
+	return 0
 }

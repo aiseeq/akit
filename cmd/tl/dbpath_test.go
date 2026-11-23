@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/aiseeq/akit/transcript"
 )
@@ -37,10 +38,11 @@ type chFile struct {
 	path, name, kind string
 	ingested         int64
 	lines, evLines   int
-	mtime, loaded    time.Time
+	loaded           time.Time
 	events           []chEvent
 	raw              []string // the lines, from 1
 	bad              int
+	inode            uint64
 }
 
 type chEvent struct {
@@ -73,7 +75,7 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 		if err != nil {
 			t.Fatal(err)
 		}
-		f.mtime = st.ModTime()
+		f.inode = transcript.Inode(st)
 		switch {
 		case isCodexRollout(path):
 			f.kind = "codex"
@@ -148,7 +150,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "files":
 		for _, f := range s.files {
-			row(f.id, f.path, f.name, f.ingested, f.lines, f.evLines, f.mtime.Unix(), f.loaded.UnixMilli(), f.bad)
+			row(f.id, f.path, f.name, f.ingested, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad, f.inode)
 		}
 	case "events", "usage":
 		for _, f := range s.files {
@@ -286,26 +288,33 @@ func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 	if strings.Contains(sql, "reply_id != '' OR request_id != ''") && (ev.Reply == nil || ev.Reply.ID == "" && ev.Reply.RequestID == "") {
 		return false
 	}
-	hay := strings.ToLower(ev.Who + " " + ev.Shown())
-	switch {
-	case strings.Contains(sql, "hay LIKE {grep:String}"):
-		like := tsvUnescape(param("grep"))
-		lit := strings.NewReplacer(`\%`, `%`, `\_`, `_`, `\\`, `\`).Replace(strings.TrimSuffix(strings.TrimPrefix(like, "%"), "%"))
-		if !strings.Contains(hay, lit) {
+	text := ev.Who + " " + ev.Shown()
+	hay := lowerUTF8(text)
+	grep := sql
+	if i := strings.Index(grep, "(file_id, line) IN (SELECT"); i >= 0 {
+		grep = grep[:i]
+	}
+	// every condition over the text the query has must hold; the server's own semantics of each
+	for _, m := range regexp.MustCompile(`hay LIKE \{(\w+):String\}`).FindAllStringSubmatch(grep, -1) {
+		// a group of LIKEs joined by OR holds when one of them does
+		if group := orGroup(grep, m[0]); group != nil {
+			if !slices.ContainsFunc(group, func(name string) bool { return likeMatch(hay, tsvUnescape(param(name))) }) {
+				return false
+			}
+			continue
+		}
+		if !likeMatch(hay, tsvUnescape(param(m[1]))) {
 			return false
 		}
-	case strings.Contains(sql, "multiMatchAny(hay"):
-		if !regexp.MustCompile(chArray(param("grep"))[0]).MatchString(hay) {
-			return false
-		}
-	case strings.Contains(sql, "match(hay, {grep:String})"):
-		if !regexp.MustCompile(tsvUnescape(param("grep"))).MatchString(hay) {
-			return false
-		}
-	case strings.Contains(sql, "match(concat(who, ' ', text), {grep:String})"):
-		if !regexp.MustCompile(tsvUnescape(param("grep"))).MatchString(ev.Who + " " + ev.Shown()) {
-			return false
-		}
+	}
+	if strings.Contains(grep, "multiMatchAny(hay") && !slices.ContainsFunc(chArray(param("grep")), func(p string) bool { return hyperscanMatch(p, hay) }) {
+		return false
+	}
+	if strings.Contains(grep, "match(hay, {grep:String})") && !re2Match(tsvUnescape(param("grep")), hay) {
+		return false
+	}
+	if strings.Contains(grep, "match(concat(who, ' ', text), {grep:String})") && !re2Match(tsvUnescape(param("grep")), text) {
+		return false
 	}
 	if strings.Contains(sql, "FROM raw WHERE") && param("raw") != "" {
 		raw := f.raw[ev.Line-1]
@@ -321,6 +330,69 @@ func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 		}
 	}
 	return true
+}
+
+// lowerUTF8 is the server's lowerUTF8: full lower case, where İ is i with a combining dot and a final Σ is ς.
+func lowerUTF8(s string) string {
+	runes := []rune(s)
+	var b strings.Builder
+	for i, r := range runes {
+		switch {
+		case r == 'İ':
+			b.WriteString("i\u0307")
+		case r == 'Σ' && i > 0 && unicode.IsLetter(runes[i-1]) && (i+1 == len(runes) || !unicode.IsLetter(runes[i+1])):
+			b.WriteRune('ς')
+		default:
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+// orGroup is the names of the LIKEs of the parenthesized OR group cond stands in, or nil when it stands alone.
+func orGroup(sql, cond string) []string {
+	for _, g := range regexp.MustCompile(`\(([^()]*)\)`).FindAllStringSubmatch(sql, -1) {
+		if strings.Contains(g[1], cond) && strings.Contains(g[1], " OR ") {
+			var names []string
+			for _, m := range regexp.MustCompile(`hay LIKE \{(\w+):String\}`).FindAllStringSubmatch(g[1], -1) {
+				names = append(names, m[1])
+			}
+			return names
+		}
+	}
+	return nil
+}
+
+// likeMatch is LIKE: % any run, _ any one character, a backslash escapes.
+func likeMatch(s, like string) bool {
+	var re strings.Builder
+	re.WriteString("(?s)^")
+	for i := 0; i < len(like); i++ {
+		switch c := like[i]; c {
+		case '%':
+			re.WriteString(".*")
+		case '_':
+			re.WriteString(".")
+		case '\\':
+			if i+1 < len(like) {
+				i++
+				re.WriteString(regexp.QuoteMeta(like[i : i+1]))
+			}
+		default:
+			re.WriteString(regexp.QuoteMeta(like[i : i+1]))
+		}
+	}
+	re.WriteString("$")
+	return regexp.MustCompile(re.String()).MatchString(s)
+}
+
+// re2Match is the server's match: RE2 where a dot matches a newline unless the pattern turns it off.
+func re2Match(pattern, s string) bool { return regexp.MustCompile("(?s)" + pattern).MatchString(s) }
+
+// hyperscanMatch is multiMatchAny: a dot matches a newline, and $ matches before a final newline too.
+func hyperscanMatch(pattern, s string) bool {
+	re := regexp.MustCompile("(?s)" + pattern)
+	return re.MatchString(s) || strings.HasSuffix(s, "\n") && re.MatchString(strings.TrimSuffix(s, "\n"))
 }
 
 // chArray reads an array parameter: numbers or quoted strings.
@@ -386,6 +458,16 @@ func dbCorpus(t *testing.T) (env, []string, map[string]int) {
 		agentRecord("2026-10-25T10:10:05.000Z", "Готово, ключ "+key+" спрятан"),
 		userRecord("2026-10-25T10:10:06.000Z", "password="+strings.Repeat("x9", 1500)+" потом текст"),
 		userRecord("2026-10-25T10:10:07.000Z", "тикет PROJ-1234 и костыль"),
+		// texts where the server's regular expressions and lower case part from Go's regexp
+		userRecord("2026-10-25T10:10:07.100Z", "an error, a terror"),
+		userRecord("2026-10-25T10:10:07.200Z", "an Xrror"),
+		agentRecord("2026-10-25T10:10:07.300Z", "all ok\n"),
+		agentRecord("2026-10-25T10:10:07.400Z", "PASS\nok, then pass ok"),
+		agentRecord("2026-10-25T10:10:07.500Z", "PASS ok"),
+		userRecord("2026-10-25T10:10:07.600Z", "foo\nwfor"),
+		userRecord("2026-10-25T10:10:07.700Z", "fooы wfor_ wforы"),
+		userRecord("2026-10-25T10:10:07.800Z", "ſecret here"),
+		userRecord("2026-10-25T10:10:07.900Z", "api_\u212Aey and ΣΟΦΟΣ and İd"),
 		usageRecord("m1", "claude-opus-5-5", "часть один", 10, 1000, 20000, 1),
 		usageRecord("m1", "claude-opus-5-5", "часть два", 10, 1000, 20000, 300),
 		usageRecord("m2", "claude-sonnet-4-5", "другой ответ", 5, 0, 100, 40),
@@ -421,6 +503,13 @@ var dbForms = [][]string{
 	{"--all", "--grep", "[A-Z]{2,6}-[0-9]{3,5}"},
 	{"--all", "--role", "all", "--grep", "(?-i:Готово)", "--max", "0"},
 	{"--all", "--role", "all", "--grep", "100%_"},
+	{"--all", "--role", "all", "--grep", "[^e]rror", "--max", "0"},
+	{"--all", "--role", "all", "--grep", `foo\S`, "--max", "0"},
+	{"--all", "--role", "all", "--grep", `wfor\W`, "--max", "0"},
+	{"--all", "--role", "agent", "--grep", "ok$", "--max", "0"},
+	{"--all", "--role", "all", "--grep", "(?-i)PASS.ok", "--max", "0"},
+	{"--all", "--role", "all", "--grep", "secret|password|api[_-]?key", "--width", "0", "--max", "0"},
+	{"--all", "--role", "all", "--grep", "σοφος|İd", "--max", "0"},
 	{"--all", "--raw", "tool_use", "--role", "all", "--max", "0"},
 	{"--all", "--raw", `"name":"Bash"|exec_command`, "--role", "all", "--codex", "--max", "0"},
 	{"--all", "--codex", "--role", "all", "--max", "0"},
@@ -468,6 +557,71 @@ func TestDBPrintsAsFiles(t *testing.T) {
 	}
 }
 
+// The folders decide which files there are, as on the file path: a file deleted after the loader read it is
+// not answered from its rows, a moved one is found where it is now, one the loader has not reached is read, and
+// one written anew at the same path is not answered from the rows of the old one.
+func TestDBFollowsTheDisk(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	const (
+		goneID     = "9a000001-0000-4000-8000-000000000001"
+		movedID    = "9a000002-0000-4000-8000-000000000002"
+		newID      = "9a000003-0000-4000-8000-000000000003"
+		replacedID = "9a000004-0000-4000-8000-000000000004"
+		cutID      = "9a000005-0000-4000-8000-000000000005"
+	)
+	gone := writeReviewClaude(t, e, "-home-x-proj", goneID, userRecord("2026-10-25T10:20:00.000Z", "удалённая сессия"))
+	moved := writeReviewClaude(t, e, "-home-x-proj", movedID, userRecord("2026-10-25T10:21:00.000Z", "перенесённая сессия"))
+	replaced := writeReviewClaude(t, e, "-home-x-proj", replacedID, userRecord("2026-10-25T10:22:00.000Z", "старая сессия"),
+		agentRecord("2026-10-25T10:22:01.000Z", "старый ответ"))
+	cut := writeReviewClaude(t, e, "-home-x-proj", cutID, userRecord("2026-10-25T10:25:00.000Z", "длинная сессия до обрезки"),
+		agentRecord("2026-10-25T10:25:01.000Z", "ответ, которого не станет"))
+	ch := newFakeCH(t, append(paths, gone, moved, replaced, cut), unloaded)
+	// cut in place: the same inode, shorter than what the loader stored
+	if err := os.WriteFile(cut, []byte(userRecord("2026-10-25T10:25:00.000Z", "обрезана")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	movedTo := filepath.Join(e.home, ".claude", "projects", "-home-x-other", movedID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(movedTo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, movedTo); err != nil {
+		t.Fatal(err)
+	}
+	writeReviewClaude(t, e, "-home-x-proj", newID, userRecord("2026-10-25T10:23:00.000Z", "новая сессия"))
+	// written beside and renamed over: a new inode, and longer than what the loader stored
+	next := writeReviewClaude(t, e, "-home-x-proj", "next", userRecord("2026-10-25T10:24:00.000Z", "новая сессия на старом месте, длиннее"),
+		agentRecord("2026-10-25T10:24:01.000Z", "новый ответ на старом месте"), agentRecord("2026-10-25T10:24:02.000Z", "и ещё один"))
+	if err := os.Rename(next, replaced); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	for _, args := range [][]string{
+		{"--all", "--role", "all", "--max", "0"},
+		{"--all", "--role", "all", "--grep", "сессия|ответ", "--max", "0"},
+		{goneID[:8]}, {goneID[:8] + ":1"},
+		{movedID[:8], "--role", "all"}, {movedID[:8] + ":1"},
+		{newID[:8], "--role", "all"}, {newID[:8] + ":1"},
+		{replacedID[:8], "--role", "all"}, {replacedID[:8] + ":2"},
+		{cutID[:8], "--role", "all"}, {cutID[:8] + ":1"},
+	} {
+		e.backend = backendFiles
+		codeF, outF, errF := runTL(t, e, args...)
+		e.backend = backendDB
+		codeD, outD, errD := runTL(t, e, args...)
+		if strings.Contains(errD, "instead") {
+			t.Errorf("%q: the database path fell back: %s", args, errD)
+		}
+		if codeF != codeD || outF != outD || errF != errD {
+			t.Errorf("%q: files exit %d, db exit %d\nfiles:\n%s%s\ndb:\n%s%s", args, codeF, codeD, outF, errF, outD, errD)
+		}
+	}
+}
+
 // A database that does not answer leaves the call to the files, with a warning.
 func TestDBUnavailableReadsFiles(t *testing.T) {
 	e, _, _ := dbCorpus(t)
@@ -487,6 +641,29 @@ func TestDBUnavailableReadsFiles(t *testing.T) {
 	}
 }
 
+// A server that takes the connection and does not answer sends the call to the files after the bound of the
+// first query, not after the bound of the whole call.
+func TestDBHungServerReadsFiles(t *testing.T) {
+	e, _, _ := dbCorpus(t)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	old := filesTimeout
+	filesTimeout = 200 * time.Millisecond
+	defer func() { filesTimeout = old }()
+	e.backend = backendDB
+	start := time.Now()
+	code, out, errOut := runTL(t, e, sessionID[:8])
+	if code != 0 || out == "" || !strings.Contains(errOut, "reading files instead") {
+		t.Errorf("exit %d, out %q, err %q", code, out, errOut)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("a hung server held the call %s", took)
+	}
+}
+
 // A server error is a fallback too, not an answer.
 func TestDBServerErrorReadsFiles(t *testing.T) {
 	e, _, _ := dbCorpus(t)
@@ -499,38 +676,6 @@ func TestDBServerErrorReadsFiles(t *testing.T) {
 	code, out, errOut := runTL(t, e, sessionID[:8])
 	if code != 0 || out == "" || !strings.Contains(errOut, "code") || !strings.Contains(errOut, "reading files instead") {
 		t.Errorf("exit %d, out %q, err %q", code, out, errOut)
-	}
-}
-
-func TestLowerPattern(t *testing.T) {
-	for _, c := range []struct{ in, lowered, literal string }{
-		{"Мера", "мера", "мера"},
-		{"wfor", "wfor", "wfor"},
-		{`прост[а-я]* решени|КОСТЫЛ`, "", ""}, // checked by matching below
-		{`\S+Error`, "", ""},
-	} {
-		lowered, literal, err := lowerPattern(c.in)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if c.lowered != "" && (lowered != c.lowered || literal != c.literal) {
-			t.Errorf("%q: %q %q, want %q %q", c.in, lowered, literal, c.lowered, c.literal)
-		}
-		if strings.Contains(lowered, "(?i") {
-			t.Errorf("%q: lowered %q keeps case folding", c.in, lowered)
-		}
-		re := regexp.MustCompile(lowered)
-		orig := regexp.MustCompile("(?i)" + c.in)
-		for _, s := range []string{"мера", "МЕРА", "wfor", "простое решение", "КОСТЫЛЬ", "костыль", "runtime Error", "x Error", " Error"} {
-			if l := strings.ToLower(s); orig.MatchString(s) != re.MatchString(l) {
-				t.Errorf("%q over %q: (?i) %v, lowered over lower case %v", c.in, s, orig.MatchString(s), re.MatchString(l))
-			}
-		}
-	}
-	for pattern, want := range map[string]bool{"(?-i:Готово)": true, "готово": false, "(?-i:123)": false, "[^a]": false, "(?-i)[a-z]": true} {
-		if got, err := caseSensitiveParts(pattern); err != nil || got != want {
-			t.Errorf("caseSensitiveParts(%q) %v %v, want %v", pattern, got, err, want)
-		}
 	}
 }
 
@@ -569,22 +714,56 @@ func TestLiveFlatLen(t *testing.T) {
 	}
 }
 
-// multiMatchAny over the lower-case text matches what (?i) matches.
-func TestLiveGrepLowered(t *testing.T) {
+// The condition of --grep over a real server holds where Go's (?i) regexp matches: the semantics of RE2 there
+// (a dot and a newline, $ and a final newline, negated classes, \S and \W) and of lowerUTF8 against Go's case
+// folding (ſ, the Kelvin sign, σ and ς, İ).
+func TestLiveGrepCondition(t *testing.T) {
 	c := liveDB(t)
-	for _, c2 := range []struct{ pattern, text string }{{"прост[а-я]* решени|КОСТЫЛ", "Простое решение"}, {`[A-Z]{2,6}-[0-9]{3,5}`, "тикет ab-1234"}, {"Мера", "МЕРА"}} {
-		cond, params, err := grepCondition(c2.pattern, grepFast)
+	for _, c2 := range grepCases {
+		cond, params, err := grepCondition(c2.pattern)
 		if err != nil {
 			t.Fatal(err)
 		}
 		params["t"] = chString(c2.text)
-		rows, err := c.selectTSV(t.Context(), chQuery{name: "test-grep", sql: "SELECT " + cond + " FROM (SELECT lowerUTF8(concat('', ' ', {t:String})) AS hay)", params: params})
+		rows, err := c.selectTSV(t.Context(), chQuery{name: "test-grep",
+			sql: "SELECT " + cond + " FROM (SELECT '' AS who, {t:String} AS text, lowerUTF8(concat(who, ' ', text)) AS hay)", params: params})
 		if err != nil {
 			t.Fatal(err)
 		}
 		want := regexp.MustCompile("(?i)" + c2.pattern).MatchString(" " + c2.text)
 		if len(rows) != 1 || (rows[0][0] == "1") != want {
 			t.Errorf("%q over %q: server %v, Go %v", c2.pattern, c2.text, rows, want)
+		}
+	}
+}
+
+// grepCases are patterns over texts where RE2, hyperscan, lowerUTF8 and Go's regexp may part.
+var grepCases = []struct{ pattern, text string }{
+	{"прост[а-я]* решени|КОСТЫЛ", "Простое решение"}, {`[A-Z]{2,6}-[0-9]{3,5}`, "тикет ab-1234"}, {"Мера", "МЕРА"},
+	{"[^e]rror", "an Error"}, {"[^e]rror", "an Xrror"}, {"[^e]rror", "terror"},
+	{`foo\S`, "foo\n"}, {`foo\S`, "foo\v"}, {`foo\S`, "fooы"}, {`wfor\W`, "wforы"}, {`wfor\W`, "wfor_"}, {`wfor\W`, "wfor"},
+	{"ok$", "all ok\n"}, {"ok$", "all ok"}, {"(?-i)PASS.ok", "PASS\nok"}, {"(?-i)PASS.ok", "PASS ok"}, {"(?-i)PASS.ok", "pass ok"},
+	{"secret", "ſecret"}, {"secret", "SECRET"}, {"api[_-]?key", "api_\u212Aey"}, {"σοφος", "ΣΟΦΟΣ"}, {"σοφοσ", "ΣΟΦΟΣ"},
+	{"İd", "İd"}, {"id", "İd"}, {"İd", "id"}, {"ı", "I"}, {"100%_", "100%_ x"}, {"100%_", "100x_"},
+}
+
+// The condition the fake server evaluates gives what Go's regexp gives on the same cases.
+func TestFakeGrepCondition(t *testing.T) {
+	ch := &fakeCH{t: t}
+	f := &chFile{id: 1, kind: "claude"}
+	for _, c2 := range grepCases {
+		cond, params, err := grepCondition(c2.pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := url.Values{"param_files": {"[1]"}, "param_kinds": {"['claude']"}, "param_roles": {"['user']"}}
+		for k, v := range params {
+			q.Set("param_"+k, v)
+		}
+		e := chEvent{ev: transcript.Event{Role: transcript.User, Text: c2.text}}
+		want := regexp.MustCompile("(?i)" + c2.pattern).MatchString(" " + c2.text)
+		if got := ch.match(q, cond, f, e); got != want {
+			t.Errorf("%q over %q: fake server %v, Go %v (%s)", c2.pattern, c2.text, got, want, cond)
 		}
 	}
 }
