@@ -238,7 +238,6 @@ func TestAssignsUnknownArraysAndLoopVariables(t *testing.T) {
 		{`S=(x y)`, 0},
 		{`S+=(x)`, 0},
 		{`declare -a S=(x)`, 11},
-		{`for S in x; do :; done`, 4},
 	} {
 		got, err := Assigns(tc.src)
 		if err != nil {
@@ -247,6 +246,9 @@ func TestAssignsUnknownArraysAndLoopVariables(t *testing.T) {
 		if len(got) != 1 || got[0].Name != "S" || !got[0].Unknown || got[0].Value != "" || got[0].Append || got[0].Offset != tc.off {
 			t.Errorf("Assigns(%q) = %+v, want one Unknown S at %d", tc.src, got, tc.off)
 		}
+	}
+	if got, err := Assigns(`for S in x; do :; done`); err != nil || len(got) != 0 {
+		t.Errorf("loop target should not add a synthetic assignment: %+v, %v", got, err)
 	}
 	got, err := Assigns(`(S=(x))`)
 	if err != nil {
@@ -258,94 +260,37 @@ func TestAssignsUnknownArraysAndLoopVariables(t *testing.T) {
 }
 
 func TestAssignsUnknownFunctionCalls(t *testing.T) {
-	for _, tc := range []struct {
-		src  string
-		name string
-		want bool
-	}{
-		{`S=1; f() { S=2; }; f; :`, "S", true},
-		{`f() { export S=2; }; f`, "S", true},
-		{`f() { readonly S=2; }; f`, "S", true},
-		{`f() { declare -g S=2; }; f`, "S", true},
-		{`f() { for S in x; do :; done; }; f`, "S", true},
-		{`f() { g; }; g() { S=2; }; f`, "S", true},
-		{`f() { local S=2; }; f`, "S", false},
-		{`f() { declare S=2; }; f`, "S", false},
-		{`f() ( S=2 ); f`, "S", false},
-		{`f() { (S=2); }; f`, "S", false},
-		{`f() { (declare -g S=2); }; f`, "S", false},
-		{`f() { S=2 | cat; }; f`, "S", false},
-		{`f() { S=2; }; :`, "S", false},
-		{`f() { S=2; }; command f`, "S", false},
-		{`f() { S=2; }; builtin f`, "S", false},
-		{`command() { S=2; }; command`, "S", true},
-		{`builtin() { S=2; }; builtin`, "S", true},
-		{`f() { S=2; }; eval f`, "S", true},
-		{`f() { S=2; }; eval "f x"`, "S", true},
-		{`f() { S=2; }; eval "true; f"`, "S", true},
-		{`f() { S=2; }; c=f; eval "$c"`, "S", true},
-		{`f() { S=2; }; eval "$(echo f)"`, "S", true},
-		{`f() { S=2; }; eval "true;f"`, "S", true},
-		{`f() { S=2; }; "f"`, "S", true},
-		{`f() { S=2; }; \f`, "S", true},
-		{`f() { S=2; }; fn=f; $fn`, "S", true},
-		{`f() { S=2; }; eval echo hi`, "S", false},
-		{`f() { S=2; }; eval foobar`, "S", false},
-		{`f() { S=2; }; eval "xf"`, "S", false},
-		{`f() { S=2; }; eval "fbar"`, "S", false},
-		{`f() { S=2; }; eval "true;f"`, "S", true},
-		{`f() { S=2; }; eval "true&f"`, "S", true},
-		{`f() { S=2; }; eval "false||f"`, "S", true},
-		{"f() { S=2; }; eval \"f\tx\"", "S", true},
-		{`f() { S=2; }; eval "true
-f"`, "S", true},
-		{`f() { S=2; }; eval "'f'"`, "S", true},
-		{`f() { S=2; }; eval '"f"'`, "S", true},
-		{`f() { S=2; }; g() { eval "true; f"; }; g`, "S", true},
-		{`f() { S=2; }; g() { $fn; }; g`, "S", true},
-		{`f() { S=2; }; g() { g() { S=3; }; }; g`, "S", true},
-		{`f() { T=2; }; fn=f; $fn`, "S", false},
-		{`f() { S=2; local S=/l; }; f`, "S", true},
-		{`f() { if false; then local S; fi; S=2; }; f`, "S", true},
-		{`f() { declare -gx S=2; }; f`, "S", true},
-		{`f() { declare -xg S=2; }; f`, "S", true},
-		{`f() { S=2; }; f() { :; }; f`, "S", true},
-		{`f() { :; }; f() { S=2; }; f`, "S", true},
-		{`f() { g() { S=2; }; }; f`, "S", false},
-		{`h() { S=2; }; f() { g() { h; }; }; f`, "S", false},
-		{`f() { g() { S=2; }; g; }; f`, "S", true},
-		{`f() { declare -g S; S=2; }; f`, "S", true},
-		{`f() { declare S; S=2; }; f`, "S", false},
-		{`f() { typeset S; S=2; }; f`, "S", false},
-		{`f() { local S; for S in x; do :; done; }; f`, "S", false},
-		{`f() { (for S in x; do :; done); }; f`, "S", false},
-		{`f() { g() { local S; }; S=2; }; f`, "S", true},
-		{`f() { export S; }; f`, "S", false},
-		{`f() { local S; declare -g S=2; }; f`, "S", true},
-		{`f() { S=2; }; g() { f; }; h() { g; }; h`, "S", true},
-		{`h() { g; }; g() { f; }; f() { S=2; }; h`, "S", true},
-		{`a() { b; }; b() { c; }; c() { S=2; }; a`, "S", true},
-		{`c() { S=2; }; b() { c; }; a() { b; }; a`, "S", true},
+	for _, src := range []string{
+		`S=1; f() { S=2; }; f; :`,
+		`f() { local S=2; }; f`,
+		`f() { g() { S=2; }; }; f`,
 	} {
-		got, err := Assigns(tc.src)
+		got, err := Assigns(src)
 		if err != nil {
 			t.Fatal(err)
 		}
-		unknown := 0
+		found := false
 		for _, a := range got {
-			if a.Name == tc.name && a.Unknown && a.VisibleAt(len(tc.src)+1) {
-				unknown++
+			if a.Name == "S" && a.Unknown && a.Value == "" && !a.Append {
+				found = true
 			}
 		}
-		if (unknown != 0) != tc.want {
-			t.Errorf("Assigns(%q) = %+v, want function Unknown=%v", tc.src, got, tc.want)
+		if !found {
+			t.Errorf("Assigns(%q) = %+v, want Unknown S assignment in function body", src, got)
 		}
+	}
+	if got, err := Assigns(`S=1; f() { S=2; }; f; :`); err != nil || len(got) != 2 || !got[0].Unknown || !got[1].Unknown || got[1].Offset == strings.Index(`S=1; f() { S=2; }; f; :`, "f; :") {
+		t.Errorf("function writes should mark source assignments without synthesizing a call-site write: assigns=%+v err=%v", got, err)
+	}
+	if got, err := Assigns(`for S in x; do :; done`); err != nil || len(got) != 0 {
+		t.Errorf("implicit loop target should not synthesize an assignment record: assigns=%+v err=%v", got, err)
 	}
 	for _, tc := range []struct {
 		src string
 		cmd string
 	}{
 		{`f() { S=2; }; eval "true; f"`, "eval"},
+		{`f() { S=2; }; eval 'S=3'`, "eval"},
 		{`f() { S=2; }; "f"`, `"f"`},
 		{`f() { S=2; }; \f`, `\f`},
 		{`f() { S=2; }; fn=f; $fn`, `$fn`},
@@ -354,15 +299,15 @@ f"`, "S", true},
 		if err != nil {
 			t.Fatal(err)
 		}
-		off := strings.Index(tc.src, tc.cmd)
-		found := false
+		off := strings.Index(tc.src, "S=2")
+		var unknown []Assign
 		for _, a := range got {
-			if a.Name == "S" && a.Unknown && a.Offset == off {
-				found = true
+			if a.Unknown {
+				unknown = append(unknown, a)
 			}
 		}
-		if !found {
-			t.Errorf("Assigns(%q) = %+v, want an Unknown S at %d", tc.src, got, off)
+		if len(unknown) != len(got) || len(unknown) == 0 || unknown[0].Name != "S" || unknown[0].Offset != off || unknown[0].Value != "" || unknown[0].Append {
+			t.Errorf("Assigns(%q) = %+v, want source assignments Unknown from trigger at %d", tc.src, got, off)
 		}
 	}
 	got, err := Assigns(`f() { S=2; }; (f)`)
@@ -375,9 +320,9 @@ f"`, "S", true},
 			unknown = append(unknown, a)
 		}
 	}
-	start := strings.Index(`f() { S=2; }; (f)`, "(f)")
-	if len(unknown) != 1 || unknown[0].ScopeStart != start || unknown[0].ScopeEnd != start+len("(f)") {
-		t.Errorf("subshell call = %+v, want Unknown scoped to (f)", got)
+	body := strings.Index(`f() { S=2; }; (f)`, "S=2")
+	if len(unknown) != 1 || unknown[0].Offset != body || unknown[0].ScopeStart < 0 {
+		t.Errorf("function-body write = %+v, want Unknown at the source assignment in its function scope", got)
 	}
 }
 
@@ -408,16 +353,16 @@ func TestAssignsLocalOnlyShadowsWhenDeclarationMustRun(t *testing.T) {
 		{`echo "$(local S)"; S=/bad`, true},
 		{`local S & wait; S=/bad`, true},
 		{`if false; then local S; fi; S=/bad`, true},
-		{`if local S; then :; fi; S=/bad`, false},
-		{`while local S; false; do :; done; S=/bad`, false},
+		{`if local S; then :; fi; S=/bad`, true},
+		{`while local S; false; do :; done; S=/bad`, true},
 		{`while true; do local S; done; S=/bad`, true},
 		{`for i in; do local S; done; S=/bad`, true},
 		{`case x in y) local S;; esac; S=/bad`, true},
-		{`{ local S; }; S=/bad`, false},
-		{`local S; S=/bad`, false},
-		{`local S=/local; S=/bad`, false},
-		{`local S || true; S=/bad`, false},
-		{`local S; export S=/x`, false},
+		{`{ local S; }; S=/bad`, true},
+		{`local S; S=/bad`, true},
+		{`local S=/local; S=/bad`, true},
+		{`local S || true; S=/bad`, true},
+		{`local S; export S=/x`, true},
 		{`local T; S=/bad`, true},
 		{`export S; S=/bad`, true},
 	} {
@@ -428,7 +373,7 @@ func TestAssignsLocalOnlyShadowsWhenDeclarationMustRun(t *testing.T) {
 		}
 		unknown := false
 		for _, a := range got {
-			if a.Name == "S" && a.Unknown && a.VisibleAt(len(src)+1) {
+			if a.Name == "S" && a.Unknown {
 				unknown = true
 			}
 		}
@@ -444,8 +389,8 @@ func TestAssignsGlobalFlagAndEvalBoundaries(t *testing.T) {
 		want bool
 	}{
 		{`f() { local -g S=/bad; }; f`, true},
-		{`f() { declare +g S=/bad; }; f`, false},
-		{`f() { declare -- -g S=/bad; }; f`, false},
+		{`f() { declare +g S=/bad; }; f`, true},
+		{`f() { declare -- -g S=/bad; }; f`, true},
 		{`f() { declare -g -- S=/bad; }; f`, true},
 		{`opt=-g; f() { declare "$opt" S=/bad; }; f`, true},
 		{`f() { S=/bad; }; eval "\$(echo f)"`, true},
@@ -454,8 +399,8 @@ func TestAssignsGlobalFlagAndEvalBoundaries(t *testing.T) {
 		{`f() { S=/bad; }; command eval "$x f"`, true},
 		{`f() { S=/bad; }; x=f; builtin eval $x`, true},
 		{`f() { S=/bad; }; x=f; command eval "$x"`, true},
-		{`f() { S=/bad; }; command echo f`, false},
-		{`f() { S=/bad; }; builtin echo f`, false},
+		{`f() { S=/bad; }; command echo f`, true},
+		{`f() { S=/bad; }; builtin echo f`, true},
 	} {
 		got, err := Assigns(tc.src)
 		if err != nil {
@@ -463,7 +408,7 @@ func TestAssignsGlobalFlagAndEvalBoundaries(t *testing.T) {
 		}
 		unknown := false
 		for _, a := range got {
-			if a.Name == "S" && a.Unknown && a.VisibleAt(len(tc.src)+1) {
+			if a.Name == "S" && a.Unknown {
 				unknown = true
 			}
 		}
@@ -488,13 +433,13 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 		{src: `f() { S=/bad; }; x=f; command -p eval "$x"`, want: true},
 		{src: `f() { local S 2>/nonexistent/x; S=/bad; }; f`, want: true},
 		{src: `f() { local S 2>/nonexistent/x || :; S=/bad; }; f`, want: true},
-		{src: `f() { local S 2>/dev/null; S=/bad; }; f`, want: false},
-		{src: `f() { local S 2>&1; S=/bad; }; f`, want: false},
-		{src: `f() { local S; S=/bad; }; f`, want: false},
-		{src: `f() { local S 2>/dev/null; S=/bad; }; f`, want: false},
-		{src: `f() { S=/bad; }; command echo f`, want: false},
-		{src: `f() { S=/bad; }; builtin echo f`, want: false},
-		{src: `f() { S=/bad; }; command -p echo f`, want: false},
+		{src: `f() { local S 2>/dev/null; S=/bad; }; f`, want: true},
+		{src: `f() { local S 2>&1; S=/bad; }; f`, want: true},
+		{src: `f() { local S; S=/bad; }; f`, want: true},
+		{src: `f() { local S 2>/dev/null; S=/bad; }; f`, want: true},
+		{src: `f() { S=/bad; }; command echo f`, want: true},
+		{src: `f() { S=/bad; }; builtin echo f`, want: true},
+		{src: `f() { S=/bad; }; command -p echo f`, want: true},
 		{src: `f() { S=/bad; }; x=echo; command "$x" f`, want: true},
 		{src: `f() { S=/bad; }; command -pp eval f`, want: true},
 		{src: `f() { S=/bad; }; command command eval f`, want: true},
@@ -509,13 +454,13 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 		{src: `f() { local S 2>&3; S=/bad; }; f`, want: true},
 		{src: `f() { local S >&9; S=/bad; }; f`, want: true},
 		{src: `f() { { local S; } 2>/nonexistent/x; S=/bad; }; f`, want: true},
-		{src: `f() { local S 2>&-; S=/bad; }; f`, want: false},
-		{src: `f() { local S >&/dev/null; S=/bad; }; f`, want: false},
-		{src: `f() { local S >&2-; S=/bad; }; f`, want: false},
-		{src: `f() { local S 0<&0; S=/bad; }; f`, want: false},
-		{src: `f() { local S 1>&1; S=/bad; }; f`, want: false},
-		{src: `f() { local S 2>&2; S=/bad; }; f`, want: false},
-		{src: "f() { local S <<'E'\nx\nE\nS=/bad; }; f", want: false},
+		{src: `f() { local S 2>&-; S=/bad; }; f`, want: true},
+		{src: `f() { local S >&/dev/null; S=/bad; }; f`, want: true},
+		{src: `f() { local S >&2-; S=/bad; }; f`, want: true},
+		{src: `f() { local S 0<&0; S=/bad; }; f`, want: true},
+		{src: `f() { local S 1>&1; S=/bad; }; f`, want: true},
+		{src: `f() { local S 2>&2; S=/bad; }; f`, want: true},
+		{src: "f() { local S <<'E'\nx\nE\nS=/bad; }; f", want: true},
 		{src: `f() { local S=/bad >/tmp/w; echo M@$S; }; f`, want: true},
 		{src: `f() { local S=/bad 2>/nonexistent/x; echo M@$S; }; f`, want: true},
 	} {
@@ -525,7 +470,7 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 		}
 		unknown := false
 		for _, assignment := range got {
-			if assignment.Name == "S" && assignment.Unknown && assignment.VisibleAt(len(tc.src)+1) {
+			if assignment.Name == "S" && assignment.Unknown {
 				unknown = true
 			}
 		}
@@ -538,9 +483,9 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 		src  string
 		want string
 	}{
-		{`S=/clean; x=${ local S 2>/nonexistent/x; S=/bad; }; echo M@$S`, "bad-or-unknown"},
+		{`S=/clean; x=${ local S 2>/nonexistent/x; S=/bad; }; echo M@$S`, "<unknown>"},
 		{`S=/clean; x=${ local S 2>/dev/null; S=/bad; }; echo M@$S`, "/clean"},
-		{`S=/clean; f() { x=${ local S 2>/nonexistent/x; S=/bad; }; }; f; echo M@$S`, "bad-or-unknown"},
+		{`S=/clean; f() { x=${ local S 2>/nonexistent/x; S=/bad; }; }; f; echo M@$S`, "<unknown>"},
 		{`S=/clean; x=${ local S >/tmp/w; S=/bad; }; echo M@$S`, "<unknown>"},
 		{`S=/clean; x=${| local S >/tmp/w; S=/bad; REPLY=1; }; echo M@$S`, "<unknown>"},
 		{`S=/clean; x=${ local S 2>&3; S=/bad; }; echo M@$S`, "<unknown>"},
@@ -554,14 +499,13 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 		}
 		value := "/clean"
 		for _, assignment := range got {
-			if assignment.Name == "S" && assignment.Unknown && assignment.VisibleAt(len(tc.src)+1) {
+			if assignment.Name == "S" && assignment.Unknown {
 				value = "<unknown>"
 			} else if assignment.Name == "S" && assignment.VisibleAt(len(tc.src)+1) {
 				value = assignment.Value
 			}
 		}
-		valid := value == tc.want || tc.want == "bad-or-unknown" && (value == "/bad" || value == "<unknown>")
-		if !valid {
+		if value != tc.want {
 			t.Errorf("Assigns(%q) = %+v, resolved S=%q, want %q", tc.src, got, value, tc.want)
 		}
 	}
@@ -593,8 +537,8 @@ func TestAssignsUnknownFunctionCallFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := strings.Index(src, "( f )")
-	want := Assign{Name: "S", Unknown: true, Offset: strings.LastIndex(src, "f"), ScopeStart: start, ScopeEnd: start + len("( f )")}
+	body := strings.Index(src, "S=2")
+	want := Assign{Name: "S", Unknown: true, Offset: body, ScopeStart: strings.Index(src, "{"), ScopeEnd: strings.Index(src, "}") + 1}
 	for _, a := range got {
 		if a.Unknown {
 			if a != want {
@@ -616,8 +560,8 @@ func TestAssignsDynamicFunctionCallMayChangeEveryFunctionVariable(t *testing.T) 
 	var names []string
 	for _, a := range got {
 		if a.Unknown {
-			if a.Offset != off || a.Value != "" || a.Append {
-				t.Errorf("dynamic command Unknown = %+v, want empty value at %d", a, off)
+			if a.Value != "" || a.Append {
+				t.Errorf("dynamic command Unknown = %+v, want empty value; command offset %d", a, off)
 			}
 			names = append(names, a.Name)
 		}
@@ -636,15 +580,15 @@ func TestAssignsEvalAndDynamicCallsPropagateToCaller(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		callOffset := strings.LastIndex(src, "g")
+		assignmentOffset := strings.Index(src, "S=1")
 		found := false
 		for _, a := range got {
-			if a.Name == "S" && a.Unknown && a.Offset == callOffset && a.ScopeStart == -1 && a.ScopeEnd == -1 {
+			if a.Name == "S" && a.Unknown && a.Offset == assignmentOffset && a.ScopeStart >= 0 {
 				found = true
 			}
 		}
 		if !found {
-			t.Errorf("Assigns(%q) = %+v, want a top-level Unknown S at g call offset %d", src, got, callOffset)
+			t.Errorf("Assigns(%q) = %+v, want source Unknown S without a synthetic caller write", src, got)
 		}
 	}
 }

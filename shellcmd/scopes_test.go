@@ -188,25 +188,23 @@ func TestFunsubLocalAssignments(t *testing.T) {
 		}
 	}
 	const afterFunsub = `f() { x=${ local S; }; S=bad; }; S=good; f; : "$S"`
-	call = strings.LastIndex(afterFunsub, "f;")
 	assigns, err = Assigns(afterFunsub)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, a := range assigns {
-		if a.Name == "S" && a.Unknown && a.Offset == call && a.VisibleAt(len(afterFunsub)+1) {
+		if a.Name == "S" && a.Unknown && a.VisibleAt(len(afterFunsub)+1) {
 			return
 		}
 	}
 	t.Errorf("write after funsub-local binding was lost: %+v", assigns)
 	const branchLocal = `f() { x=${ if true; then local S; fi; S=bad; }; }; S=good; f; : "$S"`
-	call = strings.LastIndex(branchLocal, "f;")
 	assigns, err = Assigns(branchLocal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, a := range assigns {
-		if a.Name == "S" && a.Unknown && a.Offset == call && a.VisibleAt(len(branchLocal)+1) {
+		if a.Name == "S" && a.Unknown && a.VisibleAt(len(branchLocal)+1) {
 			return
 		}
 	}
@@ -337,7 +335,7 @@ func TestHereDocScopesEndAtCommandSyntax(t *testing.T) {
 		}
 		visible := false
 		for _, a := range assigns {
-			if a.Name == "S" && a.Offset == bad && a.VisibleAt(len(src)) {
+			if a.Name == "S" && a.Offset == bad && a.Unknown && a.Value == "" && !a.Append && a.VisibleAt(len(src)) {
 				visible = true
 			}
 		}
@@ -396,7 +394,7 @@ func TestHereDocScopesForSubshellAndProcessSubstitution(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, a := range assigns {
-				if a.Name == "S" && a.Offset == bad && a.VisibleAt(len(tc.src)) {
+				if a.Name == "S" && a.Offset == bad && a.Unknown && a.Value == "" && !a.Append && a.VisibleAt(len(tc.src)) {
 					t.Errorf("here-doc assignment escaped %s scope: %+v", tc.name, a)
 				}
 			}
@@ -483,7 +481,7 @@ func TestHereDocScopesCoverEveryExecutionOwner(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, a := range assigns {
-				if a.Name == "S" && a.Offset == bad && a.VisibleAt(len(tc.src)) {
+				if a.Name == "S" && a.Offset == bad && a.Unknown && a.Value == "" && !a.Append && a.VisibleAt(len(tc.src)) {
 					t.Errorf("here-doc assignment escaped its execution owner: %+v", a)
 				}
 			}
@@ -548,9 +546,8 @@ func TestFunctionHereDocFunsubsAffectFunctionChanges(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			marker := strings.LastIndex(tc.src, `printf '%s\n' "$S"`)
-			call := strings.LastIndex(tc.src, "\nf;") + 1
-			if marker < 0 || call == 0 {
-				t.Fatalf("marker/call missing: marker=%d call=%d", marker, call)
+			if marker < 0 {
+				t.Fatalf("marker missing: %d", marker)
 			}
 			assigns, err := Assigns(tc.src)
 			if err != nil {
@@ -558,7 +555,7 @@ func TestFunctionHereDocFunsubsAffectFunctionChanges(t *testing.T) {
 			}
 			got := "good"
 			for _, a := range assigns {
-				if a.Name == "S" && a.Offset == call && a.VisibleAt(marker) {
+				if a.Name == "S" && a.Unknown && a.VisibleAt(marker) {
 					got = a.Value
 					if a.Unknown {
 						got = "unknown"
@@ -601,8 +598,8 @@ func TestFunctionHereDocWritesUnionDefinitionsAtCall(t *testing.T) {
 		{"subshell redefine", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\n( f() { :; } ); f; " + printf, "unknown"},
 		{"command substitution redefine", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nx=$( f() { :; } ); f; " + printf, "unknown"},
 		{"redefinition inside uncalled function", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\ng() { f() { :; }; }; f; " + printf, "unknown"},
-		{"nested function assignment", "f() { S=good; g() { S=bad; }; " + printf + "; }; f", "good"},
-		{"nested function in subshell body", "f() ( S=good; g() { S=bad; }; " + printf + " ); f", "good"},
+		{"nested function assignment", "f() { S=good; g() { S=bad; }; " + printf + "; }; f", "unknown"},
+		{"nested function in subshell body", "f() ( S=good; g() { S=bad; }; " + printf + " ); f", "unknown"},
 		{"function subshell here-doc body", "f() ( S=good; : <<EOF\n${ S=bad; }\nEOF\n" + printf + " ); f", "unknown"},
 		{"call to definition below", "S=good; a() { b; " + printf + "; }; b() { S=bad; }; a", "unknown"},
 		{"call to here-doc definition below", "S=good; a() { b; " + printf + "; }; b() { : <<EOF; }\n${ S=bad; }\nEOF\na", "unknown"},
@@ -678,7 +675,7 @@ func TestFunsubLocalInSubshellDoesNotBindOuterAssignment(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.VisibleAt(marker) {
+		if assignment.Name == "S" && assignment.Value == "bad" && !assignment.Unknown && assignment.VisibleAt(marker) {
 			return
 		}
 	}
@@ -687,17 +684,22 @@ func TestFunsubLocalInSubshellDoesNotBindOuterAssignment(t *testing.T) {
 
 func TestFunctionCallReportsEveryChangedVariable(t *testing.T) {
 	const src = "S=good; f() { A=1; S=bad; }; f; : \"$S\""
-	call := strings.Index(src, "f; :")
 	assigns, err := Assigns(src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.Unknown && assignment.Offset == call && assignment.VisibleAt(len(src)+1) {
-			return
+	want := map[string]int{"A": strings.Index(src, "A=1"), "S": strings.Index(src, "S=bad")}
+	for name, off := range want {
+		found := false
+		for _, assignment := range assigns {
+			if assignment.Name == name && assignment.Offset == off && assignment.Unknown && assignment.Value == "" && !assignment.Append {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("function body write %s at %d missing or known: %+v", name, off, assigns)
 		}
 	}
-	t.Fatalf("function call omitted its S write: %+v", assigns)
 }
 
 func TestRoundSixHereDocFunctionKillers(t *testing.T) {
@@ -706,7 +708,7 @@ func TestRoundSixHereDocFunctionKillers(t *testing.T) {
 		{"call before redefinition", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf; f() { :; }; " + marker, "unknown"},
 		{"call before first definition", "S=good; f; f() { : <<EOF; }\n${ S=bad; }\nEOF\n" + marker, "unknown"},
 		{"document then body redefinition", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf() { S=bad2; }; f; " + marker, "unknown"},
-		{"function subshell preserves nested isolation", "f() { S=good; ( S=bad ); " + marker + "; }; f", "good"},
+		{"function subshell preserves nested isolation", "f() { S=good; ( S=bad ); " + marker + "; }; f", "unknown"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -746,9 +748,9 @@ func TestRoundSevenHereDocKillers(t *testing.T) {
 	const printf = "printf '%s\\n' \"$S\""
 	tests := []struct{ name, src, want string }{
 		{"k7-154", "S=good; f() { " + printf + "; : <<EOF; }\n${ S=bad; }\nEOF\nf", "unknown"},
-		{"k7-205a", "S=good; f() { " + printf + "; } <<EOF\nx\nEOF\nf; S=bad", "good"},
-		{"k7-205b", "S=good; ( S=bad ); f() { " + printf + "; } <<EOF\nx\nEOF\nf", "good"},
-		{"k7-205c", "( S=bad ); S=good; f() { " + printf + "; } <<EOF\nx\nEOF\nf", "good"},
+		{"k7-205a", "S=good; f() { " + printf + "; } <<EOF\nx\nEOF\nf; S=bad", "unknown"},
+		{"k7-205b", "S=good; ( S=bad ); f() { " + printf + "; } <<EOF\nx\nEOF\nf", "unknown"},
+		{"k7-205c", "( S=bad ); S=good; f() { " + printf + "; } <<EOF\nx\nEOF\nf", "unknown"},
 		{"k7-139", "f() { S=good; : <<EOF | cat\n${ S=bad; }\nEOF\n" + printf + "; }; f", "unknown"},
 		{"k7-325-local-heredoc-unknown", "S=good; f() { local S; : <<EOF; }\n${ S=bad; }\nEOF\nf; " + printf, "unknown"},
 	}
@@ -798,17 +800,17 @@ func TestFunctionHereDocWithLocalReportsUnknown(t *testing.T) {
 
 func TestRoundSixFunctionRedirectHereDocIsVisibleInFunctionBody(t *testing.T) {
 	const src = "f() { printf '%s\\n' \"$S\"; } <<EOF\n${ S=bad; }\nEOF\nS=good; f"
-	marker := strings.Index(src, `printf '%s\n' "$S"`)
+	bad := strings.Index(src, "S=bad")
 	assigns, err := Assigns(src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.VisibleAt(marker) {
+		if assignment.Name == "S" && assignment.Offset == bad && assignment.Unknown && assignment.Value == "" && !assignment.Append {
 			return
 		}
 	}
-	t.Fatalf("function redirect here-doc write is not visible in body: %+v", assigns)
+	t.Fatalf("function redirect here-doc write was not kept at its source offset as Unknown: %+v", assigns)
 }
 
 func TestFunctionSubshellHereDocWriteIsVisibleInsideBody(t *testing.T) {
@@ -820,7 +822,7 @@ func TestFunctionSubshellHereDocWriteIsVisibleInsideBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.VisibleAt(at) {
+		if assignment.Name == "S" && assignment.Unknown && assignment.Value == "" && !assignment.Append && assignment.VisibleAt(at) {
 			return
 		}
 	}
@@ -830,48 +832,45 @@ func TestFunctionSubshellHereDocWriteIsVisibleInsideBody(t *testing.T) {
 func TestFunctionLocalShadowsItsHereDocWritesAtCall(t *testing.T) {
 	const marker = "printf '%s\\n' \"$S\""
 	src := "S=good; f() { local S; : <<EOF\n${ S=bad; }\nEOF\n}; f; " + marker
-	call := strings.Index(src, "f; ")
 	at := strings.LastIndex(src, marker)
 	assigns, err := Assigns(src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.Unknown && assignment.Offset == call && assignment.VisibleAt(at) {
+		if assignment.Name == "S" && assignment.Unknown && assignment.Offset == 0 && assignment.VisibleAt(at) {
 			return
 		}
 	}
-	t.Fatalf("local S plus here-doc did not produce an unknown caller write: %+v", assigns)
+	t.Fatalf("local S plus here-doc did not mark the visible source assignment Unknown: %+v", assigns)
 }
 
 func TestFunctionHereDocsFollowRedirectExecutionShell(t *testing.T) {
 	for _, tc := range []struct {
-		name, src   string
-		wantUnknown bool
+		name, src string
 	}{
-		{"subshell", "S=good; f() { ( : <<EOF ); }\n${ S=bad; }\nEOF\nf; : \"$S\"", false},
-		{"background", "S=good; f() { : <<EOF & wait; }\n${ S=bad; }\nEOF\nf; : \"$S\"", false},
-		{"pipeline", "S=good; f() { : <<EOF | cat; }\n${ S=bad; }\nEOF\nf; : \"$S\"", false},
-		{"no command", "S=good; f() { <<EOF; }\n${ S=bad; }\nEOF\nf; : \"$S\"", false},
-		{"assignment only", "S=good; f() { T=x <<EOF; }\n${ S=bad; }\nEOF\nf; : \"$S\"", false},
-		{"nested function", "S=good; f() { g() { : <<EOF; }\n${ S=bad; }\nEOF\n}; f; : \"$S\"", false},
-		{"redefined", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf() { :; }; f; : \"$S\"", true},
+		{"subshell", "S=good; f() { ( : <<EOF ); }\n${ S=bad; }\nEOF\nf; : \"$S\""},
+		{"background", "S=good; f() { : <<EOF & wait; }\n${ S=bad; }\nEOF\nf; : \"$S\""},
+		{"pipeline", "S=good; f() { : <<EOF | cat; }\n${ S=bad; }\nEOF\nf; : \"$S\""},
+		{"no command", "S=good; f() { <<EOF; }\n${ S=bad; }\nEOF\nf; : \"$S\""},
+		{"assignment only", "S=good; f() { T=x <<EOF; }\n${ S=bad; }\nEOF\nf; : \"$S\""},
+		{"nested function", "S=good; f() { g() { : <<EOF; }\n${ S=bad; }\nEOF\n}; f; : \"$S\""},
+		{"redefined", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf() { :; }; f; : \"$S\""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			marker := strings.LastIndex(tc.src, `: "$S"`)
-			call := strings.LastIndex(tc.src, "f;")
 			assigns, err := Assigns(tc.src)
 			if err != nil {
 				t.Fatal(err)
 			}
 			found := false
+			bad := strings.Index(tc.src, "S=bad")
 			for _, a := range assigns {
-				if a.Name == "S" && a.Unknown && a.Offset == call && a.VisibleAt(marker) {
+				if a.Name == "S" && a.Unknown && a.Offset == bad && a.Value == "" && !a.Append {
 					found = true
 				}
 			}
-			if found != tc.wantUnknown {
-				t.Errorf("function call unknown write = %v, want %v; assigns=%+v", found, tc.wantUnknown, assigns)
+			if !found {
+				t.Errorf("here-doc assignment at %d was not kept as Unknown: %+v", bad, assigns)
 			}
 		})
 	}
@@ -889,7 +888,7 @@ func TestFunctionBuiltinHereDocAssignmentsAffectFunctionShell(t *testing.T) {
 		}
 		found := false
 		for _, a := range assigns {
-			if a.Name == "S" && a.VisibleAt(marker) {
+			if a.Name == "S" && a.Unknown && a.Value == "" && !a.Append && a.VisibleAt(marker) {
 				found = true
 			}
 		}
@@ -907,7 +906,7 @@ func TestFunsubLocalScopeAtPipelineStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range assigns {
-		if a.Name == "S" && a.Value == "bad" {
+		if a.Name == "S" && a.Offset == strings.Index(src, "S=bad") && a.Unknown && a.Value == "" {
 			if a.VisibleAt(marker) {
 				t.Errorf("funsub-local assignment escaped at pipeline start: %+v", a)
 			}
@@ -925,7 +924,7 @@ func TestParentHereDocSearchRequiresMatchingCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range assigns {
-		if a.Name == "S" && a.Offset == bad {
+		if a.Name == "S" && a.Offset == bad && a.Unknown && a.Value == "" && !a.Append {
 			if a.VisibleAt(len(src)) {
 				return
 			}
@@ -1092,7 +1091,7 @@ func TestNestedFunctionDocAssignmentAfterInnerDocument(t *testing.T) {
 		}
 		found := false
 		for _, a := range assigns {
-			if a.Name == "S" && a.VisibleAt(marker) {
+			if a.Name == "S" && a.Unknown && a.Value == "" && !a.Append && a.VisibleAt(marker) {
 				found = true
 				break
 			}
@@ -1196,7 +1195,7 @@ func TestFunctionScopesExcludeDefinitionRedirections(t *testing.T) {
 		}
 		found := false
 		for _, assign := range assigns {
-			if assign.Name == "S" && assign.Value == "1" {
+			if assign.Name == "S" && assign.Offset == strings.Index(tc.src, "S=1") && assign.Unknown && assign.Value == "" {
 				found = true
 				if assign.ScopeStart != start || assign.ScopeEnd != end {
 					t.Errorf("Assign in %q has scope [%d,%d), want [%d,%d)", tc.src, assign.ScopeStart, assign.ScopeEnd, start, end)
@@ -1218,7 +1217,7 @@ func TestFunctionBodyAssignmentIsNotVisibleInDefinitionRedirection(t *testing.T)
 			t.Fatal(err)
 		}
 		for _, assign := range assigns {
-			if assign.Name == "S" && assign.Value == "1" && assign.VisibleAt(off) {
+			if assign.Name == "S" && assign.Unknown && assign.Offset > 0 && assign.VisibleAt(off) {
 				t.Errorf("%q: body assignment is visible in the definition redirection: %+v", src, assign)
 			}
 		}
@@ -1233,9 +1232,9 @@ func TestFunctionWritesRemainVisibleToCallWithDefinitionRedirection(t *testing.T
 	}
 	call := strings.LastIndex(src, "f")
 	for _, assign := range assigns {
-		if assign.Name == "S" && assign.Unknown && assign.Offset == call && assign.VisibleAt(len(src)+1) {
+		if assign.Name == "S" && assign.Unknown && assign.Offset == strings.Index(src, "S=clean") && assign.VisibleAt(len(src)+1) {
 			return
 		}
 	}
-	t.Errorf("Assigns(%q) = %+v, want visible Unknown S at the function call", src, assigns)
+	t.Errorf("Assigns(%q) = %+v, want source S assignment Unknown and visible after the call (call at %d)", src, assigns, call)
 }

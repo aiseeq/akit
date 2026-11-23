@@ -1,7 +1,6 @@
 package shellcmd
 
 import (
-	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -25,12 +24,16 @@ type Assign struct {
 	Tilde Tilde
 	// Append marks `S+=x`: Value is added to the previous value.
 	Append bool
-	// Unknown marks a value that Assigns cannot determine. It is set for assignments of names
-	// exposed to eval, defining aliases, command traps, mapfile/readarray -C, source/dot,
-	// nameref declarations, recognized nested shell scripts, arithmetic, integer declarations,
-	// names written by read, printf -v, getopts, mapfile/readarray, or exec {name}>…; `${name:=…}`;
-	// or assignments in conditional/repeated regions and here-document/here-string bodies. An
-	// implicit write without a corresponding ordinary assignment is not necessarily returned.
+	// Unknown marks a value that Assigns cannot determine. Global triggers include eval, dynamic
+	// command words, defining aliases or BASH_ALIASES writes, command traps, mapfile/readarray -C,
+	// source/dot, nameref declarations, and recognized nested shell scripts. Per-name triggers
+	// include arithmetic and integer declarations; `${name:=…}`; write targets of read, printf -v,
+	// getopts, mapfile/readarray, unset, wait -p, coproc, and `{name}>…`; readonly/case-transform
+	// declarations; special-builtin prefix assignments; writes in function bodies; and writes in
+	// if/elif/else and case arms, right sides of &&/||, loop conditions and bodies, conditional
+	// parameter expansions, case patterns, and here-document/here-string expansions. A name read
+	// in a function body with multiple assignments in the script is also Unknown. Implicit writes
+	// may not have a corresponding returned assignment.
 	Unknown bool
 	// Offset is the byte offset of the assignment in the command.
 	Offset int
@@ -43,7 +46,7 @@ type Assign struct {
 // ScopeKind identifies a shell command region whose assignments do not reach
 // the shell running the command. Bash's ${ ...; } command substitutions execute
 // in the current shell; local declarations inside them are tracked separately.
-// Trap, mapfile -C, aliases and lastpipe behavior are not modeled here.
+// Scopes is syntactic and does not model trap, callback, alias, or lastpipe effects.
 type ScopeKind int
 
 const (
@@ -72,8 +75,8 @@ func (k ScopeKind) String() string {
 // separate ranges for their here-document bodies. Function bodies include their
 // name and declaration offset; other kinds have an empty Name and DeclOffset of
 // -1. Bash funsubs have no general assignment scope, though local declarations
-// inside them are tracked by Assigns. Trap, mapfile -C, aliases and lastpipe
-// behavior are left to consumers to infer from these regions.
+// inside them are tracked by Assigns. These regions do not encode runtime effects
+// from traps, callbacks, aliases, or lastpipe.
 type Scope struct {
 	Start, End int
 	Kind       ScopeKind
@@ -83,11 +86,11 @@ type Scope struct {
 	Last       bool
 }
 
-// VisibleAt reports whether the assignment may affect a word at byte offset off: it comes
-// before off and is made by the shell running the command, or off is inside its scope. It uses
-// source order and does not model execution order, branches, loop repetition, traps, or deferred
-// here-document and here-string expansions. Unknown marks uncertainty; it does not move the
-// assignment to an estimated execution point.
+// VisibleAt reports whether the assignment is in source order before off and either belongs to
+// the command's shell or off is inside its syntactic scope. It does not determine execution order
+// across functions, branches, loop conditions/bodies, traps, callbacks, pipelines, or deferred
+// here-document and here-string expansions. Assigns marks affected names Unknown instead of
+// moving offsets; callers must not treat a known source-order value as proof that a command ran.
 func (a Assign) VisibleAt(off int) bool {
 	if a.Offset >= off {
 		return false
@@ -96,17 +99,20 @@ func (a Assign) VisibleAt(off int) bool {
 }
 
 // Assigns returns assignments in source order. Prefix assignments and declarations without a
-// value are omitted. Every assignment of every name is marked Unknown if the script contains eval,
-// a defining alias, a trap command, mapfile/readarray -C, source/dot, a declare/local/typeset -n
-// option, or a recognized nested shell script. Arithmetic names, names declared with -i, targets
-// of read, printf -v, getopts, mapfile/readarray or exec {name}>…, and names assigned in if/case
-// branches, the right side of &&/||, loop bodies, or here-document/here-string bodies are also
-// marked Unknown. `${name:=…}` marks that name; a -n option makes all script names Unknown.
-// Arithmetic referencing a name with a non-integer or already unknown value does the same.
-// Offsets and scopes remain syntactic. The
-// analysis does not execute generated text, inspect source files, follow arbitrary indirect writes,
-// model shell runtime state, or synthesize a record for every implicit write. Parse errors in the
-// input or a recognized nested shell script are returned.
+// value are omitted. It marks all assignments Unknown when the script contains eval, a dynamic
+// command word, a defining alias or BASH_ALIASES write, a command trap, mapfile/readarray -C,
+// source/dot, a declare/local/typeset -n option, or a recognized nested shell script from a string
+// or stdin. Per-name triggers include arithmetic and -i declarations; `${name:=…}`; write targets
+// of read, printf -v, getopts, mapfile/readarray, unset, wait -p, coproc, and `{name}>…`;
+// readonly/case-transform declarations; special-builtin prefix assignments; function-body writes;
+// and assignments in if/elif/else/case arms, right sides of &&/||, loop conditions and bodies,
+// conditional parameter expansions, case patterns, and here-document/here-string expansions. A
+// name read inside a function body is also Unknown when there are multiple
+// assignments to it. Arithmetic involving a write target or a non-integer/Unknown value makes all
+// assignments Unknown. Offsets and scopes remain syntactic. The analysis does not execute generated
+// text, inspect source files, resolve arbitrary indirection, model trap/callback order or lastpipe,
+// and may omit implicit write records. Malformed top-level input is an error; malformed script
+// text in a recognized nested shell marks names Unknown without returning the nested parse error.
 func Assigns(cmd string) ([]Assign, error) {
 	file, full, err := parseShellVariant(cmd, false)
 	if err != nil {
@@ -116,12 +122,12 @@ func Assigns(cmd string) ([]Assign, error) {
 	ctx := newAssignContext(file, regions)
 	ctx.assignmentModes = assignmentShellModes(file, full)
 	ctx.declarations = declarationAssignments(file)
-	uncertainRedirects := uncertainRedirectStatements(file)
+	uncertainRedirects := newSpanIndex(uncertainRedirectStatements(file))
 	var out []Assign
 	syntax.Walk(file, func(node syntax.Node) bool {
 		assignments := assignmentsForNode(node, full, ctx)
 		for i := range assignments {
-			if insideAny(uncertainRedirects, assignments[i].Offset) {
+			if uncertainRedirects.contains(assignments[i].Offset) {
 				assignments[i].Value = ""
 				assignments[i].Tilde = 0
 				assignments[i].Append = false
@@ -137,7 +143,7 @@ func Assigns(cmd string) ([]Assign, error) {
 	}
 	for i := range out {
 		if global || suspicious[out[i].Name] {
-			out[i].Value, out[i].Tilde, out[i].Append, out[i].Unknown = "", 0, false, true
+			out[i].Value, out[i].Append, out[i].Unknown = "", false, true
 		}
 	}
 	slices.SortStableFunc(out, func(a, b Assign) int { return a.Offset - b.Offset })
@@ -149,44 +155,42 @@ var shellVarName = regexp.MustCompile(`^[[:alpha:]_][[:alnum:]_]*$`)
 var numericValue = regexp.MustCompile(`^[+-]?[0-9]+$`)
 var integerDeclOption = regexp.MustCompile(`(^|[[:space:]])-[[:alpha:]]*i[[:alpha:]]*([[:space:]]|$)`)
 var namerefDeclOption = regexp.MustCompile(`(^|[[:space:]])-[[:alpha:]]*n[[:alpha:]]*([[:space:]]|$)`)
-var execFDAllocation = regexp.MustCompile(`\bexec[[:space:]]+\{([[:alpha:]_][[:alnum:]_]*)\}[[:space:]]*(?:>>?|>>\|)`)
+var caseTransformDeclOption = regexp.MustCompile(`(^|[[:space:]])-[[:alpha:]]*[ulc][[:alpha:]]*([[:space:]]|$)`)
 
 // suspiciousAssignNames makes one syntax-tree pass and records names whose value can be
 // affected by constructs Assigns deliberately does not execute or interpret.
 func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map[string]bool, bool, error) {
 	scan := suspiciousAssignScan{
 		src: src, assigns: assigns, names: make(map[string]bool), arithmetic: make(map[string]bool),
-		integerVars: make(map[string]bool),
-	}
-	for _, match := range execFDAllocation.FindAllStringSubmatch(src, -1) {
-		scan.names[match[1]] = true
+		integerVars: make(map[string]bool), writeNames: make(map[string]bool),
+		functionCounts: make(map[string]int), functionRefs: make(map[string][]int),
 	}
 	syntax.Walk(file, scan.visit)
-	if err := scan.nestedShells(); err != nil {
-		return nil, false, err
-	}
 	names, all := scan.result()
 	return names, all, nil
 }
 
 type suspiciousAssignScan struct {
-	src         string
-	assigns     []Assign
-	names       map[string]bool
-	arithmetic  map[string]bool
-	integerVars map[string]bool
-	uncertain   []span
-	all         bool
-	maybeShell  bool
+	src            string
+	assigns        []Assign
+	names          map[string]bool
+	arithmetic     map[string]bool
+	integerVars    map[string]bool
+	writeNames     map[string]bool
+	functionCounts map[string]int
+	functionRefs   map[string][]int
+	functionBodies []span
+	mathSpans      []span
+	valueSpans     map[string][]span
+	uncertain      []span
+	all            bool
 }
 
 func (s *suspiciousAssignScan) markText(lo, hi int) {
 	if lo < 0 || hi > len(s.src) || lo >= hi {
 		return
 	}
-	for _, name := range arithmeticNames.FindAllString(s.src[lo:hi], -1) {
-		s.names[name], s.arithmetic[name] = true, true
-	}
+	s.mathSpans = append(s.mathSpans, span{lo, hi})
 }
 
 func (s *suspiciousAssignScan) markStmts(stmts []*syntax.Stmt) {
@@ -201,33 +205,110 @@ func (s *suspiciousAssignScan) visit(node syntax.Node) bool {
 		s.call(n)
 	case *syntax.DeclClause:
 		s.declaration(n)
-	case *syntax.ArithmCmd, *syntax.ArithmExp, *syntax.LetClause, *syntax.CStyleLoop, *syntax.TestClause:
+	case *syntax.FuncDecl:
+		s.functionBodies = append(s.functionBodies, nodeSpan(n.Body))
+	case *syntax.ArithmCmd, *syntax.ArithmExp, *syntax.LetClause, *syntax.CStyleLoop:
 		s.markText(int(n.Pos().Offset()), int(n.End().Offset()))
 	case *syntax.Assign:
-		if n.Index != nil {
-			s.markText(int(n.Index.Pos().Offset()), int(n.Index.End().Offset()))
-		}
+		s.visitAssign(n)
 	case *syntax.ParamExp:
 		s.parameter(n)
 	case *syntax.IfClause:
-		s.markStmts(n.Then)
-		if n.Else != nil {
-			s.markStmts(n.Else.Then)
-		}
+		s.visitIf(n)
 	case *syntax.CaseClause:
-		for _, item := range n.Items {
-			s.markStmts(item.Stmts)
-		}
+		s.visitCase(n)
+	case *syntax.BinaryTest:
+		s.visitBinaryTest(n)
 	case *syntax.WhileClause:
 		s.markStmts(n.Do)
+		s.markStmts(n.Cond)
 	case *syntax.ForClause:
 		s.markStmts(n.Do)
+		if words, ok := n.Loop.(*syntax.WordIter); ok && words.Name != nil {
+			s.markName(words.Name.Value)
+		}
 	case *syntax.BinaryCmd:
 		s.binary(n)
 	case *syntax.Redirect:
 		s.redirect(n)
+	case *syntax.Stmt:
+		s.visitStmt(n)
+	case *syntax.CoprocClause:
+		s.visitCoproc(n)
 	}
 	return true
+}
+
+func nodeSpan(node syntax.Node) span {
+	return span{int(node.Pos().Offset()), int(node.End().Offset())}
+}
+
+func (s *suspiciousAssignScan) visitAssign(assign *syntax.Assign) {
+	if assign.Name != nil {
+		if assign.Value != nil {
+			if s.valueSpans == nil {
+				s.valueSpans = make(map[string][]span)
+			}
+			s.valueSpans[assign.Name.Value] = append(s.valueSpans[assign.Name.Value], nodeSpan(assign.Value))
+		}
+		if assign.Name.Value == "BASH_ALIASES" {
+			s.all = true
+		}
+	}
+	if assign.Index != nil {
+		s.markText(int(assign.Index.Pos().Offset()), int(assign.Index.End().Offset()))
+	}
+}
+
+func (s *suspiciousAssignScan) visitIf(clause *syntax.IfClause) {
+	s.markStmts(clause.Then)
+	if clause.Else != nil {
+		s.markStmts(clause.Else.Then)
+		s.markStmts(clause.Else.Cond)
+	}
+}
+
+func (s *suspiciousAssignScan) visitCase(clause *syntax.CaseClause) {
+	for _, item := range clause.Items {
+		s.markStmts(item.Stmts)
+		for _, pattern := range item.Patterns {
+			s.uncertain = append(s.uncertain, nodeSpan(pattern))
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) visitBinaryTest(test *syntax.BinaryTest) {
+	switch test.Op {
+	case syntax.TsEql, syntax.TsNeq, syntax.TsLeq, syntax.TsGeq, syntax.TsLss, syntax.TsGtr:
+		s.markText(int(test.X.Pos().Offset()), int(test.X.End().Offset()))
+		s.markText(int(test.Y.Pos().Offset()), int(test.Y.End().Offset()))
+	}
+}
+
+func (s *suspiciousAssignScan) visitStmt(stmt *syntax.Stmt) {
+	for _, redir := range stmt.Redirs {
+		if (redir.Op == syntax.Hdoc || redir.Op == syntax.DashHdoc) && redir.Word != nil && redir.Hdoc != nil {
+			lo, hi := int(redir.Word.End().Offset()), int(redir.Hdoc.Pos().Offset())
+			if lo < hi {
+				s.uncertain = append(s.uncertain, span{lo, hi})
+			}
+		}
+	}
+	if call, ok := stmt.Cmd.(*syntax.CallExpr); ok && stmtHasHeredoc(stmt) {
+		s.nestedShellHeredoc(call)
+	}
+}
+
+func (s *suspiciousAssignScan) visitCoproc(clause *syntax.CoprocClause) {
+	if clause.Name == nil {
+		return
+	}
+	name, ok := wordValue(clause.Name)
+	if !ok {
+		s.all = true
+		return
+	}
+	s.markWriteName(name)
 }
 
 func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
@@ -241,17 +322,23 @@ func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
 	}
 	name, ok := wordValue(call.Args[0])
 	if !ok {
+		s.all = true
 		return
 	}
 	args := make([]string, len(call.Args))
 	for i, word := range call.Args {
 		args[i], _ = wordValue(word)
-		if IsShell(baseName(args[i])) {
-			s.maybeShell = true
-		}
 	}
 	name, args = unwrapBuiltinCommand(name, args)
 	s.callEffects(name, args, call)
+	s.nestedShellInput(call)
+	if len(call.Assigns) > 0 && (s.specialBuiltin(name) || strings.Contains(" declare local typeset ", " "+name+" ")) {
+		for _, assign := range call.Assigns {
+			if assign.Name != nil {
+				s.markWriteName(assign.Name.Value)
+			}
+		}
+	}
 }
 
 func unwrapBuiltinCommand(name string, args []string) (string, []string) {
@@ -276,32 +363,54 @@ func (s *suspiciousAssignScan) callEffects(name string, args []string, call *syn
 	case "eval", "source", ".":
 		s.all = true
 	case "alias":
-		for _, arg := range args[1:] {
-			if strings.Contains(arg, "=") {
-				s.all = true
-				break
-			}
-		}
+		s.alias(args)
 	case "trap":
-		s.all = len(args) > 2 && args[1] != "-"
+		s.trap(args)
 	case "mapfile", "readarray":
-		s.mapfile(args)
+		s.mapfile(args, call)
 	case "read":
-		for _, arg := range args[1:] {
-			s.markName(arg)
-		}
+		s.readTargets(args)
 	case "getopts":
 		if len(args) > 2 {
-			s.markName(args[2])
+			s.markWriteName(args[2])
+		} else {
+			s.all = true
 		}
 	case "printf":
-		if len(args) > 2 && args[1] == "-v" {
-			s.markName(args[2])
-		}
+		s.printfTarget(args)
 	case "let":
 		for _, word := range call.Args[1:] {
 			s.markText(int(word.Pos().Offset()), int(word.End().Offset()))
 		}
+	case "declare", "local", "typeset", "export", "readonly":
+		s.wrappedDeclaration(name, args)
+	case "unset":
+		s.unsetTargets(args)
+	case "wait":
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == "-p" {
+				s.markWriteName(args[i+1])
+			}
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) alias(args []string) {
+	for _, arg := range args[1:] {
+		if strings.Contains(arg, "=") {
+			s.all = true
+			return
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) trap(args []string) {
+	action := 1
+	if action < len(args) && args[action] == "--" {
+		action++
+	}
+	if action < len(args) && args[action] != "" && !strings.HasPrefix(args[action], "-") {
+		s.all = true
 	}
 }
 
@@ -311,19 +420,217 @@ func (s *suspiciousAssignScan) markName(name string) {
 	}
 }
 
-func (s *suspiciousAssignScan) mapfile(args []string) {
+func (s *suspiciousAssignScan) markWriteName(name string) {
+	name = strings.Trim(name, "{}")
+	if i := strings.IndexByte(name, '['); i >= 0 {
+		if j := strings.LastIndexByte(name, ']'); j > i {
+			s.markTextByText(name[i+1 : j])
+			name = name[:i]
+		}
+	}
+	if shellVarName.MatchString(name) {
+		s.names[name], s.writeNames[name] = true, true
+	} else {
+		s.all = true
+	}
+}
+
+func (s *suspiciousAssignScan) markTextByText(text string) {
+	for _, name := range arithmeticNames.FindAllString(text, -1) {
+		s.names[name], s.arithmetic[name] = true, true
+	}
+}
+
+func (s *suspiciousAssignScan) mapfile(args []string, call *syntax.CallExpr) {
 	for i, arg := range args[1:] {
 		if strings.HasPrefix(arg, "-") && strings.Contains(arg, "C") && (arg != "-C" || i+2 < len(args)) {
 			s.all = true
 		}
 	}
-	for _, arg := range args[1:] {
+	s.mapfileTarget(args, call)
+}
+
+func (s *suspiciousAssignScan) mapfileTarget(args []string, call *syntax.CallExpr) {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			s.markWriteName(arg)
+			return
+		}
+		if arg == "--" {
+			if i+1 < len(args) {
+				s.markWriteName(args[i+1])
+			}
+			return
+		}
+		i += s.mapfileOption(args, call, i)
+	}
+}
+
+func (s *suspiciousAssignScan) mapfileOption(args []string, call *syntax.CallExpr, i int) int {
+	arg := args[i]
+	key := strings.TrimLeft(arg, "-")
+	if eq := strings.IndexByte(key, '='); eq >= 0 {
+		key = key[:eq]
+	}
+	if key == "n" || key == "d" || key == "u" || key == "O" || key == "C" || key == "c" {
+		return s.mapfileOptionArgument(args, call, i, arg, key)
+	}
+	return mapfileClusterArgument(args, i, arg)
+}
+
+func (s *suspiciousAssignScan) mapfileOptionArgument(args []string, call *syntax.CallExpr, i int, arg, key string) int {
+	if !strings.Contains(arg, "=") && len(key) == len(strings.TrimLeft(arg, "-")) && i+1 < len(args) {
+		if key == "O" && i+1 < len(call.Args) {
+			s.markWord(call.Args[i+1])
+		}
+		return 1
+	}
+	if key == "O" && strings.Contains(arg, "=") && i < len(call.Args) {
+		s.markWord(call.Args[i])
+	}
+	return 0
+}
+
+func mapfileClusterArgument(args []string, i int, arg string) int {
+	options := strings.TrimLeft(arg, "-")
+	for _, option := range options {
+		if strings.ContainsRune("nduOCc", option) && len(options) == 1 && i+1 < len(args) {
+			return 1
+		}
+	}
+	return 0
+}
+
+func (s *suspiciousAssignScan) markWord(word *syntax.Word) {
+	s.markText(int(word.Pos().Offset()), int(word.End().Offset()))
+}
+
+func (s *suspiciousAssignScan) readTargets(args []string) {
+	found := false
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			found = s.markReadTargets(args, i+1) || found
+			return
+		}
+		if strings.HasPrefix(arg, "-") && len(arg) > 1 {
+			consumed, targetFound := s.readOptionTarget(args, i, arg)
+			i += consumed
+			found = found || targetFound
+			continue
+		}
+		if arg == "" {
+			s.all = true
+			found = true
+			continue
+		}
+		s.markWriteName(arg)
+		found = true
+	}
+	if !found {
+		s.markWriteName("REPLY")
+	}
+}
+
+func (s *suspiciousAssignScan) markReadTargets(args []string, start int) bool {
+	found := start < len(args)
+	for _, target := range args[start:] {
+		s.markWriteName(target)
+	}
+	return found
+}
+
+func (s *suspiciousAssignScan) readOptionTarget(args []string, i int, arg string) (int, bool) {
+	option := strings.TrimLeft(arg, "-")
+	if option == "" {
+		return 0, false
+	}
+	if option[0] == 'a' {
+		if len(option) > 1 {
+			s.markWriteName(option[1:])
+			return 0, true
+		}
+		if i+1 < len(args) {
+			s.markWriteName(args[i+1])
+			return 1, true
+		}
+		return 1, false
+	}
+	if strings.ContainsRune("d n N p t u i", rune(option[0])) && len(option) == 1 {
+		return 1, false
+	}
+	return 0, false
+}
+
+func (s *suspiciousAssignScan) printfTarget(args []string) {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-v" {
+			if i+1 < len(args) {
+				s.markWriteName(args[i+1])
+			} else {
+				s.all = true
+			}
+			return
+		}
+		if strings.HasPrefix(arg, "-v") && len(arg) > 2 {
+			s.markWriteName(arg[2:])
+			return
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) unsetTargets(args []string) {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-v" || arg == "-f" {
+			continue
+		}
+		if arg == "--" {
+			i++
+			if i < len(args) {
+				s.markWriteName(args[i])
+			}
+			continue
+		}
 		if strings.HasPrefix(arg, "-") {
 			continue
 		}
-		s.markName(arg)
-		break
+		s.markWriteName(arg)
 	}
+}
+
+func (s *suspiciousAssignScan) wrappedDeclaration(name string, args []string) {
+	markAttributes := false
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			flags := strings.TrimLeft(arg, "-")
+			if strings.Contains(flags, "n") && (name == "declare" || name == "local" || name == "typeset") {
+				s.all = true
+			}
+			if strings.ContainsAny(flags, "iulc") {
+				markAttributes = true
+			}
+			continue
+		}
+		if n, _, ok := strings.Cut(arg, "="); ok {
+			s.markWriteName(n)
+		} else if markAttributes {
+			s.markWriteName(arg)
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) specialBuiltin(name string) bool {
+	if strings.Contains(" export readonly ", " "+name+" ") {
+		return true
+	}
+	if !strings.Contains(s.src, "set -o posix") {
+		return false
+	}
+	return strings.Contains(" : . break continue eval exec exit return set shift trap unset ", " "+name+" ")
 }
 
 func (s *suspiciousAssignScan) declaration(decl *syntax.DeclClause) {
@@ -337,19 +644,167 @@ func (s *suspiciousAssignScan) declaration(decl *syntax.DeclClause) {
 		declText = s.src[lo:hi]
 	}
 	integer := integerDeclOption.MatchString(declText)
+	attribute := caseTransformDeclOption.MatchString(declText)
 	if namerefDeclOption.MatchString(declText) && (cmd == "declare" || cmd == "local" || cmd == "typeset") {
 		s.all = true
 	}
+	s.declarationArgs(decl, integer, attribute)
+}
+
+func (s *suspiciousAssignScan) declarationArgs(decl *syntax.DeclClause, integer, attribute bool) {
+	cmd := decl.Variant.Value
 	for _, assign := range decl.Args {
-		if assign.Name == nil || (assign.Naked && strings.HasPrefix(assign.Name.Value, "-")) || !integer {
+		s.declarationArg(assign, cmd, integer, attribute)
+	}
+}
+
+func (s *suspiciousAssignScan) declarationArg(assign *syntax.Assign, cmd string, integer, attribute bool) {
+	if assign.Name == nil {
+		s.markNakedDeclaration(assign)
+		return
+	}
+	if assign.Naked && strings.HasPrefix(assign.Name.Value, "-") {
+		return
+	}
+	name := assign.Name.Value
+	if integer {
+		s.integerVars[name], s.names[name] = true, true
+	}
+	if attribute {
+		s.names[name] = true
+	}
+	if cmd == "readonly" {
+		s.markWriteName(name)
+	}
+	if integer && assign.Value != nil {
+		s.markWord(assign.Value)
+	}
+}
+
+func (s *suspiciousAssignScan) markNakedDeclaration(assign *syntax.Assign) {
+	if assign.Value == nil {
+		return
+	}
+	word, ok := wordValue(assign.Value)
+	if !ok {
+		return
+	}
+	if name, _, hasValue := strings.Cut(word, "="); hasValue {
+		s.markWriteName(name)
+	}
+}
+
+func (s *suspiciousAssignScan) nestedShellInput(call *syntax.CallExpr) {
+	if len(call.Args) == 0 {
+		return
+	}
+	values := make([]string, len(call.Args))
+	for i, word := range call.Args {
+		values[i], _ = wordValue(word)
+	}
+	if i, ok := shellCommandIndex(values); ok && shellReadsInlineScript(values[i+1:]) {
+		s.all = true
+	}
+}
+
+func (s *suspiciousAssignScan) nestedShellHeredoc(call *syntax.CallExpr) {
+	if len(call.Args) == 0 {
+		return
+	}
+	values := make([]string, len(call.Args))
+	for i, word := range call.Args {
+		values[i], _ = wordValue(word)
+	}
+	i, ok := shellCommandIndex(values)
+	if ok && (shellReadsInlineScript(values[i+1:]) || !shellHasScriptFile(values[i+1:])) {
+		s.all = true
+	}
+}
+
+// shellCommandIndex follows the package's registered wrapper chain using its existing option
+// parsers, then returns the first shell command. Arguments to ordinary commands are not candidates.
+func shellCommandIndex(args []string) (int, bool) {
+	for i := 0; i < len(args); {
+		name := baseName(args[i])
+		if IsShell(name) {
+			return i, true
+		}
+		if !wrappers[name] {
+			return 0, false
+		}
+		rest := args[i+1:]
+		start := wrapperStart(name, rest)
+		if name == "timeout" && start < len(rest) && rest[start] != "--" {
+			start++
+		}
+		if name == "env" {
+			start = envCommandStart(rest, start)
+		}
+		if name == "parallel" {
+			var ok bool
+			start, ok = parallelCommandStart(rest)
+			if !ok {
+				return 0, false
+			}
+		}
+		if start >= len(rest) {
+			return 0, false
+		}
+		i += start + 1
+	}
+	return 0, false
+}
+
+func shellReadsInlineScript(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if arg == "-c" || arg == "-s" {
+			return true
+		}
+		if arg == "--command" || strings.HasPrefix(arg, "--command=") {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") {
+			if strings.ContainsAny(arg[1:], "cs") {
+				return true
+			}
+			if arg == "-o" || arg == "-O" {
+				i++
+			}
 			continue
 		}
-		name := assign.Name.Value
-		s.integerVars[name], s.names[name] = true, true
-		if assign.Value != nil {
-			s.markText(int(assign.Value.Pos().Offset()), int(assign.Value.End().Offset()))
+		if strings.HasPrefix(arg, "--") {
+			if arg == "--rcfile" || arg == "--init-file" || arg == "--startup-file" {
+				i++
+			}
+			continue
 		}
+		return false
 	}
+	return false
+}
+
+func shellHasScriptFile(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return i+1 < len(args)
+		}
+		if arg == "-c" || arg == "-s" || strings.HasPrefix(arg, "--command=") {
+			return false
+		}
+		if strings.HasPrefix(arg, "-") {
+			if arg == "-o" || arg == "-O" || arg == "--rcfile" || arg == "--init-file" || arg == "--startup-file" {
+				i++
+			}
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (s *suspiciousAssignScan) parameter(param *syntax.ParamExp) {
@@ -358,6 +813,12 @@ func (s *suspiciousAssignScan) parameter(param *syntax.ParamExp) {
 	}
 	if param.Param != nil && param.Exp != nil && (param.Exp.Op == syntax.AssignUnset || param.Exp.Op == syntax.AssignUnsetOrNull) {
 		s.names[param.Param.Value] = true
+	}
+	if param.Exp != nil && (param.Exp.Op == syntax.AlternateUnset || param.Exp.Op == syntax.AlternateUnsetOrNull || param.Exp.Op == syntax.DefaultUnset || param.Exp.Op == syntax.DefaultUnsetOrNull) {
+		s.uncertain = append(s.uncertain, span{int(param.Pos().Offset()), int(param.End().Offset())})
+	}
+	if param.Param != nil {
+		s.functionRefs[param.Param.Value] = append(s.functionRefs[param.Param.Value], int(param.Pos().Offset()))
 	}
 }
 
@@ -374,73 +835,150 @@ func (s *suspiciousAssignScan) redirect(redir *syntax.Redirect) {
 	if redir.Op == syntax.WordHdoc && redir.Word != nil {
 		s.uncertain = append(s.uncertain, span{int(redir.Word.Pos().Offset()), int(redir.Word.End().Offset())})
 	}
-	if redir.N != nil && shellVarName.MatchString(redir.N.Value) && !numericValue.MatchString(redir.N.Value) {
-		s.names[redir.N.Value] = true
+	if redir.N != nil {
+		name := strings.Trim(redir.N.Value, "{}")
+		if shellVarName.MatchString(name) && !numericValue.MatchString(name) {
+			s.markWriteName(name)
+		}
 	}
 }
 
-func (s *suspiciousAssignScan) nestedShells() error {
-	if !s.maybeShell {
-		return nil
+func (s *suspiciousAssignScan) result() (map[string]bool, bool) {
+	for name := range s.integerVars {
+		s.names[name] = true
+		for _, value := range s.valueSpans[name] {
+			s.mathSpans = append(s.mathSpans, value)
+		}
 	}
-	calls, err := Calls(s.src)
-	if err != nil {
-		return err
+	s.collectArithmeticNames()
+	for _, assign := range s.assigns {
+		if s.integerVars[assign.Name] && (assign.Unknown || assign.Value != "" && !numericValue.MatchString(assign.Value)) {
+			s.all = true
+		}
+		if s.arithmetic[assign.Name] && (assign.Unknown || assign.Value != "" && !numericValue.MatchString(assign.Value)) {
+			s.all = true
+		}
 	}
-	for i := range calls {
-		call := &calls[i]
-		if !IsShell(call.Name) {
+	for name := range s.arithmetic {
+		if s.writeNames[name] {
+			s.all = true
+		}
+	}
+	order := assignmentOrder(s.assigns)
+	functions := mergeSpans(s.functionBodies)
+	if len(functions) > 0 {
+		for _, assign := range s.assigns {
+			s.functionCounts[assign.Name]++
+		}
+		markAssignmentsInSpans(s.assigns, order, functions, s.names)
+		for name, offsets := range s.functionRefs {
+			if s.functionCounts[name] < 2 {
+				continue
+			}
+			for _, off := range offsets {
+				if containsMergedSpan(functions, off) {
+					s.names[name] = true
+					break
+				}
+			}
+		}
+	}
+	markAssignmentsInSpans(s.assigns, order, mergeSpans(s.uncertain), s.names)
+	return s.names, s.all
+}
+
+func assignmentOrder(assigns []Assign) []int {
+	order := make([]int, len(assigns))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool { return assigns[order[i]].Offset < assigns[order[j]].Offset })
+	return order
+}
+
+func mergeSpans(spans []span) []span {
+	if len(spans) < 2 {
+		return spans
+	}
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start == spans[j].start {
+			return spans[i].end < spans[j].end
+		}
+		return spans[i].start < spans[j].start
+	})
+	merged := spans[:1]
+	for _, current := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if current.start > last.end {
+			merged = append(merged, current)
+		} else if current.end > last.end {
+			last.end = current.end
+		}
+	}
+	return merged
+}
+
+func markAssignmentsInSpans(assigns []Assign, order []int, spans []span, names map[string]bool) {
+	spanIndex := 0
+	for _, assignmentIndex := range order {
+		assignment := assigns[assignmentIndex]
+		for spanIndex < len(spans) && spans[spanIndex].end <= assignment.Offset {
+			spanIndex++
+		}
+		if spanIndex < len(spans) && spans[spanIndex].start <= assignment.Offset {
+			names[assignment.Name] = true
+		}
+	}
+}
+
+func containsMergedSpan(spans []span, off int) bool {
+	i := sort.Search(len(spans), func(i int) bool { return spans[i].start > off }) - 1
+	return i >= 0 && off < spans[i].end
+}
+
+func (s *suspiciousAssignScan) collectArithmeticNames() {
+	sort.Slice(s.mathSpans, func(i, j int) bool {
+		if s.mathSpans[i].start == s.mathSpans[j].start {
+			return s.mathSpans[i].end < s.mathSpans[j].end
+		}
+		return s.mathSpans[i].start < s.mathSpans[j].start
+	})
+	if len(s.mathSpans) == 0 {
+		return
+	}
+	merged := s.mathSpans[:0]
+	for _, current := range s.mathSpans {
+		if len(merged) == 0 || current.start > merged[len(merged)-1].end {
+			merged = append(merged, current)
 			continue
 		}
-		if call.ScriptInput || shellReadsHeredoc(call.Name, call.Args) || shellCommandString(call.Args) {
-			s.all = true
-			return nil
+		if current.end > merged[len(merged)-1].end {
+			merged[len(merged)-1].end = current.end
 		}
 	}
-	return nil
+	for _, source := range merged {
+		for _, name := range arithmeticNames.FindAllString(s.src[source.start:source.end], -1) {
+			s.names[name], s.arithmetic[name] = true, true
+		}
+	}
 }
 
-func shellCommandString(args []string) bool {
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") && strings.Contains(arg, "c") {
+func stmtHasHeredoc(stmt *syntax.Stmt) bool {
+	for _, redir := range stmt.Redirs {
+		if redir.Op == syntax.Hdoc || redir.Op == syntax.DashHdoc || redir.Op == syntax.WordHdoc {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *suspiciousAssignScan) result() (map[string]bool, bool) {
-	if s.all {
-		return s.names, true
-	}
-	for _, assign := range s.assigns {
-		if s.arithmetic[assign.Name] && (assign.Unknown || (assign.Value != "" && !numericValue.MatchString(assign.Value))) {
-			return s.names, true
-		}
-	}
-	uncertain := newSpanIndex(s.uncertain)
-	for _, assign := range s.assigns {
-		if uncertain.contains(assign.Offset) {
-			s.names[assign.Name] = true
-		}
-	}
-	return s.names, false
-}
-
 type assignContext struct {
-	scopes            []span
-	scopeIndex        spanIndex
-	functionIndex     spanIndex
-	funsubs           []span
-	funsubLocals      []localBinding
-	replySubs         []span
-	functionChanges   map[string][]string
-	functionDefs      map[string][]assignDefinition
-	functionNames     []string
-	functionNameSet   map[string]bool
-	functionDocIndex  spanIndex
-	functionDocBySpan map[span]functionDocScope
-	deferredIndex     spanIndex
+	scopes        []span
+	scopeIndex    spanIndex
+	functionIndex spanIndex
+	funsubs       []span
+	funsubLocals  []localBinding
+	replySubs     []span
 	// assignmentModes and declarations give the tilde mark of a value: the
 	// shell modes at the assignment and whether a declaration command makes it.
 	assignmentModes map[*syntax.Assign]shellModes
@@ -450,10 +988,6 @@ type assignContext struct {
 
 func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
 	uncertainDecls := uncertainDeclarationRedirects(file)
-	rawScopes := make([]span, len(regions.scopes))
-	for i, scope := range regions.scopes {
-		rawScopes[i] = span{scope.Start, scope.End}
-	}
 	docBodies := make(map[span]bool, len(regions.functionDocs))
 	for _, doc := range regions.functionDocs {
 		if doc.owner.start <= doc.doc.start && doc.doc.end <= doc.owner.end {
@@ -467,27 +1001,15 @@ func newAssignContext(file *syntax.File, regions scopeSet) assignContext {
 		}
 		scopes = append(scopes, span{scope.Start, scope.End})
 	}
-	functionChanges, functionDefs := assignFunctionChanges(regions, rawScopes)
 	scopeIndex := newSpanIndex(scopes)
 	ctx := assignContext{
-		scopes:            scopes,
-		scopeIndex:        scopeIndex,
-		functionIndex:     newSpanIndex(regions.functions),
-		funsubs:           funsubSpans(file),
-		funsubLocals:      funsubLocalBindings(file, scopeIndex, uncertainDecls),
-		functionChanges:   functionChanges,
-		functionDefs:      functionDefs,
-		functionNames:     slices.Sorted(maps.Keys(functionChanges)),
-		functionNameSet:   functionNameSet(functionChanges),
-		deferredIndex:     newSpanIndex(regions.index.deferredCalls),
-		functionDocBySpan: make(map[span]functionDocScope, len(regions.functionDocs)),
-		uncertainDecls:    uncertainDecls,
+		scopes:         scopes,
+		scopeIndex:     scopeIndex,
+		functionIndex:  newSpanIndex(regions.functions),
+		funsubs:        funsubSpans(file),
+		funsubLocals:   funsubLocalBindings(file, scopeIndex, uncertainDecls),
+		uncertainDecls: uncertainDecls,
 	}
-	for _, doc := range regions.functionDocs {
-		ctx.functionDocBySpan[doc.doc] = doc
-		ctx.functionDocIndex.spans = append(ctx.functionDocIndex.spans, doc.doc)
-	}
-	ctx.functionDocIndex = newSpanIndex(ctx.functionDocIndex.spans)
 	syntax.Walk(file, func(node syntax.Node) bool {
 		if subst, ok := node.(*syntax.CmdSubst); ok && subst.ReplyVar {
 			ctx.replySubs = append(ctx.replySubs, span{int(subst.Pos().Offset()), int(subst.End().Offset())})
@@ -503,7 +1025,6 @@ func assignmentsForNode(node syntax.Node, full string, ctx assignContext) []Assi
 		if len(n.Args) == 0 {
 			return assignmentsFromSyntax(n.Assigns, full, ctx, false)
 		}
-		return unknownFunctionAssignments(n, ctx)
 	case *syntax.DeclClause:
 		declOff := int(n.Pos().Offset())
 		if n.Variant.Value == "local" && !ctx.functionIndex.contains(declOff) && !insideAny(ctx.funsubs, declOff) {
@@ -519,8 +1040,6 @@ func assignmentsForNode(node syntax.Node, full string, ctx assignContext) []Assi
 			}
 		}
 		return assignments
-	case *syntax.ForClause:
-		return unknownLoopAssignment(n, ctx)
 	}
 	return nil
 }
@@ -564,9 +1083,6 @@ func assignmentsFromSyntax(assigns []*syntax.Assign, full string, ctx assignCont
 			assignment.Append = false
 		}
 		out = append(out, assignment)
-		if execution, ok := functionDocExecution(assignment, off, ctx); ok {
-			out = append(out, execution)
-		}
 	}
 	return out
 }
@@ -602,65 +1118,6 @@ func certainFunsubBinding(locals []localBinding, name string, offset int) (local
 	return found, found.end != 0
 }
 
-func unknownFunctionAssignments(call *syntax.CallExpr, ctx assignContext) []Assign {
-	if len(call.Args) == 0 {
-		return nil
-	}
-	off := int(call.Args[0].Pos().Offset())
-	possibleNames := calledFunctionNames(call.Args, ctx.functionNames, ctx.functionNameSet)
-	deferred := ctx.deferredIndex.contains(off)
-	knownFunction := false
-	for _, name := range possibleNames {
-		definitions := ctx.functionDefs[name]
-		if sort.Search(len(definitions), func(i int) bool { return definitions[i].declOffset > off }) > 0 {
-			knownFunction = true
-			break
-		}
-	}
-	if !knownFunction && !deferred {
-		return nil
-	}
-	var out []Assign
-	for _, variable := range calledFunctionChangesAt(call.Args, ctx.functionNames, ctx.functionNameSet, ctx.functionChanges) {
-		start, end := assignmentScope(ctx, variable, off, false)
-		assignment := Assign{Name: variable, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end}
-		out = append(out, assignment)
-		if execution, ok := functionDocExecution(assignment, off, ctx); ok {
-			out = append(out, execution)
-		}
-	}
-	return out
-}
-
-func functionDocExecution(assignment Assign, off int, ctx assignContext) (Assign, bool) {
-	doc, ok := ctx.functionDocContaining(off)
-	if !ok || !doc.functionCommandRedirect {
-		return Assign{}, false
-	}
-	assignment.Offset = doc.owner.start
-	assignment.ScopeStart, assignment.ScopeEnd = doc.owner.start, doc.owner.end
-	return assignment, true
-}
-
-func (ctx assignContext) functionDocContaining(off int) (functionDocScope, bool) {
-	start, end := ctx.functionDocIndex.innermost(off)
-	if start < 0 {
-		return functionDocScope{}, false
-	}
-	doc, ok := ctx.functionDocBySpan[span{start, end}]
-	return doc, ok
-}
-
-func unknownLoopAssignment(loop *syntax.ForClause, ctx assignContext) []Assign {
-	words, ok := loop.Loop.(*syntax.WordIter)
-	if !ok || words.Name == nil {
-		return nil
-	}
-	off := int(words.Name.Pos().Offset())
-	start, end := assignmentScope(ctx, words.Name.Value, off, false)
-	return []Assign{{Name: words.Name.Value, Unknown: true, Offset: off, ScopeStart: start, ScopeEnd: end}}
-}
-
 func declarationAssignments(file *syntax.File) map[*syntax.Assign]bool {
 	declarations := make(map[*syntax.Assign]bool)
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -676,7 +1133,7 @@ func declarationAssignments(file *syntax.File) map[*syntax.Assign]bool {
 }
 
 func uncertainDeclarationRedirects(node syntax.Node) map[*syntax.DeclClause]bool {
-	uncertainStatements := uncertainRedirectStatements(node)
+	uncertainStatements := newSpanIndex(uncertainRedirectStatements(node))
 	uncertain := make(map[*syntax.DeclClause]bool)
 	syntax.Walk(node, func(node syntax.Node) bool {
 		decl, ok := node.(*syntax.DeclClause)
@@ -684,11 +1141,8 @@ func uncertainDeclarationRedirects(node syntax.Node) map[*syntax.DeclClause]bool
 			return true
 		}
 		off := int(decl.Pos().Offset())
-		for _, stmt := range uncertainStatements {
-			if stmt.start <= off && off < stmt.end {
-				uncertain[decl] = true
-				break
-			}
+		if uncertainStatements.contains(off) {
+			uncertain[decl] = true
 		}
 		return true
 	})
@@ -713,6 +1167,14 @@ func uncertainRedirectStatements(node syntax.Node) []span {
 		return true
 	})
 	return uncertain
+}
+
+func stmtHasNoCommand(stmt *syntax.Stmt) bool {
+	if stmt.Cmd == nil {
+		return true
+	}
+	call, ok := stmt.Cmd.(*syntax.CallExpr)
+	return ok && len(call.Args) == 0
 }
 
 func redirectDefinitelySucceeds(redir *syntax.Redirect) bool {
@@ -778,37 +1240,9 @@ func Scopes(cmd string) ([]Scope, error) {
 	return commandScopes(file).scopes, nil
 }
 
-// assignFunction contains statically inferred shell-visible writes and known function calls.
-type assignFunction struct {
-	definitions []assignDefinition
-	calls       []string
-	vars        map[string]bool
-}
-
-type assignDefinition struct {
-	body           *syntax.Stmt
-	span           span
-	shells         []functionShell
-	isolated       bool
-	declOffset     int
-	vars           []string
-	calls          []string
-	uncertainDecls map[*syntax.DeclClause]bool
-}
-
-type functionShell struct {
-	span span
-	node syntax.Node
-}
-
 type functionDocScope struct {
-	redir                   *syntax.Redirect
-	hdoc                    *syntax.Word
-	doc                     span
-	owner                   span
-	functionCommandRedirect bool
-	statementOwned          bool
-	noCommand               bool
+	doc   span
+	owner span
 }
 
 type localBinding struct {
@@ -817,172 +1251,6 @@ type localBinding struct {
 	start     int
 	end       int
 	uncertain bool
-}
-
-// assignFunctionChanges returns variables that each function can change in its caller. Calls
-// between functions are resolved to a fixed point so a caller inherits its callees' changes.
-func assignFunctionChanges(regions scopeSet, scopes []span) (map[string][]string, map[string][]assignDefinition) {
-	scopeIndex := newSpanIndex(scopes)
-	funcs := assignFunctionDecls(regions, scopeIndex)
-	functionNames := slices.Sorted(maps.Keys(funcs))
-	functionSet := functionNameSet(funcs)
-	for _, name := range functionNames {
-		f := funcs[name]
-		for i := range f.definitions {
-			collectDefinitionChanges(f, &f.definitions[i], functionNames, functionSet, scopeIndex)
-		}
-	}
-	propagateFunctionChanges(funcs)
-	out := make(map[string][]string, len(funcs))
-	for name, f := range funcs {
-		for variable := range f.vars {
-			out[name] = append(out[name], variable)
-		}
-		slices.Sort(out[name])
-	}
-	definitions := make(map[string][]assignDefinition, len(funcs))
-	for name, function := range funcs {
-		definitions[name] = function.definitions
-	}
-	return out, definitions
-}
-
-func collectDefinitionChanges(function *assignFunction, definition *assignDefinition, functionNames []string, functionSet map[string]bool, scopes spanIndex) {
-	if definition.isolated {
-		return
-	}
-	locals := functionLocals(definition.body, definition.span, scopes)
-	for _, shell := range definition.shells {
-		scopedDefinition := *definition
-		scopedDefinition.span = shell.span
-		shellLocals := locals
-		if shell.node != definition.body {
-			// Here-doc expansion order relative to local declarations is not
-			// statically reliable. Keep possible writes as unknown at the caller.
-			shellLocals = nil
-		}
-		changes := &assignFunction{vars: make(map[string]bool)}
-		collectFunctionChanges(shell.node, changes, &scopedDefinition, functionNames, functionSet, shellLocals, scopes)
-		mergeDefinitionChanges(function, definition, changes)
-	}
-	sortUnique(&definition.vars)
-	sortUnique(&definition.calls)
-}
-
-func mergeDefinitionChanges(function *assignFunction, definition *assignDefinition, changes *assignFunction) {
-	for variable := range changes.vars {
-		definition.vars = append(definition.vars, variable)
-		function.vars[variable] = true
-	}
-	definition.calls = append(definition.calls, changes.calls...)
-	function.calls = append(function.calls, changes.calls...)
-}
-
-func sortUnique(values *[]string) {
-	slices.Sort(*values)
-	*values = slices.Compact(*values)
-}
-
-func assignFunctionDecls(regions scopeSet, scopes spanIndex) map[string]*assignFunction {
-	funcs := make(map[string]*assignFunction)
-	for _, f := range regions.index.functions {
-		if f.Body == nil {
-			continue
-		}
-		for _, name := range funcDeclNames(f) {
-			_, isolated := f.Body.Cmd.(*syntax.Subshell)
-			function := funcs[name.Value]
-			if function == nil {
-				function = &assignFunction{vars: make(map[string]bool)}
-				funcs[name.Value] = function
-			}
-			bodySpan := functionBodySpan(f.Body)
-			shells := append([]functionShell{{span: bodySpan, node: f.Body}}, functionHereDocShells(regions.functionDocsByFunction[f], scopes)...)
-			function.definitions = append(function.definitions, assignDefinition{
-				body: f.Body, span: bodySpan, shells: shells, isolated: isolated, declOffset: int(f.Pos().Offset()),
-				uncertainDecls: uncertainDeclarationRedirects(f.Body),
-			})
-		}
-	}
-	return funcs
-}
-
-func functionLocals(body *syntax.Stmt, fn span, scopes spanIndex) []localBinding {
-	var locals []localBinding
-	uncertain := uncertainDeclarationRedirects(body)
-	collectExecutedLocals(body, true, fn, scopes, uncertain, &locals)
-	return append(locals, funsubLocalBindingsInFunction(body, fn, scopes, uncertain)...)
-}
-
-func collectExecutedLocals(stmt *syntax.Stmt, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	if stmt == nil || !executes {
-		return
-	}
-	switch cmd := stmt.Cmd.(type) {
-	case *syntax.DeclClause:
-		collectLocalDeclaration(cmd, fn, scopes, uncertain, locals)
-	case *syntax.Block:
-		collectExecutedLocalsIn(cmd.Stmts, executes, fn, scopes, uncertain, locals)
-	case *syntax.BinaryCmd:
-		collectBinaryLocals(cmd, executes, fn, scopes, uncertain, locals)
-	case *syntax.IfClause:
-		collectIfLocals(cmd, executes, fn, scopes, uncertain, locals)
-	case *syntax.WhileClause:
-		collectWhileLocals(cmd, executes, fn, scopes, uncertain, locals)
-	case *syntax.ForClause:
-		collectExecutedLocalsIn(cmd.Do, false, fn, scopes, uncertain, locals)
-	case *syntax.CaseClause:
-		collectCaseLocals(cmd, fn, scopes, uncertain, locals)
-	}
-}
-
-func collectLocalDeclaration(decl *syntax.DeclClause, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	if uncertain[decl] || !isLocalDeclaration(decl) || declHasGlobal(decl) || !inFunctionShell(scopes, fn, int(decl.Pos().Offset())) {
-		return
-	}
-	for _, a := range decl.Args {
-		if a.Name != nil {
-			*locals = append(*locals, localBinding{name: a.Name.Value, offset: int(a.Pos().Offset()), start: fn.start, end: fn.end})
-		}
-	}
-}
-
-func collectBinaryLocals(cmd *syntax.BinaryCmd, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	if cmd.Op == syntax.AndStmt || cmd.Op == syntax.OrStmt {
-		collectExecutedLocals(cmd.X, executes, fn, scopes, uncertain, locals)
-		collectExecutedLocals(cmd.Y, false, fn, scopes, uncertain, locals)
-	}
-}
-
-func collectIfLocals(cmd *syntax.IfClause, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, uncertain, locals)
-	collectExecutedLocalsIn(cmd.Then, false, fn, scopes, uncertain, locals)
-}
-
-func collectWhileLocals(cmd *syntax.WhileClause, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	collectExecutedLocalsIn(cmd.Cond, executes, fn, scopes, uncertain, locals)
-	collectExecutedLocalsIn(cmd.Do, false, fn, scopes, uncertain, locals)
-}
-
-func collectCaseLocals(cmd *syntax.CaseClause, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	for _, item := range cmd.Items {
-		collectExecutedLocalsIn(item.Stmts, false, fn, scopes, uncertain, locals)
-	}
-}
-
-func collectExecutedLocalsIn(stmts []*syntax.Stmt, executes bool, fn span, scopes spanIndex, uncertain map[*syntax.DeclClause]bool, locals *[]localBinding) {
-	for _, stmt := range stmts {
-		collectExecutedLocals(stmt, executes, fn, scopes, uncertain, locals)
-	}
-}
-
-func localShadows(locals []localBinding, name string, offset int) bool {
-	for _, local := range locals {
-		if local.name == name && !local.uncertain && local.offset < offset && local.start <= offset && offset < local.end {
-			return true
-		}
-	}
-	return false
 }
 
 func funsubSpans(node syntax.Node) []span {
@@ -1127,231 +1395,6 @@ func isLocalDeclaration(decl *syntax.DeclClause) bool {
 	return decl.Variant.Value == "local" || decl.Variant.Value == "declare" || decl.Variant.Value == "typeset"
 }
 
-func nestedFunctionOf(node syntax.Node, definition *assignDefinition) bool {
-	nested, ok := node.(*syntax.FuncDecl)
-	if !ok || nested.Body == nil || nested.Body == definition.body {
-		return false
-	}
-	off := int(nested.Pos().Offset())
-	return definition.span.start <= off && off < definition.span.end
-}
-
-func collectFunctionChanges(root syntax.Node, f *assignFunction, definition *assignDefinition, functionNames []string, functionSet map[string]bool, locals []localBinding, scopes spanIndex) {
-	syntax.Walk(root, func(node syntax.Node) bool {
-		if nestedFunctionOf(node, definition) {
-			return false
-		}
-		switch n := node.(type) {
-		case *syntax.CallExpr:
-			if inFunctionShell(scopes, definition.span, int(n.Pos().Offset())) {
-				collectCallChanges(f, definition, n, functionNames, functionSet, locals, scopes)
-			}
-		case *syntax.DeclClause:
-			collectDeclChanges(f, definition, n, locals, scopes)
-		case *syntax.ForClause:
-			collectLoopChanges(f, definition, n, locals, scopes)
-		}
-		return true
-	})
-}
-
-func collectCallChanges(f *assignFunction, definition *assignDefinition, call *syntax.CallExpr, functionNames []string, functionSet map[string]bool, locals []localBinding, scopes spanIndex) {
-	if len(call.Args) == 0 {
-		for _, a := range call.Assigns {
-			if a.Name != nil && !a.Naked && !localShadows(locals, a.Name.Value, int(a.Pos().Offset())) && inFunctionShell(scopes, definition.span, int(a.Pos().Offset())) {
-				f.vars[a.Name.Value] = true
-			}
-		}
-		return
-	}
-	f.calls = append(f.calls, calledFunctionNames(call.Args, functionNames, functionSet)...)
-}
-
-func calledFunctionChangesAt(args []*syntax.Word, functionNames []string, functionSet map[string]bool, changes map[string][]string) []string {
-	variables := make(map[string]bool)
-	for _, name := range calledFunctionNames(args, functionNames, functionSet) {
-		for _, variable := range changes[name] {
-			variables[variable] = true
-		}
-	}
-	return slices.Sorted(maps.Keys(variables))
-}
-
-func calledFunctionNames(args []*syntax.Word, functions []string, functionSet map[string]bool) []string {
-	if len(args) == 0 {
-		return nil
-	}
-	name, literal := wordValue(args[0])
-	if !literal {
-		return functions
-	}
-	if functionSet[name] {
-		return []string{name}
-	}
-	switch name {
-	case "eval":
-		return evalCallFunctionNames(args[1:], functions)
-	case "command":
-		return wrappedBuiltinFunctionNames(args[1:], true, functions)
-	case "builtin":
-		return wrappedBuiltinFunctionNames(args[1:], false, functions)
-	}
-	return nil
-}
-
-func wrappedBuiltinFunctionNames(args []*syntax.Word, command bool, functions []string) []string {
-	for len(args) > 0 {
-		option, literal := wordValue(args[0])
-		if !literal {
-			return functions
-		}
-		if option == "--" {
-			args = args[1:]
-			break
-		}
-		if command && len(option) > 1 && option[0] == '-' {
-			valid := true
-			query := false
-			for _, flag := range option[1:] {
-				switch flag {
-				case 'p':
-				case 'v', 'V':
-					query = true
-				default:
-					valid = false
-				}
-			}
-			if !valid || query {
-				return nil
-			}
-			args = args[1:]
-			continue
-		}
-		if !command && strings.HasPrefix(option, "-") {
-			return nil
-		}
-		break
-	}
-	if len(args) == 0 {
-		return nil
-	}
-	name, literal := wordValue(args[0])
-	if !literal {
-		return functions
-	}
-	switch name {
-	case "eval":
-		return evalCallFunctionNames(args[1:], functions)
-	case "command":
-		return wrappedBuiltinFunctionNames(args[1:], true, functions)
-	case "builtin":
-		return wrappedBuiltinFunctionNames(args[1:], false, functions)
-	default:
-		return nil
-	}
-}
-
-func evalCallFunctionNames(evalArgs []*syntax.Word, functions []string) []string {
-	for _, arg := range evalArgs {
-		if _, ok := wordValue(arg); !ok {
-			return functions
-		}
-	}
-	return evalFunctionNames(evalArgs, functions)
-}
-
-func functionNameSet[V any](functions map[string]V) map[string]bool {
-	set := make(map[string]bool, len(functions))
-	for name := range functions {
-		set[name] = true
-	}
-	return set
-}
-
-func evalFunctionNames(args []*syntax.Word, functions []string) []string {
-	found := make(map[string]bool)
-	for _, arg := range args {
-		text, _ := wordValue(arg)
-		for _, name := range functions {
-			if evalTextHasWord(text, name) {
-				found[name] = true
-			}
-		}
-	}
-	return slices.Sorted(maps.Keys(found))
-}
-
-func evalTextHasWord(text, name string) bool {
-	for from := 0; from < len(text); {
-		rel := strings.Index(text[from:], name)
-		if rel < 0 {
-			return false
-		}
-		start := from + rel
-		end := start + len(name)
-		if (start == 0 || evalDelimiter(text[start-1])) && (end == len(text) || evalDelimiter(text[end])) {
-			return true
-		}
-		from = start + 1
-	}
-	return false
-}
-
-func evalDelimiter(char byte) bool {
-	return char <= ' ' || strings.ContainsRune(";&|()'\"", rune(char))
-}
-
-func collectDeclChanges(f *assignFunction, definition *assignDefinition, decl *syntax.DeclClause, locals []localBinding, scopes spanIndex) {
-	uncertainRedirect := definition.uncertainDecls[decl]
-	global := declHasGlobal(decl)
-	for _, a := range decl.Args {
-		if a.Name == nil || a.Naked || localShadows(locals, a.Name.Value, int(a.Pos().Offset())) && !global || !inFunctionShell(scopes, definition.span, int(a.Pos().Offset())) {
-			continue
-		}
-		if (decl.Variant.Value == "local" || decl.Variant.Value == "declare" || decl.Variant.Value == "typeset") && !global && !uncertainRedirect {
-			continue
-		}
-		f.vars[a.Name.Value] = true
-	}
-}
-
-func collectLoopChanges(f *assignFunction, definition *assignDefinition, loop *syntax.ForClause, locals []localBinding, scopes spanIndex) {
-	words, ok := loop.Loop.(*syntax.WordIter)
-	if ok && words.Name != nil && !localShadows(locals, words.Name.Value, int(words.Name.Pos().Offset())) && inFunctionShell(scopes, definition.span, int(words.Name.Pos().Offset())) {
-		f.vars[words.Name.Value] = true
-	}
-}
-
-func propagateFunctionChanges(funcs map[string]*assignFunction) {
-	names := slices.Sorted(maps.Keys(funcs))
-	changed := true
-	for changed {
-		changed = false
-		for _, name := range names {
-			f := funcs[name]
-			for _, call := range f.calls {
-				changed = mergeFunctionChanges(f, funcs[call]) || changed
-			}
-		}
-	}
-}
-
-func mergeFunctionChanges(target, source *assignFunction) bool {
-	changed := false
-	for name := range source.vars {
-		if !target.vars[name] {
-			target.vars[name] = true
-			changed = true
-		}
-	}
-	return changed
-}
-
-func inFunctionShell(scopes spanIndex, fn span, off int) bool {
-	start, end := scopes.innermost(off)
-	return start == fn.start && end == fn.end
-}
-
 func declHasGlobal(decl *syntax.DeclClause) bool {
 	for _, a := range decl.Args {
 		if a.Name == nil && a.Value != nil {
@@ -1416,27 +1459,21 @@ func (index spanIndex) contains(off int) bool {
 }
 
 type scopeSet struct {
-	scopes                 []Scope
-	functions              []span
-	functionDocs           []functionDocScope
-	functionDocsByFunction map[*syntax.FuncDecl][]functionDocScope
-	index                  *syntaxIndex
+	scopes       []Scope
+	functions    []span
+	functionDocs []functionDocScope
+	index        *syntaxIndex
 }
 
 type syntaxIndex struct {
 	functions         []*syntax.FuncDecl
 	redirects         []*syntax.Redirect
 	stmts             map[syntax.Command][]*syntax.Stmt
-	noCommand         map[*syntax.Redirect]bool
 	functionRedirects map[*syntax.FuncDecl]map[*syntax.Redirect]bool
-	deferredCalls     []span
 }
 
 func indexSyntax(file *syntax.File) *syntaxIndex {
-	index := &syntaxIndex{
-		stmts:     make(map[syntax.Command][]*syntax.Stmt),
-		noCommand: make(map[*syntax.Redirect]bool),
-	}
+	index := &syntaxIndex{stmts: make(map[syntax.Command][]*syntax.Stmt)}
 	seenRedirs := make(map[*syntax.Redirect]bool)
 	addRedirect := func(redir *syntax.Redirect) {
 		if redir != nil && !seenRedirs[redir] {
@@ -1448,11 +1485,6 @@ func indexSyntax(file *syntax.File) *syntaxIndex {
 		switch n := node.(type) {
 		case *syntax.FuncDecl:
 			index.functions = append(index.functions, n)
-			if n.Body != nil && n.Body.Cmd != nil {
-				index.deferredCalls = append(index.deferredCalls, functionBodySpan(n.Body))
-			}
-		case *syntax.ForClause, *syntax.WhileClause:
-			index.deferredCalls = append(index.deferredCalls, span{int(n.Pos().Offset()), int(n.End().Offset())})
 		case *syntax.Redirect:
 			addRedirect(n)
 		case *syntax.Stmt:
@@ -1461,9 +1493,6 @@ func indexSyntax(file *syntax.File) *syntaxIndex {
 			}
 			for _, redir := range n.Redirs {
 				addRedirect(redir)
-				if stmtHasNoCommand(n) {
-					index.noCommand[redir] = true
-				}
 			}
 		}
 		return true
@@ -1496,7 +1525,7 @@ func indexSyntax(file *syntax.File) *syntaxIndex {
 // commandScopes collects all assignment scopes once for both Scopes and Assigns.
 func commandScopes(file *syntax.File) scopeSet {
 	index := indexSyntax(file)
-	out := scopeSet{index: index, functionDocsByFunction: make(map[*syntax.FuncDecl][]functionDocScope)}
+	out := scopeSet{index: index}
 	collectPipelineScopes(file, &out)
 	collectExecutionScopes(file, &out, index)
 	collectFunctionDocScopes(&out, index)
@@ -1612,17 +1641,8 @@ func collectFunctionDocScopes(out *scopeSet, index *syntaxIndex) {
 		info := bodyByFunction[function]
 		owner, body := info.span, info.scopes
 		doc := span{int(redir.Hdoc.Pos().Offset()), int(redir.Hdoc.End().Offset())}
-		docInfo := functionDocScope{
-			redir: redir, hdoc: redir.Hdoc, doc: doc, owner: owner,
-			functionCommandRedirect: direct,
-			statementOwned:          direct,
-			noCommand:               index.noCommand[redir],
-		}
-		out.functionDocsByFunction[function] = append(out.functionDocsByFunction[function], docInfo)
+		docInfo := functionDocScope{doc: doc, owner: owner}
 		out.functionDocs = append(out.functionDocs, docInfo)
-		if direct {
-			index.deferredCalls = append(index.deferredCalls, doc)
-		}
 		for _, scope := range body {
 			docScope := scope
 			docScope.Start, docScope.End = doc.start, doc.end
@@ -1650,34 +1670,6 @@ func appendParentStmtHereDocs(scopes []Scope, index *syntaxIndex, node syntax.No
 		scopes = appendDirectStmtHereDocRanges(scopes, stmt, scope)
 	}
 	return scopes
-}
-
-func stmtHasNoCommand(stmt *syntax.Stmt) bool {
-	if stmt.Cmd == nil {
-		return true
-	}
-	call, ok := stmt.Cmd.(*syntax.CallExpr)
-	return ok && len(call.Args) == 0
-}
-
-func functionHereDocShells(docs []functionDocScope, scopes spanIndex) []functionShell {
-	var shells []functionShell
-	for _, doc := range docs {
-		if doc.noCommand || doc.hdoc == nil || doc.redir == nil {
-			continue
-		}
-		pos := int(doc.redir.Pos().Offset())
-		if pos < doc.owner.start || pos >= doc.owner.end {
-			if doc.statementOwned {
-				shells = append(shells, functionShell{span: doc.doc, node: doc.hdoc})
-			}
-			continue
-		}
-		if start, end := scopes.innermost(pos); start == doc.owner.start && end == doc.owner.end {
-			shells = append(shells, functionShell{span: doc.doc, node: doc.hdoc})
-		}
-	}
-	return shells
 }
 
 func appendStmtHereDocRanges(scopes []Scope, stmt *syntax.Stmt, scope Scope) []Scope {

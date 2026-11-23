@@ -57,17 +57,26 @@ the remote command of `ssh` (`Via` names the way in). A shell heredoc is not tre
 the shell has `-c` or a script file. `Calls` and `Find` return calls found outside a malformed nested
 script with a `NestedError` that identifies the script and unwraps its parse error.
 `Scopes` returns function bodies, subshells, substitutions, coprocesses, pipeline parts and background
-jobs with byte bounds and kinds; consumers use these to apply trap, `mapfile -C`, alias and `lastpipe` rules.
+jobs with byte bounds and kinds. These bounds describe syntax; they do not encode trap, callback,
+alias, or `lastpipe` execution effects.
 `Assigns` returns assignments in source order with their original byte offsets and innermost scope.
-Prefix assignments (`S=x cmd`) are omitted. All assignments of a name are marked `Unknown` when
-the script contains constructs that can change it outside ordinary assignment syntax: `eval`,
-defining aliases, command traps, `mapfile`/`readarray -C`, `source`/`.`, nameref declarations, or
-recognized nested shell scripts. Arithmetic use, integer declarations, selected write targets
-(`read`, `printf -v`, `getopts`, `mapfile`, `readarray`, and `exec {name}>…`), and assignments in
-conditional or repeated regions also make names Unknown. `${name:=…}` marks that name. `Assign.VisibleAt` uses source offsets
-and scopes; it does not model execution order, branches, loop repetitions, or deferred here-document
-and here-string expansion. Dynamic command text, trap and callback actions, source contents,
-arbitrary indirect writes, `unset`, and shell runtime state are not resolved.
+Prefix assignments (`S=x cmd`) are omitted. `Assign.Unknown` is set for script-wide triggers:
+`eval`, a dynamic command word, an alias definition or write to `BASH_ALIASES`, a command trap,
+`mapfile`/`readarray -C`, `source`/`.`, a nameref declaration, or a recognized nested shell reading
+`-c`, `-s`, a here-document, or a here-string. Per-name triggers include arithmetic and `-i`
+declarations, `${name:=…}`, write targets of `read`, `printf -v`, `getopts`, `mapfile`/`readarray`,
+`unset`, `wait -p`, `coproc`, and `{name}>…`; readonly and case-transform declarations;
+special-builtin prefix assignments; writes inside function bodies; and assignments in `if`/`elif`/
+`case`, the right side of `&&`/`||`, loop conditions and bodies, conditional parameter expansions,
+case patterns, and here-document or here-string expansions. A name read in a function body with
+multiple assignments in the script is Unknown too. These rules mark all assignments to a
+suspicious name without simulating the control flow.
+
+`Assign.VisibleAt` checks source offsets and syntactic scopes. It does not model execution order in
+functions, branches, loop conditions or bodies, traps, callbacks, pipelines, deferred here-document
+expansion, or `lastpipe`. In particular, the package does not inspect sourced files or generated
+command text, or resolve arbitrary indirection; implicit writes may have no returned assignment
+record. Unknown assignments retain their source offsets and syntactic scopes.
 ## busy
 
 Is the machine busy, in one line, by the rule graft uses to queue heavy tasks

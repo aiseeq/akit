@@ -1,6 +1,9 @@
 package shellcmd
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestAssignsConservativeUnknownForms(t *testing.T) {
 	forms := []struct {
@@ -123,11 +126,13 @@ func TestAssignsWholeScriptTriggerMarksEveryAssignmentName(t *testing.T) {
 }
 
 func TestAssignsFlowTriggerOnlyMarksWrittenName(t *testing.T) {
-	got, err := Assigns(`S=/good; T=/clean; if true; then S=/branch; fi; T=/later`)
+	const src = `S=/good; T=/clean; if true; then S=/branch; fi; T=/later`
+	got, err := Assigns(src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	seenS, seenT := false, false
+	wantT := map[int]string{strings.Index(src, "T=/clean"): "/clean", strings.Index(src, "T=/later"): "/later"}
 	for _, a := range got {
 		switch a.Name {
 		case "S":
@@ -137,8 +142,8 @@ func TestAssignsFlowTriggerOnlyMarksWrittenName(t *testing.T) {
 			}
 		case "T":
 			seenT = true
-			if a.Unknown || (a.Value != "/clean" && a.Value != "/later") {
-				t.Errorf("T assignment = %+v, want known source-order value", a)
+			if a.Unknown || a.Value != wantT[a.Offset] {
+				t.Errorf("T assignment = %+v, want known value %q", a, wantT[a.Offset])
 			}
 		}
 	}
