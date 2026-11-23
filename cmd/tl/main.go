@@ -9,10 +9,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -114,11 +116,13 @@ one. The value itself is not recoverable. The mask also hides some names that lo
 pk_test_… identifier): N tells whether it may be the name you expect, and the
 same TAG elsewhere shows where the same text recurs. Without the key the
 markers are [скрыто:KIND] and stderr says why.
-Database: TL_BACKEND=db answers --all, --grep, --raw, --usage, SESSION and REF
-from the ClickHouse tables of the transcript loader (TL_CLICKHOUSE_URL, default
-http://127.0.0.1:18123; TL_CLICKHOUSE_DB, default tr; read-only), the lines it
-has not loaded yet from the files; output is the same. If the database fails,
-stderr says so and tl reads the files. The default TL_BACKEND=files repeats a
+Database: TL_BACKEND=db answers --all, --grep, --raw, --usage, SESSION and REF from
+the ClickHouse tables of the transcript loader (TL_CLICKHOUSE_URL, default
+http://127.0.0.1:18123; TL_CLICKHOUSE_DB, default tr; read-only). Files missing
+from the database are not visible. REF may read its requested line from disk.
+Every database answer reports its freshness time in local time. If its state is missing, stale,
+unhealthy, for another home, or the database fails, stderr says so and tl reads
+the files. The default TL_BACKEND=files repeats a
 share of calls (TL_SHADOW_RATE, default 0.1, 0 off) through the database in a
 background process after the answer and appends one JSON line to
 TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
@@ -256,6 +260,7 @@ type env struct {
 	sessionID  string
 	now        time.Time
 	backend    string    // TL_BACKEND: files or db
+	dbThrough  time.Time // freshness boundary from tlfeed state.json
 	collect    *answer   // set when the shadow repeats this call: what the answer found
 	dbTrace    io.Writer // TL_DB_TRACE: the time of each database query
 }
@@ -632,7 +637,11 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if e.backend == backendDB && dbForm(opts) {
-		if code, ok := runOutputDB(opts, e, refs, stdout, stderr); ok {
+		code, ok, err := runOutputDB(opts, e, refs, stdout, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "tl: %v\n", err)
+		}
+		if ok {
 			return code
 		}
 	}
@@ -644,26 +653,67 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 
 // runOutputDB answers through the database; false — it could not, nothing is printed but the warning, and the
 // caller reads the files.
-func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, bool) {
+func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, bool, error) {
+	state, err := readDBState(e.home)
+	if err != nil {
+		return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
+	}
+	e.dbThrough = state.DBThrough
 	c, err := newCHClientFromEnv()
 	if err == nil {
 		var out, errs bytes.Buffer
 		var code int
 		if code, err = runDB(context.Background(), c, opts, e, refs, &out, &errs); err == nil {
+			fmt.Fprintf(&errs, "tl: данные актуальны на %s\n", e.dbThrough.Local().Format("15:04:05"))
 			_, outErr := io.Copy(stdout, &out)
 			_, errErr := io.Copy(stderr, &errs)
 			if err := errors.Join(outErr, errErr); err != nil {
-				fmt.Fprintf(stderr, "tl: write output: %v\n", err)
-				return exitUsage, true
+				return exitUsage, true, fmt.Errorf("write output: %w", err)
 			}
-			return code, true
+			return code, true, nil
 		}
 	}
-	fmt.Fprintf(stderr, "tl: TL_BACKEND=db: %v; reading files instead\n", err)
 	if e.collect != nil {
 		*e.collect = answer{}
 	}
-	return 0, false
+	return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
+}
+
+type dbState struct {
+	Heartbeat string    `json:"heartbeat"`
+	DBThrough time.Time `json:"db_through"`
+	Home      string    `json:"home"`
+	Error     string    `json:"error"`
+}
+
+func readDBState(home string) (dbState, error) {
+	base := os.Getenv("XDG_STATE_HOME")
+	if base == "" {
+		base = filepath.Join(home, ".local", "state")
+	}
+	path := filepath.Join(base, "akit", "tlfeed", "state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return dbState{}, fmt.Errorf("read tlfeed state: %w", err)
+	}
+	var st dbState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return dbState{}, fmt.Errorf("read tlfeed state: %w", err)
+	}
+	heartbeat, err := time.Parse(time.RFC3339Nano, st.Heartbeat)
+	if err != nil || time.Since(heartbeat) > 10*time.Minute || heartbeat.After(time.Now().Add(time.Minute)) {
+		return dbState{}, errors.New("tlfeed heartbeat is stale or invalid")
+	}
+	if st.Error != "" {
+		return dbState{}, fmt.Errorf("tlfeed reports an error: %s", st.Error)
+	}
+	if filepath.Clean(st.Home) != filepath.Clean(home) {
+		return dbState{}, errors.New("tlfeed home does not match this home")
+	}
+	if st.DBThrough.IsZero() {
+		return dbState{}, errors.New("tlfeed has no successful db_through boundary")
+	}
+	return st, nil
 }
 
 func reportRefs(refs []eventRef, opts options, e env, stdout, stderr io.Writer) int {

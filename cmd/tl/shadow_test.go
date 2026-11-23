@@ -67,6 +67,23 @@ func countOf(list []string, name string) int {
 	return n
 }
 
+func TestShadowCutoffUsesDBThrough(t *testing.T) {
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	through := now.Add(-7 * time.Second)
+	if got := shadowDBCutoff(options{}, now, through); !got.Equal(through) {
+		t.Fatalf("default cutoff %v, want %v", got, through)
+	}
+	opts := options{until: through.Add(time.Hour)}
+	if got := shadowDBCutoff(opts, now, through); !got.Equal(through) {
+		t.Fatalf("future --until cutoff %v, want %v", got, through)
+	}
+	opts.until = through.Add(-time.Second)
+	want := opts.until
+	if got := shadowDBCutoff(opts, now, through); !got.Equal(want) {
+		t.Fatalf("earlier --until cutoff %v, want %v", got, want)
+	}
+}
+
 // The shadow repeats a call answered from files through the database after the answer: the call does not wait
 // for it, the repeat writes one journal line with no differences, and no more repeats of one form run at once
 // than shadowPerForm — the call does not even start another.
@@ -90,6 +107,14 @@ func TestShadowRepeatsThroughDB(t *testing.T) {
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	t.Setenv("HOME", e.home)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	stateData, _ := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("TL_SHADOW_JOURNAL", journal)
 	t.Setenv("TL_SHADOW_RATE", "1")
 	t.Setenv("TL_BACKEND", "")

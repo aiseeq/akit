@@ -52,15 +52,17 @@ Flags:
   --idle D         a file that has not grown this long releases its parser (default 1h)
   --sweep D        every known file and every folder inotify does not watch is looked at once per D,
                    changed or not (default 5m); inotify watches the Claude projects and the codex
-                   sessions of worker tasks written to within 48h, so a line added to a transcript
-                   of an older task is loaded only by the sweep, up to D late
+                   sessions of worker tasks written to within 48h; state.db_through does not guarantee
+                   freshness for older worker tasks, which are found only by this sweep, up to D late
+                   (with --no-inotify, folders are polled instead, and old worker tasks still wait for the sweep)
   --rescan D       full listing of the transcripts (default 1h)
   --beat D         state file period, at most 60s (default 10s)
   --no-inotify     find changes by polling only
   -h, --help       this help
 
-State file fields: heartbeat, last_row_at (when a line was last inserted, by the loader's clock),
-lag_bytes (complete lines not yet confirmed by the server), files, error (last error or empty), pid.
+State file fields: heartbeat, db_through (start of the last successful pass with lag_bytes zero),
+home (transcript root), last_row_at (when a line was last inserted), lag_bytes (complete lines not
+yet confirmed by the server), files, error (last error or empty), pid.
 `
 
 var dbName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -204,6 +206,10 @@ func load(o options, srv *server, stderr io.Writer) int {
 		close(stop)
 	}()
 	st := newStatus(o.cfg.state)
+	if filepath.Clean(st.home) != o.cfg.home {
+		st.dbThrough = time.Time{}
+	}
+	st.home = o.cfg.home
 	l := newLoader(o.cfg, srv, stop, stderr, st)
 	l.dirs.w = noWatch{}
 	if o.cfg.inotify && !o.cfg.once {

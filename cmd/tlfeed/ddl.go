@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS {db}.files
     session String,                       -- short id as tl prints it
     parent String,                        -- the parent session of a subagent
     name String,                          -- agent-name of the session
+    description String,                   -- description from the subagent metadata file
     size UInt64,                          -- file size at the last pass
     ingested UInt64,                      -- bytes up to the last complete line already in raw
     lines UInt32,                         -- complete lines already in raw
@@ -72,6 +73,7 @@ ENGINE = ReplacingMergeTree(ver)
 ORDER BY file_id;
 
 ALTER TABLE {db}.files MODIFY COLUMN gen UInt64;
+ALTER TABLE {db}.files ADD COLUMN IF NOT EXISTS description String AFTER name;
 
 CREATE TABLE IF NOT EXISTS {db}.raw
 (

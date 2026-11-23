@@ -107,7 +107,7 @@ const (
 	rawColumns   = "file_id, line, off, raw"
 	eventColumns = "ts, file_id, session, kind, project, line, role, who, text, images, error, subtype, model, reply_id, " +
 		"request_id, in_tok, out_tok, cache_read, cache_write, cwd"
-	fileColumns = "file_id, path, kind, project, session, parent, name, size, ingested, lines, ev_lines, mtime, inode, " +
+	fileColumns = "file_id, path, kind, project, session, parent, name, description, size, ingested, lines, ev_lines, mtime, inode, " +
 		"first_ts, last_ts, bad, tail, gen, dirty, ver"
 	// usageColumns — the columns of usage as usage_mv fills them from events
 	usageColumns = "file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write"
@@ -172,6 +172,7 @@ func fileRow(b *bytes.Buffer, f *file, ver uint64, dirty bool) {
 	r.str(f.src.ID)
 	r.str(f.src.ParentID)
 	r.str(f.name)
+	r.str(f.src.Description)
 	r.num(size)
 	r.num(uint64(f.ingested))
 	r.num(uint64(f.lines))

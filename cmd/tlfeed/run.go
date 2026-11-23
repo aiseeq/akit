@@ -39,7 +39,7 @@ func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err
 	if p.err != nil {
 		return nil, 0, false, fmt.Errorf("files row: %w", p.err)
 	}
-	f.describe(home, transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")]})
+	f.describe(home, transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")], Description: r[c("description")]})
 	f.complete = f.ingested
 	f.commit()
 	return f, ver, dirty, nil
@@ -75,6 +75,7 @@ func (l *loader) start() ([]string, error) {
 
 // once loads everything there is and returns.
 func (l *loader) once() error {
+	passStart := l.now()
 	paths, err := l.start()
 	if err != nil {
 		return err
@@ -82,11 +83,15 @@ func (l *loader) once() error {
 	l.logf("first pass over %d files (%d known in %s.files)", len(paths), len(l.all), l.cfg.db)
 	err = l.visitAll(paths)
 	l.report()
+	if err == nil {
+		l.completePass(passStart)
+	}
 	return err
 }
 
 // follow loads new lines every tick until stopped.
 func (l *loader) follow() error {
+	passStart := l.now()
 	paths, err := l.start()
 	if err != nil {
 		return err
@@ -96,6 +101,7 @@ func (l *loader) follow() error {
 		return err
 	}
 	l.report()
+	l.completePass(passStart)
 	next := l.now().Add(l.cfg.rescan)
 	t := time.NewTicker(l.cfg.tick)
 	defer t.Stop()
@@ -135,14 +141,24 @@ func (l *loader) pass(full bool) error {
 		}
 	}
 	l.sweepSlice(want, now)
+	complete := !l.needsFullList
 	if full || lost {
 		if paths, err := l.listAll(); err != nil {
 			l.logf("list transcripts: %v", err)
+			l.st.setError(err.Error())
+			l.needsFullList, complete = true, false
 		} else {
+			l.needsFullList = false
+			if l.errText == "" {
+				l.st.setError("")
+			}
 			for _, p := range paths {
 				want[p] = true
 			}
 		}
+	}
+	if l.needsFullList {
+		complete = false
 	}
 	if err := l.visitAll(slices.Sorted(maps.Keys(want))); err != nil {
 		return err
@@ -153,7 +169,19 @@ func (l *loader) pass(full bool) error {
 		}
 	}
 	l.report()
+	if complete {
+		l.completePass(now)
+	}
 	return nil
+}
+
+// completePass records a conservative freshness boundary. Changes to watched folders arrive through inotify;
+// this pass visits every event already queued before the boundary, so all complete lines written before its
+// start are confirmed when lag is zero. Worker task folders outside inotify's recent 48-hour window are found
+// only by the sweep, so this timestamp does not guarantee freshness for them (up to --sweep late).
+func (l *loader) completePass(start time.Time) {
+	lag, _ := l.lag()
+	l.st.completedPass(start, lag)
 }
 
 // held adds the files with a parser to want and returns the folders where their growth and their subagents show.

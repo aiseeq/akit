@@ -4,12 +4,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -25,9 +22,7 @@ import (
 	"github.com/aiseeq/akit/transcript"
 )
 
-// The database path answers from the tables the transcript loader fills — files, events and raw — and prints
-// what the file path prints: the same window (files by modification time, events by their time), the same
-// filters and the same masking. Lines the loader has not stored yet are read from the file itself.
+// The database path answers only from the tables the transcript loader fills — files, events and raw.
 
 // backendDB and backendFiles are the values of TL_BACKEND; files is the default.
 const (
@@ -42,10 +37,6 @@ const dbQueryTimeout = 60 * time.Second
 // sends the call to the files in seconds rather than at dbQueryTimeout.
 var filesTimeout = 10 * time.Second
 
-// tailMargin — how long after a line's event its record may still be written: a file the loader read past until
-// plus this has no unread line with an event inside the window.
-const tailMargin = 5 * time.Minute
-
 // rawSettings is the profile of a search in the raw lines: lines of json reach megabytes, and with the default
 // block of 65536 rows each of the 8 threads holds blocks of hundreds of megabytes and the query passes the 2 GiB
 // limit; blocks of 1024 rows or 16 MB keep it under 200 MiB.
@@ -56,18 +47,22 @@ func dbForm(opts options) bool {
 	return !opts.version && !opts.worktime && !opts.openQuestions && opts.waitProg == "" && !opts.waitAll && opts.context == 0
 }
 
-// dbFile is what the files table knows of one transcript.
+// dbFile is one transcript's metadata in files FINAL.
 type dbFile struct {
-	id       uint64
-	path     string
-	name     string
-	ingested int64
-	lines    int
-	evLines  int
-	loaded   time.Time // when the loader wrote this row
-	bad      int       // lines the loader could not parse
-	inode    uint64
-	tail     uint64
+	id      uint64
+	path    string
+	session string
+	parent  string
+	kind    string
+	project string
+	name    string
+	desc    string
+	mtime   time.Time
+	first   time.Time
+	lines   int
+	evLines int
+	loaded  time.Time // when the loader wrote this row
+	bad     int       // lines the loader could not parse
 }
 
 type dbPath struct {
@@ -77,7 +72,7 @@ type dbPath struct {
 	e      env
 	f      *filter
 	files  map[string]*dbFile
-	names  []string // transcript names find knows, from the folders as the file path lists them
+	names  []string // transcript names in files FINAL
 	listed bool     // names is listed
 	trace  io.Writer
 }
@@ -161,19 +156,21 @@ func (d *dbPath) queryIn(ctx context.Context, q chQuery) ([][]string, error) {
 func (d *dbPath) loadFiles() error {
 	ctx, cancel := context.WithTimeout(d.ctx, filesTimeout)
 	defer cancel()
-	rows, err := d.queryIn(ctx, chQuery{name: "files", sql: "SELECT file_id, path, name, ingested, lines, ev_lines, " +
-		"intDiv(ver, 1000000), bad, inode, tail FROM files FINAL"})
+	rows, err := d.queryIn(ctx, chQuery{name: "files", sql: "SELECT file_id, path, name, description, lines, ev_lines, " +
+		"intDiv(ver, 1000000), bad, toUnixTimestamp(mtime) * 1000, " +
+		"toUnixTimestamp64Milli(first_ts), session, parent, kind, project FROM files FINAL"})
 	if err != nil {
 		return err
 	}
 	d.files = make(map[string]*dbFile, len(rows))
 	for _, row := range rows {
-		if len(row) != 10 {
-			return fmt.Errorf("files: %d fields in a row, want 10", len(row))
+		if len(row) != 14 {
+			return fmt.Errorf("files: %d fields in a row, want 14", len(row))
 		}
 		p := fields{row: row}
-		f := &dbFile{id: p.uint(0), path: row[1], name: row[2], ingested: int64(p.uint(3)), lines: p.int(4), evLines: p.int(5),
-			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), inode: p.uint(8), tail: p.uint(9)}
+		f := &dbFile{id: p.uint(0), path: row[1], name: row[2], desc: row[3], lines: p.int(4), evLines: p.int(5),
+			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), mtime: time.UnixMilli(int64(p.uint(8))),
+			first: time.UnixMilli(int64(p.uint(9))), session: row[10], parent: row[11], kind: row[12], project: row[13]}
 		if p.err != nil {
 			return fmt.Errorf("files: %w", p.err)
 		}
@@ -184,69 +181,6 @@ func (d *dbPath) loadFiles() error {
 		d.files[f.path] = f
 	}
 	return nil
-}
-
-// stored is what the files table has of the file at path now: nothing when the file there is another one than
-// the loader read — a new inode, or shorter than what it stored — or is gone, and the file is read instead.
-func (d *dbPath) stored(path string) (*dbFile, error) {
-	f := d.files[path]
-	if f == nil {
-		return nil, nil
-	}
-	st, err := os.Stat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", path, err)
-	}
-	if st.Size() < f.ingested {
-		return nil, nil
-	}
-	if ino := transcript.Inode(st); ino != 0 && f.inode != 0 && ino != f.inode {
-		return nil, nil
-	}
-	if f.ingested > 0 || st.Size() > 0 {
-		matches, err := storedTailMatches(path, f, st.Size())
-		if err != nil { //nolint:silent-error-handling // Unreadable stored data falls back to reading the transcript without a warning.
-			return nil, nil
-		}
-		if !matches {
-			return nil, nil
-		}
-	}
-	return f, nil
-}
-
-// storedTailMatches checks whether the cache row still describes the loaded tail; read failures are returned so
-// stored can explicitly fall back to the transcript.
-func storedTailMatches(path string, f *dbFile, size int64) (bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return false, fmt.Errorf("open stored tail: %w", err)
-	}
-	defer file.Close()
-	if f.ingested > 0 {
-		from := max(f.ingested-256, 0)
-		buf := make([]byte, f.ingested-from)
-		if _, err := file.ReadAt(buf, from); err != nil {
-			return false, fmt.Errorf("read stored tail: %w", err)
-		}
-		sum := sha256.Sum256(buf)
-		if binary.BigEndian.Uint64(sum[:8]) != f.tail {
-			return false, nil
-		}
-	}
-	if size > f.ingested {
-		var last [1]byte
-		if _, err := file.ReadAt(last[:], size-1); err != nil {
-			return false, fmt.Errorf("read stored file end: %w", err)
-		}
-		if last[0] != '\n' {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 // fields reads typed fields of one answer row; the first that does not parse is kept in err.
@@ -265,38 +199,129 @@ func (p *fields) uint(i int) uint64 {
 
 func (p *fields) int(i int) int { return int(p.uint(i)) }
 
-// resolve is resolve of the file path: the window and the sessions are what the folders hold now, so a file
-// deleted or moved since the loader read it is not answered from its rows, and one the loader has not reached
-// yet is read from the file.
+// resolve selects only names and metadata in files FINAL; an unlisted disk path is invisible here.
 func (d *dbPath) resolve() ([]source, error) {
-	return resolveWith(d.opts, d.e, func(since time.Time) ([]source, error) {
-		paths, err := d.listNames()
+	if d.opts.all {
+		return d.resolveAll()
+	}
+	return d.resolveSessions()
+}
+
+func (d *dbPath) resolveSessions() ([]source, error) {
+	args := d.opts.args
+	if len(args) == 0 {
+		if d.e.sessionID == "" {
+			return nil, errors.New("no SESSION and not inside a Claude Code session; name one or use --all")
+		}
+		args = []string{d.e.sessionID}
+	}
+	var out []source
+	for _, arg := range args {
+		path, err := d.find(arg)
 		if err != nil {
 			return nil, err
 		}
-		selected := make([]string, 0, len(paths))
-		for _, path := range paths {
-			if isCodexRollout(path) && !d.opts.codex || filepath.Base(filepath.Dir(path)) == "subagents" && strings.HasPrefix(filepath.Base(path), "agent-") && d.opts.noSubagents {
-				continue
-			}
-			selected = append(selected, path)
+		f := d.files[path]
+		out = append(out, source{Path: path, ID: f.session, ParentID: f.parent, Description: f.desc})
+		out = append(out, d.subagents(f)...)
+	}
+	return out, nil
+}
+
+func (d *dbPath) subagents(parent *dbFile) []source {
+	if !d.opts.subagents {
+		return nil
+	}
+	var out []source
+	for _, child := range d.files {
+		if child.parent == parent.session && child.kind == "sub" {
+			out = append(out, source{Path: child.path, ID: child.session, ParentID: child.parent, Description: child.desc})
 		}
-		return transcript.SelectSources(selected, since, d.opts.until, d.opts.project)
-	}, func(arg string) (string, error) { return d.find(arg) })
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+func (d *dbPath) resolveAll() ([]source, error) {
+	since := d.opts.since
+	if since.IsZero() {
+		since = d.e.now.Add(-sinceDefault)
+	}
+	var out []source
+	for _, f := range d.files {
+		if !d.selectedAll(f, since) {
+			continue
+		}
+		out = append(out, source{Path: f.path, ID: f.session, ParentID: f.parent, Description: f.desc})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
+	if f.mtime.Before(since) || !d.opts.until.IsZero() && f.first.After(d.opts.until) {
+		return false
+	}
+	if f.kind == "codex" && !d.opts.codex || f.kind == "sub" && d.opts.noSubagents {
+		return false
+	}
+	return d.opts.project == "" || strings.Contains(f.path, d.opts.project) || strings.Contains(f.project, d.opts.project)
 }
 
 func (d *dbPath) find(arg string) (string, error) {
-	return findIn(arg, d.e.home, func() ([]string, error) { return d.listNames() })
+	if strings.HasPrefix(arg, "~/") {
+		arg = filepath.Join(d.e.home, arg[2:])
+	}
+	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
+		if d.files[arg] != nil {
+			return arg, nil
+		}
+		return "", fmt.Errorf("transcript %s is not in the database", arg)
+	}
+	var named []string
+	for path, f := range d.files {
+		if f.name == arg {
+			named = append(named, path)
+		}
+	}
+	if len(named) == 1 {
+		return named[0], nil
+	}
+	if len(named) > 1 {
+		sort.Strings(named)
+		return "", fmt.Errorf("%q is ambiguous: matches %d transcripts", arg, len(named))
+	}
+	if len(arg) < 6 {
+		return "", fmt.Errorf("%q: session id must be at least 6 characters", arg)
+	}
+	var matches []string
+	for path, f := range d.files {
+		id := f.session
+		if id == "" {
+			id = sourceFullID(source{Path: path, ID: path})
+		}
+		if strings.HasPrefix(id, arg) || strings.HasPrefix(sourceFullID(source{Path: path, ID: path}), arg) {
+			matches = append(matches, path)
+		}
+	}
+	sort.Strings(matches)
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("%q: no transcript with this id in the database", arg)
+	}
+	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts; give more of the id", arg, len(matches))
 }
 
-// listNames are the transcript names find knows, listed once per call.
 func (d *dbPath) listNames() ([]string, error) {
 	if !d.listed {
-		names, err := transcriptPaths(d.e.home)
-		if err != nil {
-			return nil, fmt.Errorf("list transcript names: %w", err)
+		d.names = make([]string, 0, len(d.files))
+		for path := range d.files {
+			d.names = append(d.names, path)
 		}
-		d.names, d.listed = names, true
+		sort.Strings(d.names)
+		d.listed = true
 	}
 	return d.names, nil
 }
@@ -376,33 +401,24 @@ type stored struct {
 // way, with the link ids and names of the sources.
 func (d *dbPath) result(sources []source) (result, error) {
 	start := time.Now()
-	liveNames, liveErr := liveSessionNames(d.e.home)
-	d.tracef("live names", start, len(liveNames))
-	start = time.Now()
 	names, err := d.listNames()
 	if err != nil {
 		return result{}, err
 	}
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, liveNames), searchPaths: names,
-		liveNames: liveNames, liveErr: liveErr, files: len(sources)}
-	d.tracef("link ids", start, len(res.linkIDs))
-	var (
-		inDB  []stored
-		local []source // not in the files table yet: read as the file path does
-	)
-	for _, src := range sources {
-		f, err := d.stored(src.Path)
-		if err != nil {
-			return res, err
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, nil), searchPaths: names, files: len(sources)}
+	for path, f := range d.files {
+		if f.name != "" {
+			res.names[path] = f.name
 		}
+	}
+	d.tracef("link ids", start, len(res.linkIDs))
+	var inDB []stored
+	for _, src := range sources {
+		f := d.files[src.Path]
 		if f == nil {
-			local = append(local, src)
-			continue
+			return res, fmt.Errorf("transcript %s is not in the database", src.Path)
 		}
 		inDB = append(inDB, stored{src: src, file: f})
-		if f.name != "" {
-			res.names[src.Path] = f.name
-		}
 	}
 	var all []sortedHit
 	if len(inDB) > 0 {
@@ -413,19 +429,6 @@ func (d *dbPath) result(sources []source) (result, error) {
 		all = hits
 	}
 	bad := map[string]badLines{}
-	for _, src := range local {
-		hits, _, _, meta, err := d.f.file(src)
-		bad[src.Path] = badLines{n: meta.Bad, first: meta.FirstBad}
-		for i := range hits {
-			all = append(all, sortedHit{hit: hits[i], part: "~", off: uint64(i)})
-		}
-		if meta.Name != "" {
-			res.names[src.Path] = meta.Name
-		}
-		if err != nil {
-			res.errs = append(res.errs, err)
-		}
-	}
 	if err := d.badLines(inDB, bad); err != nil {
 		return res, err
 	}
@@ -616,64 +619,7 @@ func (d *dbPath) storedHits(inDB []stored) ([]sortedHit, error) {
 	if err != nil {
 		return nil, err
 	}
-	return d.withTails(hits, inDB)
-}
-
-// withTails adds the events of the lines the loader has not stored, read from the files.
-func (d *dbPath) withTails(hits []sortedHit, inDB []stored) ([]sortedHit, error) {
-	for _, s := range inDB {
-		if !d.needTail(s.file) {
-			continue
-		}
-		var tail []sortedHit
-		start := time.Now()
-		whole, err := readTail(s.src.Path, s.file.evLines, func(raw []byte, ev transcript.Event) {
-			if !d.f.inWindow(ev) || !d.f.match(ev) || d.f.rawRE != nil && !d.f.rawRE.Match(raw) {
-				return
-			}
-			if d.opts.usage && (ev.Reply == nil || ev.Reply.Usage == nil) {
-				return
-			}
-			tail = append(tail, sortedHit{hit: hit{src: s.src, ev: ev}, part: "~", off: uint64(len(tail))})
-		})
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return nil, fmt.Errorf("read the unloaded lines of %s: %w", s.src.Path, err)
-		}
-		if d.trace != nil {
-			fmt.Fprintf(d.trace, "tl: db tail of %s past line %d: %d ms, %d event(s), whole %v\n", s.src.ID, s.file.evLines,
-				time.Since(start).Milliseconds(), len(tail), whole)
-		}
-		if whole {
-			kept := hits[:0]
-			for i := range hits {
-				if hits[i].src.Path != s.src.Path {
-					kept = append(kept, hits[i])
-				}
-			}
-			hits = kept
-		}
-		hits = append(hits, tail...)
-	}
 	return hits, nil
-}
-
-// needTail tells whether the file may have lines past those in the events table with events in the window.
-func (d *dbPath) needTail(f *dbFile) bool {
-	if f.evLines < f.lines {
-		return true
-	}
-	if !d.opts.until.IsZero() && f.loaded.After(d.opts.until.Add(tailMargin)) {
-		return false
-	}
-	st, err := os.Stat(f.path)
-	if err != nil || st.Size() <= f.ingested {
-		return false
-	}
-	has, err := transcript.LineEndsAfter(f.path, f.ingested, st.Size())
-	return err != nil || has
 }
 
 // textCut is how much of a long text a listing reads: the first cut of maskedShort and its first widening.
@@ -934,18 +880,15 @@ func (d *dbPath) showRef(ref eventRef, width int, w, stderr io.Writer) (int, err
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage, nil
 	}
-	src, err := transcript.SourceAt(path)
-	if err != nil {
-		fmt.Fprintf(stderr, "tl: %v\n", err)
-		return exitUsage, nil
-	}
-	f, err := d.stored(path)
-	if err != nil {
-		return 0, err
-	}
+	f := d.files[path]
 	var found []sortedHit
-	if f == nil || ref.line > f.evLines {
-		// not stored yet: the file has it
+	if f == nil {
+		fmt.Fprintf(stderr, "tl: transcript %s is not in the database\n", path)
+		return exitNone, nil
+	}
+	src := source{Path: path, ID: f.session, ParentID: f.parent}
+	if ref.line > f.evLines {
+		// Event references may read one requested line from disk; they are not a search path.
 		evs, err := eventsAt(path, ref.line)
 		if err != nil {
 			fmt.Fprintf(stderr, "tl: %v\n", err)

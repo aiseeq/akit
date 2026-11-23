@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"maps"
 	"os"
 	"path/filepath"
@@ -20,6 +21,8 @@ func fakeHome(t *testing.T) env {
 	t.Helper()
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	home := t.TempDir()
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
 	dir := filepath.Join(home, ".claude", "projects", "-home-x-proj")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -29,6 +32,14 @@ func fakeHome(t *testing.T) env {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, sessionID+".jsonl"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(stateHome, "akit", "tlfeed")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: home})
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), state, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
@@ -43,7 +54,99 @@ func runTL(t *testing.T, e env, args ...string) (int, string, string) {
 	}
 	var out, errOut bytes.Buffer
 	code := run(opts, e, &out, &errOut)
-	return code, out.String(), errOut.String()
+	errText := strings.ReplaceAll(errOut.String(), "tl: данные актуальны на "+freshnessIn(errOut.String())+"\n", "")
+	return code, out.String(), errText
+}
+
+func freshnessIn(s string) string {
+	const prefix = "tl: данные актуальны на "
+	for line := range strings.SplitSeq(s, "\n") {
+		if value, ok := strings.CutPrefix(line, prefix); ok {
+			return value
+		}
+	}
+	return "\x00"
+}
+
+func TestReadDBStateHealth(t *testing.T) {
+	home, stateHome := t.TempDir(), t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	path := filepath.Join(stateHome, "akit", "tlfeed", "state.json")
+	write := func(st dbState) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	valid := dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: home}
+	if _, err := readDBState(home); err == nil {
+		t.Fatal("missing state accepted")
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*dbState)
+	}{
+		{"stale heartbeat", func(s *dbState) { s.Heartbeat = time.Now().Add(-11 * time.Minute).Format(time.RFC3339Nano) }},
+		{"loader error", func(s *dbState) { s.Error = "insert failed" }},
+		{"wrong home", func(s *dbState) { s.Home = t.TempDir() }},
+		{"missing boundary", func(s *dbState) { s.DBThrough = time.Time{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := valid
+			tc.change(&st)
+			write(st)
+			if _, err := readDBState(home); err == nil {
+				t.Fatal("unhealthy state accepted")
+			}
+		})
+	}
+	write(valid)
+	if got, err := readDBState(home); err != nil || !got.DBThrough.Equal(valid.DBThrough) {
+		t.Fatalf("valid state: %+v, %v", got, err)
+	}
+}
+
+func TestUnhealthyDBStateFallsBackToFiles(t *testing.T) {
+	e := fakeHome(t)
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	base := dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*dbState)
+		warning string
+	}{
+		{"missing", nil, "read tlfeed state"},
+		{"stale", func(s *dbState) { s.Heartbeat = time.Now().Add(-11 * time.Minute).Format(time.RFC3339Nano) }, "heartbeat is stale"},
+		{"error", func(s *dbState) { s.Error = "database error" }, "reports an error"},
+		{"home", func(s *dbState) { s.Home = t.TempDir() }, "home does not match"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.mutate == nil {
+				_ = os.Remove(statePath)
+			} else {
+				st := base
+				tc.mutate(&st)
+				raw, _ := json.Marshal(st)
+				if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.backend = backendFiles
+			wantCode, wantOut, _ := runTL(t, e, "--all", "--grep", "fixture")
+			e.backend = backendDB
+			code, out, stderr := runTL(t, e, "--all", "--grep", "fixture")
+			if code != wantCode || out != wantOut || !strings.Contains(stderr, tc.warning) || !strings.Contains(stderr, "reading files instead") {
+				t.Fatalf("fallback code=%d out=%q stderr=%q; want code=%d out=%q warning %q", code, out, stderr, wantCode, wantOut, tc.warning)
+			}
+		})
+	}
 }
 
 func TestParseArgsErrors(t *testing.T) {

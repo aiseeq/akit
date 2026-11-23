@@ -456,7 +456,7 @@ func TestStateFile(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]any{"heartbeat": "2026-11-22T12:00:01.000Z", "last_row_at": "2026-11-22T12:00:00.000Z", "lag_bytes": 123.0,
+	want := map[string]any{"heartbeat": "2026-11-22T12:00:01.000Z", "db_through": "", "home": "", "last_row_at": "2026-11-22T12:00:00.000Z", "lag_bytes": 123.0,
 		"files": 4.0, "error": "insert raw: down", "pid": float64(os.Getpid())}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("state %v, want %v", got, want)
@@ -483,6 +483,23 @@ func TestStateFile(t *testing.T) {
 	}
 	if again := newStatus(path); !again.lastRow.Equal(t0) {
 		t.Fatalf("last_row_at not kept over a restart: %v", again.lastRow)
+	}
+}
+
+func TestStateDBThroughOnlyMovesOnZeroLag(t *testing.T) {
+	s := newStatus("")
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	s.completedPass(t0, 9)
+	if !s.dbThrough.IsZero() {
+		t.Fatalf("db_through advanced with lag: %v", s.dbThrough)
+	}
+	s.completedPass(t0, 0)
+	if !s.dbThrough.Equal(t0) {
+		t.Fatalf("db_through %v, want %v", s.dbThrough, t0)
+	}
+	s.completedPass(t0.Add(time.Second), 1)
+	if !s.dbThrough.Equal(t0) {
+		t.Fatalf("db_through advanced after failed boundary: %v", s.dbThrough)
 	}
 }
 
@@ -540,7 +557,7 @@ func TestArgs(t *testing.T) {
 
 func TestStatements(t *testing.T) {
 	got := statements("tq")
-	if len(got) != 9 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
+	if len(got) != 10 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
 		t.Fatalf("%d statements: %q", len(got), got)
 	}
 	for _, s := range got {
@@ -595,8 +612,8 @@ func TestGrowthByPartialLine(t *testing.T) {
 	appendTo(t, path, []byte(`{"partial`))
 	h.pass(l)
 	files := h.fake.latestFiles()
-	if want := strconv.Itoa(len(data) + len(`{"partial`)); files[0][7] != want {
-		t.Fatalf("files size %s, file %s", files[0][7], want)
+	if want := strconv.Itoa(len(data) + len(`{"partial`)); files[0][8] != want {
+		t.Fatalf("files size %s, file %s", files[0][8], want)
 	}
 	if l.files[path].follow != nil {
 		t.Fatal("a parser built for an incomplete line")

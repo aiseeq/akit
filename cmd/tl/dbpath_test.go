@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,16 +34,16 @@ type fakeCH struct {
 }
 
 type chFile struct {
-	id               uint64
-	path, name, kind string
-	ingested         int64
-	tail             uint64
-	lines, evLines   int
-	loaded           time.Time
-	events           []chEvent
-	raw              []string // the lines, from 1
-	bad              int
-	inode            uint64
+	id                       uint64
+	path, name, desc, kind   string
+	session, parent, project string
+	mtime                    time.Time
+	first                    time.Time
+	lines, evLines           int
+	loaded                   time.Time
+	events                   []chEvent
+	raw                      []string // the lines, from 1
+	bad                      int
 }
 
 type chEvent struct {
@@ -53,7 +51,7 @@ type chEvent struct {
 	off uint64
 }
 
-// newFakeCH loads the transcripts; unloaded names files whose last lines the loader has not read yet.
+// newFakeCH loads the transcripts; unloaded names files whose last lines are absent from the tables.
 func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 	t.Helper()
 	s := &fakeCH{t: t}
@@ -68,37 +66,44 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 		}
 		n := len(lines) - unloaded[path]
 		f := &chFile{id: uint64(i+1) << 22, path: path, lines: n, evLines: n, loaded: time.Now()}
-		for i, l := range lines {
-			if i < n {
-				f.ingested += int64(len(l))
-			}
+		for _, l := range lines {
 			f.raw = append(f.raw, strings.TrimRight(l, "\r\n"))
-		}
-		if f.ingested > 0 {
-			loaded := []byte(strings.Join(lines[:n], ""))
-			sum := sha256.Sum256(loaded[max(0, len(loaded)-256):])
-			f.tail = binary.BigEndian.Uint64(sum[:8])
 		}
 		st, err := os.Stat(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		f.inode = transcript.Inode(st)
+		f.mtime = st.ModTime()
+		f.project = filepath.Base(filepath.Dir(path))
+		f.session = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		if sourceUUID.MatchString(filepath.Base(path)) {
+			f.session = sourceFullID(source{Path: path, ID: path})[:8]
+		}
 		switch {
 		case isCodexRollout(path):
 			f.kind = "codex"
 		case strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)):
 			f.kind = "sub"
+			f.session = strings.TrimPrefix(f.session, "agent-")
+			f.parent = filepath.Base(filepath.Dir(filepath.Dir(path)))
+			f.parent = f.parent[:min(8, len(f.parent))]
 		default:
 			f.kind = "claude"
 		}
-		// the events of the unloaded lines are there too, as after a pass whose clean row is not written yet: the
-		// files row says what counts
+		// Only events confirmed through evLines are in the fake events table.
 		meta, err := transcript.Read(path, nil, func(ev transcript.Event) {
-			f.events = append(f.events, chEvent{ev: ev, off: uint64(len(f.events))})
+			if ev.Line <= n {
+				f.events = append(f.events, chEvent{ev: ev, off: uint64(len(f.events))})
+				if f.first.IsZero() || ev.Time.Before(f.first) {
+					f.first = ev.Time
+				}
+			}
 		})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if src, err := transcript.SourceAt(path); err == nil {
+			f.desc = src.Description
 		}
 		f.name, f.bad = meta.Name, meta.Bad
 		if n < len(lines) {
@@ -158,7 +163,8 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "files":
 		for _, f := range s.files {
-			row(f.id, f.path, f.name, f.ingested, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad, f.inode, f.tail)
+			row(f.id, f.path, f.name, f.desc, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad,
+				f.mtime.Unix()*1000, f.first.UnixMilli(), f.session, f.parent, f.kind, f.project)
 		}
 	case "events", "usage":
 		for _, f := range s.files {
@@ -452,7 +458,7 @@ func agentRecord(at, text string) string {
 }
 
 // dbCorpus is a synthetic home for both paths: the fixture session, a session with long texts, secrets, usage and
-// a subagent, and a codex rollout. Its last two lines are not loaded yet.
+// a subagent, and a codex rollout. All rows are loaded unless a test marks lines as pending.
 func dbCorpus(t *testing.T) (env, []string, map[string]int) {
 	t.Helper()
 	e := fakeHome(t)
@@ -489,6 +495,9 @@ func dbCorpus(t *testing.T) (env, []string, map[string]int) {
 		userRecord("2026-10-25T10:10:30.000Z", "задача субагенту: sub"),
 		agentRecord("2026-10-25T10:10:40.000Z", "Сделал простое решение"),
 	})
+	if err := os.WriteFile(strings.TrimSuffix(sub, ".jsonl")+".meta.json", []byte(`{"description":"Synthetic subagent"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	codex, err := os.ReadFile("../../transcript/testdata/codex.jsonl")
 	if err != nil {
 		t.Fatal(err)
@@ -497,7 +506,7 @@ func dbCorpus(t *testing.T) (env, []string, map[string]int) {
 		"rollout-2026-10-25T10-47-55-0199aaaa-0000-7000-8000-000000000001.jsonl")
 	writeWorkFile(t, rollout, strings.Split(strings.TrimSuffix(string(codex), "\n"), "\n"))
 	main := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", sessionID+".jsonl")
-	return e, []string{main, other, sub, rollout}, map[string]int{other: 2}
+	return e, []string{main, other, sub, rollout}, map[string]int{}
 }
 
 var dbForms = [][]string{
@@ -530,11 +539,11 @@ var dbForms = [][]string{
 	{sessionID[:8] + ":999"},
 }
 
-// The database path prints what the file path prints, over the same corpus: listings, filters, cut and masked
-// texts, the lines the loader has not read, --usage, sessions with subagents and single events.
+// The database path prints what the file path prints for the same loaded corpus: listings, filters, cut and masked
+// texts, --usage, sessions with subagents and single events.
 func TestDBPrintsAsFiles(t *testing.T) {
-	e, paths, unloaded := dbCorpus(t)
-	ch := newFakeCH(t, paths, unloaded)
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
@@ -563,138 +572,75 @@ func TestDBPrintsAsFiles(t *testing.T) {
 	}
 }
 
-// The folders decide which files there are, as on the file path: a file deleted after the loader read it is
-// not answered from its rows, a moved one is found where it is now, one the loader has not reached is read, and
-// one written anew at the same path is not answered from the rows of the old one.
-func TestDBFollowsTheDisk(t *testing.T) {
-	e, paths, unloaded := dbCorpus(t)
-	const (
-		goneID     = "9a000001-0000-4000-8000-000000000001"
-		movedID    = "9a000002-0000-4000-8000-000000000002"
-		newID      = "9a000003-0000-4000-8000-000000000003"
-		replacedID = "9a000004-0000-4000-8000-000000000004"
-		cutID      = "9a000005-0000-4000-8000-000000000005"
-	)
-	gone := writeReviewClaude(t, e, "-home-x-proj", goneID, userRecord("2026-10-25T10:20:00.000Z", "удалённая сессия"))
-	moved := writeReviewClaude(t, e, "-home-x-proj", movedID, userRecord("2026-10-25T10:21:00.000Z", "перенесённая сессия"))
-	replaced := writeReviewClaude(t, e, "-home-x-proj", replacedID, userRecord("2026-10-25T10:22:00.000Z", "старая сессия"),
-		agentRecord("2026-10-25T10:22:01.000Z", "старый ответ"))
-	cut := writeReviewClaude(t, e, "-home-x-proj", cutID, userRecord("2026-10-25T10:25:00.000Z", "длинная сессия до обрезки"),
-		agentRecord("2026-10-25T10:25:01.000Z", "ответ, которого не станет"))
-	ch := newFakeCH(t, append(paths, gone, moved, replaced, cut), unloaded)
-	// cut in place: the same inode, shorter than what the loader stored
-	if err := os.WriteFile(cut, []byte(userRecord("2026-10-25T10:25:00.000Z", "обрезана")+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(gone); err != nil {
-		t.Fatal(err)
-	}
-	movedTo := filepath.Join(e.home, ".claude", "projects", "-home-x-other", movedID+".jsonl")
-	if err := os.MkdirAll(filepath.Dir(movedTo), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(moved, movedTo); err != nil {
-		t.Fatal(err)
-	}
-	writeReviewClaude(t, e, "-home-x-proj", newID, userRecord("2026-10-25T10:23:00.000Z", "новая сессия"))
-	// written beside and renamed over: a new inode, and longer than what the loader stored
-	next := writeReviewClaude(t, e, "-home-x-proj", "next", userRecord("2026-10-25T10:24:00.000Z", "новая сессия на старом месте, длиннее"),
-		agentRecord("2026-10-25T10:24:01.000Z", "новый ответ на старом месте"), agentRecord("2026-10-25T10:24:02.000Z", "и ещё один"))
-	if err := os.Rename(next, replaced); err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(ch)
-	defer srv.Close()
-	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	for _, args := range [][]string{
-		{"--all", "--role", "all", "--max", "0"},
-		{"--all", "--role", "all", "--grep", "сессия|ответ", "--max", "0"},
-		{goneID[:8]}, {goneID[:8] + ":1"},
-		{movedID[:8], "--role", "all"}, {movedID[:8] + ":1"},
-		{newID[:8], "--role", "all"}, {newID[:8] + ":1"},
-		{replacedID[:8], "--role", "all"}, {replacedID[:8] + ":2"},
-		{cutID[:8], "--role", "all"}, {cutID[:8] + ":1"},
-	} {
-		e.backend = backendFiles
-		codeF, outF, errF := runTL(t, e, args...)
-		e.backend = backendDB
-		codeD, outD, errD := runTL(t, e, args...)
-		if strings.Contains(errD, "instead") {
-			t.Errorf("%q: the database path fell back: %s", args, errD)
-		}
-		if codeF != codeD || outF != outD || errF != errD {
-			t.Errorf("%q: files exit %d, db exit %d\nfiles:\n%s%s\ndb:\n%s%s", args, codeF, codeD, outF, errF, outD, errD)
-		}
-	}
-}
-
-func TestDBDetectsSameInodeRewrite(t *testing.T) {
-	e, paths, unloaded := dbCorpus(t)
+func TestDBFreshnessLineAndNoTranscriptReads(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	unloaded := map[string]int{paths[1]: 2}
 	ch := newFakeCH(t, paths, unloaded)
-	path := paths[1]
-	var ingested int64
-	for _, file := range ch.files {
-		if file.path == path {
-			ingested = file.ingested
-		}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tailStart := max(int(ingested)-256, 0)
-	if !strings.Contains(string(data[tailStart:ingested]), "быстрый ответ") {
-		t.Fatal("fixture marker is outside the stored tail")
-	}
-	rewritten := strings.Replace(string(data), "быстрый ответ", "сломано ответ", 1)
-	if rewritten == string(data) {
-		t.Fatal("fixture text not found")
-	}
-	if err := os.WriteFile(path, []byte(rewritten), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	after, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if transcript.Inode(before) != transcript.Inode(after) || after.Size() < before.Size() {
-		t.Fatalf("rewrite changed inode or shortened file: inode %d -> %d, size %d -> %d", transcript.Inode(before), transcript.Inode(after), before.Size(), after.Size())
-	}
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	for _, needle := range []string{"быстрый", "сломано"} {
-		e.backend = backendFiles
-		codeF, outF, errF := runTL(t, e, "--all", "--role", "all", "--grep", needle, "--max", "0")
-		e.backend = backendDB
-		codeD, outD, errD := runTL(t, e, "--all", "--role", "all", "--grep", needle, "--max", "0")
-		if codeF != codeD || outF != outD || errF != errD {
-			t.Errorf("grep %q: files (%d) %q %q, db (%d) %q %q", needle, codeF, outF, errF, codeD, outD, errD)
+	through := time.Date(2026, 11, 23, 12, 34, 56, 0, time.Local)
+	state := dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: through, Home: e.home}
+	b, _ := json.Marshal(state)
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	if err := os.WriteFile(statePath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The files table remains queryable after every transcript path disappears; db search must not stat/open them.
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
 		}
+	}
+	opts, err := parseArgs([]string{"--all", "--grep", "sub"}, e.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	code, ok, err := runOutputDB(opts, e, nil, &out, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || code != 0 {
+		t.Fatalf("db answer code=%d ok=%v: %s", code, ok, stderr.String())
+	}
+	want := "данные актуальны на " + through.Local().Format("15:04:05")
+	if !strings.Contains(stderr.String(), want) {
+		t.Fatalf("freshness line %q missing from %q", want, stderr.String())
+	}
+	if !strings.Contains(out.String(), "sub") {
+		t.Fatalf("database answer empty: %q", out.String())
+	}
+	if strings.Contains(out.String(), "хвост") {
+		t.Fatalf("database read the unloaded file tail: %q", out.String())
 	}
 }
 
-func TestDBDeletedRowsDoNotDefineShortIDs(t *testing.T) {
-	e, paths, unloaded := dbCorpus(t)
-	gone := writeReviewClaude(t, e, "-home-x-proj", "9d9d9d9d-0000-4000-8000-000000000004",
-		userRecord("2026-10-25T10:30:00.000Z", "удалённая сессия sub"))
-	active := writeReviewClaude(t, e, "-home-x-proj", "9d9d9d9d-1111-4000-8000-000000000004",
-		userRecord("2026-10-25T10:31:00.000Z", "оставшаяся сессия"))
-	ch := newFakeCH(t, append(paths, gone, active), unloaded)
-	if err := os.Remove(gone); err != nil {
-		t.Fatal(err)
-	}
+func TestDBDoesNotSeeFilesMissingFromFilesTable(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	ch.files = ch.files[:1]
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	e.backend = backendDB
-	code, out, _ := runTL(t, e, "--all", "--role", "all", "--max", "0")
-	if code != 0 || strings.Contains(out, "удалённая сессия") || !strings.Contains(out, "9d9d9d9d:1") {
-		t.Fatalf("deleted transcript affected live short id: code %d\n%s", code, out)
+	code, out, stderr := runTL(t, e, dbOtherSession[:8], "--role", "all")
+	if code != exitUsage || out != "" || !strings.Contains(stderr, "no transcript with this id in the database") {
+		t.Fatalf("database exposed a path absent from files FINAL: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+}
+
+func TestDBDoesNotReadUnloadedTail(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	unloaded := map[string]int{paths[1]: 2}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, "--all", "--role", "all", "--grep", "хвост", "--max", "0")
+	if code != exitNone || strings.Contains(out, " user хвост:") || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("db included un-ingested tail: code=%d out=%q stderr=%q", code, out, stderr)
 	}
 }
 

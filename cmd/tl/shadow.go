@@ -112,11 +112,22 @@ func shadowCutoff(opts options, now time.Time) time.Time {
 	return now
 }
 
+func shadowDBCutoff(opts options, now, through time.Time) time.Time {
+	cutoff := shadowCutoff(opts, now)
+	if !through.IsZero() && (cutoff.IsZero() || through.Before(cutoff)) {
+		return through
+	}
+	return cutoff
+}
+
 // answerKeys are the events an answer holds up to cutoff: path:line of each, a row per session for --usage.
 func answerKeys(a *answer, opts options, cutoff time.Time) []string {
 	keys := []string{}
 	if a.res == nil {
 		for i := range a.refs {
+			if !cutoff.IsZero() && a.refs[i].ev.Time.After(cutoff) {
+				continue
+			}
 			keys = append(keys, a.refs[i].src.Path+":"+strconv.Itoa(a.refs[i].ev.Line))
 		}
 		slices.Sort(keys)
@@ -326,10 +337,12 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 	if a == nil || !a.filled || code != 0 && code != exitNone {
 		return
 	}
-	cutoff := time.Time{}
-	if a.res != nil {
-		cutoff = shadowCutoff(opts, e.now)
+	state, err := readDBState(e.home)
+	if err != nil {
+		printMasked(stderr, fmt.Sprintf("tl: shadow: freshness state: %v; no shadow\n", err))
+		return
 	}
+	cutoff := shadowDBCutoff(opts, e.now, state.DBThrough)
 	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeys(a, opts, cutoff), FilesS: elapsed.Seconds(),
 		FilesCode: code, Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
 	if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {

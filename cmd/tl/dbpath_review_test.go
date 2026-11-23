@@ -2,9 +2,6 @@ package main
 
 import (
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -32,37 +29,6 @@ func TestProbeBadRecordUnderGrep(t *testing.T) {
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	probeCompare(t, e, "bad record, needle elsewhere", "--all", "--grep", "needle", "--max", "0")
 	probeCompare(t, e, "bad record, no grep", "--all", "--max", "0")
-}
-
-func TestProbeDeletedFile(t *testing.T) {
-	e, paths, unloaded := dbCorpus(t)
-	gone := writeReviewClaude(t, e, "-home-x-proj", "9d9d9d9d-0000-4000-8000-000000000004",
-		userRecord("2026-10-25T10:30:00.000Z", "удалённая сессия sub"))
-	paths = append(paths, gone)
-	ch := newFakeCH(t, paths, unloaded)
-	srv := httptest.NewServer(ch)
-	defer srv.Close()
-	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	if err := os.Remove(gone); err != nil {
-		t.Fatal(err)
-	}
-	probeCompare(t, e, "deleted session", "9d9d9d9d", "--role", "all")
-	probeCompare(t, e, "deleted ref", "9d9d9d9d:1")
-	probeCompare(t, e, "deleted in --all", "--all", "--grep", "sub", "--max", "0")
-}
-
-func TestProbeNewFileNotLoaded(t *testing.T) {
-	e, paths, unloaded := dbCorpus(t)
-	ch := newFakeCH(t, paths, unloaded)
-	srv := httptest.NewServer(ch)
-	defer srv.Close()
-	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	fresh := writeReviewClaude(t, e, "-home-x-proj", "8c8c8c8c-0000-4000-8000-000000000005",
-		userRecord("2026-10-25T10:40:00.000Z", "свежая сессия sub"))
-	_ = filepath.Base(fresh)
-	probeCompare(t, e, "new file in --all", "--all", "--grep", "sub", "--max", "0")
-	probeCompare(t, e, "new file by id", "8c8c8c8c", "--role", "all")
-	_ = strings.TrimSpace
 }
 
 func TestProbeTextEndsNewlineDollar(t *testing.T) {

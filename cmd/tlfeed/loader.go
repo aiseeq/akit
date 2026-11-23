@@ -40,17 +40,18 @@ type loader struct {
 	files map[string]*file // by path
 	all   []*file          // every file known, gone ones too: ids, renames, the sweep
 	// parsers — the files that got a parser; one that has let it go stays until the next pass looks
-	parsers  map[*file]bool
-	ids      map[uint64]bool
-	dirs     *dirs
-	lockFile *os.File // the lock of the database, held for the life of the process
-	st       *status
-	batch    batch
-	buf      []byte
-	ver      uint64
-	sweep    int
-	run      string // id of this run in the query_id of its writes
-	seq      int
+	parsers       map[*file]bool
+	ids           map[uint64]bool
+	dirs          *dirs
+	lockFile      *os.File // the lock of the database, held for the life of the process
+	st            *status
+	batch         batch
+	buf           []byte
+	ver           uint64
+	sweep         int
+	run           string // id of this run in the query_id of its writes
+	seq           int
+	needsFullList bool // a full listing failed, so later incremental passes cannot advance db_through
 	// errText is the last error of a retried call; it is cleared when a call succeeds
 	errText string
 	backoff time.Duration // first wait of a retry
@@ -169,6 +170,7 @@ func (l *loader) loadKnown() error {
 		return err
 	}
 	var dirty []*file
+	var metadata []*file
 	for _, r := range rows {
 		f, ver, d, err := parseFileRow(l.cfg.home, r)
 		if err != nil {
@@ -178,27 +180,41 @@ func (l *loader) loadKnown() error {
 		// the stored size can run past the loaded lines: a loader stopped after a files row took the new size
 		// and before the lines came; the first look reads the file past ingested
 		f.complete = f.size
+		if f.src.Description == "" {
+			if src, e := transcript.SourceAt(f.src.Path); e == nil && src.Description != "" {
+				f.src.Description = src.Description
+				metadata = append(metadata, f)
+			}
+		}
 		l.add(f)
 		if d {
 			dirty = append(dirty, f)
 		}
 	}
-	if len(dirty) == 0 {
-		return nil
+	if len(dirty) > 0 {
+		// the new generation first, then no write of the stopped loader is running, then its rows go
+		was := make([]uint64, len(dirty))
+		for i, f := range dirty {
+			was[i], f.gen = f.gen, l.nextGen()
+		}
+		if err := l.storeFiles(dirty, true, was); err != nil {
+			return err
+		}
+		if err := l.killOthers(); err != nil {
+			return err
+		}
+		for _, f := range dirty {
+			if err := l.purge(f, fmt.Sprintf("stopped while sending lines past %d", f.lines), false); err != nil {
+				return err
+			}
+		}
 	}
-	// the new generation first, then no write of the stopped loader is running, then its rows go
-	was := make([]uint64, len(dirty))
-	for i, f := range dirty {
-		was[i], f.gen = f.gen, l.nextGen()
-	}
-	if err := l.storeFiles(dirty, true, was); err != nil {
-		return err
-	}
-	if err := l.killOthers(); err != nil {
-		return err
-	}
-	for _, f := range dirty {
-		if err := l.purge(f, fmt.Sprintf("stopped while sending lines past %d", f.lines), false); err != nil {
+	if len(metadata) > 0 {
+		gens := make([]uint64, len(metadata))
+		for i, f := range metadata {
+			gens[i] = f.gen
+		}
+		if err := l.storeFilesKeepSize(metadata, gens); err != nil {
 			return err
 		}
 	}
@@ -459,6 +475,15 @@ func (l *loader) purge(f *file, why string, clearUsage bool) error {
 // storeFiles writes the rows of files now, outside a batch; their size is 0, so a start before the next batch
 // looks at them again. was[i] — the generation the stored row of fs[i] must have for its new row to be written.
 func (l *loader) storeFiles(fs []*file, dirty bool, was []uint64) error {
+	return l.writeFiles(fs, dirty, was, false)
+}
+
+// storeFilesKeepSize rewrites metadata on a known row without making the next startup rescan the transcript.
+func (l *loader) storeFilesKeepSize(fs []*file, was []uint64) error {
+	return l.writeFiles(fs, false, was, true)
+}
+
+func (l *loader) writeFiles(fs []*file, dirty bool, was []uint64, keepSize bool) error {
 	var b bytes.Buffer
 	ver := l.nextVer()
 	var stored []*file
@@ -468,7 +493,9 @@ func (l *loader) storeFiles(fs []*file, dirty bool, was []uint64) error {
 			continue
 		}
 		c := *f
-		c.size = 0
+		if !keepSize {
+			c.size = 0
+		}
 		fileRow(&b, &c, ver, dirty)
 		stored, gens = append(stored, f), append(gens, was[i])
 	}

@@ -12,6 +12,8 @@ import (
 // stateFile — what a supervisor reads to tell a working loader from a stuck one. Rewritten atomically.
 type stateFile struct {
 	Heartbeat string `json:"heartbeat"`   // when this file was written
+	DBThrough string `json:"db_through"`  // start of the last successful pass with no unconfirmed complete lines
+	Home      string `json:"home"`        // transcript home this loader follows
 	LastRowAt string `json:"last_row_at"` // when the loader last inserted a line, by its own clock; empty — never
 	LagBytes  int64  `json:"lag_bytes"`   // bytes of complete lines in known files the server has not confirmed
 	Files     int    `json:"files"`       // files followed
@@ -23,13 +25,15 @@ const stampFormat = "2006-01-02T15:04:05.000Z07:00"
 
 // status is shared by the loader and the writer of the state file.
 type status struct {
-	mu      sync.Mutex
-	path    string
-	pid     int
-	lastRow time.Time
-	lag     int64
-	files   int
-	err     string
+	mu        sync.Mutex
+	path      string
+	pid       int
+	lastRow   time.Time
+	lag       int64
+	files     int
+	err       string
+	dbThrough time.Time
+	home      string
 }
 
 // newStatus keeps the last row time of a previous run: a restart is not a load.
@@ -41,10 +45,14 @@ func newStatus(path string) *status {
 	if data, err := os.ReadFile(path); err == nil {
 		// a state file that does not parse is replaced by the first write; last_row_at starts empty then
 		var old stateFile
-		if json.Unmarshal(data, &old) == nil && old.LastRowAt != "" {
+		if json.Unmarshal(data, &old) == nil {
 			if at, err := time.Parse(stampFormat, old.LastRowAt); err == nil {
 				s.lastRow = at
 			}
+			if at, err := time.Parse(stampFormat, old.DBThrough); err == nil {
+				s.dbThrough = at
+			}
+			s.home = old.Home
 		}
 	}
 	return s
@@ -68,6 +76,15 @@ func (s *status) set(lag int64, files int) {
 	s.mu.Unlock()
 }
 
+func (s *status) completedPass(start time.Time, lag int64) {
+	if lag != 0 {
+		return
+	}
+	s.mu.Lock()
+	s.dbThrough = start
+	s.mu.Unlock()
+}
+
 func stamp(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -81,7 +98,7 @@ func (s *status) write(now time.Time) error {
 		return nil
 	}
 	s.mu.Lock()
-	st := stateFile{Heartbeat: stamp(now), LastRowAt: stamp(s.lastRow), LagBytes: s.lag, Files: s.files, Error: s.err, PID: s.pid}
+	st := stateFile{Heartbeat: stamp(now), DBThrough: stamp(s.dbThrough), Home: s.home, LastRowAt: stamp(s.lastRow), LagBytes: s.lag, Files: s.files, Error: s.err, PID: s.pid}
 	s.mu.Unlock()
 	data, err := json.Marshal(st)
 	if err != nil {
