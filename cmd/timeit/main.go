@@ -1,3 +1,4 @@
+// Package main provides timeit, which measures a command's median runtime within a time budget.
 package main
 
 import (

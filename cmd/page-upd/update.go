@@ -129,7 +129,7 @@ func parseArgs(args []string) (options, error) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
-			return opt, errors.New(usage)
+			return opt, errHelp
 		case "--column", "--artifacts":
 			if i+1 == len(args) {
 				return opt, fmt.Errorf("после %s нужно значение", args[i])

@@ -48,6 +48,32 @@ func TestUpdateChangedAndNewBlocksAndPreservesBytes(t *testing.T) {
 	}
 }
 
+func TestHelpAndUnknownFlagOutput(t *testing.T) {
+	for _, arg := range []string{"--help", "-h"} {
+		var stdout, stderr bytes.Buffer
+		if code := run([]string{arg}, &stdout, &stderr, time.Now); code != 0 {
+			t.Errorf("%s exit code = %d, want 0", arg, code)
+		}
+		if got := stdout.String(); got != usage {
+			t.Errorf("%s stdout = %q, want exactly one help text %q", arg, got, usage)
+		}
+		if got := stderr.String(); got != "" {
+			t.Errorf("%s stderr = %q, want empty", arg, got)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--unknown"}, &stdout, &stderr, time.Now); code == 0 {
+		t.Fatal("unknown flag exit code = 0, want nonzero")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("unknown flag stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), usage) {
+		t.Errorf("unknown flag stderr lacks help: %q", stderr.String())
+	}
+}
+
 func TestUpdateColumnSelectorAndChangedOldStamp(t *testing.T) {
 	dir := t.TempDir()
 	page, snapshot := filepath.Join(dir, "page.html"), filepath.Join(dir, "snapshot.html")
