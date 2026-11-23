@@ -1156,7 +1156,7 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 		{"check the output manually", false},
 		{"./missing.sh", true},
 		{`дамп "x`, false},
-		{`'./missing dir/x.sh'`, true},
+		{"see the log && go test", true},
 	} {
 		var stdout, stderr bytes.Buffer
 		args := []string{"plan", "task", "--add", "x: " + tc.command}
@@ -1173,6 +1173,8 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 		"bash /tmp/a.sh", "go test ./...", "A=1 go test ./...", "test -s f", `[ -n "$X" ]`,
 		"$HOME/x.sh", `"$HOME"/x.sh`, "~/x.sh", "[[ -n x ]]", "(( 1 ))", "shopt -s x", "declare",
 		`./scripts/my\ script.sh`, `'./scripts/my script.sh'`, `"./scripts/my script.sh"`,
+		`./scripts/my" script.sh"`, "./scripts/tool-*.sh", "./scripts/{x,}.sh", `"./scripts/b\q.sh"`, "f() { ./missing.sh; }; go test",
+		"time ./missing.sh", "# a note", "A=1", "! go test", "go test | cat", "cd sub && make",
 	} {
 		var stdout, stderr bytes.Buffer
 		code := runMain([]string{"plan", "task", "--add", "x: " + command, "--required", "--by", "worker"}, time.Now(), &stdout, &stderr)

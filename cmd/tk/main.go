@@ -3180,32 +3180,55 @@ func addPlanItem(t task, o options, out, errout io.Writer) int {
 
 var errPlanItemMustBeCommand = errors.New(`plan item must start with a command available in PATH, a Bash builtin, or an existing file (e.g. "go test ./...")`)
 
+// validatePlanCommandNameAt refuses an item that surely is not a command: its first statement is a simple command
+// whose first word is a plain literal (no quotes, escapes, globs or expansions) that is neither a program in PATH,
+// a Bash builtin or keyword, nor an existing file under root, the directory where tk check runs the item. Any other
+// form passes: the check only catches prose, it does not prove that the item runs. In a && b, a || b and a | b the
+// left side is the first statement.
 func validatePlanCommandNameAt(command, root string) error {
-	calls, err := shellcmd.Calls(command)
+	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
 	if err != nil {
-		var nestedErr *shellcmd.NestedError
-		if !errors.As(err, &nestedErr) || len(calls) == 0 {
-			var syntaxErr syntax.ParseError
-			if !errors.As(err, &syntaxErr) {
-				return fmt.Errorf("cannot parse plan command: %w", err)
-			}
-			fields := strings.Fields(command)
-			if len(fields) == 0 {
-				return errPlanItemMustBeCommand
-			}
-			word := strings.Trim(fields[0], `"'`)
-			return validatePlanCommandWord(word, word, root)
+		var syntaxErr syntax.ParseError
+		if !errors.As(err, &syntaxErr) {
+			return fmt.Errorf("cannot parse plan command: %w", err)
 		}
+		// Unbalanced quotes (prose with an apostrophe): judge the first field as written.
+		fields := strings.Fields(command)
+		if len(fields) == 0 {
+			return errPlanItemMustBeCommand
+		}
+		return validatePlanCommandWord(fields[0], root)
 	}
-	if len(calls) == 0 {
-		// shellcmd omits shell-only compound commands such as [[ ... ]] and (( ... )).
+	if len(file.Stmts) == 0 {
 		return nil
 	}
-	return validatePlanCommandWord(planCommandWord(command, calls[0].Offset), calls[0].Name, root)
+	cmd := file.Stmts[0].Cmd
+	// The left side of a && b, a || b and a | b runs first.
+	for bin, ok := cmd.(*syntax.BinaryCmd); ok; bin, ok = cmd.(*syntax.BinaryCmd) {
+		cmd = bin.X.Cmd
+	}
+	call, ok := cmd.(*syntax.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return nil
+	}
+	return validatePlanCommandWord(plainPlanWord(call.Args[0]), root)
 }
 
-func validatePlanCommandWord(word, name, root string) error {
-	if word == "" || strings.ContainsAny(word, "$`") || strings.HasPrefix(word, "~") {
+// plainPlanWord — the word if it is one unquoted literal; otherwise "". validatePlanCommandWord passes a literal
+// with escapes, globs, braces, a tilde or an expansion.
+func plainPlanWord(word *syntax.Word) string {
+	if len(word.Parts) != 1 {
+		return ""
+	}
+	lit, ok := word.Parts[0].(*syntax.Lit)
+	if !ok {
+		return ""
+	}
+	return lit.Value
+}
+
+func validatePlanCommandWord(word, root string) error {
+	if word == "" || strings.ContainsAny(word, `\*?[]{}~$"'`+"`") {
 		return nil
 	}
 	if strings.ContainsRune(word, os.PathSeparator) {
@@ -3216,74 +3239,15 @@ func validatePlanCommandWord(word, name, root string) error {
 		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
 			return nil
 		}
-	} else if name != "" && shellcmd.IsBashBuiltinOrKeyword(name) {
+		return errPlanItemMustBeCommand
+	}
+	if shellcmd.IsBashBuiltinOrKeyword(word) {
 		return nil
-	} else if name != "" {
-		if _, err := exec.LookPath(name); err == nil {
-			return nil
-		}
+	}
+	if _, err := exec.LookPath(word); err == nil {
+		return nil
 	}
 	return errPlanItemMustBeCommand
-}
-
-// planCommandWord — the command word that starts at offset, with quotes and backslashes removed, so a quoted or
-// escaped path with spaces stays one word. "" — no such word or it has an expansion: the item is not refused then.
-func planCommandWord(command string, offset int) string {
-	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
-	if err != nil { //nolint:silent-error-handling // An unparsable item is not refused here; tk check reports it.
-		return ""
-	}
-	var word *syntax.Word
-	syntax.Walk(file, func(n syntax.Node) bool {
-		if w, ok := n.(*syntax.Word); ok && word == nil && int(w.Pos().Offset()) == offset {
-			word = w
-		}
-		return word == nil
-	})
-	if word == nil {
-		return ""
-	}
-	return literalPlanWord(word.Parts)
-}
-
-// literalPlanWord — the value of word parts made only of literals and quotes; "" if any part expands.
-func literalPlanWord(parts []syntax.WordPart) string {
-	var b strings.Builder
-	for _, part := range parts {
-		switch p := part.(type) {
-		case *syntax.Lit:
-			b.WriteString(unescapePlanLit(p.Value))
-		case *syntax.SglQuoted:
-			if p.Dollar {
-				return ""
-			}
-			b.WriteString(p.Value)
-		case *syntax.DblQuoted:
-			inner := literalPlanWord(p.Parts)
-			if inner == "" && len(p.Parts) > 0 {
-				return ""
-			}
-			b.WriteString(inner)
-		default:
-			return ""
-		}
-	}
-	return b.String()
-}
-
-// unescapePlanLit drops the backslash before an escaped character of an unquoted literal.
-func unescapePlanLit(s string) string {
-	if !strings.Contains(s, `\`) {
-		return s
-	}
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			i++
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
 }
 
 func checkPlanSyntax(command string) error {
