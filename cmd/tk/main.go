@@ -3208,7 +3208,8 @@ func validatePlanCommandNameAt(command, root string) error {
 		cmd = bin.X.Cmd
 	}
 	call, ok := cmd.(*syntax.CallExpr)
-	if !ok || len(call.Args) == 0 {
+	// A prefix assignment (PATH=bin:$PATH tool) can change where the word is found: not judged.
+	if !ok || len(call.Args) == 0 || len(call.Assigns) > 0 {
 		return nil
 	}
 	return validatePlanCommandWord(plainPlanWord(call.Args[0]), root)
@@ -3244,7 +3245,8 @@ func validatePlanCommandWord(word, root string) error {
 	if shellcmd.IsBashBuiltinOrKeyword(word) {
 		return nil
 	}
-	if _, err := exec.LookPath(word); err == nil {
+	// ErrDot: found through "." in PATH; bash runs it too.
+	if _, err := exec.LookPath(word); err == nil || errors.Is(err, exec.ErrDot) {
 		return nil
 	}
 	return errPlanItemMustBeCommand
