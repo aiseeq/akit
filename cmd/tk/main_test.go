@@ -1127,6 +1127,9 @@ func TestPlanParseAddSkipCheckAndJSON(t *testing.T) {
 func TestPlanAddRequiresCommand(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "x.sh"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
 	repo := filepath.Join(home, "work", "current")
 	dir := filepath.Join(repo, "docs", "tasks")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -1138,14 +1141,30 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(repo)
-	for _, command := range []string{"дамп по корпусу — 0 строк", "Start, End по корпусу"} {
+	for _, tc := range []struct {
+		command  string
+		required bool
+	}{
+		{"дамп по корпусу — 0 строк", true},
+		{"Start, End по корпусу", true},
+		{"check the output manually", false},
+		{"./missing.sh", true},
+	} {
 		var stdout, stderr bytes.Buffer
-		code := runMain([]string{"plan", "task", "--add", "x: " + command, "--required", "--by", "worker"}, time.Now(), &stdout, &stderr)
+		args := []string{"plan", "task", "--add", "x: " + tc.command}
+		if tc.required {
+			args = append(args, "--required")
+		}
+		args = append(args, "--by", "worker")
+		code := runMain(args, time.Now(), &stdout, &stderr)
 		if code == 0 || !strings.Contains(stderr.String(), "must start with a command") {
-			t.Errorf("prose %q: code=%d stderr=%q", command, code, stderr.String())
+			t.Errorf("invalid command %q: code=%d stderr=%q", tc.command, code, stderr.String())
 		}
 	}
-	for _, command := range []string{"bash /tmp/a.sh", "go test ./...", "A=1 go test ./...", "test -s f", `[ -n "$X" ]`} {
+	for _, command := range []string{
+		"bash /tmp/a.sh", "go test ./...", "A=1 go test ./...", "test -s f", `[ -n "$X" ]`,
+		"$HOME/x.sh", `"$HOME"/x.sh`, "~/x.sh", "[[ -n x ]]", "(( 1 ))", "shopt -s x", "declare",
+	} {
 		var stdout, stderr bytes.Buffer
 		code := runMain([]string{"plan", "task", "--add", "x: " + command, "--required", "--by", "worker"}, time.Now(), &stdout, &stderr)
 		if code != 0 {
@@ -1155,10 +1174,47 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 		if err != nil || !strings.Contains(string(updated), "- x: "+command) {
 			t.Errorf("command %q was not added: err=%v body=%s", command, err, updated)
 		}
-		body = string(updated)
 		if err := os.WriteFile(path, []byte("# Task\n\nСтатус: в работе\n\n## План\n\n## Журнал\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestPlanAddChecksPathsFromExecutionRoot(t *testing.T) {
+	mainRoot := t.TempDir()
+	codeRoot := t.TempDir()
+	mainTasks := filepath.Join(mainRoot, "docs", "tasks")
+	if err := os.MkdirAll(mainTasks, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(mainTasks, "20200101-1200-MEDIUM-task.md")
+	body := "# Task\n\nСтатус: в работе\n\n## План\n\n## Журнал\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{mainRoot, codeRoot} {
+		if err := os.WriteFile(filepath.Join(root, "fixture.sh"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(filepath.Join(mainRoot, "fixture.sh")); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	ticket := task{path: path, slug: "task", body: body}
+	o := options{by: "worker", add: "new: ./fixture.sh", required: true, baseRoot: codeRoot}
+	if code := addPlanItem(ticket, o, &out, &errOut); code != 0 {
+		t.Fatalf("code-tree-only file rejected: %d %s", code, errOut.String())
+	}
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	o.add = "old: ./old.sh"
+	if err := os.WriteFile(filepath.Join(mainRoot, "old.sh"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if code := addPlanItem(ticket, o, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "must start with a command") {
+		t.Fatalf("ticket-tree-only file accepted: %d %s", code, errOut.String())
 	}
 }
 
