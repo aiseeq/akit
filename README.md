@@ -60,7 +60,7 @@ script with a `NestedError` that identifies the script and unwraps its parse err
 jobs with byte bounds and kinds. These bounds describe syntax; they do not encode trap, callback,
 alias, or `lastpipe` execution effects.
 `Assigns` returns assignments in source order with their original byte offsets and innermost scope.
-Prefix assignments (`S=x cmd`) are omitted. `Assign.Unknown` is set for script-wide triggers:
+Prefix assignments (`S=x cmd`) are omitted; a function called with one sees the prefix value, so a name with a prefix and a reference inside a function body is Unknown. `Assign.Unknown` is set for script-wide triggers:
 `eval`, a dynamic command word, an alias definition or write to `BASH_ALIASES`, a command trap,
 `mapfile`/`readarray -C`, `source`/`.`, a nameref declaration, or a recognized nested shell reading
 `-c`, `-s`, a here-document, or a here-string. Per-name triggers include arithmetic and `-i`

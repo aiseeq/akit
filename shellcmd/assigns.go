@@ -99,7 +99,8 @@ func (a Assign) VisibleAt(off int) bool {
 }
 
 // Assigns returns assignments in source order. Prefix assignments and declarations without a
-// value are omitted. It marks all assignments Unknown when the script contains eval, a dynamic
+// value are omitted; a function called with a prefix sees its value, so a name with a prefix and a
+// reference inside a function body is Unknown. It marks all assignments Unknown when the script contains eval, a dynamic
 // command word, a defining alias or BASH_ALIASES write, a command trap, mapfile/readarray -C,
 // source/dot, a declare/local/typeset -n option, or a recognized nested shell script from a string
 // or stdin. Per-name triggers include arithmetic and -i declarations; `${name:=…}`; write targets
@@ -164,6 +165,9 @@ func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map
 		src: src, assigns: assigns, names: make(map[string]bool), arithmetic: make(map[string]bool),
 		integerVars: make(map[string]bool), writeNames: make(map[string]bool),
 		functionCounts: make(map[string]int), functionRefs: make(map[string][]int),
+		// Any mention of posix (set -o posix, shopt -so posix, POSIXLY_CORRECT) may switch bash to posix mode,
+		// where a prefix assignment before a special builtin persists. Checked once: per command it was quadratic.
+		posix: strings.Contains(src, "posix") || strings.Contains(src, "POSIX"),
 	}
 	syntax.Walk(file, scan.visit)
 	names, all := scan.result()
@@ -172,6 +176,7 @@ func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map
 
 type suspiciousAssignScan struct {
 	src            string
+	posix          bool
 	assigns        []Assign
 	names          map[string]bool
 	arithmetic     map[string]bool
@@ -313,6 +318,10 @@ func (s *suspiciousAssignScan) visitCoproc(clause *syntax.CoprocClause) {
 
 func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
 	for _, assign := range call.Assigns {
+		if assign.Name != nil && len(call.Args) > 0 {
+			// A prefix before a function call is seen inside the function body, though Assigns omits it.
+			s.functionCounts[assign.Name.Value]++
+		}
 		if assign.Name != nil && assign.Value != nil && s.integerVars[assign.Name.Value] {
 			s.markText(int(assign.Value.Pos().Offset()), int(assign.Value.End().Offset()))
 		}
@@ -627,7 +636,7 @@ func (s *suspiciousAssignScan) specialBuiltin(name string) bool {
 	if strings.Contains(" export readonly ", " "+name+" ") {
 		return true
 	}
-	if !strings.Contains(s.src, "set -o posix") {
+	if !s.posix {
 		return false
 	}
 	return strings.Contains(" : . break continue eval exec exit return set shift trap unset ", " "+name+" ")
@@ -638,17 +647,35 @@ func (s *suspiciousAssignScan) declaration(decl *syntax.DeclClause) {
 		return
 	}
 	cmd := decl.Variant.Value
-	lo, hi := int(decl.Pos().Offset()), int(decl.End().Offset())
-	declText := ""
-	if lo >= 0 && hi <= len(s.src) && lo < hi {
-		declText = s.src[lo:hi]
-	}
+	// Only the option words: the text of the whole clause holds nested values, and matching it at every nested
+	// declaration was quadratic.
+	declText := declOptions(decl)
 	integer := integerDeclOption.MatchString(declText)
 	attribute := caseTransformDeclOption.MatchString(declText)
 	if namerefDeclOption.MatchString(declText) && (cmd == "declare" || cmd == "local" || cmd == "typeset") {
 		s.all = true
 	}
 	s.declarationArgs(decl, integer, attribute)
+}
+
+// declOptions — the literal option words of a declaration (-i, -n, -u, ...) joined by spaces.
+func declOptions(decl *syntax.DeclClause) string {
+	var b strings.Builder
+	for _, assign := range decl.Args {
+		if !assign.Naked {
+			continue
+		}
+		word := ""
+		if assign.Name != nil {
+			word = assign.Name.Value
+		} else if assign.Value != nil {
+			word, _ = wordValue(assign.Value)
+		}
+		if strings.HasPrefix(word, "-") {
+			b.WriteString(" " + word)
+		}
+	}
+	return b.String()
 }
 
 func (s *suspiciousAssignScan) declarationArgs(decl *syntax.DeclClause, integer, attribute bool) {

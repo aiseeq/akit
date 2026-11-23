@@ -151,3 +151,44 @@ func TestAssignsFlowTriggerOnlyMarksWrittenName(t *testing.T) {
 		t.Fatalf("Assigns omitted assignments: %+v", got)
 	}
 }
+
+// A prefix assignment is omitted from the result, yet a function called with it sees the prefix value.
+func TestAssignsPrefixBeforeFunctionCall(t *testing.T) {
+	for _, src := range []string{
+		`S=/good; post() { echo "SENT $S/ref"; }; S=/bad post`,
+		`S=/tmp/a; post() { curl -d @$S/x; }; S=/tmp/b post`,
+	} {
+		as, err := Assigns(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(as) != 1 || as[0].Name != "S" || !as[0].Unknown {
+			t.Errorf("%q: got %+v, want one Unknown S", src, as)
+		}
+	}
+	as, err := Assigns(`S=/tmp/a; post() { curl -d @$S/x; }; post`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(as) != 1 || as[0].Unknown || as[0].Value != "/tmp/a" {
+		t.Errorf("without a prefix: got %+v, want known /tmp/a", as)
+	}
+}
+
+// Any spelling that may enable posix mode makes a prefix before a special builtin persist.
+func TestAssignsPosixModeSpellings(t *testing.T) {
+	for _, src := range []string{
+		"shopt -so posix\nS=/good\nS=/bad :",
+		"set -o  posix\nS=/good\nS=/bad :",
+	} {
+		as, err := Assigns(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range as {
+			if a.Name == "S" && !a.Unknown {
+				t.Errorf("%q: S known %q", src, a.Value)
+			}
+		}
+	}
+}
