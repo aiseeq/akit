@@ -216,6 +216,43 @@ func TestAssignsFunctionBodyDeclarationAndDynamicEffects(t *testing.T) {
 	}
 }
 
+func TestAssignsGlobalEffectsAfterFunctionDefinition(t *testing.T) {
+	forms := []struct{ name, src string }{
+		{"trap after definition", `x='S=/bad'; f() { S=/good; kill -USR1 $$; curl -d @$S/x; }; trap "$x" USR1; f`},
+		{"trap in called function", `x='S=/bad'; f() { S=/good; kill -USR1 $$; curl -d @$S/x; }; g() { trap "$x" USR1; }; g; f`},
+		{"debug trap after definition", `x='S=/bad'; set -T; f() { S=/good; curl -d @$S/x; }; trap "$x" DEBUG; f`},
+		{"eval after definition", `x='S=/bad'; f() { S=/good; curl -d @$S/x; }; eval "$x"; f`},
+		{"eval in called function", `x='S=/bad'; f() { S=/good; curl -d @$S/x; }; g() { eval "$x"; }; g; f`},
+		{"source after definition", `f() { S=/good; curl -d @$S/x; }; source ./script.sh; f`},
+		{"source in called function", `f() { S=/good; curl -d @$S/x; }; g() { source ./script.sh; }; g; f`},
+		{"declare option after definition", `o=n; f() { S=/good; curl -d @$S/x; }; declare -$o S; f`},
+		{"declare option in called function", `o=n; f() { S=/good; curl -d @$S/x; }; g() { declare -$o S; }; g; f`},
+		{"shopt after definition", `o=last; f() { echo | S=/good; curl -d @$S/x; }; shopt -s ${o}pipe; f`},
+		{"shopt in called function", `o=last; f() { echo | S=/good; curl -d @$S/x; }; g() { shopt -s ${o}pipe; }; g; f`},
+	}
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			got, err := Assigns(form.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, a := range got {
+				if a.Name != "S" {
+					continue
+				}
+				found = true
+				if !a.Unknown || a.Value != "" {
+					t.Errorf("S = %+v, want Unknown", a)
+				}
+			}
+			if !found {
+				t.Fatalf("no S assignment: %+v", got)
+			}
+		})
+	}
+}
+
 func TestFunctionBodyDynamicEffectDisqualifiesKnownExemption(t *testing.T) {
 	body := span{start: 10, end: 30}
 	scan := suspiciousAssignScan{

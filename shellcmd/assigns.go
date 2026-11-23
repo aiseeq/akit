@@ -185,41 +185,42 @@ func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map
 }
 
 type suspiciousAssignScan struct {
-	src              string
-	posix            bool
-	assigns          []Assign
-	names            map[string]bool
-	arithmetic       map[string]bool
-	integerVars      map[string]bool
-	writeNames       map[string]bool
-	functionCounts   map[string]int
-	functionRefs     map[string][]int
-	definedFunctions map[string]bool
-	functionCalls    map[string][]int
-	callSites        []callSite
-	functionNames    map[span]string
-	functionBodies   []span
-	functionIsolated []span
-	functionUnknown  map[int]bool
-	declWrites       []declWrite
-	pipelines        []span
-	lastpipeMaybe    bool
-	bodyIndex        spanIndex
-	isolatedIndex    spanIndex
-	assignByOffset   map[int]Assign
-	ownerCache       map[int]functionOwner
-	functionCallList []int
-	pipelineIndex    spanIndex
-	nestedBodies     map[span]bool
-	dynamicEffects   []int
-	effectBodies     map[span]bool
-	globalEffects    []span
-	subshells        []span
-	subshellIndex    spanIndex
-	mathSpans        []span
-	valueSpans       map[string][]span
-	uncertain        []span
-	all              bool
+	src                  string
+	posix                bool
+	assigns              []Assign
+	names                map[string]bool
+	arithmetic           map[string]bool
+	integerVars          map[string]bool
+	writeNames           map[string]bool
+	functionCounts       map[string]int
+	functionRefs         map[string][]int
+	definedFunctions     map[string]bool
+	functionCalls        map[string][]int
+	callSites            []callSite
+	functionNames        map[span]string
+	functionBodies       []span
+	functionIsolated     []span
+	functionUnknown      map[int]bool
+	declWrites           []declWrite
+	pipelines            []span
+	lastpipeMaybe        bool
+	bodyIndex            spanIndex
+	isolatedIndex        spanIndex
+	assignByOffset       map[int]Assign
+	ownerCache           map[int]functionOwner
+	functionCallList     []int
+	pipelineIndex        spanIndex
+	nestedBodies         map[span]bool
+	dynamicEffects       []int
+	effectBodies         map[span]bool
+	globalEffects        []span
+	globalFunctionEffect bool
+	subshells            []span
+	subshellIndex        spanIndex
+	mathSpans            []span
+	valueSpans           map[string][]span
+	uncertain            []span
+	all                  bool
 }
 
 type callSite struct {
@@ -522,6 +523,7 @@ func (s *suspiciousAssignScan) trap(args []string, call *syntax.CallExpr) {
 
 func (s *suspiciousAssignScan) markGlobalEffect(node syntax.Node) {
 	s.globalEffects = append(s.globalEffects, nodeSpan(node))
+	s.globalFunctionEffect = true
 }
 
 func (s *suspiciousAssignScan) shopt(call *syntax.CallExpr) {
@@ -1064,6 +1066,13 @@ func (s *suspiciousAssignScan) prepareFunctionIndexes() {
 }
 
 func (s *suspiciousAssignScan) applyGlobalEffects() {
+	if s.globalFunctionEffect {
+		for _, a := range s.assigns {
+			if s.bodyIndex.contains(a.Offset) {
+				s.names[a.Name] = true
+			}
+		}
+	}
 	for _, effect := range s.globalEffects {
 		for _, a := range s.assigns {
 			if a.Offset >= effect.start {
