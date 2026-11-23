@@ -479,6 +479,39 @@ func TestDirectoryWatchMaskOnlyTracksNames(t *testing.T) {
 	}
 }
 
+func TestUnrelatedInotifyNameUsesAllocationFreeFastPath(t *testing.T) {
+	const wd = 7
+	name := []byte("noise\x00")
+	eventLen := (len(name) + 3) &^ 3
+	event := make([]byte, unix.SizeofInotifyEvent+eventLen)
+	binary.LittleEndian.PutUint32(event[0:4], wd)
+	binary.LittleEndian.PutUint32(event[4:8], unix.IN_CREATE)
+	binary.LittleEndian.PutUint32(event[12:16], uint32(eventLen))
+	copy(event[unix.SizeofInotifyEvent:], name)
+	singleNames := make([]string, wd+1)
+	singleNames[wd] = "log"
+	for _, test := range []struct {
+		name        string
+		singleNames []string
+		names       map[int]map[string]struct{}
+	}{
+		{name: "single", singleNames: singleNames, names: map[int]map[string]struct{}{wd: {"log": {}}}},
+		{name: "multiple", names: map[int]map[string]struct{}{wd: {"log": {}, "other": {}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(1000, func() {
+				relevant, writeOnly, overflow := emitInotifyEventsForFiles(-1, event, test.singleNames, test.names, nil, nil, nil, nil, nil)
+				if relevant || writeOnly || overflow {
+					panic("unrelated name was reported as relevant")
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("unrelated inotify name allocated %.2f times per event, want zero", allocs)
+			}
+		})
+	}
+}
+
 type retryFDCheck struct {
 	t     *testing.T
 	calls int
@@ -866,7 +899,7 @@ func TestInotifyOverflowRebuildsSubscriptions(t *testing.T) {
 	binary.LittleEndian.PutUint32(event[0:4], ^uint32(0))
 	binary.LittleEndian.PutUint32(event[4:8], unix.IN_Q_OVERFLOW)
 	out := make(chan fileEvent, 1)
-	_, _, overflow := emitInotifyEventsForFiles(fd, event[:], byWD, fileMasks, filePaths, paths, dirWDs, out)
+	_, _, overflow := emitInotifyEventsForFiles(fd, event[:], nil, byWD, fileMasks, filePaths, paths, dirWDs, out)
 	if !overflow {
 		t.Fatal("IN_Q_OVERFLOW was not reported")
 	}
@@ -887,8 +920,76 @@ func TestInotifyOverflowRebuildsSubscriptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if relevant, _, _ := emitInotifyEventsForFiles(fd, buf[:n], byWD, fileMasks, filePaths, paths, dirWDs, out); !relevant {
+	if relevant, _, _ := emitInotifyEventsForFiles(fd, buf[:n], nil, byWD, fileMasks, filePaths, paths, dirWDs, out); !relevant {
 		t.Fatal("rebuilt subscription missed write")
+	}
+}
+
+func TestInotifyOverflowRebuildsWatchForRenamedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cooldownStarted := make(chan struct{}, 1)
+	events, cleanup, err := watchFilesWithCooldownSignal(ctx, []cond{&lineCond{path: path}}, cooldownStarted)
+	if err != nil || events == nil {
+		t.Fatalf("watchFiles: events=%v err=%v", events, err)
+	}
+	defer func() { cancel(); cleanup() }()
+
+	// A write starts the 10-second cooldown, giving this test time to overflow
+	// the kernel queue and lose the subsequent rename event.
+	if err := appendFile(path, "first"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Fatal("initial write did not wake watcher")
+	}
+	select {
+	case <-cooldownStarted:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not start write cooldown")
+	}
+	for i := range 12000 {
+		unrelated := filepath.Join(dir, fmt.Sprintf("unrelated-%d", i))
+		if err := os.WriteFile(unrelated, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(unrelated); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replacement := filepath.Join(dir, "replacement")
+	if err := os.WriteFile(replacement, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cooldownStarted:
+	case <-time.After(inotifyWriteCooldown + 2*time.Second):
+		t.Fatal("watcher did not drain the overflowed queue")
+	}
+	for {
+		select {
+		case <-events:
+		default:
+			goto drained
+		}
+	}
+drained:
+	if err := appendFile(path, "after-overflow"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-events:
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("write to renamed file did not wake watcher after overflow rebuild")
 	}
 }
 
