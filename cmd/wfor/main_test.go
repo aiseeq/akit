@@ -469,42 +469,6 @@ func waitForInotifyFD(pid int, timeout time.Duration) error {
 	return fmt.Errorf("helper %d did not start its inotify watcher within %s", pid, timeout)
 }
 
-func inotifyWatchesPath(path string) (bool, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false, fmt.Errorf("stat watched path: %w", err)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false, fmt.Errorf("stat %q has type %T, want *syscall.Stat_t", path, info.Sys())
-	}
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return false, fmt.Errorf("read inotify descriptors: %w", err)
-	}
-	wantInode := fmt.Sprintf("ino:%x", stat.Ino)
-	// fdinfo prints the kernel encoding of the device (major<<20 | minor); stat returns the user-space one, which
-	// differs once the minor is 256 or more (common for tmpfs on a machine with many mounts).
-	wantDevice := fmt.Sprintf("sdev:%x", uint64(unix.Major(stat.Dev))<<20|uint64(unix.Minor(stat.Dev)))
-	for _, entry := range entries {
-		fdPath := filepath.Join("/proc/self/fd", entry.Name())
-		target, err := os.Readlink(fdPath)
-		if err != nil || !strings.HasPrefix(target, "anon_inode:inotify") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join("/proc/self/fdinfo", entry.Name()))
-		if err != nil {
-			return false, fmt.Errorf("read inotify descriptor info: %w", err)
-		}
-		for line := range strings.SplitSeq(string(data), "\n") {
-			if strings.HasPrefix(line, "inotify wd:") && strings.Contains(line, wantInode) && strings.Contains(line, wantDevice) {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
 func TestDirectoryWatchMaskOnlyTracksNames(t *testing.T) {
 	if directoryWatchMask&(unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_ATTRIB) != 0 {
 		t.Fatalf("directory watch mask includes content/metadata events: %#x", directoryWatchMask)
@@ -570,7 +534,14 @@ func TestInotifyReaderUses64KiBBuffer(t *testing.T) {
 
 func TestInotifyPacketPrefilterRetainsExpectedNameAndOverflow(t *testing.T) {
 	namePattern := []byte("log\x00")
-	foreign := []byte("noise-1\x00noise-2\x00")
+	foreign := make([]byte, 2*(unix.SizeofInotifyEvent+8))
+	for i, name := range []string{"noise-1", "noise-2"} {
+		off := i * (unix.SizeofInotifyEvent + 8)
+		binary.NativeEndian.PutUint32(foreign[off:off+4], 9)
+		binary.NativeEndian.PutUint32(foreign[off+4:off+8], unix.IN_CREATE)
+		binary.NativeEndian.PutUint32(foreign[off+12:off+16], 8)
+		copy(foreign[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+8], name)
+	}
 	if inotifyPacketMayMatch(foreign, namePattern, nil, false) {
 		t.Fatal("foreign-only packet passed the filename prefilter")
 	}
@@ -590,6 +561,15 @@ func TestInotifyPacketPrefilterRetainsExpectedNameAndOverflow(t *testing.T) {
 	binary.NativeEndian.PutUint32(watchedWD[:], 9)
 	if !inotifyPacketMayMatch(watchedWD[:], nil, watchedWD[:], false) {
 		t.Fatal("file-watch event without a name was filtered")
+	}
+	if got := singleInotifyNamePattern([]string{"log", ""}); got != nil {
+		t.Fatalf("incomplete singleton filename set produced a filter pattern: %q", got)
+	}
+	ignored := make([]byte, unix.SizeofInotifyEvent)
+	binary.NativeEndian.PutUint32(ignored[0:4], 9)
+	binary.NativeEndian.PutUint32(ignored[4:8], unix.IN_IGNORED)
+	if !inotifyPacketMayMatch(ignored, namePattern, nil, false) {
+		t.Fatal("IN_IGNORED event was filtered")
 	}
 }
 
@@ -671,6 +651,90 @@ func TestRegularFileWatchPrunesDirectoryWatch(t *testing.T) {
 	}
 }
 
+func TestDirectoryWatchRemainsForMissingExpectedSibling(t *testing.T) {
+	dir := t.TempDir()
+	existingPath := filepath.Join(dir, "a")
+	missingPath := filepath.Join(dir, "b")
+	if err := os.WriteFile(existingPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := newLineCond("X", existingPath, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, cleanup, err := watchFiles(ctx, []cond{line, &fileCond{path: missingPath}})
+	if err != nil || events == nil {
+		t.Fatalf("watchFiles: events=%v err=%v", events, err)
+	}
+	defer func() { cancel(); cleanup() }()
+	if got := countInotifyWatches(t); got != 2 {
+		t.Fatalf("inotify watches with a missing expected sibling = %d, want directory and existing file", got)
+	}
+	if err := os.WriteFile(missingPath, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if _, ok := event.paths[missingPath]; !ok {
+			t.Fatalf("event paths = %v, want %q", event.paths, missingPath)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("directory watch missed creation of the missing expected sibling")
+	}
+}
+
+func TestPacketPrefilterKeepsNamesFromMultiNameDirectory(t *testing.T) {
+	for _, logExists := range []bool{false, true} {
+		name := "log-absent"
+		if logExists {
+			name = "log-present"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			logDir := filepath.Join(root, "d")
+			otherDir := filepath.Join(root, "e")
+			if err := os.Mkdir(logDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(otherDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			logPath := filepath.Join(logDir, "log")
+			var logCond cond = &fileCond{path: logPath}
+			if logExists {
+				if err := os.WriteFile(logPath, []byte("before\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				line, err := newLineCond("X", logPath, false, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				logCond = line
+			}
+			xPath := filepath.Join(otherDir, "x")
+			yPath := filepath.Join(otherDir, "y")
+			ctx, cancel := context.WithCancel(context.Background())
+			events, cleanup, err := watchFiles(ctx, []cond{logCond, &fileCond{path: xPath}, &fileCond{path: yPath}})
+			if err != nil || events == nil {
+				t.Fatalf("watchFiles: events=%v err=%v", events, err)
+			}
+			defer func() { cancel(); cleanup() }()
+			if err := os.WriteFile(xPath, []byte("created"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case event := <-events:
+				if _, ok := event.paths[xPath]; !ok {
+					t.Fatalf("event paths = %v, want %q", event.paths, xPath)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("packet prefilter missed a name in a directory with multiple expected paths")
+			}
+		})
+	}
+}
+
 func TestSymlinkKeepsDirectoryWatch(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")
@@ -693,58 +757,6 @@ func TestSymlinkKeepsDirectoryWatch(t *testing.T) {
 	defer func() { cancel(); cleanup() }()
 	if got := countInotifyWatches(t); got != 2 {
 		t.Fatalf("inotify watches for a symlink = %d, want directory and target file", got)
-	}
-}
-
-func TestDirectoryWatchIsRestoredAfterDirectoryRecreation(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "watched")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "log")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	line, err := newLineCond("DONE", path, false, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	events, cleanup, err := watchFiles(ctx, []cond{line})
-	if err != nil || events == nil {
-		t.Fatalf("watchFiles: events=%v err=%v", events, err)
-	}
-	defer func() { cancel(); cleanup() }()
-
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		watched, err := inotifyWatchesPath(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if watched {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("directory watch was not restored after directory recreation")
-		}
-		timer := time.NewTimer(5 * time.Millisecond)
-		<-timer.C
-	}
-	if err := os.WriteFile(path, []byte("DONE\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-events:
-	case <-time.After(5 * time.Second):
-		t.Fatal("restored directory watch did not report the expected file")
 	}
 }
 

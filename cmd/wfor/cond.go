@@ -339,7 +339,7 @@ func singleInotifyNamePattern(singleNames []string) []byte {
 	name := ""
 	for _, candidate := range singleNames {
 		if candidate == "" {
-			continue
+			return nil
 		}
 		if name != "" && name != candidate {
 			return nil
@@ -355,10 +355,32 @@ func singleInotifyNamePattern(singleNames []string) []byte {
 }
 
 func inotifyPacketMayMatch(data, fastName, fastFileWD []byte, checkOverflow bool) bool {
-	return (len(fastName) == 0 && len(fastFileWD) == 0) ||
-		(len(fastName) > 0 && bytes.Contains(data, fastName)) ||
+	if len(fastName) == 0 {
+		return true
+	}
+	return bytes.Contains(data, fastName) ||
 		(len(fastFileWD) > 0 && bytes.Contains(data, fastFileWD)) ||
-		(checkOverflow && bytes.Contains(data, inotifyOverflowSignature))
+		(checkOverflow && bytes.Contains(data, inotifyOverflowSignature)) ||
+		inotifyPacketHasNamelessEvent(data)
+}
+
+func inotifyPacketHasNamelessEvent(data []byte) bool {
+	for off := 0; off+unix.SizeofInotifyEvent <= len(data); {
+		mask := binary.NativeEndian.Uint32(data[off+4 : off+8])
+		length := int(binary.NativeEndian.Uint32(data[off+12 : off+16]))
+		if mask&unix.IN_Q_OVERFLOW != 0 {
+			off += unix.SizeofInotifyEvent
+			continue
+		}
+		if length == 0 || mask&(unix.IN_IGNORED|unix.IN_DELETE_SELF|unix.IN_MOVE_SELF) != 0 {
+			return true
+		}
+		if length > len(data)-off-unix.SizeofInotifyEvent {
+			return true
+		}
+		off += unix.SizeofInotifyEvent + length
+	}
+	return false
 }
 
 func shouldCheckInotifyOverflow(readBytes, n, bufferSize int) bool {
@@ -627,7 +649,7 @@ func canPruneInotifyDirectory(dir string, filePaths map[int]map[string]struct{},
 		path := filepath.Join(dir, name)
 		info, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) {
-			continue
+			return false
 		}
 		if err != nil || !info.Mode().IsRegular() {
 			return false
@@ -699,7 +721,7 @@ func recordInotifyEvent(fd, wd int, mask uint32, name string, byWD map[int]map[s
 				}
 			}
 			addMissingInotifyDirectoryWatches(fd, byWD, filePaths, paths, dirWDs)
-			return false, true
+			return false, false
 		}
 		delete(byWD, wd)
 		delete(fileMasks, wd)
