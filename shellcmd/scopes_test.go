@@ -337,7 +337,7 @@ func TestHereDocScopesEndAtCommandSyntax(t *testing.T) {
 		}
 		visible := false
 		for _, a := range assigns {
-			if a.Name == "S" && a.Value == "bad" && a.Offset == bad && a.VisibleAt(len(src)) {
+			if a.Name == "S" && a.Offset == bad && a.VisibleAt(len(src)) {
 				visible = true
 			}
 		}
@@ -396,7 +396,7 @@ func TestHereDocScopesForSubshellAndProcessSubstitution(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, a := range assigns {
-				if a.Name == "S" && a.Value == "bad" && a.Offset == bad && a.VisibleAt(len(tc.src)) {
+				if a.Name == "S" && a.Offset == bad && a.VisibleAt(len(tc.src)) {
 					t.Errorf("here-doc assignment escaped %s scope: %+v", tc.name, a)
 				}
 			}
@@ -527,7 +527,7 @@ func TestHereDocsWithoutACommandAreIsolated(t *testing.T) {
 			}
 			visible := false
 			for _, a := range assigns {
-				if a.Name == "S" && a.Value == "bad" && a.Offset == bad && a.VisibleAt(len(tc.src)) {
+				if a.Name == "S" && a.Offset == bad && a.VisibleAt(len(tc.src)) {
 					visible = true
 				}
 			}
@@ -595,7 +595,7 @@ func TestFunctionHereDocWritesUnionDefinitionsAtCall(t *testing.T) {
 	for _, tc := range []struct{ name, src, want string }{
 		{"call before redefine", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf; f() { :; }; " + printf, "unknown"},
 		{"call after redefinitions", "S=good; f() { S=bad; }; f() { :; }; f; " + printf, "unknown"},
-		{"call before first definition", "S=good; f; f() { : <<EOF; }\n${ S=bad; }\nEOF\n" + printf, "good"},
+		{"call before first definition", "S=good; f; f() { : <<EOF; }\n${ S=bad; }\nEOF\n" + printf, "unknown"},
 		{"doc then body redefine", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf() { S=bad2; }; f; " + printf, "unknown"},
 		{"conditional redefine", "S=good; if true; then f() { : <<EOF; }\n${ S=bad; }\nEOF\nelse f() { :; }; fi; f; " + printf, "unknown"},
 		{"subshell redefine", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\n( f() { :; } ); f; " + printf, "unknown"},
@@ -603,7 +603,7 @@ func TestFunctionHereDocWritesUnionDefinitionsAtCall(t *testing.T) {
 		{"redefinition inside uncalled function", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\ng() { f() { :; }; }; f; " + printf, "unknown"},
 		{"nested function assignment", "f() { S=good; g() { S=bad; }; " + printf + "; }; f", "good"},
 		{"nested function in subshell body", "f() ( S=good; g() { S=bad; }; " + printf + " ); f", "good"},
-		{"function subshell here-doc body", "f() ( S=good; : <<EOF\n${ S=bad; }\nEOF\n" + printf + " ); f", "bad"},
+		{"function subshell here-doc body", "f() ( S=good; : <<EOF\n${ S=bad; }\nEOF\n" + printf + " ); f", "unknown"},
 		{"call to definition below", "S=good; a() { b; " + printf + "; }; b() { S=bad; }; a", "unknown"},
 		{"call to here-doc definition below", "S=good; a() { b; " + printf + "; }; b() { : <<EOF; }\n${ S=bad; }\nEOF\na", "unknown"},
 		{"deferred call to definition below", "S=good; a() { b; }; b() { S=bad; }; a; " + printf, "unknown"},
@@ -678,7 +678,7 @@ func TestFunsubLocalInSubshellDoesNotBindOuterAssignment(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.Value == "bad" && assignment.VisibleAt(marker) {
+		if assignment.Name == "S" && assignment.VisibleAt(marker) {
 			return
 		}
 	}
@@ -704,7 +704,7 @@ func TestRoundSixHereDocFunctionKillers(t *testing.T) {
 	const marker = `printf '%s\n' "$S"`
 	tests := []struct{ name, src, want string }{
 		{"call before redefinition", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf; f() { :; }; " + marker, "unknown"},
-		{"call before first definition", "S=good; f; f() { : <<EOF; }\n${ S=bad; }\nEOF\n" + marker, "good"},
+		{"call before first definition", "S=good; f; f() { : <<EOF; }\n${ S=bad; }\nEOF\n" + marker, "unknown"},
 		{"document then body redefinition", "S=good; f() { : <<EOF; }\n${ S=bad; }\nEOF\nf() { S=bad2; }; f; " + marker, "unknown"},
 		{"function subshell preserves nested isolation", "f() { S=good; ( S=bad ); " + marker + "; }; f", "good"},
 	}
@@ -745,11 +745,11 @@ func TestRoundSixHereDocFunctionKillers(t *testing.T) {
 func TestRoundSevenHereDocKillers(t *testing.T) {
 	const printf = "printf '%s\\n' \"$S\""
 	tests := []struct{ name, src, want string }{
-		{"k7-154", "S=good; f() { " + printf + "; : <<EOF; }\n${ S=bad; }\nEOF\nf", "good"},
+		{"k7-154", "S=good; f() { " + printf + "; : <<EOF; }\n${ S=bad; }\nEOF\nf", "unknown"},
 		{"k7-205a", "S=good; f() { " + printf + "; } <<EOF\nx\nEOF\nf; S=bad", "good"},
 		{"k7-205b", "S=good; ( S=bad ); f() { " + printf + "; } <<EOF\nx\nEOF\nf", "good"},
 		{"k7-205c", "( S=bad ); S=good; f() { " + printf + "; } <<EOF\nx\nEOF\nf", "good"},
-		{"k7-139", "f() { S=good; : <<EOF | cat\n${ S=bad; }\nEOF\n" + printf + "; }; f", "good"},
+		{"k7-139", "f() { S=good; : <<EOF | cat\n${ S=bad; }\nEOF\n" + printf + "; }; f", "unknown"},
 		{"k7-325-local-heredoc-unknown", "S=good; f() { local S; : <<EOF; }\n${ S=bad; }\nEOF\nf; " + printf, "unknown"},
 	}
 	for _, tc := range tests {
@@ -804,7 +804,7 @@ func TestRoundSixFunctionRedirectHereDocIsVisibleInFunctionBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.Value == "bad" && assignment.VisibleAt(marker) {
+		if assignment.Name == "S" && assignment.VisibleAt(marker) {
 			return
 		}
 	}
@@ -820,7 +820,7 @@ func TestFunctionSubshellHereDocWriteIsVisibleInsideBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, assignment := range assigns {
-		if assignment.Name == "S" && assignment.Value == "bad" && assignment.VisibleAt(at) {
+		if assignment.Name == "S" && assignment.VisibleAt(at) {
 			return
 		}
 	}
@@ -889,7 +889,7 @@ func TestFunctionBuiltinHereDocAssignmentsAffectFunctionShell(t *testing.T) {
 		}
 		found := false
 		for _, a := range assigns {
-			if a.Name == "S" && a.Value == "bad" && a.VisibleAt(marker) {
+			if a.Name == "S" && a.VisibleAt(marker) {
 				found = true
 			}
 		}
@@ -925,7 +925,7 @@ func TestParentHereDocSearchRequiresMatchingCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range assigns {
-		if a.Name == "S" && a.Value == "bad" && a.Offset == bad {
+		if a.Name == "S" && a.Offset == bad {
 			if a.VisibleAt(len(src)) {
 				return
 			}
@@ -991,8 +991,8 @@ func TestHereDocRangesFollowStatementRedirects(t *testing.T) {
 				}
 			}
 		}
-		if got != "bad" {
-			t.Errorf("value at marker = %q, want bad; assigns=%+v", got, assigns)
+		if got != "unknown" {
+			t.Errorf("value at marker = %q, want Unknown; assigns=%+v", got, assigns)
 		}
 	}
 
@@ -1092,7 +1092,7 @@ func TestNestedFunctionDocAssignmentAfterInnerDocument(t *testing.T) {
 		}
 		found := false
 		for _, a := range assigns {
-			if a.Name == "S" && a.Value == "bad" && a.VisibleAt(marker) {
+			if a.Name == "S" && a.VisibleAt(marker) {
 				found = true
 				break
 			}

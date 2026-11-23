@@ -58,25 +58,16 @@ the shell has `-c` or a script file. `Calls` and `Find` return calls found outsi
 script with a `NestedError` that identifies the script and unwraps its parse error.
 `Scopes` returns function bodies, subshells, substitutions, coprocesses, pipeline parts and background
 jobs with byte bounds and kinds; consumers use these to apply trap, `mapfile -C`, alias and `lastpipe` rules.
-`Assigns` returns the assignments of a command (`S=x;`, `export`, `declare`, `typeset`, `readonly`,
-`local` in a function) in text order with their byte offsets, a mark for `+=` and the innermost
-subshell, substitution, pipeline part, background job or function body that holds each one;
-array and element assignments, `for` variables, and literal calls to functions that may change
-variables are returned with `Unknown` set, an empty value and `Append` false. Ordinary assignments
-in function bodies are also returned in the function body's scope. `Assign.VisibleAt` tells whether
-an assignment may affect a value at a given offset, so a caller resolves `$S` in text order and
-treats it as unknown until a later visible ordinary assignment. Prefix assignments (`S=x cmd`)
-are left out. Function names are recognized after removing shell quotes and escapes. For `eval`,
-literal arguments are scanned for function names bounded by whitespace, `;`, `&`, `|`, parentheses
-or quotes; the `eval` string is not fully parsed. An argument substitution to `eval` is treated as
-possibly calling any function that may change variables. A dynamic command word is treated the same
-way. `builtin eval f` and `command eval f` are recognized; `command f` and `builtin f` do not call
-`f`. Possible assignments in branches and loops are included. A `local` declaration shadows later
-writes only when its command necessarily runs in the function shell; an `if` or `while` condition
-runs, while branch and loop bodies may not. Writes through `read`, `printf -v`, `mapfile`,
-`${S:=…}`, arithmetic assignment, `let`, `source` or `.`, aliases, namerefs, eval assignment
-strings, and `unset` are not tracked.
-
+`Assigns` returns assignments in source order with their original byte offsets and innermost scope.
+Prefix assignments (`S=x cmd`) are omitted. All assignments of a name are marked `Unknown` when
+the script contains constructs that can change it outside ordinary assignment syntax: `eval`,
+defining aliases, command traps, `mapfile`/`readarray -C`, `source`/`.`, nameref declarations, or
+recognized nested shell scripts. Arithmetic use, integer declarations, selected write targets
+(`read`, `printf -v`, `getopts`, `mapfile`, `readarray`, and `exec {name}>…`), and assignments in
+conditional or repeated regions also make names Unknown. `${name:=…}` marks that name. `Assign.VisibleAt` uses source offsets
+and scopes; it does not model execution order, branches, loop repetitions, or deferred here-document
+and here-string expansion. Dynamic command text, trap and callback actions, source contents,
+arbitrary indirect writes, `unset`, and shell runtime state are not resolved.
 ## busy
 
 Is the machine busy, in one line, by the rule graft uses to queue heavy tasks

@@ -49,23 +49,23 @@ func TestAssignsArithmeticAndConditionalWrites(t *testing.T) {
 				}
 			}
 		}
-		if value != "/clean" && value != "<unknown>" && value != "1" && value != "/bad" {
-			t.Errorf("Assigns(%q) resolves S=%q, assignments=%+v", src, value, assigns)
+		if value != "<unknown>" {
+			t.Errorf("Assigns(%q) resolves S=%q, want Unknown, assignments=%+v", src, value, assigns)
 		}
 	}
 }
 
 func TestAssignsImplicitWritesAndDeferredExpansions(t *testing.T) {
-	tests := []struct{ name, src, want string }{
-		{"nameref", `S=/clean; declare -n R=S; R=/bad; echo "$S"`, "/bad"},
-		{"dynamic nameref", `S=/clean; T=S; declare -n R=$T; R=/bad; echo "$R"`, "/bad"},
-		{"eval", `S=/clean; eval 'S=/bad'; echo "$S"`, "/bad"},
-		{"alias", `S=/clean; alias g='S=/bad'; g; echo "$S"`, "/bad"},
-		{"trap", `S=/clean; trap 'S=/bad' DEBUG; echo "$S"`, "/bad"},
-		{"mapfile callback", `S=/clean; mapfile -C 'S=/bad;:' -c 1 A <<< x; echo "$S"`, "/bad"},
-		{"bash -c scope", `S=/clean; bash -c 'echo "$S"'`, "/clean"},
-		{"builtin here-doc", "S=/clean; : <<X; echo \"$S\"\n${ S=/bad; }\nX", "/bad"},
-		{"external here-doc", "S=/clean; cat >/dev/null <<X\n${ S=/bad; }\nX\necho \"$S\"", "/clean"},
+	tests := []struct{ name, src string }{
+		{"nameref", `S=/clean; declare -n R=S; R=/bad; echo "$S"`},
+		{"dynamic nameref", `S=/clean; T=S; declare -n R=$T; R=/bad; echo "$R"`},
+		{"eval", `S=/clean; eval 'S=/bad'; echo "$S"`},
+		{"alias", `S=/clean; alias g='S=/bad'; g; echo "$S"`},
+		{"trap", `S=/clean; trap 'S=/bad' DEBUG; echo "$S"`},
+		{"mapfile callback", `S=/clean; mapfile -C 'S=/bad;:' -c 1 A <<< x; echo "$S"`},
+		{"bash -c scope", `S=/clean; bash -c 'echo "$S"'`},
+		{"builtin here-doc", "S=/clean; : <<X; echo \"$S\"\n${ S=/bad; }\nX"},
+		{"external here-doc", "S=/clean; cat >/dev/null <<X\n${ S=/bad; }\nX\necho \"$S\""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,8 +91,8 @@ func TestAssignsImplicitWritesAndDeferredExpansions(t *testing.T) {
 					value = a.Value
 				}
 			}
-			if value != tc.want && value != "<unknown>" {
-				t.Errorf("value at reference = %q, want %q or Unknown; assignments=%+v", value, tc.want, assigns)
+			if value != "<unknown>" {
+				t.Errorf("value at reference = %q, want Unknown; assignments=%+v", value, assigns)
 			}
 		})
 	}
@@ -190,20 +190,20 @@ func TestAssignsUncertainFunsubBindingInsideOuterFunsub(t *testing.T) {
 }
 
 func TestAssignsAssignmentOnlyCommandsRunBeforeRedirects(t *testing.T) {
-	for _, src := range []string{
-		`S=/clean; S=/bad 2>/nonexistent/x; echo M@$S`,
-		`S=/clean; S=/bad >/tmp/w; echo M@$S`,
-		`S=/clean; S=/bad <file; echo M@$S`,
-		`S=/clean; [[ x ]] && S=/bad 2>/nonexistent/x; echo M@$S`,
-		`S=/clean; x=${ S=/bad; } 2>/nonexistent/x; echo M@$S`,
+	for _, tc := range []struct{ src, want string }{
+		{`S=/clean; S=/bad 2>/nonexistent/x; echo M@$S`, "/bad"},
+		{`S=/clean; S=/bad >/tmp/w; echo M@$S`, "/bad"},
+		{`S=/clean; S=/bad <file; echo M@$S`, "/bad"},
+		{`S=/clean; [[ x ]] && S=/bad 2>/nonexistent/x; echo M@$S`, "<unknown>"},
+		{`S=/clean; x=${ S=/bad; } 2>/nonexistent/x; echo M@$S`, "/bad"},
 	} {
-		got, err := Assigns(src)
+		got, err := Assigns(tc.src)
 		if err != nil {
 			t.Fatal(err)
 		}
 		value := "/clean"
 		for _, assignment := range got {
-			if assignment.Name == "S" && assignment.VisibleAt(len(src)+1) {
+			if assignment.Name == "S" && assignment.VisibleAt(len(tc.src)+1) {
 				if assignment.Unknown {
 					value = "<unknown>"
 				} else {
@@ -211,8 +211,8 @@ func TestAssignsAssignmentOnlyCommandsRunBeforeRedirects(t *testing.T) {
 				}
 			}
 		}
-		if value != "/bad" {
-			t.Errorf("Assigns(%q) = %+v, resolved S=%q, want /bad", src, got, value)
+		if value != tc.want {
+			t.Errorf("Assigns(%q) = %+v, resolved S=%q, want %q", tc.src, got, value, tc.want)
 		}
 	}
 }
@@ -326,7 +326,6 @@ f"`, "S", true},
 		{`h() { g; }; g() { f; }; f() { S=2; }; h`, "S", true},
 		{`a() { b; }; b() { c; }; c() { S=2; }; a`, "S", true},
 		{`c() { S=2; }; b() { c; }; a() { b; }; a`, "S", true},
-		{`f() { S=2; }; eval 'S=3'`, "S", true},
 	} {
 		got, err := Assigns(tc.src)
 		if err != nil {
@@ -356,14 +355,14 @@ f"`, "S", true},
 			t.Fatal(err)
 		}
 		off := strings.Index(tc.src, tc.cmd)
-		var unknown []Assign
+		found := false
 		for _, a := range got {
-			if a.Unknown {
-				unknown = append(unknown, a)
+			if a.Name == "S" && a.Unknown && a.Offset == off {
+				found = true
 			}
 		}
-		if len(unknown) != 1 || unknown[0].Name != "S" || unknown[0].Offset != off {
-			t.Errorf("Assigns(%q) = %+v, want one Unknown S at %d", tc.src, got, off)
+		if !found {
+			t.Errorf("Assigns(%q) = %+v, want an Unknown S at %d", tc.src, got, off)
 		}
 	}
 	got, err := Assigns(`f() { S=2; }; (f)`)
@@ -476,9 +475,8 @@ func TestAssignsGlobalFlagAndEvalBoundaries(t *testing.T) {
 
 func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 	for _, tc := range []struct {
-		src          string
-		want         bool
-		allowUnknown bool
+		src  string
+		want bool
 	}{
 		{src: `f() { S=/bad; }; command -p eval f`, want: true},
 		{src: `f() { S=/bad; }; command -- eval f`, want: true},
@@ -497,7 +495,7 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 		{src: `f() { S=/bad; }; command echo f`, want: false},
 		{src: `f() { S=/bad; }; builtin echo f`, want: false},
 		{src: `f() { S=/bad; }; command -p echo f`, want: false},
-		{src: `f() { S=/bad; }; x=echo; command "$x" f`, want: false, allowUnknown: true},
+		{src: `f() { S=/bad; }; x=echo; command "$x" f`, want: true},
 		{src: `f() { S=/bad; }; command -pp eval f`, want: true},
 		{src: `f() { S=/bad; }; command command eval f`, want: true},
 		{src: `f() { S=/bad; }; builtin command eval f`, want: true},
@@ -531,7 +529,7 @@ func TestAssignsCommandEvalFormsAndRedirectedLocal(t *testing.T) {
 				unknown = true
 			}
 		}
-		if unknown != tc.want && !(tc.allowUnknown && unknown) {
+		if unknown != tc.want {
 			t.Errorf("Assigns(%q) = %+v, want function Unknown=%v", tc.src, got, tc.want)
 		}
 	}
