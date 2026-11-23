@@ -23,6 +23,7 @@ type checker struct {
 	db    string
 	home  string
 	out   io.Writer
+	now   func() time.Time
 	shown int
 	bad   int
 }
@@ -97,6 +98,10 @@ func fileSum(path string, n int64) ([]byte, error) {
 // check — completeness: every transcript tl --all --codex reads has its files row, loaded up to its last complete
 // line, raw holds each of its lines once, and events has as many events as transcript.Read gives for those lines.
 func (c *checker) check() (bool, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	if c.now != nil {
+		now = c.now().UTC().Truncate(time.Second)
+	}
 	srcs, err := transcript.AllSources(c.home, time.Time{}, "", true, true)
 	if err != nil {
 		return false, err
@@ -109,7 +114,7 @@ func (c *checker) check() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	events, err := c.rows("SELECT file_id, count() FROM " + c.db + ".events WHERE " + eventRetentionPredicate("ts") + " GROUP BY file_id FORMAT TabSeparated")
+	events, err := c.rows("SELECT file_id, count() FROM " + c.db + ".events WHERE " + eventRetentionPredicateAt("ts", now) + " GROUP BY file_id FORMAT TabSeparated")
 	if err != nil {
 		return false, err
 	}
@@ -134,7 +139,7 @@ func (c *checker) check() (bool, error) {
 			c.problem("missing\t%s", s.Path)
 			continue
 		}
-		if err := c.checkFile(s.Path, r, rawOf[r[1]], evOf[r[1]]); err != nil {
+		if err := c.checkFile(s.Path, r, rawOf[r[1]], evOf[r[1]], now); err != nil {
 			return false, err
 		}
 	}
@@ -194,7 +199,7 @@ func (c *checker) materialize() error {
 }
 
 // checkFile — one transcript against its files row r, its raw rows (count, max line) and its event count.
-func (c *checker) checkFile(path string, r []string, raw [2]string, events string) error {
+func (c *checker) checkFile(path string, r []string, raw [2]string, events string, now time.Time) error {
 	ingested := r[2]
 	p := &fields{row: r}
 	lines, dirty, evLines := p.int(3), p.int(4), p.int(5)
@@ -220,7 +225,7 @@ func (c *checker) checkFile(path string, r []string, raw [2]string, events strin
 	}
 	n := 0
 	if _, err := transcript.Read(path, nil, func(e transcript.Event) {
-		if e.Line <= lines && eventRetained(e.Time, r[6], string(e.Role), time.Now()) {
+		if e.Line <= lines && eventRetained(e.Time, r[6], string(e.Role), now) {
 			n++
 		}
 	}); err != nil {

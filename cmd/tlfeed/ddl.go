@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	eventRetentionDays = 90
-	retainedEventKinds = "kind = 'claude' AND role IN ('user', 'ask')"
+	eventRetentionDays    = 90
+	eventUsageRebuildDays = eventRetentionDays - 1
+	retainedEventKinds    = "kind = 'claude' AND role IN ('user', 'ask')"
 )
 
 func eventTTL() string {
@@ -27,11 +28,16 @@ func eventWithinRetention(column string) string {
 	return "toDateTime(" + column + ") + INTERVAL " + strconv.Itoa(eventRetentionDays) + " DAY > now()"
 }
 
-func eventWithinRetentionAt(column string, at time.Time) string {
-	return "toDateTime(" + column + ") + INTERVAL " + strconv.Itoa(eventRetentionDays) + " DAY > toDateTime('" + at.UTC().Format("2006-01-02 15:04:05") + "', 'UTC')"
+func eventRetentionPredicateAt(column string, at time.Time) string {
+	return strings.Replace(eventRetentionPredicate(column), eventWithinRetention(column), eventWithinRetentionAt(column, at, eventRetentionDays), 1)
 }
 
-// schema creates the tables of one database; every statement is idempotent, so it runs at every start.
+func eventWithinRetentionAt(column string, at time.Time, days int) string {
+	return "toDateTime(" + column + ") + INTERVAL " + strconv.Itoa(days) + " DAY > toDateTime('" + at.UTC().Format("2006-01-02 15:04:05") + "', 'UTC')"
+}
+
+// schema creates the tables of one database; every statement is idempotent, so it runs at every start. TTL is
+// applied when events is created; an existing table keeps its current TTL until explicitly altered.
 // Layout (role, kind, file_id, line) with a time-ordered file id and granule 1024 is the one measured as the best
 // on the corpus; raw keeps every line as is, so a file is rebuilt from it byte for byte.
 //

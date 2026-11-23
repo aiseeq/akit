@@ -198,7 +198,7 @@ func (l *loader) loadKnown() error {
 		return err
 	}
 	for _, f := range dirty {
-		if err := l.purge(f, fmt.Sprintf("stopped while sending lines past %d", f.lines)); err != nil {
+		if err := l.purge(f, fmt.Sprintf("stopped while sending lines past %d", f.lines), false); err != nil {
 			return err
 		}
 	}
@@ -387,7 +387,7 @@ func (l *loader) rewind(f *file, why string) error {
 	}
 	f.lines, f.evLines, f.ingested, f.complete, f.tail = 0, 0, 0, 0, 0
 	f.first, f.last, f.bad, f.badBase, f.name, f.follow, f.parsed = time.Time{}, time.Time{}, 0, 0, "", nil, 0
-	return l.truncate(f, "rewind ("+why+")")
+	return l.truncate(f, "rewind ("+why+")", true)
 }
 
 // reloadEvents — a rollout began to write message events, so the events of its earlier lines change (see
@@ -397,14 +397,14 @@ func (l *loader) reloadEvents(f *file) error {
 		return err
 	}
 	f.evLines, f.follow, f.parsed, f.first, f.last, f.badBase = 0, nil, 0, time.Time{}, time.Time{}, 0
-	return l.truncate(f, "message events appeared")
+	return l.truncate(f, "message events appeared", false)
 }
 
 // truncate makes the tables hold the file up to its lines (raw) and evLines (events) and no more. The rows past
 // them are deleted under a dirty files row of a new generation: the tokens of the next inserts differ from those
 // of the deleted rows, which the server still remembers, and a loader stopped in the middle does it again at its
 // next start.
-func (l *loader) truncate(f *file, why string) error {
+func (l *loader) truncate(f *file, why string, clearUsage bool) error {
 	if err := l.flush(); err != nil {
 		return err
 	}
@@ -413,20 +413,27 @@ func (l *loader) truncate(f *file, why string) error {
 	if err := l.storeFiles([]*file{f}, true, []uint64{was}); err != nil {
 		return err
 	}
-	return l.purge(f, why)
+	return l.purge(f, why, clearUsage)
 }
 
 // purge deletes the rows of a file of the new generation past its lines and evLines, then stores it clean. usage
-// has rows merged over the parts of a reply, so rows inside event retention are made again from events; older rows
-// stay because their events may have been removed by TTL. Every statement holds only while the file keeps this generation.
-func (l *loader) purge(f *file, why string) error {
+// has rows merged over the parts of a reply, so rows inside 89 days are made again from events; older rows stay when
+// the transcript is unchanged because their events may have been removed by TTL. A raw-file rewind clears all usage
+// because replies removed from the transcript can no longer be matched after TTL removes their events. Every statement
+// holds only while the file keeps this generation.
+func (l *loader) purge(f *file, why string, clearUsage bool) error {
 	l.logf("%s: %s: rows of id %d past line %d (events past %d) deleted", f.src.Path, why, f.id, f.lines, f.evLines)
 	db, gen := l.cfg.db, l.genIs(f)
-	withinRetention := eventWithinRetentionAt("ts", l.now().UTC().Truncate(time.Second))
+	usageCutoff := l.now().UTC().Truncate(time.Second)
+	withinRetention := eventWithinRetentionAt("ts", usageCutoff, eventUsageRebuildDays)
+	usageDelete := fmt.Sprintf("DELETE FROM %s.usage WHERE file_id = %d AND %s AND %s", db, f.id, withinRetention, gen)
+	if clearUsage {
+		usageDelete = fmt.Sprintf("DELETE FROM %s.usage WHERE file_id = %d AND %s", db, f.id, gen)
+	}
 	for _, q := range []string{
 		fmt.Sprintf("DELETE FROM %s.events WHERE file_id = %d AND line > %d AND %s", db, f.id, f.evLines, gen),
 		fmt.Sprintf("DELETE FROM %s.replies WHERE file_id = %d AND line > %d AND %s", db, f.id, f.evLines, gen),
-		fmt.Sprintf("DELETE FROM %s.usage WHERE file_id = %d AND %s AND %s", db, f.id, withinRetention, gen),
+		usageDelete,
 		fmt.Sprintf("DELETE FROM %s.raw WHERE file_id = %d AND line > %d AND %s", db, f.id, f.lines, gen),
 	} {
 		if err := l.write("delete rows past the stored lines", q, nil); err != nil {

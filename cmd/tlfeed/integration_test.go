@@ -190,9 +190,9 @@ func TestLiveServer(t *testing.T) {
 }
 
 // replyLine — an assistant reply with its usage, as Claude Code writes it.
-func replyLine(id string, sec int) string {
-	return fmt.Sprintf(`{"type":"assistant","requestId":"r%s","timestamp":"2026-10-25T10:00:%02dZ","message":{"id":"%s","model":"m1",`+
-		`"content":[{"type":"text","text":"reply %s"}],"usage":{"input_tokens":5,"output_tokens":9}}}`+"\n", id, sec, id, id)
+func replyLine(id string, at time.Time) string {
+	return fmt.Sprintf(`{"type":"assistant","requestId":"r%s","timestamp":%q,"message":{"id":"%s","model":"m1",`+
+		`"content":[{"type":"text","text":"reply %s"}],"usage":{"input_tokens":5,"output_tokens":9}}}`+"\n", id, at.UTC().Format("2006-01-02T15:04:05.000Z"), id, id)
 }
 
 // Against a live server: a rewind that drops replies drops their usage too, and a rename without growth moves
@@ -201,14 +201,15 @@ func TestLiveUsageAndRename(t *testing.T) {
 	srv, db := liveServer(t)
 	h := &harness{t: t, home: t.TempDir()}
 	path := claudePath(h.home)
-	user := `{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":"2026-10-25T10:00:00.000Z","message":{"role":"user","content":"hi"}}` + "\n"
-	write(t, path, []byte(user+replyLine("m1", 1)+replyLine("m2", 2)+replyLine("m3", 3)))
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	user := fmt.Sprintf(`{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":%q,"message":{"role":"user","content":"hi"}}`+"\n", base.Format("2006-01-02T15:04:05.000Z"))
+	write(t, path, []byte(user+replyLine("m1", base.Add(time.Second))+replyLine("m2", base.Add(2*time.Second))+replyLine("m3", base.Add(3*time.Second))))
 	l := h.liveLoader(srv, db)
 	q := func(s string) string { return scalar(t, srv, fmt.Sprintf(s, db)) }
 	if got := q("SELECT sum(out_tok) FROM %s.usage FINAL"); got != "27" {
 		t.Fatalf("usage out_tok %s, want 27", got)
 	}
-	write(t, path, []byte(user+replyLine("m1", 1)+replyLine("m4", 4)))
+	write(t, path, []byte(user+replyLine("m1", base.Add(time.Second))+replyLine("m4", base.Add(4*time.Second))))
 	if err := l.pass(false); err != nil {
 		t.Fatal(err)
 	}

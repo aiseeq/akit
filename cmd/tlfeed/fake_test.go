@@ -57,6 +57,7 @@ func (f *fakeCH) pauseNext(table string) *pause {
 // sent — one insert as the server got it.
 type sent struct {
 	table, token string
+	query        string
 	rows         [][]string
 	settings     map[string]string
 }
@@ -134,12 +135,21 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for k := range r.URL.Query() {
 			settings[k] = r.URL.Query().Get(k)
 		}
-		rows := f.fenced(q, table, tsvRows(body))
+		rows := tsvRows(body)
+		if table == "usage" && strings.Contains(q, "SELECT ") {
+			var err error
+			rows, err = f.usageFromEvents(q)
+			if err != nil {
+				http.Error(w, "fake: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		rows = f.fenced(q, table, rows)
 		if early {
 			rows = pre
 		}
 		w.Header().Set("X-ClickHouse-Summary", fmt.Sprintf(`{"read_rows":"0","written_rows":"%d"}`, len(rows)))
-		f.inserts = append(f.inserts, sent{table: table, token: tok, rows: rows, settings: settings})
+		f.inserts = append(f.inserts, sent{table: table, token: tok, query: q, rows: rows, settings: settings})
 		if f.tokens[table] == nil {
 			f.tokens[table] = map[string]bool{}
 		}
@@ -183,7 +193,16 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					kept = append(kept, row)
 				} else if strings.Contains(q, "toDateTime(ts) + INTERVAL") {
 					at, err := time.Parse("2006-01-02 15:04:05.000", row[1])
-					if err == nil && !at.AddDate(0, 0, eventRetentionDays).After(time.Now()) {
+					if err != nil {
+						http.Error(w, "fake: "+err.Error(), http.StatusBadRequest)
+						return
+					}
+					within, err := retainedByRetentionSQL(q, at, "", "")
+					if err != nil {
+						http.Error(w, "fake: "+err.Error(), http.StatusBadRequest)
+						return
+					}
+					if !within {
 						kept = append(kept, row)
 					}
 				}
