@@ -24,7 +24,7 @@ import (
 type Request struct {
 	// Model — имя из списка одобренных (opus, sol, luna); id для CLI берётся оттуда же.
 	Model string
-	// Effort — усилие рассуждения: high, xhigh, max или ultra; пусто — high. Другое — ошибка: умолчание CLI
+	// Effort — усилие рассуждения: high или xhigh; пусто — high. Другое — ошибка: умолчание CLI
 	// бывает ниже high, и ни пустое поле, ни незнакомое значение не должны его включать.
 	Effort string
 	// System — системный промпт; у codex — файлом model_instructions_file вместо встроенных инструкций.
@@ -100,18 +100,18 @@ func Ask(ctx context.Context, req Request) (Result, error) {
 	return res, err
 }
 
-// effort — усилие вызова: пусто — high; допустимы high, xhigh, max и ultra, остальное — ошибка: незнакомое
-// значение CLI мог бы заменить своим умолчанием.
+// effort — усилие вызова: пусто — high; допустимы high и xhigh. Ниже high и выше xhigh — ошибка, незнакомое
+// значение — тоже: CLI мог бы заменить его своим умолчанием.
 func effort(e string) (string, error) {
 	switch v := strings.ToLower(strings.TrimSpace(e)); v {
 	case "":
 		return "high", nil
-	case "high", "xhigh", "max", "ultra":
+	case "high", "xhigh":
 		return v, nil
 	case "none", "minimal", "low", "medium":
-		return "", fmt.Errorf("oneshot: effort %q is below high", e)
+		return "", fmt.Errorf("oneshot: effort %q is below high, allowed high, xhigh", e)
 	default:
-		return "", fmt.Errorf("oneshot: effort %q is not one of high, xhigh, max, ultra", e)
+		return "", fmt.Errorf("oneshot: effort %q is not allowed, allowed high, xhigh", e)
 	}
 }
 

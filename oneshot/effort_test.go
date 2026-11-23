@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// An empty Effort reaches both CLIs as high; an effort below high is refused before any CLI runs.
+// An empty Effort reaches both CLIs as high; an effort below high or above xhigh is refused before any CLI runs.
 func TestEffortDefaultsToHighAndRefusesLower(t *testing.T) {
 	claude := fakeCLI(t, "claude", `{"result":"ответ","is_error":false,"usage":{}}`)
 	if _, err := Ask(context.Background(), Request{Model: "opus", Input: "вопрос", Approved: approved(t)}); err != nil {
@@ -29,8 +29,11 @@ func TestEffortDefaultsToHighAndRefusesLower(t *testing.T) {
 			t.Errorf("effort %q: err = %v, want below high", e, err)
 		}
 	}
-	if _, err := Ask(context.Background(), Request{Model: "sol", Effort: "auto", Input: "вопрос", Approved: approved(t)}); err == nil {
-		t.Error("effort auto: no error, want not one of high, xhigh, max, ultra")
+	for _, e := range []string{"auto", "max", "ultra", "MAX"} {
+		_, err := Ask(context.Background(), Request{Model: "sol", Effort: e, Input: "вопрос", Approved: approved(t)})
+		if err == nil || !strings.Contains(err.Error(), "allowed high, xhigh") {
+			t.Errorf("effort %q: err = %v, want not allowed", e, err)
+		}
 	}
 	if _, err := Ask(context.Background(), Request{Model: "sol", Effort: " XHigh ", Input: "вопрос", Approved: approved(t)}); err != nil {
 		t.Fatal(err)
