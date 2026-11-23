@@ -46,7 +46,9 @@ Flags:
   --home DIR       where the transcripts are (default $HOME)
   --state FILE     state file for a supervisor, rewritten every --beat; '' — none
                    (default $XDG_STATE_HOME/akit/tlfeed/state.json, ~/.local/state when unset)
-  --tick D         pass period (default 1s)
+  --tick D         pass period (default 5s): each pass is one insert per table, and at 1s the server merges
+                   parts about four times as often for the same lines; tl reads lines past the stored ones
+                   from the file, so a longer pass does not delay what it finds
   --idle D         a file that has not grown this long releases its parser (default 1h)
   --sweep D        every known file and every folder inotify does not watch is looked at once per D,
                    changed or not (default 5m); inotify watches the Claude projects and the codex
@@ -85,7 +87,7 @@ func parse(args []string) (options, error) {
 	fs.BoolVar(&o.materialize, "materialize", false, "")
 	fs.IntVar(&o.verify, "verify", 0, "")
 	fs.BoolVar(&o.check, "check", false, "")
-	fs.DurationVar(&o.cfg.tick, "tick", time.Second, "")
+	fs.DurationVar(&o.cfg.tick, "tick", 5*time.Second, "")
 	fs.DurationVar(&o.cfg.idle, "idle", time.Hour, "")
 	fs.DurationVar(&o.cfg.sweep, "sweep", 5*time.Minute, "")
 	fs.DurationVar(&o.cfg.rescan, "rescan", time.Hour, "")
