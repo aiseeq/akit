@@ -13,6 +13,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
 	"slices"
 	"sort"
@@ -205,24 +206,47 @@ func (d *dbPath) stored(path string) (*dbFile, error) {
 	if ino := transcript.Inode(st); ino != 0 && f.inode != 0 && ino != f.inode {
 		return nil, nil
 	}
-	if f.ingested > 0 {
-		file, err := os.Open(path)
-		if err != nil {
-			return nil, fmt.Errorf("open %s tail: %w", path, err)
+	if f.ingested > 0 || st.Size() > 0 {
+		matches, err := storedTailMatches(path, f, st.Size())
+		if err != nil { //nolint:silent-error-handling // Unreadable stored data falls back to reading the transcript without a warning.
+			return nil, nil
 		}
-		from := max(f.ingested-256, 0)
-		buf := make([]byte, f.ingested-from)
-		_, readErr := file.ReadAt(buf, from)
-		closeErr := file.Close()
-		if err := errors.Join(readErr, closeErr); err != nil {
-			return nil, fmt.Errorf("read %s tail: %w", path, err)
-		}
-		sum := sha256.Sum256(buf)
-		if binary.BigEndian.Uint64(sum[:8]) != f.tail {
+		if !matches {
 			return nil, nil
 		}
 	}
 	return f, nil
+}
+
+// storedTailMatches checks whether the cache row still describes the loaded tail; read failures are returned so
+// stored can explicitly fall back to the transcript.
+func storedTailMatches(path string, f *dbFile, size int64) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("open stored tail: %w", err)
+	}
+	defer file.Close()
+	if f.ingested > 0 {
+		from := max(f.ingested-256, 0)
+		buf := make([]byte, f.ingested-from)
+		if _, err := file.ReadAt(buf, from); err != nil {
+			return false, fmt.Errorf("read stored tail: %w", err)
+		}
+		sum := sha256.Sum256(buf)
+		if binary.BigEndian.Uint64(sum[:8]) != f.tail {
+			return false, nil
+		}
+	}
+	if size > f.ingested {
+		var last [1]byte
+		if _, err := file.ReadAt(last[:], size-1); err != nil {
+			return false, fmt.Errorf("read stored file end: %w", err)
+		}
+		if last[0] != '\n' {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // fields reads typed fields of one answer row; the first that does not parse is kept in err.
@@ -252,7 +276,7 @@ func (d *dbPath) resolve() ([]source, error) {
 		}
 		selected := make([]string, 0, len(paths))
 		for _, path := range paths {
-			if isCodexRollout(path) && !d.opts.codex || strings.Contains(path, string(os.PathSeparator)+"subagents"+string(os.PathSeparator)) && d.opts.noSubagents {
+			if isCodexRollout(path) && !d.opts.codex || filepath.Base(filepath.Dir(path)) == "subagents" && strings.HasPrefix(filepath.Base(path), "agent-") && d.opts.noSubagents {
 				continue
 			}
 			selected = append(selected, path)
@@ -422,16 +446,19 @@ func (d *dbPath) result(sources []source) (result, error) {
 	return res, nil
 }
 
-// badLines are the lines of one file the parse skipped, as Meta has them.
+// badLines are the unparsable lines of one file that pass the active raw prefilter.
 type badLines struct {
 	n     int
 	first error
 }
 
-// badLines counts the unparsable lines of the stored files the way a read with this filter counts them: a line
-// the prefilter drops is not parsed, so it is not counted. The lines that are not JSON come from raw; a line that
-// is JSON but not a record (a bad time, a wrong shape) is only in the count of the files table, so it is counted
-// without a place.
+type storedRawLine struct {
+	n int
+	b []byte
+}
+
+// badLines replays the stored raw lines to count the bad ones that pass the active filter. Rollouts need a
+// prescan of their complete contents before Feed, as the file reader does, to recognize message event records.
 func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 	var ids []uint64
 	byID := map[uint64]stored{}
@@ -449,7 +476,7 @@ func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 	if err != nil {
 		return err
 	}
-	follows := make(map[uint64]*transcript.Follow, len(byID))
+	all := make(map[uint64][]storedRawLine, len(byID))
 	for _, row := range rows {
 		if len(row) != 3 {
 			return fmt.Errorf("bad: %d fields in a row, want 3", len(row))
@@ -463,26 +490,73 @@ func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 		if !ok || line > s.file.lines {
 			continue
 		}
-		fl := follows[id]
-		if fl == nil {
-			fl = transcript.NewFollow()
-			follows[id] = fl
+		all[id] = append(all[id], storedRawLine{n: line, b: []byte(row[2])})
+	}
+	for id, s := range byID {
+		b, err := d.storedBadLines(s, all[id])
+		if err != nil {
+			return err
 		}
-		before := fl.Meta()
-		if err := fl.Feed([]byte(row[2]+"\n"), func(transcript.Event) {}); err != nil {
-			return fmt.Errorf("bad: parse stored line %d: %w", line, err)
-		}
-		after := fl.Meta()
-		if after.Bad > before.Bad && d.f.keepsBad([]byte(row[2])) {
-			b := out[s.src.Path]
-			b.n++
-			if b.first == nil {
-				b.first = after.FirstBad
-			}
-			out[s.src.Path] = b
-		}
+		out[s.src.Path] = b
 	}
 	return nil
+}
+
+func (d *dbPath) storedBadLines(s stored, lines []storedRawLine) (badLines, error) {
+	fl := transcript.NewFollow()
+	codex := isCodexRollout(s.src.Path)
+	if codex {
+		for _, line := range lines {
+			if err := fl.Prescan(append(bytes.Clone(line.b), '\n')); err != nil {
+				return badLines{}, fmt.Errorf("bad: prescan stored line %d: %w", line.n, err)
+			}
+		}
+	}
+	messageUser, messageAgent := fl.MessageEvents()
+	var bad badLines
+	for _, line := range lines {
+		before := fl.Meta()
+		if err := fl.Feed(append(bytes.Clone(line.b), '\n'), func(transcript.Event) {}); err != nil {
+			return badLines{}, fmt.Errorf("bad: parse stored line %d: %w", line.n, err)
+		}
+		if fl.Meta().Bad <= before.Bad || !d.f.keepsBad(line.b) {
+			continue
+		}
+		bad.n++
+		if bad.first == nil {
+			first, err := storedBadLineError(line, codex, messageUser, messageAgent)
+			if err != nil {
+				return badLines{}, err
+			}
+			bad.first = first
+		}
+	}
+	return bad, nil
+}
+
+func storedBadLineError(line storedRawLine, codex, messageUser, messageAgent bool) (error, error) {
+	candidate := transcript.NewFollow()
+	if codex {
+		seed := []byte(`{"type":"session_meta"`)
+		if messageUser {
+			seed = append(seed, []byte(`,"type":"event_msg","payload":{"type":"user_message"}`)...)
+		}
+		if messageAgent {
+			seed = append(seed, []byte(`,"type":"event_msg","payload":{"type":"agent_message"}`)...)
+		}
+		seed = append(seed, '}', '\n')
+		if err := candidate.Prescan(seed); err != nil {
+			return nil, err
+		}
+	}
+	if err := candidate.Feed(append(bytes.Clone(line.b), '\n'), func(transcript.Event) {}); err != nil {
+		return nil, fmt.Errorf("bad: parse stored line %d: %w", line.n, err)
+	}
+	cause := "unparsable line"
+	if first := candidate.Meta().FirstBad; first != nil {
+		_, cause, _ = strings.Cut(first.Error(), ": ")
+	}
+	return fmt.Errorf("line %d: %s", line.n, cause), nil
 }
 
 // sortedHit is a hit with what orders the events of one line: the role, then the place of the row in its part

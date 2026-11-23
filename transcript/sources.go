@@ -280,7 +280,7 @@ func AllSourcesWalkOrder(home string, since time.Time, project string, codex, in
 
 // SourceAt identifies a regular or subagent transcript by path.
 func SourceAt(path string) (Source, error) {
-	if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
+	if filepath.Base(filepath.Dir(path)) == "subagents" {
 		return SubSource(path)
 	}
 	return NewSource(path), nil

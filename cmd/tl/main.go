@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -567,12 +568,16 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 }
 
 func writeMasked(w io.Writer, text string) error {
+	bw := bufio.NewWriterSize(w, 64<<10)
 	for len(text) > 0 {
 		end := strings.IndexByte(text, '\n')
 		if end < 0 {
 			masked, _ := hide(text)
-			_, err := io.WriteString(w, masked)
+			_, err := io.WriteString(bw, masked)
 			if err != nil {
+				return fmt.Errorf("write masked text: %w", err)
+			}
+			if err := bw.Flush(); err != nil {
 				return fmt.Errorf("write masked text: %w", err)
 			}
 			return nil
@@ -582,13 +587,16 @@ func writeMasked(w io.Writer, text string) error {
 			line, newline = before, "\r\n"
 		}
 		masked, _ := hide(line)
-		if _, err := io.WriteString(w, masked); err != nil {
+		if _, err := io.WriteString(bw, masked); err != nil {
 			return fmt.Errorf("write masked line: %w", err)
 		}
-		if _, err := io.WriteString(w, newline); err != nil {
+		if _, err := io.WriteString(bw, newline); err != nil {
 			return fmt.Errorf("write line ending: %w", err)
 		}
 		text = text[end+1:]
+	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("write masked text: %w", err)
 	}
 	return nil
 }
