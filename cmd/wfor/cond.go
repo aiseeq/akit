@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -117,10 +118,11 @@ type fileEvent struct{ paths map[string]struct{} }
 
 const inotifyCheckInterval = 100 * time.Millisecond
 const inotifyReadCooldown = 600 * time.Millisecond
+const inotifyReadBufferSize = 64 * 1024
 
-// After a write, a second write within 10 seconds waits for the next ticker check.
+// A second write within 10 seconds may wait for the remainder of this cooldown.
 const inotifyWriteCooldown = 10 * time.Second
-const inotifyNoiseCooldown = 250 * time.Millisecond
+const inotifyNoiseCooldown = 490 * time.Millisecond
 
 // watchFiles shares one inotify descriptor across every file and line condition.
 func watchFiles(ctx context.Context, conds []cond) (<-chan fileEvent, func(), error) {
@@ -197,7 +199,7 @@ func fileWatchDirs(conds []cond) map[string]map[string]uint32 {
 	return dirs
 }
 
-const directoryWatchMask = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM
+const directoryWatchMask = unix.IN_CREATE | unix.IN_MOVED_TO
 
 func addInotifyWatches(fd int, dirs map[string]map[string]uint32) (map[int]map[string]struct{}, map[int]uint32, map[int]map[string]struct{}, map[string]map[string]uint32, map[int]string) {
 	byWD := map[int]map[string]struct{}{}
@@ -248,44 +250,54 @@ func watchInotify(ctx context.Context, fd, cancelFD int, byWD map[int]map[string
 	cooldownTimer := time.NewTimer(time.Hour)
 	cooldownTimer.Stop()
 	defer cooldownTimer.Stop()
-	state := inotifyWatchState{buf: make([]byte, 64*1024), byWD: byWD, fileMasks: fileMasks, filePaths: filePaths, paths: paths, dirWDs: dirWDs}
-	state.singleNames = singleDirectoryWatchNames(state.byWD, state.dirWDs)
-	for waitInotify(&pollfds) {
+	state := newInotifyWatchState(byWD, fileMasks, filePaths, paths, dirWDs)
+	ready := false
+	for {
+		if !ready && !waitInotify(&pollfds) {
+			return
+		}
+		ready = false
 		anyRelevant, anyWrite, anyOverflow, anyEvent, ok := state.drain(fd, out)
 		if !ok {
 			return
 		}
 		if anyRelevant || anyWrite || anyOverflow {
-			addMissingInotifyDirectoryWatches(fd, state.byWD, state.paths, state.dirWDs)
+			addMissingInotifyDirectoryWatches(fd, state.byWD, state.filePaths, state.paths, state.dirWDs)
+			pruneInotifyDirectoryWatches(fd, state.byWD, state.filePaths, state.paths, state.dirWDs)
 			state.singleNames = singleDirectoryWatchNames(state.byWD, state.dirWDs)
+			state.fastName = singleInotifyNamePattern(state.singleNames)
 		}
 		if !anyEvent {
 			continue
 		}
 		// Let the kernel collect a burst instead of waking this reader for every write.
-		cooldown := time.Duration(0)
-		if !anyOverflow {
-			cooldown = inotifyNoiseCooldown
-			if anyRelevant {
-				cooldown = inotifyReadCooldown
-			} else if anyWrite {
-				cooldown = inotifyWriteCooldown
-			}
-		}
+		cooldown := inotifyEventCooldown(anyRelevant, anyWrite, anyOverflow)
 		if cooldownStarted != nil {
 			select {
 			case cooldownStarted <- struct{}{}:
 			default:
 			}
 		}
-		if cooldown > 0 && !waitContextTimer(ctx, cooldownTimer, cooldown) {
-			return
-		}
-		if anyRelevant || anyWrite || anyOverflow {
-			pruneInotifyDirectoryWatches(fd, state.byWD, state.filePaths, state.paths, state.dirWDs)
-			state.singleNames = singleDirectoryWatchNames(state.byWD, state.dirWDs)
+		if cooldown > 0 {
+			if !waitContextTimer(ctx, cooldownTimer, cooldown) {
+				return
+			}
+			ready = true
 		}
 	}
+}
+
+func inotifyEventCooldown(anyRelevant, anyWrite, anyOverflow bool) time.Duration {
+	if anyOverflow {
+		return 0
+	}
+	if anyRelevant {
+		return inotifyReadCooldown
+	}
+	if anyWrite {
+		return inotifyWriteCooldown
+	}
+	return inotifyNoiseCooldown
 }
 
 type inotifyWatchState struct {
@@ -296,10 +308,77 @@ type inotifyWatchState struct {
 	paths       map[string]map[string]uint32
 	dirWDs      map[int]string
 	singleNames []string
+	fastName    []byte
+	fastFileWD  [4]byte
+	hasFastWD   bool
+}
+
+func newInotifyWatchState(byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string) inotifyWatchState {
+	state := inotifyWatchState{
+		buf:       make([]byte, inotifyReadBufferSize),
+		byWD:      byWD,
+		fileMasks: fileMasks,
+		filePaths: filePaths,
+		paths:     paths,
+		dirWDs:    dirWDs,
+	}
+	state.singleNames = singleDirectoryWatchNames(byWD, dirWDs)
+	state.fastName = singleInotifyNamePattern(state.singleNames)
+	state.updateFastFileWD()
+	return state
+}
+
+var inotifyOverflowSignature = func() []byte {
+	var signature [8]byte
+	binary.NativeEndian.PutUint32(signature[:4], ^uint32(0))
+	binary.NativeEndian.PutUint32(signature[4:], unix.IN_Q_OVERFLOW)
+	return signature[:]
+}()
+
+func singleInotifyNamePattern(singleNames []string) []byte {
+	name := ""
+	for _, candidate := range singleNames {
+		if candidate == "" {
+			continue
+		}
+		if name != "" && name != candidate {
+			return nil
+		}
+		name = candidate
+	}
+	if name == "" {
+		return nil
+	}
+	pattern := make([]byte, len(name)+1)
+	copy(pattern, name)
+	return pattern
+}
+
+func inotifyPacketMayMatch(data, fastName, fastFileWD []byte, checkOverflow bool) bool {
+	return (len(fastName) == 0 && len(fastFileWD) == 0) ||
+		(len(fastName) > 0 && bytes.Contains(data, fastName)) ||
+		(len(fastFileWD) > 0 && bytes.Contains(data, fastFileWD)) ||
+		(checkOverflow && bytes.Contains(data, inotifyOverflowSignature))
+}
+
+func shouldCheckInotifyOverflow(readBytes, n, bufferSize int) bool {
+	return readBytes >= bufferSize || n == bufferSize
+}
+
+func (s *inotifyWatchState) updateFastFileWD() {
+	s.hasFastWD = false
+	if len(s.filePaths) == 1 {
+		for wd := range s.filePaths {
+			binary.NativeEndian.PutUint32(s.fastFileWD[:], uint32(wd))
+			s.hasFastWD = true
+			return
+		}
+	}
 }
 
 func (s *inotifyWatchState) drain(fd int, out chan fileEvent) (anyRelevant, anyWrite, anyOverflow, anyEvent, ok bool) {
 	ok = true
+	readBytes := 0
 	for {
 		n, err := unix.Read(fd, s.buf)
 		if err == unix.EAGAIN {
@@ -313,12 +392,23 @@ func (s *inotifyWatchState) drain(fd int, out chan fileEvent) (anyRelevant, anyW
 			return
 		}
 		anyEvent = true
-		relevant, writeOnly, overflow := emitInotifyEventsForFiles(fd, s.buf[:n], s.singleNames, s.byWD, s.fileMasks, s.filePaths, s.paths, s.dirWDs, out)
+		checkOverflow := shouldCheckInotifyOverflow(readBytes, n, len(s.buf))
+		fastName, fastFileWD := s.fastName, []byte(nil)
+		if s.hasFastWD {
+			fastFileWD = s.fastFileWD[:]
+		} else if len(s.filePaths) != 0 {
+			fastName = nil
+		}
+		relevant, writeOnly, overflow := emitInotifyEventsForFiles(fd, s.buf[:n], checkOverflow, fastName, fastFileWD, s.singleNames, s.byWD, s.fileMasks, s.filePaths, s.paths, s.dirWDs, out)
+		readBytes += n
+		s.updateFastFileWD()
 		if overflow {
 			anyOverflow = true
 			removeAllFileInotifyWatches(fd, s.byWD, s.fileMasks, s.filePaths)
 			s.byWD, s.fileMasks, s.filePaths, s.paths, s.dirWDs = rebuildInotifyWatches(fd, s.paths)
 			s.singleNames = singleDirectoryWatchNames(s.byWD, s.dirWDs)
+			s.fastName = singleInotifyNamePattern(s.singleNames)
+			s.updateFastFileWD()
 		}
 		if writeOnly {
 			anyWrite = true
@@ -367,7 +457,10 @@ func waitInotify(pollfds *[2]unix.PollFd) bool {
 	}
 }
 
-func emitInotifyEventsForFiles(fd int, data []byte, singleNames []string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) (bool, bool, bool) {
+func emitInotifyEventsForFiles(fd int, data []byte, checkOverflow bool, fastName, fastFileWD []byte, singleNames []string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, out chan fileEvent) (bool, bool, bool) {
+	if !inotifyPacketMayMatch(data, fastName, fastFileWD, checkOverflow) {
+		return false, false, false
+	}
 	var changed map[string]struct{}
 	writeOnly := true
 	overflow := false
@@ -386,10 +479,6 @@ func emitInotifyEventsForFiles(fd int, data []byte, singleNames []string, byWD m
 					cachedSingleName = singleNames[wd]
 				}
 			}
-			if cachedSingleName != "" && data[nameStart] != cachedSingleName[0] {
-				off += unix.SizeofInotifyEvent + length
-				continue
-			}
 		}
 		if off+unix.SizeofInotifyEvent+length > len(data) {
 			return false, false, false
@@ -398,7 +487,7 @@ func emitInotifyEventsForFiles(fd int, data []byte, singleNames []string, byWD m
 		if length > 0 {
 			if cachedSingleName != "" {
 				expectedLen := len(cachedSingleName)
-				if !inotifySingleNameMatches(data, nameStart, length, cachedSingleName) {
+				if !inotifyEventNameMatches(data, nameStart, length, cachedSingleName) {
 					off += unix.SizeofInotifyEvent + length
 					continue
 				}
@@ -435,9 +524,11 @@ func emitInotifyEventsForFiles(fd int, data []byte, singleNames []string, byWD m
 	return len(changed) > 0, len(changed) > 0 && writeOnly, overflow
 }
 
-func inotifySingleNameMatches(data []byte, start, length int, expected string) bool {
-	expectedLen := len(expected)
-	return length > expectedLen && data[start+expectedLen] == 0 && inotifyNameTailEqual(data[start:start+length], expected)
+func inotifyEventNameMatches(data []byte, start, length int, expected string) bool {
+	if len(expected) == 0 || length <= len(expected) || data[start] != expected[0] {
+		return false
+	}
+	return data[start+len(expected)] == 0 && inotifyNameTailEqual(data[start:start+len(expected)], expected)
 }
 
 func queueInotifyChanges(changed map[string]struct{}, out chan fileEvent) {
@@ -497,7 +588,7 @@ func singleDirectoryWatchNames(byWD map[int]map[string]struct{}, dirWDs map[int]
 	return singleNames
 }
 
-func addMissingInotifyDirectoryWatches(fd int, byWD map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string) {
+func addMissingInotifyDirectoryWatches(fd int, byWD map[int]map[string]struct{}, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string) {
 	for dir, names := range paths {
 		watched := false
 		for _, watchedDir := range dirWDs {
@@ -507,6 +598,9 @@ func addMissingInotifyDirectoryWatches(fd int, byWD map[int]map[string]struct{},
 			}
 		}
 		if watched {
+			continue
+		}
+		if canPruneInotifyDirectory(dir, filePaths, paths) {
 			continue
 		}
 		wd, err := unix.InotifyAddWatch(fd, dir, directoryWatchMask)
@@ -523,24 +617,39 @@ func addMissingInotifyDirectoryWatches(fd int, byWD map[int]map[string]struct{},
 	}
 }
 
-func pruneInotifyDirectoryWatches(fd int, byWD map[int]map[string]struct{}, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string) {
-	for wd, dir := range dirWDs {
-		allFilesWatched := true
-		for name := range paths[dir] {
-			path := filepath.Join(dir, name)
-			fileWatched := false
-			for _, watchedPaths := range filePaths {
-				if _, ok := watchedPaths[path]; ok {
-					fileWatched = true
-					break
-				}
-			}
-			if !fileWatched {
-				allFilesWatched = false
+func canPruneInotifyDirectory(dir string, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32) bool {
+	names := paths[dir]
+	if len(names) == 0 {
+		return false
+	}
+	existing := false
+	for name := range names {
+		path := filepath.Join(dir, name)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+		existing = true
+		watched := false
+		for _, watchedPaths := range filePaths {
+			if _, ok := watchedPaths[path]; ok {
+				watched = true
 				break
 			}
 		}
-		if !allFilesWatched {
+		if !watched {
+			return false
+		}
+	}
+	return existing
+}
+
+func pruneInotifyDirectoryWatches(fd int, byWD map[int]map[string]struct{}, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string) {
+	for wd, dir := range dirWDs {
+		if !canPruneInotifyDirectory(dir, filePaths, paths) {
 			continue
 		}
 		if _, err := unix.InotifyRmWatch(fd, uint32(wd)); err != nil && err != unix.EINVAL {
@@ -563,7 +672,7 @@ func refreshInotifyFileWatch(fd int, path string, byWD map[int]map[string]struct
 	if expected {
 		addFileInotifyWatch(fd, path, fileMask, byWD, fileMasks, filePaths)
 	}
-	addMissingInotifyDirectoryWatches(fd, byWD, paths, dirWDs)
+	addMissingInotifyDirectoryWatches(fd, byWD, filePaths, paths, dirWDs)
 }
 
 func recordInotifyEvent(fd, wd int, mask uint32, name string, byWD map[int]map[string]struct{}, fileMasks map[int]uint32, filePaths map[int]map[string]struct{}, paths map[string]map[string]uint32, dirWDs map[int]string, changed map[string]struct{}) (bool, bool) {
@@ -589,7 +698,7 @@ func recordInotifyEvent(fd, wd int, mask uint32, name string, byWD map[int]map[s
 					addFileInotifyWatch(fd, path, fileMask, byWD, fileMasks, filePaths)
 				}
 			}
-			addMissingInotifyDirectoryWatches(fd, byWD, paths, dirWDs)
+			addMissingInotifyDirectoryWatches(fd, byWD, filePaths, paths, dirWDs)
 			return false, true
 		}
 		delete(byWD, wd)
@@ -605,7 +714,7 @@ func recordInotifyEvent(fd, wd int, mask uint32, name string, byWD map[int]map[s
 		if mask&^uint32(unix.IN_MODIFY) != 0 {
 			for path := range filePaths[wd] {
 				changed[path] = struct{}{}
-				if mask&(unix.IN_DELETE_SELF|unix.IN_MOVE_SELF) != 0 {
+				if mask&(unix.IN_ATTRIB|unix.IN_DELETE_SELF|unix.IN_MOVE_SELF) != 0 {
 					refreshInotifyFileWatch(fd, path, byWD, fileMasks, filePaths, paths, dirWDs)
 				}
 			}
