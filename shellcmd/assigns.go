@@ -29,7 +29,8 @@ type Assign struct {
 	// source/dot, nameref declarations, and recognized nested shell scripts. Per-name triggers
 	// include arithmetic and integer declarations; `${name:=…}`; write targets of read, printf -v,
 	// getopts, mapfile/readarray, unset, wait -p, coproc, and `{name}>…`; readonly/case-transform
-	// declarations; special-builtin prefix assignments; writes in function bodies; and writes in
+	// declarations; special-builtin prefix assignments; uncertain function-body writes, including
+	// nested-scope records selectable by a later reference; and writes in
 	// if/elif/else and case arms, right sides of &&/||, loop conditions and bodies, conditional
 	// parameter expansions, case patterns, and here-document/here-string expansions. A name read
 	// in a function body with multiple assignments in the script is also Unknown. Implicit writes
@@ -105,7 +106,8 @@ func (a Assign) VisibleAt(off int) bool {
 // source/dot, a declare/local/typeset -n option, or a recognized nested shell script from a string
 // or stdin. Per-name triggers include arithmetic and -i declarations; `${name:=…}`; write targets
 // of read, printf -v, getopts, mapfile/readarray, unset, wait -p, coproc, and `{name}>…`;
-// readonly/case-transform declarations; special-builtin prefix assignments; function-body writes;
+// readonly/case-transform declarations; special-builtin prefix assignments; uncertain function-body writes,
+// including nested-scope records selectable by a later reference;
 // and assignments in if/elif/else/case arms, right sides of &&/||, loop conditions and bodies,
 // conditional parameter expansions, case patterns, and here-document/here-string expansions. A
 // name read inside a function body is also Unknown when there are multiple
@@ -138,12 +140,12 @@ func Assigns(cmd string) ([]Assign, error) {
 		out = append(out, assignments...)
 		return true
 	})
-	suspicious, global, err := suspiciousAssignNames(file, cmd, out)
+	suspicious, functionUnknown, global, err := suspiciousAssignNames(file, cmd, out)
 	if err != nil {
 		return nil, err
 	}
 	for i := range out {
-		if global || suspicious[out[i].Name] {
+		if global || suspicious[out[i].Name] || functionUnknown[out[i].Offset] {
 			out[i].Value, out[i].Append, out[i].Unknown = "", false, true
 		}
 	}
@@ -160,35 +162,52 @@ var caseTransformDeclOption = regexp.MustCompile(`(^|[[:space:]])-[[:alpha:]]*[u
 
 // suspiciousAssignNames makes one syntax-tree pass and records names whose value can be
 // affected by constructs Assigns deliberately does not execute or interpret.
-func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map[string]bool, bool, error) {
+func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map[string]bool, map[int]bool, bool, error) {
 	scan := suspiciousAssignScan{
 		src: src, assigns: assigns, names: make(map[string]bool), arithmetic: make(map[string]bool),
 		integerVars: make(map[string]bool), writeNames: make(map[string]bool),
-		functionCounts: make(map[string]int), functionRefs: make(map[string][]int),
+		functionCounts: make(map[string]int), functionRefs: make(map[string][]int), functionNames: make(map[span]string), functionUnknown: make(map[int]bool),
+		definedFunctions: make(map[string]bool), functionCalls: make(map[string][]int),
 		// Any mention of posix (set -o posix, shopt -so posix, POSIXLY_CORRECT) may switch bash to posix mode,
 		// where a prefix assignment before a special builtin persists. Checked once: per command it was quadratic.
 		posix: strings.Contains(src, "posix") || strings.Contains(src, "POSIX"),
 	}
 	syntax.Walk(file, scan.visit)
+	for _, call := range scan.callSites {
+		if scan.definedFunctions[call.name] {
+			scan.functionCalls[call.name] = append(scan.functionCalls[call.name], call.offset)
+		}
+	}
 	names, all := scan.result()
-	return names, all, nil
+	return names, scan.functionUnknown, all, nil
 }
 
 type suspiciousAssignScan struct {
-	src            string
-	posix          bool
-	assigns        []Assign
-	names          map[string]bool
-	arithmetic     map[string]bool
-	integerVars    map[string]bool
-	writeNames     map[string]bool
-	functionCounts map[string]int
-	functionRefs   map[string][]int
-	functionBodies []span
-	mathSpans      []span
-	valueSpans     map[string][]span
-	uncertain      []span
-	all            bool
+	src              string
+	posix            bool
+	assigns          []Assign
+	names            map[string]bool
+	arithmetic       map[string]bool
+	integerVars      map[string]bool
+	writeNames       map[string]bool
+	functionCounts   map[string]int
+	functionRefs     map[string][]int
+	definedFunctions map[string]bool
+	functionCalls    map[string][]int
+	callSites        []callSite
+	functionNames    map[span]string
+	functionBodies   []span
+	functionIsolated []span
+	functionUnknown  map[int]bool
+	mathSpans        []span
+	valueSpans       map[string][]span
+	uncertain        []span
+	all              bool
+}
+
+type callSite struct {
+	name   string
+	offset int
 }
 
 func (s *suspiciousAssignScan) markText(lo, hi int) {
@@ -205,13 +224,35 @@ func (s *suspiciousAssignScan) markStmts(stmts []*syntax.Stmt) {
 }
 
 func (s *suspiciousAssignScan) visit(node syntax.Node) bool {
+	if !s.visitPrimary(node) {
+		s.visitSecondary(node)
+	}
+	return true
+}
+
+func (s *suspiciousAssignScan) visitPrimary(node syntax.Node) bool {
 	switch n := node.(type) {
 	case *syntax.CallExpr:
 		s.call(n)
 	case *syntax.DeclClause:
 		s.declaration(n)
 	case *syntax.FuncDecl:
-		s.functionBodies = append(s.functionBodies, nodeSpan(n.Body))
+		if n.Name != nil {
+			s.definedFunctions[n.Name.Value] = true
+		}
+		body := span{-1, -1}
+		if n.Body != nil && n.Body.Cmd != nil {
+			body = functionBodySpan(n.Body)
+		}
+		s.functionBodies = append(s.functionBodies, body)
+		if n.Name != nil {
+			s.functionNames[body] = n.Name.Value
+		}
+		if n.Body != nil {
+			if _, ok := n.Body.Cmd.(*syntax.Subshell); ok {
+				s.functionIsolated = append(s.functionIsolated, nodeSpan(n.Body.Cmd))
+			}
+		}
 	case *syntax.ArithmCmd, *syntax.ArithmExp, *syntax.LetClause, *syntax.CStyleLoop:
 		s.markText(int(n.Pos().Offset()), int(n.End().Offset()))
 	case *syntax.Assign:
@@ -224,6 +265,14 @@ func (s *suspiciousAssignScan) visit(node syntax.Node) bool {
 		s.visitCase(n)
 	case *syntax.BinaryTest:
 		s.visitBinaryTest(n)
+	default:
+		return false
+	}
+	return true
+}
+
+func (s *suspiciousAssignScan) visitSecondary(node syntax.Node) {
+	switch n := node.(type) {
 	case *syntax.WhileClause:
 		s.markStmts(n.Do)
 		s.markStmts(n.Cond)
@@ -241,7 +290,6 @@ func (s *suspiciousAssignScan) visit(node syntax.Node) bool {
 	case *syntax.CoprocClause:
 		s.visitCoproc(n)
 	}
-	return true
 }
 
 func nodeSpan(node syntax.Node) span {
@@ -317,6 +365,11 @@ func (s *suspiciousAssignScan) visitCoproc(clause *syntax.CoprocClause) {
 }
 
 func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
+	if len(call.Args) > 0 {
+		if word, ok := wordValue(call.Args[0]); ok {
+			s.callSites = append(s.callSites, callSite{name: word, offset: int(call.Pos().Offset())})
+		}
+	}
 	for _, assign := range call.Assigns {
 		if assign.Name != nil && len(call.Args) > 0 {
 			// A prefix before a function call is seen inside the function body, though Assigns omits it.
@@ -871,6 +924,17 @@ func (s *suspiciousAssignScan) redirect(redir *syntax.Redirect) {
 }
 
 func (s *suspiciousAssignScan) result() (map[string]bool, bool) {
+	s.prepareArithmeticNames()
+	order := assignmentOrder(s.assigns)
+	functions := mergeSpans(s.functionBodies)
+	if len(functions) > 0 {
+		s.markFunctionBodyNames(order, functions)
+	}
+	markAssignmentsInSpans(s.assigns, order, mergeSpans(s.uncertain), s.names)
+	return s.names, s.all
+}
+
+func (s *suspiciousAssignScan) prepareArithmeticNames() {
 	for name := range s.integerVars {
 		s.names[name] = true
 		for _, value := range s.valueSpans[name] {
@@ -891,27 +955,211 @@ func (s *suspiciousAssignScan) result() (map[string]bool, bool) {
 			s.all = true
 		}
 	}
-	order := assignmentOrder(s.assigns)
-	functions := mergeSpans(s.functionBodies)
-	if len(functions) > 0 {
-		for _, assign := range s.assigns {
-			s.functionCounts[assign.Name]++
+}
+
+func (s *suspiciousAssignScan) markFunctionBodyNames(order []int, functions []span) {
+	for _, assign := range s.assigns {
+		s.functionCounts[assign.Name]++
+	}
+	// A single assignment followed only by reads in its own body has a stable
+	// value for those reads. Another textual assignment or call prefix defeats it.
+	safeBodyNames := s.safeFunctionBodyNames(functions)
+	for _, index := range order {
+		a := s.assigns[index]
+		if containsMergedSpan(functions, a.Offset) && !safeBodyNames[a.Name] {
+			s.markFunctionBodyAssignment(a)
 		}
-		markAssignmentsInSpans(s.assigns, order, functions, s.names)
-		for name, offsets := range s.functionRefs {
-			if s.functionCounts[name] < 2 {
-				continue
-			}
-			for _, off := range offsets {
-				if containsMergedSpan(functions, off) {
-					s.names[name] = true
-					break
-				}
+	}
+	s.markFunctionReferenceNames(functions)
+}
+
+func (s *suspiciousAssignScan) markFunctionBodyAssignment(a Assign) {
+	if s.nestedFunctionWrite(a) {
+		inBody, outside := s.referencesOutsideScope(a)
+		if inBody || outside && strings.Contains(s.src, "lastpipe") {
+			s.names[a.Name] = true
+		} else if outside || s.inFunctionIsolatedScope(a.Offset) {
+			s.functionUnknown[a.Offset] = true
+		}
+		return
+	}
+	s.names[a.Name] = true
+}
+
+func (s *suspiciousAssignScan) markFunctionReferenceNames(functions []span) {
+	for name, offsets := range s.functionRefs {
+		if s.functionCounts[name] < 2 {
+			continue
+		}
+		for _, off := range offsets {
+			if containsMergedSpan(functions, off) {
+				s.names[name] = true
+				break
 			}
 		}
 	}
-	markAssignmentsInSpans(s.assigns, order, mergeSpans(s.uncertain), s.names)
-	return s.names, s.all
+}
+
+func (s *suspiciousAssignScan) inFunctionIsolatedScope(off int) bool {
+	for _, isolated := range s.functionIsolated {
+		if isolated.start <= off && off < isolated.end {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *suspiciousAssignScan) safeFunctionBodyNames(functions []span) map[string]bool {
+	counts := make(map[string]int)
+	var only map[string]int
+	for i := range s.assigns {
+		a := s.assigns[i]
+		if containsMergedSpan(functions, a.Offset) {
+			counts[a.Name]++
+			if only == nil {
+				only = make(map[string]int)
+			}
+			if counts[a.Name] == 1 {
+				only[a.Name] = a.Offset
+			}
+		}
+	}
+	safe := make(map[string]bool)
+	for name, off := range only {
+		if s.safeFunctionBodyName(name, off, counts[name], functions) {
+			safe[name] = true
+		}
+	}
+	return safe
+}
+
+func (s *suspiciousAssignScan) safeFunctionBodyName(name string, off, bodyWrites int, functions []span) bool {
+	if bodyWrites != 1 || s.functionCounts[name] != 1 {
+		return false
+	}
+	owner, bodyName, owners := s.functionBodyOwner(off)
+	calls := s.functionCalls[bodyName]
+	if bodyName == "" || owners != 1 || len(calls) != 1 || calls[0] <= owner.end {
+		return false
+	}
+	if !s.assignmentMatchesFunctionScope(name, off, owner) || s.inFunctionIsolatedScope(off) {
+		return false
+	}
+	if !s.referencesFollowBodyAssignment(name, off, owner, functions) {
+		return false
+	}
+	if s.functionCalledBetweenAssignmentAndReference(name, off) {
+		return false
+	}
+	return !s.functionBodyHasDynamicEffects(off, functions)
+}
+
+func (s *suspiciousAssignScan) functionBodyOwner(off int) (span, string, int) {
+	var owner span
+	name, count := "", 0
+	for _, body := range s.functionBodies {
+		if body.start <= off && off < body.end {
+			owner, name, count = body, s.functionNames[body], count+1
+		}
+	}
+	return owner, name, count
+}
+
+func (s *suspiciousAssignScan) assignmentMatchesFunctionScope(name string, off int, owner span) bool {
+	if off < owner.start || off >= owner.end {
+		return false
+	}
+	for i := range s.assigns {
+		a := s.assigns[i]
+		if a.Name == name && a.Offset == off && (a.ScopeStart != owner.start || a.ScopeEnd != owner.end) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *suspiciousAssignScan) referencesFollowBodyAssignment(name string, off int, owner span, functions []span) bool {
+	seen := false
+	for _, ref := range s.functionRefs[name] {
+		if !containsMergedSpan(functions, ref) || ref <= off || ref < owner.start || ref >= owner.end {
+			return false
+		}
+		seen = true
+	}
+	return seen
+}
+
+func (s *suspiciousAssignScan) functionCalledBetweenAssignmentAndReference(name string, off int) bool {
+	for _, calls := range s.functionCalls {
+		for _, called := range calls {
+			if callBeforeReference(called, off, s.functionRefs[name]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func callBeforeReference(called, assignment int, refs []int) bool {
+	for _, ref := range refs {
+		if assignment < called && called < ref {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *suspiciousAssignScan) functionBodyHasDynamicEffects(off int, functions []span) bool {
+	for _, body := range functions {
+		if body.start <= off && off < body.end {
+			text := s.src[body.start:body.end]
+			if strings.Contains(text, "eval") || strings.Contains(text, "trap") || strings.Contains(text, "source") || strings.Contains(text, " . ") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *suspiciousAssignScan) nestedFunctionWrite(a Assign) bool {
+	insideFunction, matchingBody := false, false
+	for _, body := range s.functionBodies {
+		if body.start <= a.Offset && a.Offset < body.end {
+			insideFunction = true
+			if a.ScopeStart == body.start && a.ScopeEnd == body.end {
+				matchingBody = true
+			}
+		}
+	}
+	if !insideFunction {
+		return false
+	}
+	for _, isolated := range s.functionIsolated {
+		if isolated.start <= a.Offset && a.Offset < isolated.end {
+			return true
+		}
+	}
+	return !matchingBody
+}
+
+func (s *suspiciousAssignScan) referencesOutsideScope(a Assign) (inBody, outside bool) {
+	for _, ref := range s.functionRefs[a.Name] {
+		if ref <= a.Offset || (a.ScopeStart <= ref && ref < a.ScopeEnd) {
+			continue
+		}
+		found := false
+		for _, body := range s.functionBodies {
+			if body.start <= ref && ref < body.end {
+				inBody = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			outside = true
+		}
+	}
+	return inBody, outside
 }
 
 func assignmentOrder(assigns []Assign) []int {

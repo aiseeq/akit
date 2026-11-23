@@ -66,7 +66,9 @@ Prefix assignments (`S=x cmd`) are omitted; a function called with one sees the 
 `-c`, `-s`, a here-document, or a here-string. Per-name triggers include arithmetic and `-i`
 declarations, `${name:=…}`, write targets of `read`, `printf -v`, `getopts`, `mapfile`/`readarray`,
 `unset`, `wait -p`, `coproc`, and `{name}>…`; readonly and case-transform declarations;
-special-builtin prefix assignments; writes inside function bodies; and assignments in `if`/`elif`/
+special-builtin prefix assignments; function-body writes that cannot be tied to later reads in the same
+body; writes in a nested function-body scope when a later reference can select that record by offset;
+and assignments in `if`/`elif`/
 `case`, the right side of `&&`/`||`, loop conditions and bodies, conditional parameter expansions,
 case patterns, and here-document or here-string expansions. A name read in a function body with
 multiple assignments in the script is Unknown too. These rules mark all assignments to a

@@ -113,6 +113,56 @@ func TestAssignsConservativeSafeNeighborsRemainKnown(t *testing.T) {
 	}
 }
 
+func TestAssignsFunctionBodyWritesStayPreciseOnlyForLocalReadFlow(t *testing.T) {
+	for _, tc := range []struct {
+		src, want string
+		unknown   bool
+	}{
+		{`f() { S=/good; curl -d @$S/body.json; }; f`, "/good", false},
+		{`S=/good; f() ( S=/bad ); f; curl -d @$S/body.json`, "/good", false},
+		{`S=/good; f() { (S=/bad); }; f; curl -d @$S/body.json`, "/good", false},
+		{`S=/good; f() { echo | S=/bad; }; f; curl -d @$S/body.json`, "/good", false},
+		{`S=/good; f() { echo | S=/bad; }; shopt -s lastpipe; echo | f; curl -d @$S/body.json`, "", true},
+		{`f() { S=/good; }; curl -d @$S/x; f`, "", true},
+		{`f() { curl -d @$S/x; S=/good; }; f`, "", true},
+		{`S=/good; f() { (S=/bad); curl -d @$S/x; }; f`, "", true},
+		{`f() { S=/good; g; curl -d @$S/x; }; g() { :; }; f`, "", true},
+		{`f() { S=/good; curl -d @$S/x; }; f; f`, "", true},
+		{`f; f() { S=/good; curl -d @$S/x; }`, "", true},
+		{`f() { S=/good; f; curl -d @$S/x; }; f`, "", true},
+		{`outer() { inner() { S=/good; curl -d @$S/x; }; inner; }; outer`, "", true},
+		{`f() { local S=/tmp/x; curl -d @$S/y; }; f`, "/tmp/x", false},
+		{`f() { declare S=/tmp/x; curl -d @$S/y; }; f`, "/tmp/x", false},
+		{`S=/good; for i in 1; do f() { S=/tmp/x; curl -d @$S/y; }; f; done`, "", true},
+	} {
+		got, err := Assigns(tc.src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		knownFound := false
+		for _, a := range got {
+			if a.Name != "S" {
+				continue
+			}
+			found = true
+			wantUnknown := tc.unknown || a.Value != tc.want
+			if !wantUnknown && !a.Unknown {
+				knownFound = true
+			}
+			if a.Unknown != wantUnknown || (!wantUnknown && a.Value != tc.want) {
+				t.Errorf("Assigns(%q) S = %+v, want Unknown=%v value=%q", tc.src, a, wantUnknown, tc.want)
+			}
+		}
+		if !found {
+			t.Errorf("Assigns(%q) has no S assignment", tc.src)
+		}
+		if !tc.unknown && !knownFound {
+			t.Errorf("Assigns(%q) has no known S=%q record: %+v", tc.src, tc.want, got)
+		}
+	}
+}
+
 func TestAssignsWholeScriptTriggerMarksEveryAssignmentName(t *testing.T) {
 	got, err := Assigns(`S=/good; T=/clean; alias a='S=/bad'; S=/later; T=/later`)
 	if err != nil {
