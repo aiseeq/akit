@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,7 +25,10 @@ type trackedOwnedProcess struct {
 	killed    bool
 }
 
+var errOwnUnitIneligible = errors.New("process is not eligible for own-unit stop")
+
 var afterDescendantPidfdOpen = func(int) {}
+var afterOwnUnitAncestryRead = func(int) {}
 var readSessionStat = ReadStat
 var openSessionPidfd = func(pid, flags int) (int, error) { return openProcessPidfd(pid, flags) }
 var afterSessionPidfdOpen = func(int) {}
@@ -68,6 +73,258 @@ func StopDescendants(grace time.Duration, sig syscall.Signal) (StopResult, error
 		verify: func(pid int, start string) error { return revalidateDescendant("/proc", self, pid, start) },
 	}
 	return stopOwnedProcesses(grace, sig, ops)
+}
+
+// StopOwnUnit stops a process and its observed descendants when the target and
+// caller share an approved agent cgroup v2 leaf. This is a convenience guard,
+// not a security boundary; pidfds pin each verified process before signaling.
+func StopOwnUnit(pid int, grace time.Duration, sig syscall.Signal) (StopResult, error) {
+	if err := validateOwnedStopArgs(grace, sig); err != nil {
+		return StopResult{}, err
+	}
+	self := os.Getpid()
+	if err := ensurePidfdAvailable(self); err != nil {
+		return StopResult{}, err
+	}
+	return stopOwnUnit("/proc", "/sys/fs/cgroup", self, pid, os.Getuid(), grace, sig)
+}
+
+func stopOwnUnit(procRoot, cgRoot string, self, pid, uid int, grace time.Duration, sig syscall.Signal) (StopResult, error) {
+	cg, clPID, err := approvedOwnUnitCgroup(procRoot, self, uid)
+	if err != nil {
+		return StopResult{}, err
+	}
+	if err := validateOwnUnitTarget(procRoot, self, pid, cg, clPID, uid); err != nil {
+		return StopResult{}, err
+	}
+	if err := ownUnitTargetHasManagerParent(procRoot, pid); err != nil {
+		return StopResult{}, err
+	}
+	ops := ownedStopOps{
+		scan: func() ([]int, error) { return ownUnitDescendantPIDs(procRoot, cgRoot, self, pid, cg, clPID, uid) },
+		open: func(candidate int) (*trackedOwnedProcess, error) {
+			return ownUnitDescendantTarget(procRoot, self, pid, candidate, cg, clPID, uid)
+		},
+		verify: func(candidate int, start string) error {
+			return revalidateOwnUnitDescendant(procRoot, self, pid, candidate, cg, clPID, uid, start)
+		},
+		killVerify: func(candidate int, start string) error {
+			return revalidateOwnUnitMember(procRoot, self, candidate, cg, clPID, uid, start)
+		},
+		finishPinnedOnly:     true,
+		checkAliveBeforeKill: true,
+	}
+	return stopOwnedProcesses(grace, sig, ops)
+}
+
+func approvedOwnUnitCgroup(root string, self, uid int) (string, int, error) {
+	callerCG, err := readProcessCgroup(root, self)
+	if err != nil {
+		return "", 0, fmt.Errorf("read caller cgroup: %w", err)
+	}
+	parts := strings.Split(strings.Trim(callerCG, "/"), "/")
+	if len(parts) < 2 {
+		return "", 0, fmt.Errorf("not an agent scope: cgroup leaf %q", callerCG)
+	}
+	leaf := parts[len(parts)-1]
+	allowed := false
+	clPID := 0
+	if _, pid, ok := ScopeName(leaf); ok && parts[len(parts)-2] == "agents.slice" {
+		allowed, clPID = true, pid
+	} else if strings.HasPrefix(leaf, "run-") && strings.HasSuffix(leaf, ".scope") && len(leaf) > len("run-.scope") && parts[len(parts)-2] == "app.slice" {
+		allowed = true
+	} else if strings.HasPrefix(leaf, "worker-") && len(leaf) > len("worker-.scope") && (strings.HasSuffix(leaf, ".scope") || strings.HasSuffix(leaf, ".service")) && hasUserManager(parts[:len(parts)-1], uid) {
+		allowed = true
+	}
+	if !allowed {
+		return "", 0, fmt.Errorf("not an agent scope: cgroup leaf %q", leaf)
+	}
+	return callerCG, clPID, nil
+}
+
+func hasUserManager(parts []string, uid int) bool {
+	for _, part := range parts {
+		uidText, ok := strings.CutPrefix(part, "user@")
+		if !ok {
+			continue
+		}
+		uidText, ok = strings.CutSuffix(uidText, ".service")
+		if !ok || uidText == "" {
+			continue
+		}
+		if managerUID, err := strconv.Atoi(uidText); err == nil && managerUID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func validateOwnUnitTarget(root string, self, pid int, cg string, clPID, uid int) error {
+	if pid <= 1 || pid == self {
+		return fmt.Errorf("refusing caller or invalid PID %d", pid)
+	}
+	targetCG, err := readProcessCgroup(root, pid)
+	if err != nil {
+		return fmt.Errorf("read target cgroup: %w", err)
+	}
+	if targetCG != cg {
+		return fmt.Errorf("%w: different cgroup: target %q, caller %q", errOwnUnitIneligible, targetCG, cg)
+	}
+	if clPID != 0 && pid == clPID {
+		return fmt.Errorf("%w: refusing scope launcher PID %d", errOwnUnitIneligible, pid)
+	}
+	for ancestor := self; ancestor > 1; {
+		if ancestor == pid {
+			return fmt.Errorf("%w: refusing ancestor PID %d", errOwnUnitIneligible, pid)
+		}
+		st, statErr := ReadStat(root, ancestor)
+		if statErr != nil {
+			return fmt.Errorf("read PID %d ancestry: %w", ancestor, statErr)
+		}
+		ancestor = st.Ppid
+	}
+	targetUID, targetTGID, err := processStatus(root, pid)
+	if err != nil {
+		return err
+	}
+	if targetTGID != pid {
+		return fmt.Errorf("%w: PID %d is a thread ID (TID), not a process ID", errOwnUnitIneligible, pid)
+	}
+	if targetUID != uid {
+		return fmt.Errorf("%w: different uid: target %d, caller %d", errOwnUnitIneligible, targetUID, uid)
+	}
+	return nil
+}
+
+func processStatus(root string, pid int) (uid, tgid int, err error) {
+	data, err := os.ReadFile(filepath.Join(root, strconv.Itoa(pid), "status"))
+	if err != nil {
+		return 0, 0, fmt.Errorf("read PID %d status: %w", pid, err)
+	}
+	gotUID, gotTGID := false, false
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "Uid:"); ok {
+			fields := strings.Fields(value)
+			if len(fields) != 0 {
+				uid, err = strconv.Atoi(fields[0])
+				gotUID = err == nil
+			}
+		}
+		if value, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			fields := strings.Fields(value)
+			if len(fields) != 0 {
+				tgid, err = strconv.Atoi(fields[0])
+				gotTGID = err == nil
+			}
+		}
+	}
+	if !gotUID || !gotTGID {
+		return 0, 0, fmt.Errorf("read PID %d status: no valid Uid or Tgid", pid)
+	}
+	return uid, tgid, nil
+}
+
+func ownUnitDescendantPIDs(root, cgRoot string, self, target int, cg string, clPID, uid int) ([]int, error) {
+	procs, err := os.ReadFile(filepath.Join(cgRoot, strings.TrimPrefix(cg, "/"), "cgroup.procs"))
+	if err != nil {
+		return nil, fmt.Errorf("read own cgroup.procs: %w", err)
+	}
+	var pids []int
+	for value := range strings.FieldsSeq(string(procs)) {
+		pid, parseErr := strconv.Atoi(value)
+		if parseErr != nil || pid <= 1 || pid == self || clPID != 0 && pid == clPID {
+			continue
+		}
+		if err := validateOwnUnitTarget(root, self, pid, cg, clPID, uid); err != nil {
+			if errors.Is(err, errOwnUnitIneligible) || Gone(err) {
+				continue
+			}
+			return nil, fmt.Errorf("verify own-unit cgroup member PID %d: %w", pid, err)
+		}
+		if _, err := processAncestry(root, pid, target); err != nil {
+			if errors.Is(err, errNotDescendant) || Gone(err) || errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrProcessDone) {
+				continue
+			}
+			return nil, fmt.Errorf("verify own-unit descendant PID %d ancestry: %w", pid, err)
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
+}
+
+func ownUnitDescendantTarget(root string, self, target, pid int, cg string, clPID, uid int) (*trackedOwnedProcess, error) {
+	if err := validateOwnUnitTarget(root, self, pid, cg, clPID, uid); err != nil {
+		return nil, err
+	}
+	if pid == target {
+		if err := ownUnitTargetHasManagerParent(root, pid); err != nil {
+			return nil, err
+		}
+	}
+	before, err := processAncestry(root, pid, target)
+	if err != nil {
+		return nil, err
+	}
+	stat, err := ReadStat(root, pid)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := openProcessPidfd(pid, 0)
+	if err != nil {
+		return nil, fmt.Errorf("pidfd_open PID %d: %w", pid, pidfdOpenError(err))
+	}
+	afterDescendantPidfdOpen(pid)
+	after, ancestryErr := processAncestry(root, pid, target)
+	afterOwnUnitAncestryRead(pid)
+	checked, statErr := ReadStat(root, pid)
+	validateErr := validateOwnUnitTarget(root, self, pid, cg, clPID, uid)
+	if pid == target && validateErr == nil {
+		validateErr = ownUnitTargetHasManagerParent(root, pid)
+	}
+	if ancestryErr != nil || !sameProcessChain(before, after) || statErr != nil || checked.Start != stat.Start || validateErr != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("PID %d changed during validation: %w", pid, errors.Join(errStopTargetChanged, ancestryErr, statErr, validateErr))
+	}
+	return &trackedOwnedProcess{identity: processIdentity{pid: pid, start: stat.Start}, tracked: &trackedProcess{fd: fd, start: stat.Start}}, nil
+}
+
+func revalidateOwnUnitDescendant(root string, self, target, pid int, cg string, clPID, uid int, start string) error {
+	if err := validateOwnUnitTarget(root, self, pid, cg, clPID, uid); err != nil {
+		return errors.Join(errStopTargetChanged, err)
+	}
+	if pid == target {
+		if err := ownUnitTargetHasManagerParent(root, pid); err != nil {
+			return errors.Join(errStopTargetChanged, err)
+		}
+	}
+	stat, statErr := ReadStat(root, pid)
+	if statErr != nil || stat.Start != start {
+		return errors.Join(errStopTargetChanged, statErr)
+	}
+	return nil
+}
+
+func revalidateOwnUnitMember(root string, self, pid int, cg string, clPID, uid int, start string) error {
+	if err := validateOwnUnitTarget(root, self, pid, cg, clPID, uid); err != nil {
+		return errors.Join(errStopTargetChanged, err)
+	}
+	stat, err := ReadStat(root, pid)
+	if err != nil || stat.Start != start {
+		return errors.Join(errStopTargetChanged, err)
+	}
+	return nil
+}
+
+func ownUnitTargetHasManagerParent(root string, pid int) error {
+	target, err := ReadStat(root, pid)
+	if err != nil {
+		return fmt.Errorf("read target PID %d parent: %w", pid, err)
+	}
+	parent, err := ReadStat(root, target.Ppid)
+	if err != nil || !serviceManager(target.Ppid, parent) {
+		return fmt.Errorf("%w: target PID %d parent %d is not a process manager", errOwnUnitIneligible, pid, target.Ppid)
+	}
+	return nil
 }
 
 // StopSession signals verified members of rec's detached session and then
@@ -162,10 +419,13 @@ func SignalDescendant(pid int, sig syscall.Signal) error {
 }
 
 type ownedStopOps struct {
-	scan   func() ([]int, error)
-	open   func(int) (*trackedOwnedProcess, error)
-	verify func(int, string) error
-	guard  func() error
+	scan                 func() ([]int, error)
+	open                 func(int) (*trackedOwnedProcess, error)
+	verify               func(int, string) error
+	killVerify           func(int, string) error
+	finishPinnedOnly     bool
+	checkAliveBeforeKill bool
+	guard                func() error
 }
 
 // ownedStopState — how the stop loop ended: still able to finish normally, or
@@ -207,7 +467,11 @@ func stopOwnedProcesses(grace time.Duration, sig syscall.Signal, ops ownedStopOp
 	if sig != syscall.SIGKILL {
 		switch state {
 		case ownedStopRunning:
-			finishOwnedStop(sig, ops, tracked, &failures, &result)
+			if ops.finishPinnedOnly {
+				finishPinnedOwnedStop(sig, ops, tracked, &failures, &result)
+			} else {
+				finishOwnedStop(sig, ops, tracked, &failures, &result)
+			}
 		case ownedStopLeaderGone:
 			waitOwnedStopGrace(deadline, tracked, &failures)
 			finishPinnedOwnedStop(sig, ops, tracked, &failures, &result)
@@ -239,12 +503,28 @@ func requestOwnedBatches(sig syscall.Signal, deadline time.Time, ops ownedStopOp
 			discardNewOwnedProcesses(tracked, previous)
 			return state
 		}
-		requestOwnedCandidates(batch, sig, failures, result)
+		requestOwnedCandidates(batch, ops, sig, failures, result)
 		if sig == syscall.SIGKILL || !time.Now().Before(deadline) {
+			return ownedStopRunning
+		}
+		if !ownedProcessesAlive(tracked, failures) {
 			return ownedStopRunning
 		}
 		time.Sleep(min(5*time.Millisecond, time.Until(deadline)))
 	}
+}
+
+func ownedProcessesAlive(tracked map[processIdentity]*trackedOwnedProcess, failures *stopFailures) bool {
+	alive := false
+	for _, entry := range tracked {
+		running, err := processAlive(entry.tracked)
+		if err != nil {
+			recordOwnedFailure(failures, entry.identity.pid, err)
+			running = true
+		}
+		alive = alive || running
+	}
+	return alive
 }
 
 // ownedScanFailure: pidfd unavailability aborts the finish (no reliable
@@ -351,9 +631,15 @@ func prepareOwnedCandidates(pids []int, ops ownedStopOps, tracked map[processIde
 	return batch, nil
 }
 
-func requestOwnedCandidates(batch []*trackedOwnedProcess, sig syscall.Signal, failures *stopFailures, result *StopResult) {
+func requestOwnedCandidates(batch []*trackedOwnedProcess, ops ownedStopOps, sig syscall.Signal, failures *stopFailures, result *StopResult) {
 	for _, entry := range batch {
 		pid := entry.identity.pid
+		if ops.verify != nil {
+			if err := ops.verify(pid, entry.identity.start); err != nil {
+				recordOwnedFailure(failures, pid, err)
+				continue
+			}
+		}
 		if err := signalProcess(pid, entry.tracked, unix.Signal(sig)); err != nil {
 			recordOwnedFailure(failures, pid, err)
 			continue
@@ -373,13 +659,25 @@ func killOwnedCandidates(batch []*trackedOwnedProcess, sig syscall.Signal, ops o
 	killed := 0
 	for _, entry := range batch {
 		pid := entry.identity.pid
+		if ops.checkAliveBeforeKill {
+			alive, err := processAlive(entry.tracked)
+			if err != nil {
+				recordOwnedFailure(failures, pid, err)
+			} else if !alive {
+				continue
+			}
+		}
 		if !entry.requested {
 			if requestOwnedProcess(pid, sig, entry, failures) != nil {
 				continue
 			}
 			result.Signaled++
 		}
-		if err := ops.verify(pid, entry.identity.start); err != nil {
+		verify := ops.killVerify
+		if verify == nil {
+			verify = ops.verify
+		}
+		if err := verify(pid, entry.identity.start); err != nil {
 			recordOwnedFailure(failures, pid, err)
 			continue
 		}

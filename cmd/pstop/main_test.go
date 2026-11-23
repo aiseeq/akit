@@ -1,11 +1,36 @@
 package main
 
 import (
+	"bytes"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/aiseeq/akit/proc"
 	"golang.org/x/sys/unix"
 )
+
+func TestRunOwnUnitFlagRoutesToOwnUnitAction(t *testing.T) {
+	oldOwn, oldShell := stopOwnUnitAction, stopFromShellAction
+	defer func() { stopOwnUnitAction, stopFromShellAction = oldOwn, oldShell }()
+	calls := 0
+	stopOwnUnitAction = func(pid int, grace time.Duration, sig syscall.Signal) (proc.StopResult, error) {
+		calls++
+		if pid != 77 || grace != 1500*time.Millisecond || sig != syscall.SIGKILL {
+			t.Fatalf("own-unit args = (%d, %s, %s)", pid, grace, unix.SignalName(unix.Signal(sig)))
+		}
+		return proc.StopResult{AlreadyExited: true}, nil
+	}
+	stopFromShellAction = func(int, time.Duration, unix.Signal) (proc.StopResult, error) {
+		t.Fatal("--own-unit routed through StopFromShell")
+		return proc.StopResult{}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--own-unit", "--grace", "1500ms", "--signal", "KILL", "77"}, &stdout, &stderr)
+	if code != 0 || calls != 1 || stdout.String() != "pstop: 77 already exited\n" || stderr.Len() != 0 {
+		t.Fatalf("run = code %d, calls %d, stdout %q, stderr %q", code, calls, stdout.String(), stderr.String())
+	}
+}
 
 func TestParseSignal(t *testing.T) {
 	for _, tc := range []struct {

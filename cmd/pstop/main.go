@@ -4,6 +4,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -13,7 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const usage = `Usage: pstop [--grace D] [--signal S] PID
+const usage = `Usage: pstop [--own-unit] [--grace D] [--signal S] PID
 
 Stop a descendant of pstop itself or of the consecutive shells directly above
 it (bash, sh, dash, zsh, ksh, mksh; told by the program they run, so scripts
@@ -35,49 +36,70 @@ strict tree containment. pidfd support is required.
 
 Grace defaults to 2s, accepts 0 through 24h; signal defaults to TERM.
 A zombie is reported as already exited; a reaped PID is an error.
+
+--own-unit is for a reparented background process in your own unit after its
+parent process exited. Accepted cgroup leaves are agents.slice/agent-*.scope,
+app.slice/run-*.scope, and worker-* scope/service under your user@<uid>.service.
+It is a convenience guard, not a security boundary.
 `
 
-func main() {
+var stopFromShellAction = proc.StopFromShell
+var stopOwnUnitAction = proc.StopOwnUnit
+
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+
+func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pstop", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(fs.Output(), usage) }
 	grace := fs.Duration("grace", 2*time.Second, "grace period")
 	sigName := fs.String("signal", "TERM", "signal name or number")
-	if err := fs.Parse(os.Args[1:]); err == flag.ErrHelp {
-		os.Exit(0)
+	ownUnit := fs.Bool("own-unit", false, "stop a process in this caller's agent scope")
+	if err := fs.Parse(args); err == flag.ErrHelp {
+		return 0
 	} else if err != nil {
-		fail(err)
+		fmt.Fprintln(stderr, "pstop:", err)
+		return 1
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		os.Exit(2)
+		return 2
 	}
 	pid, err := strconv.Atoi(fs.Arg(0))
 	if err != nil {
-		fail(err)
+		fmt.Fprintln(stderr, "pstop:", err)
+		return 1
 	}
 	sig, err := parseSignal(*sigName)
 	if err != nil {
-		fail(err)
+		fmt.Fprintln(stderr, "pstop:", err)
+		return 1
 	}
 	started := time.Now()
-	result, err := proc.StopFromShell(pid, *grace, sig)
+	var result proc.StopResult
+	if *ownUnit {
+		result, err = stopOwnUnitAction(pid, *grace, sig)
+	} else {
+		result, err = stopFromShellAction(pid, *grace, sig)
+	}
 	if result.Degraded {
-		fmt.Fprintln(os.Stderr, "pstop: degraded stop; descendants may remain")
+		fmt.Fprintln(stderr, "pstop: degraded stop; descendants may remain")
 	}
 	if err != nil {
 		if result.Killed > 0 {
-			fmt.Println(killedLine(pid, result.Killed, *grace))
+			fmt.Fprintln(stdout, killedLine(pid, result.Killed, *grace))
 		}
-		fail(err)
+		fmt.Fprintln(stderr, "pstop:", err)
+		return 1
 	}
 	if result.AlreadyExited {
-		fmt.Printf("pstop: %d already exited\n", pid)
+		fmt.Fprintf(stdout, "pstop: %d already exited\n", pid)
 	} else if result.Killed > 0 {
-		fmt.Println(killedLine(pid, result.Killed, *grace))
+		fmt.Fprintln(stdout, killedLine(pid, result.Killed, *grace))
 	} else {
-		fmt.Printf("pstop: %d exited after %s in %s\n", pid, unix.SignalName(sig), time.Since(started).Round(time.Millisecond))
+		fmt.Fprintf(stdout, "pstop: %d exited after %s in %s\n", pid, unix.SignalName(sig), time.Since(started).Round(time.Millisecond))
 	}
+	return 0
 }
 
 func killedLine(pid, killed int, grace time.Duration) string {
@@ -87,8 +109,6 @@ func killedLine(pid, killed int, grace time.Duration) string {
 	}
 	return fmt.Sprintf("pstop: %d killed %d %s after %s grace", pid, killed, noun, grace)
 }
-
-func fail(err error) { fmt.Fprintln(os.Stderr, "pstop:", err); os.Exit(1) }
 
 func parseSignal(s string) (unix.Signal, error) {
 	s = strings.TrimPrefix(strings.ToUpper(s), "SIG")
