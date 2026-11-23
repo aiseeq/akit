@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func write(t *testing.T, path, text string) {
@@ -21,6 +22,7 @@ func write(t *testing.T, path, text string) {
 
 func runPrior(t *testing.T, home string, words ...string) string {
 	t.Helper()
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
 	q, err := newQuery(words)
 	if err != nil {
 		t.Fatal(err)
@@ -400,6 +402,316 @@ func TestLineWithTimestampDoesNotMatchAcrossLines(t *testing.T) {
 	needle := []byte(`"timestamp":"2026-01-05T00:00:00.000Z"`)
 	if n, err := lineWith(path, needle); err != nil || n != 2 {
 		t.Fatalf("split lookup: line %d, err %v; want line 2", n, err)
+	}
+}
+
+func TestTranscriptIndexMultipleReferencesAndAppend(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "append.jsonl")
+	write(t, path, `{"timestamp":"2026-01-01T00:00:00.000Z"}`+"\n"+`{"type":"assistant"}`+"\n")
+	first := `"timestamp":"2026-01-01T00:00:00.000Z"`
+	second := `"timestamp":"2026-01-02T00:00:00.000Z"`
+	got, err := transcriptTimestampLines(path, map[string]struct{}{first: {}})
+	if err != nil || got[first] != 1 {
+		t.Fatalf("initial index = %v, %v", got, err)
+	}
+	firstInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexed, ok, err := loadTranscriptLines(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || indexed.ScannedBytes != firstInfo.Size() || indexed.LineCount != 2 {
+		t.Fatalf("timestamp index did not cover the file: cache=%+v size=%d", indexed, firstInfo.Size())
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"timestamp":"2026-01-02T00:00:00.000Z"}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	needles := map[string]struct{}{first: {}, second: {}}
+	got, err = transcriptTimestampLines(path, needles)
+	if err != nil || got[second] != 3 || got[first] != 1 {
+		t.Fatalf("appended index = %v, %v; want lines 3 and 1", got, err)
+	}
+	cachePath := transcriptLinesCachePath(path)
+	if err := os.WriteFile(cachePath, []byte("not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = transcriptTimestampLines(path, needles)
+	if err != nil || got[second] != 3 || got[first] != 1 {
+		t.Fatalf("rebuilt index = %v, %v; want lines 3 and 1", got, err)
+	}
+}
+
+func TestTranscriptIndexResumesAtUnterminatedLine(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "partial.jsonl")
+	first := `"timestamp":"2026-01-01T00:00:00.000Z"`
+	second := `"timestamp":"2026-01-02T00:00:00.000Z"`
+	third := `"timestamp":"2026-01-03T00:00:00.000Z"`
+	write(t, path, "{"+first+"}\n{"+second+"}")
+	got, err := transcriptTimestampLines(path, map[string]struct{}{first: {}, second: {}})
+	if err != nil || got[first] != 1 || got[second] != 2 {
+		t.Fatalf("partial index = %v, %v; want lines 1 and 2", got, err)
+	}
+	cache, ok, err := loadTranscriptLines(path)
+	if err != nil || !ok || cache.ScannedBytes != int64(len("{"+first+"}\n")) || cache.LineCount != 1 {
+		t.Fatalf("partial line cache = %+v, %v; want only the complete first line", cache, err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\n{" + third + "}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = transcriptTimestampLines(path, map[string]struct{}{first: {}, second: {}, third: {}})
+	if err != nil || got[first] != 1 || got[second] != 2 || got[third] != 3 {
+		t.Fatalf("resumed index = %v, %v; want lines 1, 2, and 3", got, err)
+	}
+}
+
+func TestTranscriptCachePersistsAppendDuringScan(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "growing.jsonl")
+	first := "{\"timestamp\":\"2026-01-01T00:00:00.000Z\"}\n"
+	second := "{\"timestamp\":\"2026-01-02T00:00:00.000Z\"}\n"
+	third := "{\"timestamp\":\"2026-01-03T00:00:00.000Z\"}\n"
+	write(t, path, first)
+	secondNeedle := `"timestamp":"2026-01-02T00:00:00.000Z"`
+	appended := false
+	var offsets []int64
+	transcriptScanAfterLineHook = func(gotPath string, offset int64) {
+		if gotPath != path {
+			return
+		}
+		offsets = append(offsets, offset)
+		if appended {
+			return
+		}
+		appended = true
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(second); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { transcriptScanAfterLineHook = nil })
+	got, err := transcriptTimestampLines(path, map[string]struct{}{secondNeedle: {}})
+	if err != nil || got[secondNeedle] != 2 || !appended || len(offsets) != 2 ||
+		offsets[0] != int64(len(first)) || offsets[1] != int64(len(first+second)) {
+		t.Fatalf("scan during append = %v, %v, appended=%v, offsets=%v; want one pass through line 2", got, err, appended, offsets)
+	}
+	cache, ok, err := loadTranscriptLines(path)
+	if err != nil || !ok || cache.ScannedBytes != int64(len(first+second)) || cache.Size != int64(len(first+second)) {
+		t.Fatalf("saved growing cache = %+v, %v; want complete appended prefix", cache, err)
+	}
+	start := cache.ScannedBytes
+	if err := os.WriteFile(path, []byte(first+second+third), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var bytesScanned int64
+	transcriptScanAfterLineHook = func(gotPath string, offset int64) {
+		if gotPath == path {
+			bytesScanned += offset - start
+			start = offset
+		}
+	}
+	thirdNeedle := `"timestamp":"2026-01-03T00:00:00.000Z"`
+	got, err = transcriptTimestampLines(path, map[string]struct{}{thirdNeedle: {}})
+	transcriptScanAfterLineHook = nil
+	if err != nil || got[thirdNeedle] != 3 || bytesScanned != int64(len(third)) {
+		t.Fatalf("tail scan = %v, %v, bytes=%d; want line 3 and %d bytes", got, err, bytesScanned, len(third))
+	}
+}
+
+func TestTranscriptCachePrefixInvalidation(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "replace.jsonl")
+	oldLine := "{\"timestamp\":\"2026-01-01T00:00:00.000Z\"}\n"
+	newLine := "{\"timestamp\":\"2026-01-02T00:00:00.000Z\"}\n"
+	write(t, path, oldLine)
+	oldNeedle := `"timestamp":"2026-01-01T00:00:00.000Z"`
+	newNeedle := `"timestamp":"2026-01-02T00:00:00.000Z"`
+	got, err := transcriptTimestampLines(path, map[string]struct{}{oldNeedle: {}})
+	if err != nil || got[oldNeedle] != 1 {
+		t.Fatalf("initial cache = %v, %v; want line 1", got, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(oldLine) != len(newLine) {
+		t.Fatal("test replacement must preserve file size")
+	}
+	if err := os.WriteFile(path, []byte(newLine), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	var scanned int64
+	transcriptScanAfterLineHook = func(gotPath string, offset int64) {
+		if gotPath == path {
+			scanned = offset
+		}
+	}
+	got, err = transcriptTimestampLines(path, map[string]struct{}{newNeedle: {}})
+	transcriptScanAfterLineHook = nil
+	if err != nil || got[newNeedle] != 1 || scanned != int64(len(newLine)) {
+		t.Fatalf("same-size prefix replacement = %v, %v, scanned=%d; want rebuild of %d bytes", got, err, scanned, len(newLine))
+	}
+	changedTime := info.ModTime().Add(2 * time.Second)
+	if err := os.WriteFile(path, []byte(oldLine), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, changedTime, changedTime); err != nil {
+		t.Fatal(err)
+	}
+	scanned = 0
+	transcriptScanAfterLineHook = func(gotPath string, offset int64) {
+		if gotPath == path {
+			scanned = offset
+		}
+	}
+	got, err = transcriptTimestampLines(path, map[string]struct{}{oldNeedle: {}})
+	transcriptScanAfterLineHook = nil
+	if err != nil || got[oldNeedle] != 1 || scanned != int64(len(oldLine)) {
+		t.Fatalf("same-size mtime invalidation = %v, %v, scanned=%d; want line 1 and full rebuild", got, err, scanned)
+	}
+}
+
+func TestTranscriptIndexScansPastRequestedLine(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "1234abcd-0000-0000-0000-000000000001.jsonl")
+	write(t, path, `{"timestamp":"2026-01-01T00:00:00.000Z"}`+"\n"+`{"timestamp":"2026-01-02T00:00:00.000Z"}`+"\n")
+	if _, err := transcriptTimestampLines(path, map[string]struct{}{`"timestamp":"2026-01-01T00:00:00.000Z"`: {}}); err != nil {
+		t.Fatal(err)
+	}
+	cache, ok, err := loadTranscriptLines(path)
+	if err != nil || !ok || cache.Lines[`"timestamp":"2026-01-01T00:00:00.000Z"`] != 1 ||
+		cache.Lines[`"timestamp":"2026-01-02T00:00:00.000Z"`] != 2 {
+		t.Fatalf("prewarmed lines = %+v, loaded=%v err=%v", cache.Lines, ok, err)
+	}
+}
+
+func TestReplyPrewarmCacheSkipsAndIndexesAppendedHeaders(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	root := t.TempDir()
+	repliesPath := filepath.Join(root, "user-replies.md")
+	transcript := filepath.Join(root, "1234abcd-0000-0000-0000-000000000001.jsonl")
+	firstHeader := "### 2026-01-01T00:00:00Z (01.01 00:00 UTC) · claude 1234abcd-0000-0000-0000-000000000001\n"
+	secondHeader := "### 2026-01-02T00:00:00Z (02.01 00:00 UTC) · claude 1234abcd-0000-0000-0000-000000000001\n"
+	firstLine := `{"timestamp":"2026-01-01T00:00:00.000Z"}` + "\n"
+	secondLine := `{"timestamp":"2026-01-02T00:00:00.000Z"}` + "\n"
+	write(t, repliesPath, firstHeader)
+	write(t, transcript, firstLine)
+	index := transcriptIndex{"1234abcd": {transcript}}
+	prewarmReplyTranscripts(repliesPath, firstHeader, index)
+
+	var scanned int
+	transcriptScanAfterLineHook = func(path string, _ int64) {
+		if path == transcript {
+			scanned++
+		}
+	}
+	prewarmReplyTranscripts(repliesPath, firstHeader, index)
+	transcriptScanAfterLineHook = nil
+	if scanned != 0 {
+		t.Fatalf("unchanged reply journal rescanned %d transcript lines", scanned)
+	}
+
+	f, err := os.OpenFile(repliesPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(secondHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err = os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(secondLine); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	prewarmReplyTranscripts(repliesPath, firstHeader+secondHeader, index)
+	cache, ok, err := loadTranscriptLines(transcript)
+	if err != nil || !ok || cache.Lines[`"timestamp":"2026-01-02T00:00:00.000Z"`] != 2 {
+		t.Fatalf("appended reply index = %+v, loaded=%v err=%v", cache.Lines, ok, err)
+	}
+}
+
+func TestCachedRepliesAppendAndInvalidation(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "user-replies.md")
+	initial := "first reply\n"
+	write(t, path, initial)
+	got, err := readCachedReplies(path)
+	if err != nil || string(got) != initial {
+		t.Fatalf("initial cache read = %q, %v", got, err)
+	}
+	appendix := "second reply\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(appendix); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := initial + appendix
+	got, err = readCachedReplies(path)
+	if err != nil || string(got) != want {
+		t.Fatalf("appended cache read = %q, %v; want %q", got, err, want)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := strings.Repeat("x", len(want)-1) + "\n"
+	if err := os.WriteFile(path, []byte(replacement), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mtime := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	got, err = readCachedReplies(path)
+	if err != nil || string(got) != replacement {
+		t.Fatalf("same-size changed cache read = %q, %v; want %q", got, err, replacement)
+	}
+	cachePath := replyCachePath(path)
+	if err := os.WriteFile(cachePath, []byte("broken cache"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = readCachedReplies(path)
+	if err != nil || string(got) != replacement {
+		t.Fatalf("broken cache rebuild = %q, %v; want %q", got, err, replacement)
 	}
 }
 

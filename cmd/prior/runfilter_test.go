@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFoldRuneFastMatchesBMP(t *testing.T) {
@@ -14,6 +16,123 @@ func TestFoldRuneFastMatchesBMP(t *testing.T) {
 		if got, want := foldRuneFast(r), foldRune(r); got != want {
 			t.Fatalf("foldRuneFast(%U) = %U, want %U", r, got, want)
 		}
+	}
+}
+
+func TestRunCacheInvalidation(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	q, err := newQuery([]string{"needle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	day := filepath.Join(dir, "2026-01-01")
+	if err := os.Mkdir(day, 0700); err != nil {
+		t.Fatal(err)
+	}
+	one := filepath.Join(day, "one.md")
+	writeRun := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeRun(one, "needle first\n")
+	assertSame := func(query query) {
+		t.Helper()
+		files, errs := runMarkdownFiles(dir)
+		if len(errs) != 0 {
+			t.Fatal(errs)
+		}
+		cached := matchRunFilesCached(query, files)
+		uncached := matchRunFiles(query, files, query.runs)
+		if !reflect.DeepEqual(cached, uncached) {
+			t.Fatalf("cached results %+v differ from uncached %+v", cached, uncached)
+		}
+	}
+	assertSame(q) // create a valid cache
+	otherQuery, err := newQuery([]string{"first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSame(otherQuery) // queries share a content index
+
+	// A size change invalidates the entry even if the old match line remains.
+	writeRun(one, "needle changed and grew\n")
+	assertSame(q)
+
+	// Same-size edits are caught by mtime.
+	info, err := os.Stat(one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRun(one, strings.Repeat("x", len("needle changed and grew\n")-1)+"\n")
+	if err := os.Chtimes(one, info.ModTime().Add(2*time.Second), info.ModTime().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertSame(q)
+
+	// New and removed reports update the inventory on the next call.
+	two := filepath.Join(day, "two.md")
+	writeRun(two, "needle added\n")
+	assertSame(q)
+	if err := os.Remove(one); err != nil {
+		t.Fatal(err)
+	}
+	assertSame(q)
+
+	// Unreadable cache data is a miss and is replaced by a valid cache.
+	cachePath := runEntryPath(two)
+	if err := os.WriteFile(cachePath, []byte("not a gob"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	assertSame(q)
+	file, err := os.Open(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := make([]byte, runHeaderBytes)
+	if _, err := file.Read(header); err != nil || !bytes.Equal(header[:4], runCacheMagic[:]) {
+		_ = file.Close()
+		t.Fatalf("cache was not rebuilt: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunBloomDoesNotRejectMatches(t *testing.T) {
+	for _, tc := range []struct{ pattern, text string }{
+		{"needle", "before\nNEEDLE on this line\nafter"},
+		{"Kelvin", "the kelvin sign KELVIN is here"},
+		{"σίσυφος", "ΣΊΣΥΦΟΣ"},
+		{"foo|bar", "unrelated\nBAR appears"},
+		{"a\\s+b", "a\nb\nA B"},
+		{"x{0,2}y", "Y"},
+	} {
+		q, err := newQuery([]string{tc.pattern})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !q.any.MatchString(tc.text) {
+			continue
+		}
+		if !runFilterMayMatchBloom(q.runs, runTextBloom([]byte(tc.text))) {
+			t.Errorf("bloom rejected %q for pattern %q", tc.text, tc.pattern)
+		}
+	}
+}
+
+func TestFirstMatchStreamMatchesDataSearch(t *testing.T) {
+	data := strings.Repeat("x", 5000) + "needle on a long line\nsecond needle\nlast"
+	q, err := newQuery([]string{"needle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := firstMatchDataFiltered(q, []byte(data), q.runs)
+	got, err := firstMatchStream(q, bytes.NewReader([]byte(data)), q.runs)
+	if err != nil || got != want {
+		t.Fatalf("streamed match = %q, %v; want %q", got, err, want)
 	}
 }
 

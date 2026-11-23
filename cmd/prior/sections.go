@@ -210,7 +210,7 @@ func runs(w io.Writer, q query, dir string) {
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(files)))
 
-	results := matchRunFiles(q, files, q.runs)
+	results := matchRunFilesCached(q, files)
 	var matches []runMatch
 	for i, f := range files {
 		line, err := results[i].line, results[i].err
@@ -367,6 +367,10 @@ func firstMatchFiltered(q query, path string, filter []runNeedle) (string, error
 	if err != nil {
 		return "", fmt.Errorf("отчёт не прочитался: %w", err)
 	}
+	return firstMatchDataFiltered(q, data, filter), nil
+}
+
+func firstMatchDataFiltered(q query, data []byte, filter []runNeedle) string {
 	if filter == nil {
 		filter = q.runs
 	}
@@ -376,31 +380,54 @@ func firstMatchFiltered(q query, path string, filter []runNeedle) (string, error
 			end = len(data) - at
 		}
 		line := data[at : at+end]
-		// The cheap literal filter rejects most lines before the regexp processes its alternatives.
-		if len(filter) > 0 && !runMayMatchASCII(string(line), filter) {
-			if at+end == len(data) {
-				break
-			}
-			at += end + 1
-			continue
-		}
-		folded := foldText(string(line))
-		if (len(filter) == 0 || runMayMatch(folded, filter)) && q.any.Match(line) {
-			return string(line), nil
+		if firstMatchLine(q, line, filter) {
+			return string(line)
 		}
 		if at+end == len(data) {
 			break
 		}
 		at += end + 1
 	}
-	return "", nil
+	return ""
+}
+
+func firstMatchLine(q query, line []byte, filter []runNeedle) bool {
+	// The cheap literal filter rejects most lines before the regexp processes its alternatives.
+	if len(filter) > 0 && !runMayMatchASCII(string(line), filter) {
+		return false
+	}
+	folded := foldText(string(line))
+	return (len(filter) == 0 || runMayMatch(folded, filter)) && q.any.Match(line)
+}
+
+func firstMatchStream(q query, source io.Reader, filter []runNeedle) (string, error) {
+	reader := bufio.NewReaderSize(source, 4096)
+	line := make([]byte, 0, 4096)
+	for {
+		part, err := reader.ReadSlice('\n')
+		line = append(line, part...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		content := bytes.TrimSuffix(line, []byte{'\n'})
+		if firstMatchLine(q, content, filter) {
+			return string(content), nil
+		}
+		if err == io.EOF {
+			return "", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("отчёт не распаковался: %w", err)
+		}
+		line = line[:0]
+	}
 }
 
 // maxReplies — сколько совпавших реплик показывать.
 const maxReplies = 8
 
 // replyHeader — заголовок блока журнала реплик: время UTC и сессия claude, по ним находится строка транскрипта.
-var replyHeader = regexp.MustCompile(`^### (\S+Z) .* · claude ([0-9a-f]{8})[0-9a-f-]*$`)
+var replyHeader = regexp.MustCompile(`(?m)^### (\S+Z) .* · claude ([0-9a-f]{8})[0-9a-f-]*$`)
 
 // replyHit — блок журнала реплик с совпадением: фраза агента «в ответ на», совпавшие строки пользователя (или первая
 // строка ответа, если совпала только фраза агента) и сколько разных слов темы нашлось во всём блоке.
@@ -465,11 +492,13 @@ func replies(w io.Writer, q query, s paths) {
 	if err := exec.Command(s.daydigest, "-log", s.replies).Run(); err != nil {
 		fmt.Fprintf(w, "(daydigest не дописал журнал - он может отставать: %v)\n", err)
 	}
-	data, err := os.ReadFile(s.replies)
+	data, err := readCachedReplies(s.replies)
 	if err != nil {
 		fmt.Fprintf(w, "(нет журнала: %v)\n", err)
 		return
 	}
+	transcripts := indexTranscripts(s.projects)
+	prewarmReplyTranscripts(s.replies, string(data), transcripts)
 	hits := replyBlocks(string(data), q)
 	if len(hits) == 0 {
 		fmt.Fprintln(w, "(нет)")
@@ -479,12 +508,45 @@ func replies(w io.Writer, q query, s paths) {
 		fmt.Fprintf(w, "(совпадений %d, ниже %d с наибольшим числом слов темы в блоке (вопрос агента и ответ), при равенстве - свежие: нужного нет - сузьте слова)\n", len(hits), maxReplies)
 		hits = topReplies(hits)
 	}
-	var transcripts transcriptIndex
+	refs := make(map[string]string)
+	needlesByPath := make(map[string]map[string]struct{})
 	for _, h := range hits {
-		if replyHeader.MatchString(h.head) && transcripts == nil {
-			transcripts = indexTranscripts(s.projects)
+		m := replyHeader.FindStringSubmatch(h.head)
+		if m == nil {
+			continue
 		}
-		ref, err := replyRef(h.head, transcripts)
+		files := transcripts[m[2]]
+		if len(files) != 1 {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, m[1])
+		if err != nil {
+			logCacheError(err)
+			continue
+		}
+		stamp := at.UTC().Format("2006-01-02T15:04:05.000Z")
+		needle := `"timestamp":"` + stamp + `"`
+		if needlesByPath[files[0]] == nil {
+			needlesByPath[files[0]] = make(map[string]struct{})
+		}
+		needlesByPath[files[0]][needle] = struct{}{}
+		refs[h.head] = needle
+	}
+	lineIndexes := make(map[string]map[string]int, len(needlesByPath))
+	lineErrors := make(map[string]error, len(needlesByPath))
+	for path, needles := range needlesByPath {
+		allLines, err := transcriptTimestampLines(path, needles)
+		if err != nil {
+			lineErrors[path] = err
+			continue
+		}
+		lineIndexes[path] = make(map[string]int, len(needles))
+		for needle := range needles {
+			lineIndexes[path][needle] = allLines[needle]
+		}
+	}
+	for _, h := range hits {
+		ref, err := replyRefFromLines(h.head, transcripts, refs, lineIndexes, lineErrors)
 		if err != nil {
 			ref = " · tl: " + err.Error()
 		}
@@ -521,6 +583,71 @@ func topReplies(hits []replyHit) []replyHit {
 	return top
 }
 
+func prewarmReplyTranscripts(repliesPath, data string, transcripts transcriptIndex) {
+	info, err := os.Stat(repliesPath)
+	if err != nil {
+		logCacheError(err)
+		return
+	}
+	start, completeEnd, skip := replyPrewarmRange(repliesPath, data, info)
+	if skip {
+		return
+	}
+	needlesByPath := replyTranscriptNeedles(data[start:completeEnd], transcripts)
+	for path, needles := range needlesByPath {
+		if _, err := transcriptTimestampLines(path, needles); err != nil {
+			logCacheError(err)
+		}
+	}
+	if endInfo, statErr := os.Stat(repliesPath); statErr == nil && endInfo.Size() == int64(len(data)) {
+		next := replyPrewarmCache{
+			Path: repliesPath, Size: endInfo.Size(), ModTime: endInfo.ModTime().UnixNano(), ScannedBytes: completeEnd,
+			PrefixTail: appendTranscriptPrefixTail(nil, []byte(data[:completeEnd])),
+		}
+		logCacheError(saveReplyPrewarmCache(next))
+	}
+}
+
+func replyPrewarmRange(path, data string, info os.FileInfo) (start, end int64, skip bool) {
+	cache, valid, err := loadReplyPrewarmCache()
+	logCacheError(err)
+	if valid && cache.Path == path && cache.Size == info.Size() && cache.ModTime == info.ModTime().UnixNano() &&
+		transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail) {
+		return 0, 0, true
+	}
+	if valid && cache.Path == path && cache.Size < info.Size() && cache.ScannedBytes <= int64(len(data)) &&
+		transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail) {
+		start = cache.ScannedBytes
+	}
+	end = int64(strings.LastIndexByte(data, '\n') + 1)
+	if start > end || end > int64(len(data)) {
+		start, end = 0, int64(len(data))
+	}
+	return start, end, false
+}
+
+func replyTranscriptNeedles(segment string, transcripts transcriptIndex) map[string]map[string]struct{} {
+	needlesByPath := make(map[string]map[string]struct{})
+	for _, match := range replyHeader.FindAllStringSubmatch(segment, -1) {
+		files := transcripts[match[2]]
+		if len(files) != 1 {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, match[1])
+		if err != nil {
+			logCacheError(err)
+			continue
+		}
+		stamp := at.UTC().Format("2006-01-02T15:04:05.000Z")
+		needle := `"timestamp":"` + stamp + `"`
+		if needlesByPath[files[0]] == nil {
+			needlesByPath[files[0]] = make(map[string]struct{})
+		}
+		needlesByPath[files[0]][needle] = struct{}{}
+	}
+	return needlesByPath
+}
+
 type transcriptIndex map[string][]string
 
 // indexTranscripts walks project directories once per prior call. The old per-reply glob reopened every
@@ -547,9 +674,7 @@ func indexTranscripts(projects string) transcriptIndex {
 	return index
 }
 
-// replyRef — ссылка tl на запись пользователя в транскрипте claude: журнал хранит время и сессию, номер строки
-// ищется по времени записи. Не нашлась - ошибка, её печатают вместо ссылки, а не молчат.
-func replyRef(head string, transcripts transcriptIndex) (string, error) {
+func replyRefFromLines(head string, transcripts transcriptIndex, needles map[string]string, indexes map[string]map[string]int, indexErrors map[string]error) (string, error) {
 	m := replyHeader.FindStringSubmatch(head)
 	if m == nil {
 		return "", nil
@@ -562,16 +687,19 @@ func replyRef(head string, transcripts transcriptIndex) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("время %s не разобралось: %w", m[1], err)
 	}
-	// Журнал печатает время без хвостовых нулей (.44Z), транскрипт claude — с миллисекундами тремя знаками (.440Z).
 	stamp := at.UTC().Format("2006-01-02T15:04:05.000Z")
-	n, err := lineWith(files[0], []byte(`"timestamp":"`+stamp+`"`))
-	if err != nil {
-		return "", err
-	}
-	if n == 0 {
+	needle := `"timestamp":"` + stamp + `"`
+	needle, ok := needles[head]
+	if !ok {
 		return "", fmt.Errorf("строки с %s в транскрипте нет", stamp)
 	}
-	return fmt.Sprintf(" · tl %s:%d", m[2], n), nil
+	if err := indexErrors[files[0]]; err != nil {
+		return "", err
+	}
+	if n := indexes[files[0]][needle]; n > 0 {
+		return fmt.Sprintf(" · tl %s:%d", m[2], n), nil
+	}
+	return "", fmt.Errorf("строки с %s в транскрипте нет", strings.TrimSuffix(strings.TrimPrefix(needle, `"timestamp":"`), `"`))
 }
 
 // lineWith — номер первой строки файла (с 1), где есть needle; 0 - нет такой. Читает потоком: строки транскрипта
@@ -582,11 +710,193 @@ func lineWith(path string, needle []byte) (int, error) {
 		return 0, fmt.Errorf("транскрипт не открылся: %w", err)
 	}
 	defer f.Close()
-	return lineWithStream(f, needle)
+	lines, err := lineWithAnyStream(f, [][]byte{needle})
+	return lines[string(needle)], err
 }
 
-func lineWithStream(f *os.File, needle []byte) (int, error) {
+var transcriptScanAfterLineHook func(string, int64)
+
+func transcriptTimestampLines(path string, needles map[string]struct{}) (map[string]int, error) {
+	for range 3 {
+		lines, stable, err := transcriptTimestampLinesAttempt(path, needles)
+		if err != nil {
+			return nil, err
+		}
+		if stable {
+			return lines, nil
+		}
+	}
+	return nil, fmt.Errorf("транскрипт менялся во время индексации")
+}
+
+func transcriptTimestampLinesAttempt(path string, needles map[string]struct{}) (map[string]int, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("транскрипт не открылся: %w", err)
+	}
+	cache, ok, cacheErr := loadTranscriptLines(path)
+	logCacheError(cacheErr)
+	cache = prepareTranscriptTimestampCache(path, info, cache, ok)
+	if cache.Lines == nil {
+		cache.Lines = make(map[string]int)
+	}
+	partial := make(map[string]int)
+	if !timestampsFound(cache.Lines, needles) && cache.ScannedBytes < info.Size() {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, false, fmt.Errorf("транскрипт не открылся: %w", err)
+		}
+		partial, err = scanTranscriptTimestamps(path, f, &cache)
+		closeErr := f.Close()
+		if err != nil {
+			return nil, false, err
+		}
+		if closeErr != nil {
+			return nil, false, fmt.Errorf("транскрипт не прочитался: %w", closeErr)
+		}
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("транскрипт после чтения не stat-нулся: %w", err)
+	}
+	if !transcriptCacheReadStable(info, after, path, cache) {
+		return nil, false, nil
+	}
+	cache.Size, cache.ModTime = after.Size(), after.ModTime().UnixNano()
+	logCacheError(saveTranscriptLines(cache))
+	result := make(map[string]int, len(needles))
+	for needle := range needles {
+		if line := cache.Lines[needle]; line > 0 {
+			result[needle] = line
+		} else if line := partial[needle]; line > 0 {
+			result[needle] = line
+		}
+	}
+	return result, true, nil
+}
+
+func transcriptCacheReadStable(before, after os.FileInfo, path string, cache transcriptLinesCache) bool {
+	if after.Size() < cache.ScannedBytes || (after.Size() == before.Size() && !after.ModTime().Equal(before.ModTime())) {
+		return false
+	}
+	return transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail)
+}
+
+func prepareTranscriptTimestampCache(path string, info os.FileInfo, cache transcriptLinesCache, ok bool) transcriptLinesCache {
+	if !ok || cache.Size > info.Size() || (cache.Size == info.Size() && cache.ModTime != info.ModTime().UnixNano()) {
+		return transcriptLinesCache{Version: transcriptCacheVersion, Path: path, Lines: make(map[string]int)}
+	}
+	if !transcriptPrefixMatches(path, cache.ScannedBytes, cache.PrefixTail) {
+		return transcriptLinesCache{Version: transcriptCacheVersion, Path: path, Lines: make(map[string]int)}
+	}
+	return cache
+}
+
+func transcriptPrefixMatches(path string, scannedBytes int64, tail []byte) bool {
+	if scannedBytes < 0 || len(tail) != int(min(int64(64), scannedBytes)) {
+		return false
+	}
+	if scannedBytes == 0 {
+		return len(tail) == 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		logCacheError(fmt.Errorf("транскрипт для проверки префикса не открылся: %w", err))
+		return false
+	}
+	defer f.Close()
+	actual := make([]byte, len(tail))
+	if _, err := f.ReadAt(actual, scannedBytes-int64(len(actual))); err != nil {
+		logCacheError(fmt.Errorf("префикс транскрипта не прочитался: %w", err))
+		return false
+	}
+	return bytes.Equal(actual, tail)
+}
+
+func appendTranscriptPrefixTail(tail, line []byte) []byte {
+	if len(line) >= 64 {
+		return append(tail[:0], line[len(line)-64:]...)
+	}
+	combined := append(append([]byte(nil), tail...), line...)
+	if len(combined) > 64 {
+		combined = combined[len(combined)-64:]
+	}
+	return combined
+}
+
+func timestampsFound(lines map[string]int, needles map[string]struct{}) bool {
+	for needle := range needles {
+		if lines[needle] == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func scanTranscriptTimestamps(path string, f *os.File, cache *transcriptLinesCache) (map[string]int, error) {
+	if _, err := f.Seek(cache.ScannedBytes, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("транскрипт не позиционировался: %w", err)
+	}
 	r := bufio.NewReaderSize(f, 1<<20)
+	prefix := []byte(`"timestamp":"`)
+	var line []byte
+	offset := cache.ScannedBytes
+	partial := make(map[string]int)
+	for {
+		chunk, err := r.ReadSlice('\n')
+		line = append(line, chunk...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			offset += int64(len(chunk))
+			continue
+		}
+		offset += int64(len(chunk))
+		complete := len(chunk) > 0 && chunk[len(chunk)-1] == '\n'
+		if len(line) > 0 && complete {
+			cache.LineCount++
+			indexTimestampLine(line, cache, prefix)
+			cache.ScannedBytes = offset
+			cache.PrefixTail = appendTranscriptPrefixTail(cache.PrefixTail, line)
+			if transcriptScanAfterLineHook != nil {
+				transcriptScanAfterLineHook(path, cache.ScannedBytes)
+			}
+			line = line[:0]
+		} else if len(line) > 0 && err == io.EOF {
+			incomplete := transcriptLinesCache{LineCount: cache.LineCount + 1, Lines: partial}
+			indexTimestampLine(line, &incomplete, prefix)
+		}
+		if err == io.EOF {
+			return partial, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("транскрипт не прочитался: %w", err)
+		}
+	}
+}
+
+func indexTimestampLine(line []byte, cache *transcriptLinesCache, prefix []byte) {
+	for at := 0; at < len(line); {
+		start := bytes.Index(line[at:], prefix)
+		if start < 0 {
+			return
+		}
+		start += at
+		valueStart := start + len(prefix)
+		end := bytes.IndexByte(line[valueStart:], '"')
+		if end < 0 {
+			at = valueStart
+			continue
+		}
+		needle := string(line[start : valueStart+end+1])
+		if _, exists := cache.Lines[needle]; !exists {
+			cache.Lines[needle] = cache.LineCount
+		}
+		at = valueStart + end + 1
+	}
+}
+
+func lineWithAnyStream(f *os.File, needles [][]byte) (map[string]int, error) {
+	r := bufio.NewReaderSize(f, 1<<20)
+	found := make(map[string]int, len(needles))
 	var line []byte
 	for n := 1; ; {
 		chunk, err := r.ReadSlice('\n')
@@ -594,14 +904,17 @@ func lineWithStream(f *os.File, needle []byte) (int, error) {
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		if bytes.Contains(line, needle) {
-			return n, nil
+		for _, needle := range needles {
+			key := string(needle)
+			if found[key] == 0 && bytes.Contains(line, needle) {
+				found[key] = n
+			}
 		}
 		if err == io.EOF {
-			return 0, nil
+			return found, nil
 		}
 		if err != nil {
-			return 0, fmt.Errorf("транскрипт не прочитался: %w", err)
+			return nil, fmt.Errorf("транскрипт не прочитался: %w", err)
 		}
 		line, n = line[:0], n+1
 	}
