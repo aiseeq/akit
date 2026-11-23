@@ -182,7 +182,7 @@ func fileRow(b *bytes.Buffer, f *file, ver uint64, dirty bool) {
 	r.ms(f.last)
 	r.num(uint64(max(f.bad, 0)))
 	r.num(f.tail)
-	r.num(uint64(f.gen))
+	r.num(f.gen)
 	r.num(flag)
 	r.b.WriteString(strconv.FormatUint(ver, 10))
 	r.end()

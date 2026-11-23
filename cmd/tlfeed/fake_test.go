@@ -36,7 +36,10 @@ type fakeCH struct {
 	pause map[string]*pause
 }
 
-type pause struct{ arrived, release chan struct{} }
+type pause struct {
+	arrived, release chan struct{}
+	early            bool // the condition of the insert is read when it comes, its rows are written when released
+}
 
 // pauseNext makes the next insert into table wait; arrived closes when it comes, release lets it go on.
 func (f *fakeCH) pauseNext(table string) *pause {
@@ -84,10 +87,15 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		q = string(body)
 		body = nil
 	}
+	var pre [][]string // rows a paused insert let through when it came, the condition already read
+	early := false
 	if m := insertRe.FindStringSubmatch(q); m != nil {
 		f.mu.Lock()
 		p := f.pause[m[1]]
 		delete(f.pause, m[1])
+		if p != nil && p.early {
+			pre, early = f.fenced(q, m[1], tsvRows(body)), true
+		}
 		f.mu.Unlock()
 		if p != nil { // the request waits, the client alive, until the test lets it go on
 			close(p.arrived)
@@ -126,6 +134,9 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			settings[k] = r.URL.Query().Get(k)
 		}
 		rows := f.fenced(q, table, tsvRows(body))
+		if early {
+			rows = pre
+		}
 		w.Header().Set("X-ClickHouse-Summary", fmt.Sprintf(`{"read_rows":"0","written_rows":"%d"}`, len(rows)))
 		f.inserts = append(f.inserts, sent{table: table, token: tok, rows: rows, settings: settings})
 		if f.tokens[table] == nil {
@@ -139,7 +150,7 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.lose[table]--
 			http.Error(w, "Code: 999. answer lost", http.StatusInternalServerError)
 		}
-	case strings.HasPrefix(q, "CREATE "):
+	case strings.HasPrefix(q, "CREATE "), strings.HasPrefix(q, "ALTER TABLE "):
 	case strings.HasPrefix(q, "KILL QUERY "):
 		f.kills++
 	case q == "SELECT serverUUID()":
@@ -178,6 +189,28 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "fake: unknown statement "+q, http.StatusBadRequest)
 	}
+}
+
+var heldRe = regexp.MustCompile(`file_id NOT IN \(SELECT file_id FROM \w+\.files FINAL WHERE file_id IN \([\d,]+\) AND \(file_id, gen\) NOT IN \(((?:\(\d+,\d+\),?)+)\)\)`)
+
+// held — the files of rows (files rows) that have no row yet or whose latest row has the gen of pairs.
+func (f *fakeCH) held(rows [][]string, pairs string) map[string]bool {
+	gen := map[string]string{}
+	for _, row := range f.latestFiles() {
+		gen[row[fileCol["file_id"]]] = row[fileCol["gen"]]
+	}
+	want := map[string]string{}
+	for _, p := range pairRe.FindAllStringSubmatch(pairs, -1) {
+		want[p[1]] = p[2]
+	}
+	out := map[string]bool{}
+	for _, r := range rows {
+		id := r[fileCol["file_id"]]
+		if g, ok := gen[id]; !ok || g == want[id] {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 var genSelRe = regexp.MustCompile(`^SELECT count\(\) FROM \w+\.files FINAL WHERE file_id = (\d+) AND gen = (\d+)$`)
@@ -307,11 +340,17 @@ func (f *fakeCH) allowed(pairs string) map[string]bool {
 
 // fenced keeps the rows of an INSERT ... SELECT FROM input() WHERE <generation condition> that pass it.
 func (f *fakeCH) fenced(q, table string, rows [][]string) [][]string {
-	m := fenceRe.FindStringSubmatch(q)
-	if m == nil || !strings.Contains(q, "FROM input()") {
+	if !strings.Contains(q, "FROM input()") {
 		return rows
 	}
-	allowed := f.allowed(m[1])
+	var allowed map[string]bool
+	if m := heldRe.FindStringSubmatch(q); m != nil {
+		allowed = f.held(rows, m[1])
+	} else if m := fenceRe.FindStringSubmatch(q); m != nil {
+		allowed = f.allowed(m[1])
+	} else {
+		return rows
+	}
 	idCol := 0
 	if table == "events" {
 		idCol = 1

@@ -36,7 +36,7 @@ type file struct {
 	lines       int   // lines in raw
 	evLines     int   // lines whose events are in events (below lines only after a crash between the inserts)
 	tail        uint64
-	gen         uint32
+	gen         uint64
 	name        string
 	bad         int
 	first, last time.Time

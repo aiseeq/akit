@@ -150,7 +150,7 @@ func TestLiveServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyAll(t, srv, db, h.home)
-	if f.gen != 1 {
+	if f.gen == 0 {
 		t.Fatalf("gen %d after rewind", f.gen)
 	}
 

@@ -187,10 +187,11 @@ func (l *loader) loadKnown() error {
 		return nil
 	}
 	// the new generation first, then no write of the stopped loader is running, then its rows go
-	for _, f := range dirty {
-		f.gen++
+	was := make([]uint64, len(dirty))
+	for i, f := range dirty {
+		was[i], f.gen = f.gen, l.nextGen()
 	}
-	if err := l.storeFiles(dirty, true); err != nil {
+	if err := l.storeFiles(dirty, true, was); err != nil {
 		return err
 	}
 	if err := l.killOthers(); err != nil {
@@ -407,8 +408,9 @@ func (l *loader) truncate(f *file, why string) error {
 	if err := l.flush(); err != nil {
 		return err
 	}
-	f.gen++
-	if err := l.storeFiles([]*file{f}, true); err != nil {
+	was := f.gen
+	f.gen = l.nextGen()
+	if err := l.storeFiles([]*file{f}, true, []uint64{was}); err != nil {
 		return err
 	}
 	return l.purge(f, why)
@@ -439,7 +441,7 @@ func (l *loader) purge(f *file, why string) error {
 		}
 	}
 	// the statements above did nothing if the file has a newer generation; then the clean row is turned away too
-	if err := l.storeFiles([]*file{f}, false); err != nil {
+	if err := l.storeFiles([]*file{f}, false, []uint64{f.gen}); err != nil {
 		return err
 	}
 	f.commit()
@@ -447,28 +449,57 @@ func (l *loader) purge(f *file, why string) error {
 }
 
 // storeFiles writes the rows of files now, outside a batch; their size is 0, so a start before the next batch
-// looks at them again.
-func (l *loader) storeFiles(fs []*file, dirty bool) error {
+// looks at them again. was[i] — the generation the stored row of fs[i] must have for its new row to be written.
+func (l *loader) storeFiles(fs []*file, dirty bool, was []uint64) error {
 	var b bytes.Buffer
 	ver := l.nextVer()
-	n := 0
-	for _, f := range fs {
+	var stored []*file
+	var gens []uint64
+	for i, f := range fs {
 		if f.id == 0 {
 			continue
 		}
 		c := *f
 		c.size = 0
 		fileRow(&b, &c, ver, dirty)
-		n++
+		stored, gens = append(stored, f), append(gens, was[i])
 	}
-	if n == 0 {
+	if len(stored) == 0 {
 		return nil
 	}
-	var fence []*file
-	if !dirty {
-		fence = fs // a clean row only over the dirty one of the same generation
+	return l.insert("files", fileColumns, &b, len(stored), fmt.Sprintf("files:v%d", ver), l.filesHeld(stored, gens))
+}
+
+// filesHeld — the condition for files rows: the file has no row yet, or its row has the generation gens[i] this
+// loader knows. A loader whose file another one has taken on with a new generation writes no row for it.
+func (l *loader) filesHeld(fs []*file, gens []uint64) string {
+	var ids, pairs strings.Builder
+	for i, f := range fs {
+		if i > 0 {
+			ids.WriteByte(',')
+			pairs.WriteByte(',')
+		}
+		fmt.Fprintf(&ids, "%d", f.id)
+		fmt.Fprintf(&pairs, "(%d,%d)", f.id, gens[i])
 	}
-	return l.insert("files", fileColumns, &b, n, fmt.Sprintf("files:v%d", ver), fence)
+	return fmt.Sprintf("file_id NOT IN (SELECT file_id FROM %s.files FINAL WHERE file_id IN (%s) AND (file_id, gen) NOT IN (%s))",
+		l.cfg.db, ids.String(), pairs.String())
+}
+
+// gensOf — the generations the loader knows of the files.
+func gensOf(fs []*file) []uint64 {
+	out := make([]uint64, len(fs))
+	for i, f := range fs {
+		out[i] = f.gen
+	}
+	return out
+}
+
+// nextGen — a new generation of a file: from the write order, so it is above every earlier one, and two loaders
+// that take one at once from the same stored row get different ones (the same only at the same nanosecond); the
+// generation filter then lets only the writes of the one whose row is the latest through.
+func (l *loader) nextGen() uint64 {
+	return l.nextVer()
 }
 
 func (l *loader) nextVer() uint64 {
@@ -731,17 +762,17 @@ func (l *loader) flush() error {
 		for _, f := range b.touched {
 			fileRow(&dirty, f.committed(), ver, true)
 		}
-		if err := l.insert("files", fileColumns, &dirty, len(b.touched), fmt.Sprintf("files:v%d", ver), nil); err != nil {
+		if err := l.insert("files", fileColumns, &dirty, len(b.touched), fmt.Sprintf("files:v%d", ver), l.filesHeld(b.touched, gensOf(b.touched))); err != nil {
 			return err
 		}
 	}
 	if b.rawRows > 0 {
-		if err := l.insert("raw", rawColumns, &b.raw, b.rawRows, token(b.rawTok), b.touched); err != nil {
+		if err := l.insert("raw", rawColumns, &b.raw, b.rawRows, token(b.rawTok), l.genIs(b.touched...)); err != nil {
 			return err
 		}
 	}
 	if b.evRows > 0 {
-		if err := l.insert("events", eventColumns, &b.events, b.evRows, token(b.evTok), b.touched); err != nil {
+		if err := l.insert("events", eventColumns, &b.events, b.evRows, token(b.evTok), l.genIs(b.touched...)); err != nil {
 			return err
 		}
 	}
@@ -752,7 +783,7 @@ func (l *loader) flush() error {
 		fileRow(&files, f, ver, false)
 	}
 	// the clean rows only for files that still have this generation: the batch is in the tables only then
-	if err := l.insert("files", fileColumns, &files, len(b.touched), fmt.Sprintf("files:v%d", ver), b.touched); err != nil {
+	if err := l.insert("files", fileColumns, &files, len(b.touched), fmt.Sprintf("files:v%d", ver), l.filesHeld(b.touched, gensOf(b.touched))); err != nil {
 		return err
 	}
 	for _, f := range b.touched {
@@ -768,13 +799,11 @@ func (l *loader) flush() error {
 	return nil
 }
 
-// insert sends rows in TSV under a dedup token. With fence, only the rows of those files go, and only while each
-// keeps its generation (genIs): a late insert of a stopped loader adds nothing after the next start's cleanup.
-func (l *loader) insert(table, columns string, body *bytes.Buffer, rows int, tok string, fence []*file) error {
-	q := fmt.Sprintf("INSERT INTO %s.%s (%s) FORMAT TabSeparated", l.cfg.db, table, columns)
-	if len(fence) > 0 {
-		q = fmt.Sprintf("INSERT INTO %s.%s (%s) SELECT * FROM input() WHERE %s FORMAT TabSeparated", l.cfg.db, table, columns, l.genIs(fence...))
-	}
+// insert sends rows in TSV under a dedup token; the server keeps only the rows where holds (genIs, filesHeld): a
+// late insert of a stopped loader adds nothing after the next start's cleanup, nor the insert of a loader whose
+// files another one has taken on.
+func (l *loader) insert(table, columns string, body *bytes.Buffer, rows int, tok, where string) error {
+	q := fmt.Sprintf("INSERT INTO %s.%s (%s) SELECT * FROM input() WHERE %s FORMAT TabSeparated", l.cfg.db, table, columns, where)
 	// wait_end_of_query: the answer, with its summary of written rows, comes once the insert is over
 	settings := url.Values{"insert_deduplication_token": {tok}, "async_insert": {"0"}, "wait_end_of_query": {"1"}}
 	if l.cfg.once && table == "events" {

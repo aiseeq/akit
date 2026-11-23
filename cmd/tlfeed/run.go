@@ -33,7 +33,7 @@ func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err
 	f = &file{id: p.uint(c("file_id")), name: r[c("name")], size: int64(p.uint(c("size"))), ingested: int64(p.uint(c("ingested"))),
 		lines: p.int(c("lines")), evLines: p.int(c("ev_lines")), mtime: p.time(c("mtime")), inode: p.uint(c("inode")),
 		first: p.time(c("first_ts")), last: p.time(c("last_ts")), bad: p.int(c("bad")), tail: p.uint(c("tail")),
-		gen: uint32(p.uint(c("gen")))}
+		gen: p.uint(c("gen"))}
 	dirty = p.uint(c("dirty")) != 0
 	ver = p.uint(c("ver"))
 	if p.err != nil {

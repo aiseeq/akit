@@ -14,11 +14,9 @@ type errLocked struct{ msg string }
 
 func (e *errLocked) Error() string { return e.msg }
 
-// lockDir — where the lock files are: beside the state file, or, without one, in the runtime folder of the user.
-func lockDir(state string) string {
-	if state != "" {
-		return filepath.Dir(state)
-	}
+// lockDir — where the lock files are: one folder of the user whatever --state and --home, so every loader of
+// a database on a server meets the same lock.
+func lockDir() string {
 	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 		return filepath.Join(d, "akit", "tlfeed")
 	}

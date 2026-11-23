@@ -35,8 +35,10 @@ Sources are the files tl --all --codex reads: Claude Code transcripts with subag
 rollouts of worker codex sessions under --home.
 
 One loader per database: follow, --once and --materialize hold a lock (flock) on
-tlfeed-<db>-<serverUUID>.lock beside the state file, or in $XDG_RUNTIME_DIR/akit/tlfeed without
-one; a second loader exits at once with the pid of the holder. --verify and --check take no lock.
+tlfeed-<db>-<serverUUID>.lock in $XDG_RUNTIME_DIR/akit/tlfeed (/tmp/akit-tlfeed-<uid> when unset),
+whatever --state and --home; a second loader exits at once with code 2 and the pid of the holder,
+the state file untouched. The state file is written once the lock is taken (the server answered).
+--verify and --check take no lock.
 
 Flags:
   --url URL        ClickHouse HTTP interface (default http://127.0.0.1:18123)
@@ -123,7 +125,7 @@ func parse(args []string) (options, error) {
 	if !stateGiven { // --state '' keeps no state file
 		o.cfg.state = defaultStatePath(o.cfg.home)
 	}
-	o.cfg.lock = lockDir(o.cfg.state)
+	o.cfg.lock = lockDir()
 	return o, nil
 }
 
@@ -157,7 +159,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		held, err := takeLock(lockPath(o.cfg.lock, id, o.cfg.db))
 		if err != nil {
-			return result(err, false, stderr)
+			fmt.Fprintf(stderr, "tlfeed: %v\n", err)
+			return 2 // as a loader that finds the lock taken
 		}
 		defer held.Close()
 		return result(c.materialize(), true, stderr)
@@ -209,6 +212,14 @@ func load(o options, srv *server, stderr io.Writer) int {
 		}
 	}
 	defer l.dirs.w.close()
+	// the lock first: a second loader leaves the state file of the first alone
+	if err := l.lock(); err != nil {
+		if !errors.Is(err, errStopped) {
+			l.logf("%v", err)
+			return 2
+		}
+		return 0
+	}
 	finished, beatDone := make(chan struct{}), make(chan struct{})
 	if err := st.write(time.Now()); err != nil {
 		fmt.Fprintf(stderr, "tlfeed: %v\n", err)

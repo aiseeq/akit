@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -205,14 +207,15 @@ func TestRewind(t *testing.T) {
 	write(t, path, other)
 	h.pass(l)
 	f := h.same(l, path)
-	if f.id != id || f.gen != 1 {
-		t.Fatalf("id %d gen %d after rewind, want id %d gen 1", f.id, f.gen, id)
+	gen1 := f.gen
+	if f.id != id || gen1 == 0 {
+		t.Fatalf("id %d gen %d after rewind, want id %d and a new gen", f.id, f.gen, id)
 	}
 	if len(h.fake.deletes) != 4 { // events, replies, usage, raw
 		t.Fatalf("deletes %v", h.fake.deletes)
 	}
 	raws := h.fake.sentTo("raw")
-	if last := raws[len(raws)-1]; last.token != fmt.Sprintf("%d:1:g1", id) {
+	if last := raws[len(raws)-1]; last.token != fmt.Sprintf("%d:1:g%d", id, gen1) {
 		t.Fatalf("reload token %q", last.token)
 	}
 	if !strings.Contains(h.log.String(), "rewind") {
@@ -221,8 +224,8 @@ func TestRewind(t *testing.T) {
 	// shorter than loaded: the same
 	write(t, path, bytes.Join(lines[:3], nil))
 	h.pass(l)
-	if f := h.same(l, path); f.gen != 2 {
-		t.Fatalf("gen %d after the second rewind", f.gen)
+	if f := h.same(l, path); f.gen <= gen1 {
+		t.Fatalf("gen %d after the second rewind, was %d", f.gen, gen1)
 	}
 }
 
@@ -537,11 +540,13 @@ func TestArgs(t *testing.T) {
 
 func TestStatements(t *testing.T) {
 	got := statements("tq")
-	if len(got) != 8 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
+	if len(got) != 9 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
 		t.Fatalf("%d statements: %q", len(got), got)
 	}
 	for _, s := range got {
-		if strings.Contains(s, "{db}") || strings.Contains(s, "--") || !strings.Contains(s, "IF NOT EXISTS") {
+		// the one ALTER widens a column of tables made before; run again, it changes nothing
+		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64"
+		if strings.Contains(s, "{db}") || strings.Contains(s, "--") || !idempotent {
 			t.Fatalf("statement %q", s)
 		}
 	}
@@ -858,44 +863,60 @@ func TestStoppedAfterSizeStoredBeforeLines(t *testing.T) {
 	h.same(h.loader(nil), path)
 }
 
-// A second loader on a database another one works on (follow, --once or --materialize) ends at once with the pid
-// of the holder; --check and --verify take no lock. Without a state file the lock is in the runtime folder.
+// A second loader on a database another one works on (follow, --once or --materialize) ends at once with code 2
+// and the pid of the holder, whatever its --state and --home; --check and --verify take no lock. Without
+// XDG_RUNTIME_DIR the lock is in the temporary folder.
 func TestLockOneLoaderPerDatabase(t *testing.T) {
-	for _, noState := range []bool{false, true} {
-		t.Run(fmt.Sprintf("no-state-%t", noState), func(t *testing.T) {
+	for _, runtimeDir := range []bool{true, false} {
+		t.Run(fmt.Sprintf("runtime-dir-%t", runtimeDir), func(t *testing.T) {
 			h := newHarness(t)
 			write(t, claudePath(h.home), sample(t, "claude.jsonl"))
-			runtime := t.TempDir()
-			t.Setenv("XDG_RUNTIME_DIR", runtime)
-			state := filepath.Join(t.TempDir(), "st", "state.json")
-			args := []string{"--url", h.srv.base, "--db", "tq", "--home", h.home, "--state", state}
-			dir := filepath.Dir(state)
-			if noState {
-				args[len(args)-1], dir = "", filepath.Join(runtime, "akit", "tlfeed")
+			if runtimeDir {
+				t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+			} else {
+				t.Setenv("XDG_RUNTIME_DIR", "")
+				t.Setenv("TMPDIR", t.TempDir())
 			}
-			held, err := takeLock(lockPath(dir, "00000000-0000-4000-8000-0000000000fa", "tq"))
-			if err != nil {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			// the first loader: its own state file and home
+			cfg := config{home: h.home, db: "tq", state: filepath.Join(t.TempDir(), "a", "state.json"), tick: time.Second,
+				idle: time.Hour, sweep: time.Second, rescan: time.Hour, batch: 32 << 20, lock: lockDir()}
+			first := newLoader(cfg, h.srv, make(chan struct{}), io.Discard, newStatus(""))
+			if err := first.lock(); err != nil {
 				t.Fatal(err)
 			}
-			for _, mode := range [][]string{{"--once"}, {"--materialize"}, {"--tick", "1ms"}} {
-				var out, errOut bytes.Buffer
-				code := run(append(slices.Clone(args), mode...), &out, &errOut)
-				want := fmt.Sprintf("another loader works on this database: pid %d holds", os.Getpid())
-				if code == 0 || !strings.Contains(errOut.String(), want) {
-					t.Fatalf("%v with the lock held: exit %d, %q", mode, code, errOut.String())
+			otherHome := t.TempDir()
+			write(t, claudePath(otherHome), sample(t, "claude.jsonl"))
+			base := []string{"--url", h.srv.base, "--db", "tq"}
+			seconds := [][]string{
+				{"--home", otherHome, "--state", filepath.Join(t.TempDir(), "b", "state.json")},
+				{"--home", h.home, "--state", ""},
+				{"--home", otherHome}, // the default state file
+			}
+			want := fmt.Sprintf("another loader works on this database: pid %d holds", os.Getpid())
+			for _, second := range seconds {
+				for _, mode := range [][]string{{"--once"}, {"--materialize"}, {"--tick", "1ms"}} {
+					args := slices.Concat(base, second, mode)
+					var out, errOut bytes.Buffer
+					if code := run(args, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), want) {
+						t.Fatalf("%q with the lock held: exit %d, %q", args, code, errOut.String())
+					}
 				}
 			}
 			if len(h.fake.inserts) != 0 {
-				t.Fatalf("the second loader wrote: %d inserts", len(h.fake.inserts))
+				t.Fatalf("a second loader wrote: %d inserts", len(h.fake.inserts))
+			}
+			if _, err := os.Stat(seconds[0][3]); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("a second loader wrote its state file: %v", err)
 			}
 			var out, errOut bytes.Buffer
-			if code := run(append(slices.Clone(args), "--check"), &out, &errOut); strings.Contains(errOut.String(), "another loader") {
+			if code := run(slices.Concat(base, seconds[0], []string{"--check"}), &out, &errOut); strings.Contains(errOut.String(), "another loader") {
 				t.Fatalf("--check took the lock: exit %d, %q", code, errOut.String())
 			}
-			held.Close()
+			first.lockFile.Close()
 			out.Reset()
 			errOut.Reset()
-			if code := run(append(slices.Clone(args), "--once"), &out, &errOut); code != 0 {
+			if code := run(slices.Concat(base, seconds[0], []string{"--once"}), &out, &errOut); code != 0 {
 				t.Fatalf("--once after the lock is free: exit %d, %q", code, errOut.String())
 			}
 		})
@@ -933,4 +954,82 @@ func TestTwinLoaderInsertTurnedAway(t *testing.T) {
 			h.same(h.loader(nil), path)
 		})
 	}
+}
+
+// Two loaders on one database with no lock between them (a lock folder each), both knowing a file that is then
+// cut back: each takes a generation of its own, so whichever comes second to the file stops with an error at its
+// first write and the other leaves the tables complete — no row lost, none twice.
+func TestTwoLoadersWithoutLock(t *testing.T) {
+	for _, at := range []string{"files", "raw"} {
+		t.Run("first-waits-on-"+at, func(t *testing.T) {
+			h := newHarness(t)
+			data := sample(t, "claude.jsonl")
+			path := claudePath(h.home)
+			write(t, path, data)
+			l1 := h.loader(nil)
+			l2 := h.loader(nil)
+			half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+			write(t, path, data[:half]) // cut back: both rewind it
+			p := h.fake.pauseNext(at)
+			errc := make(chan error, 1)
+			go func() { errc <- l1.pass(false) }()
+			select {
+			case <-p.arrived:
+			case err := <-errc:
+				t.Fatalf("first loader ended before its %s insert: %v", at, err)
+			case <-time.After(time.Minute):
+				t.Fatalf("no %s insert of the first loader within a minute", at)
+			}
+			err2 := l2.pass(false)
+			close(p.release)
+			err1 := <-errc
+			kept, err := l2, err1 // the first waited on its dirty row: the second took the file first
+			if at == "raw" {
+				// the first had its new generation stored: the second finds it taken
+				kept, err = l1, err2
+				if err1 != nil {
+					t.Fatalf("the loader that took the file first: %v", err1)
+				}
+			} else if err2 != nil {
+				t.Fatalf("the loader that took the file first: %v", err2)
+			}
+			if err == nil || !strings.Contains(err.Error(), "another loader works on") {
+				t.Fatalf("the loader second to the file: %v, want it stopped", err)
+			}
+			h.same(kept, path)
+		})
+	}
+}
+
+// The same with the two files rows of the new generations both checked against the stored one before either is
+// written (as two inserts running at once on the server). The row of the higher ver wins, here the second's; as
+// the generations differ, the deletes of the first pass by the second's rows and the first stops at its clean row.
+func TestTwoLoadersWithoutLockAtOnce(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	write(t, path, data)
+	l1 := h.loader(nil)
+	l2 := h.loader(nil)
+	half := bytes.Index(data, []byte(`"parentUuid":"d"`)) - 1
+	write(t, path, data[:half])
+	p := h.fake.pauseNext("files")
+	p.early = true
+	errc := make(chan error, 1)
+	go func() { errc <- l1.pass(false) }()
+	select {
+	case <-p.arrived:
+	case err := <-errc:
+		t.Fatalf("first loader ended before its files insert: %v", err)
+	case <-time.After(time.Minute):
+		t.Fatal("no files insert of the first loader within a minute")
+	}
+	if err := l2.pass(false); err != nil {
+		t.Fatalf("second loader: %v", err)
+	}
+	close(p.release)
+	if err := <-errc; err == nil || !strings.Contains(err.Error(), "another loader works on") {
+		t.Fatalf("first loader, its row older: %v, want it stopped", err)
+	}
+	h.same(l2, path)
 }

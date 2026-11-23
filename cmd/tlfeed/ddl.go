@@ -29,12 +29,14 @@ CREATE TABLE IF NOT EXISTS {db}.files
     last_ts DateTime64(3, 'UTC'),
     bad UInt32,                           -- lines the parser could not read
     tail UInt64,                          -- first 8 bytes of sha256 of the last 256 ingested bytes
-    gen UInt32,                           -- how many times rows of the file were deleted to be loaded again
+    gen UInt64,                           -- generation: new at every delete of rows to load them again, never the same for two loaders
     dirty UInt8,                          -- 1: rows past lines and ev_lines may be in raw and events; size is 0 then
     ver UInt64                            -- write order: the latest row of a file wins
 )
 ENGINE = ReplacingMergeTree(ver)
 ORDER BY file_id;
+
+ALTER TABLE {db}.files MODIFY COLUMN gen UInt64;
 
 CREATE TABLE IF NOT EXISTS {db}.raw
 (
