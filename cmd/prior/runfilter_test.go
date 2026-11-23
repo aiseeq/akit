@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -98,6 +101,96 @@ func TestRunCacheInvalidation(t *testing.T) {
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
+	}
+
+	// Replacing a report with the same size and mtime must still invalidate its cached content.
+	replaced := filepath.Join(day, "replaced.md")
+	writeRun(replaced, "needle")
+	assertSame(q)
+	oldFile, err := os.Open(replaced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldFile.Close()
+	oldInfo, err := oldFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := replaced + ".new"
+	writeRun(replacement, "miss!!")
+	if err := os.Chtimes(replacement, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, replaced); err != nil {
+		t.Fatal(err)
+	}
+	assertSame(q)
+}
+
+func TestRunCacheReadsIdenticalContentsOnce(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	q, err := newQuery([]string{"needle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"one.md", "two.md"} {
+		write(t, filepath.Join(dir, name), "needle shared report\n")
+	}
+	files, errs := runMarkdownFiles(dir)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	_ = matchRunFilesCached(q, files) // build the content cache and index
+	var reads atomic.Int32
+	runEntryReadHook = func(string) { reads.Add(1) }
+	t.Cleanup(func() { runEntryReadHook = nil })
+	got := matchRunFilesCached(q, files)
+	if len(got) != 2 || got[0].line != "needle shared report" || got[1].line != got[0].line {
+		t.Fatalf("shared report results = %+v", got)
+	}
+	if reads.Load() != 1 {
+		t.Fatalf("identical reports read %d cache entries; want one", reads.Load())
+	}
+}
+
+func TestQueryRunFilterMatchesUnfilteredRandomized(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	dir := t.TempDir()
+	corpus := []string{
+		"build 12345 done", "decision 9876", "abcdefghi", "abcdefgh", "λβγδ", "foo12", "bar345",
+		"xλ3", "nothing here", "9999 zebra", "ΑΒΓΔ", "hgfedcba",
+	}
+	for day := 1; day <= 3; day++ {
+		var body strings.Builder
+		for i, line := range corpus {
+			fmt.Fprintf(&body, "entry %d: %s\n", i, line)
+		}
+		write(t, filepath.Join(dir, fmt.Sprintf("2026-01-%02d", day), "report.md"), body.String())
+	}
+	write(t, filepath.Join(dir, "2026-01-04", "alternative.md"), "bar only\n")
+	rng := rand.New(rand.NewSource(0x51f17e))
+	atoms := []string{`[a-h]`, `\d`, `[0-9]`, `λ`, `[\p{Greek}]`, `(?:foo|bar)`, `.`}
+	patterns := []string{`\d{4}`, `[a-h]{12}`, `(?:)`, `(?:foo|bar)`, `(?:λ|β){1,3}`, `(?:[0-9]+|[\p{Greek}]{2})`}
+	for range 48 {
+		left := atoms[rng.Intn(len(atoms))]
+		right := atoms[rng.Intn(len(atoms))]
+		minRepeat := rng.Intn(3)
+		maxRepeat := minRepeat + 1 + rng.Intn(3)
+		patterns = append(patterns, fmt.Sprintf("(?:%s){%d,%d}|(?:%s)?", left, minRepeat, maxRepeat, right))
+	}
+	for _, pattern := range patterns {
+		q, err := newQuery([]string{pattern})
+		if err != nil {
+			t.Fatalf("pattern %q: %v", pattern, err)
+		}
+		var filtered, unfiltered bytes.Buffer
+		runs(&filtered, q, dir)
+		q.runs = nil
+		runs(&unfiltered, q, dir)
+		if filtered.String() != unfiltered.String() {
+			t.Errorf("filtered output differs for %q:\nfiltered:\n%s\nunfiltered:\n%s", pattern, filtered.String(), unfiltered.String())
+		}
 	}
 }
 

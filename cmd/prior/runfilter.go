@@ -30,6 +30,9 @@ func queryRunFilter(words []string, wordFilters [][]runNeedle) []runNeedle {
 				continue
 			}
 		}
+		if len(wordFilters[i]) == 0 {
+			return nil
+		}
 		filters = append(filters, wordFilters[i]...)
 	}
 	return filters

@@ -827,7 +827,7 @@ func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
 			return os.Open(got)
 		}
 		t.Cleanup(func() { openPriorSource = previous })
-		if _, err := readCachedReplies(path); err == nil || !strings.Contains(err.Error(), "forced source open failure") {
+		if _, err := readCachedReplies(path); err == nil || err.Error() != "forced source open failure" {
 			t.Fatalf("cached journal hid source open error: %v", err)
 		}
 	})
@@ -841,7 +841,8 @@ func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
 		write(t, path, "needle cached\n")
 		index := runIndexManifest{Version: runCacheVersion, Files: make(map[string]runIndexEntry)}
 		changed := atomic.Bool{}
-		_, entry, ok, err := matchRunFileCached(q, path, index, &changed)
+		contentReads := &runContentReads{entries: make(map[[16]byte]*runContentRead)}
+		_, entry, ok, err := matchRunFileCached(q, path, index, &changed, contentReads)
 		if err != nil || !ok {
 			t.Fatalf("warm source result=%v cache=%v err=%v", ok, entry, err)
 		}
@@ -854,10 +855,225 @@ func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
 			return os.Open(got)
 		}
 		t.Cleanup(func() { openPriorSource = previous })
-		if _, _, _, err := matchRunFileCached(q, path, index, &changed); err == nil || !strings.Contains(err.Error(), "forced source open failure") {
+		if _, _, _, err := matchRunFileCached(q, path, index, &changed, contentReads); err == nil || !strings.Contains(err.Error(), "forced source open failure") {
 			t.Fatalf("cached report hid source open error: %v", err)
 		}
 	})
+}
+
+func TestReadCachedRepliesReturnsSnapshotAfterRepeatedAppends(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", cacheDir)
+	path := filepath.Join(t.TempDir(), "user-replies.md")
+	write(t, path, "base\n")
+	replyReadAttemptHook = func(got string, attempt int) {
+		if got != path {
+			return
+		}
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintf(f, "tail%d\n", attempt); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { replyReadAttemptHook = nil })
+
+	got, err := readCachedReplies(path)
+	if err != nil || string(got) != "base\ntail1\ntail2\n" {
+		t.Fatalf("unstable journal snapshot = %q, %v; want last completed snapshot", got, err)
+	}
+	if _, err := os.Stat(replyCachePath(path)); !os.IsNotExist(err) {
+		t.Fatalf("unstable journal snapshot was cached: stat err=%v", err)
+	}
+}
+
+func TestCachedRepliesRejectsReplacedInodeOutsideFingerprintWindows(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "user-replies.md")
+	oldData := []byte(strings.Repeat("x", 100000) + "\n")
+	if err := os.WriteFile(path, oldData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCachedReplies(path); err != nil {
+		t.Fatal(err)
+	}
+	oldFile, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldFile.Close()
+	oldInfo, err := oldFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt := append([]byte(nil), oldData...)
+	rebuilt[10000] = 'y'
+	replacement := path + ".new"
+	if err := os.WriteFile(replacement, rebuilt, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("tail\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readCachedReplies(path)
+	want, readErr := os.ReadFile(path)
+	if err != nil || readErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("replacement inode cache read differs from source: err=%v readErr=%v", err, readErr)
+	}
+}
+
+func TestTranscriptCacheChecksAllFingerprintWindows(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "windowed.jsonl")
+	var original strings.Builder
+	for day := 1; day <= 40; day++ {
+		fmt.Fprintf(&original, `{"timestamp":"2026-01-%02dT00:00:00.000Z","pad":"%s"}`+"\n", day, strings.Repeat("x", 700))
+	}
+	target := `"timestamp":"2026-01-30T00:00:00.000Z"`
+	write(t, path, original.String())
+	got, err := transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 30 {
+		t.Fatalf("initial target line=%d err=%v; want 30", got[target], err)
+	}
+	changed := []byte(original.String())
+	quarter := len(changed) / 4
+	padAt := bytes.Index(changed[quarter:], []byte(`"pad":"`))
+	if padAt < 0 {
+		t.Fatal("quarter-window marker not found")
+	}
+	changed[quarter+padAt+len(`"pad":"`)] = '\n'
+	changed = append(changed, []byte(`{"timestamp":"2026-02-01T00:00:00.000Z"}`+"\n")...)
+	if err := os.WriteFile(path, changed, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 31 {
+		t.Fatalf("quarter-window rewrite target line=%d err=%v; want 31", got[target], err)
+	}
+}
+
+func TestTranscriptCacheRejectsInodeReplacement(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "replace-inode.jsonl")
+	content := `{"timestamp":"2026-01-01T00:00:00.000Z"}` + "\n"
+	write(t, path, content)
+	needle := `"timestamp":"2026-01-01T00:00:00.000Z"`
+	if _, err := transcriptTimestampLines(path, map[string]struct{}{needle: {}}); err != nil {
+		t.Fatal(err)
+	}
+	cache, ok, err := loadTranscriptLines(path)
+	if err != nil || !ok {
+		t.Fatalf("load transcript cache: ok=%v err=%v", ok, err)
+	}
+	oldFile, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldFile.Close()
+	oldInfo, err := oldFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := path + ".new"
+	if err := os.WriteFile(replacement, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, inode, ok := fileIdentity(info)
+	if !ok {
+		t.Fatal("replacement file has no identity")
+	}
+	cache = prepareTranscriptTimestampCache(path, f, info, device, inode, cache, true)
+	if cache.ScannedBytes != 0 || len(cache.Lines) != 0 {
+		t.Fatalf("replaced inode retained stale line index: %+v", cache)
+	}
+}
+
+func TestTranscriptScanRetriesPathInodeReplacement(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	path := filepath.Join(t.TempDir(), "swap-during-scan.jsonl")
+	other := `"timestamp":"2026-01-01T00:00:00.000Z"`
+	target := `"timestamp":"2026-01-02T00:00:00.000Z"`
+	write(t, path, "{"+other+"}\n{"+target+"}\n")
+	replacement := path + ".new"
+	var swapped atomic.Bool
+	transcriptScanAfterLineHook = func(gotPath string, _ int64) {
+		if gotPath != path || !swapped.CompareAndSwap(false, true) {
+			return
+		}
+		if err := os.WriteFile(replacement, []byte("{"+target+"}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacement, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { transcriptScanAfterLineHook = nil })
+	got, err := transcriptTimestampLines(path, map[string]struct{}{target: {}})
+	if err != nil || got[target] != 1 || !swapped.Load() {
+		t.Fatalf("lookup after path replacement = %v, %v swapped=%v; want line 1 from new inode", got, err, swapped.Load())
+	}
+}
+
+func TestQueryWithoutRequiredLiteralKeepsAllSections(t *testing.T) {
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".claude", "decisions.md"), "decision 9876\n")
+	write(t, filepath.Join(home, ".claude", "improve", "runs", "2026-11-20", "report.md"), "build 12345 done\n")
+	write(t, filepath.Join(home, ".claude", "user-replies.md"), "### 2026-11-20T10:00:00Z lead\nномер 4711\n")
+	q, err := newQuery([]string{"zebra", `\d{4}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.runs != nil {
+		t.Fatalf("query with a regex lacking required literals retained partial filter: %#v", q.runs)
+	}
+	var output bytes.Buffer
+	run(q, home, &output)
+	unfiltered := q
+	unfiltered.runs = nil
+	var baseOutput bytes.Buffer
+	run(unfiltered, home, &baseOutput)
+	if output.String() != baseOutput.String() {
+		t.Fatalf("filtered query output differs from unfiltered output:\nfiltered:\n%s\nunfiltered:\n%s", output.String(), baseOutput.String())
+	}
+	for _, want := range []string{"decision 9876", "build 12345 done", "номер 4711"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("filtered output misses %q:\n%s", want, output.String())
+		}
+	}
 }
 
 func TestReplyPrewarmSkipsWhenCacheCannotBeWritten(t *testing.T) {

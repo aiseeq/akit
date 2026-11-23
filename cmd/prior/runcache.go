@@ -23,20 +23,23 @@ import (
 )
 
 const (
-	runCacheVersion        = 5
+	runCacheVersion        = 10
 	transcriptCacheVersion = 6
 	cacheDirMode           = 0700
 	runBloomBytes          = 768
-	runHeaderBytes         = 24 + runBloomBytes
-	runIndexKeyBytes       = 32
-	runIndexMetadataBytes  = 36
-	runIndexRecordBytes    = runIndexKeyBytes + runIndexMetadataBytes + runBloomBytes
-	bloomFnvPrime          = uint64(1099511628211)
+	runIndexBloomBytes     = 128
+	// Two probes reduce false positives for long reports at the fixed index size.
+	runBloomHashes        = 2
+	runHeaderBytes        = 24 + 16 + runBloomBytes
+	runIndexKeyBytes      = 32
+	runIndexMetadataBytes = 52
+	runIndexRecordBytes   = runIndexKeyBytes + runIndexMetadataBytes + runIndexBloomBytes
+	bloomFnvPrime         = uint64(1099511628211)
 )
 
-var runCacheMagic = [4]byte{'P', 'R', 'V', '5'}
+var runCacheMagic = [4]byte{'P', 'R', 'V', 'A'}
 var replyCacheMagic = [4]byte{'R', 'P', 'L', '2'}
-var runIndexMagic = [8]byte{'P', 'R', 'I', 'D', 'X', '0', '0', '9'}
+var runIndexMagic = [8]byte{'P', 'R', 'I', 'D', 'X', '0', '1', '4'}
 var openPriorSource = os.Open
 
 type transcriptLinesCache struct {
@@ -69,12 +72,13 @@ type runIndexManifest struct {
 }
 
 type runIndexEntry struct {
-	Size    int64  `json:"size"`
-	ModTime int64  `json:"mtime"`
-	Device  uint64 `json:"device"`
-	Inode   uint64 `json:"inode"`
-	Bloom   []byte `json:"bloom"`
-	CRC     uint32 `json:"crc"`
+	Size        int64    `json:"size"`
+	ModTime     int64    `json:"mtime"`
+	Device      uint64   `json:"device"`
+	Inode       uint64   `json:"inode"`
+	ContentHash [16]byte `json:"content_hash"`
+	Bloom       []byte   `json:"bloom"`
+	CRC         uint32   `json:"crc"`
 }
 
 func fileIdentity(info os.FileInfo) (device, inode uint64, ok bool) {
@@ -85,6 +89,7 @@ func fileIdentity(info os.FileInfo) (device, inode uint64, ok bool) {
 	return uint64(stat.Dev), stat.Ino, true
 }
 
+// filePrefixHash fingerprints the cache prefix using five 4 KiB windows at the start, quarter points, and end.
 func filePrefixHash(source io.ReaderAt, size int64) ([]byte, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("размер префикса файла отрицательный")
@@ -289,10 +294,11 @@ func saveCacheBytes(path string, data []byte) (err error) {
 
 func readCachedReplies(path string) ([]byte, error) {
 	cacheFile := replyCachePath(path)
-	for range 3 {
+	var lastData []byte
+	for attempt := 1; attempt <= 3; attempt++ {
 		source, err := openPriorSource(path)
 		if err != nil {
-			return nil, fmt.Errorf("журнал ответов не прочитался: %w", err)
+			return nil, err
 		}
 		info, err := source.Stat()
 		if err != nil {
@@ -318,6 +324,10 @@ func readCachedReplies(path string) ([]byte, error) {
 		if err != nil {
 			return nil, errors.Join(err, source.Close())
 		}
+		lastData = append(lastData[:0], data...)
+		if replyReadAttemptHook != nil {
+			replyReadAttemptHook(path, attempt)
+		}
 		stable, stableErr := replySourceStable(path, source, info, data, beforeHash)
 		closeErr := source.Close()
 		if closeErr != nil {
@@ -334,8 +344,10 @@ func readCachedReplies(path string) ([]byte, error) {
 		}
 		return data, nil
 	}
-	return nil, fmt.Errorf("журнал ответов менялся во время чтения")
+	return lastData, nil
 }
+
+var replyReadAttemptHook func(string, int)
 
 func replyDataFromSource(source *os.File, cacheFile string, info os.FileInfo, device, inode uint64) ([]byte, error) {
 	var data []byte
@@ -494,7 +506,7 @@ func runIndexKey(path string) string {
 
 func loadRunIndex() (runIndexManifest, error) {
 	index := runIndexManifest{Version: runCacheVersion, Files: make(map[string]runIndexEntry)}
-	path := cachePath("runs-index-v7.bin")
+	path := cachePath("runs-index-v12.bin")
 	if path == "" {
 		return index, nil
 	}
@@ -533,7 +545,7 @@ func loadRunIndex() (runIndexManifest, error) {
 		}
 		pathHash := make([]byte, runIndexKeyBytes)
 		metadata := make([]byte, runIndexMetadataBytes)
-		bloom := make([]byte, runBloomBytes)
+		bloom := make([]byte, runIndexBloomBytes)
 		if _, err := io.ReadFull(r, pathHash); err != nil {
 			return index, fmt.Errorf("хеш пути отчётного индекса не прочитался: %w", err)
 		}
@@ -548,6 +560,7 @@ func loadRunIndex() (runIndexManifest, error) {
 			Device: binary.LittleEndian.Uint64(metadata[16:24]), Inode: binary.LittleEndian.Uint64(metadata[24:32]),
 			CRC: binary.LittleEndian.Uint32(metadata[32:36]), Bloom: bloom,
 		}
+		copy(entry.ContentHash[:], metadata[36:52])
 		if entry.Size < 0 || crc32.ChecksumIEEE(bloom) != entry.CRC {
 			return index, fmt.Errorf("запись отчётного индекса повреждена")
 		}
@@ -564,7 +577,7 @@ func loadRunIndex() (runIndexManifest, error) {
 }
 
 func saveRunIndex(index runIndexManifest) error {
-	path := cachePath("runs-index-v7.bin")
+	path := cachePath("runs-index-v12.bin")
 	if path == "" {
 		return nil
 	}
@@ -576,7 +589,7 @@ func saveRunIndex(index runIndexManifest) error {
 	for _, key := range keys {
 		entry := index.Files[key]
 		pathHash, err := hex.DecodeString(key)
-		if err != nil || len(pathHash) != runIndexKeyBytes || len(entry.Bloom) != runBloomBytes {
+		if err != nil || len(pathHash) != runIndexKeyBytes || len(entry.Bloom) != runIndexBloomBytes {
 			return fmt.Errorf("запись отчётного индекса недопустима")
 		}
 		data = append(data, pathHash...)
@@ -586,6 +599,7 @@ func saveRunIndex(index runIndexManifest) error {
 		binary.LittleEndian.PutUint64(metadata[16:24], entry.Device)
 		binary.LittleEndian.PutUint64(metadata[24:32], entry.Inode)
 		binary.LittleEndian.PutUint32(metadata[32:36], entry.CRC)
+		copy(metadata[36:52], entry.ContentHash[:])
 		data = append(data, metadata...)
 		data = append(data, entry.Bloom...)
 	}
@@ -601,12 +615,13 @@ func matchRunFilesCached(q query, files []string) []runFileResult {
 	}
 	results := make([]runFileResult, len(files))
 	nextEntries := make([]runIndexEntry, len(files))
+	contentReads := &runContentReads{entries: make(map[[16]byte]*runContentRead)}
 	jobs := make(chan int)
 	var workers sync.WaitGroup
 	for range min(len(files), runtime.GOMAXPROCS(0), 4) {
 		workers.Go(func() {
 			for i := range jobs {
-				line, entry, hasEntry, err := matchRunFileCached(q, files[i], index, &indexChanged)
+				line, entry, hasEntry, err := matchRunFileCached(q, files[i], index, &indexChanged, contentReads)
 				results[i] = runFileResult{line: line, err: err}
 				if hasEntry {
 					nextEntries[i] = entry
@@ -622,7 +637,7 @@ func matchRunFilesCached(q query, files []string) []runFileResult {
 	if indexChanged.Load() {
 		next := runIndexManifest{Version: runCacheVersion, Files: make(map[string]runIndexEntry, len(files))}
 		for i, entry := range nextEntries {
-			if len(entry.Bloom) == runBloomBytes {
+			if len(entry.Bloom) == runIndexBloomBytes {
 				next.Files[runIndexKey(files[i])] = entry
 			}
 		}
@@ -631,7 +646,36 @@ func matchRunFilesCached(q query, files []string) []runFileResult {
 	return results
 }
 
-func matchRunFileCached(q query, path string, index runIndexManifest, changed *atomic.Bool) (string, runIndexEntry, bool, error) {
+type runContentRead struct {
+	done  chan struct{}
+	line  string
+	valid bool
+	err   error
+}
+
+// runContentReads shares one cached report scan per content fingerprint within a query.
+type runContentReads struct {
+	mu      sync.Mutex
+	entries map[[16]byte]*runContentRead
+}
+
+func (reads *runContentReads) get(hash [16]byte, load func() (string, bool, error)) (string, bool, error) {
+	reads.mu.Lock()
+	if cached := reads.entries[hash]; cached != nil {
+		reads.mu.Unlock()
+		<-cached.done
+		return cached.line, cached.valid, cached.err
+	}
+	cached := &runContentRead{done: make(chan struct{})}
+	reads.entries[hash] = cached
+	reads.mu.Unlock()
+
+	cached.line, cached.valid, cached.err = load()
+	close(cached.done)
+	return cached.line, cached.valid, cached.err
+}
+
+func matchRunFileCached(q query, path string, index runIndexManifest, changed *atomic.Bool, contentReads *runContentReads) (string, runIndexEntry, bool, error) {
 	source, err := openPriorSource(path)
 	if err != nil {
 		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
@@ -650,13 +694,13 @@ func matchRunFileCached(q query, path string, index runIndexManifest, changed *a
 		return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
 	}
 	entryPath := runEntryPath(path)
-	if line, entry, hit := cachedRunFileHit(q, path, index, changed, source, info, device, inode); hit {
+	if line, entry, hit := cachedRunFileHit(q, path, index, changed, source, info, device, inode, contentReads); hit {
 		return line, entry, true, nil
 	}
 	return readRunSource(q, source, entryPath, changed)
 }
 
-func cachedRunFileHit(q query, path string, index runIndexManifest, changed *atomic.Bool, source *os.File, info os.FileInfo, device, inode uint64) (string, runIndexEntry, bool) {
+func cachedRunFileHit(q query, path string, index runIndexManifest, changed *atomic.Bool, source *os.File, info os.FileInfo, device, inode uint64, contentReads *runContentReads) (string, runIndexEntry, bool) {
 	entryPath := runEntryPath(path)
 	if entryPath == "" {
 		return "", runIndexEntry{}, false
@@ -666,7 +710,9 @@ func cachedRunFileHit(q query, path string, index runIndexManifest, changed *ato
 		changed.Store(true)
 		return "", runIndexEntry{}, false
 	}
-	line, valid, cacheErr := readRunEntry(q, entryPath, entry, info)
+	line, valid, cacheErr := contentReads.get(entry.ContentHash, func() (string, bool, error) {
+		return readRunEntry(q, entryPath, entry, info)
+	})
 	if cacheErr != nil {
 		logCacheError(cacheErr)
 		changed.Store(true)
@@ -710,12 +756,15 @@ func readRunSource(q query, source *os.File, entryPath string, changed *atomic.B
 
 func runIndexMetadataMatches(entry runIndexEntry, info os.FileInfo, device, inode uint64) bool {
 	return entry.Size == info.Size() && entry.ModTime == info.ModTime().UnixNano() &&
-		entry.Device == device && entry.Inode == inode && len(entry.Bloom) == runBloomBytes && crc32.ChecksumIEEE(entry.Bloom) == entry.CRC
+		entry.Device == device && entry.Inode == inode && len(entry.Bloom) == runIndexBloomBytes && crc32.ChecksumIEEE(entry.Bloom) == entry.CRC
 }
 
 func readRunEntry(q query, path string, entry runIndexEntry, info os.FileInfo) (string, bool, error) {
 	if !runFilterMayMatchBloom(q.runs, entry.Bloom) {
 		return "", true, nil
+	}
+	if runEntryReadHook != nil {
+		runEntryReadHook(path)
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -725,16 +774,23 @@ func readRunEntry(q query, path string, entry runIndexEntry, info os.FileInfo) (
 	if _, err := io.ReadFull(f, header); err != nil {
 		return "", false, errors.Join(fmt.Errorf("заголовок кэша отчёта не прочитался: %w", err), f.Close())
 	}
-	bloom := header[24:]
+	contentHash := header[24:40]
+	fullBloom := header[40:]
 	if !bytes.Equal(header[:4], runCacheMagic[:]) ||
 		int64(binary.LittleEndian.Uint64(header[4:12])) != info.Size() ||
 		int64(binary.LittleEndian.Uint64(header[12:20])) != entry.ModTime ||
-		binary.LittleEndian.Uint32(header[20:24]) != entry.CRC || crc32.ChecksumIEEE(bloom) != entry.CRC ||
-		!bytes.Equal(bloom, entry.Bloom) {
+		!bytes.Equal(contentHash, entry.ContentHash[:]) ||
+		crc32.ChecksumIEEE(fullBloom) != binary.LittleEndian.Uint32(header[20:24]) {
 		if err := f.Close(); err != nil {
 			return "", false, fmt.Errorf("кэш отчёта не закрылся: %w", err)
 		}
 		return "", false, nil
+	}
+	if !runFilterMayMatchBloom(q.runs, fullBloom) {
+		if err := f.Close(); err != nil {
+			return "", false, fmt.Errorf("кэш отчёта не закрылся: %w", err)
+		}
+		return "", true, nil
 	}
 	reader, err := gzip.NewReader(io.LimitReader(f, info.Size()+(1<<20)))
 	if err != nil {
@@ -759,6 +815,8 @@ func readRunEntry(q query, path string, entry runIndexEntry, info os.FileInfo) (
 	return line, true, nil
 }
 
+var runEntryReadHook func(string)
+
 func writeRunEntry(path string, info os.FileInfo, device, inode uint64, data []byte) (runIndexEntry, error) {
 	var compressed bytes.Buffer
 	gz, err := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
@@ -778,18 +836,27 @@ func writeRunEntry(path string, info os.FileInfo, device, inode uint64, data []b
 	copy(header[:4], runCacheMagic[:])
 	binary.LittleEndian.PutUint64(header[4:12], uint64(info.Size()))
 	binary.LittleEndian.PutUint64(header[12:20], uint64(info.ModTime().UnixNano()))
-	bloom := runTextBloom(data)
+	contentHashFull := sha256.Sum256(data)
+	var contentHash [16]byte
+	copy(contentHash[:], contentHashFull[:len(contentHash)])
+	copy(header[24:40], contentHash[:])
+	fullBloom := runTextBloom(data)
+	binary.LittleEndian.PutUint32(header[20:24], crc32.ChecksumIEEE(fullBloom))
+	copy(header[40:], fullBloom)
+	bloom := runTextBloomSize(data, runIndexBloomBytes)
 	crc := crc32.ChecksumIEEE(bloom)
-	binary.LittleEndian.PutUint32(header[20:24], crc)
-	copy(header[24:], bloom)
 	if err := saveCacheBytes(path, append(header, compressed.Bytes()...)); err != nil {
 		return runIndexEntry{}, err
 	}
-	return runIndexEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Device: device, Inode: inode, Bloom: bloom, CRC: crc}, nil
+	return runIndexEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Device: device, Inode: inode, ContentHash: contentHash, Bloom: bloom, CRC: crc}, nil
 }
 
 func runTextBloom(data []byte) []byte {
-	bloom := make([]byte, runBloomBytes)
+	return runTextBloomSize(data, runBloomBytes)
+}
+
+func runTextBloomSize(data []byte, size int) []byte {
+	bloom := make([]byte, size)
 	for at := 0; at < len(data); {
 		end := bytes.IndexByte(data[at:], '\n')
 		if end < 0 {
@@ -810,7 +877,7 @@ func runTextBloom(data []byte) []byte {
 func bloomAdd(bloom []byte, gram string) {
 	base := bloomHash(gram)
 	bits := uint64(len(bloom) * 8)
-	for i := range uint64(4) {
+	for i := range uint64(runBloomHashes) {
 		bit := (base + i*0x9e3779b97f4a7c15) % bits
 		bloom[bit/8] |= 1 << (bit % 8)
 	}
@@ -819,7 +886,7 @@ func bloomAdd(bloom []byte, gram string) {
 func bloomHas(bloom []byte, gram string) bool {
 	base := bloomHash(gram)
 	bits := uint64(len(bloom) * 8)
-	for i := range uint64(4) {
+	for i := range uint64(runBloomHashes) {
 		bit := (base + i*0x9e3779b97f4a7c15) % bits
 		if bloom[bit/8]&(1<<(bit%8)) == 0 {
 			return false
