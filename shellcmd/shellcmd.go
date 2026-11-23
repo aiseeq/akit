@@ -4320,6 +4320,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	}
 
 	args, split, literals := wordValues(call.Args, w.src, w.vars, true)
+	resolveZshDashTarget(call, args, w.src, w.vars)
 
 	start, end := int(call.Args[0].Pos().Offset()), int(call.Args[len(call.Args)-1].End().Offset())
 	if !validSpan(w.src, start, end) {
@@ -4330,7 +4331,7 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 	if w.info.timedCalls[call] {
 		via = append(via, "time")
 	}
-	needsScripts := wrappers[commandName(args[0])] || isShell(commandName(args[0])) || commandName(args[0]) == "ssh" || commandName(args[0]) == "find" || scriptInvocation(commandName(args[0]), args[1:])
+	needsScripts := callNeedsScripts(args)
 	if !needsScripts {
 		_, needsScripts = execTarget(args[1:])
 	}
@@ -4376,6 +4377,21 @@ func (w *callWalker) visitCall(call *syntax.CallExpr) {
 		w.parseErr = err
 		return
 	}
+}
+
+func resolveZshDashTarget(call *syntax.CallExpr, args []string, src string, vars map[string]string) {
+	if len(args) < 2 || commandName(args[0]) != "-" {
+		return
+	}
+	target, _, _ := wordValues(call.Args[1:2], src, vars, false)
+	if len(target) > 0 {
+		args[1] = target[0]
+	}
+}
+
+func callNeedsScripts(args []string) bool {
+	name := commandName(args[0])
+	return wrappers[name] || isShell(name) || name == "-" || name == "ssh" || name == "find" || scriptInvocation(name, args[1:])
 }
 
 func markedCallWords(call *syntax.CallExpr, words []word, split int, src string, info *walkInfo, initialPosix bool) ([]word, []Tilde) {
@@ -6106,12 +6122,6 @@ func shellArgs(shell string, args []string) (operand int, command, stdin bool) {
 		return fishShellArgs(args)
 	}
 	for i := 0; i < len(args); i++ {
-		if command && args[i] == "--" {
-			return i + 1, true, stdin
-		}
-		if command && (args[i] == "-" || strings.ContainsAny(args[i], " \t\n")) {
-			return i, true, stdin
-		}
 		if shell == "fish" && strings.HasPrefix(args[i], "--command=") {
 			return i, true, stdin
 		}
@@ -8947,10 +8957,37 @@ func expandShell(c cmd, name string, args []string, vars map[string]string, call
 	if isKornShell(name) && command && operand < len(args) && kornCommandNameHasSubstitution(args[operand]) {
 		return &NestedError{Script: args[operand], Err: fmt.Errorf("shellcmd: dynamic ksh command name is not modeled")}
 	}
-	if !command || operand >= len(args) || operand+1 >= len(c.words) || c.words[operand+1].script == "" {
-		return nil
+	var errs []error
+	if command && operand < len(args) && operand+1 < len(c.words) && c.words[operand+1].script != "" {
+		errs = append(errs, expandShellCommand(c, name, operand, vars, calls))
 	}
-	return expandShellCommand(c, name, operand, vars, calls)
+	if command {
+		if alternative := shellCommandStringIndex(name, args); alternative >= 0 && alternative != operand && alternative < len(args) && strings.HasPrefix(args[alternative], "-") && alternative+1 < len(c.words) && c.words[alternative+1].script != "" {
+			errs = append(errs, expandShellCommand(c, name, alternative, vars, calls))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func shellCommandStringIndex(shell string, args []string) int {
+	for i := 0; i < len(args); i++ {
+		isOption, values, _, command, _ := shellArgumentOption(shell, args[i])
+		if !isOption {
+			return -1
+		}
+		if command {
+			index := i + 1
+			if index < len(args) && args[index] == "--" {
+				index++
+			}
+			if index < len(args) {
+				return index
+			}
+			return -1
+		}
+		i += shellOptionValueCount(shell, args, i, values)
+	}
+	return -1
 }
 
 func expandFishShell(c cmd, args []string, vars map[string]string, calls *[]Call) error {
@@ -11055,11 +11092,26 @@ func zshPrecommandModifier(name string) bool {
 }
 
 func zshDashModifierRoute(via []string) bool {
-	for _, name := range via {
-		if name == "time" || name == "-" || zshPrecommandModifier(name) || isShell(name) || name == "-c" || name == "-lc" || name == "-ic" {
-			continue
+	for i := len(via) - 1; i >= 0; i-- {
+		name := via[i]
+		if zshDashScriptBoundary(name) {
+			return true
 		}
-		return false
+		if wrappers[name] && name != "time" && name != "-" && !zshPrecommandModifier(name) {
+			return false
+		}
 	}
 	return true
+}
+
+func zshDashScriptBoundary(name string) bool {
+	if isShell(name) {
+		return true
+	}
+	switch name {
+	case "eval", "trap", "ssh", "script", "source", ".", "watch", "su", "runuser", "flock", "tmux", "-c", "-lc", "-ic":
+		return true
+	default:
+		return false
+	}
 }
