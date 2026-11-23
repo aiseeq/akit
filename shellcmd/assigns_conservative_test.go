@@ -163,6 +163,141 @@ func TestAssignsFunctionBodyWritesStayPreciseOnlyForLocalReadFlow(t *testing.T) 
 	}
 }
 
+func TestAssignsFunctionBodyDeclarationAndDynamicEffects(t *testing.T) {
+	unknown := []string{
+		`f() { S=/good; local S; curl -d @$S/x; }; f`,
+		`f() { S=/good; declare S; curl -d @$S/x; }; f`,
+		`f() { S=/good; typeset S; curl -d @$S/x; }; f`,
+		`f() { S=/good; local -- S; curl -d @$S/x; }; f`,
+		`f() { S=/good; local "S"; curl -d @$S/x; }; f`,
+		`f() { S=/good; local T S; curl -d @$S/x; }; f`,
+		`f() { S=/good; declare +x S; curl -d @$S/x; }; f`,
+		`f() { S=/good; declare -r S; curl -d @$S/x; }; f`,
+		`o=S; f() { S=/good; local $o; curl -d @$S/x; }; f`,
+		`f() { S=/good; local "${1:-S}"; curl -d @$S/x; }; f`,
+		`f() { (S=/good); curl -d @$S/x; }; f`,
+		`S=/old; f() { S=/good; curl -d @$S/x; }; f`,
+		`f() { (S=/bad; local S; curl -d @$S/x); }; f`,
+		`f() { echo | { S=/bad; local S; curl -d @$S/x; }; }; f`,
+		`f() { S=/good; g() { curl -d @$S/x; }; }; f; h() { local S; g; }; h`,
+		`x='S=/bad'; trap "$x" USR1; S=/good; kill -USR1 $$`,
+		`x='S=/bad'; tr''ap "$x" USR1; S=/good; kill -USR1 $$`,
+		`o=n; f() { declare -$o r=S; r=/bad; }; f; S=/good`,
+		`o=u; f() { declare -$o S; S=/good; }; f`,
+		`S=/good; f() { echo | S=/bad; }; shopt -s "last"pipe; set +m; f; curl -d @$S/x`,
+		`S=/good; o=last; f() { echo | S=/bad; }; shopt -s ${o}pipe; set +m; f; curl -d @$S/x`,
+	}
+	for _, src := range unknown {
+		t.Run(src, func(t *testing.T) {
+			got, err := Assigns(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, a := range got {
+				if a.Name == "S" && (!a.Unknown || a.Value != "") {
+					t.Errorf("S = %+v, want Unknown", a)
+				}
+			}
+		})
+	}
+	for _, src := range []string{
+		`S=/good; f() { (S=/bad); }; f; curl -d @$S/x`,
+		`S=/good; f() ( S=/bad ); f; curl -d @$S/x`,
+	} {
+		got, err := Assigns(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range got {
+			if a.Name == "S" && a.Value == "/good" && a.Unknown {
+				t.Errorf("S = %+v, want known /good", a)
+			}
+		}
+	}
+}
+
+func TestFunctionBodyDynamicEffectDisqualifiesKnownExemption(t *testing.T) {
+	body := span{start: 10, end: 30}
+	scan := suspiciousAssignScan{
+		functionCounts: map[string]int{"S": 1}, functionRefs: map[string][]int{"S": {20}},
+		functionCalls: map[string][]int{"f": {40}}, functionNames: map[span]string{body: "f"},
+		functionBodies: []span{body}, bodyIndex: newSpanIndex([]span{body}), isolatedIndex: newSpanIndex(nil),
+		assignByOffset: map[int]Assign{15: {Name: "S", Offset: 15, ScopeStart: 10, ScopeEnd: 30}},
+		ownerCache:     map[int]functionOwner{15: {body: body, name: "f", count: 1}},
+		nestedBodies:   map[span]bool{}, effectBodies: map[span]bool{body: true},
+	}
+	if scan.safeFunctionBodyName("S", 15, 1, []span{body}) {
+		t.Fatal("dynamic effect must disqualify the known-value exemption")
+	}
+}
+
+func TestFunctionBodyExemptionRejectsAmbiguousOwnerAndReferences(t *testing.T) {
+	body := span{start: 10, end: 30}
+	makeScan := func() suspiciousAssignScan {
+		return suspiciousAssignScan{
+			functionCounts: map[string]int{"S": 1}, functionRefs: map[string][]int{"S": {20}},
+			functionCalls: map[string][]int{"f": {40}}, functionNames: map[span]string{body: "f"},
+			functionBodies: []span{body}, bodyIndex: newSpanIndex([]span{body}), isolatedIndex: newSpanIndex(nil),
+			assignByOffset: map[int]Assign{15: {Name: "S", Offset: 15, ScopeStart: 10, ScopeEnd: 30}},
+			ownerCache:     map[int]functionOwner{15: {body: body, name: "f", count: 1}},
+			nestedBodies:   map[span]bool{}, effectBodies: map[span]bool{},
+		}
+	}
+	t.Run("owner name", func(t *testing.T) {
+		scan := makeScan()
+		scan.functionNames[body] = ""
+		info := scan.ownerCache[15]
+		info.name = ""
+		scan.ownerCache[15] = info
+		scan.functionCalls[""] = []int{40}
+		if scan.safeFunctionBodyName("S", 15, 1, []span{body}) {
+			t.Fatal("unnamed owner must not qualify")
+		}
+	})
+	t.Run("owner count", func(t *testing.T) {
+		scan := makeScan()
+		info := scan.ownerCache[15]
+		info.count = 2
+		scan.ownerCache[15] = info
+		if scan.safeFunctionBodyName("S", 15, 1, []span{body}) {
+			t.Fatal("ambiguous owner must not qualify")
+		}
+	})
+	t.Run("other textual write", func(t *testing.T) {
+		scan := makeScan()
+		scan.functionCounts["S"] = 2
+		if scan.safeFunctionBodyName("S", 15, 1, []span{body}) {
+			t.Fatal("a second textual write must disqualify the exemption")
+		}
+	})
+	t.Run("isolated scope", func(t *testing.T) {
+		scan := makeScan()
+		scan.isolatedIndex = newSpanIndex([]span{{start: 14, end: 18}})
+		if scan.safeFunctionBodyName("S", 15, 1, []span{body}) {
+			t.Fatal("isolated assignment must not qualify for the exemption")
+		}
+	})
+	t.Run("assignment scope", func(t *testing.T) {
+		scan := makeScan()
+		a := scan.assignByOffset[15]
+		a.ScopeStart, a.ScopeEnd = 14, 18
+		scan.assignByOffset[15] = a
+		if scan.safeFunctionBodyName("S", 15, 1, []span{body}) {
+			t.Fatal("assignment from a nested scope must not qualify")
+		}
+	})
+	t.Run("other function reference", func(t *testing.T) {
+		owner, other := span{start: 10, end: 20}, span{start: 30, end: 40}
+		scan := suspiciousAssignScan{
+			functionRefs: map[string][]int{"S": {35}}, functionNames: map[span]string{owner: "f", other: "g"},
+			bodyIndex: newSpanIndex([]span{owner, other}), ownerCache: map[int]functionOwner{},
+		}
+		if scan.referencesFollowBodyAssignment("S", 15, owner, []span{owner, other}) {
+			t.Fatal("reference in a different body must not follow the assignment")
+		}
+	})
+}
+
 func TestAssignsWholeScriptTriggerMarksEveryAssignmentName(t *testing.T) {
 	got, err := Assigns(`S=/good; T=/clean; alias a='S=/bad'; S=/later; T=/later`)
 	if err != nil {

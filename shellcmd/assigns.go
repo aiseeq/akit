@@ -176,8 +176,10 @@ func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map
 	for _, call := range scan.callSites {
 		if scan.definedFunctions[call.name] {
 			scan.functionCalls[call.name] = append(scan.functionCalls[call.name], call.offset)
+			scan.functionCallList = append(scan.functionCallList, call.offset)
 		}
 	}
+	scan.prepareFunctionIndexes()
 	names, all := scan.result()
 	return names, scan.functionUnknown, all, nil
 }
@@ -199,6 +201,21 @@ type suspiciousAssignScan struct {
 	functionBodies   []span
 	functionIsolated []span
 	functionUnknown  map[int]bool
+	declWrites       []declWrite
+	pipelines        []span
+	lastpipeMaybe    bool
+	bodyIndex        spanIndex
+	isolatedIndex    spanIndex
+	assignByOffset   map[int]Assign
+	ownerCache       map[int]functionOwner
+	functionCallList []int
+	pipelineIndex    spanIndex
+	nestedBodies     map[span]bool
+	dynamicEffects   []int
+	effectBodies     map[span]bool
+	globalEffects    []span
+	subshells        []span
+	subshellIndex    spanIndex
 	mathSpans        []span
 	valueSpans       map[string][]span
 	uncertain        []span
@@ -208,6 +225,16 @@ type suspiciousAssignScan struct {
 type callSite struct {
 	name   string
 	offset int
+}
+
+type declWrite struct {
+	name   string
+	offset int
+}
+type functionOwner struct {
+	body  span
+	name  string
+	count int
 }
 
 func (s *suspiciousAssignScan) markText(lo, hi int) {
@@ -253,6 +280,8 @@ func (s *suspiciousAssignScan) visitPrimary(node syntax.Node) bool {
 				s.functionIsolated = append(s.functionIsolated, nodeSpan(n.Body.Cmd))
 			}
 		}
+	case *syntax.Subshell:
+		s.subshells = append(s.subshells, nodeSpan(n))
 	case *syntax.ArithmCmd, *syntax.ArithmExp, *syntax.LetClause, *syntax.CStyleLoop:
 		s.markText(int(n.Pos().Offset()), int(n.End().Offset()))
 	case *syntax.Assign:
@@ -424,10 +453,13 @@ func (s *suspiciousAssignScan) callEffects(name string, args []string, call *syn
 	switch name {
 	case "eval", "source", ".":
 		s.all = true
+		s.dynamicEffects = append(s.dynamicEffects, int(call.Pos().Offset()))
 	case "alias":
 		s.alias(args)
 	case "trap":
-		s.trap(args)
+		s.trap(args, call)
+	case "shopt":
+		s.shopt(call)
 	case "mapfile", "readarray":
 		s.mapfile(args, call)
 	case "read":
@@ -445,6 +477,11 @@ func (s *suspiciousAssignScan) callEffects(name string, args []string, call *syn
 			s.markText(int(word.Pos().Offset()), int(word.End().Offset()))
 		}
 	case "declare", "local", "typeset", "export", "readonly":
+		for _, word := range call.Args[1:] {
+			if _, ok := wordValue(word); !ok {
+				s.markGlobalEffect(call)
+			}
+		}
 		s.wrappedDeclaration(name, args)
 	case "unset":
 		s.unsetTargets(args)
@@ -466,13 +503,37 @@ func (s *suspiciousAssignScan) alias(args []string) {
 	}
 }
 
-func (s *suspiciousAssignScan) trap(args []string) {
+func (s *suspiciousAssignScan) trap(args []string, call *syntax.CallExpr) {
 	action := 1
 	if action < len(args) && args[action] == "--" {
 		action++
 	}
 	if action < len(args) && args[action] != "" && !strings.HasPrefix(args[action], "-") {
 		s.all = true
+	}
+	for _, word := range call.Args[1:] {
+		if _, ok := wordValue(word); !ok {
+			s.markGlobalEffect(call)
+			s.dynamicEffects = append(s.dynamicEffects, int(call.Pos().Offset()))
+			return
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) markGlobalEffect(node syntax.Node) {
+	s.globalEffects = append(s.globalEffects, nodeSpan(node))
+}
+
+func (s *suspiciousAssignScan) shopt(call *syntax.CallExpr) {
+	for _, word := range call.Args[1:] {
+		value, ok := wordValue(word)
+		if !ok {
+			s.lastpipeMaybe = true
+			continue
+		}
+		if value == "lastpipe" {
+			s.lastpipeMaybe = true
+		}
 	}
 }
 
@@ -700,6 +761,13 @@ func (s *suspiciousAssignScan) declaration(decl *syntax.DeclClause) {
 		return
 	}
 	cmd := decl.Variant.Value
+	for _, arg := range decl.Args {
+		if arg.Naked && arg.Name == nil && arg.Value != nil {
+			if _, ok := wordValue(arg.Value); !ok {
+				s.markGlobalEffect(decl)
+			}
+		}
+	}
 	// Only the option words: the text of the whole clause holds nested values, and matching it at every nested
 	// declaration was quadratic.
 	declText := declOptions(decl)
@@ -740,13 +808,16 @@ func (s *suspiciousAssignScan) declarationArgs(decl *syntax.DeclClause, integer,
 
 func (s *suspiciousAssignScan) declarationArg(assign *syntax.Assign, cmd string, integer, attribute bool) {
 	if assign.Name == nil {
-		s.markNakedDeclaration(assign)
+		s.markNakedDeclaration(assign, cmd)
 		return
 	}
 	if assign.Naked && strings.HasPrefix(assign.Name.Value, "-") {
 		return
 	}
 	name := assign.Name.Value
+	if assign.Value == nil && (cmd == "local" || cmd == "declare" || cmd == "typeset") {
+		s.declWrites = append(s.declWrites, declWrite{name: name, offset: int(assign.Pos().Offset())})
+	}
 	if integer {
 		s.integerVars[name], s.names[name] = true, true
 	}
@@ -761,16 +832,21 @@ func (s *suspiciousAssignScan) declarationArg(assign *syntax.Assign, cmd string,
 	}
 }
 
-func (s *suspiciousAssignScan) markNakedDeclaration(assign *syntax.Assign) {
+func (s *suspiciousAssignScan) markNakedDeclaration(assign *syntax.Assign, cmd string) {
 	if assign.Value == nil {
 		return
 	}
 	word, ok := wordValue(assign.Value)
 	if !ok {
+		if cmd == "local" || cmd == "declare" || cmd == "typeset" {
+			s.globalEffects = append(s.globalEffects, nodeSpan(assign))
+		}
 		return
 	}
 	if name, _, hasValue := strings.Cut(word, "="); hasValue {
 		s.markWriteName(name)
+	} else if cmd == "local" || cmd == "declare" || cmd == "typeset" {
+		s.declWrites = append(s.declWrites, declWrite{name: word, offset: int(assign.Pos().Offset())})
 	}
 }
 
@@ -903,6 +979,13 @@ func (s *suspiciousAssignScan) parameter(param *syntax.ParamExp) {
 }
 
 func (s *suspiciousAssignScan) binary(binary *syntax.BinaryCmd) {
+	if binary.Op == syntax.Pipe || binary.Op == syntax.PipeAll {
+		var parts []*syntax.Stmt
+		appendPipelineParts(binary, &parts)
+		if len(parts) > 0 {
+			s.pipelines = append(s.pipelines, nodeSpan(parts[len(parts)-1]))
+		}
+	}
 	if binary.Op == syntax.AndStmt || binary.Op == syntax.OrStmt {
 		s.uncertain = append(s.uncertain, span{int(binary.Y.Pos().Offset()), int(binary.Y.End().Offset())})
 	}
@@ -927,11 +1010,74 @@ func (s *suspiciousAssignScan) result() (map[string]bool, bool) {
 	s.prepareArithmeticNames()
 	order := assignmentOrder(s.assigns)
 	functions := mergeSpans(s.functionBodies)
+	if s.lastpipeMaybe {
+		for _, a := range s.assigns {
+			if s.pipelineIndex.contains(a.Offset) && !s.subshellIndex.contains(a.Offset) {
+				s.names[a.Name] = true
+			}
+		}
+	}
+	s.applyGlobalEffects()
 	if len(functions) > 0 {
 		s.markFunctionBodyNames(order, functions)
 	}
 	markAssignmentsInSpans(s.assigns, order, mergeSpans(s.uncertain), s.names)
 	return s.names, s.all
+}
+
+func (s *suspiciousAssignScan) prepareFunctionIndexes() {
+	s.bodyIndex = newSpanIndex(s.functionBodies)
+	s.isolatedIndex = newSpanIndex(s.functionIsolated)
+	s.pipelineIndex = newSpanIndex(s.pipelines)
+	s.subshellIndex = newSpanIndex(s.subshells)
+	s.assignByOffset = make(map[int]Assign, len(s.assigns))
+	s.ownerCache = make(map[int]functionOwner, len(s.assigns)+len(s.functionRefs))
+	s.nestedBodies = make(map[span]bool)
+	s.effectBodies = make(map[span]bool)
+	for _, a := range s.assigns {
+		s.assignByOffset[a.Offset] = a
+	}
+	bodies := slices.Clone(s.functionBodies)
+	slices.SortFunc(bodies, func(a, b span) int {
+		if a.start != b.start {
+			return a.start - b.start
+		}
+		return b.end - a.end
+	})
+	var parents []span
+	for _, body := range bodies {
+		for len(parents) > 0 && parents[len(parents)-1].end <= body.start {
+			parents = parents[:len(parents)-1]
+		}
+		if len(parents) > 0 && body.end <= parents[len(parents)-1].end {
+			s.nestedBodies[body] = true
+		}
+		parents = append(parents, body)
+	}
+	slices.Sort(s.functionCallList)
+	for _, off := range s.dynamicEffects {
+		body, _, count := s.functionBodyOwner(off)
+		if count > 0 {
+			s.effectBodies[body] = true
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) applyGlobalEffects() {
+	for _, effect := range s.globalEffects {
+		for _, a := range s.assigns {
+			if a.Offset >= effect.start {
+				s.names[a.Name] = true
+				continue
+			}
+			for _, ref := range s.functionRefs[a.Name] {
+				if ref >= effect.end {
+					s.names[a.Name] = true
+					break
+				}
+			}
+		}
+	}
 }
 
 func (s *suspiciousAssignScan) prepareArithmeticNames() {
@@ -961,6 +1107,11 @@ func (s *suspiciousAssignScan) markFunctionBodyNames(order []int, functions []sp
 	for _, assign := range s.assigns {
 		s.functionCounts[assign.Name]++
 	}
+	for _, write := range s.declWrites {
+		if s.bodyIndex.contains(write.offset) {
+			s.functionCounts[write.name]++
+		}
+	}
 	// A single assignment followed only by reads in its own body has a stable
 	// value for those reads. Another textual assignment or call prefix defeats it.
 	safeBodyNames := s.safeFunctionBodyNames(functions)
@@ -974,9 +1125,13 @@ func (s *suspiciousAssignScan) markFunctionBodyNames(order []int, functions []sp
 }
 
 func (s *suspiciousAssignScan) markFunctionBodyAssignment(a Assign) {
+	if s.bodyIndex.contains(a.Offset) && s.declarationAfter(a.Name, a.Offset) {
+		s.names[a.Name] = true
+		return
+	}
 	if s.nestedFunctionWrite(a) {
 		inBody, outside := s.referencesOutsideScope(a)
-		if inBody || outside && strings.Contains(s.src, "lastpipe") {
+		if inBody {
 			s.names[a.Name] = true
 		} else if outside || s.inFunctionIsolatedScope(a.Offset) {
 			s.functionUnknown[a.Offset] = true
@@ -984,6 +1139,15 @@ func (s *suspiciousAssignScan) markFunctionBodyAssignment(a Assign) {
 		return
 	}
 	s.names[a.Name] = true
+}
+
+func (s *suspiciousAssignScan) declarationAfter(name string, off int) bool {
+	for _, write := range s.declWrites {
+		if write.name == name && write.offset > off && s.bodyIndex.contains(write.offset) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *suspiciousAssignScan) markFunctionReferenceNames(functions []span) {
@@ -1001,12 +1165,7 @@ func (s *suspiciousAssignScan) markFunctionReferenceNames(functions []span) {
 }
 
 func (s *suspiciousAssignScan) inFunctionIsolatedScope(off int) bool {
-	for _, isolated := range s.functionIsolated {
-		if isolated.start <= off && off < isolated.end {
-			return true
-		}
-	}
-	return false
+	return s.isolatedIndex.contains(off)
 }
 
 func (s *suspiciousAssignScan) safeFunctionBodyNames(functions []span) map[string]bool {
@@ -1042,6 +1201,9 @@ func (s *suspiciousAssignScan) safeFunctionBodyName(name string, off, bodyWrites
 	if bodyName == "" || owners != 1 || len(calls) != 1 || calls[0] <= owner.end {
 		return false
 	}
+	if s.nestedBodies[owner] || s.bodyIndex.contains(calls[0]) {
+		return false
+	}
 	if !s.assignmentMatchesFunctionScope(name, off, owner) || s.inFunctionIsolatedScope(off) {
 		return false
 	}
@@ -1054,26 +1216,37 @@ func (s *suspiciousAssignScan) safeFunctionBodyName(name string, off, bodyWrites
 	return !s.functionBodyHasDynamicEffects(off, functions)
 }
 
+func (s *suspiciousAssignScan) functionBodyHasDynamicEffects(off int, _ []span) bool {
+	owner, _, count := s.functionBodyOwner(off)
+	return count > 0 && s.effectBodies[owner]
+}
+
 func (s *suspiciousAssignScan) functionBodyOwner(off int) (span, string, int) {
-	var owner span
-	name, count := "", 0
-	for _, body := range s.functionBodies {
-		if body.start <= off && off < body.end {
-			owner, name, count = body, s.functionNames[body], count+1
+	info, ok := s.ownerCache[off]
+	if !ok {
+		var owner span
+		name, count := "", 0
+		for i := sort.Search(len(s.bodyIndex.spans), func(i int) bool { return s.bodyIndex.spans[i].start > off }) - 1; i >= 0 && s.bodyIndex.prefixMaxEnd[i] > off; i-- {
+			body := s.bodyIndex.spans[i]
+			if body.end > off {
+				if count == 0 || body.end-body.start < owner.end-owner.start {
+					owner, name = body, s.functionNames[body]
+				}
+				count++
+			}
 		}
+		info = functionOwner{body: owner, name: name, count: count}
+		s.ownerCache[off] = info
 	}
-	return owner, name, count
+	return info.body, info.name, info.count
 }
 
 func (s *suspiciousAssignScan) assignmentMatchesFunctionScope(name string, off int, owner span) bool {
 	if off < owner.start || off >= owner.end {
 		return false
 	}
-	for i := range s.assigns {
-		a := s.assigns[i]
-		if a.Name == name && a.Offset == off && (a.ScopeStart != owner.start || a.ScopeEnd != owner.end) {
-			return false
-		}
+	if a, ok := s.assignByOffset[off]; ok && a.Name == name && (a.ScopeStart != owner.start || a.ScopeEnd != owner.end) {
+		return false
 	}
 	return true
 }
@@ -1084,62 +1257,34 @@ func (s *suspiciousAssignScan) referencesFollowBodyAssignment(name string, off i
 		if !containsMergedSpan(functions, ref) || ref <= off || ref < owner.start || ref >= owner.end {
 			return false
 		}
+		_, _, refOwners := s.functionBodyOwner(ref)
+		if refOwners != 1 {
+			return false
+		}
 		seen = true
 	}
 	return seen
 }
 
 func (s *suspiciousAssignScan) functionCalledBetweenAssignmentAndReference(name string, off int) bool {
-	for _, calls := range s.functionCalls {
-		for _, called := range calls {
-			if callBeforeReference(called, off, s.functionRefs[name]) {
-				return true
-			}
-		}
+	refs := s.functionRefs[name]
+	if len(refs) == 0 {
+		return false
 	}
-	return false
-}
-
-func callBeforeReference(called, assignment int, refs []int) bool {
-	for _, ref := range refs {
-		if assignment < called && called < ref {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *suspiciousAssignScan) functionBodyHasDynamicEffects(off int, functions []span) bool {
-	for _, body := range functions {
-		if body.start <= off && off < body.end {
-			text := s.src[body.start:body.end]
-			if strings.Contains(text, "eval") || strings.Contains(text, "trap") || strings.Contains(text, "source") || strings.Contains(text, " . ") {
-				return true
-			}
-		}
-	}
-	return false
+	maxRef := refs[len(refs)-1]
+	i := sort.Search(len(s.functionCallList), func(i int) bool { return s.functionCallList[i] > off })
+	return i < len(s.functionCallList) && s.functionCallList[i] < maxRef
 }
 
 func (s *suspiciousAssignScan) nestedFunctionWrite(a Assign) bool {
-	insideFunction, matchingBody := false, false
-	for _, body := range s.functionBodies {
-		if body.start <= a.Offset && a.Offset < body.end {
-			insideFunction = true
-			if a.ScopeStart == body.start && a.ScopeEnd == body.end {
-				matchingBody = true
-			}
-		}
-	}
-	if !insideFunction {
+	owner, _, count := s.functionBodyOwner(a.Offset)
+	if count == 0 {
 		return false
 	}
-	for _, isolated := range s.functionIsolated {
-		if isolated.start <= a.Offset && a.Offset < isolated.end {
-			return true
-		}
+	if s.inFunctionIsolatedScope(a.Offset) {
+		return true
 	}
-	return !matchingBody
+	return a.ScopeStart != owner.start || a.ScopeEnd != owner.end
 }
 
 func (s *suspiciousAssignScan) referencesOutsideScope(a Assign) (inBody, outside bool) {
@@ -1147,15 +1292,9 @@ func (s *suspiciousAssignScan) referencesOutsideScope(a Assign) (inBody, outside
 		if ref <= a.Offset || (a.ScopeStart <= ref && ref < a.ScopeEnd) {
 			continue
 		}
-		found := false
-		for _, body := range s.functionBodies {
-			if body.start <= ref && ref < body.end {
-				inBody = true
-				found = true
-				break
-			}
-		}
-		if !found {
+		if s.bodyIndex.contains(ref) {
+			inBody = true
+		} else {
 			outside = true
 		}
 	}
