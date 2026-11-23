@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,9 @@ import (
 type hit struct {
 	src source
 	ev  transcript.Event
+	// cut, when set, is the text of the listing line already cut to its width: the database path gets only the
+	// start of a long text.
+	cut *string
 }
 
 type result struct {
@@ -87,6 +91,20 @@ func syntheticCondition(group []string) bool {
 }
 
 // Пропущенный вызов мог дать Who результата: сохраняем как возможные все условия, не опровергнутые строкой.
+// keepsBad tells whether a read with this filter parses a line that is not JSON: the prefilter of --grep and
+// --raw passes it.
+func (f *filter) keepsBad(raw []byte) bool {
+	if f.rawRE != nil && !f.rawRE.Match(raw) {
+		return false
+	}
+	for _, alternatives := range f.needles {
+		if !slices.ContainsFunc(alternatives, func(needle string) bool { return hasFolded(raw, needle) }) {
+			return false
+		}
+	}
+	return true
+}
+
 func (f *filter) keepWithState(raw []byte, tools transcript.ToolNames) bool {
 	keep, absent := f.keepRawState(raw, tools)
 	if !keep && absent >= 0 {
@@ -660,13 +678,13 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 		switch {
 		case f.match(ev):
 			for i := range before {
-				out = append(out, hit{src, before[i]})
+				out = append(out, hit{src: src, ev: before[i]})
 			}
 			before = before[:0]
-			out = append(out, hit{src, ev})
+			out = append(out, hit{src: src, ev: ev})
 			after = f.opts.context
 		case after > 0:
-			out = append(out, hit{src, ev})
+			out = append(out, hit{src: src, ev: ev})
 			after--
 		case f.opts.context > 0:
 			if len(before) == f.opts.context {
@@ -901,8 +919,14 @@ func line(h *hit, width int) string {
 	if h.ev.Who != "" {
 		who = strings.TrimSpace(h.ev.Who+" "+h.ev.Subtype) + ": "
 	}
+	text := ""
+	if h.cut != nil {
+		text = *h.cut
+	} else {
+		text = maskedShort(h.ev.Shown(), width)
+	}
 	return fmt.Sprintf("%s %s:%d %s %s%s", h.ev.Time.Local().Format("02.01 15:04:05"), h.src.ID, h.ev.Line, h.ev.Role,
-		who, maskedShort(h.ev.Shown(), width))
+		who, text)
 }
 
 // maskWindow is how far past the cut the text is masked first: a secret that
@@ -921,17 +945,27 @@ func maskedShort(text string, width int) string {
 	if width <= 0 || len(r) <= width {
 		return flat
 	}
-	n := min(len(r), width+maskWindow)
+	cut, _ := maskedCut(r, len(r), width)
+	return cut
+}
+
+// maskedCut is the cut of maskedShort for a flattened text of total runes known by its start r; false — the
+// start is too short for the cut, the whole text is needed.
+func maskedCut(r []rune, total, width int) (string, bool) {
+	n := min(total, width+maskWindow)
 	for {
+		if n > len(r) {
+			return "", false
+		}
 		masked, _ := hide(string(r[:n]))
 		m := []rune(masked)
-		if n == len(r) && len(m) <= width {
-			return masked
+		if n == total && len(m) <= width {
+			return masked, true
 		}
-		if n == len(r) || len(m) >= width+maskWindow {
-			return string(m[:width]) + fmt.Sprintf("…(+%d)", len(m)-width+len(r)-n)
+		if n == total || len(m) >= width+maskWindow {
+			return string(m[:width]) + fmt.Sprintf("…(+%d)", len(m)-width+total-n), true
 		}
-		n = min(len(r), 2*n)
+		n = min(total, 2*n)
 	}
 }
 
@@ -979,33 +1013,22 @@ func showRef(ref string, lineNo, width int, e env, w, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	var found []transcript.Event
+	var found []sortedHit
 	_, err = transcript.Read(path, nil, func(ev transcript.Event) {
 		if ev.Line == lineNo {
-			found = append(found, ev)
+			found = append(found, sortedHit{hit: hit{src: source{Path: path}, ev: ev}})
 		}
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
-	if len(found) == 0 {
-		fmt.Fprintf(w, "tl: no event at %s:%d (service record, unparsable line or out of range)\n", ref, lineNo)
-		return exitNone
-	}
-	for i := range found {
-		ev := &found[i]
-		who := ""
-		if ev.Who != "" {
-			who = " " + ev.Who
+	if e.collect != nil {
+		for i := range found {
+			e.collect.refs = append(e.collect.refs, found[i].hit)
 		}
-		text := maskEventText(ev.Shown())
-		if width > 0 && utf8.RuneCountInString(text) > width {
-			text = maskedShort(text, width)
-		}
-		fmt.Fprintf(w, "--- %s %s:%d %s%s\n%s\n", ev.Time.Local().Format("02.01.2006 15:04:05 MST"), ref, ev.Line, ev.Role, who, text)
 	}
-	return 0
+	return printRef(ref, lineNo, width, found, w)
 }
 
 // maskEventText sees the complete event, including any embedded line breaks.

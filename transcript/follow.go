@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 )
 
 // ErrFollowRestart — rollout codex впервые записал событие user_message или agent_message: по Read реплики и текст
@@ -152,4 +154,29 @@ func (f *Follow) Meta() Meta {
 	m := f.rd.meta
 	m.Originator, m.Account = f.rd.codex.originator, f.rd.codex.firstAccount
 	return m
+}
+
+// LineEndsAfter tells whether a line of the file ends between off and size: a reader that has the file up to off
+// has a complete line more to read.
+func LineEndsAfter(path string, off, size int64) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("read transcript: %w", err)
+	}
+	defer f.Close()
+	b := make([]byte, 64<<10)
+	for off < size {
+		n, err := f.ReadAt(b[:min(int64(len(b)), size-off)], off)
+		if bytes.IndexByte(b[:n], '\n') >= 0 {
+			return true, nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return false, nil
+			}
+			return false, fmt.Errorf("read transcript: %w", err)
+		}
+		off += int64(n)
+	}
+	return false, nil
 }

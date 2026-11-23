@@ -142,30 +142,6 @@ func tailAt(path string, end int64) (uint64, bool, error) {
 	return tailSum(b), true, nil
 }
 
-// lineAfter tells whether a line ends between off and size in the file.
-func lineAfter(path string, off, size int64) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, fmt.Errorf("read transcript: %w", err)
-	}
-	defer f.Close()
-	b := make([]byte, 64<<10)
-	for off < size {
-		n, err := f.ReadAt(b[:min(int64(len(b)), size-off)], off)
-		if bytes.IndexByte(b[:n], '\n') >= 0 {
-			return true, nil
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return false, nil
-			}
-			return false, fmt.Errorf("read transcript: %w", err)
-		}
-		off += int64(n)
-	}
-	return false, nil
-}
-
 // pieces reads the file from off up to size in pieces of about n bytes, each ending at a line end, and gives
 // each to fn with its offset. A line longer than n makes its piece longer. Returns the end of the last complete
 // line; the incomplete rest is left for the next pass.

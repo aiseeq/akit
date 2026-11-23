@@ -63,6 +63,15 @@ type usage struct {
 	Geo   string `json:"inference_geo"`
 }
 
+// ParseUsage reads the usage object of a Claude Code reply (message.usage) as Reply.Usage has it; null — nil.
+func ParseUsage(raw []byte) (*price.Usage, error) {
+	var u *usage
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return nil, fmt.Errorf("transcript: reply usage: %w", err)
+	}
+	return u.priced(), nil
+}
+
 func (u *usage) priced() *price.Usage {
 	if u == nil {
 		return nil

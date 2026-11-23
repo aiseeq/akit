@@ -575,7 +575,7 @@ func (l *loader) newParser(f *file) error {
 func (l *loader) loadOnce(f *file) error {
 	path, size := f.src.Path, f.size
 	if f.follow == nil && f.evLines >= f.lines {
-		has, err := lineAfter(path, f.ingested, size)
+		has, err := transcript.LineEndsAfter(path, f.ingested, size)
 		if err != nil {
 			l.fileErr(path, err)
 			f.stale = true

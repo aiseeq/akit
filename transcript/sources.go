@@ -64,6 +64,13 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 		}
 		paths = append(paths, more...)
 	}
+	return SelectSources(paths, since, until, project)
+}
+
+// SelectSources makes the choice of AllSourcesWindow among the given paths, for a caller that lists the
+// transcript names from another place than the folders: a missing file is left out, the others are checked on
+// disk the same way.
+func SelectSources(paths []string, since, until time.Time, project string) ([]Source, error) {
 	var out []Source
 	for _, p := range paths {
 		codexSource := strings.Contains(p, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator))

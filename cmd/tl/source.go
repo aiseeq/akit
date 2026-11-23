@@ -21,6 +21,14 @@ type source = transcript.Source
 const sinceDefault = 7 * 24 * time.Hour
 
 func resolve(opts options, e env) ([]source, error) {
+	return resolveWith(opts, e, func(since time.Time) ([]source, error) {
+		return transcript.AllSourcesWindow(e.home, since, opts.until, opts.project, opts.codex, !opts.noSubagents)
+	}, func(arg string) (string, error) { return find(arg, e.home) })
+}
+
+// resolveWith is resolve over a listing of the --all window and a find of a named session: the folders or the
+// database's list of files give them.
+func resolveWith(opts options, e env, window func(since time.Time) ([]source, error), find func(string) (string, error)) ([]source, error) {
 	if opts.all {
 		if len(opts.args) > 0 {
 			return nil, errors.New("--all and SESSION together; pick one")
@@ -29,7 +37,7 @@ func resolve(opts options, e env) ([]source, error) {
 		if since.IsZero() {
 			since = e.now.Add(-sinceDefault)
 		}
-		return transcript.AllSourcesWindow(e.home, since, opts.until, opts.project, opts.codex, !opts.noSubagents)
+		return window(since)
 	}
 	args := opts.args
 	if len(args) == 0 {
@@ -40,7 +48,7 @@ func resolve(opts options, e env) ([]source, error) {
 	}
 	var out []source
 	for _, a := range args {
-		path, err := find(a, e.home)
+		path, err := find(a)
 		if err != nil {
 			return nil, err
 		}
@@ -62,6 +70,11 @@ func resolve(opts options, e env) ([]source, error) {
 
 // find — файл транскрипта по пути, имени живой сессии или id (префиксу id).
 func find(arg, home string) (string, error) {
+	return findIn(arg, home, func() ([]string, error) { return transcriptPaths(home) })
+}
+
+// findIn is find over the transcript names that names lists: the folders, or the database's list of files.
+func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 	if strings.HasPrefix(arg, "~/") {
 		arg = filepath.Join(home, arg[2:])
 	}
@@ -84,7 +97,7 @@ func find(arg, home string) (string, error) {
 	if len(arg) < 6 || strings.ContainsAny(arg, "*?[") {
 		return "", fmt.Errorf("%q: not a live session name, and too short for a session id (6+ chars); find sessions with --grep or --all --project", arg)
 	}
-	paths, err := transcriptPaths(home)
+	paths, err := names()
 	if err != nil {
 		return "", fmt.Errorf("find %s: %w", arg, err)
 	}
@@ -147,14 +160,8 @@ func sourceFullID(src source) string {
 
 // transcriptPaths lists only transcript names in the same roots searched by find.
 func transcriptPaths(home string) ([]string, error) {
-	projects := session.ProjectsDir(home)
-	patterns := []string{
-		filepath.Join(projects, "*", "*.jsonl"),
-		filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"),
-		filepath.Join(transcript.WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"),
-	}
 	var paths []string
-	for _, pattern := range patterns {
+	for _, pattern := range transcriptPatterns(home) {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, fmt.Errorf("glob transcript names: %w", err)
@@ -163,6 +170,16 @@ func transcriptPaths(home string) ([]string, error) {
 	}
 	sort.Strings(paths)
 	return paths, nil
+}
+
+// transcriptPatterns — the names find and the link ids know: Claude Code sessions, their subagents, worker rollouts.
+func transcriptPatterns(home string) []string {
+	projects := session.ProjectsDir(home)
+	return []string{
+		filepath.Join(projects, "*", "*.jsonl"),
+		filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"),
+		filepath.Join(transcript.WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"),
+	}
 }
 
 // liveSessionNames returns the names readable now; the error names registry records skipped because they are being written.

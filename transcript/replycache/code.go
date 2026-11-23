@@ -1,3 +1,3 @@
 package replycache
 
-const cacheCode = "8ba91990e4d17b3709b746632ea901511398fb8cc1651ca9b6b98a6295b53cae"
+const cacheCode = "374fae46e803b5c0cf747e85d0064a120567e6ced23e99b8719cba82df229cc2"

@@ -263,3 +263,22 @@ func TestFollowSkipEqualsRead(t *testing.T) {
 		t.Fatal("пропуск после Feed принят")
 	}
 }
+
+func TestLineEndsAfter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.jsonl")
+	if err := os.WriteFile(path, []byte("{\"a\":1}\n{\"b\":"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		off, size int64
+		want      bool
+	}{{0, 13, true}, {7, 13, true}, {8, 13, false}, {0, 7, false}, {8, 100, false}} {
+		got, err := LineEndsAfter(path, c.off, c.size)
+		if err != nil || got != c.want {
+			t.Errorf("%d..%d: %v %v, want %v", c.off, c.size, got, err, c.want)
+		}
+	}
+	if _, err := LineEndsAfter(filepath.Join(t.TempDir(), "none"), 0, 1); err == nil {
+		t.Error("a missing file: no error")
+	}
+}

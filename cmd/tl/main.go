@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -112,6 +113,16 @@ one. The value itself is not recoverable. The mask also hides some names that lo
 pk_test_… identifier): N tells whether it may be the name you expect, and the
 same TAG elsewhere shows where the same text recurs. Without the key the
 markers are [скрыто:KIND] and stderr says why.
+Database: TL_BACKEND=db answers --all, --grep, --raw, --usage, SESSION and REF
+from the ClickHouse tables of the transcript loader (TL_CLICKHOUSE_URL, default
+http://127.0.0.1:18123; TL_CLICKHOUSE_DB, default tr; read-only), the lines it
+has not loaded yet from the files; output is the same. If the database fails,
+stderr says so and tl reads the files. The default TL_BACKEND=files repeats a
+share of calls (TL_SHADOW_RATE, default 0.1, 0 off) through the database in a
+background process after the answer and appends one JSON line to
+TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
+counts of both paths up to the call's start or --until, "diff" (-1 when the
+repeat failed), both times. TL_DB_TRACE=1 prints the time of each query.
 Exit: 0 found, 1 none, 2 usage/IO error.
 `
 
@@ -165,12 +176,20 @@ var machineHelp = func() clihelp.Help {
 }()
 
 func main() {
+	if spec := os.Getenv(shadowChildEnv); spec != "" {
+		if err := runShadowChild(spec); err != nil {
+			fmt.Fprintf(os.Stderr, "%s tl: shadow: %v\n", time.Now().Format(time.RFC3339), err)
+			os.Exit(exitUsage)
+		}
+		os.Exit(0)
+	}
 	os.Exit(start(os.Args[1:], time.Now(), os.Stdout, os.Stderr))
 }
 
 // start parses the arguments and runs tl. What it prints itself is masked like the output of run: an
 // error quotes the argument, and a pasted key may be one.
 func start(args []string, now time.Time, stdout, stderr io.Writer) int {
+	begin := time.Now()
 	opts, err := parseArgs(args, now)
 	if errors.Is(err, errHelp) {
 		printMasked(stdout, usage)
@@ -195,7 +214,32 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	if err := useMaskKey(maskKeyPath(home)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 	}
-	return run(opts, env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now}, stdout, stderr)
+	e := env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now,
+		backend: backendFromEnv(stderr)}
+	if os.Getenv("TL_DB_TRACE") != "" {
+		e.dbTrace = stderr
+	}
+	if pick, err := pickShadow(opts, e.backend); err != nil {
+		printMasked(stderr, fmt.Sprintf("tl: %v; no shadow\n", err))
+	} else if pick {
+		e.collect = &answer{}
+	}
+	code := run(opts, e, stdout, stderr)
+	shadowAfter(e.collect, opts, e, code, time.Since(begin), stderr)
+	return code
+}
+
+// backendFromEnv is TL_BACKEND: files (the default) or db.
+func backendFromEnv(stderr io.Writer) string {
+	switch b := os.Getenv("TL_BACKEND"); b {
+	case "", backendFiles:
+		return backendFiles
+	case backendDB:
+		return backendDB
+	default:
+		printMasked(stderr, fmt.Sprintf("tl: TL_BACKEND=%q is not files or db; reading files\n", b))
+		return backendFiles
+	}
 }
 
 // printMasked prints like fmt.Fprint, with secret values masked.
@@ -210,6 +254,9 @@ type env struct {
 	configHome string
 	sessionID  string
 	now        time.Time
+	backend    string    // TL_BACKEND: files or db
+	collect    *answer   // set when the shadow repeats this call: what the answer found
+	dbTrace    io.Writer // TL_DB_TRACE: the time of each database query
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
@@ -576,10 +623,39 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "tl: --open-questions needs a SESSION, not an event reference")
 		return exitUsage
 	}
+	if e.backend == backendDB && dbForm(opts) {
+		if code, ok := runOutputDB(opts, e, refs, stdout, stderr); ok {
+			return code
+		}
+	}
 	if len(refs) > 0 {
 		return reportRefs(refs, opts, e, stdout, stderr)
 	}
 	return runOutputSessions(opts, e, stdout, stderr)
+}
+
+// runOutputDB answers through the database; false — it could not, nothing is printed but the warning, and the
+// caller reads the files.
+func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, bool) {
+	c, err := newCHClientFromEnv()
+	if err == nil {
+		var out, errs bytes.Buffer
+		var code int
+		if code, err = runDB(context.Background(), c, opts, e, refs, &out, &errs); err == nil {
+			_, outErr := io.Copy(stdout, &out)
+			_, errErr := io.Copy(stderr, &errs)
+			if err := errors.Join(outErr, errErr); err != nil {
+				fmt.Fprintf(stderr, "tl: write output: %v\n", err)
+				return exitUsage, true
+			}
+			return code, true
+		}
+	}
+	fmt.Fprintf(stderr, "tl: TL_BACKEND=db: %v; reading files instead\n", err)
+	if e.collect != nil {
+		*e.collect = answer{}
+	}
+	return 0, false
 }
 
 func reportRefs(refs []eventRef, opts options, e env, stdout, stderr io.Writer) int {
@@ -589,6 +665,9 @@ func reportRefs(refs []eventRef, opts options, e env, stdout, stderr io.Writer) 
 		width = opts.width
 	}
 	code := 0
+	if e.collect != nil {
+		e.collect.filled = true
+	}
 	for _, ref := range refs {
 		if result := showRef(ref.id, ref.line, width, e, stdout, stderr); result > code {
 			code = result
@@ -633,6 +712,9 @@ func runOutputSessions(opts options, e env, stdout, stderr io.Writer) int {
 	}
 	if opts.waitProg != "" || opts.waitAll {
 		return reportWaitOutput(res, sources, opts, stdout, stderr)
+	}
+	if e.collect != nil {
+		e.collect.res, e.collect.filled = &res, true
 	}
 	if opts.usage {
 		return reportUsage(res, sources, opts, e, stdout)
