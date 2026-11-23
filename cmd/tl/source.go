@@ -203,12 +203,15 @@ func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames m
 	for _, src := range sources {
 		fullIDs[src.Path] = sourceFullID(src)
 	}
-	counts := make(map[string]int)
+	counts := make(map[string]int, len(fullIDs))
+	unique := make([]string, 0, len(fullIDs))
 	for _, id := range fullIDs {
-		for length := 1; length <= len(id); length++ {
-			counts[id[:length]]++
+		if counts[id] == 0 {
+			unique = append(unique, id)
 		}
+		counts[id]++
 	}
+	sort.Strings(unique)
 	ids := make(map[string]string, len(sources))
 	for _, src := range sources {
 		path, id := src.Path, fullIDs[src.Path]
@@ -226,7 +229,20 @@ func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames m
 			continue
 		}
 		length := min(8, len(id))
-		for length < len(id) && (counts[id[:length]] > 1 || liveNames[id[:length]]) {
+		at := sort.SearchStrings(unique, id)
+		common := 0
+		if at > 0 {
+			common = max(common, commonPrefix(id, unique[at-1]))
+		}
+		if at+1 < len(unique) {
+			common = max(common, commonPrefix(id, unique[at+1]))
+		}
+		if common >= len(id) {
+			ids[path] = tilde(path, home)
+			continue
+		}
+		length = max(length, common+1)
+		for length < len(id) && liveNames[id[:length]] {
 			length++
 		}
 		if liveNames[id[:length]] {
@@ -236,6 +252,14 @@ func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames m
 		}
 	}
 	return ids
+}
+
+func commonPrefix(a, b string) int {
+	i := 0
+	for i < len(a) && i < len(b) && a[i] == b[i] {
+		i++
+	}
+	return i
 }
 
 type eventRef struct {

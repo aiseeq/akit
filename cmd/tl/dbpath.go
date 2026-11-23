@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"runtime/pprof"
 	"slices"
 	"sort"
 	"strconv"
@@ -64,6 +66,7 @@ type dbFile struct {
 	loaded   time.Time // when the loader wrote this row
 	bad      int       // lines the loader could not parse
 	inode    uint64
+	tail     uint64
 }
 
 type dbPath struct {
@@ -81,6 +84,20 @@ type dbPath struct {
 // runDB answers the call through the database into stdout and stderr; an error means no answer was printed and
 // the caller reads the files.
 func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, error) {
+	if profilePath := os.Getenv("TL_DB_PPROF"); profilePath != "" {
+		profile, err := os.Create(profilePath)
+		if err != nil {
+			return 0, fmt.Errorf("create database CPU profile: %w", err)
+		}
+		if err := pprof.StartCPUProfile(profile); err != nil {
+			_ = profile.Close()
+			return 0, fmt.Errorf("start database CPU profile: %w", err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = profile.Close()
+		}()
+	}
 	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
 	d := &dbPath{c: c, ctx: ctx, opts: opts, e: e, trace: e.dbTrace}
@@ -144,18 +161,18 @@ func (d *dbPath) loadFiles() error {
 	ctx, cancel := context.WithTimeout(d.ctx, filesTimeout)
 	defer cancel()
 	rows, err := d.queryIn(ctx, chQuery{name: "files", sql: "SELECT file_id, path, name, ingested, lines, ev_lines, " +
-		"intDiv(ver, 1000000), bad, inode FROM files FINAL"})
+		"intDiv(ver, 1000000), bad, inode, tail FROM files FINAL"})
 	if err != nil {
 		return err
 	}
 	d.files = make(map[string]*dbFile, len(rows))
 	for _, row := range rows {
-		if len(row) != 9 {
-			return fmt.Errorf("files: %d fields in a row, want 9", len(row))
+		if len(row) != 10 {
+			return fmt.Errorf("files: %d fields in a row, want 10", len(row))
 		}
 		p := fields{row: row}
 		f := &dbFile{id: p.uint(0), path: row[1], name: row[2], ingested: int64(p.uint(3)), lines: p.int(4), evLines: p.int(5),
-			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), inode: p.uint(8)}
+			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), inode: p.uint(8), tail: p.uint(9)}
 		if p.err != nil {
 			return fmt.Errorf("files: %w", p.err)
 		}
@@ -188,6 +205,23 @@ func (d *dbPath) stored(path string) (*dbFile, error) {
 	if ino := transcript.Inode(st); ino != 0 && f.inode != 0 && ino != f.inode {
 		return nil, nil
 	}
+	if f.ingested > 0 {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("open %s tail: %w", path, err)
+		}
+		from := max(f.ingested-256, 0)
+		buf := make([]byte, f.ingested-from)
+		_, readErr := file.ReadAt(buf, from)
+		closeErr := file.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return nil, fmt.Errorf("read %s tail: %w", path, err)
+		}
+		sum := sha256.Sum256(buf)
+		if binary.BigEndian.Uint64(sum[:8]) != f.tail {
+			return nil, nil
+		}
+	}
 	return f, nil
 }
 
@@ -211,7 +245,20 @@ func (p *fields) int(i int) int { return int(p.uint(i)) }
 // deleted or moved since the loader read it is not answered from its rows, and one the loader has not reached
 // yet is read from the file.
 func (d *dbPath) resolve() ([]source, error) {
-	return resolve(d.opts, d.e)
+	return resolveWith(d.opts, d.e, func(since time.Time) ([]source, error) {
+		paths, err := d.listNames()
+		if err != nil {
+			return nil, err
+		}
+		selected := make([]string, 0, len(paths))
+		for _, path := range paths {
+			if isCodexRollout(path) && !d.opts.codex || strings.Contains(path, string(os.PathSeparator)+"subagents"+string(os.PathSeparator)) && d.opts.noSubagents {
+				continue
+			}
+			selected = append(selected, path)
+		}
+		return transcript.SelectSources(selected, since, d.opts.until, d.opts.project)
+	}, func(arg string) (string, error) { return d.find(arg) })
 }
 
 func (d *dbPath) find(arg string) (string, error) {
@@ -397,12 +444,12 @@ func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	rows, err := d.query(chQuery{name: "bad", sql: "SELECT file_id, line, raw FROM raw WHERE file_id IN {files:Array(UInt64)} AND NOT isValidJSON(raw) " +
+	rows, err := d.query(chQuery{name: "bad", sql: "SELECT file_id, line, raw FROM raw WHERE file_id IN {files:Array(UInt64)} " +
 		"ORDER BY file_id, line", params: map[string]string{"files": chUints(ids)}, settings: rawSettings})
 	if err != nil {
 		return err
 	}
-	invalid := map[uint64]int{}
+	follows := make(map[uint64]*transcript.Follow, len(byID))
 	for _, row := range rows {
 		if len(row) != 3 {
 			return fmt.Errorf("bad: %d fields in a row, want 3", len(row))
@@ -413,29 +460,25 @@ func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 			return fmt.Errorf("bad: %w", p.err)
 		}
 		s, ok := byID[id]
-		if !ok || line > s.file.evLines {
+		if !ok || line > s.file.lines {
 			continue
 		}
-		var v any
-		jerr := json.Unmarshal([]byte(row[2]), &v)
-		if jerr == nil {
-			continue
+		fl := follows[id]
+		if fl == nil {
+			fl = transcript.NewFollow()
+			follows[id] = fl
 		}
-		invalid[id]++
-		if !d.f.keepsBad([]byte(row[2])) {
-			continue
+		before := fl.Meta()
+		if err := fl.Feed([]byte(row[2]+"\n"), func(transcript.Event) {}); err != nil {
+			return fmt.Errorf("bad: parse stored line %d: %w", line, err)
 		}
-		b := out[s.src.Path]
-		b.n++
-		if b.first == nil {
-			b.first = fmt.Errorf("line %d: not a JSON record: %w", line, jerr)
-		}
-		out[s.src.Path] = b
-	}
-	for id, s := range byID {
-		if rest := s.file.bad - invalid[id]; rest > 0 {
+		after := fl.Meta()
+		if after.Bad > before.Bad && d.f.keepsBad([]byte(row[2])) {
 			b := out[s.src.Path]
-			b.n += rest
+			b.n++
+			if b.first == nil {
+				b.first = after.FirstBad
+			}
 			out[s.src.Path] = b
 		}
 	}

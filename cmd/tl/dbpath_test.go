@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +39,7 @@ type chFile struct {
 	id               uint64
 	path, name, kind string
 	ingested         int64
+	tail             uint64
 	lines, evLines   int
 	loaded           time.Time
 	events           []chEvent
@@ -70,6 +73,11 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 				f.ingested += int64(len(l))
 			}
 			f.raw = append(f.raw, strings.TrimRight(l, "\r\n"))
+		}
+		if f.ingested > 0 {
+			loaded := []byte(strings.Join(lines[:n], ""))
+			sum := sha256.Sum256(loaded[max(0, len(loaded)-256):])
+			f.tail = binary.BigEndian.Uint64(sum[:8])
 		}
 		st, err := os.Stat(path)
 		if err != nil {
@@ -150,7 +158,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "files":
 		for _, f := range s.files {
-			row(f.id, f.path, f.name, f.ingested, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad, f.inode)
+			row(f.id, f.path, f.name, f.ingested, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad, f.inode, f.tail)
 		}
 	case "events", "usage":
 		for _, f := range s.files {
@@ -221,9 +229,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			for i, raw := range f.raw {
-				if !json.Valid([]byte(raw)) {
-					row(f.id, i+1, raw)
-				}
+				row(f.id, i+1, raw)
 			}
 		}
 	case "texts":
@@ -622,6 +628,76 @@ func TestDBFollowsTheDisk(t *testing.T) {
 	}
 }
 
+func TestDBDetectsSameInodeRewrite(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	path := paths[1]
+	var ingested int64
+	for _, file := range ch.files {
+		if file.path == path {
+			ingested = file.ingested
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tailStart := max(int(ingested)-256, 0)
+	if !strings.Contains(string(data[tailStart:ingested]), "быстрый ответ") {
+		t.Fatal("fixture marker is outside the stored tail")
+	}
+	rewritten := strings.Replace(string(data), "быстрый ответ", "сломано ответ", 1)
+	if rewritten == string(data) {
+		t.Fatal("fixture text not found")
+	}
+	if err := os.WriteFile(path, []byte(rewritten), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript.Inode(before) != transcript.Inode(after) || after.Size() < before.Size() {
+		t.Fatalf("rewrite changed inode or shortened file: inode %d -> %d, size %d -> %d", transcript.Inode(before), transcript.Inode(after), before.Size(), after.Size())
+	}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	for _, needle := range []string{"быстрый", "сломано"} {
+		e.backend = backendFiles
+		codeF, outF, errF := runTL(t, e, "--all", "--role", "all", "--grep", needle, "--max", "0")
+		e.backend = backendDB
+		codeD, outD, errD := runTL(t, e, "--all", "--role", "all", "--grep", needle, "--max", "0")
+		if codeF != codeD || outF != outD || errF != errD {
+			t.Errorf("grep %q: files (%d) %q %q, db (%d) %q %q", needle, codeF, outF, errF, codeD, outD, errD)
+		}
+	}
+}
+
+func TestDBDeletedRowsDoNotDefineShortIDs(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	gone := writeReviewClaude(t, e, "-home-x-proj", "9d9d9d9d-0000-4000-8000-000000000004",
+		userRecord("2026-10-25T10:30:00.000Z", "удалённая сессия sub"))
+	active := writeReviewClaude(t, e, "-home-x-proj", "9d9d9d9d-1111-4000-8000-000000000004",
+		userRecord("2026-10-25T10:31:00.000Z", "оставшаяся сессия"))
+	ch := newFakeCH(t, append(paths, gone, active), unloaded)
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, out, _ := runTL(t, e, "--all", "--role", "all", "--max", "0")
+	if code != 0 || strings.Contains(out, "удалённая сессия") || !strings.Contains(out, "9d9d9d9d:1") {
+		t.Fatalf("deleted transcript affected live short id: code %d\n%s", code, out)
+	}
+}
+
 // A database that does not answer leaves the call to the files, with a warning.
 func TestDBUnavailableReadsFiles(t *testing.T) {
 	e, _, _ := dbCorpus(t)
@@ -765,5 +841,23 @@ func TestFakeGrepCondition(t *testing.T) {
 		if got := ch.match(q, cond, f, e); got != want {
 			t.Errorf("%q over %q: fake server %v, Go %v (%s)", c2.pattern, c2.text, got, want, cond)
 		}
+	}
+}
+
+func TestFakeGrepFoldedAlternateKeepsUnfoldableBranch(t *testing.T) {
+	const pattern = "ſ|s"
+	cond, params, err := grepCondition(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params["t"] = chString("ſ")
+	q := url.Values{"param_files": {"[1]"}, "param_kinds": {"['claude']"}, "param_roles": {"['user']"}}
+	for k, v := range params {
+		q.Set("param_"+k, v)
+	}
+	ch := &fakeCH{t: t}
+	got := ch.match(q, cond, &chFile{id: 1, kind: "claude"}, chEvent{ev: transcript.Event{Role: transcript.User, Text: "ſ"}})
+	if !got || !regexp.MustCompile("(?i)"+pattern).MatchString("ſ") {
+		t.Fatalf("folded alternative rejected its long-s branch: condition %q, got %v", cond, got)
 	}
 }

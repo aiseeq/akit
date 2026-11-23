@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -853,6 +854,9 @@ func (res result) problems() string {
 
 // report печатает события: сначала id и пути файлов, где они нашлись, затем по строке на событие.
 func report(res result, opts options, e env, w io.Writer) int {
+	buffered := bufio.NewWriterSize(w, 64<<10)
+	defer buffered.Flush()
+	w = buffered
 	hits := res.hits
 	if len(hits) == 0 {
 		fmt.Fprintf(w, "tl: no events in %d transcript(s)%s%s\n", res.files, windowNote(opts, e), res.problems())
