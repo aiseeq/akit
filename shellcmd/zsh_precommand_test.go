@@ -21,6 +21,10 @@ func TestZshPrecommandModifiersAreWrappers(t *testing.T) {
 		{`noglob - - kill 1`, "kill", "noglob"},
 		{`noglob exec - kill 1`, "kill", "exec"},
 		{`zsh -c 'noglob - kill -9 1'`, "kill", "noglob"},
+		{`- kill 1`, "kill", "-"},
+		{`time - kill 1`, "kill", "-"},
+		{`zsh -c '- rm -rf /x'`, "rm", "-"},
+		{`- - kill 1`, "kill", "-"},
 	} {
 		calls, err := Calls(tc.src)
 		if err != nil {
@@ -32,6 +36,25 @@ func TestZshPrecommandModifiersAreWrappers(t *testing.T) {
 		}
 		if !slices.Contains(calls[i].Via, tc.via) {
 			t.Errorf("%s: %s Via = %v, want %s in it", tc.src, tc.name, calls[i].Via, tc.via)
+		}
+	}
+}
+
+func TestZshDashModifierDoesNotApplyInsideExternalWrappers(t *testing.T) {
+	for _, src := range []string{`env -`, `env - A=1 - kill 1`} {
+		calls, err := Calls(src)
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		var names []string
+		for _, call := range calls {
+			if !slices.Contains(names, call.Name) {
+				names = append(names, call.Name)
+			}
+		}
+		slices.Sort(names)
+		if !slices.Equal(names, []string{"-", "env"}) {
+			t.Errorf("%s: call names = %v, want [- env] (calls %+v)", src, names, calls)
 		}
 	}
 }

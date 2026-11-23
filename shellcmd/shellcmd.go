@@ -6106,6 +6106,12 @@ func shellArgs(shell string, args []string) (operand int, command, stdin bool) {
 		return fishShellArgs(args)
 	}
 	for i := 0; i < len(args); i++ {
+		if command && args[i] == "--" {
+			return i + 1, true, stdin
+		}
+		if command && (args[i] == "-" || strings.ContainsAny(args[i], " \t\n")) {
+			return i, true, stdin
+		}
 		if shell == "fish" && strings.HasPrefix(args[i], "--command=") {
 			return i, true, stdin
 		}
@@ -7507,7 +7513,17 @@ func emitExpanded(c cmd, lineBase int, vars map[string]string, calls *[]Call, se
 	start := len(*calls)
 	err := expand(c, lineBase, vars, calls, seen)
 	markCalls(seen, (*calls)[start:])
-	return err
+	if err != nil {
+		return err
+	}
+	return emitZshDashModifierRoute(c, lineBase, vars, calls, seen)
+}
+
+func emitZshDashModifierRoute(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
+	if c.call.Name != "-" || len(c.call.Args) == 0 || !zshDashModifierRoute(c.call.Via) {
+		return nil
+	}
+	return emit(c.sub(1, c.via("-")), lineBase, vars, calls, seen)
 }
 
 func emitCompatibleRoutes(c cmd, lineBase int, vars map[string]string, calls *[]Call, seen *callSet) error {
@@ -11036,4 +11052,14 @@ func zshPrecommandModifier(name string) bool {
 		return true
 	}
 	return false
+}
+
+func zshDashModifierRoute(via []string) bool {
+	for _, name := range via {
+		if name == "time" || name == "-" || zshPrecommandModifier(name) || isShell(name) || name == "-c" || name == "-lc" || name == "-ic" {
+			continue
+		}
+		return false
+	}
+	return true
 }
