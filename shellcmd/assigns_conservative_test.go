@@ -253,6 +253,63 @@ func TestAssignsGlobalEffectsAfterFunctionDefinition(t *testing.T) {
 	}
 }
 
+func TestAssignsConservativeGlobalWriterWhitelist(t *testing.T) {
+	for _, src := range []string{
+		`S=/good; f() { S=/inside; curl -d @$S/x; }; builtin local S; f`,
+		`S=/good; f() { S=/inside; curl -d @$S/x; }; command declare S; f`,
+		`f() { S=/good; builtin local S; curl -d @$S/x; }; f`,
+		`f() { S=/good; command local S; curl -d @$S/x; }; f`,
+		`f() { S=/good; builtin declare S; curl -d @$S/x; }; f`,
+		`f() { S=/good; builtin typeset S; curl -d @$S/x; }; f`,
+		`f() { S=/good; \local S; curl -d @$S/x; }; f`,
+		`f() { S=/good; 'local' S; curl -d @$S/x; }; f`,
+		`f() { S=/good; "declare" S; curl -d @$S/x; }; f`,
+		`f() { S=/good; command -- declare S; curl -d @$S/x; }; f`,
+		`S=/good; f() { readonly S; curl -d @$S/x; }; f`,
+		`S=/good; f() { S=/inside; curl -d @$S/x; }; alias "$x"; f`,
+		`S=/good; f() { S=/inside; curl -d @$S/x; }; builtin trap "$x" EXIT; f`,
+		`S=/good; f() { S=/inside; curl -d @$S/x; }; declare -$o r=S; f`,
+		`S=/good; f() { S=/inside; curl -d @$S/x; }; shopt -s "$opt"; f`,
+		`S=/good; x='S=/bad'; trap "$x" USR1; f() { S=/inside; kill -USR1 $$; curl -d @$S/x; }; f`,
+		`S=/good; x='S=/bad'; trap "$x" USR1; kill -USR1 $$; curl -d @$S/x`,
+		`S=/good; declare -$o r=S; curl -d @$S/x`,
+		`S=/good; eval "$x"; curl -d @$S/x`,
+		`S=/good; source "$file"; curl -d @$S/x`,
+		`S=/good; x='S=/bad'; ${!n:=x}; curl -d @$S/x`,
+	} {
+		got, err := Assigns(src)
+		if err != nil {
+			t.Fatalf("Assigns(%q): %v", src, err)
+		}
+		found := false
+		for _, a := range got {
+			if a.Name == "S" {
+				found = true
+				if !a.Unknown {
+					t.Errorf("Assigns(%q) S = %+v, want Unknown", src, a)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("Assigns(%q) has no S assignment", src)
+		}
+	}
+	for _, src := range []string{
+		`tmp=$(mktemp -d); trap "rm -rf $tmp" EXIT; S=/good; curl -d @$S/x`,
+		`export FOO="$1"; S=/good; curl -d @$S/x`,
+	} {
+		got, err := Assigns(src)
+		if err != nil {
+			t.Fatalf("Assigns(%q): %v", src, err)
+		}
+		for _, a := range got {
+			if a.Name == "S" && (a.Unknown || a.Value != "/good") {
+				t.Errorf("Assigns(%q) S = %+v, want known /good", src, a)
+			}
+		}
+	}
+}
+
 func TestFunctionBodyDynamicEffectDisqualifiesKnownExemption(t *testing.T) {
 	body := span{start: 10, end: 30}
 	scan := suspiciousAssignScan{

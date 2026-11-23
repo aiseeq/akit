@@ -101,8 +101,10 @@ func (a Assign) VisibleAt(off int) bool {
 
 // Assigns returns assignments in source order. Prefix assignments and declarations without a
 // value are omitted; a function called with a prefix sees its value, so a name with a prefix and a
-// reference inside a function body is Unknown. It marks all assignments Unknown when the script contains eval, a dynamic
-// command word, a defining alias or BASH_ALIASES write, a command trap, mapfile/readarray -C,
+// reference inside a function body is Unknown. Function-body writes are precise only when later references
+// stay in that body and no command can write variables outside the parsed model. It marks all assignments
+// Unknown when the script contains eval, a dynamic command word, dynamic arguments to variable-writing
+// commands, a defining alias or BASH_ALIASES write, a command trap, mapfile/readarray -C,
 // source/dot, a declare/local/typeset -n option, or a recognized nested shell script from a string
 // or stdin. Per-name triggers include arithmetic and -i declarations; `${name:=…}`; write targets
 // of read, printf -v, getopts, mapfile/readarray, unset, wait -p, coproc, and `{name}>…`;
@@ -168,9 +170,6 @@ func suspiciousAssignNames(file *syntax.File, src string, assigns []Assign) (map
 		integerVars: make(map[string]bool), writeNames: make(map[string]bool),
 		functionCounts: make(map[string]int), functionRefs: make(map[string][]int), functionNames: make(map[span]string), functionUnknown: make(map[int]bool),
 		definedFunctions: make(map[string]bool), functionCalls: make(map[string][]int),
-		// Any mention of posix (set -o posix, shopt -so posix, POSIXLY_CORRECT) may switch bash to posix mode,
-		// where a prefix assignment before a special builtin persists. Checked once: per command it was quadratic.
-		posix: strings.Contains(src, "posix") || strings.Contains(src, "POSIX"),
 	}
 	syntax.Walk(file, scan.visit)
 	for _, call := range scan.callSites {
@@ -328,6 +327,9 @@ func nodeSpan(node syntax.Node) span {
 
 func (s *suspiciousAssignScan) visitAssign(assign *syntax.Assign) {
 	if assign.Name != nil {
+		if assign.Name.Value == "POSIXLY_CORRECT" {
+			s.posix = true
+		}
 		if assign.Value != nil {
 			if s.valueSpans == nil {
 				s.valueSpans = make(map[string][]span)
@@ -395,11 +397,6 @@ func (s *suspiciousAssignScan) visitCoproc(clause *syntax.CoprocClause) {
 }
 
 func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
-	if len(call.Args) > 0 {
-		if word, ok := wordValue(call.Args[0]); ok {
-			s.callSites = append(s.callSites, callSite{name: word, offset: int(call.Pos().Offset())})
-		}
-	}
 	for _, assign := range call.Assigns {
 		if assign.Name != nil && len(call.Args) > 0 {
 			// A prefix before a function call is seen inside the function body, though Assigns omits it.
@@ -412,17 +409,14 @@ func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
 	if len(call.Args) == 0 {
 		return
 	}
-	name, ok := wordValue(call.Args[0])
+	name, argWords, args, ok := unwrapCallWords(call.Args)
 	if !ok {
 		s.all = true
+		s.markGlobalEffect(call)
 		return
 	}
-	args := make([]string, len(call.Args))
-	for i, word := range call.Args {
-		args[i], _ = wordValue(word)
-	}
-	name, args = unwrapBuiltinCommand(name, args)
-	s.callEffects(name, args, call)
+	s.callSites = append(s.callSites, callSite{name: name, offset: int(call.Pos().Offset())})
+	s.callEffects(name, args, argWords, call)
 	s.nestedShellInput(call)
 	if len(call.Assigns) > 0 && (s.specialBuiltin(name) || strings.Contains(" declare local typeset ", " "+name+" ")) {
 		for _, assign := range call.Assigns {
@@ -433,69 +427,302 @@ func (s *suspiciousAssignScan) call(call *syntax.CallExpr) {
 	}
 }
 
-func unwrapBuiltinCommand(name string, args []string) (string, []string) {
-	for name == "command" || name == "builtin" {
-		next := 1
-		for next < len(args) && strings.HasPrefix(args[next], "-") && args[next] != "--" {
-			next++
-		}
-		if next < len(args) && args[next] == "--" {
-			next++
-		}
-		if next >= len(args) {
-			break
-		}
-		name, args = args[next], args[next:]
+func unwrapCallWords(words []*syntax.Word) (string, []*syntax.Word, []string, bool) {
+	if len(words) == 0 {
+		return "", nil, nil, false
 	}
-	return name, args
+	name, ok := wordValue(words[0])
+	if !ok {
+		return "", nil, nil, false
+	}
+	index := 1
+	for name == "command" || name == "builtin" {
+		for index < len(words) {
+			option, literal := wordValue(words[index])
+			if !literal {
+				return "", nil, nil, false
+			}
+			if option == "--" {
+				index++
+				break
+			}
+			if !strings.HasPrefix(option, "-") {
+				break
+			}
+			index++
+		}
+		if index >= len(words) {
+			return "", nil, nil, false
+		}
+		var literal bool
+		name, literal = wordValue(words[index])
+		if !literal {
+			return "", nil, nil, false
+		}
+		index++
+	}
+	args := make([]string, len(words)-index+1)
+	args[0] = name
+	argWords := words[index:]
+	for i, word := range argWords {
+		args[i+1], _ = wordValue(word)
+	}
+	return name, argWords, args, true
 }
 
-func (s *suspiciousAssignScan) callEffects(name string, args []string, call *syntax.CallExpr) {
+func hasDynamicWord(words []*syntax.Word) bool {
+	for _, word := range words {
+		if _, ok := wordValue(word); !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func isDynamicWord(word *syntax.Word) bool {
+	if word == nil {
+		return true
+	}
+	_, ok := wordValue(word)
+	return !ok
+}
+
+func literalAssignmentValue(word *syntax.Word, src string) bool {
+	if value, ok := wordValue(word); ok {
+		name, _, hasValue := strings.Cut(value, "=")
+		return hasValue && shellVarName.MatchString(name)
+	}
+	lo, hi := int(word.Pos().Offset()), int(word.End().Offset())
+	if lo < 0 || hi > len(src) || lo >= hi {
+		return false
+	}
+	raw := strings.TrimLeft(src[lo:hi], "\"'")
+	before, _, ok := strings.Cut(raw, "=")
+	if !ok {
+		return false
+	}
+	name := strings.Trim(before, "\"'")
+	return shellVarName.MatchString(name)
+}
+
+func dynamicReadTarget(args []string, words []*syntax.Word) bool {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return hasDynamicWord(words[i:])
+		}
+		if arg == "" {
+			return true
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			return false
+		}
+		option := strings.TrimLeft(arg, "-")
+		if strings.ContainsRune(option, 'a') {
+			if len(option) > 1 {
+				return isDynamicWord(words[i-1])
+			}
+			if i+1 < len(args) {
+				if isDynamicWord(words[i]) {
+					return true
+				}
+				i++
+			}
+			continue
+		}
+		if len(option) == 1 && strings.ContainsRune("dinNptu", rune(option[0])) && i+1 < len(args) {
+			i++
+		}
+	}
+	return false
+}
+
+func dynamicPrintfTarget(args []string, words []*syntax.Word) bool {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-v" {
+			if i >= len(args)-1 {
+				return false
+			}
+			return isDynamicWord(words[i])
+		}
+		if strings.HasPrefix(arg, "-v") && arg != "-v" {
+			return isDynamicWord(words[i-1])
+		}
+		if arg == "" {
+			return true
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return false
+		}
+	}
+	return false
+}
+
+func hasDynamicTargetAfterOptions(args []string, words []*syntax.Word) bool {
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--" {
+			return hasDynamicWord(words[i:])
+		}
+		if strings.HasPrefix(args[i], "-") && args[i] != "" {
+			continue
+		}
+		return args[i] == ""
+	}
+	return false
+}
+
+func dynamicWaitTarget(args []string) bool {
+	for i := 1; i+1 < len(args); i++ {
+		if args[i] == "-p" {
+			return args[i+1] == ""
+		}
+	}
+	return false
+}
+
+func optionHasPosix(args []string, _ []*syntax.Word) bool {
+	for i, value := range args {
+		if value == "posix" && i > 0 && (strings.Contains(args[i-1], "o") || args[i-1] == "-s" || args[i-1] == "-so") {
+			return true
+		}
+		if i > 0 && strings.Contains(value, "o") && i+1 < len(args) && args[i+1] == "posix" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *suspiciousAssignScan) setOptions(args []string, _ []*syntax.Word, call *syntax.CallExpr) {
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--" {
+			return
+		}
+		if args[i] == "" {
+			s.markGlobalEffect(call)
+			continue
+		}
+		if args[i] == "-o" && i+1 < len(args) {
+			if args[i+1] == "posix" {
+				s.posix = true
+			}
+			if args[i+1] == "" {
+				s.markGlobalEffect(call)
+			}
+			i++
+			continue
+		}
+	}
+}
+
+func (s *suspiciousAssignScan) callEffects(name string, args []string, argWords []*syntax.Word, call *syntax.CallExpr) {
 	switch name {
 	case "eval", "source", ".":
-		s.all = true
-		s.dynamicEffects = append(s.dynamicEffects, int(call.Pos().Offset()))
-	case "alias":
-		s.alias(args)
-	case "trap":
-		s.trap(args, call)
-	case "shopt":
-		s.shopt(call)
+		s.callEvalSource(call)
+	case "alias", "unalias", "trap", "shopt":
+		s.callResolutionEffect(name, args, argWords, call)
 	case "mapfile", "readarray":
-		s.mapfile(args, call)
+		s.callMapfile(args, argWords, call)
 	case "read":
-		s.readTargets(args)
+		s.callRead(args, argWords, call)
+	case "getopts", "printf", "let":
+		s.callWriteTarget(name, args, argWords, call)
+	case "declare", "local", "typeset", "export", "readonly":
+		s.wrappedDeclaration(name, args, argWords, call)
+	case "unset", "wait", "set", "enable":
+		s.callControlEffect(name, args, argWords, call)
+	}
+}
+
+func (s *suspiciousAssignScan) callEvalSource(call *syntax.CallExpr) {
+	s.all = true
+	s.dynamicEffects = append(s.dynamicEffects, int(call.Pos().Offset()))
+}
+
+func (s *suspiciousAssignScan) callResolutionEffect(name string, args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	switch name {
+	case "alias":
+		s.alias(args, words, call)
+	case "unalias":
+		if hasDynamicWord(words) {
+			s.markGlobalEffect(call)
+		}
+	case "trap":
+		s.trap(args, words, call)
+	case "shopt":
+		s.shopt(args, words, call)
+	}
+}
+
+func (s *suspiciousAssignScan) callMapfile(args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	if hasDynamicWord(words) {
+		s.markGlobalEffect(call)
+	}
+	s.mapfile(args, call)
+}
+
+func (s *suspiciousAssignScan) callRead(args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	if dynamicReadTarget(args, words) {
+		s.markGlobalEffect(call)
+	}
+	s.readTargets(args)
+}
+
+func (s *suspiciousAssignScan) callWriteTarget(name string, args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	switch name {
 	case "getopts":
+		if len(words) > 1 && isDynamicWord(words[1]) || len(words) > 0 && isDynamicWord(words[0]) {
+			s.markGlobalEffect(call)
+		}
 		if len(args) > 2 {
 			s.markWriteName(args[2])
 		} else {
 			s.all = true
 		}
 	case "printf":
+		if dynamicPrintfTarget(args, words) {
+			s.markGlobalEffect(call)
+		}
 		s.printfTarget(args)
 	case "let":
+		if hasDynamicWord(words) {
+			s.markGlobalEffect(call)
+		}
 		for _, word := range call.Args[1:] {
 			s.markText(int(word.Pos().Offset()), int(word.End().Offset()))
 		}
-	case "declare", "local", "typeset", "export", "readonly":
-		for _, word := range call.Args[1:] {
-			if _, ok := wordValue(word); !ok {
-				s.markGlobalEffect(call)
-			}
-		}
-		s.wrappedDeclaration(name, args)
+	}
+}
+
+func (s *suspiciousAssignScan) callControlEffect(name string, args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	switch name {
 	case "unset":
+		if hasDynamicTargetAfterOptions(args, words) {
+			s.markGlobalEffect(call)
+		}
 		s.unsetTargets(args)
 	case "wait":
+		if dynamicWaitTarget(args) {
+			s.markGlobalEffect(call)
+		}
 		for i := 1; i+1 < len(args); i++ {
 			if args[i] == "-p" {
 				s.markWriteName(args[i+1])
 			}
 		}
+	case "set":
+		s.setOptions(args, words, call)
+	case "enable":
+		if hasDynamicWord(words) {
+			s.markGlobalEffect(call)
+		}
 	}
 }
 
-func (s *suspiciousAssignScan) alias(args []string) {
+func (s *suspiciousAssignScan) alias(args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	if hasDynamicWord(words) {
+		s.markGlobalEffect(call)
+	}
 	for _, arg := range args[1:] {
 		if strings.Contains(arg, "=") {
 			s.all = true
@@ -504,20 +731,43 @@ func (s *suspiciousAssignScan) alias(args []string) {
 	}
 }
 
-func (s *suspiciousAssignScan) trap(args []string, call *syntax.CallExpr) {
+func trapOnlyAtExit(args []string, words []*syntax.Word) bool {
+	action, actionWord := 1, 0
+	if action < len(args) && args[action] == "--" {
+		action++
+		actionWord++
+	}
+	if action >= len(args) || len(args) <= action+1 || actionWord >= len(words) {
+		return false
+	}
+	for i, signal := range args[action+1:] {
+		if signal != "EXIT" && signal != "0" {
+			return false
+		}
+		if actionWord+i+1 >= len(words) || isDynamicWord(words[actionWord+i+1]) {
+			return false
+		}
+	}
+	return isDynamicWord(words[actionWord])
+}
+
+func (s *suspiciousAssignScan) trap(args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	if trapOnlyAtExit(args, words) {
+		return
+	}
+	for _, word := range words {
+		if _, ok := wordValue(word); !ok {
+			s.markGlobalEffect(call)
+			s.dynamicEffects = append(s.dynamicEffects, int(call.Pos().Offset()))
+			return
+		}
+	}
 	action := 1
 	if action < len(args) && args[action] == "--" {
 		action++
 	}
 	if action < len(args) && args[action] != "" && !strings.HasPrefix(args[action], "-") {
 		s.all = true
-	}
-	for _, word := range call.Args[1:] {
-		if _, ok := wordValue(word); !ok {
-			s.markGlobalEffect(call)
-			s.dynamicEffects = append(s.dynamicEffects, int(call.Pos().Offset()))
-			return
-		}
 	}
 }
 
@@ -526,15 +776,19 @@ func (s *suspiciousAssignScan) markGlobalEffect(node syntax.Node) {
 	s.globalFunctionEffect = true
 }
 
-func (s *suspiciousAssignScan) shopt(call *syntax.CallExpr) {
-	for _, word := range call.Args[1:] {
+func (s *suspiciousAssignScan) shopt(args []string, words []*syntax.Word, call *syntax.CallExpr) {
+	for _, word := range words {
 		value, ok := wordValue(word)
 		if !ok {
 			s.lastpipeMaybe = true
+			s.markGlobalEffect(call)
 			continue
 		}
 		if value == "lastpipe" {
 			s.lastpipeMaybe = true
+		}
+		if strings.Contains(value, "o") && optionHasPosix(args, words) {
+			s.posix = true
 		}
 	}
 }
@@ -726,10 +980,20 @@ func (s *suspiciousAssignScan) unsetTargets(args []string) {
 	}
 }
 
-func (s *suspiciousAssignScan) wrappedDeclaration(name string, args []string) {
+func (s *suspiciousAssignScan) wrappedDeclaration(name string, args []string, words []*syntax.Word, call *syntax.CallExpr) {
 	markAttributes := false
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
+		if arg == "" {
+			if literalAssignmentValue(words[i-1], s.src) {
+				if assignmentName := literalAssignmentName(words[i-1], s.src); assignmentName != "" {
+					s.markWriteName(assignmentName)
+				}
+			} else {
+				s.markGlobalEffect(call)
+			}
+			continue
+		}
 		if strings.HasPrefix(arg, "-") {
 			flags := strings.TrimLeft(arg, "-")
 			if strings.Contains(flags, "n") && (name == "declare" || name == "local" || name == "typeset") {
@@ -744,8 +1008,30 @@ func (s *suspiciousAssignScan) wrappedDeclaration(name string, args []string) {
 			s.markWriteName(n)
 		} else if markAttributes {
 			s.markWriteName(arg)
+		} else if name == "local" || name == "declare" || name == "typeset" || name == "readonly" {
+			s.declWrites = append(s.declWrites, declWrite{name: arg, offset: int(words[i-1].Pos().Offset())})
 		}
 	}
+}
+
+func literalAssignmentName(word *syntax.Word, src string) string {
+	if word == nil {
+		return ""
+	}
+	lo, hi := int(word.Pos().Offset()), int(word.End().Offset())
+	if lo < 0 || hi > len(src) || lo >= hi {
+		return ""
+	}
+	raw := strings.TrimLeft(src[lo:hi], "\"'")
+	name, _, ok := strings.Cut(raw, "=")
+	if !ok {
+		return ""
+	}
+	name = strings.Trim(name, "\"'")
+	if !shellVarName.MatchString(name) {
+		return ""
+	}
+	return name
 }
 
 func (s *suspiciousAssignScan) specialBuiltin(name string) bool {
@@ -817,7 +1103,7 @@ func (s *suspiciousAssignScan) declarationArg(assign *syntax.Assign, cmd string,
 		return
 	}
 	name := assign.Name.Value
-	if assign.Value == nil && (cmd == "local" || cmd == "declare" || cmd == "typeset") {
+	if assign.Value == nil && (cmd == "local" || cmd == "declare" || cmd == "typeset" || cmd == "readonly") {
 		s.declWrites = append(s.declWrites, declWrite{name: name, offset: int(assign.Pos().Offset())})
 	}
 	if integer {
@@ -840,14 +1126,14 @@ func (s *suspiciousAssignScan) markNakedDeclaration(assign *syntax.Assign, cmd s
 	}
 	word, ok := wordValue(assign.Value)
 	if !ok {
-		if cmd == "local" || cmd == "declare" || cmd == "typeset" {
-			s.globalEffects = append(s.globalEffects, nodeSpan(assign))
+		if cmd == "local" || cmd == "declare" || cmd == "typeset" || cmd == "readonly" {
+			s.markGlobalEffect(assign)
 		}
 		return
 	}
 	if name, _, hasValue := strings.Cut(word, "="); hasValue {
 		s.markWriteName(name)
-	} else if cmd == "local" || cmd == "declare" || cmd == "typeset" {
+	} else if cmd == "local" || cmd == "declare" || cmd == "typeset" || cmd == "readonly" {
 		s.declWrites = append(s.declWrites, declWrite{name: word, offset: int(assign.Pos().Offset())})
 	}
 }
@@ -970,7 +1256,11 @@ func (s *suspiciousAssignScan) parameter(param *syntax.ParamExp) {
 		s.markText(int(param.Pos().Offset()), int(param.End().Offset()))
 	}
 	if param.Param != nil && param.Exp != nil && (param.Exp.Op == syntax.AssignUnset || param.Exp.Op == syntax.AssignUnsetOrNull) {
-		s.names[param.Param.Value] = true
+		if param.Excl {
+			s.all = true
+		} else {
+			s.names[param.Param.Value] = true
+		}
 	}
 	if param.Exp != nil && (param.Exp.Op == syntax.AlternateUnset || param.Exp.Op == syntax.AlternateUnsetOrNull || param.Exp.Op == syntax.DefaultUnset || param.Exp.Op == syntax.DefaultUnsetOrNull) {
 		s.uncertain = append(s.uncertain, span{int(param.Pos().Offset()), int(param.End().Offset())})
@@ -1073,18 +1363,30 @@ func (s *suspiciousAssignScan) applyGlobalEffects() {
 			}
 		}
 	}
-	for _, effect := range s.globalEffects {
-		for _, a := range s.assigns {
-			if a.Offset >= effect.start {
-				s.names[a.Name] = true
-				continue
+	if len(s.globalEffects) == 0 {
+		return
+	}
+	effect := span{start: s.globalEffects[0].start, end: s.globalEffects[0].end}
+	for _, current := range s.globalEffects[1:] {
+		if current.start < effect.start {
+			effect.start = current.start
+		}
+		if current.end < effect.end {
+			effect.end = current.end
+		}
+	}
+	affectedNames := make(map[string]bool)
+	for name, refs := range s.functionRefs {
+		for _, ref := range refs {
+			if ref >= effect.end {
+				affectedNames[name] = true
+				break
 			}
-			for _, ref := range s.functionRefs[a.Name] {
-				if ref >= effect.end {
-					s.names[a.Name] = true
-					break
-				}
-			}
+		}
+	}
+	for _, a := range s.assigns {
+		if a.Offset >= effect.start || affectedNames[a.Name] {
+			s.names[a.Name] = true
 		}
 	}
 }

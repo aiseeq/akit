@@ -61,13 +61,15 @@ jobs with byte bounds and kinds. These bounds describe syntax; they do not encod
 alias, or `lastpipe` execution effects.
 `Assigns` returns assignments in source order with their original byte offsets and innermost scope.
 Prefix assignments (`S=x cmd`) are omitted; a function called with one sees the prefix value, so a name with a prefix and a reference inside a function body is Unknown. `Assign.Unknown` is set for script-wide triggers:
-`eval`, a dynamic command word, an alias definition or write to `BASH_ALIASES`, a command trap,
+`eval`, a dynamic command word, dynamic arguments to commands that can change shell variables or
+command resolution, an alias definition or write to `BASH_ALIASES`, a command trap,
 `mapfile`/`readarray -C`, `source`/`.`, a nameref declaration, or a recognized nested shell reading
 `-c`, `-s`, a here-document, or a here-string. Per-name triggers include arithmetic and `-i`
 declarations, `${name:=…}`, write targets of `read`, `printf -v`, `getopts`, `mapfile`/`readarray`,
 `unset`, `wait -p`, `coproc`, and `{name}>…`; readonly and case-transform declarations;
-special-builtin prefix assignments; function-body writes that cannot be tied to later reads in the same
-body; writes in a nested function-body scope when a later reference can select that record by offset;
+special-builtin prefix assignments; and function-body writes unless their later references are
+confined to the same function body and no command can write variables outside the parsed model.
+Writes in a nested function-body scope remain Unknown when a later reference can select that record by offset;
 and assignments in `if`/`elif`/
 `case`, the right side of `&&`/`||`, loop conditions and bodies, conditional parameter expansions,
 case patterns, and here-document or here-string expansions. A name read in a function body with
