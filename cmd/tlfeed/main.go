@@ -1,6 +1,6 @@
 // tlfeed — loads transcripts into ClickHouse as they are written: every complete line of every file tl --all
 // --codex reads goes to raw as it is (a file is rebuilt from it byte for byte), its events as tl parses them to
-// events, and how far each file is loaded to files. It runs until stopped: every second it loads the new complete
+// events, and how far each file is loaded to files. It runs until stopped: every --tick (5s) it loads the new complete
 // lines; a line still being written waits. A server that is down is waited for. --once loads what there is and
 // exits; --verify and --check compare the tables with the files.
 //
@@ -25,7 +25,7 @@ import (
 const usage = `tlfeed — load transcripts into ClickHouse as they are written.
 
 Usage:
-  tlfeed [flags]                 follow: every second load the new complete lines (until SIGTERM)
+  tlfeed [flags]                 follow: every --tick load the new complete lines (until SIGTERM)
   tlfeed --once [flags]          load everything there is, then exit
   tlfeed --materialize [flags]   build the text index of the events after a first load (--once)
   tlfeed --verify N [flags]      rebuild N random files from raw, compare sha256 with the files
@@ -46,9 +46,10 @@ Flags:
   --home DIR       where the transcripts are (default $HOME)
   --state FILE     state file for a supervisor, rewritten every --beat; '' — none
                    (default $XDG_STATE_HOME/akit/tlfeed/state.json, ~/.local/state when unset)
-  --tick D         pass period (default 5s): each pass is one insert per table, and at 1s the server merges
-                   parts about four times as often for the same lines; tl reads lines past the stored ones
-                   from the file, so a longer pass does not delay what it finds
+  --tick D         pass period (default 5s): a pass with new lines is a few inserts (files twice, raw,
+                   events, and the views fill replies and usage) whatever the number of lines, so in one
+                   measurement 1s had the server merge parts about 4 times as often as 5s; tl reads lines
+                   past the stored ones from the file, so a longer pass does not hide what it finds
   --idle D         a file that has not grown this long releases its parser (default 1h)
   --sweep D        every known file and every folder inotify does not watch is looked at once per D,
                    changed or not (default 5m); inotify watches the Claude projects and the codex
