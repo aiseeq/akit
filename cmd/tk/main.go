@@ -3226,15 +3226,64 @@ func validatePlanCommandWord(word, name, root string) error {
 	return errPlanItemMustBeCommand
 }
 
+// planCommandWord — the command word that starts at offset, with quotes and backslashes removed, so a quoted or
+// escaped path with spaces stays one word. "" — no such word or it has an expansion: the item is not refused then.
 func planCommandWord(command string, offset int) string {
-	if offset < 0 || offset >= len(command) {
+	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
+	if err != nil { //nolint:silent-error-handling // An unparsable item is not refused here; tk check reports it.
 		return ""
 	}
-	word := command[offset:]
-	if end := strings.IndexAny(word, " \t\r\n;&|<>()"); end >= 0 {
-		word = word[:end]
+	var word *syntax.Word
+	syntax.Walk(file, func(n syntax.Node) bool {
+		if w, ok := n.(*syntax.Word); ok && word == nil && int(w.Pos().Offset()) == offset {
+			word = w
+		}
+		return word == nil
+	})
+	if word == nil {
+		return ""
 	}
-	return strings.Trim(word, `\"'`)
+	return literalPlanWord(word.Parts)
+}
+
+// literalPlanWord — the value of word parts made only of literals and quotes; "" if any part expands.
+func literalPlanWord(parts []syntax.WordPart) string {
+	var b strings.Builder
+	for _, part := range parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			b.WriteString(unescapePlanLit(p.Value))
+		case *syntax.SglQuoted:
+			if p.Dollar {
+				return ""
+			}
+			b.WriteString(p.Value)
+		case *syntax.DblQuoted:
+			inner := literalPlanWord(p.Parts)
+			if inner == "" && len(p.Parts) > 0 {
+				return ""
+			}
+			b.WriteString(inner)
+		default:
+			return ""
+		}
+	}
+	return b.String()
+}
+
+// unescapePlanLit drops the backslash before an escaped character of an unquoted literal.
+func unescapePlanLit(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 func checkPlanSyntax(command string) error {

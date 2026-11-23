@@ -1140,6 +1140,12 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(repo, "scripts"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "scripts", "my script.sh"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(repo)
 	for _, tc := range []struct {
 		command  string
@@ -1149,6 +1155,8 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 		{"Start, End по корпусу", true},
 		{"check the output manually", false},
 		{"./missing.sh", true},
+		{`дамп "x`, false},
+		{`'./missing dir/x.sh'`, true},
 	} {
 		var stdout, stderr bytes.Buffer
 		args := []string{"plan", "task", "--add", "x: " + tc.command}
@@ -1164,6 +1172,7 @@ func TestPlanAddRequiresCommand(t *testing.T) {
 	for _, command := range []string{
 		"bash /tmp/a.sh", "go test ./...", "A=1 go test ./...", "test -s f", `[ -n "$X" ]`,
 		"$HOME/x.sh", `"$HOME"/x.sh`, "~/x.sh", "[[ -n x ]]", "(( 1 ))", "shopt -s x", "declare",
+		`./scripts/my\ script.sh`, `'./scripts/my script.sh'`, `"./scripts/my script.sh"`,
 	} {
 		var stdout, stderr bytes.Buffer
 		code := runMain([]string{"plan", "task", "--add", "x: " + command, "--required", "--by", "worker"}, time.Now(), &stdout, &stderr)
