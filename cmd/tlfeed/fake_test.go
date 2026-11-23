@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeCH answers the statements the loader sends, as ClickHouse would for these tables: inserts are kept by table,
@@ -74,7 +75,7 @@ func newFake(t *testing.T) (*fakeCH, *server) {
 
 var (
 	insertRe   = regexp.MustCompile(`^INSERT INTO \w+\.(\w+) \(`)
-	deleteRe   = regexp.MustCompile(`^DELETE FROM \w+\.(\w+) WHERE file_id = (\d+)(?: AND line > (\d+))?(?: AND file_id IN .*)?$`)
+	deleteRe   = regexp.MustCompile(`^DELETE FROM \w+\.(\w+) WHERE file_id = (\d+)(?: AND line > (\d+))?(?: AND .*)?$`)
 	fenceRe    = regexp.MustCompile(`\(file_id, gen\) IN \(((?:\(\d+,\d+\),?)+)\)`)
 	pairRe     = regexp.MustCompile(`\((\d+),(\d+)\)`)
 	filesSelRe = regexp.MustCompile(`^SELECT file_id, path, .* FROM \w+\.files FINAL`)
@@ -177,6 +178,17 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		var kept [][]string
 		for _, row := range f.rows[m[1]] {
+			if m[1] == "usage" {
+				if row[0] != m[2] {
+					kept = append(kept, row)
+				} else if strings.Contains(q, "toDateTime(ts) + INTERVAL") {
+					at, err := time.Parse("2006-01-02 15:04:05.000", row[1])
+					if err == nil && !at.AddDate(0, 0, eventRetentionDays).After(time.Now()) {
+						kept = append(kept, row)
+					}
+				}
+				continue
+			}
 			if n, _ := strconv.Atoi(row[lineCol]); row[idCol] != m[2] || n <= from {
 				kept = append(kept, row)
 			}

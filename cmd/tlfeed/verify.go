@@ -101,7 +101,7 @@ func (c *checker) check() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	files, err := c.rows("SELECT path, file_id, ingested, lines, dirty, ev_lines FROM " + c.db + ".files FINAL FORMAT TabSeparated")
+	files, err := c.rows("SELECT path, file_id, ingested, lines, dirty, ev_lines, kind FROM " + c.db + ".files FINAL FORMAT TabSeparated")
 	if err != nil {
 		return false, err
 	}
@@ -109,7 +109,7 @@ func (c *checker) check() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	events, err := c.rows("SELECT file_id, count() FROM " + c.db + ".events GROUP BY file_id FORMAT TabSeparated")
+	events, err := c.rows("SELECT file_id, count() FROM " + c.db + ".events WHERE " + eventRetentionPredicate("ts") + " GROUP BY file_id FORMAT TabSeparated")
 	if err != nil {
 		return false, err
 	}
@@ -220,7 +220,7 @@ func (c *checker) checkFile(path string, r []string, raw [2]string, events strin
 	}
 	n := 0
 	if _, err := transcript.Read(path, nil, func(e transcript.Event) {
-		if e.Line <= lines {
+		if e.Line <= lines && eventRetained(e.Time, r[6], string(e.Role), time.Now()) {
 			n++
 		}
 	}); err != nil {

@@ -417,15 +417,16 @@ func (l *loader) truncate(f *file, why string) error {
 }
 
 // purge deletes the rows of a file of the new generation past its lines and evLines, then stores it clean. usage
-// has rows merged over the parts of a reply, so the file's rows there are made again from events. Every statement
-// holds only while the file keeps this generation.
+// has rows merged over the parts of a reply, so rows inside event retention are made again from events; older rows
+// stay because their events may have been removed by TTL. Every statement holds only while the file keeps this generation.
 func (l *loader) purge(f *file, why string) error {
 	l.logf("%s: %s: rows of id %d past line %d (events past %d) deleted", f.src.Path, why, f.id, f.lines, f.evLines)
 	db, gen := l.cfg.db, l.genIs(f)
+	withinRetention := eventWithinRetentionAt("ts", l.now().UTC().Truncate(time.Second))
 	for _, q := range []string{
 		fmt.Sprintf("DELETE FROM %s.events WHERE file_id = %d AND line > %d AND %s", db, f.id, f.evLines, gen),
 		fmt.Sprintf("DELETE FROM %s.replies WHERE file_id = %d AND line > %d AND %s", db, f.id, f.evLines, gen),
-		fmt.Sprintf("DELETE FROM %s.usage WHERE file_id = %d AND %s", db, f.id, gen),
+		fmt.Sprintf("DELETE FROM %s.usage WHERE file_id = %d AND %s AND %s", db, f.id, withinRetention, gen),
 		fmt.Sprintf("DELETE FROM %s.raw WHERE file_id = %d AND line > %d AND %s", db, f.id, f.lines, gen),
 	} {
 		if err := l.write("delete rows past the stored lines", q, nil); err != nil {
@@ -433,8 +434,8 @@ func (l *loader) purge(f *file, why string) error {
 		}
 	}
 	if f.evLines > 0 {
-		q := fmt.Sprintf("INSERT INTO %s.usage (%s) SELECT %s FROM %s.events WHERE file_id = %d AND reply_id != '' AND %s",
-			db, usageColumns, usageColumns, db, f.id, gen)
+		q := fmt.Sprintf("INSERT INTO %s.usage (%s) SELECT %s FROM %s.events WHERE file_id = %d AND reply_id != '' AND %s AND %s",
+			db, usageColumns, usageColumns, db, f.id, withinRetention, gen)
 		settings := url.Values{"insert_deduplication_token": {fmt.Sprintf("usage:%d:g%d", f.id, f.gen)}, "async_insert": {"0"}}
 		if err := l.write("usage of the kept events", q, settings); err != nil {
 			return err

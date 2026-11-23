@@ -1,6 +1,35 @@
 package main
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	eventRetentionDays = 90
+	retainedEventKinds = "kind = 'claude' AND role IN ('user', 'ask')"
+)
+
+func eventTTL() string {
+	return "toDateTime(ts) + INTERVAL " + strconv.Itoa(eventRetentionDays) + " DAY DELETE WHERE NOT (" + retainedEventKinds + ")"
+}
+
+func eventRetained(at time.Time, kind, role string, now time.Time) bool {
+	return at.Truncate(time.Second).Add(time.Duration(eventRetentionDays)*24*time.Hour).After(now) || kind == "claude" && (role == "user" || role == "ask")
+}
+
+func eventRetentionPredicate(column string) string {
+	return "(" + eventWithinRetention(column) + " OR (" + retainedEventKinds + "))"
+}
+
+func eventWithinRetention(column string) string {
+	return "toDateTime(" + column + ") + INTERVAL " + strconv.Itoa(eventRetentionDays) + " DAY > now()"
+}
+
+func eventWithinRetentionAt(column string, at time.Time) string {
+	return "toDateTime(" + column + ") + INTERVAL " + strconv.Itoa(eventRetentionDays) + " DAY > toDateTime('" + at.UTC().Format("2006-01-02 15:04:05") + "', 'UTC')"
+}
 
 // schema creates the tables of one database; every statement is idempotent, so it runs at every start.
 // Layout (role, kind, file_id, line) with a time-ordered file id and granule 1024 is the one measured as the best
@@ -80,7 +109,8 @@ CREATE TABLE IF NOT EXISTS {db}.events
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (role, kind, file_id, line)
-SETTINGS index_granularity = 1024, index_granularity_bytes = 1048576, non_replicated_deduplication_window = 10000;
+TTL {event_ttl}
+SETTINGS index_granularity = 1024, index_granularity_bytes = 1048576, non_replicated_deduplication_window = 10000, merge_with_ttl_timeout = 604800;
 
 CREATE TABLE IF NOT EXISTS {db}.replies
 (
@@ -130,7 +160,8 @@ WHERE reply_id != '';
 // statements splits the schema of database db into single statements: the HTTP interface takes one per query.
 func statements(db string) []string {
 	var out []string
-	for s := range strings.SplitSeq(strings.ReplaceAll(schema, "{db}", db), ";\n") {
+	ddl := strings.NewReplacer("{db}", db, "{event_ttl}", eventTTL()).Replace(schema)
+	for s := range strings.SplitSeq(ddl, ";\n") {
 		var kept []string
 		for l := range strings.SplitSeq(s, "\n") {
 			if code, _, _ := strings.Cut(l, "--"); strings.TrimSpace(code) != "" {
