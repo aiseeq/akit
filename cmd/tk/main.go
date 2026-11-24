@@ -46,7 +46,7 @@ Usage:
   tk unskip ID NAME --why TEXT [--by NAME]   return a skipped plan item; its command stays as added
   tk check ID [--timeout D]
   tk lint [--root DIR]
-  tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take]
+  tk start ID [--by NAME] [--prio P] [--diff D] [--why TEXT] [--take] [--reopen]
   tk next [--by NAME] [--json]
   tk external --json   the project's whole task source, no gates and no local tickets
   tk guide             краткая справка по зависимостям и ожиданию
@@ -90,6 +90,7 @@ Flags:
   --glint-debt S done: link findings to an open ticket when glint reports them
   --why TEXT     reject/release: reason (required); skip: why item skipped (required)
   --take         start: take a ticket assigned to another session
+  --reopen       start: explicitly reopen a closed ticket
   --add TEXT     plan: add a named command to the ticket plan (required)
   --required     plan: the item cannot be skipped (tk skip refuses, exit 2), dropped from the plan or given another command; command syntax is checked with bash -n
   --repin TEXT   plan: replace a required command from another session; current and previous executors and pin authors are refused; the session and old/new commands are journaled
@@ -150,7 +151,7 @@ var planTimeout = 8 * time.Minute
 type options struct {
 	cmd, id, prio, diff, title, by, note, check, doer, why, status, slug, root, until, text, glintDebt, baseRoot, mainRoot, add, repin, item, to, back, parent string
 	timeNow                                                                                                                                                    time.Time
-	all, due, json, required, take, journal, head, tailSet                                                                                                     bool
+	all, due, json, required, take, reopen, journal, head, tailSet                                                                                             bool
 	older, timeout                                                                                                                                             time.Duration
 	tail                                                                                                                                                       int
 	sections, blocks, unblocks                                                                                                                                 []string
@@ -490,7 +491,7 @@ func parseTailOption(args []string, i *int, o *options) error {
 
 func parseOptions(args []string, o *options) ([]string, error) {
 	values := map[string]*string{"--prio": &o.prio, "--diff": &o.diff, "--to": &o.to, "--back": &o.back, "--title": &o.title, "--by": &o.by, "--note": &o.note, "--check": &o.check, "--doer": &o.doer, "--why": &o.why, "--status": &o.status, "--slug": &o.slug, "--root": &o.root, "--until": &o.until, "--text": &o.text, "--glint-debt": &o.glintDebt, "--add": &o.add, "--repin": &o.repin, "--parent": &o.parent}
-	flags := map[string]func(){"--all": func() { o.all = true }, "--due": func() { o.due = true }, "--json": func() { o.json = true }, "--required": func() { o.required = true }, "--take": func() { o.take = true }, "--journal": func() { o.journal = true }, "--head": func() { o.head = true }}
+	flags := map[string]func(){"--all": func() { o.all = true }, "--due": func() { o.due = true }, "--json": func() { o.json = true }, "--required": func() { o.required = true }, "--take": func() { o.take = true }, "--reopen": func() { o.reopen = true }, "--journal": func() { o.journal = true }, "--head": func() { o.head = true }}
 	var pos []string
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
@@ -567,7 +568,7 @@ func validateCommand(o *options, pos []string) error {
 }
 
 func validateCommandFlags(o *options) error {
-	checks := []func(*options) error{validateTakeFlag, validateDestinationFlags, validateJournalFlag, validateTextFlag, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
+	checks := []func(*options) error{validateTakeFlag, validateReopenFlag, validateDestinationFlags, validateJournalFlag, validateTextFlag, validatePriorityFlags, validateWhyFlag, validateJSONFlag}
 	for _, check := range checks {
 		if err := check(o); err != nil {
 			return err
@@ -582,6 +583,13 @@ func validateCommandFlags(o *options) error {
 func validateTakeFlag(o *options) error {
 	if o.take && o.cmd != "start" {
 		return errors.New("--take: flag only for start")
+	}
+	return nil
+}
+
+func validateReopenFlag(o *options) error {
+	if o.reopen && o.cmd != "start" {
+		return errors.New("--reopen: flag only for start")
 	}
 	return nil
 }
@@ -1038,7 +1046,8 @@ const guideText = `Зависимости
   Нераспознанное время, невозможная дата и относительное «2h» сохраняются как
   условие без срока: tk ls --due их не покажет. Когда срок наступил, tk next
   выдаёт задачу, а tk ls --due показывает её; прошедший срок уже наступил.
-  tk start ID снимает ожидание.
+  tk start ID снимает ожидание; закрытый тикет требует явного tk start ID --reopen.
+  Переоткрытие записывается в журнал; остальные переходы по закрытому тикету отказывают.
 `
 
 // externalAtBase needs no ticket folder: a project without docs/tasks can have
@@ -3885,7 +3894,15 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return setTask(t, o, out, errout)
 	}
 	if o.cmd == "start" {
+		if code, handled := guardClosedTransition(t, o, errout); handled {
+			return code
+		}
 		if code := refuseFrozenStart(o, errout); code != 0 {
+			return code
+		}
+	}
+	if o.cmd != "start" {
+		if code, handled := guardClosedTransition(t, o, errout); handled {
 			return code
 		}
 	}
@@ -3916,7 +3933,41 @@ func transition(t task, o options, out, errout io.Writer) int {
 	return commitTransition(t, o, next, body, glintFindings, out, errout)
 }
 
+func guardClosedTransition(t task, o options, errout io.Writer) (int, bool) {
+	if !closedStatus(t.status) {
+		return 0, false
+	}
+	if o.cmd == "start" && o.reopen {
+		return 0, false
+	}
+	if o.cmd != "start" && o.cmd != "wait" && o.cmd != "review" && o.cmd != "done" && o.cmd != "reject" && o.cmd != "release" {
+		return 0, false
+	}
+	line := lastClosingJournalLine(t.body)
+	if line == "" {
+		line = "нет записи о закрытии в журнале"
+	}
+	if o.cmd == "start" {
+		fmt.Fprintf(errout, "tk: ticket is %s; закрытие: %s; to reopen: tk start %s --reopen\n", t.status, line, t.slug)
+	} else {
+		fmt.Fprintf(errout, "tk: ticket is %s; закрытие: %s\n", t.status, line)
+	}
+	return exitNone, true
+}
+
+func lastClosingJournalLine(body string) string {
+	entries := journalLines(body)
+	for _, entry := range entries {
+		line := journalRecordHeader(entry)
+		if strings.Contains(line, " готово — ") || strings.Contains(line, " отклонён — ") {
+			return line
+		}
+	}
+	return ""
+}
+
 func commitTransition(t task, o options, next, body string, glintFindings int, out, errout io.Writer) int {
+	o.reopen = o.reopen && closedStatus(t.status)
 	entry := transitionJournal(o, next, glintFindings)
 	_, acceptanceFilled := checkSections(t.body)
 	missingAcceptance := o.cmd == "start" && !isJournal(t) && !acceptanceFilled
@@ -4056,6 +4107,9 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 
 func transitionJournal(o options, next string, glintFindings int) string {
 	line := fmt.Sprintf("- %s %s — %s", time.Now().Format("2006-01-02 15:04"), next, o.by)
+	if o.cmd == "start" && o.reopen {
+		line += ": переоткрыт"
+	}
 	if o.cmd == "done" {
 		checkSession := session()
 		if checkSession != "" && !strings.EqualFold(checkSession, o.by) {
