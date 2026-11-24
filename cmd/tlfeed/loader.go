@@ -499,7 +499,17 @@ func (l *loader) storeFilesKeepSize(fs []*file, was []uint64) error {
 	return l.writeFiles(fs, false, was, true)
 }
 
+// filesBatch bounds the files of one files insert: the generation guard lists every file id in the query, which
+// goes in the request URI, and the server refuses a URI past its limit (a startup rewrites thousands of rows).
+const filesBatch = 500
+
 func (l *loader) writeFiles(fs []*file, dirty bool, was []uint64, keepSize bool) error {
+	for len(fs) > filesBatch {
+		if err := l.writeFiles(fs[:filesBatch], dirty, was[:filesBatch], keepSize); err != nil {
+			return err
+		}
+		fs, was = fs[filesBatch:], was[filesBatch:]
+	}
 	var b bytes.Buffer
 	ver := l.nextVer()
 	var stored []*file

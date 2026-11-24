@@ -1151,3 +1151,36 @@ func TestTwoLoadersWithoutLockAtOnce(t *testing.T) {
 	}
 	h.same(l2, path)
 }
+
+// TestStoreFilesManyFitsURI: a startup rewrites the metadata of thousands of known rows; the generation guard of
+// one insert lists every file, so the rows go in batches whose query fits the server's URI limit.
+func TestStoreFilesManyFitsURI(t *testing.T) {
+	h := newHarness(t)
+	l, _ := h.started(nil)
+	h.fake.mu.Lock()
+	h.fake.maxURI = 32 << 10 // one batch is about 21 KiB, all three about 63 KiB
+	h.fake.mu.Unlock()
+	const n = 3 * filesBatch
+	fs := make([]*file, n)
+	gens := make([]uint64, n)
+	for i := range fs {
+		fs[i] = &file{id: 1_000_000_000_000 + uint64(i), kind: "codex", gen: 7}
+		fs[i].src.Path = filepath.Join(h.home, fmt.Sprintf("r%05d.jsonl", i))
+		gens[i] = 7
+	}
+	done := make(chan error, 1)
+	go func() { done <- l.storeFilesKeepSize(fs, gens) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("store %d files: %v", n, err)
+		}
+	case <-time.After(20 * time.Second): // a refused insert is retried without end
+		t.Fatalf("store %d files: no answer in 20 s, the insert is refused", n)
+	}
+	h.fake.mu.Lock()
+	defer h.fake.mu.Unlock()
+	if got := len(h.fake.rows["files"]); got != n {
+		t.Fatalf("files rows %d, want %d", got, n)
+	}
+}

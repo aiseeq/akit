@@ -30,6 +30,7 @@ type fakeCH struct {
 	pass, tried map[string]int
 	down        bool
 	kills       int // KILL QUERY statements
+	maxURI      int // a request URI longer than this is refused as the server does (http_max_uri_size); 0 — no limit
 	// hold: inserts into these tables are kept unapplied and refused, to be sent again later (late)
 	hold map[string]int
 	late []*http.Request
@@ -83,6 +84,13 @@ var (
 )
 
 func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	limit := f.maxURI
+	f.mu.Unlock()
+	if limit > 0 && len(r.URL.RequestURI()) > limit {
+		http.Error(w, "Code: 1000. HTTP request URI invalid or too long", http.StatusBadRequest)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	q := r.URL.Query().Get("query")
 	if q == "" {
