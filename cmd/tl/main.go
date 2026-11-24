@@ -9,12 +9,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,6 +21,7 @@ import (
 
 	"github.com/aiseeq/akit/buildversion"
 	"github.com/aiseeq/akit/clihelp"
+	"github.com/aiseeq/akit/internal/transcriptdb"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 	"github.com/aiseeq/akit/transcript/replycache"
@@ -704,11 +703,7 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 		var out, errs bytes.Buffer
 		var code int
 		if code, err = runDB(context.Background(), c, opts, e, refs, &out, &errs); err == nil {
-			format := "15:04:05"
-			if y, m, d := e.dbThrough.Local().Date(); y != time.Now().Local().Year() || m != time.Now().Local().Month() || d != time.Now().Local().Day() {
-				format = "2006-01-02 15:04:05"
-			}
-			fmt.Fprintf(&errs, "tl: данные актуальны на %s\n", e.dbThrough.Local().Format(format))
+			errs.WriteString(transcriptdb.FreshnessLine("tl", e.dbThrough, time.Now()))
 			_, outErr := io.Copy(stdout, &out)
 			_, errErr := io.Copy(stderr, &errs)
 			if err := errors.Join(outErr, errErr); err != nil {
@@ -723,45 +718,9 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 	return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
 }
 
-type dbState struct {
-	Heartbeat string    `json:"heartbeat"`
-	DBThrough time.Time `json:"db_through"`
-	Home      string    `json:"home"`
-	Error     string    `json:"error"`
-}
+type dbState = transcriptdb.State
 
-func readDBState(home string) (dbState, error) {
-	base := os.Getenv("XDG_STATE_HOME")
-	if base == "" {
-		base = filepath.Join(home, ".local", "state")
-	}
-	path := filepath.Join(base, "akit", "tlfeed", "state.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return dbState{}, fmt.Errorf("read tlfeed state: %w", err)
-	}
-	var st dbState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return dbState{}, fmt.Errorf("read tlfeed state: %w", err)
-	}
-	heartbeat, err := time.Parse(time.RFC3339Nano, st.Heartbeat)
-	if err != nil || time.Since(heartbeat) > 10*time.Minute || heartbeat.After(time.Now().Add(time.Minute)) {
-		return dbState{}, errors.New("tlfeed heartbeat is stale or invalid")
-	}
-	if st.Error != "" {
-		return dbState{}, fmt.Errorf("tlfeed reports an error: %s", st.Error)
-	}
-	if filepath.Clean(st.Home) != filepath.Clean(home) {
-		return dbState{}, errors.New("tlfeed home does not match this home")
-	}
-	if st.DBThrough.IsZero() {
-		return dbState{}, errors.New("tlfeed has no successful db_through boundary")
-	}
-	if time.Since(st.DBThrough) > 10*time.Minute {
-		return dbState{}, errors.New("tlfeed db_through is stale")
-	}
-	return st, nil
-}
+func readDBState(home string) (dbState, error) { return transcriptdb.CheckHealth(home) }
 
 func reportRefs(refs []eventRef, opts options, e env, stdout, stderr io.Writer) int {
 	// REF — событие целиком; режет его только явный --width, не ширина списка по умолчанию.

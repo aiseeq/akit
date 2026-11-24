@@ -167,11 +167,11 @@ func (d *dbPath) query(q chQuery) ([][]string, error) { return d.queryIn(d.ctx, 
 
 func (d *dbPath) queryIn(ctx context.Context, q chQuery) ([][]string, error) {
 	start := time.Now()
-	rows, err := d.c.selectTSV(ctx, q)
+	rows, err := d.c.SelectTSV(ctx, q)
 	if d.trace != nil {
 		d.traceMu.Lock()
 		defer d.traceMu.Unlock()
-		fmt.Fprintf(d.trace, "tl: db %s %d ms, %d rows, err %v\n", q.name, time.Since(start).Milliseconds(), len(rows), err)
+		fmt.Fprintf(d.trace, "tl: db %s %d ms, %d rows, err %v\n", q.Name, time.Since(start).Milliseconds(), len(rows), err)
 	}
 	return rows, err
 }
@@ -183,10 +183,10 @@ func (d *dbPath) loadFiles() error {
 	if err != nil {
 		return err
 	}
-	rows, err := d.queryIn(ctx, chQuery{name: "files", sql: "SELECT file_id, path, name, description, lines, ev_lines, " +
+	rows, err := d.queryIn(ctx, chQuery{Name: "files", SQL: "SELECT file_id, path, name, description, lines, ev_lines, " +
 		"intDiv(ver, 1000000), bad, toUnixTimestamp64Milli(toDateTime64(mtime, 3, 'UTC')), " +
 		"toUnixTimestamp64Milli(first_ts), session, parent, kind, project, cwd FROM files FINAL WHERE " + where.sql,
-		params: where.params})
+		Params: where.params})
 	if err != nil {
 		return err
 	}
@@ -462,7 +462,7 @@ func (d *dbPath) allLinkNames() ([]string, error) {
 }
 
 func (d *dbPath) allLinkNamesAndIDs() ([]string, map[string]string, error) {
-	rows, err := d.query(chQuery{name: "link_names", sql: "SELECT path, session, kind FROM files FINAL"})
+	rows, err := d.query(chQuery{Name: "link_names", SQL: "SELECT path, session, kind FROM files FINAL"})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -648,8 +648,8 @@ func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	rows, err := d.query(chQuery{name: "bad", sql: "SELECT file_id, line, raw FROM raw WHERE file_id IN {files:Array(UInt64)} " +
-		"ORDER BY file_id, line", params: map[string]string{"files": chUints(ids)}, settings: rawSettings})
+	rows, err := d.query(chQuery{Name: "bad", SQL: "SELECT file_id, line, raw FROM raw WHERE file_id IN {files:Array(UInt64)} " +
+		"ORDER BY file_id, line", Params: map[string]string{"files": chUints(ids)}, Settings: rawSettings})
 	if err != nil {
 		return err
 	}
@@ -825,8 +825,8 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 			w.params["ws"] = chString(spaceClass + "+")
 			w.params["trim"] = chString("^" + spaceClass + "+|" + spaceClass + "+$")
 		}
-		return chQuery{sql: "SELECT file_id, line, toUnixTimestamp64Milli(ts), role, who, subtype, " + text + ", _part, _part_offset FROM events WHERE " + w.sql,
-			params: w.params, settings: w.settings}
+		return chQuery{SQL: "SELECT file_id, line, toUnixTimestamp64Milli(ts), role, who, subtype, " + text + ", _part, _part_offset FROM events WHERE " + w.sql,
+			Params: w.params, Settings: w.settings}
 	}, ids, kinds)
 	if err != nil {
 		return nil, err
@@ -894,8 +894,8 @@ func (d *dbPath) wholeTexts(hits []sortedHit, idx []int) error {
 	for id := range ids {
 		idList = append(idList, id)
 	}
-	rows, err := d.query(chQuery{name: "texts", sql: "SELECT file_id, line, role, _part, _part_offset, text FROM events WHERE file_id IN {files:Array(UInt64)} " +
-		"AND (file_id, line) IN {pairs:Array(Tuple(UInt64, UInt32))}", params: map[string]string{"files": chUints(idList), "pairs": pairs.String()}})
+	rows, err := d.query(chQuery{Name: "texts", SQL: "SELECT file_id, line, role, _part, _part_offset, text FROM events WHERE file_id IN {files:Array(UInt64)} " +
+		"AND (file_id, line) IN {pairs:Array(Tuple(UInt64, UInt32))}", Params: map[string]string{"files": chUints(idList), "pairs": pairs.String()}})
 	if err != nil {
 		return err
 	}
@@ -930,7 +930,7 @@ func (d *dbPath) selectEvents(name string, build func(where) chQuery, ids []uint
 		return nil, err
 	}
 	q := build(w)
-	q.name = name
+	q.Name = name
 	return d.query(q)
 }
 
@@ -947,8 +947,8 @@ func msToTime(ms int64) time.Time {
 func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored) ([]sortedHit, error) {
 	const cond = " AND (reply_id != '' OR request_id != '')"
 	rows, err := d.selectEvents("usage", func(w where) chQuery {
-		return chQuery{sql: "SELECT file_id, line, toUnixTimestamp64Milli(ts), role, model, reply_id, request_id, _part, _part_offset FROM events WHERE " +
-			w.sql + cond, params: w.params, settings: w.settings}
+		return chQuery{SQL: "SELECT file_id, line, toUnixTimestamp64Milli(ts), role, model, reply_id, request_id, _part, _part_offset FROM events WHERE " +
+			w.sql + cond, Params: w.params, Settings: w.settings}
 	}, ids, kinds)
 	if err != nil {
 		return nil, err
@@ -988,9 +988,9 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 	// the record with the most output of each reply, as the server picks it; its usage line from raw
 	raw, err := d.selectEvents("usage-raw", func(w where) chQuery {
 		settings := maps.Clone(rawSettings)
-		return chQuery{sql: "SELECT file_id, line, JSONExtractRaw(raw, 'message', 'usage') FROM raw WHERE file_id IN {files:Array(UInt64)} AND " +
+		return chQuery{SQL: "SELECT file_id, line, JSONExtractRaw(raw, 'message', 'usage') FROM raw WHERE file_id IN {files:Array(UInt64)} AND " +
 			"(file_id, line) IN (SELECT file_id, argMax(line, out_tok) FROM events WHERE " + w.sql + cond +
-			" GROUP BY file_id, if(reply_id != '', reply_id, request_id))", params: w.params, settings: settings}
+			" GROUP BY file_id, if(reply_id != '', reply_id, request_id))", Params: w.params, Settings: settings}
 	}, ids, kinds)
 	if err != nil {
 		return nil, err
@@ -1079,8 +1079,8 @@ func (d *dbPath) showRef(ref eventRef, width int, w, stderr io.Writer) (int, err
 			found = append(found, sortedHit{hit: hit{src: src, ev: evs[i]}, off: uint64(i)})
 		}
 	} else {
-		rows, err := d.query(chQuery{name: "event", sql: "SELECT toUnixTimestamp64Milli(ts), role, who, text, _part, _part_offset FROM events " +
-			"WHERE file_id = {file:UInt64} AND line = {line:UInt32}", params: map[string]string{"file": strconv.FormatUint(f.id, 10), "line": strconv.Itoa(ref.line)}})
+		rows, err := d.query(chQuery{Name: "event", SQL: "SELECT toUnixTimestamp64Milli(ts), role, who, text, _part, _part_offset FROM events " +
+			"WHERE file_id = {file:UInt64} AND line = {line:UInt32}", Params: map[string]string{"file": strconv.FormatUint(f.id, 10), "line": strconv.Itoa(ref.line)}})
 		if err != nil {
 			return 0, err
 		}

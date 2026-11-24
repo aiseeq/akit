@@ -75,6 +75,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "prior: %v\n", err)
 		os.Exit(exitUsage)
 	}
+	activePriorDB = priorBackend(home, os.Stderr)
 	run(q, home, os.Stdout)
 }
 

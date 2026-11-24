@@ -188,6 +188,8 @@ func parseTranscriptArgs(args []string) (options, error) {
 }
 
 func run(opts options, e env, stdout, stderr io.Writer) int {
+	initWordDB(e, stderr)
+	defer func() { activeWordDB = nil }()
 	if opts.brief {
 		return runBrief(opts, e, stdout, stderr)
 	}

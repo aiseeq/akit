@@ -792,8 +792,8 @@ func liveDB(t *testing.T) *chClient {
 func TestLiveFlatLen(t *testing.T) {
 	c := liveDB(t)
 	for _, text := range []string{" a  b\n\nc ", " x　y ", "слово\t\tслово\n", "", "\n\n", "a​b"} {
-		rows, err := c.selectTSV(t.Context(), chQuery{name: "test-flatlen", sql: "SELECT " + flatLenSQL + " FROM (SELECT {t:String} AS text)",
-			params: map[string]string{"t": chString(text), "ws": chString(spaceClass + "+"), "trim": chString("^" + spaceClass + "+|" + spaceClass + "+$")}})
+		rows, err := c.SelectTSV(t.Context(), chQuery{Name: "test-flatlen", SQL: "SELECT " + flatLenSQL + " FROM (SELECT {t:String} AS text)",
+			Params: map[string]string{"t": chString(text), "ws": chString(spaceClass + "+"), "trim": chString("^" + spaceClass + "+|" + spaceClass + "+$")}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -816,8 +816,8 @@ func TestLiveGrepCondition(t *testing.T) {
 		params["t"] = chString(c2.text)
 		// hay here has no index: its tokenizer, which hasAllTokens takes from the index on events.hay, is named
 		cond = liveTrigrams.ReplaceAllString(cond, "hasAllTokens(hay, $1, 'ngrams(3)')")
-		rows, err := c.selectTSV(t.Context(), chQuery{name: "test-grep",
-			sql: "SELECT " + cond + " FROM (SELECT '' AS who, {t:String} AS text, lowerUTF8(concat(who, ' ', text)) AS hay)", params: params})
+		rows, err := c.SelectTSV(t.Context(), chQuery{Name: "test-grep",
+			SQL: "SELECT " + cond + " FROM (SELECT '' AS who, {t:String} AS text, lowerUTF8(concat(who, ' ', text)) AS hay)", Params: params})
 		if err != nil {
 			t.Fatal(err)
 		}

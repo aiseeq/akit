@@ -498,7 +498,9 @@ func replies(w io.Writer, q query, s paths) {
 		return
 	}
 	transcripts := indexTranscripts(s.projects)
-	prewarmReplyTranscripts(s.replies, string(data), transcripts)
+	if activePriorDB == nil {
+		prewarmReplyTranscripts(s.replies, string(data), transcripts)
+	}
 	hits := replyBlocks(string(data), q)
 	if len(hits) == 0 {
 		fmt.Fprintln(w, "(нет)")
@@ -532,19 +534,7 @@ func replies(w io.Writer, q query, s paths) {
 		needlesByPath[files[0]][needle] = struct{}{}
 		refs[h.head] = needle
 	}
-	lineIndexes := make(map[string]map[string]int, len(needlesByPath))
-	lineErrors := make(map[string]error, len(needlesByPath))
-	for path, needles := range needlesByPath {
-		allLines, err := transcriptTimestampLines(path, needles)
-		if err != nil {
-			lineErrors[path] = err
-			continue
-		}
-		lineIndexes[path] = make(map[string]int, len(needles))
-		for needle := range needles {
-			lineIndexes[path][needle] = allLines[needle]
-		}
-	}
+	lineIndexes, lineErrors := replyLineIndexes(needlesByPath)
 	for _, h := range hits {
 		ref, err := replyRefFromLines(h.head, transcripts, refs, lineIndexes, lineErrors)
 		if err != nil {
@@ -558,6 +548,58 @@ func replies(w io.Writer, q query, s paths) {
 			fmt.Fprintln(w, "  "+cut(l))
 		}
 	}
+}
+
+// replyLineIndexes — номера строк реплик в транскриптах. При TL_BACKEND=db их ищет база; чего она не нашла (строка
+// ещё не загружена, транскрипта в базе нет), то и ошибку запроса - сканом файла, как без базы.
+func replyLineIndexes(needlesByPath map[string]map[string]struct{}) (map[string]map[string]int, map[string]error) {
+	lineIndexes := make(map[string]map[string]int, len(needlesByPath))
+	lineErrors := make(map[string]error, len(needlesByPath))
+	scan := needlesByPath
+	if activePriorDB != nil {
+		found, err := activePriorDB.timestampLines(needlesByPath)
+		if err != nil {
+			fmt.Fprintf(activePriorDB.stderr, "prior: TL_BACKEND=db: %v; reading files instead\n", err)
+			activePriorDB = nil
+		} else {
+			activePriorDB.fresh()
+			scan = make(map[string]map[string]struct{})
+			for path, needles := range needlesByPath {
+				lineIndexes[path], scan[path] = splitFound(needles, found[path])
+			}
+		}
+	}
+	for path, needles := range scan {
+		if len(needles) == 0 {
+			continue
+		}
+		allLines, err := transcriptTimestampLines(path, needles)
+		if err != nil {
+			lineErrors[path] = err
+			continue
+		}
+		if lineIndexes[path] == nil {
+			lineIndexes[path] = make(map[string]int, len(needles))
+		}
+		for needle := range needles {
+			lineIndexes[path][needle] = allLines[needle]
+		}
+	}
+	return lineIndexes, lineErrors
+}
+
+// splitFound — номера строк иголок, которые нашла база, и иголки, которые остаётся искать в файле.
+func splitFound(needles map[string]struct{}, found map[string]int) (map[string]int, map[string]struct{}) {
+	lines := make(map[string]int, len(needles))
+	missing := make(map[string]struct{})
+	for needle := range needles {
+		if n := found[needle]; n > 0 {
+			lines[needle] = n
+		} else {
+			missing[needle] = struct{}{}
+		}
+	}
+	return lines, missing
 }
 
 // topReplies — maxReplies блоков с наибольшим числом разных слов темы во фразе агента и ответе вместе, при равенстве -

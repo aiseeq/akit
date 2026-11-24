@@ -40,6 +40,13 @@ type line struct {
 
 // readLines — реплики пользователя и ответы агента по порядку; keep отсеивает сырые строки до разбора.
 func readLines(path string, keep func([]byte) bool) ([]line, error) {
+	if activeWordDB != nil {
+		lines, err := activeWordDB.lines(path)
+		if err == nil {
+			return lines, nil
+		}
+		setWordFreshnessFailure(err)
+	}
 	var out []line
 	meta, err := transcript.Read(path, keep, func(ev transcript.Event) {
 		switch ev.Role {
@@ -819,6 +826,13 @@ func search(opts options, e env, stdout, stderr io.Writer) int {
 
 // findHits — реплики пользователя с куском по всем транскриптам, по времени.
 func findHits(opts options, e env) ([]hit, []line, error) {
+	if activeWordDB != nil {
+		hits, warnings, err := dbFindHits(opts, e)
+		if err == nil {
+			return hits, warnings, nil
+		}
+		setWordFreshnessFailure(err)
+	}
 	return findHitsUsing(opts, e, readLines)
 }
 
@@ -1022,11 +1036,47 @@ func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string]
 	if len(dayFragments) == 0 {
 		return map[string][]hit{}, map[string]bool{}, nil, nil
 	}
+	if activeWordDB != nil {
+		hits, recordDays, warnings, err := dbBriefQuotes(dayFragments, recordWindows, e, until)
+		if err == nil {
+			return hits, recordDays, warnings, nil
+		}
+		setWordFreshnessFailure(err)
+	}
 	inventory, err := briefTranscriptInventory(e.home)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	return scanBriefQuotes(inventory, dayFragments, recordWindows, until, e.loc)
+}
+
+// dbBriefQuotes — scanBriefQuotes по транскриптам, которые назвала база: остальные недавние транскрипты реплики с
+// цитатой не содержат. Цитата и её контекст по-прежнему читаются из файла - тем же проходом, что без базы.
+func dbBriefQuotes(fragments map[string][]string, recordWindows map[string]markerRecordInterval, e env, until time.Time) (map[string][]hit, map[string]bool, []line, error) {
+	filters, err := makeBriefQuoteFilters(fragments, recordWindows, e.loc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if filters.from.IsZero() {
+		return map[string][]hit{}, map[string]bool{}, nil, nil
+	}
+	paths, err := activeWordDB.briefCandidates(e.home, fragments, e.loc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	recordDays, err := activeWordDB.briefRecordDays(recordWindows)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	results := scanBriefTranscriptPaths(paths, filters, foldBriefQuotes(fragments), until, e.loc)
+	hits, scanned, warnings, err := mergeBriefQuoteResults(results, len(fragments), e.loc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for key := range scanned {
+		recordDays[key] = true
+	}
+	return hits, recordDays, warnings, nil
 }
 
 func briefWordScanDays(word briefWord, loc *time.Location) []time.Time {

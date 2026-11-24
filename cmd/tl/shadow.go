@@ -459,7 +459,7 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 func shadowLineLimits(c *chClient) (map[string]int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), shadowTimeout)
 	defer cancel()
-	rows, err := c.selectTSV(ctx, chQuery{name: "shadow_files", sql: "SELECT path, lines FROM files FINAL"})
+	rows, err := c.SelectTSV(ctx, chQuery{Name: "shadow_files", SQL: "SELECT path, lines FROM files FINAL"})
 	if err != nil {
 		return nil, err
 	}
