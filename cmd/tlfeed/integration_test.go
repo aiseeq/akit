@@ -232,6 +232,30 @@ func TestLiveUsageAndRename(t *testing.T) {
 	verifyAll(t, srv, db, h.home)
 }
 
+// Against a live server: a rewind of a transcript whose usage is older than retention removes its stale usage.
+func TestLiveOldUsageRewind(t *testing.T) {
+	srv, db := liveServer(t)
+	h := &harness{t: t, home: t.TempDir()}
+	path := claudePath(h.home)
+	base := time.Now().UTC().Add(-100 * 24 * time.Hour).Truncate(time.Second)
+	user := fmt.Sprintf(`{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":%q,"message":{"role":"user","content":"old"}}`+"\n", base.Format("2006-01-02T15:04:05.000Z"))
+	write(t, path, []byte(user+replyLine("old", base.Add(time.Second))))
+	l := h.liveLoader(srv, db)
+	if got := scalar(t, srv, "SELECT count() FROM "+db+".usage FINAL"); got != "1" {
+		t.Fatalf("old usage before rewind: %s, want 1", got)
+	}
+	write(t, path, []byte(user+replyLine("new", base.Add(2*time.Second))))
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalar(t, srv, "SELECT count() FROM "+db+".usage FINAL"); got != "1" {
+		t.Fatalf("usage after old rewind: %s, want only the rewritten reply", got)
+	}
+	if got := scalar(t, srv, "SELECT any(reply_id) FROM "+db+".usage FINAL"); got != "new" {
+		t.Fatalf("usage after old rewind belongs to %q, want new", got)
+	}
+}
+
 // filesGate passes requests to a server and refuses the inserts into files after the first `allow` of them while
 // it is on.
 type filesGate struct {

@@ -98,10 +98,6 @@ func fileSum(path string, n int64) ([]byte, error) {
 // check — completeness: every transcript tl --all --codex reads has its files row, loaded up to its last complete
 // line, raw holds each of its lines once, and events has as many events as transcript.Read gives for those lines.
 func (c *checker) check() (bool, error) {
-	now := time.Now().UTC().Truncate(time.Second)
-	if c.now != nil {
-		now = c.now().UTC().Truncate(time.Second)
-	}
 	srcs, err := transcript.AllSources(c.home, time.Time{}, "", true, true)
 	if err != nil {
 		return false, err
@@ -113,6 +109,10 @@ func (c *checker) check() (bool, error) {
 	raw, err := c.rows("SELECT file_id, count(), max(line), uniqExact(line) FROM " + c.db + ".raw GROUP BY file_id FORMAT TabSeparated")
 	if err != nil {
 		return false, err
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if c.now != nil {
+		now = c.now().UTC().Truncate(time.Second)
 	}
 	events, err := c.rows("SELECT file_id, count() FROM " + c.db + ".events WHERE " + eventRetentionPredicateAt("ts", now) + " GROUP BY file_id FORMAT TabSeparated")
 	if err != nil {

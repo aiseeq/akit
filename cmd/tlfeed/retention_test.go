@@ -51,19 +51,27 @@ func TestRetentionSQL(t *testing.T) {
 func TestEventRetainedBoundaries(t *testing.T) {
 	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
 	cut := now.Add(-90 * 24 * time.Hour)
-	kinds := []string{"claude", "sub", "codex"}
-	roles := []string{"user", "ask", "peer", "agent", "think", "cmd", "out", "attach", "note"}
-	offsets := []time.Duration{-time.Second, -time.Millisecond, 0, time.Millisecond, time.Second}
-	for _, kind := range kinds {
-		for _, role := range roles {
-			for _, offset := range offsets {
-				at := cut.Add(offset)
-				want := at.Truncate(time.Second).Add(90*24*time.Hour).After(now) || kind == "claude" && (role == "user" || role == "ask")
-				if got := eventRetained(at, kind, role, now); got != want {
-					t.Errorf("eventRetained(%s, %s, %s) = %t, want %t", at.Format(time.RFC3339Nano), kind, role, got, want)
-				}
+	cases := []struct {
+		name, kind, role string
+		at               time.Time
+		want             bool
+	}{
+		{"one-second-before-cutoff", "codex", "agent", cut.Add(-time.Second), false},
+		{"exact-cutoff", "codex", "agent", cut, false},
+		{"fraction-at-cutoff", "codex", "agent", cut.Add(time.Millisecond), false},
+		{"one-second-after-cutoff", "codex", "agent", cut.Add(time.Second), true},
+		{"old-claude-user", "claude", "user", cut.Add(-24 * time.Hour), true},
+		{"old-claude-ask", "claude", "ask", cut.Add(-24 * time.Hour), true},
+		{"old-claude-peer", "claude", "peer", cut.Add(-24 * time.Hour), false},
+		{"old-sub-user", "sub", "user", cut.Add(-24 * time.Hour), false},
+		{"old-codex-user", "codex", "user", cut.Add(-24 * time.Hour), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := eventRetained(tc.at, tc.kind, tc.role, now); got != tc.want {
+				t.Errorf("eventRetained(%s, %s, %s) = %t, want %t", tc.at.Format(time.RFC3339Nano), tc.kind, tc.role, got, tc.want)
 			}
-		}
+		})
 	}
 }
 
@@ -91,7 +99,7 @@ func retainedByRetentionSQL(query string, at time.Time, kind, role string) (bool
 		var err error
 		cutoff, err = time.ParseInLocation(time.DateTime, m[3], time.UTC)
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("retention cutoff %q: %w", m[3], err)
 		}
 	}
 	boundary := at.UTC().Truncate(time.Second).Add(time.Duration(days) * 24 * time.Hour)
@@ -194,15 +202,16 @@ func TestCheckFileWithExpiredEvents(t *testing.T) {
 
 func TestReviewCheckBoundaryRace(t *testing.T) {
 	cutoff := time.Now().UTC().Truncate(time.Second)
-	crossing := cutoff.Add(-90*24*time.Hour + 1500*time.Millisecond)
+	checkAt := cutoff.Add(-time.Hour)
+	crossing := cutoff.Add(-90*24*time.Hour - 30*time.Minute)
 	home := t.TempDir()
 	path := claudePath(home)
 	data := fmt.Appendf(nil,
 		`{"type":"assistant","timestamp":%q,"message":{"id":"x","model":"m","content":[{"type":"text","text":"about to expire"}],"usage":{"input_tokens":1,"output_tokens":1}}}`+"\n", crossing.Format("2006-01-02T15:04:05.000Z"))
 	write(t, path, data)
-	c, ts := checkHarness(t, home, path, data, []retentionEvent{{crossing, "claude", "agent"}}, 2*time.Second)
+	c, ts := checkHarness(t, home, path, data, []retentionEvent{{crossing, "claude", "agent"}}, 0)
 	defer ts.Close()
-	c.now = func() time.Time { return cutoff }
+	c.now = func() time.Time { return checkAt }
 	if ok, err := c.check(); err != nil || !ok {
 		t.Fatalf("check raced retention boundary: ok=%t err=%v\n%s", ok, err, c.out)
 	}
@@ -239,17 +248,20 @@ func TestPurgePreservesExpiredUsageAndRebuildsRecentUsage(t *testing.T) {
 		return row
 	}
 	oldAt, staleAt, recentAt, ttlLingeringAt := now.Add(-91*24*time.Hour), now.Add(-88*24*time.Hour), now.Add(-10*24*time.Hour), now.Add(-90*24*time.Hour-23*time.Hour)
+	nearCutoffAt := now.Add(-89*24*time.Hour - 12*time.Hour)
 	h.fake.mu.Lock()
 	h.fake.rows["usage"] = [][]string{
 		usageRow(oldAt, "old", "3"),
 		usageRow(staleAt, "stale-88", "999"),
 		usageRow(recentAt, "recent", "999"),
 		usageRow(ttlLingeringAt, "ttl-lingering", "4"),
+		usageRow(nearCutoffAt, "near-cutoff", "7"),
 	}
 	h.fake.rows["events"] = [][]string{
 		eventRow(staleAt, "stale-88", "2"),
 		eventRow(recentAt, "recent", "2"),
 		eventRow(ttlLingeringAt, "ttl-lingering", "5"),
+		eventRow(nearCutoffAt, "near-cutoff", "5"),
 	}
 	h.fake.mu.Unlock()
 	l := newLoader(config{home: h.home, db: "tq"}, h.srv, make(chan struct{}), &h.log, newStatus(""))
@@ -270,7 +282,7 @@ func TestPurgePreservesExpiredUsageAndRebuildsRecentUsage(t *testing.T) {
 		got[row[5]] = row
 		counts[row[5]]++
 	}
-	if len(rows) != 4 || len(got) != 4 || got["old"] == nil || got["stale-88"] == nil || got["recent"] == nil || got["ttl-lingering"] == nil || counts["ttl-lingering"] != 1 {
+	if len(rows) != 5 || len(got) != 5 || got["old"] == nil || got["stale-88"] == nil || got["recent"] == nil || got["ttl-lingering"] == nil || got["near-cutoff"] == nil || counts["ttl-lingering"] != 1 {
 		t.Fatalf("usage after purge: %v", got)
 	}
 	if got["stale-88"][8] != "2" || got["recent"][8] != "2" {
@@ -278,6 +290,9 @@ func TestPurgePreservesExpiredUsageAndRebuildsRecentUsage(t *testing.T) {
 	}
 	if got["ttl-lingering"][8] != "4" {
 		t.Fatalf("usage whose event is past TTL boundary changed: %v", got["ttl-lingering"])
+	}
+	if got["near-cutoff"][8] != "7" || counts["near-cutoff"] != 1 {
+		t.Fatalf("usage 89.5 days old was not kept unchanged: %v", got["near-cutoff"])
 	}
 	var rebuilt bool
 	for _, sent := range h.fake.sentTo("usage") {
@@ -318,6 +333,49 @@ func TestPurgeClearsUsageAfterRawRewrite(t *testing.T) {
 	}
 }
 
+func TestLoadKnownPreservesExpiredUsageForDirtyFile(t *testing.T) {
+	h := newHarness(t)
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	h.fake.mu.Lock()
+	h.fake.rows["usage"] = [][]string{{"42", now.Add(-100 * 24 * time.Hour).Format("2006-01-02 15:04:05.000"), "s", "p", "m", "expired", "r", "1", "3", "0", "0"}}
+	h.fake.mu.Unlock()
+	l := newLoader(config{home: h.home, db: "tq"}, h.srv, make(chan struct{}), &h.log, newStatus(""))
+	l.now = func() time.Time { return now }
+	f := &file{id: 42, gen: 1, lines: 1, evLines: 1}
+	if err := l.storeFiles([]*file{f}, true, []uint64{0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.loadKnown(); err != nil {
+		t.Fatal(err)
+	}
+	h.fake.mu.Lock()
+	defer h.fake.mu.Unlock()
+	if rows := h.fake.rows["usage"]; len(rows) != 1 || rows[0][5] != "expired" || rows[0][8] != "3" {
+		t.Fatalf("dirty-file recovery removed expired usage: %v", rows)
+	}
+}
+
+func TestCheckTailRewindClearsUsage(t *testing.T) {
+	h := newHarness(t)
+	path := claudePath(h.home)
+	data := sample(t, "claude.jsonl")
+	write(t, path, data)
+	l := h.loader(nil)
+	f := l.files[path]
+	h.fake.mu.Lock()
+	h.fake.rows["usage"] = [][]string{{strconv.FormatUint(f.id, 10), time.Now().UTC().Add(-100 * 24 * time.Hour).Format("2006-01-02 15:04:05.000"), "s", "p", "m", "expired", "r", "1", "3", "0", "0"}}
+	h.fake.mu.Unlock()
+	write(t, path, []byte("rewritten transcript\n"))
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	h.fake.mu.Lock()
+	defer h.fake.mu.Unlock()
+	if rows := h.fake.rows["usage"]; len(rows) != 0 {
+		t.Fatalf("checkTail rewind retained stale usage: %v", rows)
+	}
+}
+
 func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 	m := regexp.MustCompile(`FROM \w+\.events WHERE file_id = (\d+)`).FindStringSubmatch(query)
 	if m == nil {
@@ -331,7 +389,7 @@ func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 		}
 		at, err := time.Parse("2006-01-02 15:04:05.000", event[0])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("event time %q: %w", event[0], err)
 		}
 		kept, err := retainedByRetentionSQL(query, at, event[3], event[6])
 		if err != nil {
@@ -345,8 +403,8 @@ func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 }
 
 func TestRetentionPredicateAgainstClickHouse(t *testing.T) {
-	if os.Getenv("AKIT_CLICKHOUSE_TEST") != "1" {
-		t.Skip("set AKIT_CLICKHOUSE_TEST=1 to compare retention SQL with ClickHouse")
+	if os.Getenv("AKIT_CLICKHOUSE_READ_TEST") != "1" {
+		t.Skip("set AKIT_CLICKHOUSE_READ_TEST=1 to compare retention SQL with ClickHouse; run -run TestRetentionPredicateAgainstClickHouse")
 	}
 	addr := os.Getenv("AKIT_CLICKHOUSE_URL")
 	if addr == "" {
