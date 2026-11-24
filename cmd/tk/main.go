@@ -36,6 +36,7 @@ const usage = `tk — track repository tasks in docs/tasks.
 Usage:
   tk new SLUG [--prio CRIT|HIGH|MED|MEDIUM|LOW] [--diff DO|HUNT|ARCH] [--why TEXT] [--to PROJECT] [--back SESSION] [--title TEXT] [--by NAME] [--journal] [--text FILE|-] [--blocks ID]
   tk set ID [--prio P] [--diff D] [--why TEXT] [--title TEXT] [--back NAME] [--by NAME] [--journal] [--text FILE|-] [--blocks ID] [--unblocks ID]
+  tk set JIRA-123 --unblocks ID
   tk ls [--all] [--status STATUS] [--slug PREFIX] [--root DIR] [--by NAME] [--due] [--json]
   tk note ID TEXT [--by NAME]
   tk note ID --text FILE|- [--by NAME]
@@ -66,7 +67,7 @@ Flags:
   --journal      new/set: mark the ticket as a journal entry, hidden from next unless a wait is due
   --parent KEY   transfer: parent item key passed to the transfer command
   --blocks ID    new/set: ticket this ticket blocks (repeatable)
-  --unblocks ID  set: remove a blocking relation (repeatable)
+  --unblocks ID  set: remove the relation from this blocker to ID (repeatable)
   --back NAME    new: requesting session; set: replace requester
   --title TEXT   new: ticket title (default: slug); set: replace title
   --by NAME      actor name (default: current session); done: checker (fresh sub-agent or worker, e.g. worker-<id>); release: actor; ls: show tickets assigned to NAME
@@ -825,6 +826,13 @@ func validateList(o *options, pos []string) error {
 
 func validateTicketAction(o *options, pos []string) error {
 	valid := validID(o.id)
+	jiraUnblock := o.cmd == "set" && jiraKeyRE.MatchString(o.id) && len(o.unblocks) > 0
+	if jiraUnblock {
+		valid = true
+		if o.prio != "" || o.diff != "" || o.why != "" || o.title != "" || o.back != "" || o.text != "" || o.journal || len(o.blocks) > 0 {
+			return errors.New("a Jira key can only be used with --unblocks")
+		}
+	}
 	if o.cmd == "show" && strings.Contains(o.id, "/") {
 		_, _, err := referenceLocation("", o.id)
 		valid = err == nil
@@ -992,10 +1000,12 @@ func run(o options, out, errout io.Writer) int {
 const guideText = `Зависимости
   tk new A --blocks B или tk set A --blocks B — A блокирует B;
   tk set A --unblocks B снимает связь A → B. Флаги можно повторять.
+  После tk transfer связь снимается так: tk set ABC-123 --unblocks B.
   Ссылка: slug в этом проекте; ИМЯ/slug (проект с таким именем в git или work);
   git/ИМЯ/slug или work/ИМЯ/slug.
   Если A ниже B по приоритету, связь поднимет A до уровня B; B не меняется.
-  tk ls помечает заблокированный тикет; tk show показывает свою сторону связи
+  tk ls помечает заблокированный тикет и показывает команду снятия для Jira;
+  tk show показывает свою сторону связи
   у каждого тикета: «Блокирует» или «Заблокирован». В tk next блокеры влияют
   на порядок только внутри группы приоритета; заблокированные задачи остаются
   в выдаче, и задача с более высоким приоритетом может идти первой.
@@ -1264,6 +1274,9 @@ func destinationProject(name string) (string, error) {
 }
 
 func runLockedCommand(root, dir string, o options, out, errout io.Writer) int {
+	if o.cmd == "set" && jiraKeyRE.MatchString(o.id) {
+		return unblockTransferredKey(o, o.id, out, errout)
+	}
 	if o.cmd == "show" && strings.Contains(o.id, "/") {
 		taskDir, t, err := findReferenceLocked(root, o.id)
 		if err != nil {

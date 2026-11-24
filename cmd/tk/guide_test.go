@@ -18,7 +18,7 @@ func TestGuidePrintsBothSections(t *testing.T) {
 		t.Fatalf("guide code=%d stderr=%q", code, errout.String())
 	}
 	for _, text := range []string{
-		"Зависимости", "tk new A --blocks B", "tk set A --unblocks B",
+		"Зависимости", "tk new A --blocks B", "tk set A --unblocks B", "tk set ABC-123 --unblocks B",
 		"уровня B", "внутри группы приоритета", "Блокирует", "Заблокирован",
 		"Ожидание", "tk wait ID --until", "прошедший день в ДД.ММ",
 		"ISO с T принимается", "со смещением или без него", "T можно писать и после ДД.ММ", "RFC3339 принимается",

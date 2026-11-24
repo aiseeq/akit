@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -13,6 +14,8 @@ import (
 
 const blockedPrefix = "Заблокирован: "
 const blocksPrefix = "Блокирует: "
+
+var jiraKeyRE = regexp.MustCompile(`^[A-Z][A-Z0-9_]*-[0-9]+$`)
 
 func headerLinks(body, prefix string) []string {
 	var out []string
@@ -656,13 +659,108 @@ func removeBlocks(t task, o options, errout io.Writer, refs []string) int {
 	return 0
 }
 
+func transferredByKey(rows []transferRecord, key string) (transferRecord, bool) {
+	for _, row := range slices.Backward(rows) {
+		if row.Key == key {
+			return row, true
+		}
+	}
+	return transferRecord{}, false
+}
+
+type transferredUnblockTarget struct {
+	dir, id string
+	refs    []string
+}
+
+func unblockTransferredKey(o options, key string, out, errout io.Writer) int {
+	targets := make([]transferredUnblockTarget, 0, len(o.unblocks))
+	for _, raw := range o.unblocks {
+		_, dir, id, _, err := resolveBlockLocation(o, raw)
+		if err != nil {
+			return fail(errout, err)
+		}
+		t, err := readTaskLocked(dir, id)
+		if err != nil {
+			return reportFindError(err, raw, errout)
+		}
+		ledgerDirs := map[string]struct{}{dir: {}}
+		var matches []string
+		for _, ref := range headerLinks(t.body, blockedPrefix) {
+			sourceDir, _, locationErr := referenceLocation(taskProject(t.path), ref)
+			if locationErr != nil {
+				return fail(errout, locationErr)
+			}
+			ledgerDirs[sourceDir] = struct{}{}
+			project := dirProject(sourceDir)
+			_, _, linkedErr := linkedPath(project, ref)
+			if linkedErr == nil {
+				continue // a live or archived task with this slug is a different blocker
+			}
+			if !errors.Is(linkedErr, os.ErrNotExist) {
+				return fail(errout, linkedErr)
+			}
+			rows, readErr := readTransferLedger(sourceDir)
+			if readErr != nil {
+				return fail(errout, readErr)
+			}
+			if row, ok := transferredRecord(rows, filepath.Base(ref)); ok && row.Key == key {
+				matches = append(matches, ref)
+			}
+		}
+		foundKey := false
+		for ledgerDir := range ledgerDirs {
+			rows, readErr := readTransferLedger(ledgerDir)
+			if readErr != nil {
+				return fail(errout, readErr)
+			}
+			if _, ok := transferredByKey(rows, key); ok {
+				foundKey = true
+				break
+			}
+		}
+		if !foundKey {
+			return fail(errout, fmt.Errorf("transferred blocker %s not found", key))
+		}
+		targets = append(targets, transferredUnblockTarget{dir: dir, id: id, refs: matches})
+	}
+	for _, target := range targets {
+		if len(target.refs) == 0 {
+			continue
+		}
+		changed := false
+		updated, err := mutateTask(target.dir, target.id, func(current task) (string, error) {
+			body := current.body
+			removed := false
+			for _, ref := range target.refs {
+				if slices.Contains(headerLinks(body, blockedPrefix), ref) {
+					body = removeHeaderLink(body, blockedPrefix, ref)
+					removed = true
+				}
+			}
+			if !removed {
+				return current.body, nil
+			}
+			changed = true
+			return journal(body, fmt.Sprintf("- %s note — %s: связь с %s снята", timeStamp(), o.by, key)), nil
+		})
+		if err != nil {
+			return fail(errout, err)
+		}
+		if changed {
+			fmt.Fprintln(out, filepath.Base(updated.path))
+		}
+	}
+	return 0
+}
+
 // closedStatus: a ticket in this status blocks nothing and takes no new links.
 func closedStatus(s string) bool { return s == "готово" || s == "отклонён" }
 
 func blockMark(t task, errout io.Writer) string {
 	project := taskProject(t.path)
 	for _, ref := range headerLinks(t.body, blockedPrefix) {
-		if mark := refBlockMark(project, ref, errout); mark != "" {
+		if mark := refBlockMarkForTask(project, ref, t.slug, errout); mark != "" {
 			return mark
 		}
 	}
@@ -672,6 +770,10 @@ func blockMark(t task, errout io.Writer) string {
 // refBlockMark is the mark of one blocking link when it still blocks: the ticket
 // is open and not archived, or it went to an external tracker; empty otherwise.
 func refBlockMark(project, ref string, errout io.Writer) string {
+	return refBlockMarkForTask(project, ref, "", errout)
+}
+
+func refBlockMarkForTask(project, ref, blockedSlug string, errout io.Writer) string {
 	dir, path, err := linkedPath(project, ref)
 	if err == nil {
 		if isArchivedTask(path) {
@@ -697,7 +799,11 @@ func refBlockMark(project, ref string, errout io.Writer) string {
 		return ""
 	}
 	if row, ok := transferredRecord(rows, filepath.Base(ref)); ok {
-		return " заблокирован: " + row.Key + " " + row.URL
+		mark := " заблокирован: " + row.Key + " " + row.URL
+		if blockedSlug != "" && jiraKeyRE.MatchString(row.Key) {
+			mark += fmt.Sprintf(" (снять связь: tk set %s --unblocks %s)", row.Key, blockedSlug)
+		}
+		return mark
 	}
 	return ""
 }

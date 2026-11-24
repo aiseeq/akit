@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -348,6 +350,242 @@ func TestTransferUpdatesSameFolderBlockerAfterUnlock(t *testing.T) {
 	}
 	if strings.Count(string(got), "заблокированный t перенесён в EXT-1") != 1 {
 		t.Fatalf("repeat transfer duplicated relation note:\n%s", got)
+	}
+}
+
+func TestUnblocksTransferredJiraKeyAndMakesBlockedTicketAvailable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := filepath.Join(home, "git", "sample")
+	dir := filepath.Join(project, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	command := filepath.Join(home, "git", ".tk-transfer")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"key\":\"ABC-123\",\"url\":\"https://example.test/ABC-123\"}'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	gateDir := filepath.Join(home, ".local", "state", "queue")
+	if err := os.MkdirAll(gateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	gate := fmt.Sprintf(`{"at":%q,"open_by_root":{}}`, time.Now().Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(gateDir, "gate.json"), []byte(gate), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, string) {
+		t.Helper()
+		if args[0] != "ls" {
+			args = append(args, "--by", "tester")
+		}
+		o, err := parseArgs(args)
+		if err != nil {
+			t.Fatalf("parse %v: %v", args, err)
+		}
+		o.baseRoot, o.mainRoot = project, project
+		var out, errout bytes.Buffer
+		if code := runAtBase(project, dir, o, &out, &errout); code != 0 {
+			t.Fatalf("%v code=%d stdout=%q stderr=%q", args, code, out.String(), errout.String())
+		}
+		return out.String(), errout.String()
+	}
+	blockTestWrite(t, dir, "a", "MED", "# a\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	blockTestWrite(t, dir, "b", "MED", "# b\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	blockTestWrite(t, dir, "c", "MED", "# c\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	run("set", "a", "--blocks", "b")
+	run("transfer", "a")
+	listing, _ := run("ls")
+	line := guideLineForSlug(listing, "b")
+	if !strings.Contains(line, "заблокирован: ABC-123") || !strings.Contains(line, "tk set ABC-123 --unblocks b") {
+		t.Fatalf("ls missing Jira blocker or removal hint: %q", line)
+	}
+	run("set", "ABC-123", "--unblocks", "b")
+	listing, _ = run("ls")
+	if line := guideLineForSlug(listing, "b"); strings.Contains(line, "заблокирован") {
+		t.Fatalf("b remains blocked after removing transferred blocker: %q", line)
+	}
+	if next, _ := run("next"); guideFirstField(next) != "b" {
+		t.Fatalf("tk next did not rank b ahead of its same-priority competitor: %q", next)
+	}
+	if code := runCode(t, project, dir, []string{"set", "ABC-404", "--unblocks", "b", "--by", "tester"}); code != exitUsage {
+		t.Fatalf("unknown Jira key code=%d, want %d", code, exitUsage)
+	}
+	updated, err := find(dir, "b")
+	if err != nil || strings.Count(updated.body, "снята") != 1 {
+		t.Fatalf("repeat unblock added a duplicate journal entry: task=%#v err=%v", updated, err)
+	}
+}
+
+func runCode(t *testing.T, root, dir string, args []string) int {
+	t.Helper()
+	o, err := parseArgs(args)
+	if err != nil {
+		t.Fatalf("parse %v: %v", args, err)
+	}
+	o.baseRoot, o.mainRoot = root, root
+	var out, errout bytes.Buffer
+	return runAtBase(root, dir, o, &out, &errout)
+}
+
+func TestUnblockTransferredKeyEdges(t *testing.T) {
+	t.Run("does not detach a reused live slug", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "git", "sample")
+		dir := filepath.Join(root, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		blockTestWrite(t, dir, "a", "MED", "# a\n\nСтатус: открыт\n")
+		b := blockTestWrite(t, dir, "b", "MED", "# b\n\nСтатус: открыт\nЗаблокирован: a\n")
+		if err := appendTransferRecord(dir, transferRecord{Slug: "a", Stem: "20260101-0000-MED-a", Key: "ABC-1"}); err != nil {
+			t.Fatal(err)
+		}
+		if code := runCode(t, root, dir, []string{"set", "ABC-1", "--unblocks", "b", "--by", "tester"}); code != 0 {
+			t.Fatalf("unblock code=%d", code)
+		}
+		updated, err := readTaskLocked(dir, "b")
+		if err != nil || !strings.Contains(updated.body, blockedPrefix+"a") || updated.body != b.body {
+			t.Fatalf("unlinked reused live slug: task=%#v err=%v", updated, err)
+		}
+	})
+
+	t.Run("removes all transferred tickets sharing a Jira key", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "git", "sample")
+		dir := filepath.Join(root, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		b := blockTestWrite(t, dir, "b", "MED", "# b\n\nСтатус: открыт\nЗаблокирован: a1\nЗаблокирован: a2\n")
+		for _, slug := range []string{"a1", "a2"} {
+			if err := appendTransferRecord(dir, transferRecord{Slug: slug, Stem: "20260101-0000-MED-" + slug, Key: "ABC-5"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if code := runCode(t, root, dir, []string{"set", "ABC-5", "--unblocks", "b", "--by", "tester"}); code != 0 {
+			t.Fatalf("unblock code=%d", code)
+		}
+		updated, err := readTaskLocked(dir, "b")
+		if err != nil || len(headerLinks(updated.body, blockedPrefix)) != 0 || strings.Count(updated.body, "снята") != 1 {
+			t.Fatalf("did not remove all same-key blockers with one journal note: task=%#v err=%v", updated, err)
+		}
+		if strings.Contains(b.body, "снята") {
+			t.Fatal("test setup already has an unblock note")
+		}
+	})
+
+	t.Run("uses the latest transfer record for a reused slug", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "git", "sample")
+		dir := filepath.Join(root, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		b := blockTestWrite(t, dir, "b", "MED", "# b\n\nСтатус: открыт\nЗаблокирован: a\n")
+		for _, row := range []transferRecord{
+			{Slug: "a", Stem: "20260101-0000-MED-a", Key: "ABC-1"},
+			{Slug: "a", Stem: "20260102-0000-MED-a", Key: "ABC-2"},
+		} {
+			if err := appendTransferRecord(dir, row); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if code := runCode(t, root, dir, []string{"set", "ABC-1", "--unblocks", "b", "--by", "tester"}); code != 0 {
+			t.Fatalf("stale-key command code=%d", code)
+		}
+		unchanged, err := readTaskLocked(dir, "b")
+		if err != nil || unchanged.body != b.body {
+			t.Fatalf("stale key removed latest transferred relation: task=%#v err=%v", unchanged, err)
+		}
+		if code := runCode(t, root, dir, []string{"set", "ABC-2", "--unblocks", "b", "--by", "tester"}); code != 0 {
+			t.Fatalf("current-key command code=%d", code)
+		}
+		updated, err := readTaskLocked(dir, "b")
+		if err != nil || slices.Contains(headerLinks(updated.body, blockedPrefix), "a") {
+			t.Fatalf("current transfer key failed to remove link: task=%#v err=%v", updated, err)
+		}
+	})
+
+	t.Run("known key without a matching link is a no-op", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "git", "sample")
+		dir := filepath.Join(root, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		z := blockTestWrite(t, dir, "z", "MED", "# z\n\nСтатус: открыт\n")
+		if err := appendTransferRecord(dir, transferRecord{Slug: "a", Stem: "20260101-0000-MED-a", Key: "ABC-9"}); err != nil {
+			t.Fatal(err)
+		}
+		if code := runCode(t, root, dir, []string{"set", "ABC-9", "--unblocks", "z", "--by", "tester"}); code != 0 {
+			t.Fatalf("known-key no-op code=%d", code)
+		}
+		updated, err := readTaskLocked(dir, "z")
+		if err != nil || updated.body != z.body {
+			t.Fatalf("no-op wrote a journal entry: task=%#v err=%v", updated, err)
+		}
+	})
+
+	t.Run("finds the blocker ledger in its own project", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		sample := filepath.Join(home, "git", "sample")
+		other := filepath.Join(home, "git", "other")
+		sampleDir := filepath.Join(sample, "docs", "tasks")
+		otherDir := filepath.Join(other, "docs", "tasks")
+		for _, dir := range []string{sampleDir, otherDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		b := blockTestWrite(t, sampleDir, "b", "MED", "# b\n\nСтатус: открыт\nЗаблокирован: git/other/a\n")
+		if err := appendTransferRecord(otherDir, transferRecord{Slug: "a", Stem: "20260101-0000-MED-a", Key: "ABC-7"}); err != nil {
+			t.Fatal(err)
+		}
+		if code := runCode(t, sample, sampleDir, []string{"set", "ABC-7", "--unblocks", "b", "--by", "tester"}); code != 0 {
+			t.Fatalf("cross-project unblock code=%d", code)
+		}
+		updated, err := readTaskLocked(sampleDir, "b")
+		if err != nil || strings.Contains(updated.body, blockedPrefix+"git/other/a") || !strings.Contains(updated.body, "связь с ABC-7 снята") {
+			t.Fatalf("cross-project relation remains: task=%#v err=%v", updated, err)
+		}
+		if strings.Contains(b.body, "снята") {
+			t.Fatal("test setup already has an unblock note")
+		}
+	})
+
+	t.Run("omits removal hint for a non-Jira external key", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "git", "sample")
+		dir := filepath.Join(root, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		b := blockTestWrite(t, dir, "b", "MED", "# b\n\nСтатус: открыт\nЗаблокирован: a\n")
+		if err := appendTransferRecord(dir, transferRecord{Slug: "a", Stem: "20260101-0000-MED-a", Key: "gh-5"}); err != nil {
+			t.Fatal(err)
+		}
+		if mark := blockMark(b, io.Discard); !strings.Contains(mark, "заблокирован: gh-5") || strings.Contains(mark, "снять связь") {
+			t.Fatalf("non-Jira mark=%q", mark)
+		}
+	})
+}
+
+func TestJiraKeySyntax(t *testing.T) {
+	for _, key := range []string{"ABC-123", "ABC_DEF-123", "A-1"} {
+		if !jiraKeyRE.MatchString(key) {
+			t.Errorf("Jira key %q rejected", key)
+		}
+	}
+	for _, key := range []string{"gh-5", "123", "owner/repo#5"} {
+		if jiraKeyRE.MatchString(key) {
+			t.Errorf("non-Jira key %q accepted", key)
+		}
 	}
 }
 
