@@ -37,6 +37,9 @@ func TestTransitionsRefuseClosedTicketsWithClosingJournal(t *testing.T) {
 						t.Errorf("stderr %q lacks %q", errout.String(), want)
 					}
 				}
+				if cmd == "start" && !strings.Contains(errout.String(), "to reopen: tk start sample --reopen") {
+					t.Errorf("start refusal lacks reopen hint: %q", errout.String())
+				}
 			})
 		}
 	}
@@ -96,11 +99,82 @@ func TestReopenFlagIsStartOnly(t *testing.T) {
 	}
 }
 
+func TestStartShowsNewestClosureAfterReopenAndReject(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	body := "# Sample\n\nСтатус: готово\n\n## Приёмка\n- check\n\n## Журнал\n" +
+		"- 2026-11-20 12:26 готово — reviewer: first close\n"
+	writeRunMainTask(t, dir, "20261120-1200-MED-DO-sample.md", body)
+
+	for _, args := range [][]string{
+		{"start", "sample", "--by", "tester", "--reopen"},
+		{"reject", "sample", "--by", "lead", "--why", "second close"},
+	} {
+		var out, errout strings.Builder
+		if code := runMain(args, time.Now(), &out, &errout); code != 0 {
+			t.Fatalf("%v: code=%d stdout=%q stderr=%q", args, code, out.String(), errout.String())
+		}
+	}
+	var out, errout strings.Builder
+	if code := runMain([]string{"start", "sample", "--by", "tester"}, time.Now(), &out, &errout); code == 0 {
+		t.Fatalf("closed ticket accepted start: stdout=%q stderr=%q", out.String(), errout.String())
+	}
+	if !strings.Contains(errout.String(), "отклонён — lead — second close") || strings.Contains(errout.String(), "готово — reviewer: first close") {
+		t.Fatalf("start reported the wrong closure: %q", errout.String())
+	}
+}
+
+func TestStartIgnoresNoteThatMentionsClosedStatus(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	body := "# Sample\n\nСтатус: отклонён\n\n## Журнал\n" +
+		"- 2026-11-20 12:00 отклонён — lead — final reason\n" +
+		"- 2026-11-20 13:00 note — owner: этап готово — дальше тесты\n"
+	writeRunMainTask(t, dir, "20261120-1200-MED-DO-sample.md", body)
+	var out, errout strings.Builder
+	if code := runMain([]string{"start", "sample", "--by", "tester"}, time.Now(), &out, &errout); code == 0 {
+		t.Fatalf("closed ticket accepted start: stdout=%q stderr=%q", out.String(), errout.String())
+	}
+	if !strings.Contains(errout.String(), "отклонён — lead — final reason") || strings.Contains(errout.String(), "note — owner") {
+		t.Fatalf("start reported a note instead of the closure: %q", errout.String())
+	}
+}
+
+func TestStartWithoutClosingJournalEntryShowsFallbackAndReopenHint(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	body := "# Sample\n\nСтатус: готово\n\n## Журнал\n- 2026-11-20 12:00 открыт — creator\n"
+	writeRunMainTask(t, dir, "20261120-1200-MED-DO-sample.md", body)
+	var out, errout strings.Builder
+	if code := runMain([]string{"start", "sample", "--by", "tester"}, time.Now(), &out, &errout); code == 0 {
+		t.Fatalf("closed ticket accepted start: stdout=%q stderr=%q", out.String(), errout.String())
+	}
+	for _, want := range []string{"готово", "нет записи о закрытии в журнале", "to reopen: tk start sample --reopen"} {
+		if !strings.Contains(errout.String(), want) {
+			t.Errorf("stderr %q lacks %q", errout.String(), want)
+		}
+	}
+}
+
+func TestOpenTicketStartReopenFlagDoesNotClaimReopening(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	body := "# Sample\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n- 2026-11-20 12:00 открыт — creator\n"
+	path := writeRunMainTask(t, dir, "20261120-1200-MED-DO-sample.md", body)
+	var out, errout strings.Builder
+	if code := runMain([]string{"start", "sample", "--by", "tester", "--reopen"}, time.Now(), &out, &errout); code != 0 {
+		t.Fatalf("open ticket start: code=%d stdout=%q stderr=%q", code, out.String(), errout.String())
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), "Статус: в работе") || strings.Contains(string(updated), "переоткрыт") {
+		t.Fatalf("open start wrote incorrect state or journal: %q", updated)
+	}
+}
+
 func TestLastClosingJournalLineUsesNewestClosure(t *testing.T) {
 	body := "## Журнал\n" +
+		"- 2026-11-20 12:00 готово — reviewer: first close\n" +
 		"- 2026-11-22 12:00 отклонён — lead: latest reason\n" +
-		"- 2026-11-21 12:00 note — worker: intervening note\n" +
-		"- 2026-11-20 12:00 готово — reviewer: older reason\n"
+		"- 2026-11-23 12:00 note — worker: этап готово — дальше тесты\n"
 	if got := lastClosingJournalLine(body); got != "- 2026-11-22 12:00 отклонён — lead: latest reason" {
 		t.Fatalf("lastClosingJournalLine = %q", got)
 	}

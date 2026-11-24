@@ -3957,9 +3957,10 @@ func guardClosedTransition(t task, o options, errout io.Writer) (int, bool) {
 
 func lastClosingJournalLine(body string) string {
 	entries := journalLines(body)
-	for _, entry := range entries {
-		line := journalRecordHeader(entry)
-		if strings.Contains(line, " готово — ") || strings.Contains(line, " отклонён — ") {
+	for i := len(entries) - 1; i >= 0; i-- {
+		line := journalRecordHeader(entries[i])
+		fields := strings.Fields(line)
+		if len(fields) > 3 && (fields[3] == "готово" || fields[3] == "отклонён") {
 			return line
 		}
 	}
