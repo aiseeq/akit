@@ -150,6 +150,9 @@ func (l *loader) pass(full bool) error {
 	if err := l.visitAll(slices.Sorted(maps.Keys(want))); err != nil {
 		return err
 	}
+	if err := l.refreshSubMetadata(); err != nil {
+		return err
+	}
 	for f := range l.parsers {
 		if f.follow != nil && now.Sub(f.grown) > l.cfg.idle {
 			f.follow, f.parsed = nil, 0

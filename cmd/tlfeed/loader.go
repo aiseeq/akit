@@ -52,6 +52,7 @@ type loader struct {
 	sweep         int
 	run           string // id of this run in the query_id of its writes
 	seq           int
+	readSource    func(string) (transcript.Source, error)
 	needsFullList bool // a full listing failed, so later incremental passes cannot advance db_through
 	// errText is the last error of a retried call; it is cleared when a call succeeds
 	errText string
@@ -63,7 +64,7 @@ type loader struct {
 
 func newLoader(cfg config, srv *server, stop <-chan struct{}, log io.Writer, st *status) *loader {
 	l := &loader{cfg: cfg, srv: srv, stop: stop, log: log, now: time.Now, files: map[string]*file{}, parsers: map[*file]bool{}, ids: map[uint64]bool{}, st: st,
-		backoff: time.Second}
+		backoff: time.Second, readSource: transcript.SourceAt}
 	l.dirs = newDirs(cfg.home, l.logf)
 	l.run = fmt.Sprintf("%x", time.Now().UnixNano())
 	return l
@@ -238,11 +239,57 @@ func (l *loader) restoreMetadata(f *file, row []string) bool {
 			f.src.Description = src.Description
 			changed = true
 		}
+		l.rememberSubMeta(f)
 	}
 	if f.cwd != "" && row[fileCol["cwd"]] == "" {
 		changed = true
 	}
 	return changed
+}
+
+// rememberSubMeta stores the sidecar's current identity, including its absence, so unchanged metadata is not read again.
+func (l *loader) rememberSubMeta(f *file) {
+	path := strings.TrimSuffix(f.src.Path, ".jsonl") + ".meta.json"
+	st, err := os.Stat(path)
+	f.metaSeen = true
+	f.metaExists = err == nil
+	f.metaSize, f.metaMTime, f.metaInode = 0, time.Time{}, 0
+	if err == nil {
+		f.metaSize, f.metaMTime, f.metaInode = st.Size(), st.ModTime(), transcript.Inode(st)
+	}
+}
+
+// refreshSubMeta picks up a sidecar that appeared or changed after the transcript was first read.
+func (l *loader) refreshSubMeta(f *file) bool {
+	if f.kind != "sub" || f.src.Description != "" {
+		return false
+	}
+	path := strings.TrimSuffix(f.src.Path, ".jsonl") + ".meta.json"
+	st, err := os.Stat(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		l.logf("subagent metadata %s: %v", path, err)
+		return false
+	}
+	exists := err == nil
+	if !exists && f.metaSeen && !f.metaExists {
+		return false
+	}
+	if exists && f.metaSeen && f.metaExists && f.metaSize == st.Size() && f.metaMTime.Equal(st.ModTime()) && f.metaInode == transcript.Inode(st) {
+		return false
+	}
+	src, readErr := l.readSource(f.src.Path)
+	if readErr != nil {
+		l.logf("subagent metadata %s: %v", path, readErr)
+		return false
+	}
+	f.src.Description = src.Description
+	// Cache the state observed before reading; a concurrent sidecar change will be noticed next pass.
+	f.metaSeen, f.metaExists = true, exists
+	f.metaSize, f.metaMTime, f.metaInode = 0, time.Time{}, 0
+	if exists {
+		f.metaSize, f.metaMTime, f.metaInode = st.Size(), st.ModTime(), transcript.Inode(st)
+	}
+	return f.src.Description != ""
 }
 
 func (l *loader) add(f *file) {
@@ -332,6 +379,9 @@ func (l *loader) lookup(path string, st os.FileInfo) (*file, error) {
 			if err := f.describe(l.cfg.home, src); err != nil {
 				l.logf("%v", err)
 			}
+			if f.kind == "sub" && f.src.Description == "" {
+				l.rememberSubMeta(f)
+			}
 			l.add(f)
 		}
 	}
@@ -340,6 +390,24 @@ func (l *loader) lookup(path string, st os.FileInfo) (*file, error) {
 		l.files[path] = f
 	}
 	return f, nil
+}
+
+// refreshSubMetadata checks sidecars independently of transcript changes: meta.json may be written later.
+func (l *loader) refreshSubMetadata() error {
+	var changed []*file
+	for _, f := range l.all {
+		if f.gone {
+			continue
+		}
+		if l.refreshSubMeta(f) {
+			l.batch.touch(f)
+			changed = append(changed, f)
+		}
+	}
+	if len(changed) > 0 {
+		return l.flush()
+	}
+	return nil
 }
 
 // checkTail compares the loaded bytes with the file: shorter than loaded, or the last loaded bytes changed — the

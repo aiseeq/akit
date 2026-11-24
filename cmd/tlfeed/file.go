@@ -48,6 +48,11 @@ type file struct {
 	gone        bool
 	stale       bool   // the last look could not read the file: the next pass looks again
 	ack         stored // as the files table has it: the server confirmed this much
+	metaSeen    bool
+	metaExists  bool
+	metaSize    int64
+	metaMTime   time.Time
+	metaInode   uint64
 }
 
 // stored — the state of a file as the files table has it, for the dirty row of a batch that sends more.

@@ -443,6 +443,51 @@ func TestNewSubagentFoundByPolling(t *testing.T) {
 	h.same(l, newProject)
 }
 
+func TestSubagentMetadataAppearsAfterTranscript(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	parent := claudePath(h.home)
+	path := filepath.Join(strings.TrimSuffix(parent, ".jsonl"), "subagents", "agent-a1b2c3d4e5.jsonl")
+	write(t, path, data)
+	l := h.loader(nil)
+	f := h.same(l, path)
+	if f.src.Description != "" {
+		t.Fatalf("initial description %q, want empty", f.src.Description)
+	}
+	filesInserts := len(h.fake.sentTo("files"))
+	metaReads := 0
+	l.readSource = func(path string) (transcript.Source, error) {
+		metaReads++
+		return transcript.SourceAt(path)
+	}
+	for range 2 {
+		if l.refreshSubMeta(f) {
+			t.Fatal("missing sidecar unexpectedly set a description")
+		}
+		h.pass(l)
+	}
+	if got := len(h.fake.sentTo("files")); got != filesInserts {
+		t.Fatalf("unchanged missing sidecar caused %d files inserts, want %d", got, filesInserts)
+	}
+	if metaReads != 0 {
+		t.Fatalf("unchanged missing sidecar read %d times, want 0", metaReads)
+	}
+
+	metaPath := strings.TrimSuffix(path, ".jsonl") + ".meta.json"
+	write(t, metaPath, []byte(`{"description":"late description"}`))
+	h.pass(l)
+	if f.src.Description != "late description" {
+		t.Fatalf("description %q, want late description", f.src.Description)
+	}
+	if metaReads != 1 {
+		t.Fatalf("new sidecar read %d times, want 1", metaReads)
+	}
+	rows := h.fake.latestFiles()
+	if len(rows) != 1 || rows[0][7] != "late description" {
+		t.Fatalf("latest files row description: %v", rows)
+	}
+}
+
 // A parser is released after idle and rebuilt from the file start when it grows again.
 func TestParserReleased(t *testing.T) {
 	h := newHarness(t)
