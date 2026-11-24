@@ -235,11 +235,11 @@ func (l *loader) loadKnown() error {
 func (l *loader) restoreMetadata(f *file, row []string) bool {
 	changed := false
 	if f.src.Description == "" && strings.Contains(f.src.Path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
-		if src, err := transcript.SourceAt(f.src.Path); err == nil && src.Description != "" {
+		l.rememberSubMeta(f)
+		if src, err := l.readSource(f.src.Path); err == nil && src.Description != "" {
 			f.src.Description = src.Description
 			changed = true
 		}
-		l.rememberSubMeta(f)
 	}
 	if f.cwd != "" && row[fileCol["cwd"]] == "" {
 		changed = true
@@ -249,7 +249,11 @@ func (l *loader) restoreMetadata(f *file, row []string) bool {
 
 // rememberSubMeta stores the sidecar's current identity, including its absence, so unchanged metadata is not read again.
 func (l *loader) rememberSubMeta(f *file) {
-	path := strings.TrimSuffix(f.src.Path, ".jsonl") + ".meta.json"
+	l.rememberSubMetaPath(f, f.src.Path)
+}
+
+func (l *loader) rememberSubMetaPath(f *file, transcriptPath string) {
+	path := strings.TrimSuffix(transcriptPath, ".jsonl") + ".meta.json"
 	st, err := os.Stat(path)
 	f.metaSeen = true
 	f.metaExists = err == nil
@@ -370,7 +374,11 @@ func (l *loader) vanished(path string) {
 func (l *loader) lookup(path string, st os.FileInfo) (*file, error) {
 	f := l.files[path]
 	if f == nil {
-		src, err := transcript.SourceAt(path)
+		meta := &file{src: transcript.Source{Path: path}}
+		if filepath.Base(filepath.Dir(path)) == "subagents" {
+			l.rememberSubMetaPath(meta, path)
+		}
+		src, err := l.readSource(path)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
@@ -379,8 +387,12 @@ func (l *loader) lookup(path string, st os.FileInfo) (*file, error) {
 			if err := f.describe(l.cfg.home, src); err != nil {
 				l.logf("%v", err)
 			}
-			if f.kind == "sub" && f.src.Description == "" {
-				l.rememberSubMeta(f)
+			if f.kind == "sub" {
+				f.metaSeen, f.metaExists = meta.metaSeen, meta.metaExists
+				f.metaSize, f.metaMTime, f.metaInode = meta.metaSize, meta.metaMTime, meta.metaInode
+				if !f.metaSeen && f.src.Description == "" {
+					l.rememberSubMeta(f)
+				}
 			}
 			l.add(f)
 		}
@@ -399,7 +411,7 @@ func (l *loader) refreshSubMetadata() error {
 		if f.gone {
 			continue
 		}
-		if l.refreshSubMeta(f) {
+		if l.refreshSubMeta(f) && f.id != 0 {
 			l.batch.touch(f)
 			changed = append(changed, f)
 		}
