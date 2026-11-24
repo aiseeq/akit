@@ -2961,23 +2961,23 @@ func TestRunMainNoteMarksLaterGuessedClock(t *testing.T) {
 	}
 }
 
-func TestRunMainUntilOneDigitWithoutDateHintsWithoutMarker(t *testing.T) {
+func TestRunMainUntilOneDigitWithoutDateIsRejected(t *testing.T) {
 	_, dir := testRunMainRoot(t)
 	path := writeRunMainTask(t, dir, "20200101-1200-MED-one-digit.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var out, errout bytes.Buffer
-	if code := runMain([]string{"wait", "one-digit", "--until", "6:4x итог", "--by", "tester"}, time.Now(), &out, &errout); code != 0 {
-		t.Fatalf("wait: code=%d stderr=%q", code, errout.String())
+	if code := runMain([]string{"wait", "one-digit", "--until", "6:4x итог", "--by", "tester"}, time.Now(), &out, &errout); code == 0 {
+		t.Fatalf("date-less guessed wait was accepted: stderr=%q", errout.String())
 	}
-	hint := lastStderrLine(errout.String())
-	if !strings.Contains(hint, "«6:4x»") || !strings.Contains(hint, "строка журнала записана без пометки") || !strings.Contains(hint, "срок не распознан") || strings.Contains(hint, "дополнена пометкой") {
-		t.Fatalf("unexpected hint: %q", hint)
-	}
-	if strings.Count(strings.TrimSpace(errout.String()), "\n") != 0 {
-		t.Fatalf("multiple deadline messages: %q", errout.String())
+	if !strings.Contains(errout.String(), "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём") {
+		t.Fatalf("missing date-format hint: %q", errout.String())
 	}
 	updated, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(updated), "Ждёт: 6:4x итог\n") || strings.Contains(string(updated), "6:4x итог [время требует проверки]") {
-		t.Fatalf("one-digit deadline was marked: %s err=%v", updated, err)
+	if err != nil || !bytes.Equal(updated, before) {
+		t.Fatalf("rejected wait changed ticket: %s err=%v", updated, err)
 	}
 }
 
