@@ -68,15 +68,13 @@ type dbFile struct {
 }
 
 type dbPath struct {
-	c      *chClient
-	ctx    context.Context
-	opts   options
-	e      env
-	f      *filter
-	files  map[string]*dbFile
-	names  []string // transcript names in files FINAL
-	listed bool     // names is listed
-	trace  io.Writer
+	c     *chClient
+	ctx   context.Context
+	opts  options
+	e     env
+	f     *filter
+	files map[string]*dbFile
+	trace io.Writer
 }
 
 // runDB answers the call through the database into stdout and stderr; an error means no answer was printed and
@@ -193,7 +191,10 @@ func (d *dbPath) loadFiles() error {
 		p := fields{row: row}
 		f := &dbFile{id: p.uint(0), path: row[1], name: row[2], desc: row[3], lines: p.int(4), evLines: p.int(5),
 			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), mtime: time.UnixMilli(int64(p.uint(8))),
-			first: time.UnixMilli(int64(p.uint(9))), session: row[10], parent: row[11], kind: row[12], project: row[13], cwd: row[14]}
+			session: row[10], parent: row[11], kind: row[12], project: row[13], cwd: row[14]}
+		if first := p.uint(9); first != 0 {
+			f.first = time.UnixMilli(int64(first))
+		}
 		if p.err != nil {
 			return fmt.Errorf("files: %w", p.err)
 		}
@@ -411,6 +412,7 @@ func (d *dbPath) findAfterLive(arg string, alive map[string]session.Info, aliveE
 		if path != "" {
 			return path, nil
 		}
+		return "", fmt.Errorf("live session %q is not loaded in the database", arg)
 	}
 	if len(arg) < 6 {
 		return "", fmt.Errorf("%q: session id must be at least 6 characters", arg)
@@ -445,16 +447,22 @@ func dbTranscriptPresent(path string) bool {
 	return !errors.Is(err, os.ErrNotExist)
 }
 
-func (d *dbPath) listNames() ([]string, error) {
-	if !d.listed {
-		d.names = make([]string, 0, len(d.files))
-		for path := range d.files {
-			d.names = append(d.names, path)
-		}
-		sort.Strings(d.names)
-		d.listed = true
+// allLinkNames includes files outside this call's project and time window: short links
+// must be unique in the same full search area as the file backend.
+func (d *dbPath) allLinkNames() ([]string, error) {
+	rows, err := d.query(chQuery{name: "link_names", sql: "SELECT path FROM files FINAL"})
+	if err != nil {
+		return nil, err
 	}
-	return d.names, nil
+	names := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if len(row) != 1 {
+			return nil, fmt.Errorf("link names: %d fields in a row, want 1", len(row))
+		}
+		names = append(names, row[0])
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // kindOfSource is the kind column of the events of a source.
@@ -532,11 +540,13 @@ type stored struct {
 // way, with the link ids and names of the sources.
 func (d *dbPath) result(sources []source) (result, error) {
 	start := time.Now()
-	names, err := d.listNames()
+	names, err := d.allLinkNames()
 	if err != nil {
 		return result{}, err
 	}
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, nil), searchPaths: names, files: len(sources)}
+	liveNames, liveErr := liveSessionNames(d.e.home)
+	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, liveNames), searchPaths: names,
+		liveNames: liveNames, liveErr: liveErr, files: len(sources)}
 	for path, f := range d.files {
 		if f.name != "" {
 			res.names[path] = f.name

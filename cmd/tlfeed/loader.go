@@ -177,6 +177,9 @@ func (l *loader) loadKnown() error {
 		if err != nil {
 			return err
 		}
+		if f.metadataErr != nil {
+			l.logf("restore codex cwd %s: %v", f.src.Path, f.metadataErr)
+		}
 		l.ver = max(l.ver, ver)
 		// the stored size can run past the loaded lines: a loader stopped after a files row took the new size
 		// and before the lines came; the first look reads the file past ingested

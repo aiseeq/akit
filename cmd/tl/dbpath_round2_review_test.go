@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -10,8 +11,62 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/session"
 )
+
+func TestDBFilePredicateCarriesProjectCWDAndLiveSession(t *testing.T) {
+	project := &dbPath{opts: options{all: true, codex: true, project: "akit"}}
+	w := project.allFilePredicate()
+	if !strings.Contains(w.sql, "position(cwd, {project:String}) > 0") {
+		t.Fatalf("codex project predicate omits stored cwd: %s", w.sql)
+	}
+
+	home := t.TempDir()
+	stat, err := proc.ReadStat("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alive := session.Info{Pid: os.Getpid(), SessionID: "0199aaaa-0000-7000-8000-000000000001", ProcStart: stat.Start, Name: "live-name"}
+	registry := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(alive)
+	if err := os.WriteFile(filepath.Join(registry, fmt.Sprintf("%d.json", alive.Pid)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := &dbPath{opts: options{args: []string{"live-name"}}, e: env{home: home}}
+	w, err = d.sessionFilePredicate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.params["find_id_0"] != alive.SessionID || !strings.Contains(w.sql, "startsWith(session") {
+		t.Fatalf("live name predicate = SQL %q params %v", w.sql, w.params)
+	}
+}
+
+func TestDBShortLinksUseNamesOutsideFilteredFiles(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	extra := writeReviewClaude(t, e, "-home-x-other", "01a20453-0000-4000-8000-000000000099", userRecord("2026-11-24T10:00:00.000Z", "outside"))
+	extra2 := writeReviewClaude(t, e, "-home-x-other", "01a20453-0000-4000-8000-000000000098", userRecord("2026-11-24T10:00:00.000Z", "outside two"))
+	ch := newFakeCH(t, append(paths, extra, extra2), unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	c, err := newCHClient(srv.URL, "tr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &dbPath{c: c, ctx: context.Background()}
+	names, err := d.allLinkNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sourceLinkIDs([]source{{Path: extra, ID: "01a20453"}}, names, e.home, nil)[extra]
+	if want == "01a20453:" || !strings.Contains(want, "-") {
+		t.Fatalf("link id %q did not disambiguate with the full database names", want)
+	}
+}
 
 func TestDBCodexProjectUsesRolloutCWD(t *testing.T) {
 	e, paths, unloaded := dbCorpus(t)
@@ -66,6 +121,17 @@ func TestDBFindSkipsGoneNamedFiles(t *testing.T) {
 	}
 }
 
+func TestDBFindRejectsShortIDsAndUnloadedLiveSessions(t *testing.T) {
+	d := &dbPath{files: map[string]*dbFile{}}
+	if _, err := d.findAfterLive("abc", nil, nil); err == nil || !strings.Contains(err.Error(), "at least 6") {
+		t.Fatalf("short id error = %v", err)
+	}
+	_, err := d.findAfterLive("live-name", map[string]session.Info{"live-name": {SessionID: "0199aaaa-0000-7000-8000-000000000001"}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not loaded") {
+		t.Fatalf("unloaded live session error = %v", err)
+	}
+}
+
 func TestDBRetentionBoundaryFallsBackAt89Days(t *testing.T) {
 	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	path := "/p/session.jsonl"
@@ -80,6 +146,38 @@ func TestDBRetentionBoundaryFallsBackAt89Days(t *testing.T) {
 	}
 	if !dbRetentionExceeded(options{since: now.Add(-90 * 24 * time.Hour)}, nil, nil, now) {
 		t.Fatal("old --since window stayed on the database path")
+	}
+}
+
+func TestDBRetentionTreatsZeroFirstTimestampAsUnknown(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	path := "/p/empty.jsonl"
+	if dbRetentionExceeded(options{}, []source{{Path: path}}, map[string]*dbFile{path: {path: path}}, now) {
+		t.Fatal("unknown first timestamp caused retention fallback")
+	}
+}
+
+func TestDBEmptyFilesRowKeepsZeroFirstTimestampUnknown(t *testing.T) {
+	e := fakeHome(t)
+	now := time.Now()
+	path := filepath.Join(e.home, ".claude", "projects", "-home-empty", "empty-00000000-0000-4000-8000-000000000001.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probeServe(t, []string{path}, nil)
+	c, err := newCHClientFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &dbPath{c: c, ctx: context.Background(), opts: options{all: true}, e: env{home: e.home, now: now}}
+	if err := d.loadFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if !d.files[path].first.IsZero() || dbRetentionExceeded(options{}, []source{{Path: path}}, d.files, now) {
+		t.Fatalf("empty files first=%v triggered retention fallback", d.files[path].first)
 	}
 }
 

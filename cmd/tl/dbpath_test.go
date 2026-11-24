@@ -169,8 +169,15 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "files":
 		for _, f := range s.files {
+			if !fakeFileMatches(q, sql, f) {
+				continue
+			}
 			row(f.id, f.path, f.name, f.desc, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad,
-				f.mtime.Unix()*1000, f.first.UnixMilli(), f.session, f.parent, f.kind, f.project, f.cwd)
+				f.mtime.Unix()*1000, ms(f.first), f.session, f.parent, f.kind, f.project, f.cwd)
+		}
+	case "link_names":
+		for _, f := range s.files {
+			row(f.path)
 		}
 	case "shadow_files":
 		for _, f := range s.files {
@@ -276,6 +283,35 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write(out.Bytes())
+}
+
+func fakeFileMatches(q url.Values, sql string, f *chFile) bool {
+	param := func(name string) string { return q.Get("param_" + name) }
+	if v := param("file_since"); v != "" && f.mtime.Before(chParseTime(nil, v)) {
+		return false
+	}
+	if v := param("file_until"); v != "" && f.first.After(chParseTime(nil, v)) {
+		return false
+	}
+	if strings.Contains(sql, " AND kind != 'codex' AND") && f.kind == "codex" || strings.Contains(sql, " AND kind != 'sub' AND") && f.kind == "sub" {
+		return false
+	}
+	if project := param("project"); project != "" {
+		if f.kind == "codex" {
+			pathMatch := strings.Contains(sql, "position(path, {project:String})") && strings.Contains(f.path, project)
+			cwdMatch := strings.Contains(sql, "position(cwd, {project:String})") && strings.Contains(f.cwd, project)
+			if !pathMatch && !cwdMatch {
+				return false
+			}
+		} else {
+			pathMatch := strings.Contains(sql, "position(path, {project:String})") && strings.Contains(f.path, project)
+			projectMatch := strings.Contains(sql, "position(project, {project:String})") && strings.Contains(f.project, project)
+			if !pathMatch && !projectMatch {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func outTokens(e chEvent) int64 {

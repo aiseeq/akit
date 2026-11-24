@@ -907,7 +907,7 @@ func report(res result, opts options, e env, w io.Writer) int {
 	for i := range hits {
 		displayHit := hits[i]
 		displayHit.src.ID = res.linkIDs[displayHit.src.Path]
-		fmt.Fprintln(w, line(&displayHit, opts.width))
+		writeHitLine(w, &displayHit, opts.width)
 	}
 	zone, _ := e.now.Zone()
 	summary := fmt.Sprintf("tl: %d event(s), times %s", len(hits), zone)
@@ -916,6 +916,21 @@ func report(res result, opts options, e env, w io.Writer) int {
 	}
 	fmt.Fprintln(w, summary+res.problems()+"; full event: tl <id:line>")
 	return 0
+}
+
+func writeHitLine(w io.Writer, h *hit, width int) {
+	who := ""
+	if h.ev.Who != "" {
+		who = strings.TrimSpace(h.ev.Who+" "+h.ev.Subtype) + ": "
+	}
+	text := ""
+	if h.cut != nil {
+		text = *h.cut
+	} else {
+		text = maskedShort(h.ev.Shown(), width)
+	}
+	fmt.Fprintf(w, "%s %s:%d %s %s%s\n",
+		h.ev.Time.Local().Format("02.01 15:04:05"), h.src.ID, h.ev.Line, h.ev.Role, who, text)
 }
 
 func line(h *hit, width int) string {

@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -41,11 +39,11 @@ func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err
 	if p.err != nil {
 		return nil, 0, false, fmt.Errorf("files row: %w", p.err)
 	}
-	if err := f.describe(home, transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")], Description: r[c("description")]}); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, 0, false, err
-	}
-	if r[c("cwd")] != "" {
-		f.cwd = r[c("cwd")]
+	f.src = transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")], Description: r[c("description")]}
+	f.kind, f.project = kindOf(home, f.src)
+	f.cwd = r[c("cwd")]
+	if f.kind == "codex" && f.cwd == "" {
+		f.cwd, f.metadataErr = transcript.CodexProjectCWD(f.src.Path)
 	}
 	f.complete = f.ingested
 	f.commit()
@@ -166,13 +164,15 @@ func (l *loader) pass(full bool) error {
 		l.needsFullList = true
 		complete = false
 	}
+	queuedPaths := map[string]bool{}
 	for _, e := range queued {
 		for _, p := range l.dirs.event(e, boundary) {
 			want[p] = true
+			queuedPaths[p] = true
 		}
 	}
 	if len(queued) > 0 {
-		if err := l.visitAll(slices.Sorted(maps.Keys(want))); err != nil {
+		if err := l.visitAll(slices.Sorted(maps.Keys(queuedPaths))); err != nil {
 			return err
 		}
 	}

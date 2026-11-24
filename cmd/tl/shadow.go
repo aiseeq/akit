@@ -112,12 +112,11 @@ func shadowCutoff(opts options, now time.Time) time.Time {
 	return now
 }
 
-func shadowDBCutoff(opts options, now, through time.Time) time.Time {
-	cutoff := shadowCutoff(opts, now)
-	if !through.IsZero() && (cutoff.IsZero() || through.Before(cutoff)) {
-		return through
+func boundShadowOptions(opts options, cutoff time.Time) options {
+	if !cutoff.IsZero() && (opts.until.IsZero() || cutoff.Before(opts.until)) {
+		opts.until = cutoff
 	}
-	return cutoff
+	return opts
 }
 
 // answerKeys are the events an answer found: path:line of each, a row per session for --usage.
@@ -140,6 +139,32 @@ func answerKeys(a *answer, opts options) []string {
 	}
 	slices.Sort(keys)
 	return keys
+}
+
+func answerKeysThrough(a *answer, opts options, cutoff time.Time) []string {
+	if a == nil {
+		return nil
+	}
+	if cutoff.IsZero() {
+		return answerKeys(a, opts)
+	}
+	filtered := &answer{filled: a.filled}
+	if a.res == nil {
+		for _, ref := range a.refs {
+			if !ref.ev.Time.After(cutoff) {
+				filtered.refs = append(filtered.refs, ref)
+			}
+		}
+	} else {
+		res := &result{}
+		for _, h := range a.res.hits {
+			if !h.ev.Time.After(cutoff) {
+				res.hits = append(res.hits, h)
+			}
+		}
+		filtered.res = res
+	}
+	return answerKeys(filtered, opts)
 }
 
 // usageKeys — a row per session: replies, the four token counts and the API price, as --usage counts them.
@@ -330,15 +355,15 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 	if a == nil || !a.filled || code != 0 && code != exitNone {
 		return
 	}
-	state, err := readDBState(e.home)
+	_, err := readDBState(e.home)
 	if err != nil {
 		if e.dbTrace != nil {
 			fmt.Fprintf(e.dbTrace, "tl: shadow freshness state: %v; no shadow\n", err)
 		}
 		return
 	}
-	cutoff := shadowDBCutoff(opts, e.now, state.DBThrough)
-	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeys(a, opts), FilesS: elapsed.Seconds(),
+	cutoff := shadowCutoff(opts, e.now)
+	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysThrough(a, opts, cutoff), FilesS: elapsed.Seconds(),
 		FilesCode: code, Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
 	if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: shadow: %v\n", err))
@@ -394,6 +419,7 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		rec.Error = err.Error()
 		return rec
 	}
+	opts = boundShadowOptions(opts, spec.Cutoff)
 	c, err := newCHClientFromEnv()
 	if err != nil {
 		rec.Error = err.Error()

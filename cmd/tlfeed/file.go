@@ -39,6 +39,7 @@ type file struct {
 	gen         uint64
 	name        string
 	bad         int
+	metadataErr error
 	first, last time.Time
 	follow      *transcript.Follow
 	parsed      int64 // bytes the parser has read

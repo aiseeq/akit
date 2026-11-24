@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 // shadowPidsEnv names a file the repeat started from a test adds its pid to: what the call started is seen.
@@ -67,20 +69,69 @@ func countOf(list []string, name string) int {
 	return n
 }
 
-func TestShadowCutoffUsesDBThrough(t *testing.T) {
+func TestShadowCutoffUsesCallTime(t *testing.T) {
 	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
-	through := now.Add(-7 * time.Second)
-	if got := shadowDBCutoff(options{}, now, through); !got.Equal(through) {
-		t.Fatalf("default cutoff %v, want %v", got, through)
+	if got := shadowCutoff(options{}, now); !got.Equal(now) {
+		t.Fatalf("default cutoff %v, want call time %v", got, now)
 	}
-	opts := options{until: through.Add(time.Hour)}
-	if got := shadowDBCutoff(opts, now, through); !got.Equal(through) {
-		t.Fatalf("future --until cutoff %v, want %v", got, through)
+	opts := options{until: now.Add(time.Hour)}
+	if got := shadowCutoff(opts, now); !got.Equal(now) {
+		t.Fatalf("future --until cutoff %v, want %v", got, now)
 	}
-	opts.until = through.Add(-time.Second)
+	opts.until = now.Add(-time.Second)
 	want := opts.until
-	if got := shadowDBCutoff(opts, now, through); !got.Equal(want) {
+	if got := shadowCutoff(opts, now); !got.Equal(want) {
 		t.Fatalf("earlier --until cutoff %v, want %v", got, want)
+	}
+}
+
+func TestShadowBoundsUntilAndLoadedLines(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	opts := boundShadowOptions(options{}, now)
+	if !opts.until.Equal(now) {
+		t.Fatalf("shadow until %v, want call moment %v", opts.until, now)
+	}
+	opts.until = now.Add(-time.Minute)
+	if got := boundShadowOptions(opts, now); !got.until.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("explicit earlier until moved: %v", got.until)
+	}
+	got := filterShadowLines([]string{"/p/a.jsonl:2", "/p/a.jsonl:3"}, map[string]int{"/p/a.jsonl": 2})
+	if len(got) != 1 || got[0] != "/p/a.jsonl:2" {
+		t.Fatalf("shadow line cap = %v", got)
+	}
+}
+
+func TestShadowAnswerKeysStopAtCallTime(t *testing.T) {
+	cutoff := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	path := "/p/session.jsonl"
+	a := &answer{res: &result{hits: []hit{
+		{src: source{Path: path}, ev: transcript.Event{Line: 1, Time: cutoff.Add(-time.Second)}},
+		{src: source{Path: path}, ev: transcript.Event{Line: 2, Time: cutoff.Add(time.Second)}},
+	}}}
+	got := answerKeysThrough(a, options{}, cutoff)
+	if len(got) != 1 || got[0] != path+":1" {
+		t.Fatalf("shadow keys through call time = %v", got)
+	}
+}
+
+func TestShadowDropsFileKeysPastStoredLines(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	main := paths[0]
+	cutoff := time.Now()
+	keys := make([]string, 0, len(ch.files[0].events)+1)
+	for _, event := range ch.files[0].events {
+		keys = append(keys, main+":"+strconv.Itoa(event.ev.Line))
+	}
+	keys = append(keys, main+":999999")
+	spec := shadowSpec{Args: []string{"--role", "all", "--max", "0", main}, Now: cutoff,
+		Cutoff: cutoff, Keys: keys}
+	rec := shadowRepeat(spec, e.home)
+	if rec.Error != "" || rec.Diff != 0 || rec.DBKeys != len(keys)-1 {
+		t.Fatalf("shadow repeat = %+v", rec)
 	}
 }
 

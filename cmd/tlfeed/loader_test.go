@@ -580,6 +580,47 @@ func TestCodexCWDStoredInFilesRow(t *testing.T) {
 	}
 }
 
+func TestRestoreMetadataPersistsLegacyCWD(t *testing.T) {
+	l := &loader{}
+	f := &file{src: transcript.Source{Path: "/p/rollout.jsonl"}, cwd: "/work/akit"}
+	row := make([]string, strings.Count(fileColumns, ",")+1)
+	if !l.restoreMetadata(f, row) {
+		t.Fatal("legacy row with empty cwd was not marked for update")
+	}
+}
+
+func TestParseFileRowUsesStoredCWDWithoutReadingRollout(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "state", "codex", "sessions", "rollout-missing.jsonl")
+	row := make([]string, strings.Count(fileColumns, ",")+1)
+	for i := range row {
+		row[i] = "0"
+	}
+	set := func(name, value string) { row[fileCol[name]] = value }
+	set("file_id", "7")
+	set("path", path)
+	set("mtime", "2026-11-24 00:00:00.000")
+	set("first_ts", "1970-01-01 00:00:00.000")
+	set("last_ts", "1970-01-01 00:00:00.000")
+	set("session", "rollout")
+	set("cwd", "/work/akit")
+	parsed, _, _, err := parseFileRow(home, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.cwd != "/work/akit" || parsed.metadataErr != nil {
+		t.Fatalf("stored cwd=%q metadata error=%v", parsed.cwd, parsed.metadataErr)
+	}
+	row[fileCol["cwd"]] = ""
+	parsed, _, _, err = parseFileRow(home, row)
+	if err != nil {
+		t.Fatalf("unreadable legacy rollout prevented loader recovery: %v", err)
+	}
+	if parsed.metadataErr == nil {
+		t.Fatal("missing legacy rollout did not report its cwd read failure for logging")
+	}
+}
+
 func TestInotifyDrainReadsPendingFDEventsSynchronously(t *testing.T) {
 	dir := t.TempDir()
 	w, err := newWatcher(func(string, ...any) {})
