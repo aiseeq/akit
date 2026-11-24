@@ -2684,93 +2684,40 @@ func contextSecretName(text string, start, end int) (string, string, bool) {
 }
 
 func flagMatches(text string) []contextMatch {
-	if !strings.Contains(text, "-") {
-		return nil
-	}
 	var matches []contextMatch
-	for at := 0; at < len(text); at++ {
-		if text[at] != '-' || at > 0 && !flagBoundary(text[at-1]) {
+	coveredUntil := 0
+	for _, ix := range flagRE.FindAllStringSubmatchIndex(text, -1) {
+		if ix[0] < coveredUntil {
 			continue
 		}
-		match, next, ok := flagMatchAt(text, at)
-		if next > at {
-			at = next - 1
+		name := text[ix[2]:ix[3]]
+		kind, ok := optionSecretName(name)
+		if !ok {
+			continue
 		}
-		if ok {
-			matches = append(matches, match)
+		at := ix[1]
+		assigned := at < len(text) && text[at] == '='
+		if assigned {
+			at++
+		} else if at == len(text) || !hasFlagSpaceAt(text, at) {
+			continue
+		}
+		if assigned && hasHorizontalSpaceAt(text, at) {
+			continue
+		}
+		value, ok := scanValue(text, at, false)
+		if !ok || valueIsStructure(text, value) {
+			continue
+		}
+		coveredUntil = value.end
+		if !assigned && !flagValueAllowed(text[value.start:value.end]) || plainValueFor(name, text[value.start:value.end]) {
+			continue
+		}
+		if valueIsValue(text, value, name, kind, false) {
+			matches = append(matches, contextMatch{value.start, value.end, kind})
 		}
 	}
 	return matches
-}
-
-func flagMatchAt(text string, at int) (contextMatch, int, bool) {
-	nameStart := at + 1
-	if nameStart < len(text) && text[nameStart] == '-' {
-		nameStart++
-	}
-	nameEnd := nameStart
-	for nameEnd < len(text) {
-		_, size, ok := contextNameRuneAt(text, nameEnd)
-		if !ok {
-			break
-		}
-		nameEnd += size
-	}
-	if nameEnd == nameStart {
-		return contextMatch{}, nameStart, false
-	}
-	name := text[nameStart:nameEnd]
-	kind, ok := optionSecretName(name)
-	if !ok {
-		return contextMatch{}, nameEnd, false
-	}
-	return flagValueMatch(text, name, kind, nameEnd)
-}
-
-func flagValueMatch(text, name, kind string, nameEnd int) (contextMatch, int, bool) {
-	assigned := nameEnd < len(text) && text[nameEnd] == '='
-	valueAt := nameEnd
-	if assigned {
-		valueAt++
-	} else if valueAt == len(text) || !hasFlagSpaceAt(text, valueAt) {
-		return contextMatch{}, nameEnd, false
-	}
-	if assigned && hasHorizontalSpaceAt(text, valueAt) {
-		return contextMatch{}, nameEnd, false
-	}
-	value, ok := scanValue(text, valueAt, false)
-	if !ok {
-		return contextMatch{}, nameEnd, false
-	}
-	if valueIsStructure(text, value) {
-		return contextMatch{}, value.end, false
-	}
-	if !assigned && !flagValueAllowed(text[value.start:value.end]) || plainValueFor(name, text[value.start:value.end]) {
-		return contextMatch{}, value.end, false
-	}
-	if !valueIsValue(text, value, name, kind, false) {
-		return contextMatch{}, value.end, false
-	}
-	return contextMatch{value.start, value.end, kind}, value.end, true
-}
-
-func flagBoundary(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\'' || b == '"' || b == '`'
-}
-
-func contextNameRuneAt(text string, at int) (rune, int, bool) {
-	r, size := utf8.DecodeRuneInString(text[at:])
-	if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-' {
-		return r, size, true
-	}
-	if r > unicode.MaxASCII {
-		for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
-			if folded >= 'a' && folded <= 'z' || folded >= 'A' && folded <= 'Z' {
-				return r, size, true
-			}
-		}
-	}
-	return 0, 0, false
 }
 
 // urlMatches finds credentials in scheme://user:password@ and a token standing

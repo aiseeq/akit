@@ -2,13 +2,86 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aiseeq/akit/session"
 )
+
+func TestDBCodexProjectUsesRolloutCWD(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	rollout := filepath.Join(e.home, ".local", "state", "worker", "w2", "codex", "sessions", "2026", "11", "24",
+		"rollout-2026-11-24T10-00-00-0199cccc-0000-7000-8000-000000000003.jsonl")
+	writeWorkFile(t, rollout, []string{
+		`{"timestamp":"2026-11-24T10:00:00.000Z","type":"session_meta","payload":{"id":"0199cccc","cwd":"/work/akit"}}`,
+		`{"timestamp":"2026-11-24T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex project match"}]}}`,
+	})
+	probeServe(t, append(paths, rollout), unloaded)
+	probeCompare(t, e, "codex cwd project", "--all", "--codex", "--project", "akit", "--role", "all", "--max", "0")
+}
+
+func TestDBFindPrioritizesLiveNames(t *testing.T) {
+	home := t.TempDir()
+	projects := filepath.Join(home, ".claude", "projects", "-home-akit")
+	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	d := &dbPath{e: env{home: home}, files: map[string]*dbFile{}}
+	for i := range 119 {
+		path := filepath.Join(projects, fmt.Sprintf("%08x-0000-4000-8000-%012x.jsonl", i+1, i+1))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d.files[path] = &dbFile{path: path, name: "lead", session: filepath.Base(path)[:8]}
+	}
+	for _, name := range []string{"lead", "akit-master"} {
+		id := "00000077"
+		path := filepath.Join(projects, id+"-0000-4000-8000-000000000077.jsonl")
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d.files[path] = &dbFile{path: path, name: name, session: id}
+		got, err := d.findAfterLive(name, map[string]session.Info{name: {SessionID: filepath.Base(path)[:len(filepath.Base(path))-6]}}, nil)
+		if err != nil || got != path {
+			t.Errorf("find %q = %q, %v; want live path %q", name, got, err, path)
+		}
+	}
+	for _, name := range []string{"lead", "akit-master"} {
+		if _, err := d.findAfterLive(name, nil, nil); err == nil || strings.Contains(err.Error(), "ambiguous") {
+			t.Errorf("non-live name %q was matched as a transcript name: %v", name, err)
+		}
+	}
+}
+
+func TestDBFindSkipsGoneNamedFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gone-00000000-0000-4000-8000-000000000001.jsonl")
+	d := &dbPath{e: env{home: t.TempDir()}, files: map[string]*dbFile{path: {path: path, name: "gone-session", session: "gone0000"}}}
+	if _, err := d.findAfterLive("gone-session", nil, nil); err == nil || strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("gone file participated in name lookup: %v", err)
+	}
+}
+
+func TestDBRetentionBoundaryFallsBackAt89Days(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	path := "/p/session.jsonl"
+	src := source{Path: path}
+	files := map[string]*dbFile{path: {path: path, first: now.Add(-90 * 24 * time.Hour)}}
+	if !dbRetentionExceeded(options{}, []source{src}, files, now) {
+		t.Fatal("old session stayed on the database path")
+	}
+	files[path].first = now.Add(-88 * 24 * time.Hour)
+	if dbRetentionExceeded(options{}, []source{src}, files, now) {
+		t.Fatal("recent session fell back")
+	}
+	if !dbRetentionExceeded(options{since: now.Add(-90 * 24 * time.Hour)}, nil, nil, now) {
+		t.Fatal("old --since window stayed on the database path")
+	}
+}
 
 func probeServe(t *testing.T, paths []string, unloaded map[string]int) {
 	t.Helper()

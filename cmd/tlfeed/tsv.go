@@ -108,7 +108,7 @@ const (
 	eventColumns = "ts, file_id, session, kind, project, line, role, who, text, images, error, subtype, model, reply_id, " +
 		"request_id, in_tok, out_tok, cache_read, cache_write, cwd"
 	fileColumns = "file_id, path, kind, project, session, parent, name, description, size, ingested, lines, ev_lines, mtime, inode, " +
-		"first_ts, last_ts, bad, tail, gen, dirty, ver"
+		"first_ts, last_ts, bad, tail, gen, dirty, ver, cwd"
 	// usageColumns — the columns of usage as usage_mv fills them from events
 	usageColumns = "file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write"
 )
@@ -177,7 +177,7 @@ func fileRow(b *bytes.Buffer, f *file, ver uint64, dirty bool) {
 	r.num(uint64(f.ingested))
 	r.num(uint64(f.lines))
 	r.num(uint64(f.evLines))
-	r.seconds(f.mtime)
+	r.ms(f.mtime)
 	r.num(f.inode)
 	r.ms(f.first)
 	r.ms(f.last)
@@ -186,7 +186,8 @@ func fileRow(b *bytes.Buffer, f *file, ver uint64, dirty bool) {
 	r.num(f.gen)
 	r.num(flag)
 	r.b.WriteString(strconv.FormatUint(ver, 10))
-	r.end()
+	r.sep()
+	r.last(f.cwd)
 }
 
 // fields reads typed fields of one answer row; the first field that does not parse is kept in err, and the

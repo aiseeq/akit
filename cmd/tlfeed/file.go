@@ -26,6 +26,7 @@ type file struct {
 	id            uint64
 	src           transcript.Source
 	kind, project string
+	cwd           string
 	inode         uint64
 	size          int64
 	mtime         time.Time
@@ -68,9 +69,17 @@ func (f *file) committed() *file {
 }
 
 // describe sets the source fields that come from the path.
-func (f *file) describe(home string, src transcript.Source) {
+func (f *file) describe(home string, src transcript.Source) error {
 	f.src = src
 	f.kind, f.project = kindOf(home, src)
+	if f.kind == "codex" {
+		cwd, err := transcript.CodexProjectCWD(src.Path)
+		if err != nil {
+			return fmt.Errorf("codex cwd %s: %w", src.Path, err)
+		}
+		f.cwd = cwd
+	}
+	return nil
 }
 
 // kindOf — claude, sub or codex, and the project: the Claude project folder or worker:<task>.

@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -39,7 +41,12 @@ func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err
 	if p.err != nil {
 		return nil, 0, false, fmt.Errorf("files row: %w", p.err)
 	}
-	f.describe(home, transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")], Description: r[c("description")]})
+	if err := f.describe(home, transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")], Description: r[c("description")]}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, 0, false, err
+	}
+	if r[c("cwd")] != "" {
+		f.cwd = r[c("cwd")]
+	}
 	f.complete = f.ingested
 	f.commit()
 	return f, ver, dirty, nil
@@ -141,25 +148,7 @@ func (l *loader) pass(full bool) error {
 		}
 	}
 	l.sweepSlice(want, now)
-	complete := !l.needsFullList
-	if full || lost {
-		if paths, err := l.listAll(); err != nil {
-			l.logf("list transcripts: %v", err)
-			l.st.setError(err.Error())
-			l.needsFullList, complete = true, false
-		} else {
-			l.needsFullList = false
-			if l.errText == "" {
-				l.st.setError("")
-			}
-			for _, p := range paths {
-				want[p] = true
-			}
-		}
-	}
-	if l.needsFullList {
-		complete = false
-	}
+	complete := l.listPass(full, lost, want)
 	if err := l.visitAll(slices.Sorted(maps.Keys(want))); err != nil {
 		return err
 	}
@@ -169,15 +158,55 @@ func (l *loader) pass(full bool) error {
 		}
 	}
 	l.report()
-	if complete {
-		l.completePass(now)
+	// The boundary is taken before a synchronous drain: writes that happened before it are already
+	// in the kernel queue and are visited before the boundary is recorded.
+	boundary := l.now()
+	queued, overflow := l.dirs.w.drain()
+	if overflow {
+		l.needsFullList = true
+		complete = false
+	}
+	for _, e := range queued {
+		for _, p := range l.dirs.event(e, boundary) {
+			want[p] = true
+		}
+	}
+	if len(queued) > 0 {
+		if err := l.visitAll(slices.Sorted(maps.Keys(want))); err != nil {
+			return err
+		}
+	}
+	if complete && !l.needsFullList {
+		l.completePass(boundary)
 	}
 	return nil
 }
 
+func (l *loader) listPass(full, lost bool, want map[string]bool) bool {
+	complete := !l.needsFullList
+	if !full && !lost && !l.needsFullList {
+		return complete
+	}
+	paths, err := l.listAll()
+	if err != nil {
+		l.logf("list transcripts: %v", err)
+		l.st.setError(err.Error())
+		l.needsFullList = true
+		return false
+	}
+	l.needsFullList = false
+	if l.errText == "" {
+		l.st.setError("")
+	}
+	for _, p := range paths {
+		want[p] = true
+	}
+	return true
+}
+
 // completePass records a conservative freshness boundary. Changes to watched folders arrive through inotify;
-// this pass visits every event already queued before the boundary, so all complete lines written before its
-// start are confirmed when lag is zero. Worker task folders outside inotify's recent 48-hour window are found
+// the pass takes the boundary before synchronously draining the nonblocking fd, then visits those events,
+// so complete lines written before the boundary are confirmed when lag is zero. Worker task folders outside inotify's recent 48-hour window are found
 // only by the sweep, so this timestamp does not guarantee freshness for them (up to --sweep late).
 func (l *loader) completePass(start time.Time) {
 	lag, _ := l.lag()

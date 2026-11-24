@@ -191,8 +191,17 @@ func TestShadowKeyDiff(t *testing.T) {
 	res := &result{hits: []hit{{src: source{Path: "/p/a.jsonl"}}, {src: source{Path: "/p/a.jsonl"}}}}
 	res.hits[0].ev.Time, res.hits[0].ev.Line = at, 1
 	res.hits[1].ev.Time, res.hits[1].ev.Line = at.Add(time.Minute), 2
-	if keys := answerKeys(&answer{res: res}, opts, at.Add(time.Second)); !slices.Equal(keys, []string{"/p/a.jsonl:1"}) {
+	if keys := answerKeys(&answer{res: res}, opts); !slices.Equal(keys, []string{"/p/a.jsonl:1", "/p/a.jsonl:2"}) {
 		t.Errorf("keys %q", keys)
+	}
+}
+
+func TestShadowKeysUseStoredLineLimits(t *testing.T) {
+	got := filterShadowLines([]string{"/p/a.jsonl:1", "/p/a.jsonl:2", "/p/a.jsonl:3", "/p/gone.jsonl:1"},
+		map[string]int{"/p/a.jsonl": 2})
+	want := []string{"/p/a.jsonl:1", "/p/a.jsonl:2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("line-limited shadow keys %q, want %q", got, want)
 	}
 }
 

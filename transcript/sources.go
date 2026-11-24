@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+// EventRetention is the age after which the loader may remove transcript events.
+const EventRetention = 90 * 24 * time.Hour
+
 // Source describes a transcript file and, for a subagent, its parent.
 type Source struct {
 	Path, ID, ParentID, Description string
@@ -169,6 +172,18 @@ func codexCWD(path string) (string, error) {
 		return "", fmt.Errorf("read transcript cwd: %w", err)
 	}
 	return "", nil
+}
+
+// CodexCWD reads the cwd from the first records of a rollout, when present.
+func CodexCWD(path string) (string, error) { return codexCWD(path) }
+
+// CodexProjectCWD returns the rollout cwd, falling back to worker task metadata as source selection does.
+func CodexProjectCWD(path string) (string, error) {
+	cwd, err := codexCWD(path)
+	if err != nil || cwd != "" {
+		return cwd, err
+	}
+	return workerTree(path)
 }
 
 func workerTree(path string) (string, error) {

@@ -94,9 +94,11 @@ func TestReadDBStateHealth(t *testing.T) {
 		change func(*dbState)
 	}{
 		{"stale heartbeat", func(s *dbState) { s.Heartbeat = time.Now().Add(-11 * time.Minute).Format(time.RFC3339Nano) }},
+		{"future heartbeat", func(s *dbState) { s.Heartbeat = time.Now().Add(2 * time.Minute).Format(time.RFC3339Nano) }},
 		{"loader error", func(s *dbState) { s.Error = "insert failed" }},
 		{"wrong home", func(s *dbState) { s.Home = t.TempDir() }},
 		{"missing boundary", func(s *dbState) { s.DBThrough = time.Time{} }},
+		{"stale boundary with fresh heartbeat", func(s *dbState) { s.DBThrough = time.Now().Add(-11 * time.Minute) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := valid
@@ -126,6 +128,7 @@ func TestUnhealthyDBStateFallsBackToFiles(t *testing.T) {
 		{"stale", func(s *dbState) { s.Heartbeat = time.Now().Add(-11 * time.Minute).Format(time.RFC3339Nano) }, "heartbeat is stale"},
 		{"error", func(s *dbState) { s.Error = "database error" }, "reports an error"},
 		{"home", func(s *dbState) { s.Home = t.TempDir() }, "home does not match"},
+		{"stale boundary", func(s *dbState) { s.DBThrough = time.Now().Add(-11 * time.Minute) }, "db_through is stale"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.mutate == nil {

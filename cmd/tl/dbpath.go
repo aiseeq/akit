@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/price"
+	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -55,6 +56,7 @@ type dbFile struct {
 	parent  string
 	kind    string
 	project string
+	cwd     string
 	name    string
 	desc    string
 	mtime   time.Time
@@ -118,6 +120,9 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage, nil
 	}
+	if dbRetentionExceeded(opts, sources, d.files, d.e.now) {
+		return 0, errors.New("requested data may predate retained events")
+	}
 	d.tracef("sources", start, len(sources))
 	start = time.Now()
 	res, err := d.result(sources)
@@ -134,6 +139,19 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 		return reportUsage(res, sources, opts, e, stdout), nil
 	}
 	return report(res, opts, e, stdout), nil
+}
+
+func dbRetentionExceeded(opts options, sources []source, files map[string]*dbFile, now time.Time) bool {
+	cutoff := now.Add(-transcript.EventRetention + 24*time.Hour)
+	if !opts.since.IsZero() && opts.since.Before(cutoff) {
+		return true
+	}
+	for _, src := range sources {
+		if f := files[src.Path]; f != nil && !f.first.IsZero() && f.first.Before(cutoff) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *dbPath) tracef(what string, start time.Time, n int) {
@@ -156,21 +174,26 @@ func (d *dbPath) queryIn(ctx context.Context, q chQuery) ([][]string, error) {
 func (d *dbPath) loadFiles() error {
 	ctx, cancel := context.WithTimeout(d.ctx, filesTimeout)
 	defer cancel()
+	where, err := d.filePredicate()
+	if err != nil {
+		return err
+	}
 	rows, err := d.queryIn(ctx, chQuery{name: "files", sql: "SELECT file_id, path, name, description, lines, ev_lines, " +
-		"intDiv(ver, 1000000), bad, toUnixTimestamp(mtime) * 1000, " +
-		"toUnixTimestamp64Milli(first_ts), session, parent, kind, project FROM files FINAL"})
+		"intDiv(ver, 1000000), bad, toUnixTimestamp64Milli(toDateTime64(mtime, 3, 'UTC')), " +
+		"toUnixTimestamp64Milli(first_ts), session, parent, kind, project, cwd FROM files FINAL WHERE " + where.sql,
+		params: where.params})
 	if err != nil {
 		return err
 	}
 	d.files = make(map[string]*dbFile, len(rows))
 	for _, row := range rows {
-		if len(row) != 14 {
-			return fmt.Errorf("files: %d fields in a row, want 14", len(row))
+		if len(row) != 15 {
+			return fmt.Errorf("files: %d fields in a row, want 15", len(row))
 		}
 		p := fields{row: row}
 		f := &dbFile{id: p.uint(0), path: row[1], name: row[2], desc: row[3], lines: p.int(4), evLines: p.int(5),
 			loaded: time.UnixMilli(int64(p.uint(6))), bad: p.int(7), mtime: time.UnixMilli(int64(p.uint(8))),
-			first: time.UnixMilli(int64(p.uint(9))), session: row[10], parent: row[11], kind: row[12], project: row[13]}
+			first: time.UnixMilli(int64(p.uint(9))), session: row[10], parent: row[11], kind: row[12], project: row[13], cwd: row[14]}
 		if p.err != nil {
 			return fmt.Errorf("files: %w", p.err)
 		}
@@ -181,6 +204,93 @@ func (d *dbPath) loadFiles() error {
 		d.files[f.path] = f
 	}
 	return nil
+}
+
+func (d *dbPath) filePredicate() (where, error) {
+	if d.opts.all {
+		return d.allFilePredicate(), nil
+	}
+	return d.sessionFilePredicate()
+}
+
+func (d *dbPath) allFilePredicate() where {
+	w := where{params: map[string]string{}}
+	since := d.opts.since
+	if since.IsZero() {
+		since = d.e.now.Add(-sinceDefault)
+	}
+	w.params["file_since"] = chTime(since)
+	conds := []string{"mtime >= {file_since:DateTime64(3, 'UTC')}"}
+	if !d.opts.until.IsZero() {
+		w.params["file_until"] = chTime(d.opts.until)
+		conds = append(conds, "first_ts <= {file_until:DateTime64(3, 'UTC')}")
+	}
+	if !d.opts.codex {
+		conds = append(conds, "kind != 'codex'")
+	}
+	if d.opts.noSubagents {
+		conds = append(conds, "kind != 'sub'")
+	}
+	if d.opts.project != "" {
+		w.params["project"] = d.opts.project
+		conds = append(conds, "((kind = 'codex' AND (position(path, {project:String}) > 0 OR position(cwd, {project:String}) > 0)) OR (kind != 'codex' AND (position(path, {project:String}) > 0 OR position(project, {project:String}) > 0)) )")
+	}
+	w.sql = strings.Join(conds, " AND ")
+	return w
+}
+
+func (d *dbPath) sessionFilePredicate() (where, error) {
+	w := where{params: map[string]string{}}
+	args := d.opts.args
+	if len(args) == 0 && d.e.sessionID != "" {
+		args = []string{d.e.sessionID}
+	}
+	if len(args) == 0 {
+		return where{sql: "0", params: w.params}, nil
+	}
+	var ids, paths []string
+	alive, aliveErr := session.ForHome(d.e.home).Alive()
+	if aliveErr != nil && len(alive) == 0 {
+		return where{}, fmt.Errorf("read live session names: %w", aliveErr)
+	}
+	if aliveErr != nil && d.trace != nil {
+		fmt.Fprintf(d.trace, "tl: db live session registry: %v\n", aliveErr)
+	}
+	for _, arg := range args {
+		if ref := refArg.FindStringSubmatch(arg); ref != nil {
+			arg = ref[1]
+		}
+		if strings.HasPrefix(arg, "~/") {
+			arg = filepath.Join(d.e.home, arg[2:])
+		}
+		if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
+			paths = append(paths, arg)
+			continue
+		}
+		if in, ok := alive[arg]; ok {
+			ids = append(ids, in.SessionID)
+		} else if len(arg) >= 6 {
+			ids = append(ids, arg)
+		}
+	}
+	var conds []string
+	if len(paths) > 0 {
+		w.params["find_paths"] = chStrings(paths)
+		conds = append(conds, "path IN {find_paths:Array(String)}")
+	}
+	for i, id := range ids {
+		key := fmt.Sprintf("find_id_%d", i)
+		w.params[key] = id
+		conds = append(conds, "(startsWith(session, {"+key+":String}) OR position(path, {"+key+":String}) > 0)")
+	}
+	if len(conds) == 0 {
+		return where{sql: "0", params: w.params}, nil
+	}
+	if d.opts.subagents {
+		conds = append(conds, "parent IN (SELECT session FROM files FINAL WHERE "+strings.Join(conds, " OR ")+")")
+	}
+	w.sql = "(" + strings.Join(conds, " OR ") + ")"
+	return w, nil
 }
 
 // fields reads typed fields of one answer row; the first that does not parse is kept in err.
@@ -265,7 +375,13 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 	if f.kind == "codex" && !d.opts.codex || f.kind == "sub" && d.opts.noSubagents {
 		return false
 	}
-	return d.opts.project == "" || strings.Contains(f.path, d.opts.project) || strings.Contains(f.project, d.opts.project)
+	if d.opts.project == "" {
+		return true
+	}
+	if f.kind == "codex" {
+		return strings.Contains(f.path, d.opts.project) || strings.Contains(f.cwd, d.opts.project)
+	}
+	return strings.Contains(f.path, d.opts.project) || strings.Contains(f.project, d.opts.project)
 }
 
 func (d *dbPath) find(arg string) (string, error) {
@@ -278,18 +394,23 @@ func (d *dbPath) find(arg string) (string, error) {
 		}
 		return "", fmt.Errorf("transcript %s is not in the database", arg)
 	}
-	var named []string
-	for path, f := range d.files {
-		if f.name == arg {
-			named = append(named, path)
+	// Match the file resolver: live names take precedence over transcript names and ids.
+	alive, aliveErr := session.ForHome(d.e.home).Alive()
+	return d.findAfterLive(arg, alive, aliveErr)
+}
+
+func (d *dbPath) findAfterLive(arg string, alive map[string]session.Info, aliveErr error) (string, error) {
+	if in, ok := alive[arg]; ok {
+		var path string
+		var newest time.Time
+		for p, f := range d.files {
+			if sourceFullID(source{Path: p, ID: p}) == in.SessionID && dbTranscriptPresent(p) && (path == "" || f.mtime.After(newest)) {
+				path, newest = p, f.mtime
+			}
 		}
-	}
-	if len(named) == 1 {
-		return named[0], nil
-	}
-	if len(named) > 1 {
-		sort.Strings(named)
-		return "", fmt.Errorf("%q is ambiguous: matches %d transcripts", arg, len(named))
+		if path != "" {
+			return path, nil
+		}
 	}
 	if len(arg) < 6 {
 		return "", fmt.Errorf("%q: session id must be at least 6 characters", arg)
@@ -300,7 +421,7 @@ func (d *dbPath) find(arg string) (string, error) {
 		if id == "" {
 			id = sourceFullID(source{Path: path, ID: path})
 		}
-		if strings.HasPrefix(id, arg) || strings.HasPrefix(sourceFullID(source{Path: path, ID: path}), arg) {
+		if (strings.HasPrefix(id, arg) || strings.HasPrefix(sourceFullID(source{Path: path, ID: path}), arg)) && dbTranscriptPresent(path) {
 			matches = append(matches, path)
 		}
 	}
@@ -309,9 +430,19 @@ func (d *dbPath) find(arg string) (string, error) {
 		return matches[0], nil
 	}
 	if len(matches) == 0 {
+		if aliveErr != nil {
+			return "", fmt.Errorf("%q: no transcript with this id; live sessions read with error: %w", arg, aliveErr)
+		}
 		return "", fmt.Errorf("%q: no transcript with this id in the database", arg)
 	}
 	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts; give more of the id", arg, len(matches))
+}
+
+// dbTranscriptPresent excludes stale names for files the loader has already seen disappear. It only stats
+// candidate rows from files FINAL; it never opens a transcript or walks its parent folders.
+func dbTranscriptPresent(path string) bool {
+	_, err := os.Stat(path)
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 func (d *dbPath) listNames() ([]string, error) {

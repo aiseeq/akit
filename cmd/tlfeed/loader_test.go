@@ -503,6 +503,107 @@ func TestStateDBThroughOnlyMovesOnZeroLag(t *testing.T) {
 	}
 }
 
+func TestStateBoundaryResetsWhenHomeChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	oldHome, newHome := filepath.Join(t.TempDir(), "old"), filepath.Join(t.TempDir(), "new")
+	old := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	data, _ := json.Marshal(stateFile{Home: oldHome, DBThrough: stamp(old)})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := newStatus(path)
+	st.forHome(newHome)
+	if !st.dbThrough.IsZero() || st.home != newHome {
+		t.Fatalf("home change retained boundary %v, home %q", st.dbThrough, st.home)
+	}
+	data, _ = json.Marshal(stateFile{Home: newHome, DBThrough: stamp(old)})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st = newStatus(path)
+	st.forHome(newHome)
+	if !st.dbThrough.Equal(old) {
+		t.Fatalf("same home lost boundary %v, want %v", st.dbThrough, old)
+	}
+}
+
+func TestFailedFullListingDoesNotAdvanceBoundaryAndRetries(t *testing.T) {
+	h := newHarness(t)
+	data := sample(t, "claude.jsonl")
+	path := claudePath(h.home)
+	write(t, path, data)
+	st := newStatus("")
+	old := time.Now().Add(-time.Hour)
+	st.completedPass(old, 0)
+	stop := make(chan struct{})
+	badHome := h.home + "["
+	l := newLoader(config{home: badHome, db: "tq", tick: time.Second, idle: time.Hour, sweep: time.Hour, rescan: time.Hour,
+		batch: 32 << 20}, h.srv, stop, &h.log, st)
+	l.dirs.w = noWatch{}
+	if err := l.pass(true); err != nil {
+		t.Fatal(err)
+	}
+	if !l.needsFullList || !st.dbThrough.Equal(old) {
+		t.Fatalf("failed listing: needsFullList=%t boundary=%v", l.needsFullList, st.dbThrough)
+	}
+	l.cfg.home = h.home
+	l.dirs = newDirs(h.home, l.logf)
+	l.dirs.w = noWatch{}
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	if l.needsFullList || l.files[path] == nil {
+		t.Fatalf("retry did not list sources: needsFullList=%t files=%v", l.needsFullList, l.files)
+	}
+}
+
+func TestCodexCWDStoredInFilesRow(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "state", "worker", "task", "codex", "sessions", "2026", "11", "24", "rollout-test.jsonl")
+	write(t, path, []byte(`{"type":"session_meta","payload":{"id":"test","cwd":"/work/akit"}}`+"\n"))
+	f := &file{id: 1, gen: 2}
+	if err := f.describe(home, transcript.Source{Path: path, ID: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	var row bytes.Buffer
+	fileRow(&row, f, 3, false)
+	rows := tsvRows(row.Bytes())
+	if len(rows) != 1 {
+		t.Fatalf("files row count %d", len(rows))
+	}
+	loaded, _, _, err := parseFileRow(home, rows[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.cwd != "/work/akit" {
+		t.Fatalf("stored cwd %q", loaded.cwd)
+	}
+}
+
+func TestInotifyDrainReadsPendingFDEventsSynchronously(t *testing.T) {
+	dir := t.TempDir()
+	w, err := newWatcher(func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("create inotify watcher: %v", err)
+	}
+	defer w.close()
+	w.add(dir)
+	write(t, filepath.Join(dir, "ready.jsonl"), []byte("line\n"))
+	events, lost := w.drain()
+	if lost {
+		t.Fatal("inotify reported an overflow")
+	}
+	if len(events) == 0 {
+		t.Fatal("drain left the kernel fd unread")
+	}
+	for _, event := range events {
+		if event.name == "ready.jsonl" {
+			return
+		}
+	}
+	t.Fatalf("events %v do not contain the pending file", events)
+}
+
 // The state file of a follow run: lag is zero once the server confirmed every complete line; while the server is
 // down, the file shows the error and the bytes waiting for it.
 func TestStateOfLoader(t *testing.T) {
@@ -557,12 +658,12 @@ func TestArgs(t *testing.T) {
 
 func TestStatements(t *testing.T) {
 	got := statements("tq")
-	if len(got) != 10 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
+	if len(got) != 12 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
 		t.Fatalf("%d statements: %q", len(got), got)
 	}
 	for _, s := range got {
-		// the one ALTER widens a column of tables made before; run again, it changes nothing
-		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64"
+		// ALTERs widen existing columns; run again, they change nothing.
+		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')"
 		if strings.Contains(s, "{db}") || strings.Contains(s, "--") || !idempotent {
 			t.Fatalf("statement %q", s)
 		}

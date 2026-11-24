@@ -206,10 +206,7 @@ func load(o options, srv *server, stderr io.Writer) int {
 		close(stop)
 	}()
 	st := newStatus(o.cfg.state)
-	if filepath.Clean(st.home) != o.cfg.home {
-		st.dbThrough = time.Time{}
-	}
-	st.home = o.cfg.home
+	st.forHome(o.cfg.home)
 	l := newLoader(o.cfg, srv, stop, stderr, st)
 	l.dirs.w = noWatch{}
 	if o.cfg.inotify && !o.cfg.once {

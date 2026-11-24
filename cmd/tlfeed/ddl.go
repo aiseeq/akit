@@ -4,10 +4,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 const (
-	eventRetentionDays    = 90
+	eventRetentionDays    = int(transcript.EventRetention / (24 * time.Hour))
 	eventUsageRebuildDays = eventRetentionDays - 1
 	retainedEventKinds    = "kind = 'claude' AND role IN ('user', 'ask')"
 )
@@ -55,11 +57,12 @@ CREATE TABLE IF NOT EXISTS {db}.files
     parent String,                        -- the parent session of a subagent
     name String,                          -- agent-name of the session
     description String,                   -- description from the subagent metadata file
+    cwd String,                            -- working directory from a codex rollout header
     size UInt64,                          -- file size at the last pass
     ingested UInt64,                      -- bytes up to the last complete line already in raw
     lines UInt32,                         -- complete lines already in raw
     ev_lines UInt32,                      -- lines whose events are already in events
-    mtime DateTime('UTC'),
+    mtime DateTime64(3, 'UTC'),
     inode UInt64,
     first_ts DateTime64(3, 'UTC'),
     last_ts DateTime64(3, 'UTC'),
@@ -73,7 +76,9 @@ ENGINE = ReplacingMergeTree(ver)
 ORDER BY file_id;
 
 ALTER TABLE {db}.files MODIFY COLUMN gen UInt64;
+ALTER TABLE {db}.files MODIFY COLUMN mtime DateTime64(3, 'UTC');
 ALTER TABLE {db}.files ADD COLUMN IF NOT EXISTS description String AFTER name;
+ALTER TABLE {db}.files ADD COLUMN IF NOT EXISTS cwd String AFTER description;
 
 CREATE TABLE IF NOT EXISTS {db}.raw
 (

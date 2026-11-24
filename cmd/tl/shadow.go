@@ -120,25 +120,18 @@ func shadowDBCutoff(opts options, now, through time.Time) time.Time {
 	return cutoff
 }
 
-// answerKeys are the events an answer holds up to cutoff: path:line of each, a row per session for --usage.
-func answerKeys(a *answer, opts options, cutoff time.Time) []string {
+// answerKeys are the events an answer found: path:line of each, a row per session for --usage.
+func answerKeys(a *answer, opts options) []string {
 	keys := []string{}
 	if a.res == nil {
 		for i := range a.refs {
-			if !cutoff.IsZero() && a.refs[i].ev.Time.After(cutoff) {
-				continue
-			}
 			keys = append(keys, a.refs[i].src.Path+":"+strconv.Itoa(a.refs[i].ev.Line))
 		}
 		slices.Sort(keys)
 		return keys
 	}
 	var hits []hit
-	for i := range a.res.hits {
-		if cutoff.IsZero() || !a.res.hits[i].ev.Time.After(cutoff) {
-			hits = append(hits, a.res.hits[i])
-		}
-	}
+	hits = append(hits, a.res.hits...)
 	if opts.usage {
 		return usageKeys(hits)
 	}
@@ -339,11 +332,13 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 	}
 	state, err := readDBState(e.home)
 	if err != nil {
-		printMasked(stderr, fmt.Sprintf("tl: shadow: freshness state: %v; no shadow\n", err))
+		if e.dbTrace != nil {
+			fmt.Fprintf(e.dbTrace, "tl: shadow freshness state: %v; no shadow\n", err)
+		}
 		return
 	}
 	cutoff := shadowDBCutoff(opts, e.now, state.DBThrough)
-	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeys(a, opts, cutoff), FilesS: elapsed.Seconds(),
+	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeys(a, opts), FilesS: elapsed.Seconds(),
 		FilesCode: code, Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
 	if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: shadow: %v\n", err))
@@ -399,9 +394,6 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		rec.Error = err.Error()
 		return rec
 	}
-	if !spec.Cutoff.IsZero() {
-		opts.until = spec.Cutoff
-	}
 	c, err := newCHClientFromEnv()
 	if err != nil {
 		rec.Error = err.Error()
@@ -423,13 +415,59 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		rec.Error = hideSafe(err.Error())
 		return rec
 	}
-	keys := answerKeys(a, opts, spec.Cutoff)
+	limits, err := shadowLineLimits(c)
+	if err != nil {
+		rec.Error = err.Error()
+		return rec
+	}
+	spec.Keys = filterShadowLines(spec.Keys, limits)
+	keys := filterShadowLines(answerKeys(a, opts), limits)
 	rec.DBKeys = len(keys)
 	rec.Diff, rec.OnlyFiles, rec.OnlyDB = keyDiff(spec.Keys, keys)
 	if code != spec.FilesCode {
 		rec.Error = fmt.Sprintf("exit %d through the database, %d through files", code, spec.FilesCode)
 	}
 	return rec
+}
+
+func shadowLineLimits(c *chClient) (map[string]int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), shadowTimeout)
+	defer cancel()
+	rows, err := c.selectTSV(ctx, chQuery{name: "shadow_files", sql: "SELECT path, lines FROM files FINAL"})
+	if err != nil {
+		return nil, err
+	}
+	limits := make(map[string]int, len(rows))
+	for _, row := range rows {
+		if len(row) != 2 {
+			return nil, fmt.Errorf("shadow files: want 2 fields, got %d", len(row))
+		}
+		n, err := strconv.Atoi(row[1])
+		if err != nil {
+			return nil, fmt.Errorf("shadow files lines %q: %w", row[1], err)
+		}
+		limits[row[0]] = n
+	}
+	return limits, nil
+}
+
+func filterShadowLines(keys []string, limits map[string]int) []string {
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		path, raw, ok := strings.Cut(key, ":")
+		if !ok {
+			if strings.Contains(key, "\t") {
+				out = append(out, key)
+			}
+			continue
+		}
+		line, err := strconv.Atoi(raw)
+		if err == nil && line <= limits[path] {
+			out = append(out, key)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // hideSafe masks what goes to the journal from the call: a pasted key may be in an argument.

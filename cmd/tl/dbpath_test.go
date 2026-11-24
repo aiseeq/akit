@@ -34,16 +34,16 @@ type fakeCH struct {
 }
 
 type chFile struct {
-	id                       uint64
-	path, name, desc, kind   string
-	session, parent, project string
-	mtime                    time.Time
-	first                    time.Time
-	lines, evLines           int
-	loaded                   time.Time
-	events                   []chEvent
-	raw                      []string // the lines, from 1
-	bad                      int
+	id                          uint64
+	path, name, desc, kind, cwd string
+	session, parent, project    string
+	mtime                       time.Time
+	first                       time.Time
+	lines, evLines              int
+	loaded                      time.Time
+	events                      []chEvent
+	raw                         []string // the lines, from 1
+	bad                         int
 }
 
 type chEvent struct {
@@ -105,6 +105,9 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 		if src, err := transcript.SourceAt(path); err == nil {
 			f.desc = src.Description
 		}
+		if f.kind == "codex" {
+			f.cwd, _ = transcript.CodexProjectCWD(path)
+		}
 		f.name, f.bad = meta.Name, meta.Bad
 		if n < len(lines) {
 			// the loader read the file when its last loaded line was new
@@ -136,6 +139,9 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Code: 164. DB::Exception: readonly", http.StatusInternalServerError)
 		return
 	}
+	if r.Header.Get("Accept-Encoding") != "identity" {
+		s.t.Errorf("request enabled HTTP compression: %q", r.Header.Get("Accept-Encoding"))
+	}
 	for _, word := range []string{"INSERT", "ALTER", "OPTIMIZE", "DROP", "CREATE", "SYSTEM"} {
 		if strings.Contains(strings.ToUpper(sql), word+" ") {
 			s.t.Errorf("a query that writes: %s", sql)
@@ -164,7 +170,11 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "files":
 		for _, f := range s.files {
 			row(f.id, f.path, f.name, f.desc, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad,
-				f.mtime.Unix()*1000, f.first.UnixMilli(), f.session, f.parent, f.kind, f.project)
+				f.mtime.Unix()*1000, f.first.UnixMilli(), f.session, f.parent, f.kind, f.project, f.cwd)
+		}
+	case "shadow_files":
+		for _, f := range s.files {
+			row(f.path, f.lines)
 		}
 	case "events", "usage":
 		for _, f := range s.files {
@@ -579,7 +589,7 @@ func TestDBFreshnessLineAndNoTranscriptReads(t *testing.T) {
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	through := time.Date(2026, 11, 23, 12, 34, 56, 0, time.Local)
+	through := time.Now().Add(-time.Minute).Truncate(time.Second)
 	state := dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: through, Home: e.home}
 	b, _ := json.Marshal(state)
 	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")

@@ -3,10 +3,11 @@ package secretmask
 import (
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestNameMatchesFastAgreesWithRegexp(t *testing.T) {
+func TestNameMatchesFastAcrossRandomText(t *testing.T) {
 	check := func(text string) {
 		t.Helper()
 		var want []contextMatch
@@ -28,7 +29,6 @@ func TestNameMatchesFastAgreesWithRegexp(t *testing.T) {
 		"paſsword=hidden and KEY:another-value",
 	} {
 		check(text)
-		checkFlags(t, text)
 	}
 	r := rand.New(rand.NewSource(71))
 	alphabet := []byte("abcXYZ09_-. :='\"\\>\t[]")
@@ -38,49 +38,25 @@ func TestNameMatchesFastAgreesWithRegexp(t *testing.T) {
 			text[j] = alphabet[r.Intn(len(alphabet))]
 		}
 		check(string(text))
-		checkFlags(t, string(text))
 	}
 }
 
-func checkFlags(t *testing.T, text string) {
-	t.Helper()
-	var want []contextMatch
-	coveredUntil := 0
-	for _, ix := range flagRE.FindAllStringSubmatchIndex(text, -1) {
-		if ix[0] < coveredUntil {
-			continue
-		}
-		name := text[ix[2]:ix[3]]
-		kind, ok := optionSecretName(name)
-		if !ok {
-			continue
-		}
-		at := ix[1]
-		assigned := at < len(text) && text[at] == '='
-		if assigned {
-			at++
-		} else if at == len(text) || !hasFlagSpaceAt(text, at) {
-			continue
-		}
-		if assigned && hasHorizontalSpaceAt(text, at) {
-			continue
-		}
-		value, ok := scanValue(text, at, false)
-		if !ok || valueIsStructure(text, value) {
-			if ok {
-				coveredUntil = value.end
+func TestNestedSecretFlagsInsideStructuredFlagValues(t *testing.T) {
+	for _, in := range []string{
+		`--token '{"a": "--password hunter2xyzQ9"}'`,
+		`--token "{\"a\": \"--password hunter2xyzQ9\"}"`,
+		`--token {"a":"--password=hunter2xyzQ9"}`,
+		`--token {"a":1,"b":"--api-key sk9Hx7Lm2Qp4Zt8"}`,
+		`run --config '{"x": 1}' --password hunter2xyzQ9`,
+		`--secret '[a: 1, "--password Zx9QwErTy7"]'`,
+		`cmd --opts "(k: v, '--token Zx9QwErTy7Ab')"`,
+		`--token (name: x) --password Zx9QwErTy7`,
+	} {
+		got, _ := Mask(in)
+		for _, secret := range []string{"hunter2xyzQ9", "Zx9QwErTy7", "sk9Hx7Lm2Qp4Zt8", "Zx9QwErTy7Ab"} {
+			if strings.Contains(got, secret) {
+				t.Errorf("nested flag value was not masked: %q -> %q", in, got)
 			}
-			continue
 		}
-		coveredUntil = value.end
-		if !assigned && !flagValueAllowed(text[value.start:value.end]) || plainValueFor(name, text[value.start:value.end]) {
-			continue
-		}
-		if valueIsValue(text, value, name, kind, false) {
-			want = append(want, contextMatch{value.start, value.end, kind})
-		}
-	}
-	if got := flagMatches(text); !reflect.DeepEqual(got, want) {
-		t.Fatalf("flagMatches(%q) = %#v, regexp path = %#v", text, got, want)
 	}
 }

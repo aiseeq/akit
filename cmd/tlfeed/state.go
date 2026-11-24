@@ -64,6 +64,15 @@ func (s *status) setError(text string) {
 	s.mu.Unlock()
 }
 
+func (s *status) forHome(home string) {
+	s.mu.Lock()
+	if filepath.Clean(s.home) != filepath.Clean(home) {
+		s.dbThrough = time.Time{}
+	}
+	s.home = home
+	s.mu.Unlock()
+}
+
 func (s *status) rowsLoaded(at time.Time) {
 	s.mu.Lock()
 	s.lastRow = at

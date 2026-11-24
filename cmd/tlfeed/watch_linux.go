@@ -17,7 +17,7 @@ const watchMask = syscall.IN_CREATE | syscall.IN_MOVED_TO | syscall.IN_MOVED_FRO
 // the passes; repeated events of one entry count once.
 type inotify struct {
 	fd     int
-	f      *os.File // the same descriptor, read through the runtime poller so that close ends the reader
+	f      *os.File // closes the nonblocking descriptor
 	mu     sync.Mutex
 	dirs   map[int32]string
 	wds    map[string]int32
@@ -38,7 +38,6 @@ func newWatcher(logf func(string, ...any)) (watcher, error) {
 	}
 	w := &inotify{fd: fd, f: os.NewFile(uintptr(fd), "inotify"), dirs: map[int32]string{}, wds: map[string]int32{},
 		events: map[watchEvent]bool{}, logf: logf}
-	go w.read()
 	return w, nil
 }
 
@@ -63,54 +62,62 @@ func (w *inotify) add(dir string) {
 	w.dirs[int32(wd)], w.wds[dir] = dir, int32(wd)
 }
 
-func (w *inotify) read() {
-	buf := make([]byte, 64<<10)
-	for {
-		n, err := w.f.Read(buf)
-		if err != nil {
-			if !errors.Is(err, os.ErrClosed) {
-				w.mu.Lock()
-				w.dead, w.lost = err, true
-				w.mu.Unlock()
-			}
-			return
+func (w *inotify) collect(buf []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for off := 0; off+syscall.SizeofInotifyEvent <= len(buf); {
+		// struct inotify_event: wd, mask, cookie, len, then len bytes of a NUL-padded name
+		wd := int32(binary.NativeEndian.Uint32(buf[off:]))
+		mask := binary.NativeEndian.Uint32(buf[off+4:])
+		size := int(binary.NativeEndian.Uint32(buf[off+12:]))
+		start := off + syscall.SizeofInotifyEvent
+		if start+size > len(buf) {
+			break
 		}
-		w.mu.Lock()
-		for off := 0; off+syscall.SizeofInotifyEvent <= n; {
-			// struct inotify_event: wd, mask, cookie, len, then len bytes of a NUL-padded name
-			wd := int32(binary.NativeEndian.Uint32(buf[off:]))
-			mask := binary.NativeEndian.Uint32(buf[off+4:])
-			size := int(binary.NativeEndian.Uint32(buf[off+12:]))
-			start := off + syscall.SizeofInotifyEvent
-			if start+size > n {
-				break
-			}
-			name := buf[start : start+size]
-			off = start + size
-			if mask&syscall.IN_Q_OVERFLOW != 0 {
-				w.lost = true
-				continue
-			}
-			dir, ok := w.dirs[wd]
-			if mask&syscall.IN_IGNORED != 0 {
-				delete(w.dirs, wd)
-				delete(w.wds, dir)
-				continue
-			}
-			if !ok {
-				continue
-			}
-			e := watchEvent{dir: dir, name: string(bytes.TrimRight(name, "\x00")), isDir: mask&syscall.IN_ISDIR != 0}
-			if !w.events[e] {
-				w.events[e] = true
-				w.order = append(w.order, e)
-			}
+		name := buf[start : start+size]
+		off = start + size
+		if mask&syscall.IN_Q_OVERFLOW != 0 {
+			w.lost = true
+			continue
 		}
-		w.mu.Unlock()
+		dir, ok := w.dirs[wd]
+		if mask&syscall.IN_IGNORED != 0 {
+			delete(w.dirs, wd)
+			delete(w.wds, dir)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		e := watchEvent{dir: dir, name: string(bytes.TrimRight(name, "\x00")), isDir: mask&syscall.IN_ISDIR != 0}
+		if !w.events[e] {
+			w.events[e] = true
+			w.order = append(w.order, e)
+		}
 	}
 }
 
 func (w *inotify) drain() ([]watchEvent, bool) {
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := syscall.Read(w.fd, buf)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			break
+		}
+		if err != nil {
+			w.mu.Lock()
+			w.dead, w.lost = err, true
+			w.mu.Unlock()
+			break
+		}
+		if n == 0 {
+			break
+		}
+		w.collect(buf[:n])
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	out, lost := w.order, w.lost

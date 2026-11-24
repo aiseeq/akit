@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -180,11 +181,8 @@ func (l *loader) loadKnown() error {
 		// the stored size can run past the loaded lines: a loader stopped after a files row took the new size
 		// and before the lines came; the first look reads the file past ingested
 		f.complete = f.size
-		if f.src.Description == "" {
-			if src, e := transcript.SourceAt(f.src.Path); e == nil && src.Description != "" {
-				f.src.Description = src.Description
-				metadata = append(metadata, f)
-			}
+		if l.restoreMetadata(f, r) {
+			metadata = append(metadata, f)
 		}
 		l.add(f)
 		if d {
@@ -219,6 +217,20 @@ func (l *loader) loadKnown() error {
 		}
 	}
 	return nil
+}
+
+func (l *loader) restoreMetadata(f *file, row []string) bool {
+	changed := false
+	if f.src.Description == "" && strings.Contains(f.src.Path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
+		if src, err := transcript.SourceAt(f.src.Path); err == nil && src.Description != "" {
+			f.src.Description = src.Description
+			changed = true
+		}
+	}
+	if f.cwd != "" && row[fileCol["cwd"]] == "" {
+		changed = true
+	}
+	return changed
 }
 
 func (l *loader) add(f *file) {
@@ -305,7 +317,9 @@ func (l *loader) lookup(path string, st os.FileInfo) (*file, error) {
 		}
 		if f = l.renamed(src, transcript.Inode(st), st.Size()); f == nil {
 			f = &file{}
-			f.describe(l.cfg.home, src)
+			if err := f.describe(l.cfg.home, src); err != nil {
+				l.logf("%v", err)
+			}
 			l.add(f)
 		}
 	}
@@ -371,7 +385,9 @@ func (l *loader) renamed(src transcript.Source, ino uint64, size int64) *file {
 		if l.files[f.src.Path] == f {
 			delete(l.files, f.src.Path)
 		}
-		f.describe(l.cfg.home, src)
+		if err := f.describe(l.cfg.home, src); err != nil {
+			l.logf("%v", err)
+		}
 		f.gone = false
 		l.files[path] = f
 		l.dirs.addFileDir(path, f.mtime)

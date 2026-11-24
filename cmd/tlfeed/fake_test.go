@@ -274,7 +274,7 @@ func (f *fakeCH) latestFiles() [][]string {
 }
 
 func ver(row []string) uint64 {
-	n, _ := strconv.ParseUint(row[len(row)-1], 10, 64)
+	n, _ := strconv.ParseUint(row[fileCol["ver"]], 10, 64)
 	return n
 }
 

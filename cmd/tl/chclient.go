@@ -99,6 +99,8 @@ func (c *chClient) selectTSV(ctx context.Context, q chQuery) ([][]string, error)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse request: %w", err)
 	}
+	// ClickHouse is on localhost for tl; avoid gzip CPU on the already-local TSV response.
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errUnavailable, err)

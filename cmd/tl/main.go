@@ -664,7 +664,11 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 		var out, errs bytes.Buffer
 		var code int
 		if code, err = runDB(context.Background(), c, opts, e, refs, &out, &errs); err == nil {
-			fmt.Fprintf(&errs, "tl: данные актуальны на %s\n", e.dbThrough.Local().Format("15:04:05"))
+			format := "15:04:05"
+			if y, m, d := e.dbThrough.Local().Date(); y != time.Now().Local().Year() || m != time.Now().Local().Month() || d != time.Now().Local().Day() {
+				format = "2006-01-02 15:04:05"
+			}
+			fmt.Fprintf(&errs, "tl: данные актуальны на %s\n", e.dbThrough.Local().Format(format))
 			_, outErr := io.Copy(stdout, &out)
 			_, errErr := io.Copy(stderr, &errs)
 			if err := errors.Join(outErr, errErr); err != nil {
@@ -712,6 +716,9 @@ func readDBState(home string) (dbState, error) {
 	}
 	if st.DBThrough.IsZero() {
 		return dbState{}, errors.New("tlfeed has no successful db_through boundary")
+	}
+	if time.Since(st.DBThrough) > 10*time.Minute {
+		return dbState{}, errors.New("tlfeed db_through is stale")
 	}
 	return st, nil
 }
