@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aiseeq/akit/price"
@@ -75,6 +76,8 @@ type dbPath struct {
 	f     *filter
 	files map[string]*dbFile
 	trace io.Writer
+	// traceMu keeps the trace lines of the queries that run at once whole.
+	traceMu sync.Mutex
 }
 
 // runDB answers the call through the database into stdout and stderr; an error means no answer was printed and
@@ -154,6 +157,8 @@ func dbRetentionExceeded(opts options, sources []source, files map[string]*dbFil
 
 func (d *dbPath) tracef(what string, start time.Time, n int) {
 	if d.trace != nil {
+		d.traceMu.Lock()
+		defer d.traceMu.Unlock()
 		fmt.Fprintf(d.trace, "tl: db %s: %d ms, %d\n", what, time.Since(start).Milliseconds(), n)
 	}
 }
@@ -164,6 +169,8 @@ func (d *dbPath) queryIn(ctx context.Context, q chQuery) ([][]string, error) {
 	start := time.Now()
 	rows, err := d.c.selectTSV(ctx, q)
 	if d.trace != nil {
+		d.traceMu.Lock()
+		defer d.traceMu.Unlock()
 		fmt.Fprintf(d.trace, "tl: db %s %d ms, %d rows, err %v\n", q.name, time.Since(start).Milliseconds(), len(rows), err)
 	}
 	return rows, err
@@ -450,19 +457,28 @@ func dbTranscriptPresent(path string) bool {
 // allLinkNames includes files outside this call's project and time window: short links
 // must be unique in the same full search area as the file backend.
 func (d *dbPath) allLinkNames() ([]string, error) {
-	rows, err := d.query(chQuery{name: "link_names", sql: "SELECT path FROM files FINAL"})
+	rows, _, err := d.allLinkNamesAndIDs()
+	return rows, err
+}
+
+func (d *dbPath) allLinkNamesAndIDs() ([]string, map[string]string, error) {
+	rows, err := d.query(chQuery{name: "link_names", sql: "SELECT path, session, kind FROM files FINAL"})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	names := make([]string, 0, len(rows))
+	fullIDs := make(map[string]string, len(rows))
 	for _, row := range rows {
-		if len(row) != 1 {
-			return nil, fmt.Errorf("link names: %d fields in a row, want 1", len(row))
+		if len(row) != 3 {
+			return nil, nil, fmt.Errorf("link names: %d fields in a row, want 3", len(row))
 		}
 		names = append(names, row[0])
+		if row[1] != "" && row[2] != "codex" {
+			fullIDs[row[0]] = row[1]
+		}
 	}
 	sort.Strings(names)
-	return names, nil
+	return names, fullIDs, nil
 }
 
 // kindOfSource is the kind column of the events of a source.
@@ -539,35 +555,52 @@ type stored struct {
 // result is scan of the file path from the database: the events of the sources in the window, sorted the same
 // way, with the link ids and names of the sources.
 func (d *dbPath) result(sources []source) (result, error) {
-	start := time.Now()
-	names, err := d.allLinkNames()
-	if err != nil {
-		return result{}, err
-	}
-	liveNames, liveErr := liveSessionNames(d.e.home)
-	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, liveNames), searchPaths: names,
-		liveNames: liveNames, liveErr: liveErr, files: len(sources)}
-	for path, f := range d.files {
-		if f.name != "" {
-			res.names[path] = f.name
+	// The link ids and the events do not depend on each other: the ids are worked out while the server answers.
+	links := make(chan result, 1)
+	var linkErr error
+	go func() {
+		start := time.Now()
+		names, fullIDs, err := d.allLinkNamesAndIDs()
+		if err != nil {
+			linkErr = err
+			links <- result{}
+			return
 		}
-	}
-	d.tracef("link ids", start, len(res.linkIDs))
+		liveNames, liveErr := liveSessionNames(d.e.home)
+		res := result{names: map[string]string{}, linkIDs: sourceLinkIDsWithIDs(sources, names, fullIDs, d.e.home, liveNames),
+			searchPaths: names, liveNames: liveNames, liveErr: liveErr, files: len(sources)}
+		for path, f := range d.files {
+			if f.name != "" {
+				res.names[path] = f.name
+			}
+		}
+		d.tracef("link ids", start, len(res.linkIDs))
+		links <- res
+	}()
 	var inDB []stored
+	var missing error
 	for _, src := range sources {
 		f := d.files[src.Path]
 		if f == nil {
-			return res, fmt.Errorf("transcript %s is not in the database", src.Path)
+			missing = fmt.Errorf("transcript %s is not in the database", src.Path)
+			break
 		}
 		inDB = append(inDB, stored{src: src, file: f})
 	}
 	var all []sortedHit
-	if len(inDB) > 0 {
-		hits, err := d.storedHits(inDB)
-		if err != nil {
-			return res, err
-		}
-		all = hits
+	var hitsErr error
+	if missing == nil && len(inDB) > 0 {
+		all, hitsErr = d.storedHits(inDB)
+	}
+	res := <-links
+	if linkErr != nil {
+		return result{}, linkErr
+	}
+	if missing != nil {
+		return res, missing
+	}
+	if hitsErr != nil {
+		return res, hitsErr
 	}
 	bad := map[string]badLines{}
 	if err := d.badLines(inDB, bad); err != nil {
@@ -580,7 +613,7 @@ func (d *dbPath) result(sources []source) (result, error) {
 			res.firstBad = fmt.Errorf("%s %w", res.linkIDs[src.Path], b.first)
 		}
 	}
-	start = time.Now()
+	start := time.Now()
 	sortHits(all)
 	d.tracef("sort", start, len(all))
 	res.hits = make([]hit, len(all))
@@ -766,6 +799,11 @@ func (d *dbPath) storedHits(inDB []stored) ([]sortedHit, error) {
 // textCut is how much of a long text a listing reads: the first cut of maskedShort and its first widening.
 func textCut(width int) int { return 2 * (width + maskWindow) }
 
+// wholeText is the longest text, in characters, a listing reads whole and cuts itself. The server counts the
+// flattened length of a text with regular expressions at tens of MB/s, slower than sending the text and counting it
+// here; only a longer text comes as its start and that count.
+var wholeText = 1 << 16
+
 // flatLenSQL is the length of transcript.Short(text, 0) in characters: spaces as unicode.IsSpace has them,
 // trimmed, a line break as " ⏎ ", runs of spaces as one.
 const flatLenSQL = `lengthUTF8(arrayStringConcat(arrayFilter(x -> x != '', splitByRegexp({ws:String}, ` +
@@ -777,11 +815,13 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 	width := d.opts.width
 	text := "text, 0"
 	if width > 0 {
-		text = "substringUTF8(text, 1, {cut:UInt32}), if(lengthUTF8(text) <= {cut:UInt32}, 0, " + flatLenSQL + ")"
+		text = "if(lengthUTF8(text) <= {whole:UInt32}, text, substringUTF8(text, 1, {cut:UInt32})), " +
+			"if(lengthUTF8(text) <= {whole:UInt32}, 0, " + flatLenSQL + ")"
 	}
 	rows, err := d.selectEvents("events", func(w where) chQuery {
 		if width > 0 {
 			w.params["cut"] = strconv.Itoa(textCut(width))
+			w.params["whole"] = strconv.Itoa(max(wholeText, textCut(width)))
 			w.params["ws"] = chString(spaceClass + "+")
 			w.params["trim"] = chString("^" + spaceClass + "+|" + spaceClass + "+$")
 		}

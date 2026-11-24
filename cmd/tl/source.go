@@ -139,11 +139,38 @@ func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 }
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)
-var sourceUUID = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+// findUUID is the leftmost lower-case UUID in s, as the regexp [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+// finds it, or "". The link ids take it from every name of the search area, tens of thousands per call, where the
+// regexp costs tens of milliseconds.
+func findUUID(s string) string {
+	const n = 36
+	for i := 0; i+n <= len(s); i++ {
+		if uuidAt(s[i : i+n]) {
+			return s[i : i+n]
+		}
+	}
+	return ""
+}
+
+// uuidAt tells whether s, 36 bytes, is a lower-case UUID.
+func uuidAt(s string) bool {
+	for j := range len(s) {
+		c := s[j]
+		if j == 8 || j == 13 || j == 18 || j == 23 {
+			if c != '-' {
+				return false
+			}
+		} else if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 func sourceFullID(src source) string {
 	base := filepath.Base(src.Path)
-	if id := sourceUUID.FindString(base); id != "" {
+	if id := findUUID(base); id != "" {
 		return id
 	}
 	if id, ok := strings.CutPrefix(base, "agent-"); ok {
@@ -194,11 +221,18 @@ func liveSessionNames(home string) (map[string]bool, error) {
 
 // sourceLinkIDs assigns each selected path the shortest prefix unique in find's full search area.
 func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames map[string]bool) map[string]string {
+	return sourceLinkIDsWithIDs(sources, allPaths, nil, home, liveNames)
+}
+
+func sourceLinkIDsWithIDs(sources []source, allPaths []string, storedIDs map[string]string, home string, liveNames map[string]bool) map[string]string {
 	fullIDs := make(map[string]string, len(allPaths)+len(sources))
 	searchable := make(map[string]bool, len(allPaths))
 	for _, path := range allPaths {
 		searchable[path] = true
-		fullIDs[path] = sourceFullID(source{Path: path, ID: path})
+		fullIDs[path] = storedIDs[path]
+		if fullIDs[path] == "" {
+			fullIDs[path] = sourceFullID(source{Path: path, ID: path})
+		}
 	}
 	for _, src := range sources {
 		fullIDs[src.Path] = sourceFullID(src)
@@ -220,7 +254,7 @@ func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames m
 			ids[path] = tilde(path, home)
 			continue
 		}
-		if src.ID == path && !sourceUUID.MatchString(base) && !strings.HasPrefix(base, "agent-") {
+		if src.ID == path && findUUID(base) == "" && !strings.HasPrefix(base, "agent-") {
 			ids[path] = tilde(path, home)
 			continue
 		}

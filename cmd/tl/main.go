@@ -15,8 +15,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aiseeq/akit/buildversion"
@@ -572,7 +574,45 @@ func run(opts options, e env, stdout, stderr io.Writer) int {
 	return code
 }
 
+// parallelMask is the shortest output masked in pieces of whole lines on all processors: each line is masked on
+// its own, so the pieces do not depend on each other.
+const parallelMask = 256 << 10
+
+// writeMasked writes text masked line by line.
 func writeMasked(w io.Writer, text string) error {
+	if len(text) < parallelMask {
+		return writeMaskedLines(w, text)
+	}
+	var pieces []string
+	size := len(text)/(4*runtime.GOMAXPROCS(0)) + 1
+	for len(text) > 0 {
+		end := len(text)
+		if size < len(text) {
+			if nl := strings.IndexByte(text[size:], '\n'); nl >= 0 {
+				end = size + nl + 1
+			}
+		}
+		pieces, text = append(pieces, text[:end]), text[end:]
+	}
+	masked := make([]strings.Builder, len(pieces))
+	errs := make([]error, len(pieces))
+	var wg sync.WaitGroup
+	for i := range pieces {
+		wg.Go(func() { errs[i] = writeMaskedLines(&masked[i], pieces[i]) })
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	for i := range masked {
+		if _, err := io.WriteString(w, masked[i].String()); err != nil {
+			return fmt.Errorf("write masked text: %w", err)
+		}
+	}
+	return nil
+}
+
+func writeMaskedLines(w io.Writer, text string) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 	for len(text) > 0 {
 		end := strings.IndexByte(text, '\n')

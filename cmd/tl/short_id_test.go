@@ -90,3 +90,40 @@ func TestHelpExplainsLongLinkIDs(t *testing.T) {
 		t.Fatal("help does not explain that link IDs can exceed 8 characters")
 	}
 }
+
+// findUUID finds what the regexp of a lower-case UUID finds: the leftmost match, none in upper case, too short
+// or misplaced groups, and the first of two.
+func TestFindUUIDAsRegexp(t *testing.T) {
+	re := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	id := "0199aaaa-0000-7000-8000-000000000001"
+	cases := []string{"", id, id + ".jsonl", "rollout-2026-10-25T10-47-55-" + id + ".jsonl", "agent-a1b2c3d4.jsonl",
+		strings.ToUpper(id), id[:35], "x" + id[1:], "a" + id, id + "f", "0199aaaa-0000-7000-80000-00000000001",
+		"0199aaaa-0000-7000-8000-00000000000g1", id + "-" + strings.Replace(id, "0199", "aaaa", 1), "ффф" + id,
+		"12345678-1234-1234-1234-12345678901212345678-1234-1234-1234-123456789012"}
+	// near misses: a UUID between random characters with one or two of them changed
+	rnd := uint64(1)
+	next := func(n int) int {
+		rnd = rnd*6364136223846793005 + 1442695040888963407
+		return int(rnd >> 33 % uint64(n))
+	}
+	const alphabet = "0123456789abcdef-AFgz"
+	for range 20000 {
+		b := make([]byte, 0, 80)
+		for range next(6) {
+			b = append(b, alphabet[next(len(alphabet))])
+		}
+		b = append(b, id...)
+		for range next(6) {
+			b = append(b, alphabet[next(len(alphabet))])
+		}
+		for range next(3) {
+			b[next(len(b))] = alphabet[next(len(alphabet))]
+		}
+		cases = append(cases, string(b))
+	}
+	for _, s := range cases {
+		if got, want := findUUID(s), re.FindString(s); got != want {
+			t.Errorf("%q: findUUID %q, regexp %q", s, got, want)
+		}
+	}
+}

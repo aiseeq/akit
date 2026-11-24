@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -904,9 +906,13 @@ func report(res result, opts options, e env, w io.Writer) int {
 			fmt.Fprintf(w, "== %s %s%s\n", id, name, tilde(h.src.Path, e.home))
 		}
 	}
+	cuts := maskedShorts(hits, opts.width)
 	for i := range hits {
 		displayHit := hits[i]
 		displayHit.src.ID = res.linkIDs[displayHit.src.Path]
+		if displayHit.cut == nil && cuts != nil {
+			displayHit.cut = &cuts[i]
+		}
 		writeHitLine(w, &displayHit, opts.width)
 	}
 	zone, _ := e.now.Zone()
@@ -948,6 +954,39 @@ func line(h *hit, width int) string {
 		who, text)
 }
 
+// parallelHits is the shortest listing whose texts are masked and cut on all processors: masking is most of the
+// time of a long listing, and the texts do not depend on each other.
+const parallelHits = 256
+
+// maskedShorts are maskedShort of the texts of hits without a cut, in their order, worked out on all processors;
+// nil for a short listing, which writeHitLine cuts itself.
+func maskedShorts(hits []hit, width int) []string {
+	if len(hits) < parallelHits {
+		return nil
+	}
+	cuts := make([]string, len(hits))
+	const batch = 64
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(runtime.GOMAXPROCS(0), len(hits)/batch+1) {
+		wg.Go(func() {
+			for {
+				from := int(next.Add(batch)) - batch
+				if from >= len(hits) {
+					return
+				}
+				for i := from; i < min(from+batch, len(hits)); i++ {
+					if hits[i].cut == nil {
+						cuts[i] = maskedShort(hits[i].ev.Shown(), width)
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return cuts
+}
+
 // maskWindow is how far past the cut the text is masked first: a secret that
 // starts before the cut keeps its prefix and context in the masked part.
 const maskWindow = 512
@@ -959,13 +998,82 @@ const maskWindow = 512
 // maskWindow past the cut; a key cut by the window's end then stays out of sight.
 // The hidden count is of the masked text: of the whole text once it is all masked.
 func maskedShort(text string, width int) string {
-	flat := transcript.Short(text, 0)
-	r := []rune(flat)
-	if width <= 0 || len(r) <= width {
+	if width <= 0 {
+		flat, _ := flatten(text, -1)
 		return flat
 	}
-	cut, _ := maskedCut(r, len(r), width)
+	// a listing shows the start of a long text: its first widening is flattened, the rest only counted
+	start, total := flatten(text, textCut(width))
+	if total <= width {
+		return start
+	}
+	if cut, ok := maskedCut([]rune(start), total, width); ok {
+		return cut
+	}
+	flat, _ := flatten(text, -1)
+	cut, _ := maskedCut([]rune(flat), total, width)
 	return cut
+}
+
+// flatten is transcript.Short(text, 0) in one pass: its first limit characters (all of it when limit < 0) and the
+// count of all of them. Spaces are unicode.IsSpace, trimmed at both ends; a run of them between two words is one
+// space, with " ⏎" before it for each line break in the run.
+func flatten(text string, limit int) (string, int) {
+	var b strings.Builder
+	if limit < 0 {
+		b.Grow(len(text))
+	} else {
+		b.Grow(min(len(text), 4*limit))
+	}
+	total, breaks, gap := 0, 0, false
+	put := func(s string, n int) {
+		if limit < 0 || total+n <= limit {
+			b.WriteString(s)
+		} else if total < limit {
+			b.WriteString(string([]rune(s)[:limit-total]))
+		}
+		total += n
+	}
+	putGap := func() {
+		put(" ", 1)
+		for range breaks {
+			put("⏎ ", 2)
+		}
+		gap, breaks = false, 0
+	}
+	word, words := 0, 0 // the start of the current word and its characters so far
+	for i := 0; i < len(text); {
+		r, size := rune(text[i]), 1
+		if r >= utf8.RuneSelf {
+			r, size = utf8.DecodeRuneInString(text[i:])
+		}
+		if !unicode.IsSpace(r) {
+			if words == 0 && gap {
+				putGap()
+			}
+			if words == 0 {
+				word = i
+			}
+			words++
+			i += size
+			continue
+		}
+		if words > 0 {
+			put(text[word:i], words)
+			words = 0
+		}
+		if total > 0 {
+			gap = true
+			if r == '\n' {
+				breaks++
+			}
+		}
+		i += size
+	}
+	if words > 0 {
+		put(text[word:], words)
+	}
+	return b.String(), total
 }
 
 // maskedCut is the cut of maskedShort for a flattened text of total runes known by its start r; false — the

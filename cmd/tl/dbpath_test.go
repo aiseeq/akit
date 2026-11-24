@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
 )
@@ -76,7 +77,7 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 		f.mtime = st.ModTime()
 		f.project = filepath.Base(filepath.Dir(path))
 		f.session = strings.TrimSuffix(filepath.Base(path), ".jsonl")
-		if sourceUUID.MatchString(filepath.Base(path)) {
+		if findUUID(filepath.Base(path)) != "" {
 			f.session = sourceFullID(source{Path: path, ID: path})[:8]
 		}
 		switch {
@@ -177,7 +178,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case "link_names":
 		for _, f := range s.files {
-			row(f.path)
+			row(f.path, f.session, f.kind)
 		}
 	case "shadow_files":
 		for _, f := range s.files {
@@ -201,7 +202,8 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				text, flat := ev.Shown(), 0
 				if strings.Contains(sql, "substringUTF8(text") {
 					cut, _ := strconv.Atoi(param("cut"))
-					if r := []rune(text); len(r) > cut {
+					whole, _ := strconv.Atoi(param("whole"))
+					if r := []rune(text); len(r) > whole {
 						text, flat = string(r[:cut]), len([]rune(transcript.Short(ev.Shown(), 0)))
 					}
 				}
@@ -353,17 +355,8 @@ func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 		grep = grep[:i]
 	}
 	// every condition over the text the query has must hold; the server's own semantics of each
-	for _, m := range regexp.MustCompile(`hay LIKE \{(\w+):String\}`).FindAllStringSubmatch(grep, -1) {
-		// a group of LIKEs joined by OR holds when one of them does
-		if group := orGroup(grep, m[0]); group != nil {
-			if !slices.ContainsFunc(group, func(name string) bool { return likeMatch(hay, tsvUnescape(param(name))) }) {
-				return false
-			}
-			continue
-		}
-		if !likeMatch(hay, tsvUnescape(param(m[1]))) {
-			return false
-		}
+	if !hayPrefilterHolds(s.t, grep, hay, param) {
+		return false
 	}
 	if strings.Contains(grep, "multiMatchAny(hay") && !slices.ContainsFunc(chArray(param("grep")), func(p string) bool { return hyperscanMatch(p, hay) }) {
 		return false
@@ -407,18 +400,40 @@ func lowerUTF8(s string) string {
 	return b.String()
 }
 
-// orGroup is the names of the LIKEs of the parenthesized OR group cond stands in, or nil when it stands alone.
-func orGroup(sql, cond string) []string {
-	for _, g := range regexp.MustCompile(`\(([^()]*)\)`).FindAllStringSubmatch(sql, -1) {
-		if strings.Contains(g[1], cond) && strings.Contains(g[1], " OR ") {
-			var names []string
-			for _, m := range regexp.MustCompile(`hay LIKE \{(\w+):String\}`).FindAllStringSubmatch(g[1], -1) {
-				names = append(names, m[1])
+// hayChoiceSQL is one choice of a prefilter group over hay: a LIKE or the trigrams of the ngram index.
+const hayChoiceSQL = `(?:hay LIKE \{(\w+):String\}|hasAllTokens\(hay, \{(\w+):Array\(String\)\}\))`
+
+var (
+	hayChoiceRe = regexp.MustCompile(hayChoiceSQL)
+	hayGroupRe  = regexp.MustCompile(`\(` + hayChoiceSQL + `(?: OR ` + hayChoiceSQL + `)*\)`)
+)
+
+// hayPrefilterHolds is the prefilter of grepCondition over hay: every parenthesized group of choices joined by OR
+// holds when one of them does. A LIKE is LIKE; hasAllTokens holds when every token is three characters of hay, as
+// the ngrams(3) tokenizer of the index cuts it.
+func hayPrefilterHolds(t *testing.T, sql, hay string, param func(string) string) bool {
+	groups := hayGroupRe.FindAllString(sql, -1)
+	if n, m := len(hayChoiceRe.FindAllString(sql, -1)), len(hayChoiceRe.FindAllString(strings.Join(groups, " "), -1)); n != m {
+		t.Errorf("%d of %d prefilter choices outside a group: %s", n-m, n, sql)
+	}
+	for _, g := range groups {
+		holds := false
+		for _, m := range hayChoiceRe.FindAllStringSubmatch(g, -1) {
+			if m[1] != "" {
+				holds = holds || likeMatch(hay, tsvUnescape(param(m[1])))
+				continue
 			}
-			return names
+			all := true
+			for _, tok := range chArray(param(m[2])) {
+				all = all && utf8.RuneCountInString(tok) == 3 && strings.Contains(hay, tok)
+			}
+			holds = holds || all
+		}
+		if !holds {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 // likeMatch is LIKE: % any run, _ any one character, a backslash escapes.
@@ -601,19 +616,25 @@ func TestDBPrintsAsFiles(t *testing.T) {
 			}
 		}
 	}()
-	for _, args := range dbForms {
-		e.backend = backendFiles
-		codeF, outF, _ := runTL(t, e, args...)
-		e.backend = backendDB
-		codeD, outD, errD := runTL(t, e, args...)
-		if strings.Contains(errD, "instead") {
-			t.Errorf("%q: the database path fell back: %s", args, errD)
-		}
-		if codeF != codeD || outF != outD {
-			t.Errorf("%q: files exit %d, db exit %d\nfiles:\n%s\ndb:\n%s", args, codeF, codeD, outF, outD)
-		}
-		if outF == "" {
-			t.Errorf("%q: empty answer", args)
+	// texts up to wholeText come whole and are cut here; with 0 every long one comes as its start and the server's
+	// count of its flattened length
+	defer func(whole int) { wholeText = whole }(wholeText)
+	for _, whole := range []int{wholeText, 0} {
+		wholeText = whole
+		for _, args := range dbForms {
+			e.backend = backendFiles
+			codeF, outF, _ := runTL(t, e, args...)
+			e.backend = backendDB
+			codeD, outD, errD := runTL(t, e, args...)
+			if strings.Contains(errD, "instead") {
+				t.Errorf("whole %d, %q: the database path fell back: %s", whole, args, errD)
+			}
+			if codeF != codeD || outF != outD {
+				t.Errorf("whole %d, %q: files exit %d, db exit %d\nfiles:\n%s\ndb:\n%s", whole, args, codeF, codeD, outF, outD)
+			}
+			if outF == "" {
+				t.Errorf("%q: empty answer", args)
+			}
 		}
 	}
 }
@@ -793,6 +814,8 @@ func TestLiveGrepCondition(t *testing.T) {
 			t.Fatal(err)
 		}
 		params["t"] = chString(c2.text)
+		// hay here has no index: its tokenizer, which hasAllTokens takes from the index on events.hay, is named
+		cond = liveTrigrams.ReplaceAllString(cond, "hasAllTokens(hay, $1, 'ngrams(3)')")
 		rows, err := c.selectTSV(t.Context(), chQuery{name: "test-grep",
 			sql: "SELECT " + cond + " FROM (SELECT '' AS who, {t:String} AS text, lowerUTF8(concat(who, ' ', text)) AS hay)", params: params})
 		if err != nil {
@@ -802,6 +825,37 @@ func TestLiveGrepCondition(t *testing.T) {
 		if len(rows) != 1 || (rows[0][0] == "1") != want {
 			t.Errorf("%q over %q: server %v, Go %v", c2.pattern, c2.text, rows, want)
 		}
+	}
+}
+
+var liveTrigrams = regexp.MustCompile(`hasAllTokens\(hay, (\{\w+:Array\(String\)\})\)`)
+
+// The trigrams of the --grep prefilter are the tokens of the index on hay the loader creates: hasAllTokens takes
+// the tokenizer of a column from its index, and without it would cut hay into words and miss a literal inside one.
+func TestGrepTrigramsMatchTheIndexOnHay(t *testing.T) {
+	ddl, err := os.ReadFile("../tlfeed/ddl.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ddl), "INDEX hay_ng hay TYPE text(tokenizer = ngrams(3))") {
+		t.Error("cmd/tlfeed/ddl.go has no ngrams(3) text index on events.hay; grepCondition's trigrams need it")
+	}
+	cond, params, err := grepCondition("Wfor|мЕра")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "(hasAllTokens(hay, {hay0_0:Array(String)}) OR hasAllTokens(hay, {hay0_1:Array(String)}))"; !strings.HasPrefix(cond, want) {
+		t.Errorf("condition %q, want it to start with %q", cond, want)
+	}
+	if got := chArray(params["hay0_0"]); !slices.Equal(got, []string{"wfo", "for"}) {
+		t.Errorf("trigrams of Wfor %q", got)
+	}
+	if got := chArray(params["hay0_1"]); !slices.Equal(got, []string{"мер", "ера"}) {
+		t.Errorf("trigrams of мЕра %q", got)
+	}
+	// a choice too short for a trigram keeps its group on LIKE
+	if cond, _, _ := grepCondition("wfor|ab"); !strings.Contains(cond, "hay LIKE {hay0_0:String} OR hay LIKE {hay0_1:String}") {
+		t.Errorf("short choice: %q", cond)
 	}
 }
 
