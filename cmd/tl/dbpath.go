@@ -120,11 +120,7 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 	start := time.Now()
 	sources, err := d.resolve()
 	if err != nil {
-		if errors.Is(err, errLiveSessionNotLoaded) {
-			return 0, err
-		}
-		fmt.Fprintf(stderr, "tl: %v\n", err)
-		return exitUsage, nil
+		return 0, err
 	}
 	if dbRetentionExceeded(opts, sources, d.files, d.e.now) {
 		return 0, errors.New("requested data may predate retained events")
@@ -459,31 +455,22 @@ func dbTranscriptPresent(path string) bool {
 	return !errors.Is(err, os.ErrNotExist)
 }
 
-// allLinkNames includes files outside this call's project and time window: short links
+// linkNames includes files outside this call's project and time window: short links
 // must be unique in the same full search area as the file backend.
-func (d *dbPath) allLinkNames() ([]string, error) {
-	rows, _, err := d.allLinkNamesAndIDs()
-	return rows, err
-}
-
-func (d *dbPath) allLinkNamesAndIDs() ([]string, map[string]string, error) {
+func (d *dbPath) linkNames() ([]string, error) {
 	rows, err := d.query(chQuery{Name: "link_names", SQL: "SELECT path, session, kind FROM files FINAL"})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	names := make([]string, 0, len(rows))
-	fullIDs := make(map[string]string, len(rows))
 	for _, row := range rows {
 		if len(row) != 3 {
-			return nil, nil, fmt.Errorf("link names: %d fields in a row, want 3", len(row))
+			return nil, fmt.Errorf("link names: %d fields in a row, want 3", len(row))
 		}
 		names = append(names, row[0])
-		if row[1] != "" && row[2] != "codex" {
-			fullIDs[row[0]] = row[1]
-		}
 	}
 	sort.Strings(names)
-	return names, fullIDs, nil
+	return names, nil
 }
 
 // kindOfSource is the kind column of the events of a source.
@@ -565,14 +552,14 @@ func (d *dbPath) result(sources []source) (result, error) {
 	var linkErr error
 	go func() {
 		start := time.Now()
-		names, fullIDs, err := d.allLinkNamesAndIDs()
+		names, err := d.linkNames()
 		if err != nil {
 			linkErr = err
 			links <- result{}
 			return
 		}
 		liveNames, liveErr := liveSessionNames(d.e.home)
-		res := result{names: map[string]string{}, linkIDs: sourceLinkIDsWithIDs(sources, names, fullIDs, d.e.home, liveNames),
+		res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, names, d.e.home, liveNames),
 			searchPaths: names, liveNames: liveNames, liveErr: liveErr, files: len(sources)}
 		for path, f := range d.files {
 			if f.name != "" {

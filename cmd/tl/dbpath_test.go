@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,12 +28,14 @@ import (
 // the transcripts of a synthetic home: it evaluates the conditions the client sends (parameters, LIKE, the regular
 // expressions, the raw prefilter) in Go. Every request must be a read-only POST.
 type fakeCH struct {
-	t     *testing.T
-	files []*chFile
-	mu    sync.Mutex
-	names []string      // log_comment of each request, in order
-	gate  chan struct{} // when set, requests wait for it to close
-	fail  map[string]bool
+	t          *testing.T
+	files      []*chFile
+	mu         sync.Mutex
+	names      []string      // log_comment of each request, in order
+	eventWhole []string      // whole-text limits used by the event listing
+	eventSQL   []string      // event projections, for the text-preservation contract
+	gate       chan struct{} // when set, requests wait for it to close
+	fail       map[string]bool
 }
 
 type chFile struct {
@@ -152,6 +155,10 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(q.Get("log_comment"), "tl:")
 	s.mu.Lock()
 	s.names = append(s.names, name)
+	if name == "events" {
+		s.eventWhole = append(s.eventWhole, q.Get("param_whole"))
+		s.eventSQL = append(s.eventSQL, sql)
+	}
 	gate := s.gate
 	s.mu.Unlock()
 	if gate != nil {
@@ -211,7 +218,8 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if strings.Contains(sql, "substringUTF8(text") {
 					cut, _ := strconv.Atoi(param("cut"))
 					whole, _ := strconv.Atoi(param("whole"))
-					if r := []rune(text); len(r) > whole {
+					truncateWhole := strings.Contains(sql, "lengthUTF8(text) <= {whole:UInt32}, substringUTF8(text")
+					if r := []rune(text); len(r) > whole || truncateWhole && len(r) > cut {
 						text, flat = string(r[:cut]), len([]rune(transcript.Short(ev.Shown(), 0)))
 					}
 				}
@@ -691,17 +699,19 @@ func TestDBFreshnessLineAndNoTranscriptReads(t *testing.T) {
 	}
 }
 
-func TestDBDoesNotSeeFilesMissingFromFilesTable(t *testing.T) {
+func TestDBFallsBackForFilesMissingFromFilesTable(t *testing.T) {
 	e, paths, _ := dbCorpus(t)
 	ch := newFakeCH(t, paths, map[string]int{})
 	ch.files = ch.files[:1]
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendFiles
+	wantCode, _, _ := runTL(t, e, dbOtherSession[:8], "--role", "all")
 	e.backend = backendDB
 	code, out, stderr := runTL(t, e, dbOtherSession[:8], "--role", "all")
-	if code != exitUsage || out != "" || !strings.Contains(stderr, "no transcript with this id in the database") {
-		t.Fatalf("database exposed a path absent from files FINAL: code=%d out=%q stderr=%q", code, out, stderr)
+	if wantCode != 0 || code != 0 || !strings.Contains(out, "== "+dbOtherSession[:8]) || !strings.Contains(stderr, "no transcript with this id in the database") {
+		t.Fatalf("missing files-table row fallback failed: files code=%d, db=(%d,%q,%q)", wantCode, code, out, stderr)
 	}
 }
 
@@ -717,6 +727,85 @@ func TestDBDoesNotReadUnloadedTail(t *testing.T) {
 	if code != exitNone || strings.Contains(out, " user хвост:") || strings.Contains(stderr, "reading files instead") {
 		t.Fatalf("db included un-ingested tail: code=%d out=%q stderr=%q", code, out, stderr)
 	}
+}
+
+func TestDBUntilUsesEarliestStoredEvent(t *testing.T) {
+	cutoff := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	d := &dbPath{opts: options{all: true, until: cutoff}, e: env{now: cutoff}}
+	w := d.allFilePredicate()
+	if !strings.Contains(w.sql, "first_ts <= {file_until:DateTime64(3, 'UTC')}") || w.params["file_until"] == "" {
+		t.Fatalf("file predicate does not bound first event by --until: SQL=%q params=%v", w.sql, w.params)
+	}
+	before := &dbFile{mtime: cutoff, first: cutoff.Add(-time.Second)}
+	after := &dbFile{mtime: cutoff, first: cutoff.Add(time.Second)}
+	if !d.selectedAll(before, cutoff.Add(-time.Hour)) || d.selectedAll(after, cutoff.Add(-time.Hour)) {
+		t.Fatal("--until did not select sessions by their first event time")
+	}
+}
+
+func TestDBWideListingUsesAWholeLimitAtLeastAsWideAsItsCut(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	marker := "long-width-fixture "
+	f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := fmt.Fprintln(f, userRecord("2026-10-25T11:00:00Z", marker+strings.Repeat("x", 68_000)))
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	args := []string{paths[0], "--grep", marker, "--role", "user", "--width", "33000"}
+	e.backend = backendFiles
+	wantCode, wantOut, _ := runTL(t, e, args...)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, args...)
+	wantWhole := strconv.Itoa(max(wholeText, textCut(33000)))
+	if code != wantCode || out != wantOut || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("wide listing differs: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if !slices.Contains(ch.eventWhole, wantWhole) {
+		t.Fatalf("events whole limits %v, want %s", ch.eventWhole, wantWhole)
+	}
+}
+
+func TestDBShortCutReadsWholeText(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	marker := "whole-text-fixture "
+	f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := marker + strings.Repeat("x", 5000) + " unique-tail-marker"
+	_, writeErr := fmt.Fprintln(f, userRecord("2026-10-25T11:00:00Z", text))
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	args := []string{paths[0], "--grep", marker, "--role", "user", "--width", "80"}
+	e.backend = backendFiles
+	wantCode, wantOut, _ := runTL(t, e, args...)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, args...)
+	if code != wantCode || out != wantOut || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("short-cut listing differs: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	for _, sql := range ch.eventSQL {
+		if strings.Contains(sql, "lengthUTF8(text) <= {whole:UInt32}, text, substringUTF8") {
+			return
+		}
+	}
+	t.Fatalf("event query does not preserve whole text below the whole-text limit: %v", ch.eventSQL)
 }
 
 // A database that does not answer leaves the call to the files, with a warning.

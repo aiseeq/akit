@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aiseeq/akit/transcript"
 )
@@ -27,6 +30,27 @@ func parallelTexts(n int) []string {
 		}
 	}
 	return texts
+}
+
+type failedOutput struct{}
+
+func (failedOutput) Write([]byte) (int, error) { return 0, errors.New("synthetic write failure") }
+
+func TestWriteMaskedReturnsPieceWriteError(t *testing.T) {
+	text := strings.Repeat("ordinary line\n", parallelMask/14+1)
+	err := writeMasked(failedOutput{}, text)
+	if err == nil || !strings.Contains(err.Error(), "synthetic write failure") {
+		t.Fatalf("writeMasked error = %v", err)
+	}
+}
+
+func TestWriteMaskedReturnsPieceMaskError(t *testing.T) {
+	want := errors.New("synthetic mask write failure")
+	text := strings.Repeat("ordinary line\n", parallelMask/14+1)
+	err := writeMaskedWith(io.Discard, text, func(io.Writer, string) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("writeMasked error = %v, want %v", err, want)
+	}
 }
 
 // The listing cuts worked out on all processors are those of maskedShort, each in its place; a hit with its own
@@ -58,6 +82,25 @@ func TestMaskedShortsAsOneByOne(t *testing.T) {
 				t.Fatalf("width %d, hit %d: got %q, want %q", width, i, cuts[i], want)
 			}
 		}
+	}
+}
+
+func TestReportKeepsDatabaseCutInParallelListing(t *testing.T) {
+	const n = parallelHits
+	cut := "database supplied cut"
+	path := "/synthetic/session.jsonl"
+	hits := make([]hit, n)
+	for i := range hits {
+		hits[i] = hit{src: source{Path: path, ID: "session"}, ev: transcript.Event{Line: i + 1, Text: fmt.Sprintf("full text %d", i)}}
+	}
+	hits[0].cut = &cut
+	res := result{hits: hits, files: 1, linkIDs: map[string]string{path: "session"}}
+	var out strings.Builder
+	if code := report(res, options{width: 80}, env{now: time.Now()}, &out); code != 0 {
+		t.Fatalf("report code = %d", code)
+	}
+	if !strings.Contains(out.String(), "database supplied cut") || strings.Contains(out.String(), "full text 0") {
+		t.Fatalf("parallel report overwrote the database cut: %q", out.String()[:min(300, out.Len())])
 	}
 }
 

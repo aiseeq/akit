@@ -579,8 +579,12 @@ const parallelMask = 256 << 10
 
 // writeMasked writes text masked line by line.
 func writeMasked(w io.Writer, text string) error {
+	return writeMaskedWith(w, text, writeMaskedLines)
+}
+
+func writeMaskedWith(w io.Writer, text string, mask func(io.Writer, string) error) error {
 	if len(text) < parallelMask {
-		return writeMaskedLines(w, text)
+		return mask(w, text)
 	}
 	var pieces []string
 	size := len(text)/(4*runtime.GOMAXPROCS(0)) + 1
@@ -597,7 +601,7 @@ func writeMasked(w io.Writer, text string) error {
 	errs := make([]error, len(pieces))
 	var wg sync.WaitGroup
 	for i := range pieces {
-		wg.Go(func() { errs[i] = writeMaskedLines(&masked[i], pieces[i]) })
+		wg.Go(func() { errs[i] = mask(&masked[i], pieces[i]) })
 	}
 	wg.Wait()
 	if err := errors.Join(errs...); err != nil {

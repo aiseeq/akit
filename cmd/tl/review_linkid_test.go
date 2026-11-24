@@ -10,7 +10,7 @@ func TestReviewLinkIDsDuplicateAgent(t *testing.T) {
 	b := "/h/.claude/projects/-p/22222222-2222-4222-8222-222222222222/subagents/agent-a181d1bbcf323f2c9.jsonl"
 	sources := []source{{Path: a, ID: "a181d1bb"}}
 	files := sourceLinkIDs(sources, []string{a, b}, home, nil)
-	stored := sourceLinkIDsWithIDs(sources, []string{a, b}, map[string]string{a: "a181d1bb", b: "a181d1bb"}, home, nil)
+	stored := sourceLinkIDs(sources, []string{a, b}, home, nil)
 	t.Logf("files path %q, database path %q", files[a], stored[a])
 	if files[a] != stored[a] {
 		t.Errorf("link id differs: files %q, database %q", files[a], stored[a])
@@ -20,7 +20,7 @@ func TestReviewLinkIDsDuplicateAgent(t *testing.T) {
 	d := "/h/.claude/projects/-p/abcdef01-2222-4222-8222-222222222222.jsonl"
 	sources = []source{{Path: c, ID: "abcdef01"}}
 	files = sourceLinkIDs(sources, []string{c, d}, home, nil)
-	stored = sourceLinkIDsWithIDs(sources, []string{c, d}, map[string]string{c: "abcdef01", d: "abcdef01"}, home, nil)
+	stored = sourceLinkIDs(sources, []string{c, d}, home, nil)
 	t.Logf("files path %q, database path %q", files[c], stored[c])
 	if files[c] != stored[c] {
 		t.Errorf("link id differs: files %q, database %q", files[c], stored[c])

@@ -59,7 +59,7 @@ func TestDBShortLinksUseNamesOutsideFilteredFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &dbPath{c: c, ctx: context.Background()}
-	names, err := d.allLinkNames()
+	names, err := d.linkNames()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,11 +164,11 @@ func TestDBFindPrioritizesLiveNames(t *testing.T) {
 	}
 }
 
-func TestDBFindSkipsGoneNamedFiles(t *testing.T) {
+func TestDBFindSkipsGoneIDPrefix(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gone-00000000-0000-4000-8000-000000000001.jsonl")
 	d := &dbPath{e: env{home: t.TempDir()}, files: map[string]*dbFile{path: {path: path, name: "gone-session", session: "gone0000"}}}
-	if _, err := d.findAfterLive("gone-session", nil, nil); err == nil || strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("gone file participated in name lookup: %v", err)
+	if _, err := d.findAfterLive("gone0000", nil, nil); err == nil || strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("gone file participated in ID lookup: %v", err)
 	}
 }
 
@@ -213,6 +213,46 @@ func TestDBUnloadedLiveSessionFallsBackToFiles(t *testing.T) {
 	code, out, stderr := runTL(t, e, "active-fixture", "--role", "all")
 	if code != wantCode || code != 0 || out != wantOut || !strings.Contains(stderr, "not loaded in the database") || !strings.Contains(stderr, "reading files instead") {
 		t.Fatalf("live fallback: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+	}
+}
+
+func TestDBTranscriptMissingFromFilesFallsBackForAllSessionForms(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	e.sessionID = sessionID
+	stat, err := proc.ReadStat("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := session.Info{Pid: os.Getpid(), SessionID: sessionID, ProcStart: stat.Start, Name: "active-fixture"}
+	registry := filepath.Join(e.home, ".claude", "sessions")
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registry, fmt.Sprintf("%d.json", info.Pid)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	ch.files = ch.files[1:]
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+
+	for _, args := range [][]string{
+		{sessionID[:8], "--role", "all"},
+		{paths[0], "--role", "all"},
+		{"--role", "all"},
+	} {
+		e.backend = backendFiles
+		wantCode, wantOut, _ := runTL(t, e, args...)
+		e.backend = backendDB
+		code, out, warning := runTL(t, e, args...)
+		if wantCode != 0 || code != 0 || out != wantOut || !strings.Contains(warning, "reading files instead") {
+			t.Errorf("args %q: files=(%d,%q), db=(%d,%q,%q)", args, wantCode, wantOut, code, out, warning)
+		}
 	}
 }
 

@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -132,6 +135,67 @@ func TestShadowDropsFileKeysPastStoredLines(t *testing.T) {
 	rec := shadowRepeat(spec, e.home)
 	if rec.Error != "" || rec.Diff != 0 || rec.DBKeys != len(keys)-1 {
 		t.Fatalf("shadow repeat = %+v", rec)
+	}
+}
+
+func TestShadowRepeatUsesCallTimeForFileKeys(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	cutoff := e.now
+	file, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := "synthetic cutoff marker"
+	_, writeErr := fmt.Fprintln(file, userRecord(cutoff.Add(-time.Second).Format(time.RFC3339Nano), marker))
+	if writeErr == nil {
+		_, writeErr = fmt.Fprintln(file, userRecord(cutoff.Add(time.Second).Format(time.RFC3339Nano), marker))
+	}
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	e.now = cutoff
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_BACKEND", "")
+	journal := filepath.Join(t.TempDir(), "shadow.jsonl")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	stateData, _ := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args := []string{paths[0], "--grep", marker, "--role", "all"}
+	opts, err := parseArgs(args, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.now = cutoff
+	var answerHits []hit
+	for _, event := range ch.files[0].events {
+		if strings.Contains(event.ev.Shown(), marker) {
+			answerHits = append(answerHits, hit{src: source{Path: paths[0]}, ev: event.ev})
+		}
+	}
+	if len(answerHits) != 2 {
+		t.Fatalf("synthetic marker events = %d, want two", len(answerHits))
+	}
+	a := &answer{filled: true, res: &result{hits: answerHits}}
+	shadowAfter(a, opts, e, 0, time.Second, io.Discard)
+	waitFor(t, "shadow cutoff journal", func() bool { return countLines(t, journal) == 1 })
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec shadowRecord
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Error != "" || rec.Diff != 0 || rec.FilesKeys != rec.DBKeys {
+		t.Fatalf("shadow cutoff record = %+v", rec)
 	}
 }
 

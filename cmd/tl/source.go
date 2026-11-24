@@ -221,11 +221,6 @@ func liveSessionNames(home string) (map[string]bool, error) {
 
 // sourceLinkIDs assigns each selected path the shortest prefix unique in find's full search area.
 func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames map[string]bool) map[string]string {
-	return sourceLinkIDsWithIDs(sources, allPaths, nil, home, liveNames)
-}
-
-// sourceLinkIDsWithIDs derives links from the transcript names: the stored session id is only a short lookup key.
-func sourceLinkIDsWithIDs(sources []source, allPaths []string, _ map[string]string, home string, liveNames map[string]bool) map[string]string {
 	fullIDs := make(map[string]string, len(allPaths)+len(sources))
 	searchable := make(map[string]bool, len(allPaths))
 	for _, path := range allPaths {
