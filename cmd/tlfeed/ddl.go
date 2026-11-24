@@ -42,6 +42,9 @@ func eventWithinRetentionAt(column string, at time.Time, days int) string {
 // applied when events is created; an existing table keeps its current TTL until explicitly altered.
 // Layout (role, kind, file_id, line) with a time-ordered file id and granule 1024 is the one measured as the best
 // on the corpus; raw keeps every line as is, so a file is rebuilt from it byte for byte.
+// files is rewritten for the newest file ids on every pass, so its newest part takes a merge per insert; the merge cap
+// bounds that part: once it passes 512 KiB it stays as is and a new small one starts. Old versions left in capped
+// parts are a few dozen rows, FINAL drops them.
 //
 //nolint:sql-runtime-ddl the loader owns its schema: idempotent CREATE ... IF NOT EXISTS run at every start
 const schema = `
@@ -73,12 +76,14 @@ CREATE TABLE IF NOT EXISTS {db}.files
     ver UInt64                            -- write order: the latest row of a file wins
 )
 ENGINE = ReplacingMergeTree(ver)
-ORDER BY file_id;
+ORDER BY file_id
+SETTINGS max_bytes_to_merge_at_max_space_in_pool = 524288;
 
 ALTER TABLE {db}.files MODIFY COLUMN gen UInt64;
 ALTER TABLE {db}.files MODIFY COLUMN mtime DateTime64(3, 'UTC');
 ALTER TABLE {db}.files ADD COLUMN IF NOT EXISTS description String AFTER name;
 ALTER TABLE {db}.files ADD COLUMN IF NOT EXISTS cwd String AFTER description;
+ALTER TABLE {db}.files MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288;
 
 CREATE TABLE IF NOT EXISTS {db}.raw
 (

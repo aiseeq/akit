@@ -658,12 +658,13 @@ func TestArgs(t *testing.T) {
 
 func TestStatements(t *testing.T) {
 	got := statements("tq")
-	if len(got) != 12 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
+	if len(got) != 13 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
 		t.Fatalf("%d statements: %q", len(got), got)
 	}
 	for _, s := range got {
 		// ALTERs widen existing columns; run again, they change nothing.
-		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')"
+		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')" ||
+			s == "ALTER TABLE tq.files MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288"
 		if strings.Contains(s, "{db}") || strings.Contains(s, "--") || !idempotent {
 			t.Fatalf("statement %q", s)
 		}
