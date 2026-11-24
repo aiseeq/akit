@@ -24,7 +24,12 @@ type priorDB struct {
 var activePriorDB *priorDB
 
 func priorBackend(home string, stderr io.Writer) *priorDB {
-	if os.Getenv("TL_BACKEND") != "db" {
+	switch b := os.Getenv("TL_BACKEND"); b {
+	case "", "files":
+		return nil
+	case "db":
+	default:
+		fmt.Fprintf(stderr, "prior: TL_BACKEND=%q is not files or db; reading files\n", b)
 		return nil
 	}
 	state, err := transcriptdb.CheckHealth(home)

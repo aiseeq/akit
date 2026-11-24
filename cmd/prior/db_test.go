@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -55,7 +57,8 @@ func replyHeads(out string) []string {
 }
 
 // База отвечает номером строки первой реплики (не тем, что в файле: видно, что ответ взят из базы); вторую она
-// находит только на нижней границе окна - ряд мог начаться раньше, третьей в базе нет: обе ищутся в файле.
+// находит только на нижней границе окна - ряд мог начаться раньше, третьей в базе нет: обе ищутся в файле. Строка
+// сервера о транскрипте, о котором не спрашивали, окна не даёт; прогрева строк журнала по файлам при базе нет.
 func TestPriorReplyLinesFromDatabase(t *testing.T) {
 	home, transcript := dbHome(t)
 	first := time.Date(2026, 10, 5, 8, 7, 9, 440_000_000, time.UTC).UnixMilli()
@@ -73,9 +76,10 @@ func TestPriorReplyLinesFromDatabase(t *testing.T) {
 			if got := r.URL.Query().Get("param_paths"); got != transcriptdb.Strings([]string{transcript}) {
 				t.Errorf("paths %s", got)
 			}
-			_, _ = fmt.Fprintf(w, "77\t%s\t%d\t9\n77\t%s\t%d\t300\n", transcript, first, transcript, second)
+			_, _ = fmt.Fprintf(w, "88\t/elsewhere/%s.jsonl\t%d\t3\n77\t%s\t%d\t9\n77\t%s\t%d\t300\n", dbSession, first, transcript, first, transcript, second)
 		case "tl:prior_reply_lines":
-			if !strings.Contains(string(body), "file_id = {f0:UInt64}") || r.URL.Query().Get("param_b1") != "300" || r.URL.Query().Get("param_a1") != "44" {
+			if !strings.Contains(string(body), "file_id = {f0:UInt64}") || r.URL.Query().Get("param_f0") != "77" || r.URL.Query().Get("param_b1") != "300" ||
+				r.URL.Query().Get("param_a1") != "44" || r.URL.Query().Has("param_f2") {
 				t.Errorf("windows: %s %v", body, r.URL.Query())
 			}
 			_, _ = fmt.Fprint(w, "77\t5\t1,0\n77\t9\t1,0\n77\t44\t0,1\n")
@@ -88,6 +92,9 @@ func TestPriorReplyLinesFromDatabase(t *testing.T) {
 	activePriorDB = &priorDB{client: dbClient(t, server.URL), through: time.Now(), stderr: &stderr}
 	defer func() { activePriorDB = nil }()
 	got := replyHeads(runPrior(t, home, "ключслово"))
+	if _, err := os.Stat(cachePath("reply-prewarm.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("reply lines prewarmed from the files with the database: %v", err)
+	}
 	want := []string{
 		"### 2026-10-05T08:07:09.44Z (05.10 10:07 CEST) · ~/x · claude " + dbSession + " · tl 1234abcd:5",
 		"### 2026-10-06T08:00:00Z (06.10 10:00 CEST) · ~/x · claude " + dbSession + " · tl 1234abcd:3",
@@ -158,7 +165,12 @@ func TestPriorBackendHealth(t *testing.T) {
 		t.Fatalf("fallback warning missing: %s", stderr.String())
 	}
 	t.Setenv("TL_BACKEND", "files")
-	if priorBackend(home, &stderr) != nil {
-		t.Fatal("files backend opened the database")
+	stderr.Reset()
+	if priorBackend(home, &stderr) != nil || stderr.Len() > 0 {
+		t.Fatalf("files backend opened the database: %q", stderr.String())
+	}
+	t.Setenv("TL_BACKEND", "dbx")
+	if priorBackend(home, &stderr) != nil || !strings.Contains(stderr.String(), `prior: TL_BACKEND="dbx" is not files or db; reading files`) {
+		t.Fatalf("unknown backend: %q", stderr.String())
 	}
 }

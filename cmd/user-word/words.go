@@ -39,13 +39,17 @@ type line struct {
 }
 
 // readLines — реплики пользователя и ответы агента по порядку; keep отсеивает сырые строки до разбора.
+// Отсев keep видит сырые строки и бывает с побочным действием (запоминает ответ агента перед цитатой и дни записей):
+// строк базы он не видит, поэтому с отсевом транскрипт читается из файла.
 func readLines(path string, keep func([]byte) bool) ([]line, error) {
-	if activeWordDB != nil {
+	if activeWordDB != nil && keep == nil {
 		lines, err := activeWordDB.lines(path)
 		if err == nil {
 			return lines, nil
 		}
-		setWordFreshnessFailure(err)
+		if !errors.Is(err, errReadFile) {
+			setWordFreshnessFailure(err)
+		}
 	}
 	var out []line
 	meta, err := transcript.Read(path, keep, func(ev transcript.Event) {
@@ -841,10 +845,7 @@ func findHitsUsing(opts options, e env, read func(string, func([]byte) bool) ([]
 	if err != nil {
 		return nil, nil, err
 	}
-	has := prefilter(opts.frag)
-	keep := func(raw []byte) bool {
-		return bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) || has(raw)
-	}
+	keep := hitKeep(opts.frag)
 	var hits []hit
 	var warnings []line
 	seen := map[string]bool{} // запись, повторённая в другом транскрипте (продолжение сессии), — один раз
@@ -877,6 +878,14 @@ func findHitsUsing(opts options, e env, read func(string, func([]byte) bool) ([]
 	}
 	sort.SliceStable(hits, func(i, j int) bool { return hits[i].t.Before(hits[j].t) })
 	return hits, warnings, nil
+}
+
+// hitKeep — отсев сырых строк поиска реплик: строки с куском и вызовы окна вопроса (без них ответ в окне не узнать).
+func hitKeep(frag string) func([]byte) bool {
+	has := prefilter(frag)
+	return func(raw []byte) bool {
+		return bytes.Contains(raw, []byte(`"name":"AskUserQuestion"`)) || has(raw)
+	}
 }
 
 func writeWarnings(w io.Writer, lines []line) {
