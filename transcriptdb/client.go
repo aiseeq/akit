@@ -1,3 +1,10 @@
+// Package transcriptdb reads agent transcripts from the ClickHouse database the tlfeed loader fills: files (one row
+// per transcript, its newest version under FINAL), raw (the lines of a file as they are on disk) and usage (token
+// usage of the model replies). The client is read-only: every query goes with readonly=1.
+//
+// A tool picks the database with TL_BACKEND=db (SourceFromEnv, Backend) or explicitly (Connect, New); the address is
+// TL_CLICKHOUSE_URL and TL_CLICKHOUSE_DB. Lines of a file come from raw only when the database holds all of them in
+// order: a gap, a cut answer or a file not loaded to its end is a SourceError, and Open reads such a file from disk.
 package transcriptdb
 
 import (
@@ -27,8 +34,12 @@ const (
 type Client struct {
 	base string
 	db   string
+	tool string
 	hc   *http.Client
 }
+
+// defaultTool tags the queries of a client no tool has named (WithTool).
+const defaultTool = "transcriptdb"
 
 // NewFromEnv creates a client from TL_CLICKHOUSE_URL and TL_CLICKHOUSE_DB.
 func NewFromEnv() (*Client, error) {
@@ -52,10 +63,22 @@ func New(base, db string) (*Client, error) {
 	if db == "" || strings.Trim(db, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != "" {
 		return nil, fmt.Errorf("bad TL_CLICKHOUSE_DB %q: want a plain name", db)
 	}
+	// Idle connections are kept for parallel readers (several files at once), not for two as by default.
 	tr := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext,
-		ResponseHeaderTimeout: headerTimeout, IdleConnTimeout: 90 * time.Second}
-	return &Client{base: strings.TrimRight(base, "/") + "/", db: db, hc: &http.Client{Transport: tr}}, nil
+		ResponseHeaderTimeout: headerTimeout, IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 16}
+	return &Client{base: strings.TrimRight(base, "/") + "/", db: db, tool: defaultTool, hc: &http.Client{Transport: tr}}, nil
 }
+
+// WithTool is a copy of the client whose queries carry log_comment "<tool>:<query name>", so system.query_log tells
+// the tool that sent them. The copy shares the connections of c.
+func (c *Client) WithTool(tool string) *Client {
+	d := *c
+	d.tool = tool
+	return &d
+}
+
+// DB is the database name the client reads.
+func (c *Client) DB() string { return c.db }
 
 // dialTimeout and headerTimeout bound a server that does not take the connection or does not start the answer:
 // a query that sorts sends its header after the sort, which takes seconds over days of events.
@@ -79,7 +102,7 @@ func (e *ServerError) Error() string {
 }
 
 // Query is one read: the statement with typed parameters, their values and the settings of this query.
-// name goes to log_comment, so the query is found in system.query_log by it.
+// Name goes to log_comment after the tool name, so the query is found in system.query_log by it.
 type Query struct {
 	Name     string
 	SQL      string
@@ -94,34 +117,26 @@ func (c *Client) Select(ctx context.Context, name, sql string, params map[string
 
 // SelectTSV executes a read-only query and returns its TabSeparated rows.
 func (c *Client) SelectTSV(ctx context.Context, q Query) ([][]string, error) {
-	params := url.Values{}
-	maps.Copy(params, q.Settings)
-	params.Set("readonly", "1")
-	params.Set("database", c.db)
-	params.Set("log_comment", "tl:"+q.Name)
-	for name, value := range q.Params {
-		params.Set("param_"+name, value)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"?"+params.Encode(), strings.NewReader(q.SQL+" FORMAT TabSeparated"))
+	var rows [][]string
+	err := c.EachTSV(ctx, q, func(fields []string) error {
+		rows = append(rows, fields)
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("clickhouse request: %w", err)
+		return nil, err
 	}
-	// ClickHouse is on localhost for tl; avoid gzip CPU on the already-local TSV response.
-	req.Header.Set("Accept-Encoding", "identity")
-	resp, err := c.hc.Do(req)
+	return rows, nil
+}
+
+// EachTSV executes a read-only query and gives fn its TabSeparated rows one by one, unescaped, as they come: a large
+// answer is not held whole. An error of fn stops the read and is returned as is.
+func (c *Client) EachTSV(ctx context.Context, q Query, fn func(fields []string) error) error {
+	q.SQL += " FORMAT TabSeparated"
+	resp, err := c.post(ctx, q)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, rerr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		if rerr != nil {
-			msg = append(msg, " (answer cut: "+rerr.Error()+")"...)
-		}
-		first, _, _ := strings.Cut(strings.TrimSpace(string(msg)), "\n")
-		return nil, &ServerError{status: resp.StatusCode, code: resp.Header.Get("X-ClickHouse-Exception-Code"), msg: first}
-	}
-	var rows [][]string
 	br := bufio.NewReaderSize(resp.Body, 1<<20)
 	// An error after the first rows comes inside the answer, the status 200 already sent: a block between lines
 	// "__exception__\r" with the tag of the header. A row cannot hold a bare \r: TabSeparated escapes it.
@@ -129,26 +144,60 @@ func (c *Client) SelectTSV(ctx context.Context, q Query) ([][]string, error) {
 	for {
 		line, rerr := br.ReadString('\n')
 		if tag != "" && line == "__exception__\r\n" {
-			return nil, exceptionBlock(br, tag, resp.Header.Get("X-ClickHouse-Exception-Code"))
+			return exceptionBlock(br, tag, resp.Header.Get("X-ClickHouse-Exception-Code"))
 		}
 		if line = strings.TrimSuffix(line, "\n"); line != "" && line != "\r" {
 			fields := strings.Split(line, "\t")
 			for i := range fields {
 				fields[i] = TSVUnescape(fields[i])
 			}
-			rows = append(rows, fields)
+			if err := fn(fields); err != nil {
+				return err
+			}
 		}
 		if errors.Is(rerr, io.EOF) {
-			break
+			return nil
 		}
 		if rerr != nil {
 			if IsTransportError(rerr) || ctx.Err() != nil {
-				return nil, fmt.Errorf("%w: answer cut: %w", ErrUnavailable, rerr)
+				return fmt.Errorf("%w: answer cut: %w", ErrUnavailable, rerr)
 			}
-			return nil, fmt.Errorf("clickhouse answer: %w", rerr)
+			return fmt.Errorf("clickhouse answer: %w", rerr)
 		}
 	}
-	return rows, nil
+}
+
+// post sends the statement of q as it is, its format clause included, and returns the answer of status 200; any
+// other status is a ServerError with the first line of the message, no answer — ErrUnavailable.
+func (c *Client) post(ctx context.Context, q Query) (*http.Response, error) {
+	params := url.Values{}
+	maps.Copy(params, q.Settings)
+	params.Set("readonly", "1")
+	params.Set("database", c.db)
+	params.Set("log_comment", c.tool+":"+q.Name)
+	for name, value := range q.Params {
+		params.Set("param_"+name, value)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"?"+params.Encode(), strings.NewReader(q.SQL))
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse request: %w", err)
+	}
+	// The server is local; a compressed answer would only spend CPU on both ends.
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		msg, rerr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if rerr != nil {
+			msg = append(msg, " (answer cut: "+rerr.Error()+")"...)
+		}
+		first, _, _ := strings.Cut(strings.TrimSpace(string(msg)), "\n")
+		return nil, &ServerError{status: resp.StatusCode, code: resp.Header.Get("X-ClickHouse-Exception-Code"), msg: first}
+	}
+	return resp, nil
 }
 
 // exceptionBlock reads the error the server wrote after the rows it had sent.

@@ -504,6 +504,9 @@ func replies(w io.Writer, q query, s paths) {
 	hits := replyBlocks(string(data), q)
 	if len(hits) == 0 {
 		fmt.Fprintln(w, "(нет)")
+		if activePriorDB != nil {
+			activePriorDB.fresh() // запуск на базе: строка свежести и без находок, как у tl
+		}
 		return
 	}
 	if len(hits) > maxReplies {

@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/aiseeq/akit/internal/transcriptdb"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // priorDB — база транскриптов при TL_BACKEND=db. Список реплик и при ней остаётся журналом: в нём реплики из
@@ -24,24 +23,11 @@ type priorDB struct {
 var activePriorDB *priorDB
 
 func priorBackend(home string, stderr io.Writer) *priorDB {
-	switch b := os.Getenv("TL_BACKEND"); b {
-	case "", "files":
-		return nil
-	case "db":
-	default:
-		fmt.Fprintf(stderr, "prior: TL_BACKEND=%q is not files or db; reading files\n", b)
+	c, state := transcriptdb.Backend("prior", home, stderr)
+	if c == nil {
 		return nil
 	}
-	state, err := transcriptdb.CheckHealth(home)
-	if err == nil {
-		var c *transcriptdb.Client
-		c, err = transcriptdb.NewFromEnv()
-		if err == nil {
-			return &priorDB{client: c, through: state.DBThrough, stderr: stderr}
-		}
-	}
-	fmt.Fprintf(stderr, "prior: TL_BACKEND=db: %v; reading files instead\n", err)
-	return nil
+	return &priorDB{client: c, through: state.DBThrough, stderr: stderr}
 }
 
 // fresh — строка свежести в stderr, как у tl.
@@ -114,7 +100,7 @@ func (d *priorDB) replyWindows(needlesByPath map[string]map[string]struct{}) ([]
 			stampNeedle[key] = needle
 		}
 	}
-	rows, err := d.client.Select(context.Background(), "prior_reply_events",
+	rows, err := d.client.Select(context.Background(), "reply_events",
 		"SELECT toString(f.file_id), f.path, toString(toUnixTimestamp64Milli(e.ts)), toString(min(e.line)) "+
 			"FROM events AS e INNER JOIN (SELECT file_id, path, ev_lines FROM files FINAL WHERE path IN {paths:Array(String)}) AS f USING (file_id) "+
 			"WHERE e.file_id IN (SELECT file_id FROM files FINAL WHERE path IN {paths:Array(String)}) "+
@@ -161,7 +147,7 @@ func (d *priorDB) firstNeedleLines(windows []replyWindow) (map[string]map[string
 		}
 	}
 	params["needles"] = transcriptdb.Strings(needles)
-	rows, err := d.client.Select(context.Background(), "prior_reply_lines",
+	rows, err := d.client.Select(context.Background(), "reply_lines",
 		"SELECT toString(file_id), toString(line), arrayStringConcat(arrayMap(p -> toString(p), multiSearchAllPositions(raw, {needles:Array(String)})), ',') "+
 			"FROM raw WHERE ("+strings.Join(conds, " OR ")+") AND multiSearchAny(raw, {needles:Array(String)})", params)
 	if err != nil {

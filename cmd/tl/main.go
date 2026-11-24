@@ -21,10 +21,10 @@ import (
 
 	"github.com/aiseeq/akit/buildversion"
 	"github.com/aiseeq/akit/clihelp"
-	"github.com/aiseeq/akit/internal/transcriptdb"
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
 	"github.com/aiseeq/akit/transcript/replycache"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 const usage = `tl — session transcripts, briefly: a time/role window or a search.

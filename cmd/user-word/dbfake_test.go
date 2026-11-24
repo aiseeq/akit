@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiseeq/akit/internal/transcriptdb"
 	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // fakeEvent and fakeFile are the rows the loader would write for a synthetic transcript: text as Shown(), the

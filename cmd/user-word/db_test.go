@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiseeq/akit/internal/transcriptdb"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // healthyLoader — state.json свежего загрузчика для home.
@@ -40,6 +40,9 @@ func fakeDB(t *testing.T, answer func(sql string, params map[string]string) stri
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("readonly") != "1" {
 			t.Error("query not readonly")
+		}
+		if c := r.URL.Query().Get("log_comment"); !strings.HasPrefix(c, "user-word:") {
+			t.Errorf("log_comment %q does not name user-word", c)
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {

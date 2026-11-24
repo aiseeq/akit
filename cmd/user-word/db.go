@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aiseeq/akit/internal/transcriptdb"
 	"github.com/aiseeq/akit/session"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 type wordDB struct {
@@ -30,24 +30,9 @@ var activeWordDB *wordDB
 
 func initWordDB(e env, stderr io.Writer) {
 	activeWordDB = nil
-	switch b := os.Getenv("TL_BACKEND"); b {
-	case "", "files":
-		return
-	case "db":
-	default:
-		fmt.Fprintf(stderr, "user-word: TL_BACKEND=%q is not files or db; reading files\n", b)
-		return
+	if c, st := transcriptdb.Backend("user-word", e.home, stderr); c != nil {
+		activeWordDB = &wordDB{client: c, through: st.DBThrough, stderr: stderr}
 	}
-	st, err := transcriptdb.CheckHealth(e.home)
-	var c *transcriptdb.Client
-	if err == nil {
-		c, err = transcriptdb.NewFromEnv()
-	}
-	if err != nil {
-		fmt.Fprintf(stderr, "user-word: TL_BACKEND=db: %v; reading files instead\n", err)
-		return
-	}
-	activeWordDB = &wordDB{client: c, through: st.DBThrough, stderr: stderr}
 }
 
 func (d *wordDB) query(name, sql string, params map[string]string) ([][]string, error) {
@@ -66,7 +51,7 @@ var errReadFile = errors.New("the database lacks what the file gives")
 // он читается из файла; в нём есть битые строки - тоже из файла (предупреждение о них - с ошибкой разбора первой).
 func (d *wordDB) lines(path string) ([]line, error) {
 	params := map[string]string{"path": transcriptdb.String(path)}
-	rows, err := d.query("user_word_lines", "SELECT toString(events.file_id), toString(events.line), toString(toUnixTimestamp64Milli(events.ts)), events.role, events.text, "+
+	rows, err := d.query("lines", "SELECT toString(events.file_id), toString(events.line), toString(toUnixTimestamp64Milli(events.ts)), events.role, events.text, "+
 		"toString(events.images), toString(f.bad) FROM events "+
 		"INNER JOIN (SELECT file_id, ev_lines, bad FROM files FINAL WHERE path = {path:String}) AS f USING (file_id) "+
 		"WHERE events.file_id IN (SELECT file_id FROM files FINAL WHERE path = {path:String}) AND events.line <= f.ev_lines "+
@@ -187,7 +172,7 @@ func (d *wordDB) rawLines(keys []rawKey) (map[rawKey][]byte, error) {
 	if len(keys) == 0 {
 		return out, nil
 	}
-	rows, err := d.query("user_word_raw", "SELECT toString(file_id), toString(line), raw FROM raw WHERE (file_id, line) IN {keys:Array(Tuple(UInt64, UInt32))}",
+	rows, err := d.query("raw", "SELECT toString(file_id), toString(line), raw FROM raw WHERE (file_id, line) IN {keys:Array(Tuple(UInt64, UInt32))}",
 		map[string]string{"keys": transcriptdb.ArrayParam(keys, func(k rawKey) string {
 			return "(" + strconv.FormatUint(k.file, 10) + "," + strconv.Itoa(k.line) + ")"
 		})})
@@ -243,7 +228,7 @@ func (d *wordDB) briefCandidates(home string, fragments map[string][]string, loc
 	if len(conds) == 0 {
 		return nil, nil
 	}
-	rows, err := d.query("user_word_brief_candidates", "SELECT DISTINCT files.path FROM events INNER JOIN files FINAL USING (file_id) "+
+	rows, err := d.query("brief_candidates", "SELECT DISTINCT files.path FROM events INNER JOIN files FINAL USING (file_id) "+
 		"WHERE events.role IN ('user','ask') AND events.kind = 'claude' AND events.line <= files.ev_lines AND ("+
 		strings.Join(conds, " OR ")+") ORDER BY files.path", params)
 	if err != nil {
@@ -294,7 +279,7 @@ func (d *wordDB) briefRecordDays(recordWindows map[string]markerRecordInterval) 
 		}
 	}
 	params["lo"], params["hi"] = transcriptdb.Time(lo), transcriptdb.Time(hi)
-	rows, err := d.query("user_word_brief_record_days", "SELECT "+strings.Join(columns, ", ")+" FROM events WHERE kind = 'claude' "+
+	rows, err := d.query("brief_record_days", "SELECT "+strings.Join(columns, ", ")+" FROM events WHERE kind = 'claude' "+
 		"AND ts >= {lo:DateTime64(3, 'UTC')} AND ts < {hi:DateTime64(3, 'UTC')}", params)
 	if err != nil {
 		return nil, err
@@ -328,7 +313,7 @@ func dbFindHits(opts options, e env) ([]hit, []line, error) {
 		filter += " AND events.ts >= {since:DateTime64(3, 'UTC')}"
 		params["since"] = transcriptdb.Time(since)
 	}
-	rows, err := activeWordDB.query("user_word_search", "SELECT files.path, toString(events.file_id), toString(events.line), toString(toUnixTimestamp64Milli(events.ts)), "+
+	rows, err := activeWordDB.query("search", "SELECT files.path, toString(events.file_id), toString(events.line), toString(toUnixTimestamp64Milli(events.ts)), "+
 		"events.role, events.text, toString(events.images) "+
 		"FROM events INNER JOIN files FINAL USING (file_id) WHERE events.line <= files.ev_lines AND events.kind = 'claude' "+
 		"AND events.role IN ('user','ask')"+filter+" ORDER BY events.ts, files.path, events.line", params)

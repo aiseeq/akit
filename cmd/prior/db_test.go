@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiseeq/akit/internal/transcriptdb"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 const dbSession = "1234abcd-0000-0000-0000-000000000001"
@@ -43,7 +43,7 @@ func dbClient(t *testing.T, url string) *transcriptdb.Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return c
+	return c.WithTool("prior")
 }
 
 func replyHeads(out string) []string {
@@ -72,12 +72,12 @@ func TestPriorReplyLinesFromDatabase(t *testing.T) {
 		name := r.URL.Query().Get("log_comment")
 		queries = append(queries, name)
 		switch name {
-		case "tl:prior_reply_events":
+		case "prior:reply_events":
 			if got := r.URL.Query().Get("param_paths"); got != transcriptdb.Strings([]string{transcript}) {
 				t.Errorf("paths %s", got)
 			}
 			_, _ = fmt.Fprintf(w, "88\t/elsewhere/%s.jsonl\t%d\t3\n77\t%s\t%d\t9\n77\t%s\t%d\t300\n", dbSession, first, transcript, first, transcript, second)
-		case "tl:prior_reply_lines":
+		case "prior:reply_lines":
 			if !strings.Contains(string(body), "file_id = {f0:UInt64}") || r.URL.Query().Get("param_f0") != "77" || r.URL.Query().Get("param_b1") != "300" ||
 				r.URL.Query().Get("param_a1") != "44" || r.URL.Query().Has("param_f2") {
 				t.Errorf("windows: %s %v", body, r.URL.Query())
@@ -103,7 +103,7 @@ func TestPriorReplyLinesFromDatabase(t *testing.T) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("заголовки:\n%s", strings.Join(got, "\n"))
 	}
-	if strings.Join(queries, ",") != "tl:prior_reply_events,tl:prior_reply_lines" {
+	if strings.Join(queries, ",") != "prior:reply_events,prior:reply_lines" {
 		t.Errorf("queries %v", queries)
 	}
 	if !strings.Contains(stderr.String(), "prior: данные актуальны на") {
@@ -131,6 +131,25 @@ func TestPriorDatabaseServerFailureFallsBackToFiles(t *testing.T) {
 	}
 	if activePriorDB != nil {
 		t.Error("backend kept after a failed query")
+	}
+}
+
+// Запуск на базе без находок в разделе реплик: запросов к базе нет, а строка свежести есть, как у tl.
+func TestPriorDatabaseNoRepliesPrintsFreshness(t *testing.T) {
+	home, _ := dbHome(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("the database is asked without reply hits")
+		http.Error(w, "synthetic", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	var stderr bytes.Buffer
+	activePriorDB = &priorDB{client: dbClient(t, server.URL), through: time.Now(), stderr: &stderr}
+	defer func() { activePriorDB = nil }()
+	if got := sectionOf(runPrior(t, home, "несуществующееслово"), "реплики"); len(got) == 0 || got[len(got)-1] != "(нет)" {
+		t.Errorf("replies section %q", got)
+	}
+	if strings.Count(stderr.String(), "prior: данные актуальны на") != 1 {
+		t.Errorf("freshness line: %q", stderr.String())
 	}
 }
 
