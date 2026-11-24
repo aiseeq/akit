@@ -244,15 +244,15 @@ func TestLiveOldUsageRewind(t *testing.T) {
 	if got := scalar(t, srv, "SELECT count() FROM "+db+".usage FINAL"); got != "1" {
 		t.Fatalf("old usage before rewind: %s, want 1", got)
 	}
-	write(t, path, []byte(user+replyLine("new", base.Add(2*time.Second))))
+	write(t, path, []byte(user+replyLine("newer", base.Add(2*time.Second)))) // another length: a rewrite of the same size within the load second is not seen
 	if err := l.pass(false); err != nil {
 		t.Fatal(err)
 	}
 	if got := scalar(t, srv, "SELECT count() FROM "+db+".usage FINAL"); got != "1" {
 		t.Fatalf("usage after old rewind: %s, want only the rewritten reply", got)
 	}
-	if got := scalar(t, srv, "SELECT any(reply_id) FROM "+db+".usage FINAL"); got != "new" {
-		t.Fatalf("usage after old rewind belongs to %q, want new", got)
+	if got := scalar(t, srv, "SELECT any(reply_id) FROM "+db+".usage FINAL"); got != "newer" {
+		t.Fatalf("usage after old rewind belongs to %q, want newer", got)
 	}
 }
 
