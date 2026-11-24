@@ -156,12 +156,12 @@ func TestGuideExamplesWork(t *testing.T) {
 	if shown := call([]string{"show", "waiter"}, time.Now()); strings.Contains(shown, "Ждёт: ") {
 		t.Fatalf("tk start did not remove the wait: %q", shown)
 	}
-	call([]string{"wait", "waiter", "--until", "2h", "--by", "tester"}, time.Now())
-	if due := call([]string{"ls", "--due"}, time.Now()); guideLineForSlug(due, "waiter") != "" {
-		t.Fatalf("relative condition appeared in ls --due: %q", due)
+	var relativeOut, relativeErr bytes.Buffer
+	if code := runMain([]string{"wait", "waiter", "--until", "2h", "--by", "tester"}, time.Now(), &relativeOut, &relativeErr); code == 0 || !strings.Contains(relativeErr.String(), "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём") {
+		t.Fatalf("relative wait result: code=%d stderr=%q", code, relativeErr.String())
 	}
-	if shown := call([]string{"show", "waiter"}, time.Now()); !strings.Contains(shown, "Ждёт: 2h") {
-		t.Fatalf("relative wait was not stored as a condition: %q", shown)
+	if shown := call([]string{"show", "waiter"}, time.Now()); strings.Contains(shown, "Ждёт: ") {
+		t.Fatalf("refused relative wait changed ticket: %q", shown)
 	}
 }
 
@@ -280,13 +280,16 @@ func TestGuideWaitDateAndZoneExamples(t *testing.T) {
 	if !ok || !shortDeadline.Equal(wantShort) {
 		t.Fatalf("RFC3339 offset without seconds deadline=%v ok=%v want %v", shortDeadline, ok, wantShort)
 	}
-	call([]string{"wait", "impossible", "--until", "2026-02-30 10:00 проверка", "--by", "tester"}, now)
+	var impossibleOut, impossibleErr bytes.Buffer
+	if code := runMain([]string{"wait", "impossible", "--until", "2026-02-30 10:00 проверка", "--by", "tester"}, now, &impossibleOut, &impossibleErr); code == 0 || !strings.Contains(impossibleErr.String(), "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём") {
+		t.Fatalf("impossible date result: code=%d stderr=%q", code, impossibleErr.String())
+	}
 	impossibleTask, err := find(dir, "impossible")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := timearg.Deadline(waiting(impossibleTask.body), now); ok {
-		t.Fatalf("impossible date unexpectedly had a deadline: %q", waiting(impossibleTask.body))
+	if waiting(impossibleTask.body) != "" || impossibleTask.status != "открыт" {
+		t.Fatalf("impossible date refusal changed task: status=%q wait=%q", impossibleTask.status, waiting(impossibleTask.body))
 	}
 }
 

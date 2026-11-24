@@ -1043,9 +1043,11 @@ const guideText = `Зависимости
   «МСК» и «мск» в любом регистре дают ошибку. Ошибку также дают имена зон из
   областей Africa, America, Antarctica, Arctic, Asia, Atlantic, Australia,
   Europe, Indian, Pacific, Etc, US, Canada, Mexico, Brazil и Chile.
-  Нераспознанное время, невозможная дата и относительное «2h» сохраняются как
-  условие без срока: tk ls --due их не покажет. Когда срок наступил, tk next
-  выдаёт задачу, а tk ls --due показывает её; прошедший срок уже наступил.
+  Нераспознанное время, невозможная дата и относительное «2h» не принимаются
+  новым tk wait. Старые ожидания без срока видны в tk ls --due с пометкой
+  «требует даты». Когда срок наступил или закрыт названный тикет/блокер,
+  tk next выдаёт задачу с пометкой «условие наступило»; tk ls --due показывает
+  ожидания с наступившим сроком.
   tk start ID снимает ожидание; закрытый тикет требует явного tk start ID --reopen.
   Переоткрытие записывается в журнал; остальные переходы по закрытому тикету отказывают.
 `
@@ -2521,7 +2523,7 @@ func matchesListFilters(t task, o options) bool {
 			return false
 		}
 		at, ok := waitTimeDeadline(factsForTask(t).Waits, time.Now())
-		if !ok || at.After(time.Now()) {
+		if ok && at.After(time.Now()) {
 			return false
 		}
 	}
@@ -2550,6 +2552,8 @@ func printTask(out io.Writer, t task, label string, errout io.Writer) {
 			if !at.After(time.Now()) {
 				shown += " overdue"
 			}
+		} else {
+			shown += " (требует даты)"
 		}
 		wait = " [" + shown + "]"
 	}
@@ -2563,10 +2567,6 @@ func printTask(out io.Writer, t task, label string, errout io.Writer) {
 func waiting(s string) string {
 	return lineValue(s, "Ждёт: ")
 }
-
-// datedBadClock — в начале дата (ДД.ММ или ГГГГ-ММ-ДД) и слово-часы: срок не разобран, потому что такой даты
-// или таких часов нет.
-var datedBadClock = regexp.MustCompile(`^\s*(?:[0-9]{1,2}\.[0-9]{1,2}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?:[,:;]\s*|\s+)[0-9]{1,2}:[0-9]{1,2}`)
 
 // datedWait записывает год у ожидания ДД.ММ, чтобы срок не сдвигался после Нового года.
 func datedWait(wait string, now time.Time) string {
@@ -3913,6 +3913,12 @@ func transition(t task, o options, out, errout io.Writer) int {
 	if code, handled := guardStart(t, o, out, errout); handled {
 		return code
 	}
+	if o.cmd == "wait" {
+		if hint := ownWaitHint(t, o.until); hint != "" {
+			fmt.Fprintln(errout, "tk: "+hint)
+			return exitNone
+		}
+	}
 	glintFindings, release, code := prepareTransition(t, o, errout)
 	if code != 0 {
 		return code
@@ -4051,7 +4057,7 @@ func transitionStatus(cmd string) string {
 	return map[string]string{"start": "в работе", "wait": "ждёт", "review": "на проверке", "done": "готово", "reject": "отклонён", "release": "открыт"}[cmd]
 }
 
-func transitionBody(body string, o *options, next string, errout io.Writer) (string, error) {
+func transitionBody(body string, o *options, next string, _ io.Writer) (string, error) {
 	if o.cmd == "start" || o.cmd == "review" && executor(body) == "" {
 		body = setExecutor(body, o.by)
 	}
@@ -4082,16 +4088,12 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 		o.until = datedWait(o.until, now)
 		deadlineText = datedWait(deadlineText, now)
 		deadline, hasDeadline := timearg.Deadline(deadlineText, now)
-		if o.hintFacts != nil {
-			o.hintFacts.deadline, o.hintFacts.hasDeadline = deadline, hasDeadline
-		}
 		_, hasGuessed := timearg.GuessedClock(o.until)
 		if !hasDeadline && !hasGuessed {
-			if datedBadClock.MatchString(timearg.NormalizeSpaces(o.until)) {
-				fmt.Fprintln(errout, "tk: --until starts with a date and time that do not exist: no deadline, tk ls --due will not show it")
-			} else {
-				fmt.Fprintln(errout, "tk: --until has no time at the start: a condition, tk ls --due will not show it")
-			}
+			return "", errors.New("--until needs a date or time at the start; use ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём")
+		}
+		if o.hintFacts != nil {
+			o.hintFacts.deadline, o.hintFacts.hasDeadline = deadline, hasDeadline
 		}
 		body = setWaiting(setStatus(body, next), o.until)
 	}
@@ -4104,6 +4106,27 @@ func transitionBody(body string, o *options, next string, errout io.Writer) (str
 		}
 	}
 	return body, nil
+}
+
+var waitOwnTicketRE = regexp.MustCompile(`(?i)(?:после|за)\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)`)
+
+func ownWaitHint(t task, value string) string {
+	hint := "после своего тикета — `tk set <ID> --blocks <X>`; своя очередь — оставь открытым"
+	if strings.Contains(strings.ToLower(value), "очеред") {
+		return hint
+	}
+	match := waitOwnTicketRE.FindStringSubmatch(value)
+	if len(match) != 2 {
+		return ""
+	}
+	project := taskProject(t.path)
+	if project == "" {
+		return ""
+	}
+	if _, err := find(filepath.Join(project, "docs/tasks"), strings.ToLower(match[1])); err == nil {
+		return hint
+	}
+	return ""
 }
 
 func transitionJournal(o options, next string, glintFindings int) string {
@@ -4892,7 +4915,7 @@ func eligibleForNext(t task, actor string) bool {
 	waitDueNow := false
 	if t.status == "ждёт" {
 		at, ok := waitTimeDeadline(taskWait(t), time.Now())
-		waitDueNow = ok && !at.After(time.Now())
+		waitDueNow = ok && !at.After(time.Now()) || waitConditionReached(t)
 	}
 	if isJournal(t) && !waitDueNow {
 		return false
@@ -4904,6 +4927,77 @@ func eligibleForNext(t task, actor string) bool {
 		return false
 	}
 	return waitDueNow
+}
+
+func waitConditionReached(t task) bool {
+	project := taskProject(t.path)
+	for _, ref := range taskBlockedBy(t) {
+		if closedWaitReference(project, ref) {
+			return true
+		}
+	}
+	for _, ref := range waitReferences(taskWait(t)) {
+		if closedWaitReference(project, ref) {
+			return true
+		}
+	}
+	return false
+}
+
+var waitPathReferenceRE = regexp.MustCompile(`(?i)(?:git|work)/[a-z0-9._-]+/[a-z0-9]+(?:-[a-z0-9]+)*|[a-z0-9._-]+/[a-z0-9]+(?:-[a-z0-9]+)*`)
+var waitSlugReferenceRE = regexp.MustCompile(`(?i)[a-z0-9]+(?:-[a-z0-9]+)*`)
+
+func waitReferences(value string) []string {
+	seen := make(map[string]bool)
+	var refs []string
+	add := func(ref string) {
+		ref = strings.Trim(ref, ".,;:!?()[]{}<>\"'`")
+		if ref != "" && !seen[ref] {
+			seen[ref] = true
+			refs = append(refs, ref)
+		}
+	}
+	for _, match := range waitPathReferenceRE.FindAllString(value, -1) {
+		add(match)
+	}
+	for token := range strings.FieldsSeq(value) {
+		if strings.Contains(token, "/") {
+			continue
+		}
+		for _, match := range waitSlugReferenceRE.FindAllString(strings.Trim(token, ".,;:!?()[]{}<>\"'`"), -1) {
+			add(strings.ToLower(match))
+		}
+	}
+	return refs
+}
+
+func closedWaitReference(project, ref string) bool {
+	parts := strings.Split(ref, "/")
+	var dir, id string
+	if len(parts) == 2 {
+		root, err := destinationProject(parts[0])
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr, "tk: cannot resolve wait reference %q: %v\n", ref, err)
+			}
+			return false
+		}
+		dir, id = filepath.Join(root, "docs/tasks"), parts[1]
+	} else {
+		var err error
+		dir, id, err = referenceLocation(project, ref)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr, "tk: cannot resolve wait reference %q: %v\n", ref, err)
+			}
+			return false
+		}
+	}
+	linked, err := findWithArchive(dir, id)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "tk: cannot resolve wait reference %q: %v\n", ref, err)
+	}
+	return err == nil && closedStatus(linked.status)
 }
 
 func isJournal(t task) bool {
@@ -5072,6 +5166,9 @@ func nextLine(choice nextChoice, errout io.Writer) string {
 	var row bytes.Buffer
 	printTask(&row, choice.task, "", errout)
 	line := strings.TrimSuffix(row.String(), "\n")
+	if choice.task.status == "ждёт" && waitConditionReached(choice.task) {
+		line += " условие наступило"
+	}
 	if choice.gate.Valid && !choice.gate.Live {
 		line += " закрыто"
 	}

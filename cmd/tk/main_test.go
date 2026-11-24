@@ -865,7 +865,7 @@ func TestWaitReplaceAndStartClearsWait(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
-	for _, until := range []string{"2020-01-01 10:00", "после ответа"} {
+	for _, until := range []string{"2020-01-01 10:00", "2020-01-01 после ответа"} {
 		var out, errOut bytes.Buffer
 		if code := transition(task{path: path, slug: "waiting", body: body}, options{cmd: "wait", by: "worker", until: until}, &out, &errOut); code != 0 {
 			t.Fatalf("wait %d: %s", code, errOut.String())
@@ -898,12 +898,12 @@ func TestWaitReplaceAndStartClearsWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	var legacyOut, legacyErr bytes.Buffer
-	if code := transition(task{path: legacy, slug: "legacy-wait", body: "# Legacy\n## Что сделать\ntext\n"}, options{cmd: "wait", by: "worker", until: "after response"}, &legacyOut, &legacyErr); code != 0 {
-		t.Fatalf("legacy wait %d: %s", code, legacyErr.String())
+	if code := transition(task{path: legacy, slug: "legacy-wait", body: "# Legacy\n## Что сделать\ntext\n"}, options{cmd: "wait", by: "worker", until: "after response"}, &legacyOut, &legacyErr); code == 0 || !strings.Contains(legacyErr.String(), "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём") {
+		t.Fatalf("legacy wait result %d: %s", code, legacyErr.String())
 	}
 	legacyData, err := os.ReadFile(legacy)
-	if err != nil || !strings.Contains(string(legacyData), "Статус: ждёт\nЖдёт: after response") {
-		t.Fatalf("legacy wait field not inserted: %s, %v", legacyData, err)
+	if err != nil || strings.Contains(string(legacyData), "Ждёт:") {
+		t.Fatalf("refused legacy wait changed ticket: %s, %v", legacyData, err)
 	}
 	waitingTask := task{status: "ждёт", body: "Статус: ждёт\nЖдёт: 2020-01-01 10:00"}
 	if !includeTask(waitingTask, options{cmd: "ls"}) {
@@ -1805,10 +1805,13 @@ func TestDueWithTextAndISO(t *testing.T) {
 			t.Errorf("overdue false у %q", wait)
 		}
 	}
-	for _, wait := range []string{"2999-01-01 12:00 итог", "после ответа"} {
+	for _, wait := range []string{"2999-01-01 12:00 итог"} {
 		if matchesListFilters(task{status: "ждёт", body: "Статус: ждёт\nЖдёт: " + wait}, options{cmd: "ls", due: true}) {
 			t.Errorf("--due показал непросроченное %q", wait)
 		}
+	}
+	if !matchesListFilters(task{status: "ждёт", body: "Статус: ждёт\nЖдёт: после ответа"}, options{cmd: "ls", due: true}) {
+		t.Error("--due пропустил ожидание без даты")
 	}
 }
 
@@ -1833,11 +1836,8 @@ func TestWaitDatesBareClockAndWarnsOnCondition(t *testing.T) {
 		t.Errorf("лишнее предупреждение: %q", errOut.String())
 	}
 	errOut.Reset()
-	if code := transition(task{path: path, slug: "clock", body: string(data)}, options{cmd: "wait", by: "worker", until: "после ответа"}, &out, &errOut); code != 0 {
-		t.Fatalf("wait %d: %s", code, errOut.String())
-	}
-	if !strings.Contains(errOut.String(), "tk ls --due will not show it") {
-		t.Errorf("нет предупреждения про условие: %q", errOut.String())
+	if code := transition(task{path: path, slug: "clock", body: string(data)}, options{cmd: "wait", by: "worker", until: "после ответа"}, &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём") {
+		t.Fatalf("wait without date result %d: %s", code, errOut.String())
 	}
 }
 
@@ -2651,7 +2651,7 @@ func TestMarkedJournalFieldsAndUnmarkedHeaders(t *testing.T) {
 		t.Fatalf("ls --json guessed deadline: rows=%#v raw=%q err=%v", rows, jsonOut.String(), err)
 	}
 	var listOut, listErr bytes.Buffer
-	if code := list("", options{cmd: "ls", root: root, due: true}, &listOut, &listErr); code != 0 || strings.Contains(listOut.String(), "header-reason") {
+	if code := list("", options{cmd: "ls", root: root, due: true}, &listOut, &listErr); code != 0 || !strings.Contains(listOut.String(), "header-reason") || !strings.Contains(listOut.String(), "требует даты") {
 		t.Fatalf("ls --due includes guessed clock: code=%d out=%q err=%q", code, listOut.String(), listErr.String())
 	}
 }
@@ -2870,7 +2870,7 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 			t.Fatalf("guessed clock %q became due %q", until, obj.Due)
 		}
 		var dueOut, dueErr bytes.Buffer
-		if code := list("", options{cmd: "ls", root: filepath.Dir(filepath.Dir(dir)), due: true}, &dueOut, &dueErr); code != 0 || strings.Contains(dueOut.String(), "wait") {
+		if code := list("", options{cmd: "ls", root: filepath.Dir(filepath.Dir(dir)), due: true}, &dueOut, &dueErr); code != 0 || !strings.Contains(dueOut.String(), "wait") || !strings.Contains(dueOut.String(), "требует даты") {
 			t.Fatalf("ls --due %q: code=%d out=%q err=%q", until, code, dueOut.String(), dueErr.String())
 		}
 	}

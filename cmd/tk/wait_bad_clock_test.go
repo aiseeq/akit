@@ -8,28 +8,25 @@ import (
 	"github.com/aiseeq/akit/timearg"
 )
 
-// A date with impossible hours gives no deadline, and the warning says so
-// instead of claiming there is no time at the start.
-func TestWaitWarnsOnImpossibleHoursAfterDate(t *testing.T) {
+// Wait refuses inputs without a parseable deadline, including impossible dates.
+func TestWaitRejectsInputsWithoutDeadline(t *testing.T) {
 	for _, tc := range []struct{ until, want string }{
-		{"12.11, 25:00 build done", "date and time that do not exist"},
-		{"12.11 9:5 build done", "date and time that do not exist"},
-		{"2026-11-12 25:00 build done", "date and time that do not exist"},
-		{"2026-11-12; 25:00 build done", "date and time that do not exist"},
-		{"31.11 9:00 build done", "date and time that do not exist"},
-		{"31.02\u00a010:00 build done", "date and time that do not exist"},
-		{"12.11;25:00 build done", "date and time that do not exist"},
-		{"2026-11-12,25:00 build done", "date and time that do not exist"},
-		{"build done", "has no time at the start"},
+		{"12.11, 25:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"12.11 9:5 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"2026-11-12 25:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"2026-11-12; 25:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"31.11 9:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"31.02\u00a010:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"12.11;25:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"2026-11-12,25:00 build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
+		{"build done", "ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём"},
 		{"2026-11-12,09:00 build done", ""},
 	} {
 		var errout strings.Builder
 		o := &options{cmd: "wait", until: tc.until, by: "someone"}
-		if _, err := transitionBody("# t\n\nСтатус: открыт\n", o, "ждёт", &errout); err != nil {
-			t.Fatalf("%q: %v", tc.until, err)
-		}
-		if tc.want == "" && errout.Len() != 0 || tc.want != "" && !strings.Contains(errout.String(), tc.want) {
-			t.Errorf("%q: warning %q, want %q", tc.until, errout.String(), tc.want)
+		_, err := transitionBody("# t\n\nСтатус: открыт\n", o, "ждёт", &errout)
+		if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+			t.Errorf("%q: error %v, want %q", tc.until, err, tc.want)
 		}
 	}
 }

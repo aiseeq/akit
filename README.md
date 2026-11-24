@@ -314,7 +314,7 @@ repository's exclude file when needed.
 `tk new` and `tk start` name the next step on stderr; stdout stays what scripts read.
 
 Use `tk new --journal` or `tk set ID --journal` to mark a journal ticket; it stays out of `tk next`
-until a wait deadline is due. Queue gates use `open_by_root` in `gate.json`, keyed by absolute project
+until a wait deadline is due or a ticket named by its wait condition or blocker is closed. Queue gates use `open_by_root` in `gate.json`, keyed by absolute project
 roots; `crit_only` maps such a root to a reason (a day off, say) and closes all new work there but
 CRIT, which `tk next` names when the queue is empty. `tk transfer ID [--parent KEY]` passes the project name, ticket filename stem, optional parent
 key, and full ticket text to the executable `.tk-transfer` in the parent of the project under
@@ -350,9 +350,9 @@ Ticket IDs accept the slug, the full file name, or the file name without `.md`. 
 repository, `tk` uses the nearest `docs/tasks/` up to `$HOME`; `new` creates it in the current
 directory when none exists. `tk ls --all` includes closed tickets; `--status STATUS` filters by
 status, `--by NAME` filters by executor (or opening actor on older tickets), and `--due` lists
-waiting tickets whose deadline has passed: the time at the start of `--until` (`2026-10-28 09:00`, `2026-10-28T09:00`,
+waiting tickets whose deadline has passed, plus older waits without a readable date that need one: the time at the start of `--until` (`2026-10-28 09:00`, `2026-10-28T09:00`,
 `28.10 09:00`, a date, RFC3339; `UTC` after it means UTC), any text after it is a note. A clock time without a date
-gets today's date when written; `--until` without a time is a condition and never due. Empty acceptance sections are marked `no-check`.
+gets today's date when written. A new `tk wait` needs a readable date or time at the start and rejects waits for its own queue or another ticket in the same project; use `tk set ID --blocks X` for a dependency. An older undated condition stays visible in `tk ls --due` with `требует даты`; `tk next` marks a wait as `условие наступило` when a named ticket or blocker closes. Empty acceptance sections are marked `no-check`.
 When `.glint.yaml` exists at the task base, `tk done` checks all glint severities; findings block
 completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;
