@@ -224,15 +224,13 @@ func sourceLinkIDs(sources []source, allPaths []string, home string, liveNames m
 	return sourceLinkIDsWithIDs(sources, allPaths, nil, home, liveNames)
 }
 
-func sourceLinkIDsWithIDs(sources []source, allPaths []string, storedIDs map[string]string, home string, liveNames map[string]bool) map[string]string {
+// sourceLinkIDsWithIDs derives links from the transcript names: the stored session id is only a short lookup key.
+func sourceLinkIDsWithIDs(sources []source, allPaths []string, _ map[string]string, home string, liveNames map[string]bool) map[string]string {
 	fullIDs := make(map[string]string, len(allPaths)+len(sources))
 	searchable := make(map[string]bool, len(allPaths))
 	for _, path := range allPaths {
 		searchable[path] = true
-		fullIDs[path] = storedIDs[path]
-		if fullIDs[path] == "" {
-			fullIDs[path] = sourceFullID(source{Path: path, ID: path})
-		}
+		fullIDs[path] = sourceFullID(source{Path: path, ID: path})
 	}
 	for _, src := range sources {
 		fullIDs[src.Path] = sourceFullID(src)

@@ -37,6 +37,9 @@ func TestMaskedShortsAsOneByOne(t *testing.T) {
 	hits := make([]hit, len(texts))
 	for i, text := range texts {
 		hits[i] = hit{ev: transcript.Event{Text: text}}
+		if i%17 == 0 {
+			hits[i].ev.Images = 1
+		}
 		if i%11 == 0 {
 			hits[i].cut = &own
 		}
@@ -49,7 +52,7 @@ func TestMaskedShortsAsOneByOne(t *testing.T) {
 		for i := range hits {
 			want := ""
 			if hits[i].cut == nil {
-				want = maskedShort(texts[i], width)
+				want = maskedShort(hits[i].ev.Shown(), width)
 			}
 			if cuts[i] != want {
 				t.Fatalf("width %d, hit %d: got %q, want %q", width, i, cuts[i], want)

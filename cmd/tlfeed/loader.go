@@ -172,13 +172,19 @@ func (l *loader) loadKnown() error {
 	}
 	var dirty []*file
 	var metadata []*file
+	var metadataPath string
+	var metadataErr error
+	metadataCount := 0
 	for _, r := range rows {
 		f, ver, d, err := parseFileRow(l.cfg.home, r)
 		if err != nil {
 			return err
 		}
 		if f.metadataErr != nil {
-			l.logf("restore codex cwd %s: %v", f.src.Path, f.metadataErr)
+			metadataCount++
+			if metadataErr == nil {
+				metadataPath, metadataErr = f.src.Path, f.metadataErr
+			}
 		}
 		l.ver = max(l.ver, ver)
 		// the stored size can run past the loaded lines: a loader stopped after a files row took the new size
@@ -191,6 +197,9 @@ func (l *loader) loadKnown() error {
 		if d {
 			dirty = append(dirty, f)
 		}
+	}
+	if metadataCount > 0 {
+		l.logf("restore codex cwd: %d transcript(s) unavailable; first %s: %v", metadataCount, metadataPath, metadataErr)
 	}
 	if len(dirty) > 0 {
 		// the new generation first, then no write of the stopped loader is running, then its rows go

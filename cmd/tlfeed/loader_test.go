@@ -23,6 +23,28 @@ const (
 	testSession = "11111111-2222-4333-8444-555555555555"
 )
 
+type passWatcher struct {
+	drains   int
+	events   []watchEvent
+	overflow bool
+	during   func()
+}
+
+func (*passWatcher) add(string) {}
+func (w *passWatcher) drain() ([]watchEvent, bool) {
+	w.drains++
+	if w.drains == 2 {
+		if w.during != nil {
+			w.during()
+		}
+		return w.events, w.overflow
+	}
+	return nil, false
+}
+func (*passWatcher) active() bool   { return true }
+func (*passWatcher) complete() bool { return true }
+func (*passWatcher) close()         {}
+
 // sample — a synthetic transcript of the transcript package's tests.
 func sample(t *testing.T, name string) []byte {
 	t.Helper()
@@ -571,6 +593,9 @@ func TestCodexCWDStoredInFilesRow(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("files row count %d", len(rows))
 	}
+	if got := rows[0][fileCol["cwd"]]; got != "/work/akit" {
+		t.Fatalf("stored cwd column %q", got)
+	}
 	loaded, _, _, err := parseFileRow(home, rows[0])
 	if err != nil {
 		t.Fatal(err)
@@ -618,6 +643,77 @@ func TestParseFileRowUsesStoredCWDWithoutReadingRollout(t *testing.T) {
 	}
 	if parsed.metadataErr == nil {
 		t.Fatal("missing legacy rollout did not report its cwd read failure for logging")
+	}
+}
+
+func TestLoadKnownSummarizesMissingCodexRollouts(t *testing.T) {
+	h := newHarness(t)
+	var rows [][]string
+	for i := 1; i <= 3; i++ {
+		path := filepath.Join(h.home, ".local", "state", "worker", "task", "codex", "sessions", "2026", "11", "24", fmt.Sprintf("rollout-missing-%d.jsonl", i))
+		f := &file{id: uint64(i), gen: 1, kind: "codex", src: transcript.Source{Path: path, ID: fmt.Sprintf("missing-%d", i)}}
+		var b bytes.Buffer
+		fileRow(&b, f, 1, false)
+		rows = append(rows, tsvRows(b.Bytes())[0])
+	}
+	h.fake.mu.Lock()
+	h.fake.rows["files"] = rows
+	h.fake.mu.Unlock()
+	l := newLoader(config{home: h.home, db: "tq"}, h.srv, make(chan struct{}), &h.log, newStatus(""))
+	l.dirs = newDirs(h.home, l.logf)
+	l.dirs.w = noWatch{}
+	l.backoff = time.Millisecond
+	if err := l.loadKnown(); err != nil {
+		t.Fatal(err)
+	}
+	log := h.log.String()
+	if strings.Count(log, "restore codex cwd") != 1 || !strings.Contains(log, "3 transcript(s) unavailable") || !strings.Contains(log, "rollout-missing-1.jsonl") {
+		t.Fatalf("missing rollout report was not summarized: %q", log)
+	}
+}
+
+func TestPassDrainsEventsArrivingDuringVisit(t *testing.T) {
+	h := newHarness(t)
+	l := h.loader(nil)
+	path := filepath.Join(h.home, ".claude", "projects", testProject, "new-session.jsonl")
+	write(t, path, sample(t, "claude.jsonl"))
+	base := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	clock := base
+	l.now = func() time.Time { return clock }
+	l.st.completedPass(base.Add(-time.Hour), 0)
+	l.dirs.w = &passWatcher{events: []watchEvent{{dir: filepath.Dir(path), name: filepath.Base(path)}}, during: func() { clock = base.Add(time.Second) }}
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	if l.files[path] == nil {
+		t.Fatal("file announced during the pass was not visited")
+	}
+	l.st.mu.Lock()
+	through := l.st.dbThrough
+	l.st.mu.Unlock()
+	if !through.Equal(base) {
+		t.Fatalf("freshness boundary %v, want pre-drain boundary %v", through, base)
+	}
+}
+
+func TestPassOverflowForcesListingAndKeepsBoundary(t *testing.T) {
+	h := newHarness(t)
+	l := h.loader(nil)
+	base := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return base }
+	l.st.completedPass(base.Add(-time.Hour), 0)
+	l.dirs.w = &passWatcher{overflow: true}
+	if err := l.pass(false); err != nil {
+		t.Fatal(err)
+	}
+	if !l.needsFullList {
+		t.Fatal("watcher overflow did not require a full listing")
+	}
+	l.st.mu.Lock()
+	through := l.st.dbThrough
+	l.st.mu.Unlock()
+	if !through.Equal(base.Add(-time.Hour)) {
+		t.Fatalf("overflow advanced freshness boundary to %v", through)
 	}
 }
 

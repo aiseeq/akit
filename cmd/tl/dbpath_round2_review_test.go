@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -68,6 +69,56 @@ func TestDBShortLinksUseNamesOutsideFilteredFiles(t *testing.T) {
 	}
 }
 
+func TestDBResultUsesNamesOutsideFilteredFiles(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	extra := writeReviewClaude(t, e, "-home-x-other", "1a2b3c4d-1111-4111-8111-111111111111",
+		userRecord("2026-10-25T10:00:00.000Z", "outside project"))
+	ch := newFakeCH(t, append(paths, extra), unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	args := []string{"--all", "--project", "-home-x-proj", "--role", "all", "--max", "0"}
+	e.backend = backendFiles
+	wantCode, wantOut, _ := runTL(t, e, args...)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, args...)
+	if code != wantCode || out != wantOut || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("filtered link ids differ: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+	}
+}
+
+func TestDBResultAvoidsLiveSessionLinkNames(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	stat, err := proc.ReadStat("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := session.Info{Pid: os.Getpid(), SessionID: "0199aaaa-0000-7000-8000-000000000001", ProcStart: stat.Start, Name: sessionID[:8]}
+	registry := filepath.Join(e.home, ".claude", "sessions")
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registry, fmt.Sprintf("%d.json", info.Pid)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	args := []string{"--all", "--role", "all", "--max", "0"}
+	e.backend = backendFiles
+	wantCode, wantOut, _ := runTL(t, e, args...)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, args...)
+	if code != wantCode || out != wantOut || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("live-name links differ: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+	}
+}
+
 func TestDBCodexProjectUsesRolloutCWD(t *testing.T) {
 	e, paths, unloaded := dbCorpus(t)
 	rollout := filepath.Join(e.home, ".local", "state", "worker", "w2", "codex", "sessions", "2026", "11", "24",
@@ -127,8 +178,41 @@ func TestDBFindRejectsShortIDsAndUnloadedLiveSessions(t *testing.T) {
 		t.Fatalf("short id error = %v", err)
 	}
 	_, err := d.findAfterLive("live-name", map[string]session.Info{"live-name": {SessionID: "0199aaaa-0000-7000-8000-000000000001"}}, nil)
-	if err == nil || !strings.Contains(err.Error(), "not loaded") {
+	if !errors.Is(err, errLiveSessionNotLoaded) || !strings.Contains(err.Error(), "not loaded") {
 		t.Fatalf("unloaded live session error = %v", err)
+	}
+}
+
+func TestDBUnloadedLiveSessionFallsBackToFiles(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	writeWorkFile(t, paths[0], []string{userRecord("2026-10-25T10:00:00.000Z", "synthetic live session")})
+	stat, err := proc.ReadStat("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := session.Info{Pid: os.Getpid(), SessionID: sessionID, ProcStart: stat.Start, Name: "active-fixture"}
+	registry := filepath.Join(e.home, ".claude", "sessions")
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registry, fmt.Sprintf("%d.json", info.Pid)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	ch.files = ch.files[1:]
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendFiles
+	wantCode, wantOut, _ := runTL(t, e, "active-fixture", "--role", "all")
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, "active-fixture", "--role", "all")
+	if code != wantCode || code != 0 || out != wantOut || !strings.Contains(stderr, "not loaded in the database") || !strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("live fallback: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
 	}
 }
 

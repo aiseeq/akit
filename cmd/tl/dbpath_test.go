@@ -32,6 +32,7 @@ type fakeCH struct {
 	mu    sync.Mutex
 	names []string      // log_comment of each request, in order
 	gate  chan struct{} // when set, requests wait for it to close
+	fail  map[string]bool
 }
 
 type chFile struct {
@@ -155,6 +156,13 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if gate != nil {
 		<-gate
+	}
+	s.mu.Lock()
+	fail := s.fail[name]
+	s.mu.Unlock()
+	if fail {
+		http.Error(w, "Code: 999. DB::Exception: synthetic query failure", http.StatusInternalServerError)
+		return
 	}
 	var out bytes.Buffer
 	row := func(fields ...any) {
@@ -765,6 +773,27 @@ func TestDBServerErrorReadsFiles(t *testing.T) {
 	code, out, errOut := runTL(t, e, sessionID[:8])
 	if code != 0 || out == "" || !strings.Contains(errOut, "code") || !strings.Contains(errOut, "reading files instead") {
 		t.Errorf("exit %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestDBDataQueryErrorsReadFiles(t *testing.T) {
+	for _, query := range []string{"events", "link_names"} {
+		t.Run(query, func(t *testing.T) {
+			e, paths, unloaded := dbCorpus(t)
+			ch := newFakeCH(t, paths, unloaded)
+			ch.fail = map[string]bool{query: true}
+			srv := httptest.NewServer(ch)
+			defer srv.Close()
+			t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+			args := []string{"--all", "--role", "all", "--grep", "sub", "--max", "0"}
+			e.backend = backendFiles
+			codeF, outF, _ := runTL(t, e, args...)
+			e.backend = backendDB
+			codeD, outD, errD := runTL(t, e, args...)
+			if codeD != codeF || outD != outF || !strings.Contains(errD, "synthetic query failure") || !strings.Contains(errD, "reading files instead") {
+				t.Fatalf("query error did not fall back: files=(%d,%q), db=(%d,%q,%q)", codeF, outF, codeD, outD, errD)
+			}
+		})
 	}
 }
 

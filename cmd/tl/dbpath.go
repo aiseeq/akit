@@ -35,6 +35,8 @@ const (
 // dbQueryTimeout bounds one call through the database; past it the call reads the files.
 const dbQueryTimeout = 60 * time.Second
 
+var errLiveSessionNotLoaded = errors.New("live session is not loaded in the database")
+
 // filesTimeout bounds the first query, the list of files: it takes well under a second, so a server that hangs
 // sends the call to the files in seconds rather than at dbQueryTimeout.
 var filesTimeout = 10 * time.Second
@@ -118,6 +120,9 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 	start := time.Now()
 	sources, err := d.resolve()
 	if err != nil {
+		if errors.Is(err, errLiveSessionNotLoaded) {
+			return 0, err
+		}
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage, nil
 	}
@@ -419,7 +424,7 @@ func (d *dbPath) findAfterLive(arg string, alive map[string]session.Info, aliveE
 		if path != "" {
 			return path, nil
 		}
-		return "", fmt.Errorf("live session %q is not loaded in the database", arg)
+		return "", fmt.Errorf("%w: %q", errLiveSessionNotLoaded, arg)
 	}
 	if len(arg) < 6 {
 		return "", fmt.Errorf("%q: session id must be at least 6 characters", arg)
