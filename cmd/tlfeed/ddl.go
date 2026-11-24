@@ -167,7 +167,10 @@ CREATE TABLE IF NOT EXISTS {db}.usage
 ENGINE = ReplacingMergeTree(out_tok)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (session, reply_id, request_id)
-SETTINGS non_replicated_deduplication_window = 10000;
+SETTINGS non_replicated_deduplication_window = 10000, max_bytes_to_merge_at_max_space_in_pool = 524288;
+
+-- Each reply insert adds a small usage part; cap merging so a growing hot part stops being rewritten in full.
+ALTER TABLE {db}.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.usage_mv TO {db}.usage AS
 SELECT file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write
