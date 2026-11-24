@@ -257,3 +257,31 @@ func TestDateTimeParamIsUTCSeconds(t *testing.T) {
 		t.Fatalf("DateTimeParam = %q", got)
 	}
 }
+
+// A gap or a repeat that still ends on the last line must fail on the order of the lines, not on the length.
+func TestOpenRawRejectsOutOfOrderStreamOfFullLength(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lines uint32
+		rows  []uint32
+	}{
+		"gap":      {3, []uint32{1, 3}},
+		"repeat":   {2, []uint32{1, 1, 2}},
+		"backward": {2, []uint32{1, 2, 1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				for _, n := range tc.rows {
+					writeRow(w, n, `{}`)
+				}
+			})
+			r, err := c.OpenRaw(context.Background(), File{ID: 12, Path: "/x.jsonl", Size: 1, Ingested: 1, Lines: tc.lines})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if _, err := io.ReadAll(r); !IsSourceError(err) || !strings.Contains(err.Error(), "/x.jsonl") {
+				t.Fatalf("out-of-order answer accepted: %v", err)
+			}
+		})
+	}
+}
