@@ -128,7 +128,8 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (role, kind, file_id, line)
 TTL {event_ttl}
-SETTINGS index_granularity = 1024, index_granularity_bytes = 1048576, non_replicated_deduplication_window = 10000, merge_with_ttl_timeout = 604800;
+-- 128 KiB granules: a search over two days reads half as many bytes of text as with 1 MiB granules
+SETTINGS index_granularity = 1024, index_granularity_bytes = 131072, non_replicated_deduplication_window = 10000, merge_with_ttl_timeout = 604800;
 
 CREATE TABLE IF NOT EXISTS {db}.replies
 (

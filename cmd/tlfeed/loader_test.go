@@ -847,6 +847,9 @@ func TestStatements(t *testing.T) {
 		if strings.HasPrefix(s, "CREATE TABLE IF NOT EXISTS tq.usage") && !strings.Contains(s, "max_bytes_to_merge_at_max_space_in_pool = 524288") {
 			t.Fatalf("usage table lacks the merge cap: %q", s)
 		}
+		if strings.HasPrefix(s, "CREATE TABLE IF NOT EXISTS tq.events") && !strings.Contains(s, "index_granularity_bytes = 131072") {
+			t.Fatalf("events table without 128 KiB granules: %q", s)
+		}
 		// ALTER migrations run on every start and are idempotent.
 		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')" ||
 			s == "ALTER TABLE tq.files MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288" ||
