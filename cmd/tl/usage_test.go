@@ -11,7 +11,19 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/price"
+	"github.com/aiseeq/akit/transcript"
 )
+
+func TestUsageDeduplicatesReplyAcrossSubagents(t *testing.T) {
+	hits := []hit{
+		{src: source{Path: "parent/subagents/agent-a.jsonl", ID: "agent-a", ParentID: "session"}, ev: transcript.Event{Reply: &transcript.Reply{ID: "reply", RequestID: "request", Usage: &price.Usage{Output: 4}}}},
+		{src: source{Path: "parent/subagents/agent-b.jsonl", ID: "agent-b", ParentID: "session"}, ev: transcript.Event{Reply: &transcript.Reply{ID: "reply", RequestID: "request", Usage: &price.Usage{Output: 9}}}},
+	}
+	replies := usageReplies(hits)
+	if len(replies) != 1 || replies[0].r.Usage.Output != 9 {
+		t.Fatalf("got %d replies, want the single largest copy: %+v", len(replies), replies)
+	}
+}
 
 // usageRecord — ответ модели в записи Claude Code; один ответ Claude Code раскладывает на несколько записей с тем
 // же id сообщения, расход в них растёт к последней.
@@ -443,27 +455,32 @@ func TestUsageScopeAll(t *testing.T) {
 	for _, c := range cases {
 		_, out, errOut := runTL(t, e, c.args...)
 		last := lastLine(out)
+		codexIncluded := strings.Contains(last, "codex rollout token_count included")
 		if !strings.Contains(last, c.read) || !strings.Contains(last, "--no-session-persistence") ||
-			strings.Contains(last, "codex rollouts") != c.codex || strings.Contains(last, "no model replies") != c.noUsageRow {
+			codexIncluded != c.codex || strings.Contains(last, "no model replies") != c.noUsageRow {
 			t.Errorf("%v: summary %q, stderr %s", c.args, last, errOut)
 		}
 	}
 }
 
-// Rollout codex по пути: его счёт токенов не читается, итог говорит, что он не входит.
-func TestUsageScopeCodexRollout(t *testing.T) {
+func TestUsageCodexLastTokens(t *testing.T) {
 	e := fakeHome(t)
-	data, err := os.ReadFile("../../transcript/testdata/codex.jsonl")
-	if err != nil {
-		t.Fatal(err)
-	}
 	path := filepath.Join(t.TempDir(), "rollout-2026-10-25T10-00-00-0000.jsonl")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	data := strings.Join([]string{
+		`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"session-1"}}`,
+		`{"timestamp":"2026-10-25T10:00:01Z","type":"turn_context","payload":{"model":"gpt-6-luna"}}`,
+		`{"timestamp":"2026-10-25T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_write_input_tokens":4,"output_tokens":7,"reasoning_output_tokens":3,"total_tokens":111},"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_write_input_tokens":4,"output_tokens":7,"reasoning_output_tokens":3,"total_tokens":111}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, out, _ := runTL(t, e, "--usage", path)
-	if last := lastLine(out); !strings.Contains(last, "read: "+path+";") || !strings.Contains(last, "codex rollouts (their token counts are not read)") {
-		t.Errorf("codex rollout: summary %q", last)
+	code, out, errOut := runTL(t, e, "--usage", path)
+	if code != 0 {
+		t.Fatalf("code %d, stderr %s", code, errOut)
+	}
+	rows := strings.Split(strings.TrimSpace(out), "\n")
+	if len(rows) < 3 || !strings.Contains(rows[0], "pct100_openai") || !strings.Contains(rows[len(rows)-2], "total\t1\t40\t4\t60\t7\t") {
+		t.Fatalf("Codex token_count not priced as one turn:\n%s", out)
 	}
 }
 

@@ -76,12 +76,12 @@ func (u *usage) priced() *price.Usage {
 	if u == nil {
 		return nil
 	}
-	p := &price.Usage{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheCreation,
-		Fast: u.Speed == "fast", Geo: u.Geo}
+	var write5m, write1h int64
 	if u.Split != nil {
-		p.Write5m, p.Write1h = u.Split.Write5m, u.Split.Write1h
+		write5m, write1h = u.Split.Write5m, u.Split.Write1h
 	}
-	return p
+	p := price.NewUsage(u.Input, u.Output, u.CacheRead, u.CacheCreation, write5m, write1h, u.Speed == "fast", u.Geo)
+	return &p
 }
 
 // attachment — вложение: тип, реплика из очереди и поля, в которых бывает его сообщение.

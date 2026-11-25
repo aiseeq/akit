@@ -65,8 +65,8 @@ path (Claude Code or codex rollout).
   --usage       tokens, API cost, and subscription-week percentage instead of
                 events: a TSV row per session and the total (--role defaults to all); the
                 summary names the transcripts read: runs that leave none
-                (claude -p --no-session-persistence) and codex rollouts
-                (their token counts are not read) are not in it
+                (claude -p --no-session-persistence) are not in it; --codex
+                includes token_count from codex rollouts
   --open-questions  list question sentences and whether the user replied (SESSION only)
                 One row per sentence with '?', linked to its event. Replies are
                 matched by file order. AskUserQuestion calls whose window was

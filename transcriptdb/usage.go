@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// Tokens is the token usage of model replies, as the usage table keeps it.
+// Tokens is token usage and the price metadata stored in the usage table.
 type Tokens struct {
-	In         uint64
-	Out        uint64
-	CacheRead  uint64
-	CacheWrite uint64
+	In, Out, CacheRead, CacheWrite uint64
+	CacheWrite5m, CacheWrite1h     uint64
+	Fast                           bool
+	Geo                            string
 }
 
 // Add adds the tokens of o.
@@ -24,9 +24,11 @@ func (t *Tokens) Add(o Tokens) {
 	t.Out += o.Out
 	t.CacheRead += o.CacheRead
 	t.CacheWrite += o.CacheWrite
+	t.CacheWrite5m += o.CacheWrite5m
+	t.CacheWrite1h += o.CacheWrite1h
 }
 
-// UsageReply is one model reply of the usage table: one row per session, reply id and request id, the record with
+// UsageReply is one model turn of the usage table: one row per session, reply id and request id, the record with
 // the most output of the reply (a streamed reply repeats its usage in every record).
 type UsageReply struct {
 	At        time.Time
@@ -39,7 +41,7 @@ type UsageReply struct {
 	Tokens
 }
 
-// UsageTotal is the sum of the replies of one local day, model and project.
+// UsageTotal is the sum of turns of one local day, model, project, speed and route.
 type UsageTotal struct {
 	Day     string // YYYY-MM-DD in the location of UsageTotals
 	Model   string
@@ -61,10 +63,10 @@ func (c *Client) Usage(ctx context.Context, from, until time.Time, fn func(Usage
 	var fnErr error
 	err := c.EachTSV(ctx, Query{Name: "usage", Params: params,
 		SQL: "SELECT toString(toUnixTimestamp64Milli(ts)), toString(file_id), session, project, model, reply_id, request_id, " +
-			"toString(in_tok), toString(out_tok), toString(cache_read), toString(cache_write) FROM " + c.db + ".usage FINAL WHERE " + where},
+			"toString(in_tok), toString(out_tok), toString(cache_read), toString(cache_write), toString(cache_write_5m), toString(cache_write_1h), toString(fast), geo FROM " + c.db + ".usage FINAL WHERE " + where},
 		func(r []string) error {
-			if len(r) != 11 {
-				return sourceErr("usage: %d fields in a row, want 11", len(r))
+			if len(r) != 15 {
+				return sourceErr("usage: %d fields in a row, want 15", len(r))
 			}
 			ms, err := strconv.ParseInt(r[0], 10, 64)
 			if err != nil {
@@ -74,7 +76,7 @@ func (c *Client) Usage(ctx context.Context, from, until time.Time, fn func(Usage
 			if err != nil {
 				return sourceErr("usage file_id: %w", err)
 			}
-			tok, err := parseTokens(r[7:])
+			tok, err := parseUsageTokens(r[7:])
 			if err != nil {
 				return err
 			}
@@ -103,15 +105,19 @@ func asSourceError(what string, err, own error) error {
 // hours, so the days match the zone's own, its daylight saving changes included. Every error is a SourceError.
 func (c *Client) UsageTotals(ctx context.Context, from, until time.Time, loc *time.Location) ([]UsageTotal, error) {
 	where, params := usageWindow(from, until)
-	type key struct{ day, model, project string }
+	type key struct {
+		day, model, project, geo string
+		fast                     bool
+	}
 	sums := map[key]*UsageTotal{}
 	err := c.EachTSV(ctx, Query{Name: "usage_totals", Params: params,
 		SQL: "SELECT toString(toUnixTimestamp(toStartOfFifteenMinutes(ts))) AS q, model, project, toString(count()), " +
-			"toString(sum(in_tok)), toString(sum(out_tok)), toString(sum(cache_read)), toString(sum(cache_write)) FROM " + c.db + ".usage FINAL " +
-			"WHERE " + where + " GROUP BY q, model, project"},
+			"toString(sum(in_tok)), toString(sum(out_tok)), toString(sum(cache_read)), toString(sum(cache_write)), " +
+			"toString(sum(cache_write_5m)), toString(sum(cache_write_1h)), toString(fast), geo FROM " + c.db + ".usage FINAL " +
+			"WHERE " + where + " GROUP BY q, model, project, fast, geo"},
 		func(r []string) error {
-			if len(r) != 8 {
-				return sourceErr("usage totals: %d fields in a row, want 8", len(r))
+			if len(r) != 12 {
+				return sourceErr("usage totals: %d fields in a row, want 12", len(r))
 			}
 			sec, err := strconv.ParseInt(r[0], 10, 64)
 			if err != nil {
@@ -121,14 +127,15 @@ func (c *Client) UsageTotals(ctx context.Context, from, until time.Time, loc *ti
 			if err != nil {
 				return sourceErr("usage totals count: %w", err)
 			}
-			tok, err := parseTokens(r[4:])
+			tok, err := parseUsageTokens(r[4:])
 			if err != nil {
 				return err
 			}
-			k := key{time.Unix(sec, 0).In(loc).Format(time.DateOnly), r[1], r[2]}
+			fast := r[10] == "1" || r[10] == "true"
+			k := key{day: time.Unix(sec, 0).In(loc).Format(time.DateOnly), model: r[1], project: r[2], fast: fast, geo: r[11]}
 			t := sums[k]
 			if t == nil {
-				t = &UsageTotal{Day: k.day, Model: k.model, Project: k.project}
+				t = &UsageTotal{Day: k.day, Model: k.model, Project: k.project, Tokens: Tokens{Fast: k.fast, Geo: k.geo}}
 				sums[k] = t
 			}
 			t.Replies += n
@@ -143,9 +150,38 @@ func (c *Client) UsageTotals(ctx context.Context, from, until time.Time, loc *ti
 		out = append(out, *t)
 	}
 	slices.SortFunc(out, func(a, b UsageTotal) int {
-		return cmp.Or(cmp.Compare(a.Day, b.Day), cmp.Compare(a.Model, b.Model), cmp.Compare(a.Project, b.Project))
+		if c := cmp.Or(cmp.Compare(a.Day, b.Day), cmp.Compare(a.Model, b.Model), cmp.Compare(a.Project, b.Project), cmp.Compare(a.Geo, b.Geo)); c != 0 {
+			return c
+		}
+		if a.Fast == b.Fast {
+			return 0
+		}
+		if !a.Fast {
+			return -1
+		}
+		return 1
 	})
 	return out, nil
+}
+
+func parseUsageTokens(fields []string) (Tokens, error) {
+	if len(fields) != 8 {
+		return Tokens{}, sourceErr("usage tokens: %d fields, want 8", len(fields))
+	}
+	t, err := parseTokens(fields[:4])
+	if err != nil {
+		return Tokens{}, err
+	}
+	for i, dst := range []*uint64{&t.CacheWrite5m, &t.CacheWrite1h} {
+		n, err := strconv.ParseUint(fields[4+i], 10, 64)
+		if err != nil {
+			return Tokens{}, sourceErr("usage cache write: %w", err)
+		}
+		*dst = n
+	}
+	t.Fast = fields[6] == "1" || fields[6] == "true"
+	t.Geo = fields[7]
+	return t, nil
 }
 
 // parseTokens reads in_tok, out_tok, cache_read and cache_write.

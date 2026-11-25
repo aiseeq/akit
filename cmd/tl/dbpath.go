@@ -933,94 +933,67 @@ func msToTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
-// usageHits are the events of model replies with their usage. The token columns of the events table decide which
-// record of a reply counts, as in usageReplies; the usage of that record — with the split of cache writes, speed
-// and route the price needs — is read from its raw line.
+// usageHits reads the priced usage rows selected by the matching events; price fields live in usage, not raw.
 func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored) ([]sortedHit, error) {
-	const cond = " AND (reply_id != '' OR request_id != '')"
-	rows, err := d.selectEvents("usage", func(w where) chQuery {
-		return chQuery{SQL: "SELECT file_id, line, toUnixTimestamp64Milli(ts), role, model, reply_id, request_id, _part, _part_offset FROM events WHERE " +
-			w.sql + cond, Params: w.params, Settings: w.settings}
-	}, ids, kinds)
+	w, err := d.where(ids, kinds)
 	if err != nil {
 		return nil, err
 	}
-	type replyKey struct {
-		file uint64
-		key  string
+	usageWhere := "(session, reply_id, if(reply_id = '', request_id, '')) IN (SELECT usage_session, reply_id, if(reply_id = '', request_id, '') FROM events WHERE " + w.sql + " AND (reply_id != '' OR request_id != ''))"
+	if !d.opts.since.IsZero() {
+		usageWhere += " AND ts >= {since:DateTime64(3, 'UTC')}"
 	}
-	hits := make([]sortedHit, 0, len(rows))
-	keyOf := map[uint64]map[int]string{} // file → line → reply key
+	if !d.opts.until.IsZero() {
+		usageWhere += " AND ts <= {until:DateTime64(3, 'UTC')}"
+	}
+	rows, err := d.query(chQuery{Name: "usage", SQL: "SELECT file_id, toUnixTimestamp64Milli(ts), model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM usage FINAL WHERE " + usageWhere,
+		Params: w.params, Settings: w.settings})
+	if err != nil {
+		return nil, err
+	}
+	type usageKey struct{ session, reply, request string }
+	type pricedHit struct {
+		hit sortedHit
+		out uint64
+	}
+	best := make(map[usageKey]pricedHit, len(rows))
 	for _, row := range rows {
-		if len(row) != 9 {
-			return nil, fmt.Errorf("usage: %d fields in a row, want 9", len(row))
+		if len(row) != 13 {
+			return nil, fmt.Errorf("usage: %d fields in a row, want 13", len(row))
 		}
 		p := fields{row: row}
-		id, line, ms, off := p.uint(0), p.int(1), int64(p.uint(2)), p.uint(8)
+		id, ms := p.uint(0), int64(p.uint(1))
+		in, out, read, write, w5, w1 := p.uint(5), p.uint(6), p.uint(7), p.uint(8), p.uint(9), p.uint(10)
 		if p.err != nil {
 			return nil, fmt.Errorf("usage: %w", p.err)
 		}
 		s, ok := byID[id]
-		if !ok || line > s.file.evLines {
-			continue
-		}
-		// the usage comes from the raw line below
-		reply := &transcript.Reply{Model: row[4], ID: row[5], RequestID: row[6]}
-		h := sortedHit{hit: hit{src: s.src, ev: dbEvent(line, ms, row[3], "", "")}, rank: roleRank[transcript.Role(row[3])], part: row[7], off: off, fileID: id}
-		h.ev.Reply = reply
-		hits = append(hits, h)
-		if keyOf[id] == nil {
-			keyOf[id] = map[int]string{}
-		}
-		keyOf[id][line] = cmp.Or(reply.ID, reply.RequestID)
-	}
-	if len(hits) == 0 {
-		return hits, nil
-	}
-	// the record with the most output of each reply, as the server picks it; its usage line from raw
-	raw, err := d.selectEvents("usage-raw", func(w where) chQuery {
-		settings := maps.Clone(rawSettings)
-		return chQuery{SQL: "SELECT file_id, line, JSONExtractRaw(raw, 'message', 'usage') FROM raw WHERE file_id IN {files:Array(UInt64)} AND " +
-			"(file_id, line) IN (SELECT file_id, argMax(line, out_tok) FROM events WHERE " + w.sql + cond +
-			" GROUP BY file_id, if(reply_id != '', reply_id, request_id))", Params: w.params, Settings: settings}
-	}, ids, kinds)
-	if err != nil {
-		return nil, err
-	}
-	usages := map[replyKey]*price.Usage{}
-	for _, row := range raw {
-		if len(row) != 3 {
-			return nil, fmt.Errorf("usage-raw: %d fields in a row, want 3", len(row))
-		}
-		p := fields{row: row}
-		id, line := p.uint(0), p.int(1)
-		if p.err != nil {
-			return nil, fmt.Errorf("usage-raw: %w", p.err)
-		}
-		key, ok := keyOf[id][line]
 		if !ok {
 			continue
 		}
-		var u *price.Usage
-		if row[2] != "" {
-			if u, err = transcript.ParseUsage([]byte(row[2])); err != nil {
-				return nil, fmt.Errorf("usage-raw %d:%d: %w", id, line, err)
-			}
+		request := row[4]
+		if row[3] != "" {
+			request = ""
 		}
-		usages[replyKey{id, key}] = u
-	}
-	kept := hits[:0]
-	for i := range hits {
-		h := &hits[i]
-		u, ok := usages[replyKey{h.fileID, cmp.Or(h.ev.Reply.ID, h.ev.Reply.RequestID)}]
-		if !ok || u == nil {
-			continue // a record without usage: the file path skips it too
+		session := s.src.ID
+		if s.src.ParentID != "" {
+			session = s.src.ParentID
 		}
-		// every record of the reply carries the usage of its largest one: the count takes one per reply
-		h.ev.Reply.Usage = u
-		kept = append(kept, *h)
+		key := usageKey{session, row[3], request}
+		if old, ok := best[key]; ok && old.out >= out {
+			continue
+		}
+		u := price.NewUsage(int64(in), int64(out), int64(read), int64(write), int64(w5), int64(w1), row[11] == "1" || row[11] == "true", row[12])
+		reply := &transcript.Reply{Model: row[2], ID: row[3], RequestID: row[4], Usage: &u}
+		ev := dbEvent(0, ms, string(transcript.Agent), "", "")
+		ev.Reply = reply
+		best[key] = pricedHit{hit: sortedHit{hit: hit{src: s.src, ev: ev}, fileID: id}, out: out}
 	}
-	return kept, nil
+	hits := make([]sortedHit, 0, len(best))
+	for _, candidate := range best {
+		hits = append(hits, candidate.hit)
+	}
+	return hits, nil
 }
 
 // refs prints events in full, as showRef does.

@@ -158,10 +158,15 @@ func reportUsage(res result, sources []source, opts options, e env, w io.Writer)
 
 func usageReplies(hits []hit) []usageReply {
 	var replies []usageReply
-	last := map[string]int{}   // id ответа в сессии → индекс в replies
+	last := map[string]int{}   // ответ в исходном transcript-файле → индекс в replies
 	copies := map[string]int{} // один agent transcript под разными родителями → индекс в replies
 	for i := range hits {
 		h := &hits[i]
+		if u := h.ev.Tokens.PriceUsage(); u != nil {
+			r := &transcript.Reply{ID: fmt.Sprintf("codex:%d", h.ev.Line), Model: h.ev.Tokens.Model, Usage: u}
+			appendUsageReply(&replies, last, copies, h, r)
+			continue
+		}
 		r := h.ev.Reply
 		if r == nil || r.Usage == nil {
 			continue
@@ -171,24 +176,30 @@ func usageReplies(hits []hit) []usageReply {
 			replies = append(replies, usageReply{h.src.Path, r})
 			continue
 		}
-		localKey := h.src.Path + "\x00" + key
-		if j, ok := last[localKey]; ok {
-			keepLargestReply(replies, j, r)
-			continue
-		}
-		copyKey := copiedAgentReplyKey(h.src.Path, r)
-		if copyKey != "" {
-			if j, ok := copies[copyKey]; ok {
-				last[localKey] = j
-				keepLargestReply(replies, j, r)
-				continue
-			}
-			copies[copyKey] = len(replies)
-		}
-		last[localKey] = len(replies)
-		replies = append(replies, usageReply{h.src.Path, r})
+		appendUsageReply(&replies, last, copies, h, r)
 	}
 	return replies
+}
+
+func appendUsageReply(replies *[]usageReply, last, copies map[string]int, h *hit, r *transcript.Reply) {
+	key := cmp.Or(r.ID, r.RequestID)
+	session := cmp.Or(h.src.ParentID, h.src.Path)
+	localKey := session + "\x00" + key
+	if j, ok := last[localKey]; ok {
+		keepLargestReply(*replies, j, r)
+		return
+	}
+	copyKey := copiedAgentReplyKey(h.src.Path, r)
+	if copyKey != "" {
+		if j, ok := copies[copyKey]; ok {
+			last[localKey] = j
+			keepLargestReply(*replies, j, r)
+			return
+		}
+		copies[copyKey] = len(*replies)
+	}
+	last[localKey] = len(*replies)
+	*replies = append(*replies, usageReply{h.src.Path, r})
 }
 
 func copiedAgentReplyKey(path string, reply *transcript.Reply) string {
@@ -251,7 +262,7 @@ func usageSummary(total tally, replies []usageReply, sessionCount int, ratePath 
 
 // usageScope — что прочитано: расход вне этих журналов (запуск `claude -p --no-session-persistence` журнала не
 // пишет, у других клиентов он свой) в итог не входит, и читатель итога должен это видеть.
-// Счёт токенов rollout codex (token_count) --usage не читает: rollout в итог не входит.
+// Расход по token_count в rollout Codex включён в тот же итог, что и ответы Claude.
 func usageScope(sources []source, opts options, e env) string {
 	var read string
 	switch {
@@ -271,7 +282,7 @@ func usageScope(sources []source, opts options, e env) string {
 	}
 	scope := "read: " + read + "; not counted: runs without a transcript (claude -p --no-session-persistence)"
 	if opts.codex || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.Path) }) {
-		scope += " and codex rollouts (their token counts are not read)"
+		scope += "; codex rollout token_count included"
 	}
 	return scope
 }

@@ -21,6 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/aiseeq/akit/price"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -199,21 +200,67 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for _, f := range s.files {
 			row(f.path, f.lines)
 		}
-	case "events", "usage":
+	case "usage":
+		if !strings.Contains(sql, "SELECT usage_session, reply_id, if(reply_id = '', request_id, '') FROM events") {
+			s.t.Errorf("usage query does not use the canonical session key: %s", sql)
+		}
+		type usageKey struct{ session, reply, request string }
+		best := map[usageKey]struct {
+			f                     *chFile
+			e                     chEvent
+			u                     *price.Usage
+			model, reply, request string
+		}{}
+		for _, f := range s.files {
+			for _, e := range f.events {
+				if !s.match(q, sql, f, e) {
+					continue
+				}
+				var u *price.Usage
+				var model, reply, request string
+				if e.ev.Reply != nil {
+					model, reply, request, u = e.ev.Reply.Model, e.ev.Reply.ID, e.ev.Reply.RequestID, e.ev.Reply.Usage
+				} else if e.ev.Tokens != nil {
+					model, reply, u = e.ev.Tokens.Model, fmt.Sprintf("codex:%d", e.ev.Line), e.ev.Tokens.PriceUsage()
+				}
+				if u == nil || reply == "" && request == "" {
+					continue
+				}
+				session := f.session
+				if f.parent != "" {
+					session = f.parent
+				}
+				if reply != "" {
+					request = ""
+				}
+				k := usageKey{session, reply, request}
+				old, ok := best[k]
+				if !ok || u.Output > old.u.Output {
+					best[k] = struct {
+						f                     *chFile
+						e                     chEvent
+						u                     *price.Usage
+						model, reply, request string
+					}{f, e, u, model, reply, request}
+				}
+			}
+		}
+		for k, b := range best {
+			_ = k
+			fast := "0"
+			if b.u.Fast {
+				fast = "1"
+			}
+			row(b.f.id, ms(b.e.ev.Time), b.model, b.reply, b.request, b.u.Input, b.u.Output, b.u.CacheRead, b.u.CacheWrite,
+				b.u.Write5m, b.u.Write1h, fast, b.u.Geo)
+		}
+	case "events":
 		for _, f := range s.files {
 			for _, e := range f.events {
 				if !s.match(q, sql, f, e) {
 					continue
 				}
 				ev := e.ev
-				if name == "usage" {
-					model, id, req := "", "", ""
-					if u := ev.Reply; u != nil {
-						model, id, req = u.Model, u.ID, u.RequestID
-					}
-					row(f.id, ev.Line, ms(ev.Time), ev.Role, model, id, req, "all_1_1_0", e.off)
-					continue
-				}
 				text, flat := ev.Shown(), 0
 				if strings.Contains(sql, "substringUTF8(text") {
 					cut, _ := strconv.Atoi(param("cut"))
@@ -225,44 +272,6 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				row(f.id, ev.Line, ms(ev.Time), ev.Role, ev.Who, ev.Subtype, text, flat, "all_1_1_0", e.off)
 			}
-		}
-	case "usage-raw":
-		type key struct {
-			file uint64
-			id   string
-		}
-		best := map[key]chEvent{}
-		var order []key
-		byKey := map[key]*chFile{}
-		for _, f := range s.files {
-			for _, e := range f.events {
-				rp := e.ev.Reply
-				if !s.match(q, sql, f, e) || rp == nil {
-					continue
-				}
-				k := key{f.id, rp.ID}
-				if k.id == "" {
-					k.id = rp.RequestID
-				}
-				old, ok := best[k]
-				if !ok {
-					order = append(order, k)
-					byKey[k] = f
-				}
-				if !ok || outTokens(e) > outTokens(old) {
-					best[k] = e
-				}
-			}
-		}
-		for _, k := range order {
-			e := best[k]
-			var rec struct {
-				Message struct {
-					Usage json.RawMessage `json:"usage"`
-				} `json:"message"`
-			}
-			_ = json.Unmarshal([]byte(byKey[k].raw[e.ev.Line-1]), &rec)
-			row(k.file, e.ev.Line, string(rec.Message.Usage))
 		}
 	case "bad":
 		for _, f := range s.files {
@@ -332,13 +341,6 @@ func fakeFileMatches(q url.Values, sql string, f *chFile) bool {
 	return true
 }
 
-func outTokens(e chEvent) int64 {
-	if e.ev.Reply == nil || e.ev.Reply.Usage == nil {
-		return 0
-	}
-	return e.ev.Reply.Usage.Output
-}
-
 func ms(t time.Time) int64 {
 	if t.IsZero() {
 		return 0
@@ -361,8 +363,10 @@ func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 	if v := param("until"); v != "" && ts.After(chParseTime(s.t, v)) {
 		return false
 	}
-	if strings.Contains(sql, "reply_id != '' OR request_id != ''") && (ev.Reply == nil || ev.Reply.ID == "" && ev.Reply.RequestID == "") {
-		return false
+	if strings.Contains(sql, "reply_id != '' OR request_id != ''") {
+		if ev.Reply != nil && ev.Reply.ID == "" && ev.Reply.RequestID == "" || ev.Reply == nil && ev.Tokens == nil {
+			return false
+		}
 	}
 	text := ev.Who + " " + ev.Shown()
 	hay := lowerUTF8(text)
@@ -626,10 +630,13 @@ func TestDBPrintsAsFiles(t *testing.T) {
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	defer func() {
 		// each kind of query is asked: the whole text of a long event, the unparsable lines, the usage records
-		for _, name := range []string{"files", "events", "texts", "bad", "usage", "usage-raw", "event"} {
+		for _, name := range []string{"files", "events", "texts", "bad", "usage", "event"} {
 			if !slices.Contains(ch.requests(), name) {
 				t.Errorf("no %s query", name)
 			}
+		}
+		if slices.Contains(ch.requests(), "usage-raw") {
+			t.Error("usage queried raw for price details")
 		}
 	}()
 	// texts up to wholeText come whole and are cut here; with 0 every long one comes as its start and the server's

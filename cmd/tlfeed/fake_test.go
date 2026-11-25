@@ -169,7 +169,7 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.lose[table]--
 			http.Error(w, "Code: 999. answer lost", http.StatusInternalServerError)
 		}
-	case strings.HasPrefix(q, "CREATE "), strings.HasPrefix(q, "ALTER TABLE "):
+	case strings.HasPrefix(q, "CREATE "), strings.HasPrefix(q, "ALTER TABLE "), strings.HasPrefix(q, "DROP TABLE "):
 	case strings.HasPrefix(q, "KILL QUERY "):
 		f.kills++
 	case q == "SELECT serverUUID()":

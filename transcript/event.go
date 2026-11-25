@@ -96,6 +96,16 @@ type Tokens struct {
 	Limits *RateLimits
 }
 
+// PriceUsage is the token usage of one Codex turn in the format used by price.Cost.
+func (t *Tokens) PriceUsage() *price.Usage {
+	if t == nil || t.Last == nil {
+		return nil
+	}
+	u := t.Last
+	p := price.NewUsage(max(u.Input-u.CachedInput, 0), u.Output, u.CachedInput, u.CacheWrite, 0, 0, false, "")
+	return &p
+}
+
 // TokenUsage — токены codex как в token_count; ReasoningOutput входит в Output.
 type TokenUsage struct {
 	Input, CachedInput, CacheWrite, Output, ReasoningOutput, Total int64

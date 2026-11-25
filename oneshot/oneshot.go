@@ -152,8 +152,7 @@ func askClaude(ctx context.Context, req Request) (string, price.Usage, error) {
 	out, stderr, err := run(ctx, exec.CommandContext(ctx, "claude", args...), req.Dir, req.Input)
 	var r claudeOutput
 	parseErr := json.Unmarshal(out, &r)
-	u := price.Usage{Input: r.Usage.Input, CacheWrite: r.Usage.CacheWrite, CacheRead: r.Usage.CacheRead,
-		Output: r.Usage.Output}
+	u := price.NewUsage(r.Usage.Input, r.Usage.Output, r.Usage.CacheRead, r.Usage.CacheWrite, 0, 0, false, "")
 	if err != nil {
 		// Отказ («исчерпан бюджет») claude пишет в JSON на stdout с кодом 1, stderr при этом пуст.
 		why := r.reason()

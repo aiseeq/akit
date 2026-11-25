@@ -34,6 +34,12 @@ type Usage struct {
 	Geo                                  string
 }
 
+// NewUsage builds token usage with all price modifiers in one place.
+func NewUsage(input, output, cacheRead, cacheWrite, write5m, write1h int64, fast bool, geo string) Usage {
+	return Usage{Input: input, Output: output, CacheRead: cacheRead, CacheWrite: cacheWrite,
+		Write5m: write5m, Write1h: write1h, Fast: fast, Geo: geo}
+}
+
 // geo — множитель маршрутизации: только США — ×1.1, глобальная и запросы без поля — обычная цена.
 var geo = map[string]float64{"": 1, "global": 1, "not_available": 1, "us": 1.1}
 

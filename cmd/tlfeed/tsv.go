@@ -106,11 +106,11 @@ func msTime(t time.Time) string {
 const (
 	rawColumns   = "file_id, line, off, raw"
 	eventColumns = "ts, file_id, session, kind, project, line, role, who, text, images, error, subtype, model, reply_id, " +
-		"request_id, in_tok, out_tok, cache_read, cache_write, cwd"
+		"request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo, cwd, usage_session"
 	fileColumns = "file_id, path, kind, project, session, parent, name, description, size, ingested, lines, ev_lines, mtime, inode, " +
 		"first_ts, last_ts, bad, tail, gen, dirty, ver, cwd"
 	// usageColumns — the columns of usage as usage_mv fills them from events
-	usageColumns = "file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write"
+	usageColumns = "file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo"
 )
 
 // rawRow — one line of a file, without its '\n'.
@@ -139,12 +139,19 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 	r.flag(e.Error)
 	r.str(e.Subtype)
 	var model, id, req string
-	var in, out, cr, cw int64
+	var in, out, cr, cw, w5, w1 int64
+	var fast bool
+	var geo string
 	if e.Reply != nil {
 		model, id, req = e.Reply.Model, e.Reply.ID, e.Reply.RequestID
 		if u := e.Reply.Usage; u != nil {
-			in, out, cr, cw = u.Input, u.Output, u.CacheRead, u.CacheWrite
+			in, out, cr, cw, w5, w1, fast, geo = u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Write5m, u.Write1h, u.Fast, u.Geo
 		}
+	} else if e.Tokens != nil && e.Tokens.Last != nil {
+		model = e.Tokens.Model
+		id = fmt.Sprintf("codex:%d", e.Line)
+		u := e.Tokens.PriceUsage()
+		in, out, cr, cw = u.Input, u.Output, u.CacheRead, u.CacheWrite
 	}
 	r.str(model)
 	r.str(id)
@@ -153,7 +160,16 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 	r.signed(out)
 	r.signed(cr)
 	r.signed(cw)
-	r.last(e.Cwd)
+	r.signed(w5)
+	r.signed(w1)
+	r.flag(fast)
+	r.str(geo)
+	r.str(e.Cwd)
+	if f.src.ParentID != "" {
+		r.last(f.src.ParentID)
+	} else {
+		r.last(f.src.ID)
+	}
 }
 
 // fileRow — the state of a file after this pass. A dirty row is written before rows past its lines and ev_lines

@@ -840,8 +840,14 @@ func TestArgs(t *testing.T) {
 
 func TestStatements(t *testing.T) {
 	got := statements("tq")
-	if len(got) != 14 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
+	if len(got) < 20 || !strings.HasPrefix(got[0], "CREATE DATABASE IF NOT EXISTS tq") {
 		t.Fatalf("%d statements: %q", len(got), got)
+	}
+	joined := strings.Join(got, "\n")
+	for _, column := range []string{"cache_write_5m", "cache_write_1h", "fast", "geo"} {
+		if !strings.Contains(joined, "ADD COLUMN IF NOT EXISTS "+column) {
+			t.Errorf("schema lacks idempotent %s migration", column)
+		}
 	}
 	for _, s := range got {
 		if strings.HasPrefix(s, "CREATE TABLE IF NOT EXISTS tq.usage") && !strings.Contains(s, "max_bytes_to_merge_at_max_space_in_pool = 524288") {
@@ -851,9 +857,9 @@ func TestStatements(t *testing.T) {
 			t.Fatalf("events table without 128 KiB granules: %q", s)
 		}
 		// ALTER migrations run on every start and are idempotent.
-		idempotent := strings.Contains(s, "IF NOT EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')" ||
+		idempotent := strings.Contains(s, "IF NOT EXISTS") || strings.Contains(s, "IF EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')" ||
 			s == "ALTER TABLE tq.files MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288" ||
-			s == "ALTER TABLE tq.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288"
+			s == "ALTER TABLE tq.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288" || strings.HasPrefix(s, "CREATE MATERIALIZED VIEW tq.usage_mv TO tq.usage AS")
 		if strings.Contains(s, "{db}") || strings.Contains(s, "--") || !idempotent {
 			t.Fatalf("statement %q", s)
 		}

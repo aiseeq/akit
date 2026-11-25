@@ -384,7 +384,7 @@ func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 	id := m[1]
 	var out [][]string
 	for _, event := range f.rows["events"] {
-		if event[1] != id || event[13] == "" {
+		if event[1] != id || event[13] == "" && event[14] == "" {
 			continue
 		}
 		at, err := time.Parse("2006-01-02 15:04:05.000", event[0])
@@ -396,10 +396,17 @@ func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 			return nil, err
 		}
 		if kept {
-			out = append(out, []string{event[1], event[0], event[2], event[4], event[12], event[13], event[14], event[15], event[16], event[17], event[18]})
+			out = append(out, []string{event[1], event[0], eventValue(event, 24, event[2]), event[4], event[12], event[13], event[14], event[15], event[16], event[17], event[18], eventValue(event, 19, "0"), eventValue(event, 20, "0"), eventValue(event, 21, "0"), eventValue(event, 22, "")})
 		}
 	}
 	return out, nil
+}
+
+func eventValue(event []string, index int, fallback string) string {
+	if index >= len(event) {
+		return fallback
+	}
+	return event[index]
 }
 
 func TestRetentionPredicateAgainstClickHouse(t *testing.T) {

@@ -22,16 +22,16 @@ func TestUsageRepliesFromFinalTable(t *testing.T) {
 			q.Get("param_until") != "2026-03-02 00:00:00.000" || q.Get("log_comment") != "stub:usage" {
 			t.Errorf("usage query %s %s", body, r.URL.RawQuery)
 		}
-		io.WriteString(w, "1772326800123\t7\tsess-1\t-p\tmodel-a\tmsg_1\treq_1\t10\t20\t30\t40\n"+
-			"1772330400000\t8\tsess-2\tworker:t\tmodel-b\tmsg_2\t\t1\t2\t3\t4\n")
+		io.WriteString(w, "1772326800123\t7\tsess-1\t-p\tmodel-a\tmsg_1\treq_1\t10\t20\t30\t40\t5\t6\t1\tus\n"+
+			"1772330400000\t8\tsess-2\tworker:t\tmodel-b\tmsg_2\t\t1\t2\t3\t4\t0\t0\t0\t\n")
 	})
 	var got []UsageReply
 	if err := c.Usage(t.Context(), from, until, func(u UsageReply) error { got = append(got, u); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	want := []UsageReply{
-		{At: time.UnixMilli(1772326800123).UTC(), FileID: 7, Session: "sess-1", Project: "-p", Model: "model-a", ReplyID: "msg_1", RequestID: "req_1", Tokens: Tokens{10, 20, 30, 40}},
-		{At: time.UnixMilli(1772330400000).UTC(), FileID: 8, Session: "sess-2", Project: "worker:t", Model: "model-b", ReplyID: "msg_2", Tokens: Tokens{1, 2, 3, 4}},
+		{At: time.UnixMilli(1772326800123).UTC(), FileID: 7, Session: "sess-1", Project: "-p", Model: "model-a", ReplyID: "msg_1", RequestID: "req_1", Tokens: Tokens{In: 10, Out: 20, CacheRead: 30, CacheWrite: 40, CacheWrite5m: 5, CacheWrite1h: 6, Fast: true, Geo: "us"}},
+		{At: time.UnixMilli(1772330400000).UTC(), FileID: 8, Session: "sess-2", Project: "worker:t", Model: "model-b", ReplyID: "msg_2", Tokens: Tokens{In: 1, Out: 2, CacheRead: 3, CacheWrite: 4}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Usage:\n%+v\nwant\n%+v", got, want)
@@ -70,27 +70,27 @@ func TestUsageTotalsByLocalDay(t *testing.T) {
 	}
 	c := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		if !strings.Contains(string(body), "toStartOfFifteenMinutes(ts)") || !strings.Contains(string(body), "FROM tr.usage FINAL") {
+		if !strings.Contains(string(body), "toStartOfFifteenMinutes(ts)") || !strings.Contains(string(body), "GROUP BY q, model, project, fast, geo") || !strings.Contains(string(body), "FROM tr.usage FINAL") {
 			t.Errorf("totals query %s", body)
 		}
 		// 03:15 UTC on 8 March is 23:45 of 7 March local; 03:30 UTC is 00:00 of 8 March
-		io.WriteString(w, q("2026-03-08 03:15:00")+"\tm1\tp1\t2\t1\t2\t3\t4\n"+
-			q("2026-03-08 03:30:00")+"\tm1\tp1\t1\t10\t20\t30\t40\n"+
-			q("2026-03-08 20:00:00")+"\tm1\tp1\t1\t100\t200\t300\t400\n"+
-			q("2026-03-08 21:00:00")+"\tm2\tp1\t1\t5\t5\t5\t5\n"+
+		io.WriteString(w, q("2026-03-08 03:15:00")+"\tm1\tp1\t2\t1\t2\t3\t4\t2\t3\t1\tus\n"+
+			q("2026-03-08 03:30:00")+"\tm1\tp1\t1\t10\t20\t30\t40\t0\t0\t0\t\n"+
+			q("2026-03-08 20:00:00")+"\tm1\tp1\t1\t100\t200\t300\t400\t0\t0\t0\t\n"+
+			q("2026-03-08 21:00:00")+"\tm2\tp1\t1\t5\t5\t5\t5\t0\t0\t0\t\n"+
 			// after the change to summer time (05:30 UTC on 8 March): 02:30 UTC on 9 March is 00:00 of 9 March local
-			q("2026-03-09 02:15:00")+"\tm1\tp1\t1\t7\t7\t7\t7\n"+
-			q("2026-03-09 02:30:00")+"\tm1\tp1\t1\t9\t9\t9\t9\n")
+			q("2026-03-09 02:15:00")+"\tm1\tp1\t1\t7\t7\t7\t7\t0\t0\t0\t\n"+
+			q("2026-03-09 02:30:00")+"\tm1\tp1\t1\t9\t9\t9\t9\t0\t0\t0\t\n")
 	})
 	got, err := c.UsageTotals(t.Context(), time.Time{}, time.Now(), loc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []UsageTotal{
-		{Day: "2026-03-07", Model: "m1", Project: "p1", Replies: 2, Tokens: Tokens{1, 2, 3, 4}},
-		{Day: "2026-03-08", Model: "m1", Project: "p1", Replies: 3, Tokens: Tokens{117, 227, 337, 447}},
-		{Day: "2026-03-08", Model: "m2", Project: "p1", Replies: 1, Tokens: Tokens{5, 5, 5, 5}},
-		{Day: "2026-03-09", Model: "m1", Project: "p1", Replies: 1, Tokens: Tokens{9, 9, 9, 9}},
+		{Day: "2026-03-07", Model: "m1", Project: "p1", Replies: 2, Tokens: Tokens{In: 1, Out: 2, CacheRead: 3, CacheWrite: 4, CacheWrite5m: 2, CacheWrite1h: 3, Fast: true, Geo: "us"}},
+		{Day: "2026-03-08", Model: "m1", Project: "p1", Replies: 3, Tokens: Tokens{In: 117, Out: 227, CacheRead: 337, CacheWrite: 447}},
+		{Day: "2026-03-08", Model: "m2", Project: "p1", Replies: 1, Tokens: Tokens{In: 5, Out: 5, CacheRead: 5, CacheWrite: 5}},
+		{Day: "2026-03-09", Model: "m1", Project: "p1", Replies: 1, Tokens: Tokens{In: 9, Out: 9, CacheRead: 9, CacheWrite: 9}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("UsageTotals:\n%+v\nwant\n%+v", got, want)

@@ -118,7 +118,12 @@ CREATE TABLE IF NOT EXISTS {db}.events
     out_tok UInt64,
     cache_read UInt64,
     cache_write UInt64,
+    cache_write_5m UInt64 DEFAULT 0,
+    cache_write_1h UInt64 DEFAULT 0,
+    fast Bool DEFAULT false,
+    geo LowCardinality(String) DEFAULT '',
     cwd LowCardinality(String),
+    usage_session String DEFAULT '',
     head String MATERIALIZED substringUTF8(text, 1, 300) CODEC(ZSTD(3)),
     hay String MATERIALIZED lowerUTF8(concat(who, ' ', text)) CODEC(LZ4),
     INDEX hay_ng hay TYPE text(tokenizer = ngrams(3)),
@@ -130,6 +135,12 @@ ORDER BY (role, kind, file_id, line)
 TTL {event_ttl}
 -- 128 KiB granules: a search over two days reads half as many bytes of text as with 1 MiB granules
 SETTINGS index_granularity = 1024, index_granularity_bytes = 131072, non_replicated_deduplication_window = 10000, merge_with_ttl_timeout = 604800;
+
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS cache_write_5m UInt64 DEFAULT 0 AFTER cache_write;
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS cache_write_1h UInt64 DEFAULT 0 AFTER cache_write_5m;
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS fast Bool DEFAULT false AFTER cache_write_1h;
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS geo LowCardinality(String) DEFAULT '' AFTER fast;
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS usage_session String DEFAULT '' AFTER cwd;
 
 CREATE TABLE IF NOT EXISTS {db}.replies
 (
@@ -163,20 +174,29 @@ CREATE TABLE IF NOT EXISTS {db}.usage
     in_tok UInt64,
     out_tok UInt64,
     cache_read UInt64,
-    cache_write UInt64
+    cache_write UInt64,
+    cache_write_5m UInt64,
+    cache_write_1h UInt64,
+    fast Bool,
+    geo LowCardinality(String)
 )
 ENGINE = ReplacingMergeTree(out_tok)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (session, reply_id, request_id)
 SETTINGS non_replicated_deduplication_window = 10000, max_bytes_to_merge_at_max_space_in_pool = 524288;
 
--- Each reply insert adds a small usage part; cap merging so a growing hot part stops being rewritten in full.
+ALTER TABLE {db}.usage ADD COLUMN IF NOT EXISTS cache_write_5m UInt64 DEFAULT 0 AFTER cache_write;
+ALTER TABLE {db}.usage ADD COLUMN IF NOT EXISTS cache_write_1h UInt64 DEFAULT 0 AFTER cache_write_5m;
+ALTER TABLE {db}.usage ADD COLUMN IF NOT EXISTS fast Bool DEFAULT false AFTER cache_write_1h;
+ALTER TABLE {db}.usage ADD COLUMN IF NOT EXISTS geo LowCardinality(String) DEFAULT '' AFTER fast;
 ALTER TABLE {db}.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.usage_mv TO {db}.usage AS
-SELECT file_id, ts, session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write
+-- Refresh the view definition so new event fields and Codex token counts reach usage.
+DROP TABLE IF EXISTS {db}.usage_mv;
+CREATE MATERIALIZED VIEW {db}.usage_mv TO {db}.usage AS
+SELECT file_id, ts, usage_session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo
 FROM {db}.events
-WHERE reply_id != '';
+WHERE reply_id != '' OR request_id != '';
 `
 
 // statements splits the schema of database db into single statements: the HTTP interface takes one per query.
