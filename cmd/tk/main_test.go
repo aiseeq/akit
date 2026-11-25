@@ -2973,7 +2973,10 @@ func TestRunMainUntilOneDigitWithoutDateIsRejected(t *testing.T) {
 func TestRunMainUntilIncompleteDatedMinuteIsRejected(t *testing.T) {
 	_, dir := testRunMainRoot(t)
 	path := writeRunMainTask(t, dir, "20200101-1200-MED-incomplete-minute.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
-	for _, until := range []string{"2026-11-30 12:3x: answer", "30.11 12:3x: answer", "2026-11-30 1x:30: answer", "30.11 12:3?: answer"} {
+	for _, until := range []string{
+		"2026-11-30 12:3x: answer", "30.11 12:3x: answer", "2026-11-30 1x:30: answer", "30.11 12:3?: answer", "2026-11-30 12x:30: answer",
+		"2026-11-30 12:xx: answer", "2026-11-30 xx:30: answer", "2026-11-30 12.3x: answer", "2026-11-30 12::",
+	} {
 		before, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -2989,6 +2992,9 @@ func TestRunMainUntilIncompleteDatedMinuteIsRejected(t *testing.T) {
 		if err != nil || !bytes.Equal(after, before) {
 			t.Errorf("rejected wait modified ticket: %s err=%v", after, err)
 		}
+	}
+	if !incompleteDatedMinute("30.11 12:3x: answer") {
+		t.Fatal("incomplete short-date minute was not recognized")
 	}
 }
 

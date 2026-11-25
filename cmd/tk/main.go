@@ -3964,13 +3964,22 @@ func impossibleWaitDate(value string) bool {
 		return err != nil
 	}
 	if m := leadingShortDateRE.FindStringSubmatch(value); m != nil {
+		parts := strings.Split(m[1], ".")
+		day, dayErr := strconv.Atoi(parts[0])
+		month, monthErr := strconv.Atoi(parts[1])
+		if dayErr != nil || monthErr != nil {
+			return true
+		}
+		m[1] = fmt.Sprintf("%02d.%02d", day, month)
 		_, err := time.ParseInLocation("02.01", m[1], time.Local)
 		return err != nil
 	}
 	return false
 }
 
-var incompleteDatedMinuteRE = regexp.MustCompile(`(?i)^(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2})(?:\s+(?:(?:в|до|к|около)\s+)?|T)(?:\d{1,2}:\d[^\d\s:]|\d{1,2}[^\d\s:][^\s:]*:\d{1,2})`)
+var incompleteMinuteExtraRE = regexp.MustCompile(`(?:\d{1,2}:\d[^\d\s:]|\d{1,2}[^\d\s:][^\s:]*:\d{1,2})`)
+
+var incompleteDatedMinuteRE = regexp.MustCompile(`(?i)^(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2})(?:\s+(?:(?:в|до|к|около)\s+)?|T)(?:\d{1,2}:[^\d\s:]+|\d{1,2}::|[^\d\s:]+:\d{1,2}|\d{1,2}\.\d+[^\d\s:]|` + incompleteMinuteExtraRE.String()[3:len(incompleteMinuteExtraRE.String())-1] + `)`)
 
 func incompleteDatedMinute(value string) bool {
 	return incompleteDatedMinuteRE.MatchString(timearg.NormalizeSpaces(value))
@@ -4145,15 +4154,18 @@ func transitionBody(body string, o *options, next string, _ io.Writer) (string, 
 	return body, nil
 }
 
-var waitOwnTicketRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])(?:после|за)\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^\pL\pN_./-])`)
+var waitOwnTicketRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])(?:после|за)\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^\pL\pN_./-]|\.(?:$|\s))`)
 var waitOwnQueueRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_])своя\s+очередь(?:$|[^\pL\pN_])`)
+var waitTerminalOwnQueueRE = regexp.MustCompile(`(?i)(?:^|:)\s*очередь\s*$`)
+var waitLeadingOwnQueueRE = regexp.MustCompile(`(?i)^жду\s+очередь\s*$`)
+var waitDatedOwnQueueRE = regexp.MustCompile(`(?i)^(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2})\s+\d{1,2}:\d{2}\s*:\s*жду\s+очередь\s*$`)
 var waitQueueAfterRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])очередь\s+после\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^\pL\pN_./-])`)
 var waitQueueAfterMarkerRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_])очередь\s+после\s+g\d+(?:$|[^\pL\pN_])`)
 var waitAfterMarkerRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])после\s+g\d+(?:$|[^\pL\pN_./-])`)
 
 func ownWaitHint(t task, value string) (string, error) {
 	hint := "после своего тикета — `tk set <ID> --blocks <X>`; своя очередь — оставь открытым"
-	if waitOwnQueueRE.MatchString(value) || waitQueueAfterRE.MatchString(value) || waitQueueAfterMarkerRE.MatchString(value) || waitAfterMarkerRE.MatchString(value) {
+	if waitOwnQueueRE.MatchString(value) || waitTerminalOwnQueueRE.MatchString(value) || waitLeadingOwnQueueRE.MatchString(value) || waitDatedOwnQueueRE.MatchString(value) || waitQueueAfterRE.MatchString(value) || waitQueueAfterMarkerRE.MatchString(value) || waitAfterMarkerRE.MatchString(value) {
 		return hint, nil
 	}
 	project := taskProject(t.path)
@@ -5597,7 +5609,7 @@ func waitReferenceTargetErrUsing(project, ref string, resolve func(string) (stri
 		}
 		project, id = root, parts[1]
 	} else if len(parts) == 3 && (parts[0] == "git" || parts[0] == "work") {
-		if parts[1] == "" || parts[1] == "." || parts[1] == ".." {
+		if parts[1] == "" || parts[1] == "." || parts[1] == ".." || !validWaitProjectName(parts[1]) {
 			return "", "", false, nil
 		}
 		home, err := os.UserHomeDir()
@@ -5613,7 +5625,7 @@ func waitReferenceTargetErrUsing(project, ref string, resolve func(string) (stri
 }
 
 func resolveWaitProject(name string) (string, bool, error) {
-	if len(name) > 255 {
+	if !validWaitProjectName(name) {
 		return "", false, nil
 	}
 	home, err := os.UserHomeDir()
@@ -5638,6 +5650,13 @@ func resolveWaitProject(name string) (string, bool, error) {
 		return gitPath, true, nil
 	}
 	return workPath, true, nil
+}
+
+func validWaitProjectName(name string) bool {
+	if len(name) > 255 {
+		return false
+	}
+	return true
 }
 
 func isJournal(t task) bool {
