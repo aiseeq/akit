@@ -10,7 +10,6 @@ import (
 	"maps"
 	"net/url"
 	"os"
-	"path/filepath"
 	"runtime/pprof"
 	"slices"
 	"sort"
@@ -270,12 +269,7 @@ func (d *dbPath) sessionFilePredicate() (where, error) {
 		fmt.Fprintf(d.trace, "tl: db live session registry: %v\n", aliveErr)
 	}
 	for _, arg := range args {
-		if ref := refArg.FindStringSubmatch(arg); ref != nil {
-			arg = ref[1]
-		}
-		if strings.HasPrefix(arg, "~/") {
-			arg = filepath.Join(d.e.home, arg[2:])
-		}
+		arg = normalizeSessionArg(arg, d.e.home)
 		if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 			paths = append(paths, arg)
 			continue
@@ -399,9 +393,7 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 }
 
 func (d *dbPath) find(arg string) (string, error) {
-	if strings.HasPrefix(arg, "~/") {
-		arg = filepath.Join(d.e.home, arg[2:])
-	}
+	arg = normalizeSessionArg(arg, d.e.home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		if d.files[arg] != nil {
 			return arg, nil
@@ -853,7 +845,7 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 		}
 		s, ok := byID[id]
 		if !ok || line > s.file.evLines {
-			continue // a row past what the files table says is stored: the tail read gives it
+			continue // rows beyond evLines are absent from the event table until the loader indexes them
 		}
 		h := sortedHit{hit: hit{src: s.src, ev: dbEvent(line, ms, row[4], row[5], row[7])}, seq: seq, rank: roleRank[transcript.Role(row[4])], part: row[9],
 			off: off, fileID: id}
@@ -975,7 +967,7 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 	if !d.opts.until.IsZero() {
 		usageWhere += " AND ts <= {until:DateTime64(3, 'UTC')}"
 	}
-	rows, err := d.query(chQuery{Name: "usage", SQL: "SELECT file_id, toUnixTimestamp64Milli(ts), session, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM usage FINAL WHERE " + usageWhere,
+	rows, err := d.query(chQuery{Name: "usage", SQL: "SELECT file_id, toUnixTimestamp64Milli(ts), session, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM usage WHERE " + usageWhere,
 		Params: w.params, Settings: w.settings})
 	if err != nil {
 		return nil, err

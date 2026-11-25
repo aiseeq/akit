@@ -89,9 +89,7 @@ func find(arg, home string) (string, error) {
 
 // findIn is find over the transcript names that names lists: the folders, or the database's list of files.
 func findIn(arg, home string, names func() ([]string, error)) (string, error) {
-	if strings.HasPrefix(arg, "~/") {
-		arg = filepath.Join(home, arg[2:])
-	}
+	arg = normalizeSessionArg(arg, home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		if _, err := os.Stat(arg); err != nil {
 			return "", fmt.Errorf("transcript %s: %w", arg, err)
@@ -150,6 +148,19 @@ func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 		shown = append(shown, fmt.Sprintf("… ещё %d", more))
 	}
 	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts (%s); give more of the id", arg, len(matches), strings.Join(shown, ", "))
+}
+
+// normalizeSessionArg removes the optional reference prefix and expands home-relative paths for either resolver.
+func normalizeSessionArg(arg, home string) string {
+	if id, _, ok, err := parseRef(arg); ok && err == nil {
+		arg = id
+	} else {
+		arg = strings.TrimPrefix(arg, "id:")
+	}
+	if strings.HasPrefix(arg, "~/") {
+		arg = filepath.Join(home, arg[2:])
+	}
+	return arg
 }
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)

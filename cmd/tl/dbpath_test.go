@@ -259,31 +259,51 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			u                     *price.Usage
 			model, reply, request string
 		}{}
+		final := strings.Contains(sql, "usage FINAL")
+		selected := map[usageKey]bool{}
+		keyFor := func(f *chFile, e chEvent) (usageKey, *price.Usage, string, string, string, bool) {
+			var u *price.Usage
+			var model, reply, request string
+			if e.ev.Reply != nil {
+				model, reply, request, u = e.ev.Reply.Model, e.ev.Reply.ID, e.ev.Reply.RequestID, e.ev.Reply.Usage
+			} else if e.ev.Tokens != nil {
+				model, reply, u = e.ev.Tokens.Model, fmt.Sprintf("codex:%d", e.ev.Line), e.ev.Tokens.PriceUsage()
+			}
+			if u == nil || reply == "" && request == "" {
+				return usageKey{}, nil, "", "", "", false
+			}
+			session := f.session
+			if transcriptdb.IsCodexKind(f.kind) {
+				session = f.path
+			} else if f.parent != "" {
+				session = f.parent
+			}
+			if reply != "" {
+				request = ""
+			}
+			return usageKey{session, reply, request}, u, model, reply, request, true
+		}
+		if final {
+			for _, f := range s.files {
+				for _, e := range f.events {
+					if !s.match(q, sql, f, e) {
+						continue
+					}
+					if k, _, _, _, _, ok := keyFor(f, e); ok {
+						selected[k] = true
+					}
+				}
+			}
+		}
 		for _, f := range s.files {
 			for _, e := range f.events {
-				if !s.match(q, sql, f, e) {
+				if !final && !s.match(q, sql, f, e) {
 					continue
 				}
-				var u *price.Usage
-				var model, reply, request string
-				if e.ev.Reply != nil {
-					model, reply, request, u = e.ev.Reply.Model, e.ev.Reply.ID, e.ev.Reply.RequestID, e.ev.Reply.Usage
-				} else if e.ev.Tokens != nil {
-					model, reply, u = e.ev.Tokens.Model, fmt.Sprintf("codex:%d", e.ev.Line), e.ev.Tokens.PriceUsage()
-				}
-				if u == nil || reply == "" && request == "" {
+				k, u, model, reply, request, ok := keyFor(f, e)
+				if !ok || final && !selected[k] {
 					continue
 				}
-				session := f.session
-				if transcriptdb.IsCodexKind(f.kind) {
-					session = f.path
-				} else if f.parent != "" {
-					session = f.parent
-				}
-				if reply != "" {
-					request = ""
-				}
-				k := usageKey{session, reply, request}
 				old, ok := best[k]
 				if !ok || u.Output > old.u.Output {
 					best[k] = struct {
@@ -292,6 +312,13 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						u                     *price.Usage
 						model, reply, request string
 					}{f, e, u, model, reply, request}
+				}
+			}
+		}
+		if final {
+			for k, b := range best {
+				if !s.match(q, sql, b.f, b.e) {
+					delete(best, k)
 				}
 			}
 		}
@@ -364,6 +391,20 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func fakeFileMatches(q url.Values, sql string, f *chFile) bool {
 	param := func(name string) string { return q.Get("param_" + name) }
+	selected := false
+	for _, path := range chArray(param("find_paths")) {
+		selected = selected || f.path == path
+	}
+	for i := 0; ; i++ {
+		id := param(fmt.Sprintf("find_id_%d", i))
+		if id == "" {
+			break
+		}
+		selected = selected || f.kind != transcriptdb.KindCodexExt && (strings.HasPrefix(f.session, id) || strings.Contains(f.path, id))
+	}
+	if (param("find_paths") != "" || param("find_id_0") != "") && !selected {
+		return false
+	}
 	if v := param("file_since"); v != "" && f.mtime.Before(chParseTime(nil, v)) {
 		return false
 	}
@@ -942,6 +983,60 @@ func TestDBUsageIncompleteSessionFallsBackToFiles(t *testing.T) {
 	codeDB, outDB, warning := runTL(t, e, "--all", "--usage")
 	if codeDB != codeFiles || outDB != outFiles || !strings.Contains(warning, "usage session metadata is incomplete") || !strings.Contains(warning, "reading files instead") {
 		t.Fatalf("incomplete usage did not fall back: files=(%d,%q), db=(%d,%q,%q)", codeFiles, outFiles, codeDB, outDB, warning)
+	}
+}
+
+func TestDBUsageWindowSelectsReplyVersionsByEventTime(t *testing.T) {
+	e := fakeHome(t)
+	path := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", "abab1234-0000-4000-8000-000000000001.jsonl")
+	first := usageRecord("windowed", "claude-opus-5-5", "first", 10, 0, 0, 2)
+	last := strings.ReplaceAll(usageRecord("windowed", "claude-opus-5-5", "last", 10, 0, 0, 20), "2026-10-25T10:00:00Z", "2026-10-25T10:01:00Z")
+	writeWorkFile(t, path, []string{first, last})
+	ch := newFakeCH(t, []string{path}, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+
+	for _, tc := range []struct {
+		name, bound string
+		wantOut     string
+	}{
+		{"until", "--until", "2"},
+		{"since", "--since", "20"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			at := "2026-10-25T10:00:30Z"
+			args := []string{"--usage", path, tc.bound, at}
+			e.backend = backendFiles
+			codeFiles, outFiles, _ := runTL(t, e, args...)
+			e.backend = backendDB
+			codeDB, outDB, errDB := runTL(t, e, args...)
+			if codeFiles != codeDB || outFiles != outDB || strings.Contains(errDB, "reading files instead") {
+				t.Fatalf("files (%d):\n%s\ndb (%d, %s):\n%s", codeFiles, outFiles, codeDB, errDB, outDB)
+			}
+			rows := strings.Split(strings.TrimSpace(outDB), "\n")
+			fields := strings.Split(rows[2], "\t")
+			if len(fields) < 6 || fields[5] != tc.wantOut {
+				t.Fatalf("window selected output tokens %v, want %s:\n%s", fields, tc.wantOut, outDB)
+			}
+		})
+	}
+}
+
+func TestDBSessionReferencePrefixes(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	for _, arg := range []string{"id:" + dbOtherSession[:8], "id:" + dbOtherSession[:8] + ":2", "~/" + strings.TrimPrefix(paths[1], e.home+string(filepath.Separator))} {
+		e.backend = backendFiles
+		wantCode, wantOut, _ := runTL(t, e, arg)
+		e.backend = backendDB
+		code, out, errOut := runTL(t, e, arg)
+		if code != wantCode || out != wantOut || strings.Contains(errOut, "reading files instead") {
+			t.Errorf("%q: files=(%d,%q), db=(%d,%q,%q)", arg, wantCode, wantOut, code, out, errOut)
+		}
 	}
 }
 
