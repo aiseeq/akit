@@ -2626,13 +2626,12 @@ func TestMarkedJournalFieldsAndUnmarkedHeaders(t *testing.T) {
 	var waitOut, waitErr bytes.Buffer
 	until := "2000-01-01 06:4x"
 	code := runMain([]string{"wait", "header-reason", "--until", until, "--by", "tester"}, now, &waitOut, &waitErr)
-	lines := strings.Split(strings.TrimSpace(waitErr.String()), "\n")
-	if code != 0 || len(lines) != 1 || !strings.Contains(lines[len(lines)-1], "срок не распознан") {
+	if code == 0 || !strings.Contains(waitErr.String(), "incomplete minute") {
 		t.Fatalf("wait result: code=%d, stdout=%q stderr=%q", code, waitOut.String(), waitErr.String())
 	}
 	updated, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
-	if err != nil || !strings.Contains(string(updated), "Ждёт: "+until+"\n") || strings.Contains(string(updated), "Ждёт: "+until+" [") {
-		t.Fatalf("wait header changed: %s, %v", updated, err)
+	if err != nil || strings.Contains(string(updated), "Ждёт:") {
+		t.Fatalf("rejected wait changed the header: %s, %v", updated, err)
 	}
 	waitingTask, err := find(dir, "header-reason")
 	if err != nil {
@@ -2651,8 +2650,8 @@ func TestMarkedJournalFieldsAndUnmarkedHeaders(t *testing.T) {
 		t.Fatalf("ls --json guessed deadline: rows=%#v raw=%q err=%v", rows, jsonOut.String(), err)
 	}
 	var listOut, listErr bytes.Buffer
-	if code := list("", options{cmd: "ls", root: root, due: true}, &listOut, &listErr); code != 0 || !strings.Contains(listOut.String(), "header-reason") || !strings.Contains(listOut.String(), "требует даты") {
-		t.Fatalf("ls --due includes guessed clock: code=%d out=%q err=%q", code, listOut.String(), listErr.String())
+	if code := list("", options{cmd: "ls", root: root, due: true}, &listOut, &listErr); code != 0 || strings.Contains(listOut.String(), "header-reason") {
+		t.Fatalf("ls --due includes rejected wait: code=%d out=%q err=%q", code, listOut.String(), listErr.String())
 	}
 }
 
@@ -2835,9 +2834,13 @@ func TestRunMainFailureAfterParseDoesNotPrintTimeHint(t *testing.T) {
 	}
 }
 
-func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
+func TestRunMainUntilGuessedDatedClocksAreRejected(t *testing.T) {
 	_, dir := testRunMainRoot(t)
 	path := writeRunMainTask(t, dir, "20200101-1200-MED-wait.md", "# Wait\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	forms := []string{
 		"12.11 06:4x: итог", "12.11 06:4x, итог", "12.11 06:4x; итог",
 		"2026-11-12 06:4x: итог", "12.11 06:4xМСК",
@@ -2846,32 +2849,12 @@ func TestRunMainUntilGuessedClocksAndExactFuture(t *testing.T) {
 	}
 	for _, until := range forms {
 		var out, errout bytes.Buffer
-		if code := runMain([]string{"wait", "wait", "--until", until, "--by", "tester"}, time.Now(), &out, &errout); code != 0 {
+		if code := runMain([]string{"wait", "wait", "--until", until, "--by", "tester"}, time.Now(), &out, &errout); code == 0 || !strings.Contains(errout.String(), "incomplete minute") {
 			t.Fatalf("wait %q: code=%d stderr=%q", until, code, errout.String())
 		}
-		requireHintParts(t, errout.String(), "tk ls --due")
-		if strings.Count(strings.TrimSpace(errout.String()), "\n") != 0 {
-			t.Fatalf("wait %q printed contradictory diagnostics: %q", until, errout.String())
-		}
-		if !strings.Contains(lastStderrLine(errout.String()), "срок не распознан") {
-			t.Fatalf("wait %q lacks deadline explanation: %q", until, errout.String())
-		}
-		updated, err := os.ReadFile(path)
-		journalLines := strings.Split(strings.TrimSpace(string(updated)), "\n")
-		lastJournalLine := journalLines[len(journalLines)-1]
-		if err != nil || !strings.Contains(string(updated), "Ждёт: ") || strings.Contains(string(updated), "Ждёт: "+until+" [") || !strings.Contains(lastJournalLine, "[время требует проверки]") {
-			t.Fatalf("wait field %q changed: %s err=%v", until, updated, err)
-		}
-		waitTask, err := find(dir, "wait")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if obj := taskObject("", waitTask, "", false); obj.Due != "" {
-			t.Fatalf("guessed clock %q became due %q", until, obj.Due)
-		}
-		var dueOut, dueErr bytes.Buffer
-		if code := list("", options{cmd: "ls", root: filepath.Dir(filepath.Dir(dir)), due: true}, &dueOut, &dueErr); code != 0 || !strings.Contains(dueOut.String(), "wait") || !strings.Contains(dueOut.String(), "требует даты") {
-			t.Fatalf("ls --due %q: code=%d out=%q err=%q", until, code, dueOut.String(), dueErr.String())
+		unchanged, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(unchanged, original) {
+			t.Fatalf("wait %q changed task: %s err=%v", until, unchanged, err)
 		}
 	}
 	todayClock := "23:30 итог бойца"
@@ -2915,6 +2898,12 @@ func TestRunMainUntilHintReflectsDeadlineParsing(t *testing.T) {
 			root, dir := testRunMainRoot(t)
 			path := writeRunMainTask(t, dir, "20200101-1200-MED-wait.md", "# Wait\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
 			var out, errout bytes.Buffer
+			if tc.name == "no-deadline" {
+				if code := runMain([]string{"wait", "wait", "--until", tc.until, "--by", "tester"}, now, &out, &errout); code == 0 || !strings.Contains(errout.String(), "incomplete minute") {
+					t.Fatalf("incomplete wait: code=%d stderr=%q", code, errout.String())
+				}
+				return
+			}
 			if code := runMain([]string{"wait", "wait", "--until", tc.until, "--by", "tester"}, now, &out, &errout); code != 0 {
 				t.Fatalf("wait: code=%d stderr=%q", code, errout.String())
 			}
@@ -2978,6 +2967,28 @@ func TestRunMainUntilOneDigitWithoutDateIsRejected(t *testing.T) {
 	updated, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(updated, before) {
 		t.Fatalf("rejected wait changed ticket: %s err=%v", updated, err)
+	}
+}
+
+func TestRunMainUntilIncompleteDatedMinuteIsRejected(t *testing.T) {
+	_, dir := testRunMainRoot(t)
+	path := writeRunMainTask(t, dir, "20200101-1200-MED-incomplete-minute.md", "# Task\n\nСтатус: открыт\n\n## Приёмка\n- check\n\n## Журнал\n")
+	for _, until := range []string{"2026-11-30 12:3x: answer", "30.11 12:3x: answer", "2026-11-30 1x:30: answer", "30.11 12:3?: answer"} {
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, errout bytes.Buffer
+		if code := runMain([]string{"wait", "incomplete-minute", "--until", until, "--by", "tester"}, time.Now(), &out, &errout); code == 0 {
+			t.Errorf("incomplete dated minute was accepted: %q", until)
+		}
+		if !strings.Contains(strings.ToLower(errout.String()), "minute") && !strings.Contains(errout.String(), "время") {
+			t.Errorf("missing clear time error for %q: %q", until, errout.String())
+		}
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(after, before) {
+			t.Errorf("rejected wait modified ticket: %s err=%v", after, err)
+		}
 	}
 }
 

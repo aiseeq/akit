@@ -352,7 +352,7 @@ directory when none exists. `tk ls --all` includes closed tickets; `--status STA
 status, `--by NAME` filters by executor (or opening actor on older tickets), and `--due` lists
 waiting tickets whose deadline has passed, plus older waits without a readable date that need one: the time at the start of `--until` (`2026-10-28 09:00`, `2026-10-28T09:00`,
 `28.10 09:00`, a date, RFC3339; `UTC` after it means UTC), any text after it is a note. A clock time without a date
-gets today's date when written. A new `tk wait` needs a readable date or time at the start and rejects waits for its own queue or after its own ticket; use `tk set ID --blocks X` for a dependency. An older undated condition stays visible in `tk ls --due` with `требует даты`; `tk next` marks a wait as `условие наступило` when every explicitly named ticket or blocker is closed. Empty acceptance sections are marked `no-check`.
+gets today's date when written. A new `tk wait` needs a readable date or time at the start and rejects waits for its own queue or after its own ticket; use `tk set ID --blocks X` for a dependency. An older undated condition stays visible in `tk ls --due` with `требует даты`; `tk next` marks a wait as `условие наступило` when every explicitly named ticket or blocker has a closing journal entry later than the wait entry. Empty acceptance sections are marked `no-check`.
 When `.glint.yaml` exists at the task base, `tk done` checks all glint severities; findings block
 completion unless `--glint-debt SLUG` links them to an open ticket.
 `tk ls --root DIR` lists tasks for DIR and its first-level repositories, skipping linked worktrees;

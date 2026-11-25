@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"maps"
 	"os"
 	"os/exec"
@@ -1011,6 +1010,7 @@ const guideText = `Зависимости
   tk new A --blocks B или tk set A --blocks B — A блокирует B;
   tk set A --unblocks B снимает связь A → B. Флаги можно повторять.
   После tk transfer связь снимается так: tk set ABC-123 --unblocks B.
+  Условие ожидания считается наступившим, если закрытие явно указанного тикета записано позже записи «ждёт».
   Ссылка: slug в этом проекте; ИМЯ/slug (проект с таким именем в git или work);
   git/ИМЯ/slug или work/ИМЯ/slug.
   Если A ниже B по приоритету, связь поднимет A до уровня B; B не меняется.
@@ -3916,6 +3916,10 @@ func transition(t task, o options, out, errout io.Writer) int {
 		return code
 	}
 	if o.cmd == "wait" {
+		if incompleteDatedMinute(o.until) {
+			fmt.Fprintln(errout, "tk: --until has an incomplete minute; use a complete time such as 12:30")
+			return exitUsage
+		}
 		if impossibleWaitDate(o.until) {
 			fmt.Fprintf(errout, "tk: невозможная дата в начале --until %q; нужна настоящая: ГГГГ-ММ-ДД ЧЧ:ММ: чего ждём\n", o.until)
 			return exitUsage
@@ -3951,15 +3955,25 @@ func transition(t task, o options, out, errout io.Writer) int {
 }
 
 var leadingISODateRE = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})`)
+var leadingShortDateRE = regexp.MustCompile(`^(\d{1,2}\.\d{1,2})(?:\s|$)`)
 
 func impossibleWaitDate(value string) bool {
 	value = timearg.NormalizeSpaces(value)
-	m := leadingISODateRE.FindStringSubmatch(value)
-	if m == nil {
-		return false
+	if m := leadingISODateRE.FindStringSubmatch(value); m != nil {
+		_, err := time.ParseInLocation("2006-01-02", m[1], time.Local)
+		return err != nil
 	}
-	_, err := time.ParseInLocation("2006-01-02", m[1], time.Local)
-	return err != nil
+	if m := leadingShortDateRE.FindStringSubmatch(value); m != nil {
+		_, err := time.ParseInLocation("02.01", m[1], time.Local)
+		return err != nil
+	}
+	return false
+}
+
+var incompleteDatedMinuteRE = regexp.MustCompile(`(?i)^(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2})(?:\s+(?:(?:в|до|к|около)\s+)?|T)(?:\d{1,2}:\d[^\d\s:]|\d{1,2}[^\d\s:][^\s:]*:\d{1,2})`)
+
+func incompleteDatedMinute(value string) bool {
+	return incompleteDatedMinuteRE.MatchString(timearg.NormalizeSpaces(value))
 }
 
 func guardClosedTransition(t task, o options, errout io.Writer) (int, bool) {
@@ -4135,18 +4149,22 @@ var waitOwnTicketRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])(?:после|�
 var waitOwnQueueRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_])своя\s+очередь(?:$|[^\pL\pN_])`)
 var waitQueueAfterRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])очередь\s+после\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^\pL\pN_./-])`)
 var waitQueueAfterMarkerRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_])очередь\s+после\s+g\d+(?:$|[^\pL\pN_])`)
-var waitTerminalOwnQueueRE = regexp.MustCompile(`(?i)(?:^|:)\s*(?:жду\s+)?очередь\s*$`)
+var waitAfterMarkerRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])после\s+g\d+(?:$|[^\pL\pN_./-])`)
 
 func ownWaitHint(t task, value string) (string, error) {
 	hint := "после своего тикета — `tk set <ID> --blocks <X>`; своя очередь — оставь открытым"
-	if waitOwnQueueRE.MatchString(value) || waitTerminalOwnQueueRE.MatchString(value) || waitQueueAfterRE.MatchString(value) || waitQueueAfterMarkerRE.MatchString(value) {
+	if waitOwnQueueRE.MatchString(value) || waitQueueAfterRE.MatchString(value) || waitQueueAfterMarkerRE.MatchString(value) || waitAfterMarkerRE.MatchString(value) {
 		return hint, nil
 	}
 	project := taskProject(t.path)
 	if project == "" {
 		return "", nil
 	}
-	if hasOwnWaitTicketReference(value, filepath.Join(project, "docs/tasks")) {
+	ownTicket, err := hasOwnWaitTicketReference(value, filepath.Join(project, "docs/tasks"))
+	if err != nil {
+		return "", err
+	}
+	if ownTicket {
 		return hint, nil
 	}
 	qualified, err := hasOwnWaitQualifiedReference(value, project)
@@ -4172,36 +4190,52 @@ func hasOwnWaitQualifiedReference(value, project string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if ok && filepath.Clean(target) == filepath.Clean(project) && ownTaskReferenceExists(filepath.Join(project, "docs/tasks"), id) {
-			return true, nil
+		if ok && filepath.Clean(target) == filepath.Clean(project) {
+			exists, err := ownTaskReferenceExists(filepath.Join(project, "docs/tasks"), id)
+			if err != nil {
+				return false, err
+			}
+			if exists {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
 }
 
-func hasOwnWaitTicketReference(value, dir string) bool {
+func hasOwnWaitTicketReference(value, dir string) (bool, error) {
 	for _, re := range []*regexp.Regexp{waitOwnTicketRE, waitQueueAfterRE} {
 		for _, match := range re.FindAllStringSubmatch(value, -1) {
-			if len(match) == 2 && ownTaskReferenceExists(dir, match[1]) {
-				return true
+			if len(match) == 2 {
+				exists, err := ownTaskReferenceExists(dir, match[1])
+				if err != nil {
+					return false, err
+				}
+				if exists {
+					return true, nil
+				}
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
-func ownTaskReferenceExists(dir, id string) bool {
+func ownTaskReferenceExists(dir, id string) (bool, error) {
 	_, err := find(dir, id)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("check own wait reference %q: %w", id, err)
+	}
+	_, err = find(dir, strings.ToLower(id))
+	if err == nil {
+		return true, nil
+	}
 	if errors.Is(err, os.ErrNotExist) {
-		_, err = find(dir, strings.ToLower(id))
+		return false, nil
 	}
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			log.Printf("tk: cannot check own wait reference %q: %v", id, err)
-		}
-		return false
-	}
-	return true
+	return false, fmt.Errorf("check own wait reference %q: %w", id, err)
 }
 
 func transitionJournal(o options, next string, glintFindings int) string {
@@ -5017,7 +5051,7 @@ func eligibleForNext(t task, actor string) bool {
 func waitConditionReached(t task) bool {
 	reached, err := waitConditionReachedErr(t)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "tk: cannot read wait reference: %v\n", err)
+		fmt.Fprintf(os.Stderr, "tk: cannot read wait reference for %q: %v\n", t.slug, err)
 		return false
 	}
 	return reached
@@ -5029,20 +5063,25 @@ func waitConditionReachedErr(t task) (bool, error) {
 	if index == nil {
 		index = newWaitReferenceIndex()
 	}
+	found := false
 	for _, ref := range taskBlockedBy(t) {
 		linked, ok, err := lookupWaitReferenceErr(project, ref, index)
 		if err != nil {
 			return false, fmt.Errorf("%q: %w", ref, err)
 		}
-		if !ok || !closedAfterWait(linked, t.body) {
-			return false, nil
+		if ok {
+			if !closedStatus(linked.status) {
+				return false, nil
+			}
+			if closedAfterWait(linked, t.body) {
+				found = true
+			}
 		}
 	}
 	refs, err := waitReferencesUsing(taskWait(t), index.resolveProject)
 	if err != nil {
 		return false, err
 	}
-	found := false
 	for _, ref := range refs {
 		linked, exists, err := lookupWaitReferenceErr(project, ref, index)
 		if err != nil {
@@ -5058,7 +5097,26 @@ func waitConditionReachedErr(t task) (bool, error) {
 			found = true
 		}
 	}
-	return found || len(taskBlockedBy(t)) > 0, nil
+	if waitHasUnresolvedCandidate(taskWait(t), refs) {
+		return false, nil
+	}
+	return found, nil
+}
+
+var waitRangeCandidateRE = regexp.MustCompile(`(?i)\b[a-z0-9]+-[a-z0-9]+(?:…|\.\.\.)\d+\b`)
+var waitTaskPathCandidateRE = regexp.MustCompile(`(?i)(?:^|\s)(?:(?:[^\s]*/)?(?:docs/tasks|tasks)/|(?:~?/|(?:git|work)/))[^\s]+\.md(?:$|\s)`)
+var waitTrailingDotCandidateRE = regexp.MustCompile(`(?i)(?:^|\s)([a-z0-9][a-z0-9-]*)\.(?:\s|$)`)
+
+func waitHasUnresolvedCandidate(value string, refs []string) bool {
+	if waitRangeCandidateRE.MatchString(value) || waitTaskPathCandidateRE.MatchString(value) {
+		return true
+	}
+	for _, match := range waitTrailingDotCandidateRE.FindAllStringSubmatch(value, -1) {
+		if len(match) == 2 && !slices.Contains(refs, match[1]) {
+			return true
+		}
+	}
+	return false
 }
 
 func journalStatusTime(body string, statuses ...string) time.Time {
@@ -5124,13 +5182,9 @@ var waitQualifiedReferenceRE = regexp.MustCompile(`(?i)^(?:(?:git|work)/)?[a-z0-
 var waitLocalSlugReferenceRE = regexp.MustCompile(`(?i)^[a-z0-9]+(?:-[a-z0-9]+)+$`)
 var waitSlugHasLetterRE = regexp.MustCompile(`(?i)[a-z]`)
 var waitPageLabelRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_.-])([a-z0-9]+(?:-[a-z0-9]+)+)\s+(?:README\s+)?(?:p\d+|п\.\s*\d+)(?:$|[^\pL\pN_.-])`)
-var waitContextSlugRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_.-])(?:после|за|тикет|тикета)\s+([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^a-z0-9_.-])`)
+var waitContextSlugRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_.-])(?:после|за|тикет|тикета)\s+([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^a-z0-9_.-]|\.(?:\s|$))`)
 var waitContextContinuationRE = regexp.MustCompile(`(?i)^\s*и\s+([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^a-z0-9_.-])`)
 var waitSpacedProjectReferenceRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])([a-z0-9][a-z0-9._-]*)\s+([a-z0-9]+(?:-[a-z0-9]+)+)(?:$|[^\pL\pN_./-])`)
-
-func waitReferences(value string) ([]string, error) {
-	return waitReferencesUsing(value, resolveWaitProject)
-}
 
 func waitReferencesUsing(value string, resolve func(string) (string, bool, error)) ([]string, error) {
 	seen := make(map[string]bool)
@@ -5155,10 +5209,6 @@ func waitReferencesUsing(value string, resolve func(string) (string, bool, error
 	return refs, nil
 }
 
-func waitSpacedProjectSlugs(value string) (map[string]bool, error) {
-	return waitSpacedProjectSlugsUsing(value, resolveWaitProject)
-}
-
 func waitSpacedProjectSlugsUsing(value string, resolve func(string) (string, bool, error)) (map[string]bool, error) {
 	slugs := make(map[string]bool)
 	for _, match := range waitSpacedProjectReferenceRE.FindAllStringSubmatch(value, -1) {
@@ -5174,10 +5224,6 @@ func waitSpacedProjectSlugsUsing(value string, resolve func(string) (string, boo
 		}
 	}
 	return slugs, nil
-}
-
-func addWaitSpacedProjectReferences(value string, add func(string)) error {
-	return addWaitSpacedProjectReferencesUsing(value, add, resolveWaitProject)
 }
 
 func addWaitSpacedProjectReferencesUsing(value string, add func(string), resolve func(string) (string, bool, error)) error {
@@ -5409,10 +5455,14 @@ func (index *waitReferenceIndex) project(project string) *waitProjectIndex {
 
 func (index *waitReferenceIndex) lookupErr(project, id string) (*task, bool, error) {
 	entry := index.project(project)
-	if found, ok, ambiguous := findWaitIndexTask(entry.active, id); ok || ambiguous {
+	if found, ok, ambiguous := findWaitIndexTask(entry.active, id); ambiguous {
+		return nil, false, fmt.Errorf("ambiguous wait reference %q in %s", id, project)
+	} else if ok {
 		return found, ok, nil
 	}
-	if found, ok, ambiguous := findWaitIndexTask(entry.archived, id); ok || ambiguous {
+	if found, ok, ambiguous := findWaitIndexTask(entry.archived, id); ambiguous {
+		return nil, false, fmt.Errorf("ambiguous wait reference %q in %s", id, project)
+	} else if ok {
 		return found, ok, nil
 	}
 	if !entry.activeLoaded {
@@ -5425,7 +5475,9 @@ func (index *waitReferenceIndex) lookupErr(project, id string) (*task, bool, err
 	}
 	if found, ok, ambiguous, err := lookupWaitEntry(entry.activeEntries, filepath.Join(project, "docs/tasks"), id); err != nil {
 		return nil, false, err
-	} else if ok || ambiguous {
+	} else if ambiguous {
+		return nil, false, fmt.Errorf("ambiguous wait reference %q in %s", id, project)
+	} else if ok {
 		return found, ok, nil
 	}
 	if !entry.archiveLoaded {
@@ -5441,8 +5493,14 @@ func (index *waitReferenceIndex) lookupErr(project, id string) (*task, bool, err
 	if entry.archiveErr != nil {
 		return nil, false, entry.archiveErr
 	}
-	found, ok, _, err := lookupWaitEntry(entry.archiveEntries, entry.archiveDir, id)
-	return found, ok, err
+	found, ok, ambiguous, err := lookupWaitEntry(entry.archiveEntries, entry.archiveDir, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if ambiguous {
+		return nil, false, fmt.Errorf("ambiguous wait reference %q in %s", id, project)
+	}
+	return found, ok, nil
 }
 
 func readWaitEntries(dir string) ([]os.DirEntry, error) {
@@ -5508,15 +5566,6 @@ func lookupWaitEntry(entries []os.DirEntry, dir, id string) (*task, bool, bool, 
 	return matches[0], true, false, nil
 }
 
-func closedWaitReference(project, ref string, index *waitReferenceIndex) (bool, error) {
-	linked, ok, err := lookupWaitReferenceErr(project, ref, index)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "tk: cannot read wait reference %q: %v\n", ref, err)
-		return false, err
-	}
-	return ok && linked != nil && closedStatus(linked.status), nil
-}
-
 func lookupWaitReferenceErr(project, ref string, index *waitReferenceIndex) (*task, bool, error) {
 	if index == nil {
 		index = newWaitReferenceIndex()
@@ -5530,10 +5579,6 @@ func lookupWaitReferenceErr(project, ref string, index *waitReferenceIndex) (*ta
 	}
 	linked, ok, err := index.lookupErr(project, id)
 	return linked, ok && linked != nil, err
-}
-
-func waitReferenceTarget(project, ref string) (string, string, bool, error) {
-	return waitReferenceTargetErrUsing(project, ref, resolveWaitProject)
 }
 
 func waitReferenceTargetErrUsing(project, ref string, resolve func(string) (string, bool, error)) (string, string, bool, error) {
@@ -5568,6 +5613,9 @@ func waitReferenceTargetErrUsing(project, ref string, resolve func(string) (stri
 }
 
 func resolveWaitProject(name string) (string, bool, error) {
+	if len(name) > 255 {
+		return "", false, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", false, fmt.Errorf("resolve project for wait reference: %w", err)
