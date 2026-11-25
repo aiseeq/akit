@@ -1903,6 +1903,55 @@ func shortRussianValue(value string) bool {
 	return true
 }
 
+// passInProse: a bare "pass" (or "-pass") with a colon inside a sentence is a
+// word, not a key: "the first binding pass: read it through", "«…-pass: слово»".
+// The name, lower-case, must follow a lower-case word of the value's language
+// and a space, or an ellipsis; a key at the start of a line or list item, after
+// a comma or a table bar stays a key.
+// The value is one word of letters only: a Russian one (closing punctuation
+// aside), or lower-case Latin letters with another lower-case word after it.
+// A dictionary password written into a sentence ("user bob pass: letmein
+// retry") is let through by this rule: prose and such a password differ by no
+// form.
+func passInProse(text string, nameAt int, name, delimiter string, value contextValue) bool {
+	if strings.TrimLeft(name, "-") != "pass" || strings.TrimSpace(delimiter) != ":" {
+		return false
+	}
+	if value.start < 2 || text[value.start-1] != ' ' || text[value.start-2] != ':' {
+		return false
+	}
+	// the word before the name, in the language of the value; an ellipsis stands for any
+	before := strings.TrimRight(text[:nameAt], "-")
+	var last rune
+	if !strings.HasSuffix(before, "…") {
+		word, ok := strings.CutSuffix(before, " ")
+		if !ok {
+			return false
+		}
+		last, _ = utf8.DecodeLastRuneInString(word)
+		if !unicode.IsLower(last) {
+			return false
+		}
+	}
+	v := text[value.start:value.end]
+	if isCyrillicProseWord(strings.TrimRight(v, "»\"'.,;:!?)")) {
+		return last == 0 || unicode.Is(unicode.Cyrillic, last)
+	}
+	if len(v) < 2 || !onlyLowerASCII(v) || last != 0 && (last < 'a' || last > 'z') {
+		return false
+	}
+	return value.end+1 < len(text) && text[value.end] == ' ' && text[value.end+1] >= 'a' && text[value.end+1] <= 'z'
+}
+
+func onlyLowerASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 'a' || s[i] > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
 func isCyrillicProseWord(value string) bool {
 	if value == "" {
 		return false
@@ -2049,6 +2098,9 @@ func namedValueIsSecret(text string, nameAt int, name, kind, delimiter string, v
 		return false
 	}
 	if valueIsStructure(text, value) || plainValueFor(name, text[value.start:value.end]) || nonSecretValueForm(text, value, name) {
+		return false
+	}
+	if !value.quoted && passInProse(text, nameAt, name, delimiter, value) {
 		return false
 	}
 	if !value.quoted && notSecretHere(text, nameAt, name, delimiter, text[value.start:value.end]) {
