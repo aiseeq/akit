@@ -500,7 +500,10 @@ type where struct {
 }
 
 func (d *dbPath) where(ids []uint64, kinds []string) (where, error) {
-	opts := d.opts
+	return d.whereOpts(ids, kinds, d.opts)
+}
+
+func (d *dbPath) whereOpts(ids []uint64, kinds []string, opts options) (where, error) {
 	w := where{params: map[string]string{}, settings: url.Values{}}
 	roles := make([]string, 0, len(opts.roles))
 	for _, r := range transcript.Roles {
@@ -602,6 +605,13 @@ func (d *dbPath) result(sources []source) (result, error) {
 	if hitsErr != nil {
 		return res, hitsErr
 	}
+	if d.opts.raw != "" {
+		hiddenCount, hiddenRoles, err := d.hiddenRawMatches(inDB)
+		if err != nil {
+			return res, err
+		}
+		res.rawHidden, res.rawRoles = hiddenCount, hiddenRoles
+	}
 	bad := map[string]badLines{}
 	if err := d.badLines(inDB, bad); err != nil {
 		return res, err
@@ -621,6 +631,71 @@ func (d *dbPath) result(sources []source) (result, error) {
 		res.hits[i] = all[i].hit
 	}
 	return res, nil
+}
+
+// hiddenRawMatches counts raw-matched lines on the server whose matching events all fall outside --role.
+func (d *dbPath) hiddenRawMatches(inDB []stored) (int, []transcript.Role, error) {
+	visible := make([]string, 0, len(d.opts.roles))
+	for _, role := range transcript.Roles {
+		if d.opts.roles[role] {
+			visible = append(visible, string(role))
+		}
+	}
+	if len(visible) == len(transcript.Roles) {
+		return 0, nil, nil
+	}
+	if len(inDB) == 0 {
+		return 0, nil, nil
+	}
+	ids := make([]uint64, 0, len(inDB))
+	kinds := make([]string, 0, len(inDB))
+	for _, stored := range inDB {
+		ids = append(ids, stored.file.id)
+		kind := stored.file.kind
+		if kind == "" {
+			kind = kindOfSource(stored.src)
+		}
+		kinds = append(kinds, kind)
+	}
+	opts := d.opts
+	opts.roles = make(map[transcript.Role]bool, len(transcript.Roles))
+	for _, role := range transcript.Roles {
+		opts.roles[role] = true
+	}
+	w, err := d.whereOpts(ids, slices.Compact(kinds), opts)
+	if err != nil {
+		return 0, nil, err
+	}
+	w.params["visible_roles"] = chStrings(visible)
+	lines := "SELECT file_id, line, groupUniqArray(role) AS roles FROM events WHERE " + w.sql +
+		" GROUP BY file_id, line HAVING countIf(role IN {visible_roles:Array(String)}) = 0"
+	sql := "SELECT (SELECT count() FROM (" + lines + ")), " +
+		"(SELECT arrayStringConcat(groupUniqArray(role), ',') FROM (SELECT arrayJoin(roles) AS role FROM (" + lines + ")))"
+	rows, err := d.query(chQuery{Name: "raw-hidden", SQL: sql, Params: w.params, Settings: w.settings})
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		return 0, nil, fmt.Errorf("raw-hidden: got %d rows, want one aggregate row", len(rows))
+	}
+	p := fields{row: rows[0]}
+	count := p.int(0)
+	if p.err != nil {
+		return 0, nil, fmt.Errorf("raw-hidden: %w", p.err)
+	}
+	roleSet := map[transcript.Role]bool{}
+	for name := range strings.SplitSeq(rows[0][1], ",") {
+		if name != "" {
+			roleSet[transcript.Role(name)] = true
+		}
+	}
+	var roles []transcript.Role
+	for _, role := range transcript.Roles {
+		if roleSet[role] && !d.opts.roles[role] {
+			roles = append(roles, role)
+		}
+	}
+	return count, roles, nil
 }
 
 // badLines are the unparsable lines of one file that pass the active raw prefilter.

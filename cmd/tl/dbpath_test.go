@@ -264,6 +264,51 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			row(f.id, f.path, f.name, f.desc, f.lines, f.evLines, f.loaded.UnixMilli(), f.bad,
 				f.mtime.Unix()*1000, ms(f.first), f.session, f.parent, f.kind, f.project, f.cwd)
 		}
+	case "raw-hidden":
+		if !strings.Contains(sql, "GROUP BY file_id, line") || !strings.Contains(sql, "countIf(role IN {visible_roles:Array(String)}) = 0") {
+			s.t.Errorf("raw-hidden query does not aggregate hidden-only lines: %s", sql)
+		}
+		type lineKey struct {
+			file uint64
+			line int
+		}
+		lineRoles := map[lineKey]map[transcript.Role]bool{}
+		visible := chArray(param("visible_roles"))
+		for _, f := range s.files {
+			for _, event := range f.events {
+				if !s.match(q, sql, f, event) {
+					continue
+				}
+				key := lineKey{f.id, event.ev.Line}
+				if lineRoles[key] == nil {
+					lineRoles[key] = map[transcript.Role]bool{}
+				}
+				lineRoles[key][event.ev.Role] = true
+			}
+		}
+		count, roles := 0, map[transcript.Role]bool{}
+		for _, found := range lineRoles {
+			showable := false
+			for _, role := range visible {
+				if found[transcript.Role(role)] {
+					showable = true
+				}
+			}
+			if showable {
+				continue
+			}
+			count++
+			for role := range found {
+				roles[role] = true
+			}
+		}
+		var names []string
+		for _, role := range transcript.Roles {
+			if roles[role] {
+				names = append(names, string(role))
+			}
+		}
+		row(count, strings.Join(names, ","))
 	case "link_names":
 		for _, f := range s.files {
 			if f.kind == transcriptdb.KindCodexExt && strings.Contains(sql, "WHERE kind != 'codex-ext'") {
@@ -693,6 +738,75 @@ func userRecord(at, text string) string {
 
 func agentRecord(at, text string) string {
 	return `{"parentUuid":"x","type":"assistant","timestamp":"` + at + `","message":{"role":"assistant","content":[{"type":"text","text":` + jsonText(text) + `}]}}`
+}
+
+func rawModelRecord(at, model string, visible bool) string {
+	content := `[{"type":"thinking","thinking":"private synthetic detail"},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"private synthetic detail"}}`
+	if visible {
+		content += `,{"type":"text","text":"visible synthetic detail"}`
+	}
+	content += "]"
+	return `{"type":"assistant","timestamp":"` + at + `","message":{"model":"` + model + `","role":"assistant","content":` + content + `}}`
+}
+
+func rawHiddenCorpus(t *testing.T) (env, []string) {
+	t.Helper()
+	e := fakeHome(t)
+	path := writeReviewClaude(t, e, "-home-x-proj", "6a7b8c9d-0000-4000-8000-000000000003",
+		rawModelRecord("2026-10-25T10:10:00Z", "hidden-model", false),
+		rawModelRecord("2026-10-25T10:10:01Z", "mixed-model", true),
+	)
+	fixture := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", sessionID+".jsonl")
+	return e, []string{fixture, path}
+}
+
+func checkRawHiddenSummary(t *testing.T, e env) {
+	t.Helper()
+	queries := []struct {
+		name string
+		args []string
+		hint bool
+	}{
+		{"hidden-only", []string{"--all", "--raw", "hidden-model", "--max", "0"}, true},
+		{"mixed-line", []string{"--all", "--raw", "mixed-model", "--max", "0"}, false},
+		{"without-raw", []string{"--all", "--max", "0"}, false},
+		{"all-roles", []string{"--all", "--role", "all", "--raw", "hidden-model", "--max", "0"}, false},
+	}
+	for _, test := range queries {
+		t.Run(test.name, func(t *testing.T) {
+			code, out, errOut := runTL(t, e, test.args...)
+			if code != 0 && code != exitNone {
+				t.Fatalf("exit %d: %s\n%s", code, errOut, out)
+			}
+			note := "1 line(s) matched --raw only in hidden roles (think, cmd): --role all"
+			got := strings.Contains(out, note)
+			if got != test.hint {
+				t.Fatalf("hidden-role hint = %t, want %t:\n%s", got, test.hint, out)
+			}
+			if test.name == "hidden-only" && strings.Contains(out, "private synthetic detail") {
+				t.Fatalf("hidden event text reached output:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestRawHiddenRoleSummaryFiles(t *testing.T) {
+	e, _ := rawHiddenCorpus(t)
+	e.backend = backendFiles
+	checkRawHiddenSummary(t, e)
+}
+
+func TestRawHiddenRoleSummaryDB(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	checkRawHiddenSummary(t, e)
+	if !slices.Contains(ch.requests(), "raw-hidden") {
+		t.Fatal("database did not query the hidden-role aggregate")
+	}
 }
 
 // dbCorpus is a synthetic home for both paths: the fixture session, a session with long texts, secrets, usage and
