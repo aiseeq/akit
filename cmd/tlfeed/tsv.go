@@ -148,10 +148,10 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 			model, id, req = e.Reply.Model, e.Reply.ID, e.Reply.RequestID
 			in, out, cr, cw, w5, w1, fast, geo = u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Write5m, u.Write1h, u.Fast, u.Geo
 		}
-	} else if e.Tokens != nil && e.Tokens.Last != nil {
+	} else if u := e.Tokens.PriceUsage(); u != nil {
+		// a report without last_token_usage or repeating the previous total is no call: no usage key
 		model = e.Tokens.Model
 		id = fmt.Sprintf("codex:%d", e.Line)
-		u := e.Tokens.PriceUsage()
 		in, out, cr, cw = u.Input, u.Output, u.CacheRead, u.CacheWrite
 	}
 	r.str(model)

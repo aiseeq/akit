@@ -73,3 +73,15 @@ func TestEventRowCodexUsesFullRolloutAndSkipsMissingUsage(t *testing.T) {
 		t.Fatalf("reply without usage was included in usage keys: %q", fields[13:15])
 	}
 }
+
+// A Codex report repeating the previous total is no call: the row has no usage key, and writing it does not panic.
+func TestEventRowCodexRepeatHasNoUsageKey(t *testing.T) {
+	var b bytes.Buffer
+	eventRow(&b, &file{kind: "codex", src: transcript.Source{ID: "0199abcd", Path: "/synthetic/rollout-x.jsonl"}}, &transcript.Event{
+		Line: 7, Tokens: &transcript.Tokens{Model: "gpt-5", Repeat: true, Last: &transcript.TokenUsage{Input: 10, Output: 3}},
+	})
+	fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
+	if got := strings.Join(fields[12:19], ","); got != ",,,0,0,0,0" {
+		t.Fatalf("repeated report usage fields %q, want none", got)
+	}
+}
