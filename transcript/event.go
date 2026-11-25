@@ -186,9 +186,12 @@ func Read(path string, keep func(raw []byte) bool, fn func(Event)) (Meta, error)
 
 // ReadReader reads events from r with the same line numbering, filtering, and metadata as Read.
 // Codex needs a preliminary pass to distinguish TUI messages from response_item duplicates. A non-seekable Codex
-// stream is spooled to a temporary file, limited to 16 GiB; larger streams fail with an error. Seekable sources
-// are read from their current position and rewound to that position for the preliminary pass. Claude input is
-// parsed directly. The caller retains ownership of r.
+// stream is spooled to an unlinked file in os.TempDir (the TMPDIR environment variable on Unix), limited to 2 GiB;
+// larger streams fail with an error. Set TMPDIR before calling to choose the spool directory. Seekable sources are
+// read from their current position and rewound to that position for the preliminary pass. If SeekCurrent fails,
+// the source is treated as a stream. An error during Codex's preliminary pass returns no events and empty Meta;
+// errors during the main parse can return events and Meta accumulated before the error. Claude input is parsed
+// directly. The caller retains ownership of r.
 func ReadReader(name string, r io.Reader, keep func(raw []byte) bool, fn func(Event)) (Meta, error) {
 	return readReader(name, r, keep, nil, fn, nil)
 }
@@ -261,18 +264,17 @@ func ReadReaderWithCodexCommandsDiscardOutput(name string, r io.Reader, fn func(
 	return readReader(name, r, nil, nil, fn, commandFn)
 }
 
-const maxReaderSpool = int64(16 << 30)
+const maxReaderSpool = int64(2 << 30)
 
 func readReader(name string, source io.Reader, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (meta Meta, retErr error) {
 	if source == nil {
 		return Meta{}, fmt.Errorf("transcript %s: nil reader", name)
 	}
 	if seeker, ok := source.(io.Seeker); ok {
-		start, err := seeker.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return Meta{}, fmt.Errorf("transcript %s: tell reader position: %w", name, err)
+		// A pipe or terminal implements Seek but cannot seek; such a source is read as a plain stream below.
+		if start, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+			return readStream(name, source, start, keep, keepWithTools, fn, commandFn)
 		}
-		return readStream(name, source, start, keep, keepWithTools, fn, commandFn)
 	}
 	input := bufio.NewReaderSize(source, 1<<20)
 	head, err := input.Peek(codexHead)
@@ -287,10 +289,13 @@ func readReader(name string, source io.Reader, keep func([]byte) bool, keepWithT
 	if err != nil {
 		return Meta{}, fmt.Errorf("transcript %s: create spool: %w", name, err)
 	}
+	if err := os.Remove(spool.Name()); err != nil {
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+		return Meta{}, fmt.Errorf("transcript %s: unlink spool: %w", name, err)
+	}
 	defer func() {
-		closeErr := spool.Close()
-		removeErr := os.Remove(spool.Name())
-		retErr = errors.Join(retErr, closeErr, removeErr)
+		retErr = errors.Join(retErr, spool.Close())
 	}()
 	n, err := io.Copy(spool, io.LimitReader(input, maxReaderSpool+1))
 	if err != nil {
@@ -323,15 +328,15 @@ func readStream(name string, source io.Reader, start int64, keep func([]byte) bo
 		if _, err = seeker.Seek(start, io.SeekStart); err != nil {
 			return Meta{}, fmt.Errorf("transcript %s: rewind spool: %w", name, err)
 		}
-		prepass := bufio.NewReaderSize(source, 1<<20)
-		rd.codex.eventUser, rd.codex.eventAgent, err = codexMessagesReader(prepass)
+		r.Reset(source)
+		rd.codex.eventUser, rd.codex.eventAgent, err = codexMessagesReader(r)
 		if err != nil {
 			return Meta{}, fmt.Errorf("transcript %s: %w", name, err)
 		}
 		if _, err = seeker.Seek(start, io.SeekStart); err != nil {
 			return Meta{}, fmt.Errorf("transcript %s: rewind spool: %w", name, err)
 		}
-		r = bufio.NewReaderSize(source, 1<<20)
+		r.Reset(source)
 	}
 	for {
 		var raw []byte

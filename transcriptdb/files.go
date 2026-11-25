@@ -56,10 +56,12 @@ func (f File) MTime() time.Time {
 }
 
 // ModifiedNotBefore reports whether the file may have been modified at t or later. Millisecond storage is
-// rounded down, so retain the rest of that millisecond; old rows with only mtime_s retain a whole second.
+// rounded down, so retain the rest of that millisecond; old rows with whole-second mtime_ms values retain a second.
 func (f File) ModifiedNotBefore(t time.Time) bool {
 	precision := time.Second
-	if f.MTimeMS != 0 {
+	// Rows written before mtime_ms carried milliseconds hold whole seconds times 1000: a zero remainder
+	// means second precision, even though mtime_ms is nonzero.
+	if f.MTimeMS != 0 && f.MTimeMS%1000 != 0 {
 		precision = time.Millisecond
 	}
 	return f.MTime().Add(precision).After(t)

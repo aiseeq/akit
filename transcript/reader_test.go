@@ -78,6 +78,119 @@ func TestReadReaderFixtures(t *testing.T) {
 	}
 }
 
+func TestReadReaderPipe(t *testing.T) {
+	input := `{"type":"user","timestamp":"2026-10-25T10:00:00Z","message":{"role":"user","content":"pipe"}}` + "\n"
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, input)
+		writeDone <- errors.Join(err, writer.Close())
+	}()
+	var events []Event
+	meta, readErr := ReadReader("pipe", reader, nil, func(e Event) { events = append(events, e) })
+	_ = reader.Close()
+	if writeErr := <-writeDone; writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if readErr != nil || len(events) != 1 || meta.Bad != 0 {
+		t.Fatalf("pipe read: events=%d meta=%+v err=%v", len(events), meta, readErr)
+	}
+}
+
+// A Codex stream needs a preliminary pass; through a pipe, which reports Seek but cannot seek, it must be spooled.
+func TestReadReaderPipeCodex(t *testing.T) {
+	input := `{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"c1"}}` + "\n" +
+		`{"timestamp":"2026-10-25T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}` + "\n" +
+		`{"timestamp":"2026-10-25T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}` + "\n"
+	path := filepath.Join(t.TempDir(), "codex.jsonl")
+	if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var want []Event
+	if _, err := Read(path, nil, func(e Event) { want = append(want, e) }); err != nil {
+		t.Fatal(err)
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, input)
+		writeDone <- errors.Join(err, writer.Close())
+	}()
+	var got []Event
+	_, readErr := ReadReader("pipe", reader, nil, func(e Event) { got = append(got, e) })
+	_ = reader.Close()
+	if writeErr := <-writeDone; writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if readErr != nil || len(want) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("codex pipe read: got %d events, want %d, err=%v", len(got), len(want), readErr)
+	}
+}
+
+func TestReadReaderCodexStartingOffset(t *testing.T) {
+	input := `{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"c1"}}` + "\n" +
+		`{"timestamp":"2026-10-25T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}` + "\n" +
+		`{"timestamp":"2026-10-25T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}` + "\n"
+	const prefix = "ignored\n"
+	path := filepath.Join(t.TempDir(), "codex.jsonl")
+	if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reader := strings.NewReader(prefix + input)
+	if _, err := io.CopyN(io.Discard, reader, int64(len(prefix))); err != nil {
+		t.Fatal(err)
+	}
+	var fileEvents, readerEvents []Event
+	fileMeta, err := Read(path, nil, func(e Event) { fileEvents = append(fileEvents, e) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerMeta, err := ReadReader("offset", reader, nil, func(e Event) { readerEvents = append(readerEvents, e) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fileEvents, readerEvents) || !reflect.DeepEqual(fileMeta, readerMeta) {
+		t.Fatalf("offset read mismatch: meta %+v / %+v; events %d / %d", fileMeta, readerMeta, len(fileEvents), len(readerEvents))
+	}
+}
+
+func TestReadReaderCodexSpoolUnlinked(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	input := []byte(`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"c1"}}` + "\n" +
+		`{"timestamp":"2026-10-25T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}` + "\n" +
+		`{"timestamp":"2026-10-25T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}` + "\n")
+	boom := errors.New("stream broke")
+	for _, tc := range []struct {
+		name string
+		r    io.Reader
+		want error
+	}{
+		{name: "success", r: onlyReader{strings.NewReader(string(input))}},
+		{name: "read error", r: &errorReader{data: input, err: boom}, want: boom},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ReadReader(tc.name, tc.r, nil, func(Event) {})
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("error=%v, want %v", err, tc.want)
+			}
+			if tc.want == nil && err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("temporary spool remains: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
 func BenchmarkReadLargeSynthetic(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "large.jsonl")
 	line := `{"type":"user","timestamp":"2026-10-25T10:00:00Z","message":{"role":"user","content":"` + strings.Repeat("x", 4096) + `"}}` + "\n"
@@ -132,11 +245,8 @@ func TestTranscriptLiveReader(t *testing.T) {
 	}
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatalf("file unavailable: %v", err)
-			}
-			files, err := db.FilesByPath(context.Background(), path)
+			sourcePath := path
+			files, err := db.FilesByPath(context.Background(), sourcePath)
 			if err != nil {
 				t.Fatalf("database lookup: %v", err)
 			}
@@ -144,6 +254,25 @@ func TestTranscriptLiveReader(t *testing.T) {
 				t.Fatalf("database row count=%d", len(files))
 			}
 			f := files[0]
+			snapshot := filepath.Join(t.TempDir(), filepath.Base(sourcePath))
+			source, err := os.Open(sourcePath)
+			if err != nil {
+				t.Fatalf("file unavailable: %v", err)
+			}
+			copy, err := os.Create(snapshot)
+			if err != nil {
+				_ = source.Close()
+				t.Fatal(err)
+			}
+			_, copyErr := io.Copy(copy, source)
+			closeErr := errors.Join(source.Close(), copy.Close())
+			if err := errors.Join(copyErr, closeErr); err != nil {
+				t.Fatalf("snapshot file: %v", err)
+			}
+			info, err := os.Stat(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
 			run := func(read func(func(Event)) (Meta, error)) ([]Event, Meta, error) {
 				var ev []Event
 				m, e := read(func(x Event) { ev = append(ev, x) })
@@ -168,15 +297,15 @@ func TestTranscriptLiveReader(t *testing.T) {
 			}
 			for _, v := range variants {
 				t.Run(v.name, func(t *testing.T) {
-					a, am, e := run(func(fn func(Event)) (Meta, error) { return v.file(path, fn) })
+					a, am, e := run(func(fn func(Event)) (Meta, error) { return v.file(snapshot, fn) })
 					if e != nil {
 						t.Fatalf("file read: %v", e)
 					}
-					file, e := os.Open(path)
+					file, e := os.Open(snapshot)
 					if e != nil {
 						t.Fatal(e)
 					}
-					b, bm, e := run(func(fn func(Event)) (Meta, error) { return v.read(file, path, fn) })
+					b, bm, e := run(func(fn func(Event)) (Meta, error) { return v.read(file, sourcePath, fn) })
 					_ = file.Close()
 					if e != nil {
 						t.Fatalf("reader read: %v", e)
@@ -187,7 +316,7 @@ func TestTranscriptLiveReader(t *testing.T) {
 					if f.Ingested > uint64(info.Size()) {
 						t.Fatalf("database ingested %d bytes, disk has %d", f.Ingested, info.Size())
 					}
-					disk, e := os.Open(path)
+					disk, e := os.Open(snapshot)
 					if e != nil {
 						t.Fatal(e)
 					}

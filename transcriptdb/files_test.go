@@ -250,6 +250,13 @@ func TestModifiedNotBeforeMillisecondPrecision(t *testing.T) {
 	}
 }
 
+func TestModifiedNotBeforeLegacyMilliseconds(t *testing.T) {
+	f := File{MTimeSec: 100, MTimeMS: 100_000}
+	if !f.ModifiedNotBefore(time.Unix(100, 500e6)) {
+		t.Fatal("legacy whole-second millisecond value lost its second precision")
+	}
+}
+
 func TestParseErrorIsNotSourceError(t *testing.T) {
 	if IsSourceError(fmt.Errorf("parsing rollout x: %w", bufio.ErrTooLong)) {
 		t.Fatal("a parse error taken for a source failure")
