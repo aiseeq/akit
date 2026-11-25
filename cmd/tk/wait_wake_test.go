@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +9,22 @@ import (
 	"testing"
 	"time"
 )
+
+func mustWaitReferences(t *testing.T, value string) []string {
+	t.Helper()
+	refs, err := waitReferences(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return refs
+}
+
+func mustIndexWaitTasks(t *testing.T, index *waitReferenceIndex, tasks []task) {
+	t.Helper()
+	if err := index.addTasks(tasks); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestWaitRequiresLeadingDateAndRejectsOwnQueue(t *testing.T) {
 	home := t.TempDir()
@@ -77,12 +92,17 @@ func TestWaitRequiresLeadingDateAndRejectsOwnQueue(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("cross-project wait was mistaken for local git ticket: code=%d stderr=%q", code, errout.String())
 	}
-	for _, until := range []string{"2026-11-30 12:00: в очереди sample впереди MED старше", "2026-11-30 12:00: (state.json очереди)", "2026-11-30 12:00: ничья очереди газа", "2026-11-30 12:00: очередь выкатки graft", "2026-11-30 12:00: ответ Юры, он в очереди", "2026-11-30 12:00: показа demo"} {
+	for _, until := range []string{"2026-11-30 12:00: в очереди sample впереди MED старше", "2026-11-30 12:00: (state.json очереди)", "2026-11-30 12:00: ничья очереди газа", "2026-11-30 12:00: очередь выкатки graft", "2026-11-30 12:00: ответ Юры, он в очереди", "2026-11-30 12:00: ответ Юры про очередь", "2026-11-30 12:00: релиз через общую очередь", "2026-11-30 12:00: показа demo"} {
 		errout.Reset()
 		code = runMain([]string{"wait", "external", "--until", until, "--by", "tester"}, time.Date(2026, 11, 24, 12, 0, 0, 0, time.Local), &out, &errout)
 		if code != 0 {
 			t.Errorf("wait falsely rejected %q: code=%d stderr=%q", until, code, errout.String())
 		}
+	}
+	errout.Reset()
+	code = runMain([]string{"wait", "current", "--until", "2026-02-30 10:00: срок", "--by", "tester"}, time.Date(2026, 2, 1, 12, 0, 0, 0, time.Local), &out, &errout)
+	if code == 0 || !strings.Contains(errout.String(), "невозможная дата") {
+		t.Errorf("impossible calendar date error = code %d, stderr %q", code, errout.String())
 	}
 	for _, until := range []string{"2026-11-30 12:00: очередь после G3", "2026-11-30 12:00: отчёт: очередь", "2026-11-30 12:00: ответ: жду очередь", "2026-11-30 12:00: после p1/own-other", "2026-11-30 12:00: после git/p1/own-other", "2026-11-30 12:00: очередь после own-other"} {
 		errout.Reset()
@@ -96,35 +116,37 @@ func TestWaitRequiresLeadingDateAndRejectsOwnQueue(t *testing.T) {
 func TestNextWakesOnClosedLocalReferencesAndDueListsUndatedWait(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	_, dir := testRunMainRoot(t)
-	writeRunMainTask(t, dir, "20261120-1000-MED-blocker.md", "# Blocker\n\nСтатус: готово\n")
-	writeRunMainTask(t, dir, "20261120-1100-MED-mentioned.md", "# Mentioned\n\nСтатус: отклонён\n")
+	project := filepath.Dir(filepath.Dir(dir))
+	writeRunMainTask(t, dir, "20261120-1000-MED-blocker.md", "# Blocker\n\nСтатус: готово\n\n## Журнал\n- 2026-11-21 10:00 готово — checker: закрыт\n")
+	writeRunMainTask(t, dir, "20261120-1100-MED-mentioned.md", "# Mentioned\n\nСтатус: отклонён\n\n## Журнал\n- 2026-11-21 10:00 отклонён — checker: закрыт\n")
 	writeRunMainTask(t, dir, "20261120-1030-MED-example-parent-p1.md", "# Example parent p1\n\nСтатус: готово\n")
 	writeRunMainTask(t, dir, "20261120-1035-MED-example-parent.md", "# Example parent\n\nСтатус: готово\n")
-	writeRunMainTask(t, dir, "20261120-1040-MED-blk.md", "# Blk\n\nСтатус: готово\n")
+	writeRunMainTask(t, dir, "20261120-1040-MED-blk.md", "# Blk\n\nСтатус: готово\n\n## Журнал\n- 2026-11-21 10:00 готово — checker: закрыт\n")
 	writeRunMainTask(t, dir, "20261120-1050-MED-state.md", "# State\n\nСтатус: готово\n")
 	writeRunMainTask(t, dir, "20261120-1055-MED-release.md", "# Release\n\nСтатус: готово\n")
+	writeRunMainTask(t, dir, "20261120-1056-MED-doc-topic.md", "# Doc topic\n\nСтатус: готово\n\n## Журнал\n- 2026-11-21 10:00 готово — checker: закрыт\n")
 	writeRunMainTask(t, dir, "20261120-1110-MED-openref.md", "# Open ref\n\nСтатус: открыт\n")
 	writeRunMainTask(t, dir, "20261120-1120-MED-progressref.md", "# Progress ref\n\nСтатус: в работе\n")
-	writeRunMainTask(t, dir, "20261120-1200-MED-by-blocker.md", "# By blocker\n\nСтатус: ждёт\nЗаблокирован: blocker\nЖдёт: ответ от blocker\n")
-	writeRunMainTask(t, dir, "20261120-1300-MED-by-text.md", "# By text\n\nСтатус: ждёт\nЖдёт: после mentioned\n")
-	writeRunMainTask(t, dir, "20261120-1310-MED-by-id.md", "# By ID\n\nСтатус: ждёт\nЖдёт: после 20261120-1100-MED-mentioned\n")
+	writeRunMainTask(t, dir, "20261120-1200-MED-by-blocker.md", "# By blocker\n\nСтатус: ждёт\nЗаблокирован: blocker\nЖдёт: ответ от blocker\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
+	writeRunMainTask(t, dir, "20261120-1300-MED-by-text.md", "# By text\n\nСтатус: ждёт\nЖдёт: после mentioned\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
+	writeRunMainTask(t, dir, "20261120-1310-MED-by-id.md", "# By ID\n\nСтатус: ждёт\nЖдёт: после 20261120-1100-MED-mentioned\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
 	writeRunMainTask(t, dir, "20261120-1400-MED-undated.md", "# Undated\n\nСтатус: ждёт\nЖдёт: ответ Юры\n")
 	writeRunMainTask(t, dir, "20261120-1500-MED-openrefwait.md", "# Open ref wait\n\nСтатус: ждёт\nЖдёт: после openref\n")
 	writeRunMainTask(t, dir, "20261120-1510-MED-progressrefwait.md", "# Progress ref wait\n\nСтатус: ждёт\nЖдёт: после progressref\n")
-	writeRunMainTask(t, dir, "20261120-1600-MED-multiref.md", "# Multi ref\n\nСтатус: ждёт\nЖдёт: после mentioned и openref\n")
+	writeRunMainTask(t, dir, "20261120-1600-MED-multiref.md", "# Multi ref\n\nСтатус: ждёт\nЖдёт: после mentioned и openref\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
 	falseReasons := map[string]string{"false-doc-label": "doc-topic README п. 263", "false-parent-slug": "example-parent p1", "false-underscore": "blk_extra", "false-dot": "state.json", "false-common-word": "release graft"}
 	for slug, reason := range falseReasons {
-		writeRunMainTask(t, dir, "20261120-1700-MED-"+slug+".md", "# False match\n\nСтатус: ждёт\nЖдёт: "+reason+"\n")
+		writeRunMainTask(t, dir, "20261120-1700-MED-"+slug+".md", "# False match\n\nСтатус: ждёт\nЖдёт: "+reason+"\n\n## Журнал\n- 2026-11-20 17:00 ждёт — tester: замера\n")
 	}
-	writeRunMainTask(t, dir, "20261120-1710-MED-unknown-plus-closed.md", "# Unknown plus closed\n\nСтатус: ждёт\nЖдёт: ABC-123 e-mail 0/0 после mentioned\n")
-	writeRunMainTask(t, dir, "20261120-1720-MED-multi-project-and.md", "# Multi project and\n\nСтатус: ждёт\nЖдёт: после blk и p2/xblk\n")
+	writeRunMainTask(t, dir, "20261120-1710-MED-unknown-plus-closed.md", "# Unknown plus closed\n\nСтатус: ждёт\nЖдёт: ABC-123 e-mail 0/0 после mentioned\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
+	writeRunMainTask(t, dir, "20261120-1720-MED-multi-project-and.md", "# Multi project and\n\nСтатус: ждёт\nЖдёт: после blk и p2/xblk\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
 	archive := filepath.Join(filepath.Dir(dir), "tasks-archive")
 	if err := os.MkdirAll(archive, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeRunMainTask(t, archive, "20261120-1800-MED-archived.md", "# Archived\n\nСтатус: готово\n")
+	writeRunMainTask(t, archive, "20261120-1800-MED-archived.md", "# Archived\n\nСтатус: готово\n\n## Журнал\n- 2026-11-21 10:00 готово — checker: закрыт\n")
 	writeRunMainTask(t, archive, "20261120-1810-MED-readme.md", "# README\n\nСтатус: готово\n")
-	writeRunMainTask(t, dir, "20261120-1900-MED-archivewait.md", "# Archive wait\n\nСтатус: ждёт\nЖдёт: после archived\n")
+	writeRunMainTask(t, dir, "20261120-1900-MED-archivewait.md", "# Archive wait\n\nСтатус: ждёт\nЖдёт: после archived\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
 	var nextOut, nextErr bytes.Buffer
 	if code := runMain([]string{"next", "--by", "tester"}, time.Now(), &nextOut, &nextErr); code != 0 || !strings.Contains(nextOut.String(), "by-blocker") || !strings.Contains(nextOut.String(), "условие наступило") {
 		t.Fatalf("next local closed blocker: code=%d out=%q err=%q", code, nextOut.String(), nextErr.String())
@@ -134,7 +156,7 @@ func TestNextWakesOnClosedLocalReferencesAndDueListsUndatedWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := newWaitReferenceIndex()
-	idx.addTasks(loaded)
+	mustIndexWaitTasks(t, idx, loaded)
 	for _, task := range loaded {
 		task.waitIndex = idx
 		switch task.slug {
@@ -156,20 +178,23 @@ func TestNextWakesOnClosedLocalReferencesAndDueListsUndatedWait(t *testing.T) {
 		}
 	}
 	for _, ref := range []string{"git/other/cross", "other/cross", "work/other/cross"} {
-		if got := waitReferences("ref " + ref); len(got) != 1 || got[0] != ref {
+		if got := mustWaitReferences(t, "ref "+ref); len(got) != 1 || got[0] != ref {
 			t.Errorf("explicit project reference %q parsed as %q", ref, got)
 		}
 	}
-	if got := waitReferences("после blk и p2/xblk"); len(got) != 2 || !slices.Contains(got, "blk") || !slices.Contains(got, "p2/xblk") {
+	if _, _, ok, err := waitReferenceTarget(project, "git/../evil-x"); err != nil || ok {
+		t.Fatal("traversal project reference was accepted")
+	}
+	if got := mustWaitReferences(t, "после blk и p2/xblk"); len(got) != 2 || !slices.Contains(got, "blk") || !slices.Contains(got, "p2/xblk") {
 		t.Errorf("project prefix after conjunction parsed as extra reference: %q", got)
 	}
-	if got := waitReferences("sample project-local-reference"); !slices.Contains(got, "project-local-reference") {
+	if got := mustWaitReferences(t, "sample project-local-reference"); !slices.Contains(got, "project-local-reference") {
 		t.Errorf("local multiword slug was not parsed as a complete token: %q", got)
 	}
-	if got := waitReferences("release"); len(got) != 0 {
+	if got := mustWaitReferences(t, "release"); len(got) != 0 {
 		t.Errorf("common one-word slug was inferred as a reference: %q", got)
 	}
-	if got := waitReferences("2026-11-30 12:00"); len(got) != 0 {
+	if got := mustWaitReferences(t, "2026-11-30 12:00"); len(got) != 0 {
 		t.Errorf("date was inferred as a local slug: %q", got)
 	}
 	for _, slug := range []string{"openrefwait", "multiref", "false-doc-label", "false-parent-slug", "false-underscore", "false-dot", "false-common-word"} {
@@ -196,7 +221,7 @@ func TestNextWakesOnClosedLocalReferencesAndDueListsUndatedWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx = newWaitReferenceIndex()
-	idx.addTasks(loaded)
+	mustIndexWaitTasks(t, idx, loaded)
 	for _, task := range loaded {
 		task.waitIndex = idx
 		if task.slug == "multiref" && !waitConditionReached(task) {
@@ -233,23 +258,23 @@ func TestNextWakesOnClosedCrossProjectWaitReference(t *testing.T) {
 	if err := os.MkdirAll(work, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeRunMainTask(t, other, "20261120-1000-MED-cross.md", "# Cross\n\nСтатус: готово\n")
-	writeRunMainTask(t, other, "20261120-1001-MED-cross-spaced.md", "# Cross spaced\n\nСтатус: отклонён\n")
-	if got := waitReferences("other cross-spaced"); len(got) != 1 || got[0] != "other/cross-spaced" {
+	writeRunMainTask(t, other, "20261120-1000-MED-cross.md", "# Cross\n\nСтатус: готово\n\n## Журнал\n- 2026-11-21 10:00 готово — checker: закрыт\n")
+	writeRunMainTask(t, other, "20261120-1001-MED-cross-spaced.md", "# Cross spaced\n\nСтатус: отклонён\n\n## Журнал\n- 2026-11-21 10:00 отклонён — checker: закрыт\n")
+	if got := mustWaitReferences(t, "other cross-spaced"); len(got) != 1 || got[0] != "other/cross-spaced" {
 		t.Fatalf("spaced project reference parsed as %q", got)
 	}
 	writeRunMainTask(t, work, "20261120-1000-MED-workclosed.md", "# Work closed\n\nСтатус: отклонён\n")
 	writeRunMainTask(t, dir, "20261120-1050-MED-blk.md", "# Blk\n\nСтатус: готово\n")
-	blocked := writeRunMainTask(t, dir, "20261120-1100-MED-cross-blocked.md", "# Cross blocked\n\nСтатус: ждёт\nЗаблокирован: git/other/cross\nЖдёт: результат\n")
-	first := writeRunMainTask(t, dir, "20261120-1200-MED-waiting.md", "# Waiting\n\nСтатус: ждёт\nЖдёт: после git/other/cross\n")
-	writeRunMainTask(t, dir, "20261120-1300-MED-waiting-alias.md", "# Waiting alias\n\nСтатус: ждёт\nЖдёт: после other/cross\n")
-	spaced := writeRunMainTask(t, dir, "20261120-1400-MED-waiting-spaced.md", "# Waiting spaced\n\nСтатус: ждёт\nЖдёт: после blk и other cross-spaced\n")
+	blocked := writeRunMainTask(t, dir, "20261120-1100-MED-cross-blocked.md", "# Cross blocked\n\nСтатус: ждёт\nЗаблокирован: git/other/cross\nЖдёт: результат\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
+	first := writeRunMainTask(t, dir, "20261120-1200-MED-waiting.md", "# Waiting\n\nСтатус: ждёт\nЖдёт: после git/other/cross\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
+	writeRunMainTask(t, dir, "20261120-1300-MED-waiting-alias.md", "# Waiting alias\n\nСтатус: ждёт\nЖдёт: после other/cross\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
+	spaced := writeRunMainTask(t, dir, "20261120-1400-MED-waiting-spaced.md", "# Waiting spaced\n\nСтатус: ждёт\nЖдёт: после blk и other cross-spaced\n\n## Журнал\n- 2026-11-20 10:00 ждёт — tester: ждёт\n")
 	localTasks, err := loadTasks(dir, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	idx := newWaitReferenceIndex()
-	idx.addTasks(localTasks)
+	mustIndexWaitTasks(t, idx, localTasks)
 	for _, task := range localTasks {
 		if task.slug == "waiting-spaced" {
 			task.waitIndex = idx
@@ -261,7 +286,7 @@ func TestNextWakesOnClosedCrossProjectWaitReference(t *testing.T) {
 	if err := os.Remove(spaced); err != nil {
 		t.Fatal(err)
 	}
-	if !closedWaitReference(project, "work/third/workclosed", idx) {
+	if closed, err := closedWaitReference(project, "work/third/workclosed", idx); err != nil || !closed {
 		t.Fatal("closed work/project/slug reference was not resolved")
 	}
 	if _, ok, err := resolveWaitProject("other"); err != nil || !ok {
@@ -313,20 +338,17 @@ func TestSpacedWaitProjectReportsLookupErrorsAndSkipsMissingProjects(t *testing.
 	if err := os.Symlink(filepath.Join(blockedParent, "child"), filepath.Join(gitRoot, "broken")); err != nil {
 		t.Fatal(err)
 	}
-	var logs bytes.Buffer
-	oldWriter := log.Writer()
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(oldWriter) })
-	waitSpacedProjectSlugs("broken sample-slug")
-	addWaitSpacedProjectReferences("broken sample-slug", func(string) {})
-	if got := strings.Count(logs.String(), "cannot resolve spaced wait project \"broken\""); got != 2 {
-		t.Fatalf("both spaced-project parsers should report lookup errors; count=%d logs=%q", got, logs.String())
+	if _, err := waitSpacedProjectSlugs("broken sample-slug"); err == nil {
+		t.Fatal("spaced-project parser dropped resolver error")
 	}
-	logs.Reset()
-	waitSpacedProjectSlugs("missing sample-slug")
-	addWaitSpacedProjectReferences("missing sample-slug", func(string) {})
-	if logs.Len() != 0 {
-		t.Fatalf("a missing project should be skipped without an error log: %q", logs.String())
+	if err := addWaitSpacedProjectReferences("broken sample-slug", func(string) {}); err == nil {
+		t.Fatal("spaced-project reference parser dropped resolver error")
+	}
+	if _, err := waitSpacedProjectSlugs("missing sample-slug"); err != nil {
+		t.Fatalf("missing project should be skipped: %v", err)
+	}
+	if err := addWaitSpacedProjectReferences("missing sample-slug", func(string) {}); err != nil {
+		t.Fatalf("missing project should be skipped: %v", err)
 	}
 }
 
@@ -337,7 +359,7 @@ func TestWaitReferenceIndexLoadsArchiveOnlyAfterActiveMiss(t *testing.T) {
 	entry := index.project(project)
 	entry.activeLoaded = true
 	addWaitIndexTask(&entry.active, &active)
-	if got, ok := index.lookup(project, "active"); !ok || got.slug != "active" {
+	if got, ok, err := index.lookupErr(project, "active"); err != nil || !ok || got.slug != "active" {
 		t.Fatalf("active lookup = %#v, %v", got, ok)
 	}
 	if entry.archiveLoaded {
@@ -352,7 +374,9 @@ func TestWaitReferenceIndexCachesSpacedProjectLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	index := newWaitReferenceIndex()
-	waitReferencesUsing("proj first-ticket and proj second-ticket", index.resolveProject)
+	if _, err := waitReferencesUsing("proj first-ticket and proj second-ticket", index.resolveProject); err != nil {
+		t.Fatal(err)
+	}
 	if len(index.projectLookups) != 1 {
 		t.Fatalf("project lookups = %v, want one cached project", index.projectLookups)
 	}
@@ -367,7 +391,126 @@ func TestWaitReferenceIndexRejectsAmbiguousIDs(t *testing.T) {
 		ticket := task{path: filepath.Join(project, "docs", "tasks", name), slug: "duplicate", status: "готово"}
 		addWaitIndexTask(&entry.active, &ticket)
 	}
-	if got, ok := index.lookup(project, "duplicate"); ok || got != nil {
+	if got, ok, err := index.lookupErr(project, "duplicate"); err != nil || ok || got != nil {
 		t.Fatalf("ambiguous lookup = %#v, %v", got, ok)
+	}
+}
+
+func TestWaitReferenceMustCloseAfterWaitJournalEntry(t *testing.T) {
+	project := t.TempDir()
+	dir := filepath.Join(project, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, stamp string
+		want        bool
+	}{
+		{name: "closed-before-wait", stamp: "2026-11-16 12:00", want: false},
+		{name: "closed-after-wait", stamp: "2026-11-17 12:00", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closedAt := "2026-11-02 10:00"
+			if tc.want {
+				closedAt = "2026-11-18 10:00"
+			}
+			writeRunMainTask(t, dir, "20261101-1000-MED-binary-trace.md", "# binary-trace\n\nСтатус: готово\n\n## Журнал\n- "+closedAt+" готово — checker: закрыт\n")
+			waitPath := writeRunMainTask(t, dir, "20261116-1100-MED-wait-"+tc.name+".md", "# wait\n\nСтатус: ждёт\nЖдёт: закрытия binary-trace\n\n## Журнал\n- "+tc.stamp+" ждёт — tester: закрытия binary-trace\n")
+			tasks, err := loadTasks(dir, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			idx := newWaitReferenceIndex()
+			mustIndexWaitTasks(t, idx, tasks)
+			for _, task := range tasks {
+				if task.path == waitPath {
+					task.waitIndex = idx
+					if got := waitConditionReached(task); got != tc.want {
+						t.Fatalf("wait condition = %v, want %v", got, tc.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestWaitReferenceReadErrorsKeepWaitAndReportWithoutLogTimestamp(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := filepath.Join(home, "git", "foreign")
+	dir := filepath.Join(project, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(dir, "20261101-1000-MED-secret.md")
+	if err := os.WriteFile(badFile, []byte("# secret\n\nСтатус: готово\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(badFile, 0o600)
+	if err := os.WriteFile(filepath.Join(dir, "20261399-1000-MED-invalid-date.md"), []byte("# invalid\n\nСтатус: готово\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	index := newWaitReferenceIndex()
+	readErr, writeErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = writeErr
+	t.Cleanup(func() { os.Stderr = oldStderr; _ = readErr.Close(); _ = writeErr.Close() })
+	for _, ref := range []string{"foreign/secret", "foreign/invalid-date"} {
+		if closed, err := closedWaitReference(project, ref, index); err == nil && closed {
+			t.Errorf("unreadable or malformed reference %q was treated as closed", ref)
+		} else if err == nil {
+			t.Errorf("unreadable or malformed reference %q did not return an error", ref)
+		}
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	if closed, err := closedWaitReference(project, "foreign/missing", newWaitReferenceIndex()); err == nil || closed {
+		t.Fatal("unreadable task folder was treated as closed")
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = writeErr.Close()
+	var logs bytes.Buffer
+	_, _ = logs.ReadFrom(readErr)
+	if got := logs.String(); strings.Contains(got, "cannot read wait reference") == false || strings.Contains(got, "2026/") {
+		t.Fatalf("read errors should be reported without log timestamp: %q", got)
+	}
+}
+
+func TestWaitConditionDoesNotWakeForOpenBlockerOrMention(t *testing.T) {
+	project := t.TempDir()
+	dir := filepath.Join(project, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRunMainTask(t, dir, "20261101-1000-MED-open-blocker.md", "# blocker\n\nСтатус: открыт\n")
+	writeRunMainTask(t, dir, "20261101-1001-MED-open-mention.md", "# mention\n\nСтатус: в работе\n")
+	for _, body := range []string{
+		"Статус: ждёт\nЗаблокирован: open-blocker\nЖдёт: результата\n",
+		"Статус: ждёт\nЖдёт: после open-mention\n",
+	} {
+		waiting := writeRunMainTask(t, dir, "20261101-1100-MED-waiting.md", "# waiting\n\n"+body+"\n## Журнал\n- 2026-11-02 10:00 ждёт — tester: ждёт\n")
+		tasks, err := loadTasks(dir, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx := newWaitReferenceIndex()
+		mustIndexWaitTasks(t, idx, tasks)
+		for _, task := range tasks {
+			if task.path == waiting {
+				task.waitIndex = idx
+				if waitConditionReached(task) {
+					t.Fatal("wait woke for an open or in-progress reference")
+				}
+			}
+		}
+		if err := os.Remove(waiting); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

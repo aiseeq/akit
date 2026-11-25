@@ -224,17 +224,9 @@ func cacheTooFresh(info os.FileInfo, written int64) bool {
 }
 
 func lastChangeStamp(body string) string {
-	inJournal := false
 	last := ""
-	for line := range strings.SplitSeq(body, "\n") {
-		if line == "## Журнал" {
-			inJournal = true
-			continue
-		}
-		if inJournal && strings.HasPrefix(line, "## ") {
-			break
-		}
-		if !inJournal || !strings.HasPrefix(line, "- ") {
+	for line := range strings.SplitSeq(journalSection(body), "\n") {
+		if !strings.HasPrefix(line, "- ") {
 			continue
 		}
 		fields := strings.Fields(line)

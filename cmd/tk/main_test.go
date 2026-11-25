@@ -3437,8 +3437,8 @@ func TestClosedFieldIsOnlyAddedToNextJSON(t *testing.T) {
 }
 
 func TestNextJSONMarksReachedWaitCondition(t *testing.T) {
-	ticket := task{path: filepath.Join(t.TempDir(), "20200101-1000-MED-waiting.md"), slug: "waiting", prio: "MED", status: "ждёт", body: "# Waiting\nСтатус: ждёт\nЖдёт: 2020-01-01 10:00: после closed\n"}
-	closed := task{path: filepath.Join(filepath.Dir(ticket.path), "20200101-0900-MED-closed.md"), slug: "closed", status: "готово", body: "Статус: готово\n"}
+	ticket := task{path: filepath.Join(t.TempDir(), "20200101-1000-MED-waiting.md"), slug: "waiting", prio: "MED", status: "ждёт", body: "# Waiting\nСтатус: ждёт\nЖдёт: 2020-01-01 10:00: после closed\n\n## Журнал\n- 2020-01-01 09:00 ждёт — tester: waiting\n"}
+	closed := task{path: filepath.Join(filepath.Dir(ticket.path), "20200101-0900-MED-closed.md"), slug: "closed", status: "готово", body: "Статус: готово\n\n## Журнал\n- 2020-01-02 09:00 готово — tester: closed\n"}
 	index := newWaitReferenceIndex()
 	entry := index.project(taskProject(ticket.path))
 	entry.activeLoaded = true
