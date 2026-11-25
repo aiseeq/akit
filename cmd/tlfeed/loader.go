@@ -565,8 +565,8 @@ func (l *loader) purge(f *file, why string, clearUsage bool) error {
 		}
 	}
 	if f.evLines > 0 {
-		q := fmt.Sprintf("INSERT INTO %s.usage (%s) SELECT %s FROM %s.events WHERE file_id = %d AND (reply_id != '' OR request_id != '') AND %s AND %s",
-			db, usageColumns, usageColumns, db, f.id, withinRetention, gen)
+		q := fmt.Sprintf("INSERT INTO %s.usage (%s) SELECT file_id, ts, usage_session AS session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM %s.events WHERE file_id = %d AND (reply_id != '' OR request_id != '') AND %s AND %s",
+			db, usageColumns, db, f.id, withinRetention, gen)
 		settings := url.Values{"insert_deduplication_token": {fmt.Sprintf("usage:%d:g%d", f.id, f.gen)}, "async_insert": {"0"}}
 		if err := l.write("usage of the kept events", q, settings); err != nil {
 			return err

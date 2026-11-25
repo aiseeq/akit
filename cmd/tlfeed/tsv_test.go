@@ -44,3 +44,28 @@ func TestEventRowKeepsClaudePriceFields(t *testing.T) {
 		t.Fatalf("price fields were not written to event row: %q", b.String())
 	}
 }
+
+func TestEventRowCodexUsesFullRolloutAndSkipsMissingUsage(t *testing.T) {
+	var rows []string
+	for _, name := range []string{"rollout-2026-11-25T10-00-00-0199abcd-1111-7000-8000-000000000001.jsonl", "rollout-2026-11-25T10-00-00-0199abcd-2222-7000-8000-000000000002.jsonl"} {
+		var b bytes.Buffer
+		eventRow(&b, &file{kind: "codex", src: transcript.Source{ID: "0199abcd", Path: "/synthetic/" + name}}, &transcript.Event{
+			Line: 12, Tokens: &transcript.Tokens{Model: "gpt-5", Last: &transcript.TokenUsage{Input: 10, Output: 3}},
+		})
+		fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
+		want := strings.TrimSuffix(name, ".jsonl")
+		if fields[24] != want {
+			t.Errorf("usage session %q, want full rollout id %q", fields[24], want)
+		}
+		rows = append(rows, fields[24])
+	}
+	if rows[0] == rows[1] {
+		t.Fatalf("rollouts sharing a prefix collapsed to %q", rows[0])
+	}
+	var b bytes.Buffer
+	eventRow(&b, &file{src: transcript.Source{ID: "session"}}, &transcript.Event{Reply: &transcript.Reply{ID: "without-usage", Model: "claude-opus-5-5"}})
+	fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
+	if fields[13] != "" || fields[14] != "" {
+		t.Fatalf("reply without usage was included in usage keys: %q", fields[13:15])
+	}
+}

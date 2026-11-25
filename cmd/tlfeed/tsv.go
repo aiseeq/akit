@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -143,8 +144,8 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 	var fast bool
 	var geo string
 	if e.Reply != nil {
-		model, id, req = e.Reply.Model, e.Reply.ID, e.Reply.RequestID
 		if u := e.Reply.Usage; u != nil {
+			model, id, req = e.Reply.Model, e.Reply.ID, e.Reply.RequestID
 			in, out, cr, cw, w5, w1, fast, geo = u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Write5m, u.Write1h, u.Fast, u.Geo
 		}
 	} else if e.Tokens != nil && e.Tokens.Last != nil {
@@ -165,7 +166,9 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 	r.flag(fast)
 	r.str(geo)
 	r.str(e.Cwd)
-	if f.src.ParentID != "" {
+	if f.kind == "codex" {
+		r.last(strings.TrimSuffix(filepath.Base(f.src.Path), ".jsonl"))
+	} else if f.src.ParentID != "" {
 		r.last(f.src.ParentID)
 	} else {
 		r.last(f.src.ID)

@@ -29,14 +29,15 @@ import (
 // the transcripts of a synthetic home: it evaluates the conditions the client sends (parameters, LIKE, the regular
 // expressions, the raw prefilter) in Go. Every request must be a read-only POST.
 type fakeCH struct {
-	t          *testing.T
-	files      []*chFile
-	mu         sync.Mutex
-	names      []string      // log_comment of each request, in order
-	eventWhole []string      // whole-text limits used by the event listing
-	eventSQL   []string      // event projections, for the text-preservation contract
-	gate       chan struct{} // when set, requests wait for it to close
-	fail       map[string]bool
+	t           *testing.T
+	files       []*chFile
+	mu          sync.Mutex
+	names       []string      // log_comment of each request, in order
+	eventWhole  []string      // whole-text limits used by the event listing
+	eventSQL    []string      // event projections, for the text-preservation contract
+	gate        chan struct{} // when set, requests wait for it to close
+	fail        map[string]bool
+	legacyUsage bool
 }
 
 type chFile struct {
@@ -184,6 +185,15 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	param := func(name string) string { return q.Get("param_" + name) }
 	switch name {
+	case "usage_legacy":
+		if !strings.Contains(sql, "reply_id != '' AND usage_session = ''") {
+			s.t.Errorf("legacy usage query misses incomplete session rows: %s", sql)
+		}
+		if s.legacyUsage {
+			row(1)
+		} else {
+			row(0)
+		}
 	case "files":
 		for _, f := range s.files {
 			if !fakeFileMatches(q, sql, f) {
@@ -227,7 +237,9 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				session := f.session
-				if f.parent != "" {
+				if f.kind == "codex" {
+					session = f.path
+				} else if f.parent != "" {
 					session = f.parent
 				}
 				if reply != "" {
@@ -251,7 +263,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if b.u.Fast {
 				fast = "1"
 			}
-			row(b.f.id, ms(b.e.ev.Time), b.model, b.reply, b.request, b.u.Input, b.u.Output, b.u.CacheRead, b.u.CacheWrite,
+			row(b.f.id, ms(b.e.ev.Time), k.session, b.model, b.reply, b.request, b.u.Input, b.u.Output, b.u.CacheRead, b.u.CacheWrite,
 				b.u.Write5m, b.u.Write1h, fast, b.u.Geo)
 		}
 	case "events":
@@ -869,6 +881,28 @@ func TestDBServerErrorReadsFiles(t *testing.T) {
 	code, out, errOut := runTL(t, e, sessionID[:8])
 	if code != 0 || out == "" || !strings.Contains(errOut, "code") || !strings.Contains(errOut, "reading files instead") {
 		t.Errorf("exit %d, out %q, err %q", code, out, errOut)
+	}
+}
+
+func TestDBUsageIncompleteSessionFallsBackToFiles(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	ch.legacyUsage = true
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	state := dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home}
+	b, _ := json.Marshal(state)
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	if err := os.WriteFile(statePath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.backend = backendFiles
+	codeFiles, outFiles, _ := runTL(t, e, "--all", "--usage")
+	e.backend = backendDB
+	codeDB, outDB, warning := runTL(t, e, "--all", "--usage")
+	if codeDB != codeFiles || outDB != outFiles || !strings.Contains(warning, "usage session metadata is incomplete") || !strings.Contains(warning, "reading files instead") {
+		t.Fatalf("incomplete usage did not fall back: files=(%d,%q), db=(%d,%q,%q)", codeFiles, outFiles, codeDB, outDB, warning)
 	}
 }
 

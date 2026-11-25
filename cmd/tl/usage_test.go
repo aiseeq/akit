@@ -25,6 +25,16 @@ func TestUsageDeduplicatesReplyAcrossSubagents(t *testing.T) {
 	}
 }
 
+func TestUsageKeepsCodexRolloutsWithSharedPrefixSeparate(t *testing.T) {
+	hits := []hit{
+		{src: source{Path: "/synthetic/rollout-2026-11-25T10-00-00-0199abcd-1111.jsonl"}, ev: transcript.Event{Line: 8, Tokens: &transcript.Tokens{Model: "gpt-5", Last: &transcript.TokenUsage{Input: 3, Output: 5}}}},
+		{src: source{Path: "/synthetic/rollout-2026-11-25T10-00-00-0199abcd-2222.jsonl"}, ev: transcript.Event{Line: 8, Tokens: &transcript.Tokens{Model: "gpt-5", Last: &transcript.TokenUsage{Input: 7, Output: 9}}}},
+	}
+	if got := usageReplies(hits); len(got) != 2 {
+		t.Fatalf("rollouts sharing the timestamp prefix collapsed: %+v", got)
+	}
+}
+
 // usageRecord — ответ модели в записи Claude Code; один ответ Claude Code раскладывает на несколько записей с тем
 // же id сообщения, расход в них растёт к последней.
 func usageRecord(msgID, model, text string, in, write, read, out int64) string {

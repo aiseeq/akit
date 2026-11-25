@@ -192,9 +192,12 @@ ALTER TABLE {db}.usage ADD COLUMN IF NOT EXISTS geo LowCardinality(String) DEFAU
 ALTER TABLE {db}.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288;
 
 -- Refresh the view definition so new event fields and Codex token counts reach usage.
-DROP TABLE IF EXISTS {db}.usage_mv;
-CREATE MATERIALIZED VIEW {db}.usage_mv TO {db}.usage AS
-SELECT file_id, ts, usage_session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo
+CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.usage_mv TO {db}.usage AS
+SELECT file_id, ts, usage_session AS session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo
+FROM {db}.events
+WHERE reply_id != '' OR request_id != '';
+ALTER TABLE {db}.usage_mv MODIFY QUERY
+SELECT file_id, ts, usage_session AS session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo
 FROM {db}.events
 WHERE reply_id != '' OR request_id != '';
 `

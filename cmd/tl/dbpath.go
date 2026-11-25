@@ -939,6 +939,18 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 	if err != nil {
 		return nil, err
 	}
+	legacy, err := d.query(chQuery{Name: "usage_legacy", SQL: "SELECT count() FROM events WHERE " + w.sql + " AND reply_id != '' AND usage_session = ''", Params: w.params, Settings: w.settings})
+	if err != nil {
+		return nil, err
+	}
+	if len(legacy) != 1 || len(legacy[0]) != 1 {
+		return nil, fmt.Errorf("usage legacy: expected one count row")
+	}
+	if n, err := strconv.ParseUint(legacy[0][0], 10, 64); err != nil {
+		return nil, fmt.Errorf("usage legacy count: %w", err)
+	} else if n != 0 {
+		return nil, errors.New("usage session metadata is incomplete")
+	}
 	usageWhere := "(session, reply_id, if(reply_id = '', request_id, '')) IN (SELECT usage_session, reply_id, if(reply_id = '', request_id, '') FROM events WHERE " + w.sql + " AND (reply_id != '' OR request_id != ''))"
 	if !d.opts.since.IsZero() {
 		usageWhere += " AND ts >= {since:DateTime64(3, 'UTC')}"
@@ -946,7 +958,7 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 	if !d.opts.until.IsZero() {
 		usageWhere += " AND ts <= {until:DateTime64(3, 'UTC')}"
 	}
-	rows, err := d.query(chQuery{Name: "usage", SQL: "SELECT file_id, toUnixTimestamp64Milli(ts), model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM usage FINAL WHERE " + usageWhere,
+	rows, err := d.query(chQuery{Name: "usage", SQL: "SELECT file_id, toUnixTimestamp64Milli(ts), session, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM usage FINAL WHERE " + usageWhere,
 		Params: w.params, Settings: w.settings})
 	if err != nil {
 		return nil, err
@@ -957,13 +969,14 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 		out uint64
 	}
 	best := make(map[usageKey]pricedHit, len(rows))
+	keys := make([]usageKey, 0, len(rows))
 	for _, row := range rows {
-		if len(row) != 13 {
-			return nil, fmt.Errorf("usage: %d fields in a row, want 13", len(row))
+		if len(row) != 14 {
+			return nil, fmt.Errorf("usage: %d fields in a row, want 14", len(row))
 		}
 		p := fields{row: row}
 		id, ms := p.uint(0), int64(p.uint(1))
-		in, out, read, write, w5, w1 := p.uint(5), p.uint(6), p.uint(7), p.uint(8), p.uint(9), p.uint(10)
+		in, out, read, write, w5, w1 := p.uint(6), p.uint(7), p.uint(8), p.uint(9), p.uint(10), p.uint(11)
 		if p.err != nil {
 			return nil, fmt.Errorf("usage: %w", p.err)
 		}
@@ -971,27 +984,29 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 		if !ok {
 			continue
 		}
-		request := row[4]
-		if row[3] != "" {
+		request := row[5]
+		if row[4] != "" {
 			request = ""
 		}
-		session := s.src.ID
-		if s.src.ParentID != "" {
-			session = s.src.ParentID
-		}
-		key := usageKey{session, row[3], request}
+		key := usageKey{row[2], row[4], request}
 		if old, ok := best[key]; ok && old.out >= out {
 			continue
 		}
-		u := price.NewUsage(int64(in), int64(out), int64(read), int64(write), int64(w5), int64(w1), row[11] == "1" || row[11] == "true", row[12])
-		reply := &transcript.Reply{Model: row[2], ID: row[3], RequestID: row[4], Usage: &u}
+		u := price.Usage{Input: int64(in), Output: int64(out), CacheRead: int64(read), CacheWrite: int64(write), Write5m: int64(w5), Write1h: int64(w1), Fast: row[12] == "1" || row[12] == "true", Geo: row[13]}
+		reply := &transcript.Reply{Model: row[3], ID: row[4], RequestID: row[5], Usage: &u}
 		ev := dbEvent(0, ms, string(transcript.Agent), "", "")
 		ev.Reply = reply
+		if _, ok := best[key]; !ok {
+			keys = append(keys, key)
+		}
 		best[key] = pricedHit{hit: sortedHit{hit: hit{src: s.src, ev: ev}, fileID: id}, out: out}
 	}
-	hits := make([]sortedHit, 0, len(best))
-	for _, candidate := range best {
-		hits = append(hits, candidate.hit)
+	slices.SortFunc(keys, func(a, b usageKey) int {
+		return cmp.Or(cmp.Compare(a.session, b.session), cmp.Compare(a.reply, b.reply), cmp.Compare(a.request, b.request))
+	})
+	hits := make([]sortedHit, 0, len(keys))
+	for _, key := range keys {
+		hits = append(hits, best[key].hit)
 	}
 	return hits, nil
 }

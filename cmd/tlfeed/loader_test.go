@@ -844,6 +844,16 @@ func TestStatements(t *testing.T) {
 		t.Fatalf("%d statements: %q", len(got), got)
 	}
 	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "DROP TABLE") {
+		t.Fatal("schema drops usage_mv during startup")
+	}
+	for _, statement := range got {
+		if strings.Contains(statement, "CREATE MATERIALIZED VIEW IF NOT EXISTS tq.usage_mv") || strings.HasPrefix(statement, "ALTER TABLE tq.usage_mv MODIFY QUERY") {
+			if !strings.Contains(statement, "usage_session AS session") {
+				t.Errorf("usage view query does not alias the destination column: %s", statement)
+			}
+		}
+	}
 	for _, column := range []string{"cache_write_5m", "cache_write_1h", "fast", "geo"} {
 		if !strings.Contains(joined, "ADD COLUMN IF NOT EXISTS "+column) {
 			t.Errorf("schema lacks idempotent %s migration", column)
@@ -859,7 +869,7 @@ func TestStatements(t *testing.T) {
 		// ALTER migrations run on every start and are idempotent.
 		idempotent := strings.Contains(s, "IF NOT EXISTS") || strings.Contains(s, "IF EXISTS") || s == "ALTER TABLE tq.files MODIFY COLUMN gen UInt64" || s == "ALTER TABLE tq.files MODIFY COLUMN mtime DateTime64(3, 'UTC')" ||
 			s == "ALTER TABLE tq.files MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288" ||
-			s == "ALTER TABLE tq.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288" || strings.HasPrefix(s, "CREATE MATERIALIZED VIEW tq.usage_mv TO tq.usage AS")
+			s == "ALTER TABLE tq.usage MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 524288" || strings.HasPrefix(s, "CREATE MATERIALIZED VIEW IF NOT EXISTS tq.usage_mv TO tq.usage AS") || strings.HasPrefix(s, "ALTER TABLE tq.usage_mv MODIFY QUERY")
 		if strings.Contains(s, "{db}") || strings.Contains(s, "--") || !idempotent {
 			t.Fatalf("statement %q", s)
 		}

@@ -241,10 +241,11 @@ func TestPurgePreservesExpiredUsageAndRebuildsRecentUsage(t *testing.T) {
 		return []string{"42", at.Format("2006-01-02 15:04:05.000"), "s", "p", "m", reply, "r-" + reply, "1", out, "0", "0"}
 	}
 	eventRow := func(at time.Time, reply, out string) []string {
-		row := make([]string, 20)
+		row := make([]string, 25)
 		row[0], row[1], row[2], row[3], row[4] = at.Format("2006-01-02 15:04:05.000"), "42", "s", "claude", "p"
 		row[5], row[6], row[12], row[13], row[14] = "1", "agent", "m", reply, "r-"+reply
 		row[15], row[16], row[17], row[18] = "1", out, "0", "0"
+		row[24] = "usage-session-" + reply
 		return row
 	}
 	oldAt, staleAt, recentAt, ttlLingeringAt := now.Add(-91*24*time.Hour), now.Add(-88*24*time.Hour), now.Add(-10*24*time.Hour), now.Add(-90*24*time.Hour-23*time.Hour)
@@ -287,6 +288,9 @@ func TestPurgePreservesExpiredUsageAndRebuildsRecentUsage(t *testing.T) {
 	}
 	if got["stale-88"][8] != "2" || got["recent"][8] != "2" {
 		t.Fatalf("recent usage was not rebuilt: %v", got)
+	}
+	if got["recent"][2] != "usage-session-recent" {
+		t.Fatalf("rebuilt usage used event session %q, want usage session", got["recent"][2])
 	}
 	if got["ttl-lingering"][8] != "4" {
 		t.Fatalf("usage whose event is past TTL boundary changed: %v", got["ttl-lingering"])
@@ -377,6 +381,14 @@ func TestCheckTailRewindClearsUsage(t *testing.T) {
 }
 
 func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
+	_, selectBody, ok := strings.Cut(query, " SELECT ")
+	if !ok {
+		return nil, fmt.Errorf("usage rebuild has no SELECT: %s", query)
+	}
+	selectSQL, _, ok := strings.Cut(selectBody, " FROM ")
+	if !ok || !strings.Contains(selectSQL, "usage_session AS session") {
+		return nil, fmt.Errorf("usage rebuild does not project usage_session AS session: %s", query)
+	}
 	m := regexp.MustCompile(`FROM \w+\.events WHERE file_id = (\d+)`).FindStringSubmatch(query)
 	if m == nil {
 		return nil, fmt.Errorf("unrecognized usage rebuild: %s", query)
@@ -396,7 +408,10 @@ func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 			return nil, err
 		}
 		if kept {
-			out = append(out, []string{event[1], event[0], eventValue(event, 24, event[2]), event[4], event[12], event[13], event[14], event[15], event[16], event[17], event[18], eventValue(event, 19, "0"), eventValue(event, 20, "0"), eventValue(event, 21, "0"), eventValue(event, 22, "")})
+			if len(event) <= 24 {
+				return nil, fmt.Errorf("event row has no usage_session column")
+			}
+			out = append(out, []string{event[1], event[0], event[24], event[4], event[12], event[13], event[14], event[15], event[16], event[17], event[18], event[19], event[20], event[21], event[22]})
 		}
 	}
 	return out, nil
