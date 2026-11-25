@@ -156,6 +156,7 @@ func TestHelperProcessMovePGID(t *testing.T) {
 			os.Exit(4)
 		}
 		time.Sleep(time.Hour)
+		os.Exit(0)
 	}
 }
 
