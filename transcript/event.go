@@ -469,13 +469,15 @@ func (rd *reader) line(raw []byte) {
 	rd.emitParsed(raw, codex, events)
 }
 
-// Отсев не должен терять состояние Codex: вызовы, контекст и отметку первого события после session_meta.
+// Отсев не должен терять состояние Codex: вызовы, контекст, отметку первого события после session_meta и итог
+// последнего token_count (по нему узнаётся повтор).
 func (rd *reader) rememberCodex(raw []byte) {
 	if !containsPayload(raw) && (rd.noUnicode || !MayHideType(raw)) {
 		return
 	}
 	if !rd.codex.named && !bytes.Contains(raw, []byte(`"session_meta"`)) &&
 		!bytes.Contains(raw, []byte(`"turn_context"`)) && !bytes.Contains(raw, []byte(`_call`)) &&
+		!bytes.Contains(raw, []byte(`"token_count"`)) &&
 		(rd.noUnicode || !MayHideType(raw)) {
 		return
 	}

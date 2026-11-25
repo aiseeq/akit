@@ -499,3 +499,31 @@ func TestCodexRepeatedTotalIsNotACall(t *testing.T) {
 		t.Fatalf("repeat/priced %v, want %v", got, want)
 	}
 }
+
+// Follow, пропустивший строки (SkipThrough), помнит итог последнего token_count: повтор сразу после пропуска — тоже не вызов.
+func TestCodexRepeatAfterSkipIsNotACall(t *testing.T) {
+	tc := func(ts string, total int) string {
+		return `{"timestamp":"2026-10-25T10:00:0` + ts + `Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":` +
+			fmt.Sprint(total) + `,"total_tokens":` + fmt.Sprint(total) + `},"last_token_usage":{"input_tokens":7,"total_tokens":7}}}}`
+	}
+	meta := `{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"0199abcd-0000-7000-8000-000000000001","cwd":"/synthetic"}}`
+	data := []byte(strings.Join([]string{meta, tc("1", 7), tc("2", 14), tc("3", 14), tc("4", 21)}, "\n") + "\n")
+	f := NewFollow()
+	if err := f.Prescan(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SkipThrough(3); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if err := f.Feed(data, func(e Event) {
+		if e.Tokens != nil {
+			got = append(got, fmt.Sprintf("%d:%v", e.Line, e.Tokens.Repeat))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "[4:true 5:false]"; fmt.Sprint(got) != want {
+		t.Fatalf("line:repeat after skip %v, want %s", got, want)
+	}
+}
