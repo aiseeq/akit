@@ -317,14 +317,14 @@ func (f *fakeCH) rebuilt(id uint64) (string, bool) {
 	return b.String(), dup
 }
 
-// events — events rows of a file as "line role who: text", in line order.
+// events — events rows of a file as "line seq role who: text", in line order.
 func (f *fakeCH) events(id uint64) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []string
 	for _, row := range f.rows["events"] {
 		if row[1] == strconv.FormatUint(id, 10) {
-			out = append(out, row[5]+" "+row[6]+" "+row[7]+": "+row[8])
+			out = append(out, row[5]+" "+row[6]+" "+row[7]+" "+row[8]+": "+row[9])
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {

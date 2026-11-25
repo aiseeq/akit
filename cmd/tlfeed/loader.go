@@ -805,10 +805,18 @@ func (l *loader) feed(f *file, data []byte, at int64) error {
 		off += int64(len(raw) + 1)
 		rest = next
 	}
+	var eventLine int
+	var eventSeq uint32
 	for i := range evs {
 		e := &evs[i]
+		if e.Line != eventLine {
+			eventLine, eventSeq = e.Line, 0
+		}
 		b.evPart(f, e.Line)
-		eventRow(&b.events, f, e)
+		eventRow(&b.events, f, e, uint16(min(eventSeq, 65535)))
+		if eventSeq < 65535 {
+			eventSeq++
+		}
 		b.evRows++
 		if !e.Time.IsZero() && (f.first.IsZero() || e.Time.Before(f.first)) {
 			f.first = e.Time

@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS {db}.events
     kind LowCardinality(String),
     project LowCardinality(String),
     line UInt32 CODEC(Delta, ZSTD(1)),
+    seq UInt16 DEFAULT 0,
     role Enum8('user' = 1, 'ask' = 2, 'peer' = 3, 'agent' = 4, 'think' = 5, 'cmd' = 6, 'out' = 7, 'attach' = 8, 'note' = 9),
     who LowCardinality(String),
     text String CODEC(ZSTD(3)),
@@ -137,6 +138,7 @@ TTL {event_ttl}
 SETTINGS index_granularity = 1024, index_granularity_bytes = 131072, non_replicated_deduplication_window = 10000, merge_with_ttl_timeout = 604800;
 
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS cache_write_5m UInt64 DEFAULT 0 AFTER cache_write;
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS seq UInt16 DEFAULT 0 AFTER line;
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS cache_write_1h UInt64 DEFAULT 0 AFTER cache_write_5m;
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS fast Bool DEFAULT false AFTER cache_write_1h;
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS geo LowCardinality(String) DEFAULT '' AFTER fast;

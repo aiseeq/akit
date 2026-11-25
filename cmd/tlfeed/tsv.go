@@ -106,7 +106,7 @@ func msTime(t time.Time) string {
 
 const (
 	rawColumns   = "file_id, line, off, raw"
-	eventColumns = "ts, file_id, session, kind, project, line, role, who, text, images, error, subtype, model, reply_id, " +
+	eventColumns = "ts, file_id, session, kind, project, line, seq, role, who, text, images, error, subtype, model, reply_id, " +
 		"request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo, cwd, usage_session"
 	fileColumns = "file_id, path, kind, project, session, parent, name, description, size, ingested, lines, ev_lines, mtime, inode, " +
 		"first_ts, last_ts, bad, tail, gen, dirty, ver, cwd"
@@ -125,7 +125,7 @@ func rawRow(b *bytes.Buffer, id uint64, line int, off int64, raw []byte) {
 }
 
 // eventRow — one event as tl shows it: text is Shown(), the reply's usage goes to its token columns.
-func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
+func eventRow(b *bytes.Buffer, f *file, e *transcript.Event, seq uint16) {
 	r := row{b}
 	r.ms(e.Time)
 	r.num(f.id)
@@ -133,6 +133,7 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event) {
 	r.str(f.kind)
 	r.str(f.project)
 	r.num(uint64(e.Line))
+	r.num(uint64(seq))
 	r.str(string(e.Role))
 	r.str(e.Who)
 	r.str(e.Shown())

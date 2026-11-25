@@ -55,7 +55,35 @@ type chFile struct {
 
 type chEvent struct {
 	ev  transcript.Event
+	seq uint64
 	off uint64
+}
+
+func TestSortHitsUsesSequenceBeforeRoleAndPart(t *testing.T) {
+	base := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	makeHit := func(seq uint64, role transcript.Role, part string, off uint64) sortedHit {
+		return sortedHit{hit: hit{src: source{Path: "/synthetic/transcript.jsonl"}, ev: transcript.Event{Time: base, Line: 4, Role: role}},
+			seq: seq, rank: roleRank[role], part: part, off: off}
+	}
+	hits := []sortedHit{
+		makeHit(2, transcript.User, "a", 0),
+		makeHit(1, transcript.Agent, "z", 9),
+		makeHit(1, transcript.Cmd, "a", 0),
+	}
+	sortHits(hits)
+	if got := []transcript.Role{hits[0].ev.Role, hits[1].ev.Role, hits[2].ev.Role}; !slices.Equal(got, []transcript.Role{transcript.Agent, transcript.Cmd, transcript.User}) {
+		t.Fatalf("order by seq then role/part = %v", got)
+	}
+	hits = []sortedHit{makeHit(1, transcript.Cmd, "z", 9), makeHit(1, transcript.Agent, "a", 0)}
+	sortHits(hits)
+	if hits[0].ev.Role != transcript.Agent || hits[1].ev.Role != transcript.Cmd {
+		t.Fatalf("equal seq did not keep role rank first: %v, %v", hits[0].ev.Role, hits[1].ev.Role)
+	}
+	hits = []sortedHit{makeHit(1, transcript.Agent, "z", 9), makeHit(1, transcript.Agent, "a", 0)}
+	sortHits(hits)
+	if hits[0].part != "a" || hits[1].part != "z" {
+		t.Fatalf("equal seq and role did not use part/off: %+v", hits)
+	}
 }
 
 // newFakeCH loads the transcripts; unloaded names files whose last lines are absent from the tables.
@@ -98,9 +126,12 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 			f.kind = "claude"
 		}
 		// Only events confirmed through evLines are in the fake events table.
+		seqByLine := map[int]uint64{}
 		meta, err := transcript.Read(path, nil, func(ev transcript.Event) {
 			if ev.Line <= n {
-				f.events = append(f.events, chEvent{ev: ev, off: uint64(len(f.events))})
+				seq := seqByLine[ev.Line]
+				seqByLine[ev.Line]++
+				f.events = append(f.events, chEvent{ev: ev, seq: seq, off: uint64(len(f.events))})
 				if f.first.IsZero() || ev.Time.Before(f.first) {
 					f.first = ev.Time
 				}
@@ -283,7 +314,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						text, flat = string(r[:cut]), len([]rune(transcript.Short(ev.Shown(), 0)))
 					}
 				}
-				row(f.id, ev.Line, ms(ev.Time), ev.Role, ev.Who, ev.Subtype, text, flat, "all_1_1_0", e.off)
+				row(f.id, ev.Line, e.seq, ms(ev.Time), ev.Role, ev.Who, ev.Subtype, text, flat, "all_1_1_0", e.off)
 			}
 		}
 	case "bad":
@@ -313,7 +344,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for _, f := range s.files {
 			for _, e := range f.events {
 				if strconv.FormatUint(f.id, 10) == param("file") && strconv.Itoa(e.ev.Line) == param("line") {
-					row(ms(e.ev.Time), e.ev.Role, e.ev.Who, e.ev.Shown(), "all_1_1_0", e.off)
+					row(ms(e.ev.Time), e.seq, e.ev.Role, e.ev.Who, e.ev.Shown(), "all_1_1_0", e.off)
 				}
 			}
 		}

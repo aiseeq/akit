@@ -133,9 +133,14 @@ func (h *harness) pass(l *loader) {
 func readEvents(t *testing.T, path string, lines int) []string {
 	t.Helper()
 	var out []string
+	var line, seq int
 	if _, err := transcript.Read(path, nil, func(e transcript.Event) {
 		if e.Line <= lines {
-			out = append(out, fmt.Sprintf("%d %s %s: %s", e.Line, e.Role, e.Who, e.Shown()))
+			if e.Line != line {
+				line, seq = e.Line, 0
+			}
+			out = append(out, fmt.Sprintf("%d %d %s %s: %s", e.Line, seq, e.Role, e.Who, e.Shown()))
+			seq++
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -209,6 +214,24 @@ func TestGrowsMidLine(t *testing.T) {
 	}
 	if f.id>>22 != uint64(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC).Unix()) {
 		t.Fatalf("file id %d: high bits are not the first event's second", f.id)
+	}
+}
+
+func TestEventSequenceResetsForEachLine(t *testing.T) {
+	h := newHarness(t)
+	path := claudePath(h.home)
+	write(t, path, []byte(
+		`{"type":"assistant","timestamp":"2026-10-25T10:00:00Z","message":{"id":"m1","content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"true"}}]}}`+"\n"+
+			`{"type":"assistant","timestamp":"2026-10-25T10:00:01Z","message":{"id":"m2","content":[{"type":"text","text":"next"}]}}`+"\n"))
+	h.loader(nil)
+	var seqs []string
+	for _, insert := range h.fake.sentTo("events") {
+		for _, row := range insert.rows {
+			seqs = append(seqs, row[6])
+		}
+	}
+	if !slices.Equal(seqs, []string{"0", "1", "0"}) {
+		t.Fatalf("event sequences = %v, want [0 1 0]", seqs)
 	}
 }
 
@@ -860,6 +883,12 @@ func TestStatements(t *testing.T) {
 		if !strings.Contains(joined, "ADD COLUMN IF NOT EXISTS "+column) {
 			t.Errorf("schema lacks idempotent %s migration", column)
 		}
+	}
+	if !strings.Contains(joined, "seq UInt16 DEFAULT 0") || !strings.Contains(joined, "ADD COLUMN IF NOT EXISTS seq UInt16 DEFAULT 0 AFTER line") {
+		t.Fatal("events schema lacks the sequence column or migration")
+	}
+	if !strings.Contains(eventColumns, "project, line, seq, role") {
+		t.Fatalf("event insert columns omit seq: %s", eventColumns)
 	}
 	for _, s := range got {
 		if strings.HasPrefix(s, "CREATE TABLE IF NOT EXISTS tq.usage") && !strings.Contains(s, "max_bytes_to_merge_at_max_space_in_pool = 524288") {

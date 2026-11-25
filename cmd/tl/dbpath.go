@@ -728,10 +728,10 @@ func storedBadLineError(line storedRawLine, codex, messageUser, messageAgent boo
 	return fmt.Errorf("line %d: %s", line.n, cause), nil
 }
 
-// sortedHit is a hit with what orders the events of one line: the role, then the place of the row in its part
-// (the loader inserts the events of a line in the order the file has them).
+// sortedHit is a hit with the stored sequence and deterministic tie-breakers for events of one line.
 type sortedHit struct {
 	hit
+	seq  uint64
 	rank int
 	part string
 	off  uint64
@@ -751,7 +751,7 @@ func sortHits(hits []sortedHit) {
 		if c := a.ev.Time.Compare(b.ev.Time); c != 0 {
 			return c < 0
 		}
-		return cmp.Or(cmp.Compare(a.src.Path, b.src.Path), cmp.Compare(a.ev.Line, b.ev.Line), cmp.Compare(a.rank, b.rank),
+		return cmp.Or(cmp.Compare(a.src.Path, b.src.Path), cmp.Compare(a.ev.Line, b.ev.Line), cmp.Compare(a.seq, b.seq), cmp.Compare(a.rank, b.rank),
 			cmp.Compare(a.part, b.part), cmp.Compare(a.off, b.off)) < 0
 	})
 }
@@ -817,7 +817,7 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 			w.params["ws"] = chString(spaceClass + "+")
 			w.params["trim"] = chString("^" + spaceClass + "+|" + spaceClass + "+$")
 		}
-		return chQuery{SQL: "SELECT file_id, line, toUnixTimestamp64Milli(ts), role, who, subtype, " + text + ", _part, _part_offset FROM events WHERE " + w.sql,
+		return chQuery{SQL: "SELECT file_id, line, seq, toUnixTimestamp64Milli(ts), role, who, subtype, " + text + ", _part, _part_offset FROM events WHERE " + w.sql,
 			Params: w.params, Settings: w.settings}
 	}, ids, kinds)
 	if err != nil {
@@ -826,11 +826,11 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 	hits := make([]sortedHit, 0, len(rows))
 	var long []int // rows whose start does not decide the cut
 	for _, row := range rows {
-		if len(row) != 10 {
-			return nil, fmt.Errorf("events: %d fields in a row, want 10", len(row))
+		if len(row) != 11 {
+			return nil, fmt.Errorf("events: %d fields in a row, want 11", len(row))
 		}
 		p := fields{row: row}
-		id, line, ms, flat, off := p.uint(0), p.int(1), int64(p.uint(2)), p.int(7), p.uint(9)
+		id, line, seq, ms, flat, off := p.uint(0), p.int(1), p.uint(2), int64(p.uint(3)), p.int(8), p.uint(10)
 		if p.err != nil {
 			return nil, fmt.Errorf("events: %w", p.err)
 		}
@@ -838,13 +838,13 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 		if !ok || line > s.file.evLines {
 			continue // a row past what the files table says is stored: the tail read gives it
 		}
-		h := sortedHit{hit: hit{src: s.src, ev: dbEvent(line, ms, row[3], row[4], row[6])}, rank: roleRank[transcript.Role(row[3])], part: row[8],
+		h := sortedHit{hit: hit{src: s.src, ev: dbEvent(line, ms, row[4], row[5], row[7])}, seq: seq, rank: roleRank[transcript.Role(row[4])], part: row[9],
 			off: off, fileID: id}
-		h.ev.Subtype = row[5]
+		h.ev.Subtype = row[6]
 		if flat > 0 {
 			cut, ok := "", false
 			if flat > width {
-				cut, ok = maskedCut([]rune(transcript.Short(row[6], 0)), flat, width)
+				cut, ok = maskedCut([]rune(transcript.Short(row[7], 0)), flat, width)
 			}
 			if ok {
 				h.cut = &cut
@@ -1059,22 +1059,22 @@ func (d *dbPath) showRef(ref eventRef, width int, w, stderr io.Writer) (int, err
 			found = append(found, sortedHit{hit: hit{src: src, ev: evs[i]}, off: uint64(i)})
 		}
 	} else {
-		rows, err := d.query(chQuery{Name: "event", SQL: "SELECT toUnixTimestamp64Milli(ts), role, who, text, _part, _part_offset FROM events " +
+		rows, err := d.query(chQuery{Name: "event", SQL: "SELECT toUnixTimestamp64Milli(ts), seq, role, who, text, _part, _part_offset FROM events " +
 			"WHERE file_id = {file:UInt64} AND line = {line:UInt32}", Params: map[string]string{"file": strconv.FormatUint(f.id, 10), "line": strconv.Itoa(ref.line)}})
 		if err != nil {
 			return 0, err
 		}
 		for _, row := range rows {
-			if len(row) != 6 {
-				return 0, fmt.Errorf("event: %d fields in a row, want 6", len(row))
+			if len(row) != 7 {
+				return 0, fmt.Errorf("event: %d fields in a row, want 7", len(row))
 			}
 			p := fields{row: row}
-			ms, off := int64(p.uint(0)), p.uint(5)
+			ms, seq, off := int64(p.uint(0)), p.uint(1), p.uint(6)
 			if p.err != nil {
 				return 0, fmt.Errorf("event: %w", p.err)
 			}
-			found = append(found, sortedHit{hit: hit{src: src, ev: dbEvent(ref.line, ms, row[1], row[2], row[3])}, rank: roleRank[transcript.Role(row[1])],
-				part: row[4], off: off})
+			found = append(found, sortedHit{hit: hit{src: src, ev: dbEvent(ref.line, ms, row[2], row[3], row[4])}, seq: seq, rank: roleRank[transcript.Role(row[2])],
+				part: row[5], off: off})
 		}
 		sortHits(found)
 	}
