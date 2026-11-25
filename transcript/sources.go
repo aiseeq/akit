@@ -76,7 +76,8 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 func SelectSources(paths []string, since, until time.Time, project string) ([]Source, error) {
 	var out []Source
 	for _, p := range paths {
-		codexSource := strings.Contains(p, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator))
+		codexSource := strings.Contains(p, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator)) ||
+			strings.HasPrefix(filepath.Base(p), "rollout-")
 		pathMatches := projectPathMatches(p, project)
 		if !pathMatches && !codexSource {
 			continue

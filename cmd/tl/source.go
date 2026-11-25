@@ -22,7 +22,21 @@ const sinceDefault = 7 * 24 * time.Hour
 
 func resolve(opts options, e env) ([]source, error) {
 	return resolveWith(opts, e, func(since time.Time) ([]source, error) {
-		return transcript.AllSourcesWindow(e.home, since, opts.until, opts.project, opts.codex, !opts.noSubagents)
+		sources, err := transcript.AllSourcesWindow(e.home, since, opts.until, opts.project, opts.codex, !opts.noSubagents)
+		if err != nil || !opts.codexExt {
+			return sources, err
+		}
+		roots, err := transcript.CodexRoots(e.home)
+		if err != nil {
+			return nil, err
+		}
+		ext, err := transcript.CodexRootSources(roots, since, opts.until, opts.project)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, ext...)
+		sort.Slice(sources, func(i, j int) bool { return sources[i].Path < sources[j].Path })
+		return sources, nil
 	}, func(arg string) (string, error) { return find(arg, e.home) })
 }
 

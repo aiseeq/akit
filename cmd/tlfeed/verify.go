@@ -95,13 +95,23 @@ func fileSum(path string, n int64) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
-// check — completeness: every transcript tl --all --codex reads has its files row, loaded up to its last complete
-// line, raw holds each of its lines once, and events has as many events as transcript.Read gives for those lines.
+// check — completeness: every transcript tl --all --codex --codex-ext reads has its files row, loaded up to its last
+// complete line, raw holds each of its lines once, and events has as many events as transcript.Read gives for those
+// lines. Codex roots that cannot be read fail the check: the loader would not see their transcripts either.
 func (c *checker) check() (bool, error) {
 	srcs, err := transcript.AllSources(c.home, time.Time{}, "", true, true)
 	if err != nil {
 		return false, err
 	}
+	roots, err := transcript.CodexRoots(c.home)
+	if err != nil {
+		return false, err
+	}
+	ext, err := transcript.CodexRootSources(roots, time.Time{}, time.Time{}, "")
+	if err != nil {
+		return false, err
+	}
+	srcs = append(srcs, ext...)
 	files, err := c.rows("SELECT path, file_id, ingested, lines, dirty, ev_lines, kind FROM " + c.db + ".files FINAL FORMAT TabSeparated")
 	if err != nil {
 		return false, err

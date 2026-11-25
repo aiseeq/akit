@@ -22,6 +22,7 @@ import (
 	"github.com/aiseeq/akit/price"
 	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // The database path answers only from the tables the transcript loader fills — files, events and raw.
@@ -237,12 +238,15 @@ func (d *dbPath) allFilePredicate() where {
 	if !d.opts.codex {
 		conds = append(conds, "kind != 'codex'")
 	}
+	if !d.opts.codexExt {
+		conds = append(conds, "kind != '"+transcriptdb.KindCodexExt+"'")
+	}
 	if d.opts.noSubagents {
 		conds = append(conds, "kind != 'sub'")
 	}
 	if d.opts.project != "" {
 		w.params["project"] = d.opts.project
-		conds = append(conds, "((kind = 'codex' AND (position(path, {project:String}) > 0 OR position(cwd, {project:String}) > 0)) OR (kind != 'codex' AND (position(path, {project:String}) > 0 OR position(project, {project:String}) > 0)) )")
+		conds = append(conds, "((kind IN "+codexKindsSQL+" AND (position(path, {project:String}) > 0 OR position(cwd, {project:String}) > 0)) OR (kind NOT IN "+codexKindsSQL+" AND (position(path, {project:String}) > 0 OR position(project, {project:String}) > 0)) )")
 	}
 	w.sql = strings.Join(conds, " AND ")
 	return w
@@ -290,7 +294,8 @@ func (d *dbPath) sessionFilePredicate() (where, error) {
 	for i, id := range ids {
 		key := fmt.Sprintf("find_id_%d", i)
 		w.params[key] = id
-		conds = append(conds, "(startsWith(session, {"+key+":String}) OR position(path, {"+key+":String}) > 0)")
+		// a session id finds what the files find (transcriptPatterns): codex-ext only by its path
+		conds = append(conds, "(kind != '"+transcriptdb.KindCodexExt+"' AND (startsWith(session, {"+key+":String}) OR position(path, {"+key+":String}) > 0))")
 	}
 	if len(conds) == 0 {
 		return where{sql: "0", params: w.params}, nil
@@ -381,13 +386,13 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 	if f.mtime.Before(since) || !d.opts.until.IsZero() && f.first.After(d.opts.until) {
 		return false
 	}
-	if f.kind == "codex" && !d.opts.codex || f.kind == "sub" && d.opts.noSubagents {
+	if f.kind == "codex" && !d.opts.codex || f.kind == transcriptdb.KindCodexExt && !d.opts.codexExt || f.kind == "sub" && d.opts.noSubagents {
 		return false
 	}
 	if d.opts.project == "" {
 		return true
 	}
-	if f.kind == "codex" {
+	if transcriptdb.IsCodexKind(f.kind) {
 		return strings.Contains(f.path, d.opts.project) || strings.Contains(f.cwd, d.opts.project)
 	}
 	return strings.Contains(f.path, d.opts.project) || strings.Contains(f.project, d.opts.project)
@@ -427,6 +432,9 @@ func (d *dbPath) findAfterLive(arg string, alive map[string]session.Info, aliveE
 	}
 	var matches []string
 	for path, f := range d.files {
+		if f.kind == transcriptdb.KindCodexExt {
+			continue // named by its path only, as in the files
+		}
 		id := f.session
 		if id == "" {
 			id = sourceFullID(source{Path: path, ID: path})
@@ -458,7 +466,8 @@ func dbTranscriptPresent(path string) bool {
 // linkNames includes files outside this call's project and time window: short links
 // must be unique in the same full search area as the file backend.
 func (d *dbPath) linkNames() ([]string, error) {
-	rows, err := d.query(chQuery{Name: "link_names", SQL: "SELECT path, session, kind FROM files FINAL"})
+	// codex-ext is outside the search area of the files (transcriptPatterns): its links are paths on both
+	rows, err := d.query(chQuery{Name: "link_names", SQL: "SELECT path, session, kind FROM files FINAL WHERE kind != '" + transcriptdb.KindCodexExt + "'"})
 	if err != nil {
 		return nil, err
 	}
@@ -473,7 +482,11 @@ func (d *dbPath) linkNames() ([]string, error) {
 	return names, nil
 }
 
-// kindOfSource is the kind column of the events of a source.
+// codexKindsSQL — the kinds of Codex rollouts as an SQL list: their project filter reads cwd.
+const codexKindsSQL = "('codex', '" + transcriptdb.KindCodexExt + "')"
+
+// kindOfSource is the kind column of the events of a source the database does not name: a rollout under a Codex
+// root outside worker is codex-ext there, its files row tells (storedHits).
 func kindOfSource(src source) string {
 	switch {
 	case isCodexRollout(src.Path):
@@ -769,7 +782,11 @@ func (d *dbPath) storedHits(inDB []stored) ([]sortedHit, error) {
 	byID := make(map[uint64]stored, len(inDB))
 	for _, s := range inDB {
 		ids = append(ids, s.file.id)
-		kindSet[kindOfSource(s.src)] = true
+		kind := s.file.kind
+		if kind == "" {
+			kind = kindOfSource(s.src)
+		}
+		kindSet[kind] = true
 		byID[s.file.id] = s
 	}
 	kinds := slices.Sorted(maps.Keys(kindSet))
@@ -939,7 +956,7 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 	if err != nil {
 		return nil, err
 	}
-	legacy, err := d.query(chQuery{Name: "usage_legacy", SQL: "SELECT count() FROM events WHERE " + w.sql + " AND usage_session = '' AND (reply_id != '' OR (kind = 'codex' AND who = 'token_count'))", Params: w.params, Settings: w.settings})
+	legacy, err := d.query(chQuery{Name: "usage_legacy", SQL: "SELECT count() FROM events WHERE " + w.sql + " AND usage_session = '' AND (reply_id != '' OR (kind IN " + codexKindsSQL + " AND who = 'token_count'))", Params: w.params, Settings: w.settings})
 	if err != nil {
 		return nil, err
 	}

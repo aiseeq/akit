@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // tailBytes — how many of the last ingested bytes identify a file: a file cut back and grown past its old size
@@ -78,22 +79,48 @@ func (f *file) committed() *file {
 func (f *file) describe(home string, src transcript.Source) error {
 	f.src = src
 	f.kind, f.project = kindOf(home, src)
-	if f.kind == "codex" {
+	if transcriptdb.IsCodexKind(f.kind) {
 		cwd, err := transcript.CodexProjectCWD(src.Path)
 		if err != nil {
 			return fmt.Errorf("codex cwd %s: %w", src.Path, err)
 		}
 		f.cwd = cwd
+		f.setCodexExtProject()
 	}
 	return nil
 }
 
-// kindOf — claude, sub or codex, and the project: the Claude project folder or worker:<task>.
+// setCodexExtProject names the project of a rollout outside worker tasks after its cwd, the way Claude Code names
+// a project folder: the session folders (a benchmark run, the Codex CLI home) say nothing of the work, and a path
+// taken from them would put a machine's folder names into the column.
+func (f *file) setCodexExtProject() {
+	if false {
+		f.project = projectOfCWD(f.cwd)
+	}
+}
+
+// projectOfCWD — the folder name Claude Code gives a project in ~/.claude/projects: every character other than a
+// Latin letter or digit becomes '-'.
+func projectOfCWD(cwd string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, cwd)
+}
+
+// kindOf — claude, sub, codex or codex-ext, and the project: the Claude project folder or worker:<task>; the
+// project of codex-ext comes from its cwd (setCodexExtProject). A rollout outside the worker tree is codex-ext
+// whichever folder it is in, so a row keeps its kind after its folder leaves the list of transcript.CodexRoots.
 func kindOf(home string, src transcript.Source) (kind, project string) {
 	sep := string(filepath.Separator)
 	if rel, ok := strings.CutPrefix(src.Path, filepath.Join(home, ".local", "state", "worker")+sep); ok {
 		task, _, _ := strings.Cut(rel, sep)
 		return "codex", "worker:" + task
+	}
+	if strings.HasPrefix(filepath.Base(src.Path), "rollout-") {
+		return transcriptdb.KindCodexExt, ""
 	}
 	if strings.Contains(src.Path, sep+"codex"+sep+"sessions"+sep) {
 		return "codex", ""

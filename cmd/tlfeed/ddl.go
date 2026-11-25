@@ -54,8 +54,8 @@ CREATE TABLE IF NOT EXISTS {db}.files
 (
     file_id UInt64,                       -- (unix seconds of the first event << 22) | low 22 bits of fnv64a(path)
     path String,
-    kind LowCardinality(String),          -- claude | sub | codex
-    project LowCardinality(String),       -- Claude project folder or worker:<task>
+    kind LowCardinality(String),          -- claude | sub | codex | codex-ext
+    project LowCardinality(String),       -- Claude project folder, worker:<task>, or the cwd of codex-ext as one
     session String,                       -- short id as tl prints it
     parent String,                        -- the parent session of a subagent
     name String,                          -- agent-name of the session

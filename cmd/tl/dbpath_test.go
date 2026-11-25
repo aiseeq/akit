@@ -23,6 +23,7 @@ import (
 
 	"github.com/aiseeq/akit/price"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // fakeCH answers the queries of the database path the way ClickHouse would over tables the loader filled from
@@ -115,8 +116,10 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 			f.session = sourceFullID(source{Path: path, ID: path})[:8]
 		}
 		switch {
-		case isCodexRollout(path):
+		case isCodexRollout(path) && strings.Contains(path, string(filepath.Separator)+"worker"+string(filepath.Separator)):
 			f.kind = "codex"
+		case isCodexRollout(path):
+			f.kind = transcriptdb.KindCodexExt
 		case strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)):
 			f.kind = "sub"
 			f.session = strings.TrimPrefix(f.session, "agent-")
@@ -143,7 +146,7 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 		if src, err := transcript.SourceAt(path); err == nil {
 			f.desc = src.Description
 		}
-		if f.kind == "codex" {
+		if transcriptdb.IsCodexKind(f.kind) {
 			f.cwd, _ = transcript.CodexProjectCWD(path)
 		}
 		f.name, f.bad = meta.Name, meta.Bad
@@ -218,7 +221,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch name {
 	case "usage_legacy":
 		// Claude replies and Codex token reports loaded before usage_session existed both carry an empty one
-		if !strings.Contains(sql, "usage_session = '' AND (reply_id != '' OR (kind = 'codex' AND who = 'token_count'))") {
+		if !strings.Contains(sql, "usage_session = '' AND (reply_id != '' OR (kind IN ('codex', 'codex-ext') AND who = 'token_count'))") {
 			s.t.Errorf("legacy usage query misses incomplete session rows: %s", sql)
 		}
 		if s.legacyUsage {
@@ -236,6 +239,9 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case "link_names":
 		for _, f := range s.files {
+			if f.kind == transcriptdb.KindCodexExt && strings.Contains(sql, "WHERE kind != 'codex-ext'") {
+				continue
+			}
 			row(f.path, f.session, f.kind)
 		}
 	case "shadow_files":
@@ -269,7 +275,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				session := f.session
-				if f.kind == "codex" {
+				if transcriptdb.IsCodexKind(f.kind) {
 					session = f.path
 				} else if f.parent != "" {
 					session = f.parent
@@ -364,11 +370,12 @@ func fakeFileMatches(q url.Values, sql string, f *chFile) bool {
 	if v := param("file_until"); v != "" && f.first.After(chParseTime(nil, v)) {
 		return false
 	}
-	if strings.Contains(sql, " AND kind != 'codex' AND") && f.kind == "codex" || strings.Contains(sql, " AND kind != 'sub' AND") && f.kind == "sub" {
+	if strings.Contains(sql, " AND kind != 'codex' AND") && f.kind == "codex" || strings.Contains(sql, " AND kind != 'sub' AND") && f.kind == "sub" ||
+		strings.Contains(sql, " AND kind != 'codex-ext'") && f.kind == transcriptdb.KindCodexExt {
 		return false
 	}
 	if project := param("project"); project != "" {
-		if f.kind == "codex" {
+		if f.kind == "codex" || f.kind == transcriptdb.KindCodexExt && strings.Contains(sql, "kind IN ('codex', 'codex-ext') AND") {
 			pathMatch := strings.Contains(sql, "position(path, {project:String})") && strings.Contains(f.path, project)
 			cwdMatch := strings.Contains(sql, "position(cwd, {project:String})") && strings.Contains(f.cwd, project)
 			if !pathMatch && !cwdMatch {

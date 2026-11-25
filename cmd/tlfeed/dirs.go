@@ -28,9 +28,12 @@ type dirs struct {
 	polled []string
 	pnext  int
 	worker string // the worker tree: tasks of codex sessions
-	w      watcher
-	logf   func(string, ...any)
-	now    func() time.Time
+	// codexRoots — the Codex session folders outside worker (transcript.CodexRoots), globs; codexBases — the
+	// folder of each before its first glob character, polled and watched as a root
+	codexRoots, codexBases []string
+	w                      watcher
+	logf                   func(string, ...any)
+	now                    func() time.Time
 }
 
 // recentTask — a worker task whose transcript changed within it has its session folders watched; the folders of
@@ -46,9 +49,21 @@ func (d *dirs) watch(dir string) {
 }
 
 // activate watches the session folders of the worker task of a transcript that changed lately: its folder and
-// those above it up to codex/sessions, so a session on a new day or month of the task is seen at once.
+// those above it up to codex/sessions, so a session on a new day or month of the task is seen at once. Below a
+// Codex root outside worker, the folders up to its base are watched the same way.
 func (d *dirs) activate(path string) {
 	sep := string(filepath.Separator)
+	for _, base := range d.codexBases {
+		if !strings.HasPrefix(path, base+sep) {
+			continue
+		}
+		for dir := filepath.Dir(path); strings.HasPrefix(dir, base+sep); dir = filepath.Dir(dir) {
+			if _, ok := d.known[dir]; ok {
+				d.watch(dir)
+			}
+		}
+		return
+	}
 	sessions := sep + filepath.Join("codex", "sessions")
 	for dir := filepath.Dir(path); strings.HasPrefix(dir, d.worker+sep); dir = filepath.Dir(dir) {
 		rel := strings.TrimPrefix(dir, d.worker)
@@ -91,14 +106,28 @@ func (d *dirs) sweep(n int, now time.Time) []string {
 	return out
 }
 
+// newDirs reads the Codex roots of home once: a change of transcript.CodexRootsFile takes a restart. A line of it
+// that cannot be used is logged, the others are followed.
 func newDirs(home string, logf func(string, ...any)) *dirs {
 	d := &dirs{known: map[string]time.Time{}, recent: map[string]time.Time{}, on: map[string]bool{}, logf: logf, now: time.Now}
-	for _, p := range transcript.SourcePatterns(home, true, true) {
+	patterns := transcript.SourcePatterns(home, true, true)
+	roots, err := transcript.CodexRoots(home)
+	if err != nil {
+		logf("%v", err)
+	}
+	d.codexRoots = roots
+	for _, root := range roots {
+		patterns = append(patterns, transcript.CodexRolloutPattern(root))
+		if base := transcript.CodexRootBase(root); !slices.Contains(d.codexBases, base) {
+			d.codexBases = append(d.codexBases, base)
+		}
+	}
+	for _, p := range patterns {
 		d.pats = append(d.pats, strings.Split(p, string(filepath.Separator)))
 	}
 	d.claude = filepath.Join(home, ".claude", "projects")
 	d.worker = filepath.Join(home, ".local", "state", "worker")
-	d.roots = []string{d.claude, d.worker}
+	d.roots = append([]string{d.claude, d.worker}, d.codexBases...)
 	return d
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // fileCol — the position of each column of fileColumns.
@@ -42,9 +43,10 @@ func parseFileRow(home string, r []string) (f *file, ver uint64, dirty bool, err
 	f.src = transcript.Source{Path: r[c("path")], ID: r[c("session")], ParentID: r[c("parent")], Description: r[c("description")]}
 	f.kind, f.project = kindOf(home, f.src)
 	f.cwd = r[c("cwd")]
-	if f.kind == "codex" && f.cwd == "" {
+	if transcriptdb.IsCodexKind(f.kind) && f.cwd == "" {
 		f.cwd, f.metadataErr = transcript.CodexProjectCWD(f.src.Path)
 	}
+	f.setCodexExtProject()
 	f.complete = f.ingested
 	f.commit()
 	return f, ver, dirty, nil

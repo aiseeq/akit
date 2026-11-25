@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // escape writes s as one TabSeparated field: the bytes that end a field or a row, and the escape itself, are escaped;
@@ -167,7 +168,7 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event, seq uint16) {
 	r.flag(fast)
 	r.str(geo)
 	r.str(e.Cwd)
-	if f.kind == "codex" {
+	if transcriptdb.IsCodexKind(f.kind) {
 		r.last(strings.TrimSuffix(filepath.Base(f.src.Path), ".jsonl"))
 	} else if f.src.ParentID != "" {
 		r.last(f.src.ParentID)

@@ -307,12 +307,17 @@ func (l *loader) add(f *file) {
 	}
 }
 
-// listAll — every transcript tl --all --codex reads, with their folders.
+// listAll — every transcript tl --all --codex --codex-ext reads, with their folders.
 func (l *loader) listAll() ([]string, error) {
 	srcs, err := transcript.AllSources(l.cfg.home, time.Time{}, "", true, true)
 	if err != nil {
 		return nil, err
 	}
+	ext, err := transcript.CodexRootSources(l.dirs.codexRoots, time.Time{}, time.Time{}, "")
+	if err != nil {
+		return nil, err
+	}
+	srcs = append(srcs, ext...)
 	out := make([]string, 0, len(srcs))
 	for _, s := range srcs {
 		out = append(out, s.Path)

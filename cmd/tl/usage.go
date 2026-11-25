@@ -281,8 +281,11 @@ func usageScope(sources []source, opts options, e env) string {
 		}
 	}
 	scope := "read: " + read + "; not counted: runs without a transcript (claude -p --no-session-persistence)"
-	if opts.codex || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.Path) }) {
+	if opts.codex || opts.codexExt || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.Path) }) {
 		scope += "; codex rollout token_count included"
+	}
+	if opts.codexExt {
+		scope += " (with rollouts outside worker)"
 	}
 	return scope
 }

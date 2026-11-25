@@ -36,7 +36,7 @@ func tlFlagArgs(f string, values map[string]string, companions map[string][]stri
 	if v, ok := values[f]; ok {
 		a = append(a, v)
 	}
-	if f == "--codex" || f == "--project" || f == "--no-subagents" {
+	if f == "--codex" || f == "--codex-ext" || f == "--project" || f == "--no-subagents" {
 		a = append([]string{"--all"}, a...)
 	}
 	if f == "--worktime" {
@@ -50,7 +50,7 @@ func tlMissingArgs(f string, companions map[string][]string) []string {
 	}
 	a := append([]string{}, companions[f]...)
 	a = append(a, f)
-	if f == "--codex" || f == "--project" || f == "--no-subagents" {
+	if f == "--codex" || f == "--codex-ext" || f == "--project" || f == "--no-subagents" {
 		a = append([]string{"--all"}, a...)
 	}
 	if f == "--worktime" {

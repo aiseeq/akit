@@ -1,5 +1,5 @@
 // tlfeed — loads transcripts into ClickHouse as they are written: every complete line of every file tl --all
-// --codex reads goes to raw as it is (a file is rebuilt from it byte for byte), its events as tl parses them to
+// --codex --codex-ext reads goes to raw as it is (a file is rebuilt from it byte for byte), its events as tl parses them to
 // events, and how far each file is loaded to files. It runs until stopped: every --tick (1s) it loads the new complete
 // lines; a line still being written waits. A server that is down is waited for. --once loads what there is and
 // exits; --verify and --check compare the tables with the files.
@@ -31,8 +31,12 @@ Usage:
   tlfeed --verify N [flags]      rebuild N random files from raw, compare sha256 with the files
   tlfeed --check [flags]         every transcript loaded to its last line, raw and events complete
 
-Sources are the files tl --all --codex reads: Claude Code transcripts with subagents and the
-rollouts of worker codex sessions under --home.
+Sources are the files tl --all --codex --codex-ext reads: Claude Code transcripts with subagents and
+the rollouts of worker codex sessions under --home (kind codex), and the rollouts under the Codex
+session folders listed in --home/.config/akit/codex-roots (kind codex-ext; one folder per line, globs
+and ~/ allowed, # comments; without the file ~/.codex/sessions and ~/.codex-personal/sessions). The
+file is read at start: a change takes a restart. The project of codex-ext is its cwd named as a
+Claude Code project folder.
 
 One loader per database: follow, --once and --materialize hold a lock (flock) on
 tlfeed-<db>-<serverUUID>.lock in $XDG_RUNTIME_DIR/akit/tlfeed (/tmp/akit-tlfeed-<uid> when unset),

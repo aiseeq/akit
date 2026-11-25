@@ -57,6 +57,10 @@ path (Claude Code or codex rollout).
   --no-subagents with --all: omit subagent transcripts
   --subagents   with SESSION: include that session's subagents
   --codex       with --all: also codex rollouts of worker fighters
+  --codex-ext   with --all: also codex rollouts outside worker, under the
+                session folders of ~/.config/akit/codex-roots (one per line,
+                globs and ~/ allowed; without the file ~/.codex/sessions and
+                ~/.codex-personal/sessions); their links are paths
   --project S   with --all: project folders containing S; codex checks the
                 transcript path and working directory (worker task directory if
                 the session has no cwd)
@@ -66,7 +70,7 @@ path (Claude Code or codex rollout).
                 events: a TSV row per session and the total (--role defaults to all); the
                 summary names the transcripts read: runs that leave none
                 (claude -p --no-session-persistence) are not in it; --codex
-                includes token_count from codex rollouts
+                and --codex-ext include token_count from codex rollouts
   --open-questions  list question sentences and whether the user replied (SESSION only)
                 One row per sentence with '?', linked to its event. Replies are
                 matched by file order. AskUserQuestion calls whose window was
@@ -146,6 +150,7 @@ type options struct {
 	context       int
 	all           bool
 	codex         bool
+	codexExt      bool
 	noSubagents   bool
 	subagents     bool
 	project       string
@@ -176,7 +181,7 @@ type options struct {
 var errHelp = errors.New("help")
 var errHelpJSON = errors.New("help json")
 var machineHelp = func() clihelp.Help {
-	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --no-subagents --subagents --usage --open-questions --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --wait-all --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
+	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --codex-ext --no-subagents --subagents --usage --open-questions --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --wait-all --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
 	help.Commands[0].NoDashdash = true
 	return help
 }()
@@ -321,6 +326,8 @@ func setSwitch(opts *options, name string) bool {
 		opts.all = true
 	case "--codex":
 		opts.codex = true
+	case "--codex-ext":
+		opts.codexExt = true
 	case "--no-subagents":
 		opts.noSubagents = true
 	case "--subagents":
@@ -359,8 +366,8 @@ func checkCombos(opts options) error {
 }
 
 func checkScopeCombos(opts options) error {
-	if (opts.codex || opts.project != "" || opts.noSubagents) && !opts.all {
-		return errors.New("--codex, --project and --no-subagents work with --all")
+	if (opts.codex || opts.codexExt || opts.project != "" || opts.noSubagents) && !opts.all {
+		return errors.New("--codex, --codex-ext, --project and --no-subagents work with --all")
 	}
 	if opts.subagents && opts.all {
 		return errors.New("--subagents works with SESSION, not --all")

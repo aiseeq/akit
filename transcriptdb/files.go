@@ -30,13 +30,20 @@ func IsSourceError(err error) bool {
 	return errors.As(err, &se) || errors.As(err, &server) || errors.Is(err, ErrUnavailable)
 }
 
+// KindCodexExt is the kind of a Codex rollout outside worker tasks, from the session folders of
+// transcript.CodexRoots: a benchmark's or the Codex CLI's own. tl shows it only when asked (--codex-ext).
+const KindCodexExt = "codex-ext"
+
+// IsCodexKind reports whether a files kind is a Codex rollout: of a worker task (codex) or KindCodexExt.
+func IsCodexKind(kind string) bool { return kind == "codex" || kind == KindCodexExt }
+
 // File is the newest version of a files row. The lines of the file in raw are numbered 1 to Lines; Ingested is
 // their length in bytes, each with its '\n'.
 type File struct {
 	ID       uint64 `json:"file_id"`
 	Path     string `json:"path"`
-	Kind     string `json:"kind"`    // claude, sub or codex
-	Project  string `json:"project"` // the Claude project folder or worker:<task>
+	Kind     string `json:"kind"`    // claude, sub, codex (worker tasks) or KindCodexExt
+	Project  string `json:"project"` // the Claude project folder, worker:<task>, or for KindCodexExt its cwd named as a Claude project folder
 	Session  string `json:"session"` // the short id tl prints
 	Parent   string `json:"parent"`  // the parent session of a subagent
 	MTimeSec int64  `json:"mtime_s"`
