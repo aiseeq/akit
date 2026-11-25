@@ -51,16 +51,16 @@ func TestFilesUsesPostBodyAndBoundParameters(t *testing.T) {
 		if r.URL.Query().Has("query") || strings.Contains(string(body), injected) {
 			t.Errorf("SQL or a value out of place: %s %s", r.URL.RawQuery, body)
 		}
-		if !strings.Contains(string(body), "{prefix:String}") || !strings.Contains(string(body), "FROM tr.files FINAL") {
+		if !strings.Contains(string(body), "{prefix:String}") || !strings.Contains(string(body), "FROM tr.files FINAL") || !strings.Contains(string(body), "toUnixTimestamp64Milli(mtime)") {
 			t.Errorf("query without the parameter or the newest version: %s", body)
 		}
 		if got := r.URL.Query().Get("param_prefix"); got != injected {
 			t.Errorf("param_prefix=%q, want %q", got, injected)
 		}
-		io.WriteString(w, `{"file_id":12,"path":"/p.jsonl","kind":"claude","project":"p","session":"s1","mtime_s":1795334400,"size":9,"ingested":9,"lines":2,"dirty":0}`+"\n")
+		io.WriteString(w, `{"file_id":12,"path":"/p.jsonl","kind":"claude","project":"p","session":"s1","mtime_s":1795334400,"mtime_ms":1795334400123,"size":9,"ingested":9,"lines":2,"dirty":0}`+"\n")
 	})
 	files, err := c.Files(context.Background(), "startsWith(project,{prefix:String})", map[string]string{"prefix": injected})
-	if err != nil || len(files) != 1 || files[0].Lines != 2 || files[0].ID != 12 || files[0].Session != "s1" || !files[0].MTime().Equal(time.Unix(1795334400, 0)) {
+	if err != nil || len(files) != 1 || files[0].Lines != 2 || files[0].ID != 12 || files[0].Session != "s1" || !files[0].MTime().Equal(time.UnixMilli(1795334400123)) {
 		t.Fatalf("Files = %#v, %v", files, err)
 	}
 }
@@ -237,6 +237,16 @@ func TestModifiedNotBeforeKeepsSameSecond(t *testing.T) {
 	}
 	if f.ModifiedNotBefore(time.Unix(101, 0)) {
 		t.Error("a file of the second before kept")
+	}
+}
+
+func TestModifiedNotBeforeMillisecondPrecision(t *testing.T) {
+	f := File{MTimeSec: 100, MTimeMS: 100_123}
+	if !f.MTime().Equal(time.UnixMilli(100_123)) || !f.ModifiedNotBefore(time.UnixMilli(100_123).Add(500*time.Microsecond)) {
+		t.Fatalf("millisecond timestamp was not retained: %v", f.MTime())
+	}
+	if f.ModifiedNotBefore(time.UnixMilli(101_123)) {
+		t.Fatal("file at least one millisecond old should be excluded")
 	}
 }
 

@@ -40,19 +40,30 @@ type File struct {
 	Session  string `json:"session"` // the short id tl prints
 	Parent   string `json:"parent"`  // the parent session of a subagent
 	MTimeSec int64  `json:"mtime_s"`
+	MTimeMS  int64  `json:"mtime_ms"`
 	Size     uint64 `json:"size"`
 	Ingested uint64 `json:"ingested"`
 	Lines    uint32 `json:"lines"`
 	Dirty    uint8  `json:"dirty"`
 }
 
-// MTime is the modification time of the file to the second.
-func (f File) MTime() time.Time { return time.Unix(f.MTimeSec, 0) }
+// MTime is the modification time of the file, to the millisecond when available.
+func (f File) MTime() time.Time {
+	if f.MTimeMS != 0 {
+		return time.UnixMilli(f.MTimeMS)
+	}
+	return time.Unix(f.MTimeSec, 0)
+}
 
-// ModifiedNotBefore reports whether the file may have been modified at t or later. The time is taken to the
-// second (rows of an older loader keep only seconds), so the file is dropped only when the end of its second is
-// not after t either: then ModTime().Before(t) holds on disk as well.
-func (f File) ModifiedNotBefore(t time.Time) bool { return f.MTime().Add(time.Second).After(t) }
+// ModifiedNotBefore reports whether the file may have been modified at t or later. Millisecond storage is
+// rounded down, so retain the rest of that millisecond; old rows with only mtime_s retain a whole second.
+func (f File) ModifiedNotBefore(t time.Time) bool {
+	precision := time.Second
+	if f.MTimeMS != 0 {
+		precision = time.Millisecond
+	}
+	return f.MTime().Add(precision).After(t)
+}
 
 // NeedsDiskRead reports whether the database holds the file only in part: a row of a send in progress (Dirty) or
 // a file that grew past its loaded lines. Its lines are read from disk, as without the database.
@@ -65,7 +76,7 @@ func DateTimeParam(t time.Time) string { return t.UTC().Format(time.DateTime) }
 // values go as typed parameters ({name:Type}) in params, never into the text. Every error is a SourceError.
 func (c *Client) Files(ctx context.Context, where string, params map[string]string) ([]File, error) {
 	q := Query{Name: "files", Params: params, SQL: "SELECT file_id, path, kind, project, session, parent, " +
-		"toInt64(toUnixTimestamp(mtime)) AS mtime_s, size, ingested, lines, dirty FROM " + c.db + ".files FINAL WHERE " + where +
+		"toInt64(toUnixTimestamp(mtime)) AS mtime_s, toInt64(toUnixTimestamp64Milli(mtime)) AS mtime_ms, size, ingested, lines, dirty FROM " + c.db + ".files FINAL WHERE " + where +
 		" SETTINGS output_format_json_quote_64bit_integers = 0 FORMAT JSONEachRow"}
 	resp, err := c.post(ctx, q)
 	if err != nil {

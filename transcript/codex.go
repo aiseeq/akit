@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -179,39 +177,6 @@ func newCodexParser() *codexParser { return &codexParser{tools: map[string]strin
 // <turn_aborted> — её же вставка после прерванного хода.
 var codexInjected = []string{"<environment_context>", "# AGENTS.md instructions", "<user_instructions>",
 	"<permissions instructions>", "<turn_aborted>"}
-
-// codexHead — сколько байт начала файла смотреть, чтобы узнать rollout codex: тип session_meta стоит в начале строки.
-const codexHead = 256
-
-// Строки событий user_message и agent_message: codex пишет их так, тип события — сразу после типа записи.
-var (
-	userMessageLine  = []byte(`"type":"event_msg","payload":{"type":"user_message"`)
-	agentMessageLine = []byte(`"type":"event_msg","payload":{"type":"agent_message"`)
-)
-
-// codexMessages — есть ли в rollout события user_message и agent_message. Их пишет только TUI: в rollout exec
-// реплики и текст агента есть лишь в response_item, а в TUI response_item дублирует их со вставками обвязки
-// (<turn_aborted>, заглушки картинок) и метками на 1 мс позже. Файл читается по смещениям, его позиция не меняется.
-func codexMessages(f *os.File) (user, agent bool, err error) {
-	st, err := f.Stat()
-	if err != nil {
-		return false, false, fmt.Errorf("stat: %w", err)
-	}
-	r := bufio.NewReaderSize(io.NewSectionReader(f, 0, st.Size()), 1<<20)
-	for !user || !agent {
-		line, err := readLine(r)
-		head := line[:min(len(line), codexHead)]
-		user = user || bytes.Contains(head, userMessageLine)
-		agent = agent || bytes.Contains(head, agentMessageLine)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return false, false, err
-		}
-	}
-	return user, agent, nil
-}
 
 func (p *codexParser) parse(rec *record) []Event {
 	events := p.events(rec)

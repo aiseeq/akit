@@ -169,11 +169,28 @@ type Meta struct {
 // maxLine — потолок длины строки транскрипта: запись с вложениями бывает в мегабайты.
 const maxLine = 256 << 20
 
+// codexHead is the prefix length used to recognize a Codex rollout.
+const codexHead = 256
+
+var (
+	userMessageLine  = []byte(`"type":"event_msg","payload":{"type":"user_message"`)
+	agentMessageLine = []byte(`"type":"event_msg","payload":{"type":"agent_message"`)
+)
+
 // Read читает файл и отдаёт события по порядку. keep, если задан, получает сырую строку и может отбросить её до
 // разбора JSON: так поиск по гигабайтам не разбирает лишнее. Испорченная строка (файл дописывается прямо сейчас)
 // пропускается и считается в Meta.Bad.
 func Read(path string, keep func(raw []byte) bool, fn func(Event)) (Meta, error) {
 	return read(path, keep, nil, fn, nil)
+}
+
+// ReadReader reads events from r with the same line numbering, filtering, and metadata as Read.
+// Codex needs a preliminary pass to distinguish TUI messages from response_item duplicates. A non-seekable Codex
+// stream is spooled to a temporary file, limited to 16 GiB; larger streams fail with an error. Seekable sources
+// are read from their current position and rewound to that position for the preliminary pass. Claude input is
+// parsed directly. The caller retains ownership of r.
+func ReadReader(name string, r io.Reader, keep func(raw []byte) bool, fn func(Event)) (Meta, error) {
+	return readReader(name, r, keep, nil, fn, nil)
 }
 
 // ToolNames даёт фильтру известные и возможные имена инструментов из предыдущих строк.
@@ -229,35 +246,95 @@ func ReadWithTools(path string, keep func([]byte, ToolNames) bool, fn func(Event
 	return read(path, nil, keep, fn, nil)
 }
 
+// ReadReaderWithTools is the reader form of ReadWithTools.
+func ReadReaderWithTools(name string, r io.Reader, keep func([]byte, ToolNames) bool, fn func(Event)) (Meta, error) {
+	return readReader(name, r, nil, keep, fn, nil)
+}
+
 // ReadWithCodexCommandsDiscardOutput reads command completions without retaining their output.
 func ReadWithCodexCommandsDiscardOutput(path string, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
 	return read(path, nil, nil, fn, commandFn)
 }
 
-func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return Meta{}, fmt.Errorf("transcript: %w", err)
+// ReadReaderWithCodexCommandsDiscardOutput is the reader form of ReadWithCodexCommandsDiscardOutput.
+func ReadReaderWithCodexCommandsDiscardOutput(name string, r io.Reader, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
+	return readReader(name, r, nil, nil, fn, commandFn)
+}
+
+const maxReaderSpool = int64(16 << 30)
+
+func readReader(name string, source io.Reader, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (meta Meta, retErr error) {
+	if source == nil {
+		return Meta{}, fmt.Errorf("transcript %s: nil reader", name)
 	}
-	defer f.Close()
-	r := bufio.NewReaderSize(f, 1<<20)
+	if seeker, ok := source.(io.Seeker); ok {
+		start, err := seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return Meta{}, fmt.Errorf("transcript %s: tell reader position: %w", name, err)
+		}
+		return readStream(name, source, start, keep, keepWithTools, fn, commandFn)
+	}
+	input := bufio.NewReaderSize(source, 1<<20)
+	head, err := input.Peek(codexHead)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return Meta{}, fmt.Errorf("transcript %s: %w", name, err)
+	}
+	if !bytes.Contains(head, []byte(`"type":"session_meta"`)) {
+		return readStream(name, input, 0, keep, keepWithTools, fn, commandFn)
+	}
+	// Spool Codex to disk to support its preliminary pass without requiring a seekable source or unbounded memory.
+	spool, err := os.CreateTemp("", "akit-transcript-reader-*")
+	if err != nil {
+		return Meta{}, fmt.Errorf("transcript %s: create spool: %w", name, err)
+	}
+	defer func() {
+		closeErr := spool.Close()
+		removeErr := os.Remove(spool.Name())
+		retErr = errors.Join(retErr, closeErr, removeErr)
+	}()
+	n, err := io.Copy(spool, io.LimitReader(input, maxReaderSpool+1))
+	if err != nil {
+		return Meta{}, fmt.Errorf("transcript %s: %w", name, err)
+	}
+	if n > maxReaderSpool {
+		return Meta{}, fmt.Errorf("transcript %s: input exceeds %d-byte spool limit", name, maxReaderSpool)
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return Meta{}, fmt.Errorf("transcript %s: rewind spool: %w", name, err)
+	}
+	return readStream(name, spool, 0, keep, keepWithTools, fn, commandFn)
+}
+
+func readStream(name string, source io.Reader, start int64, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
+	r := bufio.NewReaderSize(source, 1<<20)
 	rd := reader{claude: newClaudeParser(), codex: newCodexParser(), keep: keep, keepWithTools: keepWithTools, fn: fn, commandFn: commandFn}
 	if keepWithTools != nil {
 		rd.toolNames = make(map[string]struct{})
 	}
 	head, err := r.Peek(codexHead)
-	if err != nil && !errors.Is(err, io.EOF) { // EOF — файл короче codexHead
-		return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return Meta{}, fmt.Errorf("transcript %s: %w", name, err)
 	}
 	if bytes.Contains(head, []byte(`"type":"session_meta"`)) {
-		rd.codex.eventUser, rd.codex.eventAgent, err = codexMessages(f)
-		if err != nil {
-			return Meta{}, fmt.Errorf("transcript %s: %w", path, err)
+		seeker, ok := source.(io.Seeker)
+		if !ok {
+			return Meta{}, fmt.Errorf("transcript %s: Codex prepass requires a seekable spool", name)
 		}
+		if _, err = seeker.Seek(start, io.SeekStart); err != nil {
+			return Meta{}, fmt.Errorf("transcript %s: rewind spool: %w", name, err)
+		}
+		prepass := bufio.NewReaderSize(source, 1<<20)
+		rd.codex.eventUser, rd.codex.eventAgent, err = codexMessagesReader(prepass)
+		if err != nil {
+			return Meta{}, fmt.Errorf("transcript %s: %w", name, err)
+		}
+		if _, err = seeker.Seek(start, io.SeekStart); err != nil {
+			return Meta{}, fmt.Errorf("transcript %s: rewind spool: %w", name, err)
+		}
+		r = bufio.NewReaderSize(source, 1<<20)
 	}
 	for {
 		var raw []byte
-		var err error
 		if keepWithTools == nil {
 			raw, err = readLine(r)
 		} else {
@@ -266,16 +343,41 @@ func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNa
 		if len(raw) > 0 {
 			rd.line(raw)
 		} else if err == nil {
-			rd.lineNo++ // a blank line is still a line of the file: numbers match sed -n
+			rd.lineNo++
 		}
 		if err != nil {
 			rd.meta.Originator, rd.meta.Account = rd.codex.originator, rd.codex.firstAccount
 			if errors.Is(err, io.EOF) {
 				return rd.meta, nil
 			}
-			return rd.meta, fmt.Errorf("transcript %s: %w", path, err)
+			return rd.meta, fmt.Errorf("transcript %s: %w", name, err)
 		}
 	}
+}
+
+func codexMessagesReader(r *bufio.Reader) (user, agent bool, err error) {
+	for !user || !agent {
+		line, readErr := readLine(r)
+		head := line[:min(len(line), codexHead)]
+		user = user || bytes.Contains(head, userMessageLine)
+		agent = agent || bytes.Contains(head, agentMessageLine)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return false, false, readErr
+		}
+	}
+	return user, agent, nil
+}
+
+func read(path string, keep func([]byte) bool, keepWithTools func([]byte, ToolNames) bool, fn func(Event), commandFn func(CodexCommandResult)) (Meta, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Meta{}, fmt.Errorf("transcript: %w", err)
+	}
+	defer f.Close()
+	return readReader(path, f, keep, keepWithTools, fn, commandFn)
 }
 
 // toolResult — часть с выводом инструмента в записи Claude Code. Без экранирования эти байты бывают только в
@@ -788,7 +890,7 @@ func Short(text string, width int) string {
 // Parser разбирает транскрипт по строкам для того, кто читает файл сам (например, только дописанное с
 // запомненного смещения). Между вызовами он помнит имена инструментов по id вызова: out и ask узнаются, если
 // запись вызова прошла через тот же Parser. Line событий не ставит. У codex реплики и текст агента берутся из
-// response_item: какие события есть в файле (codexMessages), Parser не видит. Один Parser — один файл.
+// response_item: какие события есть в файле (предварительный проход Read), Parser не видит. Один Parser — один файл.
 type Parser struct {
 	claude *claudeParser
 	codex  *codexParser
