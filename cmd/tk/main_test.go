@@ -3436,6 +3436,24 @@ func TestClosedFieldIsOnlyAddedToNextJSON(t *testing.T) {
 	}
 }
 
+func TestNextJSONMarksReachedWaitCondition(t *testing.T) {
+	ticket := task{path: filepath.Join(t.TempDir(), "20200101-1000-MED-waiting.md"), slug: "waiting", prio: "MED", status: "ждёт", body: "# Waiting\nСтатус: ждёт\nЖдёт: 2020-01-01 10:00: после closed\n"}
+	closed := task{path: filepath.Join(filepath.Dir(ticket.path), "20200101-0900-MED-closed.md"), slug: "closed", status: "готово", body: "Статус: готово\n"}
+	index := newWaitReferenceIndex()
+	entry := index.project(taskProject(ticket.path))
+	entry.activeLoaded = true
+	addWaitIndexTask(&entry.active, &closed)
+	ticket.waitIndex = index
+	var out, errout bytes.Buffer
+	if code := printCombinedNext("", nextChoice{task: ticket, found: true, gate: queuegate.Scope{Valid: true}}, nil, true, &out, &errout); code != 0 {
+		t.Fatalf("next JSON = %d %s", code, errout.String())
+	}
+	var next map[string]any
+	if err := json.Unmarshal(out.Bytes(), &next); err != nil || next["condition_reached"] != true {
+		t.Fatalf("next JSON condition marker = %v, want true; err=%v; output=%s", next["condition_reached"], err, out.String())
+	}
+}
+
 func TestNextWaitDeadlinesExcludeFutureTickets(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "docs", "tasks")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
