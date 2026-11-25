@@ -146,7 +146,7 @@ func TestEventRowCodexExtUsesFullRollout(t *testing.T) {
 	var b bytes.Buffer
 	eventRow(&b, &file{kind: transcriptdb.KindCodexExt, project: "-work-repo", src: transcript.Source{ID: "0199abcd", Path: "/synthetic/.codex/sessions/" + name + ".jsonl"}}, &transcript.Event{
 		Line: 12, Tokens: &transcript.Tokens{Model: "gpt-5", Last: &transcript.TokenUsage{Input: 10, CachedInput: 4, Output: 3}},
-	})
+	}, 0)
 	fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
 	if fields[evCol(t, "kind")] != transcriptdb.KindCodexExt || fields[evCol(t, "project")] != "-work-repo" {
 		t.Errorf("kind %q project %q", fields[evCol(t, "kind")], fields[evCol(t, "project")])
