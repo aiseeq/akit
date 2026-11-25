@@ -50,9 +50,13 @@ func TestEventRowCodexUsesFullRolloutAndSkipsMissingUsage(t *testing.T) {
 	for _, name := range []string{"rollout-2026-11-25T10-00-00-0199abcd-1111-7000-8000-000000000001.jsonl", "rollout-2026-11-25T10-00-00-0199abcd-2222-7000-8000-000000000002.jsonl"} {
 		var b bytes.Buffer
 		eventRow(&b, &file{kind: "codex", src: transcript.Source{ID: "0199abcd", Path: "/synthetic/" + name}}, &transcript.Event{
-			Line: 12, Tokens: &transcript.Tokens{Model: "gpt-5", Last: &transcript.TokenUsage{Input: 10, Output: 3}},
+			Line: 12, Tokens: &transcript.Tokens{Model: "gpt-5", Last: &transcript.TokenUsage{Input: 10, CachedInput: 4, Output: 3}},
 		})
 		fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
+		// model, reply key, request, input without the cached part, output, cache read, cache write
+		if got, want := strings.Join(fields[12:19], ","), "gpt-5,codex:12,,6,3,4,0"; got != want {
+			t.Errorf("codex usage fields %q, want %q", got, want)
+		}
 		want := strings.TrimSuffix(name, ".jsonl")
 		if fields[24] != want {
 			t.Errorf("usage session %q, want full rollout id %q", fields[24], want)

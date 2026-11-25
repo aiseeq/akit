@@ -849,8 +849,10 @@ func TestStatements(t *testing.T) {
 	}
 	for _, statement := range got {
 		if strings.Contains(statement, "CREATE MATERIALIZED VIEW IF NOT EXISTS tq.usage_mv") || strings.HasPrefix(statement, "ALTER TABLE tq.usage_mv MODIFY QUERY") {
-			if !strings.Contains(statement, "usage_session AS session") {
-				t.Errorf("usage view query does not alias the destination column: %s", statement)
+			// the whole column list: a view that drops a price column fills it with zeros in every new row
+			const columns = "SELECT file_id, ts, usage_session AS session, project, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo\n"
+			if !strings.Contains(statement, columns) {
+				t.Errorf("usage view query does not select every usage column: %s", statement)
 			}
 		}
 	}

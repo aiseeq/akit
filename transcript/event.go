@@ -94,11 +94,14 @@ type Tokens struct {
 	Account string
 	// Limits — окна лимита подписки; nil — в событии их нет.
 	Limits *RateLimits
+	// Repeat — total_tokens равен прошлому отчёту с info в том же файле (у первого — нулю): это повтор, не новый
+	// запрос, и в расход он не идёт.
+	Repeat bool
 }
 
 // PriceUsage is the token usage of one Codex turn in the format used by price.Cost.
 func (t *Tokens) PriceUsage() *price.Usage {
-	if t == nil || t.Last == nil {
+	if t == nil || t.Last == nil || t.Repeat {
 		return nil
 	}
 	u := t.Last

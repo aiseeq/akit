@@ -480,3 +480,22 @@ func TestReadCodexEmptyCmd(t *testing.T) {
 		t.Fatalf("события:\n%s\nждали:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
+
+// A token_count whose total repeats the previous report (the first one: zero) is a repeat, not a call: it has no price
+// usage. A report without info does not move the remembered total.
+func TestCodexRepeatedTotalIsNotACall(t *testing.T) {
+	tc := func(ts string, total int) string {
+		return `{"timestamp":"2026-10-25T10:00:0` + ts + `Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":` +
+			fmt.Sprint(total) + `,"total_tokens":` + fmt.Sprint(total) + `},"last_token_usage":{"input_tokens":7,"total_tokens":7}}}}`
+	}
+	limitsOnly := `{"timestamp":"2026-10-25T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":1}}}}`
+	evs, _ := events(t, tc("0", 0), tc("1", 7), tc("2", 7), limitsOnly, tc("4", 7), tc("5", 14))
+	var got []string
+	for _, e := range evs {
+		got = append(got, fmt.Sprintf("%v/%v", e.Tokens.Repeat, e.Tokens.PriceUsage() != nil))
+	}
+	want := []string{"true/false", "false/true", "true/false", "false/false", "true/false", "false/true"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("repeat/priced %v, want %v", got, want)
+	}
+}

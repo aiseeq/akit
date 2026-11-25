@@ -169,6 +169,8 @@ type codexParser struct {
 	firstAccount          string
 	eventUser, eventAgent bool
 	named                 bool
+	// total — total_tokens of the last token_count with info: a report that repeats it is not a new call.
+	total int64
 }
 
 func newCodexParser() *codexParser { return &codexParser{tools: map[string]string{}} }
@@ -349,6 +351,8 @@ func (p *codexParser) eventMsg(pl *payload, ev func(Role, string, string) []Even
 		t := &Tokens{Model: p.model, Account: p.account}
 		if pl.Info != nil {
 			t.Total, t.ContextWindow = pl.Info.Total.usage(), pl.Info.ContextWindow
+			t.Repeat = t.Total.Total == p.total
+			p.total = t.Total.Total
 			if pl.Info.Last != nil {
 				last := pl.Info.Last.usage()
 				t.Last = &last

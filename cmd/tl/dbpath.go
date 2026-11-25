@@ -939,7 +939,7 @@ func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored)
 	if err != nil {
 		return nil, err
 	}
-	legacy, err := d.query(chQuery{Name: "usage_legacy", SQL: "SELECT count() FROM events WHERE " + w.sql + " AND reply_id != '' AND usage_session = ''", Params: w.params, Settings: w.settings})
+	legacy, err := d.query(chQuery{Name: "usage_legacy", SQL: "SELECT count() FROM events WHERE " + w.sql + " AND usage_session = '' AND (reply_id != '' OR (kind = 'codex' AND who = 'token_count'))", Params: w.params, Settings: w.settings})
 	if err != nil {
 		return nil, err
 	}

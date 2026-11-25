@@ -186,7 +186,8 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	param := func(name string) string { return q.Get("param_" + name) }
 	switch name {
 	case "usage_legacy":
-		if !strings.Contains(sql, "reply_id != '' AND usage_session = ''") {
+		// Claude replies and Codex token reports loaded before usage_session existed both carry an empty one
+		if !strings.Contains(sql, "usage_session = '' AND (reply_id != '' OR (kind = 'codex' AND who = 'token_count'))") {
 			s.t.Errorf("legacy usage query misses incomplete session rows: %s", sql)
 		}
 		if s.legacyUsage {
