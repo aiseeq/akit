@@ -38,7 +38,7 @@ func TestCodexRootsDefaultAndFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex-personal", "sessions")}
+	want := []string{filepath.Join(home, ".codex", "sessions")}
 	if !slices.Equal(roots, want) {
 		t.Fatalf("roots without a file %q, want %q", roots, want)
 	}

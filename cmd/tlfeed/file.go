@@ -94,7 +94,7 @@ func (f *file) describe(home string, src transcript.Source) error {
 // a project folder: the session folders (a benchmark run, the Codex CLI home) say nothing of the work, and a path
 // taken from them would put a machine's folder names into the column.
 func (f *file) setCodexExtProject() {
-	if false {
+	if f.kind == transcriptdb.KindCodexExt {
 		f.project = projectOfCWD(f.cwd)
 	}
 }

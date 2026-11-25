@@ -59,8 +59,8 @@ path (Claude Code or codex rollout).
   --codex       with --all: also codex rollouts of worker fighters
   --codex-ext   with --all: also codex rollouts outside worker, under the
                 session folders of ~/.config/akit/codex-roots (one per line,
-                globs and ~/ allowed; without the file ~/.codex/sessions and
-                ~/.codex-personal/sessions); their links are paths
+                globs and ~/ allowed; without the file ~/.codex/sessions);
+                their links are paths
   --project S   with --all: project folders containing S; codex checks the
                 transcript path and working directory (worker task directory if
                 the session has no cwd)

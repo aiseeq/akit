@@ -34,7 +34,7 @@ Usage:
 Sources are the files tl --all --codex --codex-ext reads: Claude Code transcripts with subagents and
 the rollouts of worker codex sessions under --home (kind codex), and the rollouts under the Codex
 session folders listed in --home/.config/akit/codex-roots (kind codex-ext; one folder per line, globs
-and ~/ allowed, # comments; without the file ~/.codex/sessions and ~/.codex-personal/sessions). The
+and ~/ allowed, # comments; without the file ~/.codex/sessions). The
 file is read at start: a change takes a restart. The project of codex-ext is its cwd named as a
 Claude Code project folder.
 

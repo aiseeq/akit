@@ -124,16 +124,14 @@ func TestLoaderCodexExtRoots(t *testing.T) {
 	}
 }
 
-// Without a roots file the loader follows ~/.codex/sessions and ~/.codex-personal/sessions.
+// Without a roots file the loader follows ~/.codex/sessions.
 func TestLoaderCodexExtDefaultRoots(t *testing.T) {
 	h := newHarness(t)
 	day := filepath.Join("2026", "11", "20")
 	cli := filepath.Join(h.home, ".codex", "sessions", day, "rollout-2026-11-20T10-00-00-a.jsonl")
-	personal := filepath.Join(h.home, ".codex-personal", "sessions", day, "rollout-2026-11-20T10-00-00-b.jsonl")
 	write(t, cli, extRollout("/work/repo"))
-	write(t, personal, extRollout("/work/repo"))
 	l := h.loader(nil)
-	for _, p := range []string{cli, personal} {
+	for _, p := range []string{cli} {
 		if f := h.same(l, p); f.kind != transcriptdb.KindCodexExt {
 			t.Errorf("%s: kind %q", p, f.kind)
 		}

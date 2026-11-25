@@ -21,7 +21,7 @@ func CodexRootsFile(home string) string {
 
 // DefaultCodexRoots are the folders used when CodexRootsFile does not exist: where the Codex CLI keeps its sessions.
 func DefaultCodexRoots(home string) []string {
-	return []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex-personal", "sessions")}
+	return []string{filepath.Join(home, ".codex", "sessions")}
 }
 
 // CodexRoots lists the Codex session folders outside worker tasks: those of CodexRootsFile, or DefaultCodexRoots
