@@ -144,7 +144,9 @@ func TestStopChildGroupKillsLiveGroup(t *testing.T) {
 	}
 }
 
-func TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup(t *testing.T) {
+// TestHelperProcessMovePGID is not a test: it is the child that the test below starts, which moves itself into the
+// process group named in its environment and waits there. Without that environment it returns at once.
+func TestHelperProcessMovePGID(t *testing.T) {
 	if os.Getenv("PROC_MOVE_PGID_HELPER") == "1" {
 		pgid, _ := strconv.Atoi(os.Getenv("PROC_MOVE_PGID_TARGET"))
 		if err := syscall.Setpgid(0, pgid); err != nil {
@@ -155,6 +157,9 @@ func TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup(t *testing.T) {
 		}
 		time.Sleep(time.Hour)
 	}
+}
+
+func TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup(t *testing.T) {
 	sibling := exec.Command("sleep", "30")
 	sibling.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := sibling.Start(); err != nil {
@@ -169,7 +174,7 @@ func TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup(t *testing.T) {
 		}
 	})
 	ready := filepath.Join(t.TempDir(), "ready")
-	mover := exec.Command(os.Args[0], "-test.run=^TestStopChildGroupFallsBackWhenChildMovesToAnotherGroup$")
+	mover := exec.Command(os.Args[0], "-test.run=^TestHelperProcessMovePGID$")
 	mover.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	mover.Env = append(os.Environ(), "PROC_MOVE_PGID_HELPER=1", "PROC_MOVE_PGID_TARGET="+strconv.Itoa(sibling.Process.Pid), "PROC_MOVE_PGID_READY="+ready)
 	if err := mover.Start(); err != nil {
