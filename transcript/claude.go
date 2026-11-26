@@ -224,8 +224,11 @@ func attachmentFieldText(raw json.RawMessage, itemName string) string {
 	}
 	lines := make([]string, 0, len(items))
 	for _, item := range items {
-		if s := str(item); s != "" {
-			lines = append(lines, s)
+		var s string
+		if json.Unmarshal(item, &s) == nil { // a string item; an empty one adds no line
+			if s != "" {
+				lines = append(lines, s)
+			}
 			continue
 		}
 		var named map[string]json.RawMessage

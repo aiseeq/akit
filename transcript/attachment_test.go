@@ -54,3 +54,10 @@ func TestAttachmentTextStringField(t *testing.T) {
 		t.Fatalf("text = %q, want %q", got, want)
 	}
 }
+
+func TestAttachmentTextArraySkipsEmptyStrings(t *testing.T) {
+	got := parsedAttachmentText(t, `{"type":"hook_additional_context","content":["first","","second"]}`)
+	if want := "first\nsecond"; got != want {
+		t.Fatalf("text = %q, want %q", got, want)
+	}
+}
