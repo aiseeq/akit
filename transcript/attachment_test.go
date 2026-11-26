@@ -61,3 +61,14 @@ func TestAttachmentTextArraySkipsEmptyStrings(t *testing.T) {
 		t.Fatalf("text = %q, want %q", got, want)
 	}
 }
+
+func TestAttachmentTextArrayWithNullStaysEmpty(t *testing.T) {
+	for _, value := range []string{
+		`{"type":"hook_additional_context","content":["first",null,"second"]}`,
+		`{"type":"invoked_skills","skills":[{"name":"alpha-skill"},null]}`,
+	} {
+		if got := parsedAttachmentText(t, value); got != "" {
+			t.Errorf("text for %s = %q, want empty", value, got)
+		}
+	}
+}
