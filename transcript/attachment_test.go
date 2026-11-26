@@ -128,3 +128,24 @@ func TestAttachmentTextSkillsSkipsUnnamedObjects(t *testing.T) {
 		t.Fatalf("text = %q, want %q", got, want)
 	}
 }
+
+func TestAttachmentTextOtherTypeKeepsFallbackPriority(t *testing.T) {
+	got := parsedAttachmentText(t, `{"type":"other","filename":"file.txt","skills":[{"name":"skill-name"}]}`)
+	if want := "file.txt"; got != want {
+		t.Fatalf("text = %q, want %q", got, want)
+	}
+}
+
+func TestAttachmentTextUnknownNestedArrayUsesFallback(t *testing.T) {
+	got := parsedAttachmentText(t, `{"type":"instructions","files":[{"content":"visible"},{"body":"unrecognized"}],"filename":"fallback.txt"}`)
+	if want := "fallback.txt"; got != want {
+		t.Fatalf("text = %q, want %q", got, want)
+	}
+}
+
+func TestAttachmentTextNestedArraySkipsEmptyKnownValues(t *testing.T) {
+	got := parsedAttachmentText(t, `{"type":"instructions","files":[{"content":"visible"},{"content":""},{"content":[]}]}`)
+	if want := "visible"; got != want {
+		t.Fatalf("text = %q, want %q", got, want)
+	}
+}

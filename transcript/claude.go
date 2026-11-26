@@ -216,14 +216,14 @@ func (a *attachment) text() string {
 	for _, field := range []struct {
 		raw      json.RawMessage
 		itemName string
-	}{{a.Content, ""}, {a.Text, ""}, {a.Stdout, ""}, {a.Snippet, ""}, {a.Prompt, ""}, {a.Skills, "name"}} {
+	}{{a.Content, ""}, {a.Text, ""}, {a.Stdout, ""}, {a.Snippet, ""}, {a.Prompt, ""}} {
 		if s := attachmentFieldText(field.raw, field.itemName); s != "" {
 			return s
 		}
 	}
 	// Nested attachment payloads share the same path walker; array traversal preserves item order.
 	for _, path := range attachmentTextPaths[a.Type] {
-		if s := attachmentPathText(a.Raw, path); s != "" {
+		if s, known := attachmentPathText(a.Raw, path); known && s != "" {
 			return s
 		}
 	}
@@ -232,31 +232,43 @@ func (a *attachment) text() string {
 			return s
 		}
 	}
+	if s := attachmentFieldText(a.Skills, "name"); s != "" {
+		return s
+	}
 	return ""
 }
 
-func attachmentPathText(raw json.RawMessage, path []string) string {
+func attachmentPathText(raw json.RawMessage, path []string) (string, bool) {
 	if len(raw) == 0 {
-		return ""
-	}
-	if len(path) == 0 {
-		return attachmentFieldText(raw, "")
+		return "", false
 	}
 	var items []json.RawMessage
 	if json.Unmarshal(raw, &items) == nil {
 		lines := make([]string, 0, len(items))
 		for _, item := range items {
-			if s := attachmentPathText(item, path); s != "" {
-				lines = append(lines, s)
+			text, known := attachmentPathText(item, path)
+			if !known {
+				return "", false
+			}
+			if text != "" {
+				lines = append(lines, text)
 			}
 		}
-		return strings.Join(lines, "\n")
+		return strings.Join(lines, "\n"), true
+	}
+	if len(path) == 0 {
+		var text string
+		return text, json.Unmarshal(raw, &text) == nil
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(raw, &fields) != nil {
-		return ""
+		return "", false
 	}
-	return attachmentPathText(fields[path[0]], path[1:])
+	field, ok := fields[path[0]]
+	if !ok {
+		return "", false
+	}
+	return attachmentPathText(field, path[1:])
 }
 
 func attachmentFieldText(raw json.RawMessage, itemName string) string {
