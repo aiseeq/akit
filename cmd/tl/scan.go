@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
@@ -648,36 +647,30 @@ func (f *filter) inTimeWindow(ev transcript.Event) bool {
 }
 
 // rawSummary is what --raw matched beyond the listed events: the lines whose events in the window and --grep are
-// all of roles --role hides (hidden, of the roles), and the lines that carry no events at all; err is why the
-// database could not count it.
+// all of roles --role hides (hidden, of the roles); err is why the database could not count it.
 type rawSummary struct {
-	hidden, noEvents int
-	roles            []transcript.Role
-	err              error
+	hidden int
+	roles  []transcript.Role
+	err    error
 }
 
 // add is the summary of two sets of files.
 func (s rawSummary) add(o rawSummary) rawSummary {
 	s.hidden += o.hidden
-	s.noEvents += o.noEvents
 	s.roles = mergeRoles(s.roles, o.roles)
 	return s
 }
 
-// notes are the parts of the summary line about it.
+// notes is the part of the summary line about it.
 func (s rawSummary) notes() string {
-	var out string
-	if s.hidden > 0 {
-		roles := make([]string, len(s.roles))
-		for i, role := range s.roles {
-			roles[i] = string(role)
-		}
-		out += fmt.Sprintf("; %d line(s) matched --raw only in hidden roles (%s): --role all", s.hidden, strings.Join(roles, ", "))
+	if s.hidden == 0 {
+		return ""
 	}
-	if s.noEvents > 0 {
-		out += fmt.Sprintf("; %d matched line(s) carry no events", s.noEvents)
+	roles := make([]string, len(s.roles))
+	for i, role := range s.roles {
+		roles[i] = string(role)
 	}
-	return out
+	return fmt.Sprintf("; %d line(s) matched --raw only in hidden roles (%s): --role all", s.hidden, strings.Join(roles, ", "))
 }
 
 // mergeRoles is the roles of a and b once each, in the order of transcript.Roles.
@@ -804,10 +797,6 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 		}
 	}
 	meta, err := f.readEvents(src.Path, keep, consume)
-	var raw rawSummary
-	if err == nil {
-		raw, err = f.rawFileSummary(src.Path, lineRoles)
-	}
 	var waits []time.Duration
 	var waitRows []waitSample
 	if wt != nil {
@@ -817,54 +806,7 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 	if err != nil {
 		return out, waits, waitRows, meta, rawSummary{}, fmt.Errorf("read %s: %w", src.Path, err)
 	}
-	return out, waits, waitRows, meta, raw, nil
-}
-
-// rawFileSummary is the rawSummary of one file under --raw, none without it: lines are the roles of the events of
-// the lines --raw kept; the matched lines that carry no events take two more passes over the file, one over the
-// raw lines and one over all events.
-func (f *filter) rawFileSummary(path string, lines map[int]*rawLineRoles) (rawSummary, error) {
-	s := rawHiddenSummary(lines) // no lines without --raw
-	if f.rawRE == nil {
-		return s, nil
-	}
-	matched, err := rawLinesMatching(path, f.rawRE)
-	if err != nil {
-		return s, err
-	}
-	if _, err := transcript.ReadWithTools(path, nil, func(ev transcript.Event) { delete(matched, ev.Line) }); err != nil {
-		return s, fmt.Errorf("events of the --raw lines: %w", err)
-	}
-	s.noEvents = len(matched)
-	return s, nil
-}
-
-// rawLinesMatching returns the line numbers whose raw JSON matches --raw.
-func rawLinesMatching(path string, re *regexp.Regexp) (map[int]bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("raw lines for --raw: %w", err)
-	}
-	defer file.Close()
-	lines := map[int]bool{}
-	reader := bufio.NewReader(file)
-	line := 0
-	for {
-		part, err := reader.ReadBytes('\n')
-		if len(part) > 0 {
-			line++
-			if re.Match(part) {
-				lines[line] = true
-			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				return nil, err
-			}
-			break
-		}
-	}
-	return lines, nil
+	return out, waits, waitRows, meta, rawHiddenSummary(lineRoles), nil
 }
 
 func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Duration, []waitSample, transcript.Meta, error) {

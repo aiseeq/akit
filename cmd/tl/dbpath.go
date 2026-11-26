@@ -700,23 +700,22 @@ func (d *dbPath) rawSummaryQuery(inDB []stored) (chQuery, error) {
 }
 
 // rawSummarySQL counts in one pass what --raw (rawCond over the raw lines) matched beyond the listing: the matched
-// lines whose events that pass filter are all of hidden roles, the bits of those roles (bit i is
-// transcript.Roles[i]), and the matched lines with no events at all. A line counts only up to ev_lines of its file,
-// as the event listing does. The raw lines are read once, under the condition of the event query (rawFromSQL);
-// the events of the files are grouped by line without it, which costs far less than reading the raw lines again,
-// and filter stays in WHERE, where the ngram index of --grep answers.
+// lines whose events that pass filter are all of hidden roles, and the bits of those roles (bit i is
+// transcript.Roles[i]). A line counts only up to ev_lines of its file, as the event listing does. The raw lines are
+// read once, under the condition of the event query (rawFromSQL); the events of the files are grouped by line
+// without it, which costs far less than reading the raw lines again, and filter stays in WHERE, where the ngram
+// index of --grep answers.
 func rawSummarySQL(rawCond string, filter []string) string {
 	passing := ""
 	if len(filter) > 0 {
 		passing = " AND " + strings.Join(filter, " AND ")
 	}
 	const hiddenOnly = "kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0"
-	return "SELECT countIf(" + hiddenOnly + "), groupBitOrIf(roles, " + hiddenOnly + "), countIf(kept AND events = 0) " +
+	return "SELECT countIf(" + hiddenOnly + "), groupBitOrIf(roles, " + hiddenOnly + ") " +
 		"FROM (SELECT max(raw_match) AND line <= transform(file_id, {files:Array(UInt64)}, {ev_lines:Array(UInt64)}, toUInt64(0)) AS kept, " +
-		"groupBitOr(role_bit) AS roles, sum(event) AS events FROM (" +
-		"SELECT file_id, line, true AS raw_match, toUInt16(0) AS role_bit, toUInt8(0) AS event " + rawFromSQL + rawCond +
-		" UNION ALL SELECT file_id, line, false, toUInt16(0), toUInt8(1) FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)}" +
-		" UNION ALL SELECT file_id, line, false, bitShiftLeft(toUInt16(1), indexOf({role_names:Array(String)}, toString(role)) - 1), toUInt8(0) " +
+		"groupBitOr(role_bit) AS roles FROM (" +
+		"SELECT file_id, line, true AS raw_match, toUInt16(0) AS role_bit " + rawFromSQL + rawCond +
+		" UNION ALL SELECT file_id, line, false, bitShiftLeft(toUInt16(1), indexOf({role_names:Array(String)}, toString(role)) - 1) " +
 		"FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)}" + passing + ") GROUP BY file_id, line)"
 }
 
@@ -733,11 +732,11 @@ func roleBits(roles map[transcript.Role]bool) uint16 {
 
 // parseRawSummary reads the one row of rawSummarySQL; the roles it names are those visible does not show.
 func parseRawSummary(rows [][]string, visible map[transcript.Role]bool) rawSummary {
-	if len(rows) != 1 || len(rows[0]) != 3 {
-		return rawSummary{err: fmt.Errorf("raw-hidden: got %d rows, want one row of 3 fields", len(rows))}
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		return rawSummary{err: fmt.Errorf("raw-hidden: got %d rows, want one row of 2 fields", len(rows))}
 	}
 	p := fields{row: rows[0]}
-	out := rawSummary{hidden: p.int(0), noEvents: p.int(2)}
+	out := rawSummary{hidden: p.int(0)}
 	bits := p.uint(1)
 	if p.err != nil {
 		return rawSummary{err: fmt.Errorf("raw-hidden: %w", p.err)}

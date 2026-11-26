@@ -372,7 +372,6 @@ func (s *fakeCH) rawHidden(q url.Values, sql string, row func(...any)) {
 		line int
 	}
 	matched := map[lineKey]bool{}
-	events := map[lineKey]int{}
 	bits := map[lineKey]uint64{}
 	for _, f := range s.files {
 		for i := range min(f.evLines, len(f.raw)) {
@@ -382,23 +381,19 @@ func (s *fakeCH) rawHidden(q url.Values, sql string, row func(...any)) {
 		}
 		for _, event := range f.events {
 			key := lineKey{f.id, event.ev.Line}
-			events[key]++
 			if s.match(all, sql, f, event) {
 				bits[key] |= 1 << slices.Index(names, string(event.ev.Role))
 			}
 		}
 	}
-	count, noEvents, roles := 0, 0, uint64(0)
+	count, roles := 0, uint64(0)
 	for key := range matched {
-		switch {
-		case events[key] == 0:
-			noEvents++
-		case bits[key] != 0 && bits[key]&visible == 0:
+		if bits[key] != 0 && bits[key]&visible == 0 {
 			count++
 			roles |= bits[key]
 		}
 	}
-	row(count, roles, noEvents)
+	row(count, roles)
 }
 
 func (s *fakeCH) rawMatch(q url.Values, f *chFile, line int) bool {
@@ -832,7 +827,6 @@ func TestRawHiddenSummaryWithVisibleEventsAndFilters(t *testing.T) {
 		{"events-and-hidden", []string{"--all", "--raw", "hidden-model|mixed-model", "--max", "0"}, "1 line(s) matched --raw only in hidden roles (think, cmd): --role all"},
 		{"time-excludes-hidden", []string{"--all", "--raw", "hidden-model", "--since", "2026-10-26", "--max", "0"}, ""},
 		{"grep-excludes-hidden", []string{"--all", "--raw", "hidden-model", "--grep", "^$", "--max", "0"}, ""},
-		{"eventless", []string{"--all", "--raw", "empty-model", "--max", "0"}, "1 matched line(s) carry no events"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			code, out, errOut := runTL(t, e, test.args...)
@@ -902,19 +896,6 @@ func TestRawHiddenSummaryDeduplicatesMergedRoles(t *testing.T) {
 	}
 }
 
-func TestRawNoEventsSummaryDB(t *testing.T) {
-	e, paths := rawHiddenCorpus(t)
-	ch := newFakeCH(t, paths, map[string]int{})
-	srv := httptest.NewServer(ch)
-	defer srv.Close()
-	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	e.backend = backendDB
-	code, out, errOut := runTL(t, e, "--all", "--raw", "empty-model", "--max", "0")
-	if code != exitNone || !strings.Contains(out, "1 matched line(s) carry no events") || !slices.Contains(ch.requests(), "raw-hidden") {
-		t.Fatalf("eventless raw summary missing: exit=%d out=%q stderr=%q requests=%v", code, out, errOut, ch.requests())
-	}
-}
-
 // TestRawSummarySQL pins the text of the one-pass summary: the fake server answers it from its own count, so a
 // change of a condition in the query is caught here and not by the summary line.
 func TestRawSummarySQL(t *testing.T) {
@@ -927,13 +908,12 @@ func TestRawSummarySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	const want = "SELECT countIf(kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0), " +
-		"groupBitOrIf(roles, kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0), countIf(kept AND events = 0) " +
+		"groupBitOrIf(roles, kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0) " +
 		"FROM (SELECT max(raw_match) AND line <= transform(file_id, {files:Array(UInt64)}, {ev_lines:Array(UInt64)}, toUInt64(0)) AS kept, " +
-		"groupBitOr(role_bit) AS roles, sum(event) AS events FROM (" +
-		"SELECT file_id, line, true AS raw_match, toUInt16(0) AS role_bit, toUInt8(0) AS event FROM raw WHERE file_id IN {files:Array(UInt64)} AND " +
+		"groupBitOr(role_bit) AS roles FROM (" +
+		"SELECT file_id, line, true AS raw_match, toUInt16(0) AS role_bit FROM raw WHERE file_id IN {files:Array(UInt64)} AND " +
 		"multiSearchAnyCaseInsensitiveUTF8(raw, {rawlit0:Array(String)}) AND multiSearchAnyCaseInsensitiveUTF8(raw, {rawlit1:Array(String)}) AND match(raw, {raw:String}) " +
-		"UNION ALL SELECT file_id, line, false, toUInt16(0), toUInt8(1) FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} " +
-		"UNION ALL SELECT file_id, line, false, bitShiftLeft(toUInt16(1), indexOf({role_names:Array(String)}, toString(role)) - 1), toUInt8(0) " +
+		"UNION ALL SELECT file_id, line, false, bitShiftLeft(toUInt16(1), indexOf({role_names:Array(String)}, toString(role)) - 1) " +
 		"FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} AND ts >= {since:DateTime64(3, 'UTC')} AND " +
 		"ts <= {until:DateTime64(3, 'UTC')} AND (hasAllTokens(hay, {hay0_0:Array(String)})) AND match(concat(who, ' ', text), {grep:String})) " +
 		"GROUP BY file_id, line)"
@@ -975,54 +955,14 @@ func TestRawSummaryWithoutFilters(t *testing.T) {
 func TestParseRawSummary(t *testing.T) {
 	visible := map[transcript.Role]bool{transcript.User: true}
 	// bits 0 (user, shown), 4 (think) and 5 (cmd)
-	got := parseRawSummary([][]string{{"3", "49", "2"}}, visible)
-	if got.err != nil || got.hidden != 3 || got.noEvents != 2 || !slices.Equal(got.roles, []transcript.Role{transcript.Think, transcript.Cmd}) {
+	got := parseRawSummary([][]string{{"3", "49"}}, visible)
+	if got.err != nil || got.hidden != 3 || !slices.Equal(got.roles, []transcript.Role{transcript.Think, transcript.Cmd}) {
 		t.Errorf("parseRawSummary = %+v", got)
 	}
-	for _, rows := range [][][]string{nil, {{"1", "2"}}, {{"1", "x", "2"}}, {{"1", "2", "3"}, {"1", "2", "3"}}} {
+	for _, rows := range [][][]string{nil, {{"1"}}, {{"1", "x"}}, {{"1", "2", "3"}}, {{"1", "2"}, {"1", "2"}}} {
 		if parseRawSummary(rows, visible).err == nil {
 			t.Errorf("parseRawSummary(%q) took a malformed answer", rows)
 		}
-	}
-}
-
-func TestRawNoEventsSummarySumsAcrossFiles(t *testing.T) {
-	e, paths := rawHiddenCorpus(t)
-	second := writeReviewClaude(t, e, "-home-x-other", "7a7b8c9d-0000-4000-8000-000000000006",
-		`{"type":"api-request","model":"empty-model"}`)
-	paths = append(paths, second)
-	for _, backend := range []string{backendFiles, backendDB} {
-		t.Run(backend, func(t *testing.T) {
-			e.backend = backend
-			if backend == backendDB {
-				srv := httptest.NewServer(newFakeCH(t, paths, map[string]int{}))
-				defer srv.Close()
-				t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-			}
-			code, out, errOut := runTL(t, e, "--all", "--raw", "empty-model", "--max", "0")
-			if code != exitNone || !strings.Contains(out, "; 2 matched line(s) carry no events") {
-				t.Fatalf("eventless lines of two files: exit=%d out=%q stderr=%q", code, out, errOut)
-			}
-		})
-	}
-}
-
-func TestRawNoEventsSummarySkipsLinesWithEvents(t *testing.T) {
-	e, paths := rawHiddenCorpus(t)
-	for _, backend := range []string{backendFiles, backendDB} {
-		t.Run(backend, func(t *testing.T) {
-			e.backend = backend
-			if backend == backendDB {
-				srv := httptest.NewServer(newFakeCH(t, paths, map[string]int{}))
-				defer srv.Close()
-				t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-			}
-			// three matched lines: hidden events only, a shown event, and no events
-			code, out, errOut := runTL(t, e, "--all", "--raw", "hidden-model|mixed-model|empty-model", "--max", "0")
-			if code != 0 || !strings.Contains(out, "; 1 matched line(s) carry no events") {
-				t.Fatalf("eventless count beside lines with events: exit=%d out=%q stderr=%q", code, out, errOut)
-			}
-		})
 	}
 }
 
@@ -1930,5 +1870,64 @@ func TestFakeGrepFoldedAlternateKeepsUnfoldableBranch(t *testing.T) {
 	got := ch.match(q, cond, &chFile{id: 1, kind: "claude"}, chEvent{ev: transcript.Event{Role: transcript.User, Text: "ſ"}})
 	if !got || !regexp.MustCompile("(?i)"+pattern).MatchString("ſ") {
 		t.Fatalf("folded alternative rejected its long-s branch: condition %q, got %v", cond, got)
+	}
+}
+
+// rawSummaryLine runs tl over paths on the files or the database path and returns its last output line.
+func rawSummaryLine(t *testing.T, e env, paths []string, backend string, args ...string) string {
+	t.Helper()
+	e.backend = backend
+	if backend == backendDB {
+		srv := httptest.NewServer(newFakeCH(t, paths, map[string]int{}))
+		defer srv.Close()
+		t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	}
+	code, out, errOut := runTL(t, e, args...)
+	if code != 0 && code != exitNone {
+		t.Fatalf("exit %d: %s\n%s", code, errOut, out)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	return lines[len(lines)-1]
+}
+
+// TestRawSummaryKeepsToTheWindow: the summary of a window does not change when matched lines are added outside it.
+func TestRawSummaryKeepsToTheWindow(t *testing.T) {
+	e := fakeHome(t)
+	path := writeReviewClaude(t, e, "-home-x-window", "6a7b8c9d-0000-4000-8000-000000000007",
+		rawModelRecord("2020-01-01T10:00:00Z", "window-model", false),
+		`{"type":"api-request","timestamp":"2026-10-25T10:00:00Z","model":"window-model"}`,
+		rawModelRecord("2026-10-25T10:00:01Z", "window-model", false),
+	)
+	const want = "agent); 1 line(s) matched --raw only in hidden roles (think, cmd): --role all"
+	for _, backend := range []string{backendFiles, backendDB} {
+		t.Run(backend, func(t *testing.T) {
+			got := rawSummaryLine(t, e, []string{path}, backend, "--all", "--raw", "window-model",
+				"--since", "2020-01-01T00:00:00Z", "--until", "2020-01-02T00:00:00Z", "--max", "0")
+			if !strings.HasSuffix(got, want) {
+				t.Errorf("summary of a 2020 window:\n got %s\nwant %s", got, want)
+			}
+		})
+	}
+}
+
+// TestRawSummaryMatchesLinesWithoutNewline: the summary applies --raw to a line without its newline, as the event
+// listing and the database loader do.
+func TestRawSummaryMatchesLinesWithoutNewline(t *testing.T) {
+	e := fakeHome(t)
+	path := writeReviewClaude(t, e, "-home-x-newline", "6a7b8c9d-0000-4000-8000-000000000008",
+		`{"type":"api-request","model":"empty-model"}`,
+		rawModelRecord("2026-10-25T10:10:00Z", "hidden-model", false),
+	)
+	for _, backend := range []string{backendFiles, backendDB} {
+		for _, test := range []struct{ raw, want string }{
+			{`empty-model"}\n`, "agent)"},
+			{`hidden-model.*}$`, "agent); 1 line(s) matched --raw only in hidden roles (think, cmd): --role all"},
+		} {
+			t.Run(backend+"/"+test.raw, func(t *testing.T) {
+				if got := rawSummaryLine(t, e, []string{path}, backend, "--all", "--raw", test.raw, "--max", "0"); !strings.HasSuffix(got, test.want) {
+					t.Errorf("summary of --raw %s:\n got %s\nwant %s", test.raw, got, test.want)
+				}
+			})
+		}
 	}
 }
