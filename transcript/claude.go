@@ -86,6 +86,7 @@ func (u *usage) priced() *price.Usage {
 
 // attachment — вложение: тип, реплика из очереди и поля, в которых бывает его сообщение.
 type attachment struct {
+	Raw      json.RawMessage `json:"-"`
 	Type     string          `json:"type"`
 	Prompt   json.RawMessage `json:"prompt"`
 	Origin   *origin         `json:"origin"`
@@ -96,6 +97,14 @@ type attachment struct {
 	Filename json.RawMessage `json:"filename"`
 	Path     json.RawMessage `json:"path"`
 	Skills   json.RawMessage `json:"skills"`
+}
+
+var attachmentTextPaths = map[string][][]string{
+	"instructions":           {{"files", "content"}},
+	"mcp_instructions_delta": {{"addedBlocks"}},
+	"hook_blocking_error":    {{"blockingError", "blockingError"}},
+	"file":                   {{"content", "file", "content"}},
+	"nested_memory":          {{"content", "content"}},
 }
 
 type part struct {
@@ -185,6 +194,7 @@ func attached(raw json.RawMessage, ev func(Role, string, string) Event) []Event 
 	if len(raw) == 0 || json.Unmarshal(raw, &a) != nil || a.Type == "" {
 		return nil
 	}
+	a.Raw = raw
 	if a.Type == "queued_command" {
 		kind := ""
 		if a.Origin != nil {
@@ -206,12 +216,47 @@ func (a *attachment) text() string {
 	for _, field := range []struct {
 		raw      json.RawMessage
 		itemName string
-	}{{a.Content, ""}, {a.Text, ""}, {a.Stdout, ""}, {a.Snippet, ""}, {a.Prompt, ""}, {a.Filename, ""}, {a.Path, ""}, {a.Skills, "name"}} {
+	}{{a.Content, ""}, {a.Text, ""}, {a.Stdout, ""}, {a.Snippet, ""}, {a.Prompt, ""}, {a.Skills, "name"}} {
 		if s := attachmentFieldText(field.raw, field.itemName); s != "" {
 			return s
 		}
 	}
+	// Nested attachment payloads share the same path walker; array traversal preserves item order.
+	for _, path := range attachmentTextPaths[a.Type] {
+		if s := attachmentPathText(a.Raw, path); s != "" {
+			return s
+		}
+	}
+	for _, raw := range []json.RawMessage{a.Filename, a.Path} {
+		if s := attachmentFieldText(raw, ""); s != "" {
+			return s
+		}
+	}
 	return ""
+}
+
+func attachmentPathText(raw json.RawMessage, path []string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if len(path) == 0 {
+		return attachmentFieldText(raw, "")
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) == nil {
+		lines := make([]string, 0, len(items))
+		for _, item := range items {
+			if s := attachmentPathText(item, path); s != "" {
+				lines = append(lines, s)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return ""
+	}
+	return attachmentPathText(fields[path[0]], path[1:])
 }
 
 func attachmentFieldText(raw json.RawMessage, itemName string) string {
@@ -235,10 +280,16 @@ func attachmentFieldText(raw json.RawMessage, itemName string) string {
 		if itemName == "" || json.Unmarshal(item, &named) != nil {
 			return ""
 		}
-		if s := str(named[itemName]); s != "" {
-			lines = append(lines, s)
-		} else {
+		nameRaw := bytes.TrimSpace(named[itemName])
+		if len(nameRaw) == 0 || nameRaw[0] != '"' {
 			return ""
+		}
+		var name string
+		if json.Unmarshal(nameRaw, &name) != nil {
+			return ""
+		}
+		if name != "" {
+			lines = append(lines, name)
 		}
 	}
 	return strings.Join(lines, "\n")

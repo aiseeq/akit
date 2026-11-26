@@ -3,7 +3,7 @@ module github.com/aiseeq/akit
 go 1.26.0
 
 require (
-	github.com/chromedp/cdproto v0.160.10
+	github.com/chromedp/cdproto v0.160.11
 	github.com/chromedp/chromedp v0.24.0
 	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0

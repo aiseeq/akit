@@ -72,3 +72,59 @@ func TestAttachmentTextArrayWithNullStaysEmpty(t *testing.T) {
 		}
 	}
 }
+
+func TestAttachmentTextNestedForms(t *testing.T) {
+	tests := []struct {
+		name, value, want string
+	}{
+		{
+			name:  "instructions file contents",
+			value: `{"type":"instructions","files":[{"name":"one.md","content":"first instruction"},{"name":"two.md","content":"second instruction"}]}`,
+			want:  "first instruction\nsecond instruction",
+		},
+		{
+			name:  "MCP instruction blocks",
+			value: `{"type":"mcp_instructions_delta","addedBlocks":["first block","second block"]}`,
+			want:  "first block\nsecond block",
+		},
+		{
+			name:  "blocking hook error",
+			value: `{"type":"hook_blocking_error","blockingError":{"blockingError":"hook failed with a useful explanation"}}`,
+			want:  "hook failed with a useful explanation",
+		},
+		{
+			name:  "nested file contents",
+			value: `{"type":"file","content":{"file":{"content":"file body"}},"filename":"example.txt"}`,
+			want:  "file body",
+		},
+		{
+			name:  "file fallback",
+			value: `{"type":"file","filename":"example.txt"}`,
+			want:  "example.txt",
+		},
+		{
+			name:  "nested memory contents",
+			value: `{"type":"nested_memory","content":{"content":"memory body"},"path":"memory.md"}`,
+			want:  "memory body",
+		},
+		{
+			name:  "nested memory fallback",
+			value: `{"type":"nested_memory","path":"memory.md"}`,
+			want:  "memory.md",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parsedAttachmentText(t, tt.value); got != tt.want {
+				t.Fatalf("text = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAttachmentTextSkillsSkipsUnnamedObjects(t *testing.T) {
+	got := parsedAttachmentText(t, `{"type":"invoked_skills","skills":[{"name":"alpha-skill"},{"name":""},{"name":"beta-skill"}]}`)
+	if want := "alpha-skill\nbeta-skill"; got != want {
+		t.Fatalf("text = %q, want %q", got, want)
+	}
+}
