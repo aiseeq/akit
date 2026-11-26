@@ -500,10 +500,7 @@ type where struct {
 }
 
 func (d *dbPath) where(ids []uint64, kinds []string) (where, error) {
-	return d.whereOpts(ids, kinds, d.opts)
-}
-
-func (d *dbPath) whereOpts(ids []uint64, kinds []string, opts options) (where, error) {
+	opts := d.opts
 	w := where{params: map[string]string{}, settings: url.Values{}}
 	roles := make([]string, 0, len(opts.roles))
 	for _, r := range transcript.Roles {
@@ -515,38 +512,53 @@ func (d *dbPath) whereOpts(ids []uint64, kinds []string, opts options) (where, e
 	w.params["kinds"] = chStrings(kinds)
 	w.params["roles"] = chStrings(roles)
 	conds := []string{"file_id IN {files:Array(UInt64)}", "kind IN {kinds:Array(String)}", "role IN {roles:Array(String)}"}
+	filter, err := eventFilter(opts, w.params)
+	if err != nil {
+		return w, err
+	}
+	conds = append(conds, filter...)
+	if opts.raw != "" {
+		cond, params, err := rawCondition(opts.raw)
+		if err != nil {
+			return w, err
+		}
+		conds = append(conds, "(file_id, line) IN (SELECT file_id, line "+rawFromSQL+cond+")")
+		maps.Copy(w.params, params)
+		maps.Copy(w.settings, rawSettings)
+	}
+	w.sql = strings.Join(conds, " AND ")
+	return w, nil
+}
+
+// rawFromSQL is the raw lines of the files that pass the condition after it: the event query and the raw summary
+// select the lines of --raw the same way.
+const rawFromSQL = "FROM raw WHERE file_id IN {files:Array(UInt64)} AND "
+
+// eventFilter is the conditions of --since, --until and --grep over the events table; their parameters go to params.
+func eventFilter(opts options, params map[string]string) ([]string, error) {
+	var conds []string
 	if !opts.since.IsZero() {
 		// ts holds milliseconds: an event at the same millisecond as since but before it in finer time is out
 		since := opts.since.Truncate(time.Millisecond)
 		if since.Before(opts.since) {
 			since = since.Add(time.Millisecond)
 		}
-		w.params["since"] = chTime(since)
+		params["since"] = chTime(since)
 		conds = append(conds, "ts >= {since:DateTime64(3, 'UTC')}")
 	}
 	if !opts.until.IsZero() {
-		w.params["until"] = chTime(opts.until)
+		params["until"] = chTime(opts.until)
 		conds = append(conds, "ts <= {until:DateTime64(3, 'UTC')}")
 	}
 	if opts.grep != "" {
-		cond, params, err := grepCondition(opts.grep)
+		cond, grepParams, err := grepCondition(opts.grep)
 		if err != nil {
-			return w, err
+			return nil, err
 		}
 		conds = append(conds, cond)
-		maps.Copy(w.params, params)
+		maps.Copy(params, grepParams)
 	}
-	if opts.raw != "" {
-		cond, params, err := rawCondition(opts.raw)
-		if err != nil {
-			return w, err
-		}
-		conds = append(conds, "(file_id, line) IN (SELECT file_id, line FROM raw WHERE file_id IN {files:Array(UInt64)} AND "+cond+")")
-		maps.Copy(w.params, params)
-		maps.Copy(w.settings, rawSettings)
-	}
-	w.sql = strings.Join(conds, " AND ")
-	return w, nil
+	return conds, nil
 }
 
 // stored is a source and what the database has of it.
@@ -592,21 +604,11 @@ func (d *dbPath) result(sources []source) (result, error) {
 	}
 	var all []sortedHit
 	var hitsErr error
-	type rawSummary struct {
-		count, noEvents int
-		roles           []transcript.Role
-		err             error
-	}
-	rawDone := make(chan rawSummary, 1)
+	var rawDone <-chan rawSummary
 	if missing == nil && len(inDB) > 0 {
-		if d.opts.raw != "" && !d.opts.usage {
-			go func() {
-				rawCtx, cancel := context.WithTimeout(d.ctx, dbQueryTimeout/2)
-				defer cancel()
-				count, roles, noEvents, err := d.hiddenRawMatches(rawCtx, inDB)
-				rawDone <- rawSummary{count, noEvents, roles, err}
-			}()
-		}
+		var cancelRaw context.CancelFunc
+		rawDone, cancelRaw = d.startRawSummary(inDB)
+		defer cancelRaw()
 		all, hitsErr = d.storedHits(inDB)
 	}
 	res := <-links
@@ -619,9 +621,8 @@ func (d *dbPath) result(sources []source) (result, error) {
 	if hitsErr != nil {
 		return res, hitsErr
 	}
-	if d.opts.raw != "" && !d.opts.usage && len(inDB) > 0 {
-		raw := <-rawDone
-		res.rawHidden, res.rawRoles, res.rawNoEvents, res.rawErr = raw.count, raw.roles, raw.noEvents, raw.err
+	if rawDone != nil {
+		res.raw = <-rawDone
 	}
 	bad := map[string]badLines{}
 	if err := d.badLines(inDB, bad); err != nil {
@@ -644,108 +645,109 @@ func (d *dbPath) result(sources []source) (result, error) {
 	return res, nil
 }
 
-// hiddenRawMatches counts hidden-only and eventless raw matches on the server.
-func (d *dbPath) hiddenRawMatches(ctx context.Context, inDB []stored) (int, []transcript.Role, int, error) {
-	visible := make([]string, 0, len(d.opts.roles))
-	for _, role := range transcript.Roles {
-		if d.opts.roles[role] {
-			visible = append(visible, string(role))
-		}
+// startRawSummary counts on the server, beside the event query, what --raw matched but the listing leaves out
+// (rawSummary). The channel is nil when there is nothing to count: no --raw, or --usage, whose report has no such
+// note. The cancel func stops the count once the call no longer waits for it.
+func (d *dbPath) startRawSummary(inDB []stored) (<-chan rawSummary, context.CancelFunc) {
+	if d.opts.raw == "" || d.opts.usage {
+		return nil, func() {}
 	}
-	if len(inDB) == 0 {
-		return 0, nil, 0, nil
+	// a slow count drops only the note, so it gives up well before the call does
+	ctx, cancel := context.WithTimeout(d.ctx, dbQueryTimeout/2)
+	done := make(chan rawSummary, 1)
+	go func() { done <- d.rawSummary(ctx, inDB) }()
+	return done, cancel
+}
+
+func (d *dbPath) rawSummary(ctx context.Context, inDB []stored) rawSummary {
+	q, err := d.rawSummaryQuery(inDB)
+	if err != nil {
+		return rawSummary{err: err}
 	}
-	ids := make([]uint64, 0, len(inDB))
+	rows, err := d.queryIn(ctx, q)
+	if err != nil {
+		return rawSummary{err: err}
+	}
+	return parseRawSummary(rows, d.opts.roles)
+}
+
+// rawSummaryQuery is rawSummarySQL over the files of inDB with the filters of the call.
+func (d *dbPath) rawSummaryQuery(inDB []stored) (chQuery, error) {
+	ids := make([]uint64, len(inDB))
+	evLines := make([]uint64, len(inDB))
 	kindSet := map[string]bool{}
-	evLines := make(map[uint64]int, len(inDB))
-	for _, stored := range inDB {
-		ids = append(ids, stored.file.id)
-		kind := stored.file.kind
-		if kind == "" {
-			kind = kindOfSource(stored.src)
+	for i, s := range inDB {
+		ids[i], evLines[i] = s.file.id, uint64(s.file.evLines)
+		kindSet[storedKind(s)] = true
+	}
+	names := make([]string, len(transcript.Roles))
+	for i, role := range transcript.Roles {
+		names[i] = string(role)
+	}
+	params := map[string]string{"files": chUints(ids), "ev_lines": chUints(evLines),
+		"kinds": chStrings(slices.Sorted(maps.Keys(kindSet))), "role_names": chStrings(names),
+		"visible": strconv.FormatUint(uint64(roleBits(d.opts.roles)), 10)}
+	rawCond, rawParams, err := rawCondition(d.opts.raw)
+	if err != nil {
+		return chQuery{}, err
+	}
+	maps.Copy(params, rawParams)
+	filter, err := eventFilter(d.opts, params)
+	if err != nil {
+		return chQuery{}, err
+	}
+	return chQuery{Name: "raw-hidden", SQL: rawSummarySQL(rawCond, filter), Params: params, Settings: rawSettings}, nil
+}
+
+// rawSummarySQL counts in one pass what --raw (rawCond over the raw lines) matched beyond the listing: the matched
+// lines whose events that pass filter are all of hidden roles, the bits of those roles (bit i is
+// transcript.Roles[i]), and the matched lines with no events at all. A line counts only up to ev_lines of its file,
+// as the event listing does. The raw lines are read once, under the condition of the event query (rawFromSQL);
+// the events of the files are grouped by line without it, which costs far less than reading the raw lines again,
+// and filter stays in WHERE, where the ngram index of --grep answers.
+func rawSummarySQL(rawCond string, filter []string) string {
+	passing := ""
+	if len(filter) > 0 {
+		passing = " AND " + strings.Join(filter, " AND ")
+	}
+	const hiddenOnly = "kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0"
+	return "SELECT countIf(" + hiddenOnly + "), groupBitOrIf(roles, " + hiddenOnly + "), countIf(kept AND events = 0) " +
+		"FROM (SELECT max(raw_match) AND line <= transform(file_id, {files:Array(UInt64)}, {ev_lines:Array(UInt64)}, toUInt64(0)) AS kept, " +
+		"groupBitOr(role_bit) AS roles, sum(event) AS events FROM (" +
+		"SELECT file_id, line, true AS raw_match, toUInt16(0) AS role_bit, toUInt8(0) AS event " + rawFromSQL + rawCond +
+		" UNION ALL SELECT file_id, line, false, toUInt16(0), toUInt8(1) FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)}" +
+		" UNION ALL SELECT file_id, line, false, bitShiftLeft(toUInt16(1), indexOf({role_names:Array(String)}, toString(role)) - 1), toUInt8(0) " +
+		"FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)}" + passing + ") GROUP BY file_id, line)"
+}
+
+// roleBits is the set of roles as the bits of rawSummarySQL.
+func roleBits(roles map[transcript.Role]bool) uint16 {
+	var bits uint16
+	for i, role := range transcript.Roles {
+		if roles[role] {
+			bits |= 1 << i
 		}
-		kindSet[kind] = true
-		evLines[stored.file.id] = stored.file.evLines
 	}
-	kinds := slices.Sorted(maps.Keys(kindSet))
-	opts := d.opts
-	opts.roles = make(map[transcript.Role]bool, len(transcript.Roles))
-	for _, role := range transcript.Roles {
-		opts.roles[role] = true
-	}
-	pattern := opts.raw
-	opts.raw = ""
-	opts.since, opts.until, opts.grep = time.Time{}, time.Time{}, ""
-	w, err := d.whereOpts(ids, kinds, opts)
-	if err != nil {
-		return 0, nil, 0, err
-	}
-	w.params["visible_roles"] = chStrings(visible)
-	rawCond, rawParams, err := rawCondition(pattern)
-	if err != nil {
-		return 0, nil, 0, err
-	}
-	maps.Copy(w.params, rawParams)
-	maps.Copy(w.settings, rawSettings)
-	var lineLimits []string
-	for id, lines := range evLines {
-		lineLimits = append(lineLimits, fmt.Sprintf("(file_id = %d AND line <= %d)", id, lines))
-	}
-	slices.Sort(lineLimits)
-	lineLimit := "(" + strings.Join(lineLimits, " OR ") + ")"
-	eventOpts := d.opts
-	eventOpts.raw = ""
-	eventOpts.roles = opts.roles
-	filtered, err := d.whereOpts(ids, kinds, eventOpts)
-	if err != nil {
-		return 0, nil, 0, err
-	}
-	for key, value := range filtered.params {
-		if _, exists := w.params[key]; !exists {
-			w.params[key] = value
-		}
-	}
-	eventFilter := strings.TrimPrefix(filtered.sql, "file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} AND role IN {roles:Array(String)}")
-	eventFilter = strings.TrimPrefix(eventFilter, " AND ")
-	if eventFilter == "" {
-		eventFilter = "1"
-	}
-	sql := "WITH raw_lines AS (SELECT file_id, line FROM raw WHERE file_id IN {files:Array(UInt64)} AND " + lineLimit + " AND " + rawCond + "), " +
-		"line_roles AS (SELECT file_id, line, groupUniqArrayIf(role, " + eventFilter + ") AS roles, count() AS event_count " +
-		"FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} AND " + lineLimit +
-		" AND (file_id, line) IN (SELECT file_id, line FROM raw_lines) GROUP BY file_id, line) " +
-		"SELECT countIf(notEmpty(roles) AND NOT hasAny(roles, {visible_roles:Array(String)})), " +
-		"arrayStringConcat(groupUniqArrayArrayIf(roles, notEmpty(roles) AND NOT hasAny(roles, {visible_roles:Array(String)})), ','), " +
-		"countIf(event_count = 0) FROM raw_lines LEFT JOIN line_roles USING (file_id, line)"
-	rows, err := d.queryIn(ctx, chQuery{Name: "raw-hidden", SQL: sql, Params: w.params, Settings: w.settings})
-	if err != nil {
-		return 0, nil, 0, err
-	}
+	return bits
+}
+
+// parseRawSummary reads the one row of rawSummarySQL; the roles it names are those visible does not show.
+func parseRawSummary(rows [][]string, visible map[transcript.Role]bool) rawSummary {
 	if len(rows) != 1 || len(rows[0]) != 3 {
-		return 0, nil, 0, fmt.Errorf("raw-hidden: got %d rows, want one aggregate row", len(rows))
+		return rawSummary{err: fmt.Errorf("raw-hidden: got %d rows, want one row of 3 fields", len(rows))}
 	}
 	p := fields{row: rows[0]}
-	count := p.int(0)
+	out := rawSummary{hidden: p.int(0), noEvents: p.int(2)}
+	bits := p.uint(1)
 	if p.err != nil {
-		return 0, nil, 0, fmt.Errorf("raw-hidden: %w", p.err)
+		return rawSummary{err: fmt.Errorf("raw-hidden: %w", p.err)}
 	}
-	roleSet := map[transcript.Role]bool{}
-	for name := range strings.SplitSeq(rows[0][1], ",") {
-		if name != "" {
-			roleSet[transcript.Role(name)] = true
+	for i, role := range transcript.Roles {
+		if bits&(1<<i) != 0 && !visible[role] {
+			out.roles = append(out.roles, role)
 		}
 	}
-	var roles []transcript.Role
-	for _, role := range transcript.Roles {
-		if roleSet[role] && !d.opts.roles[role] {
-			roles = append(roles, role)
-		}
-	}
-	noEvents, err := strconv.Atoi(rows[0][2])
-	if err != nil {
-		return 0, nil, 0, fmt.Errorf("raw-hidden eventless count: %w", err)
-	}
-	return count, roles, noEvents, nil
+	return out
 }
 
 // badLines are the unparsable lines of one file that pass the active raw prefilter.
@@ -905,17 +907,21 @@ func dbEvent(line int, ms int64, role, who, text string) transcript.Event {
 		Line: line, Time: msToTime(ms), Role: transcript.Role(role), Who: who, Text: text}
 }
 
+// storedKind is the kind of a stored file, from its source when the row has none.
+func storedKind(s stored) string {
+	if s.file.kind != "" {
+		return s.file.kind
+	}
+	return kindOfSource(s.src)
+}
+
 func (d *dbPath) storedHits(inDB []stored) ([]sortedHit, error) {
 	ids := make([]uint64, 0, len(inDB))
 	kindSet := map[string]bool{}
 	byID := make(map[uint64]stored, len(inDB))
 	for _, s := range inDB {
 		ids = append(ids, s.file.id)
-		kind := s.file.kind
-		if kind == "" {
-			kind = kindOfSource(s.src)
-		}
-		kindSet[kind] = true
+		kindSet[storedKind(s)] = true
 		byID[s.file.id] = s
 	}
 	kinds := slices.Sorted(maps.Keys(kindSet))

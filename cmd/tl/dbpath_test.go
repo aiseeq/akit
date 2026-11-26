@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -265,64 +266,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				f.mtime.Unix()*1000, ms(f.first), f.session, f.parent, f.kind, f.project, f.cwd)
 		}
 	case "raw-hidden":
-		if strings.Count(sql, "FROM raw WHERE") != 1 || !strings.Contains(sql, "groupUniqArrayArrayIf") || !strings.Contains(sql, "line <=") {
-			s.t.Errorf("raw-hidden query does not aggregate hidden-only lines: %s", sql)
-		}
-		type lineKey struct {
-			file uint64
-			line int
-		}
-		lineRoles := map[lineKey]map[transcript.Role]bool{}
-		eventCounts := map[lineKey]int{}
-		visible := chArray(param("visible_roles"))
-		for _, f := range s.files {
-			for i := 0; i < min(f.evLines, len(f.raw)); i++ {
-				if s.rawMatch(q, f, i+1) {
-					lineRoles[lineKey{f.id, i + 1}] = map[transcript.Role]bool{}
-				}
-			}
-			for _, event := range f.events {
-				if event.ev.Line > f.evLines {
-					continue
-				}
-				key := lineKey{f.id, event.ev.Line}
-				eventCounts[key]++
-				if !s.match(q, sql, f, event) {
-					continue
-				}
-				if lineRoles[key] == nil {
-					lineRoles[key] = map[transcript.Role]bool{}
-				}
-				lineRoles[key][event.ev.Role] = true
-			}
-		}
-		count, noEvents, roles := 0, 0, map[transcript.Role]bool{}
-		for key, found := range lineRoles {
-			if eventCounts[key] == 0 {
-				noEvents++
-				continue
-			}
-			showable := false
-			for _, role := range visible {
-				if found[transcript.Role(role)] {
-					showable = true
-				}
-			}
-			if showable {
-				continue
-			}
-			count++
-			for role := range found {
-				roles[role] = true
-			}
-		}
-		var names []string
-		for _, role := range transcript.Roles {
-			if roles[role] {
-				names = append(names, string(role))
-			}
-		}
-		row(count, strings.Join(names, ","), noEvents)
+		s.rawHidden(q, sql, row)
 	case "link_names":
 		for _, f := range s.files {
 			if f.kind == transcriptdb.KindCodexExt && strings.Contains(sql, "WHERE kind != 'codex-ext'") {
@@ -405,6 +349,56 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write(out.Bytes())
+}
+
+// rawHidden answers rawSummarySQL from the synthetic files: what the server would count, so the tests of the
+// summary line run on it; the text of the query itself is checked by TestRawSummarySQL.
+func (s *fakeCH) rawHidden(q url.Values, sql string, row func(...any)) {
+	if strings.Count(sql, "FROM raw WHERE") != 1 || !strings.Contains(sql, "groupBitOrIf") || !strings.Contains(sql, "transform(file_id") {
+		s.t.Errorf("raw-hidden query is not the one-pass summary: %s", sql)
+	}
+	param := func(name string) string { return q.Get("param_" + name) }
+	// the events of every role pass s.match; the bits of the roles follow role_names
+	all := url.Values{}
+	maps.Copy(all, q)
+	all.Set("param_roles", param("role_names"))
+	names := chArray(param("role_names"))
+	visible, err := strconv.ParseUint(param("visible"), 10, 16)
+	if err != nil {
+		s.t.Errorf("raw-hidden visible = %q: %v", param("visible"), err)
+	}
+	type lineKey struct {
+		file uint64
+		line int
+	}
+	matched := map[lineKey]bool{}
+	events := map[lineKey]int{}
+	bits := map[lineKey]uint64{}
+	for _, f := range s.files {
+		for i := range min(f.evLines, len(f.raw)) {
+			if s.rawMatch(q, f, i+1) {
+				matched[lineKey{f.id, i + 1}] = true
+			}
+		}
+		for _, event := range f.events {
+			key := lineKey{f.id, event.ev.Line}
+			events[key]++
+			if s.match(all, sql, f, event) {
+				bits[key] |= 1 << slices.Index(names, string(event.ev.Role))
+			}
+		}
+	}
+	count, noEvents, roles := 0, 0, uint64(0)
+	for key := range matched {
+		switch {
+		case events[key] == 0:
+			noEvents++
+		case bits[key] != 0 && bits[key]&visible == 0:
+			count++
+			roles |= bits[key]
+		}
+	}
+	row(count, roles, noEvents)
 }
 
 func (s *fakeCH) rawMatch(q url.Values, f *chFile, line int) bool {
@@ -918,6 +912,117 @@ func TestRawNoEventsSummaryDB(t *testing.T) {
 	code, out, errOut := runTL(t, e, "--all", "--raw", "empty-model", "--max", "0")
 	if code != exitNone || !strings.Contains(out, "1 matched line(s) carry no events") || !slices.Contains(ch.requests(), "raw-hidden") {
 		t.Fatalf("eventless raw summary missing: exit=%d out=%q stderr=%q requests=%v", code, out, errOut, ch.requests())
+	}
+}
+
+// TestRawSummarySQL pins the text of the one-pass summary: the fake server answers it from its own count, so a
+// change of a condition in the query is caught here and not by the summary line.
+func TestRawSummarySQL(t *testing.T) {
+	d := &dbPath{opts: options{raw: `"model": ?"x`, grep: "deploy", since: time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC),
+		until: time.Date(2026, 10, 25, 11, 0, 0, 0, time.UTC), roles: map[transcript.Role]bool{transcript.User: true, transcript.Agent: true}}}
+	inDB := []stored{{src: source{Path: "/a.jsonl"}, file: &dbFile{id: 11, evLines: 7, kind: "claude"}},
+		{src: source{Path: "/b.jsonl"}, file: &dbFile{id: 12, evLines: 9, kind: "sub"}}}
+	q, err := d.rawSummaryQuery(inDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "SELECT countIf(kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0), " +
+		"groupBitOrIf(roles, kept AND roles != 0 AND bitAnd(roles, {visible:UInt16}) = 0), countIf(kept AND events = 0) " +
+		"FROM (SELECT max(raw_match) AND line <= transform(file_id, {files:Array(UInt64)}, {ev_lines:Array(UInt64)}, toUInt64(0)) AS kept, " +
+		"groupBitOr(role_bit) AS roles, sum(event) AS events FROM (" +
+		"SELECT file_id, line, true AS raw_match, toUInt16(0) AS role_bit, toUInt8(0) AS event FROM raw WHERE file_id IN {files:Array(UInt64)} AND " +
+		"multiSearchAnyCaseInsensitiveUTF8(raw, {rawlit0:Array(String)}) AND multiSearchAnyCaseInsensitiveUTF8(raw, {rawlit1:Array(String)}) AND match(raw, {raw:String}) " +
+		"UNION ALL SELECT file_id, line, false, toUInt16(0), toUInt8(1) FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} " +
+		"UNION ALL SELECT file_id, line, false, bitShiftLeft(toUInt16(1), indexOf({role_names:Array(String)}, toString(role)) - 1), toUInt8(0) " +
+		"FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} AND ts >= {since:DateTime64(3, 'UTC')} AND " +
+		"ts <= {until:DateTime64(3, 'UTC')} AND (hasAllTokens(hay, {hay0_0:Array(String)})) AND match(concat(who, ' ', text), {grep:String})) " +
+		"GROUP BY file_id, line)"
+	if q.SQL != want {
+		t.Errorf("raw summary SQL:\n got %s\nwant %s", q.SQL, want)
+	}
+	for name, value := range map[string]string{"files": "[11,12]", "ev_lines": "[7,9]", "kinds": "['claude','sub']", "visible": "9",
+		"role_names": "['user','ask','peer','agent','think','cmd','out','attach','note']"} {
+		if q.Params[name] != value {
+			t.Errorf("param %s = %q, want %q", name, q.Params[name], value)
+		}
+	}
+	// the summary selects the raw lines of --raw the same way as the event query
+	w, err := (&dbPath{opts: d.opts}).where([]uint64{11, 12}, []string{"claude", "sub"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawCond, _, err := rawCondition(d.opts.raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := rawFromSQL + rawCond; !strings.Contains(w.sql, read) || !strings.Contains(q.SQL, read) {
+		t.Errorf("the event query and the summary read the raw lines under different conditions:\n%s\n%s", w.sql, q.SQL)
+	}
+}
+
+func TestRawSummaryWithoutFilters(t *testing.T) {
+	d := &dbPath{opts: options{raw: "x", roles: map[transcript.Role]bool{transcript.Note: true}}}
+	q, err := d.rawSummaryQuery([]stored{{src: source{Path: "/a.jsonl"}, file: &dbFile{id: 1, evLines: 2, kind: "claude"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(q.SQL, "FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)}) GROUP BY file_id, line)") ||
+		q.Params["visible"] != "256" {
+		t.Errorf("summary without --since, --until and --grep: %s, visible %s", q.SQL, q.Params["visible"])
+	}
+}
+
+func TestParseRawSummary(t *testing.T) {
+	visible := map[transcript.Role]bool{transcript.User: true}
+	// bits 0 (user, shown), 4 (think) and 5 (cmd)
+	got := parseRawSummary([][]string{{"3", "49", "2"}}, visible)
+	if got.err != nil || got.hidden != 3 || got.noEvents != 2 || !slices.Equal(got.roles, []transcript.Role{transcript.Think, transcript.Cmd}) {
+		t.Errorf("parseRawSummary = %+v", got)
+	}
+	for _, rows := range [][][]string{nil, {{"1", "2"}}, {{"1", "x", "2"}}, {{"1", "2", "3"}, {"1", "2", "3"}}} {
+		if parseRawSummary(rows, visible).err == nil {
+			t.Errorf("parseRawSummary(%q) took a malformed answer", rows)
+		}
+	}
+}
+
+func TestRawNoEventsSummarySumsAcrossFiles(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	second := writeReviewClaude(t, e, "-home-x-other", "7a7b8c9d-0000-4000-8000-000000000006",
+		`{"type":"api-request","model":"empty-model"}`)
+	paths = append(paths, second)
+	for _, backend := range []string{backendFiles, backendDB} {
+		t.Run(backend, func(t *testing.T) {
+			e.backend = backend
+			if backend == backendDB {
+				srv := httptest.NewServer(newFakeCH(t, paths, map[string]int{}))
+				defer srv.Close()
+				t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+			}
+			code, out, errOut := runTL(t, e, "--all", "--raw", "empty-model", "--max", "0")
+			if code != exitNone || !strings.Contains(out, "; 2 matched line(s) carry no events") {
+				t.Fatalf("eventless lines of two files: exit=%d out=%q stderr=%q", code, out, errOut)
+			}
+		})
+	}
+}
+
+func TestRawNoEventsSummarySkipsLinesWithEvents(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	for _, backend := range []string{backendFiles, backendDB} {
+		t.Run(backend, func(t *testing.T) {
+			e.backend = backend
+			if backend == backendDB {
+				srv := httptest.NewServer(newFakeCH(t, paths, map[string]int{}))
+				defer srv.Close()
+				t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+			}
+			// three matched lines: hidden events only, a shown event, and no events
+			code, out, errOut := runTL(t, e, "--all", "--raw", "hidden-model|mixed-model|empty-model", "--max", "0")
+			if code != 0 || !strings.Contains(out, "; 1 matched line(s) carry no events") {
+				t.Fatalf("eventless count beside lines with events: exit=%d out=%q stderr=%q", code, out, errOut)
+			}
+		})
 	}
 }
 
