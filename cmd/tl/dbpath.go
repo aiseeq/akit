@@ -342,25 +342,20 @@ func (d *dbPath) resolveSessions() ([]source, error) {
 		if err != nil {
 			return nil, err
 		}
-		f := d.files[path]
-		out = append(out, source{Path: path, ID: f.session, ParentID: f.parent, Description: f.desc})
-		out = append(out, d.subagents(f)...)
-	}
-	return out, nil
-}
-
-func (d *dbPath) subagents(parent *dbFile) []source {
-	if !d.opts.subagents {
-		return nil
-	}
-	var out []source
-	for _, child := range d.files {
-		if child.parent == parent.session && child.kind == "sub" {
-			out = append(out, source{Path: child.path, ID: child.session, ParentID: child.parent, Description: child.desc})
+		src, err := transcript.SourceAt(path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, src)
+		if d.opts.subagents {
+			subs, err := transcript.SubSources(path)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, subs...)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out
+	return out, nil
 }
 
 func (d *dbPath) resolveAll() ([]source, error) {
@@ -398,6 +393,9 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 func (d *dbPath) find(arg string) (string, error) {
 	arg = sessionArg(arg, d.e.home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
+		if _, err := os.Stat(arg); err != nil {
+			return "", fmt.Errorf("transcript %s: %w", arg, err)
+		}
 		if d.files[arg] != nil {
 			return arg, nil
 		}

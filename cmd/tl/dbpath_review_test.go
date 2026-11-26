@@ -2,8 +2,102 @@ package main
 
 import (
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
+
+func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	e, paths, unloaded := dbCorpus(t)
+	project := filepath.Dir(paths[0])
+	projectName := filepath.Base(project)
+	parent := filepath.Dir(project)
+	rollout := paths[len(paths)-1]
+	target := filepath.Join(project, "x.jsonl")
+	writeWorkFile(t, target, []string{userRecord("2026-10-25T11:00:00.000Z", "synthetic relative path")})
+	paths = append(paths, target)
+	filePaths, err := transcriptPaths(e.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(filePaths, paths[2]) || !slices.Contains(filePaths, paths[1]) {
+		t.Fatalf("file path search misses parent or subagent: parent=%t subagent=%t", slices.Contains(filePaths, paths[1]), slices.Contains(filePaths, paths[2]))
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+
+	alias := filepath.Join(parent, "project-alias")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Fatal(err)
+	}
+	fromDir := filepath.Join(parent, "from")
+	if err := os.Mkdir(fromDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutDir := filepath.Dir(rollout)
+	forms := []struct {
+		name, dir, arg string
+	}{
+		{"project basename", project, "x.jsonl"},
+		{"project dot path", project, "./x.jsonl"},
+		{"parent project path", fromDir, filepath.Join("..", projectName, "x.jsonl")},
+		{"symlink project path", parent, filepath.Join("project-alias", "x.jsonl")},
+		{"agent path", project, filepath.Join(dbOtherSession, "subagents", "agent-a1b2c3d4.jsonl")},
+		{"Codex rollout absolute", project, rollout},
+		{"Codex rollout relative", rolloutDir, filepath.Base(rollout)},
+		{"line reference", project, "x.jsonl:1"},
+	}
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			if err := os.Chdir(form.dir); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.Chdir(project); err != nil {
+					t.Errorf("restore working directory: %v", err)
+				}
+			})
+			probeComparePath(t, e, form.name, form.arg, false)
+		})
+	}
+	t.Run("missing relative path", func(t *testing.T) {
+		if err := os.Chdir(project); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(project) })
+		probeComparePath(t, e, "missing relative path", "missing.jsonl", true)
+	})
+}
+
+func probeComparePath(t *testing.T, e env, label, arg string, allowMissing bool) {
+	t.Helper()
+	e.backend = backendFiles
+	codeF, outF, errF := runTL(t, e, arg, "--role", "all", "--max", "0")
+	e.backend = backendDB
+	codeD, outD, errD := runTL(t, e, arg, "--role", "all", "--max", "0")
+	errComparable := errD
+	if allowMissing {
+		if warning, rest, ok := strings.Cut(errD, "\n"); ok && strings.Contains(warning, "reading files instead") {
+			errComparable = rest
+		}
+	}
+	if codeF != codeD || outF != outD || errF != errComparable || !allowMissing && strings.Contains(errD, "is not in the database") {
+		t.Errorf("%s %q: files exit %d, db exit %d\nfiles out:\n%s\ndb out:\n%s\nfiles err: %s\ndb err: %s", label, arg, codeF, codeD, outF, outD, errF, errD)
+	}
+}
 
 func probeCompare(t *testing.T, e env, label string, args ...string) {
 	t.Helper()

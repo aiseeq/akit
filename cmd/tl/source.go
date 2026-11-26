@@ -150,14 +150,27 @@ func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts (%s); give more of the id", arg, len(matches), strings.Join(shown, ", "))
 }
 
-// sessionArg is a session argument as the resolvers of both backends look it up: without its "id:" prefix and with
-// "~/" expanded. The prefix goes once, and the line of a reference is split off before, by parseRef.
+// sessionArg normalizes a session argument for both backends: it strips "id:", expands "~/", and resolves filesystem
+// paths to absolute paths, following symlinks when they exist. parseRef removes a line suffix before this call.
 func sessionArg(arg, home string) string {
 	arg = strings.TrimPrefix(arg, idPrefix)
 	if strings.HasPrefix(arg, "~/") {
 		arg = filepath.Join(home, arg[2:])
 	}
+	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, string(filepath.Separator)) {
+		arg = absoluteTranscriptPath(arg)
+	}
 	return arg
+}
+
+func absoluteTranscriptPath(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return path
 }
 
 const idPrefix = "id:"
@@ -217,7 +230,9 @@ func transcriptPaths(home string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("glob transcript names: %w", err)
 		}
-		paths = append(paths, matches...)
+		for _, path := range matches {
+			paths = append(paths, absoluteTranscriptPath(path))
+		}
 	}
 	sort.Strings(paths)
 	return paths, nil
