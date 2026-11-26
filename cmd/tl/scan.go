@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
@@ -34,6 +35,8 @@ type result struct {
 	hits        []hit
 	rawHidden   int
 	rawRoles    []transcript.Role
+	rawNoEvents int
+	rawErr      error
 	waits       []time.Duration // --wait: ожидания вывода, сведённые по ходу чтения файлов
 	waitRows    []waitSample
 	names       map[string]string // path → имя сессии
@@ -675,6 +678,13 @@ func rawHiddenNote(res result) string {
 	return fmt.Sprintf("; %d line(s) matched --raw only in hidden roles (%s): --role all", res.rawHidden, strings.Join(roles, ", "))
 }
 
+func rawNoEventsNote(res result) string {
+	if res.rawNoEvents == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; %d matched line(s) carry no events", res.rawNoEvents)
+}
+
 type rawLineRoles struct {
 	visible bool
 	hidden  map[transcript.Role]bool
@@ -724,11 +734,11 @@ func (f *filter) match(ev transcript.Event) bool {
 // file читает один файл и отдаёт отобранные события с окрестностью -C; в режиме --wait вместо событий — ожидания
 // вывода: события в памяти не копятся.
 func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcript.Meta, error) {
-	hits, waits, rows, meta, _, _, err := f.fileWithRawSummary(src)
+	hits, waits, rows, meta, _, _, _, err := f.fileWithRawSummary(src)
 	return hits, waits, rows, meta, err
 }
 
-func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitSample, transcript.Meta, int, []transcript.Role, error) {
+func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitSample, transcript.Meta, int, []transcript.Role, int, error) {
 	var keep func([]byte, transcript.ToolNames) bool
 	if len(f.needles) > 0 || f.rawRE != nil {
 		keep = f.keepWithState
@@ -739,7 +749,7 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 	}
 	if wt != nil && (f.opts.waitCache != nil || isCodexRollout(src.Path)) {
 		hits, waits, rows, meta, err := f.cachedWaitFile(src, wt)
-		return hits, waits, rows, meta, 0, nil, err
+		return hits, waits, rows, meta, 0, nil, 0, err
 	}
 	var (
 		out    []hit
@@ -779,6 +789,25 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 	}
 	meta, err := f.readEvents(src.Path, keep, consume)
 	hiddenCount, hiddenRoles := rawHiddenSummary(lineRoles)
+	noEvents := 0
+	if err == nil && f.rawRE != nil {
+		matched, matchErr := rawLinesMatching(src.Path, f.rawRE)
+		if matchErr != nil {
+			err = matchErr
+		}
+		eventLines := map[int]bool{}
+		if err == nil {
+			_, err = transcript.ReadWithTools(src.Path, nil, func(ev transcript.Event) { eventLines[ev.Line] = true })
+		}
+		if err == nil {
+			for line := range eventLines {
+				if matched[line] {
+					delete(matched, line)
+				}
+			}
+			noEvents = len(matched)
+		}
+	}
 	var waits []time.Duration
 	var waitRows []waitSample
 	if wt != nil {
@@ -786,9 +815,37 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 		waitRows = f.waitRowsInWindow(wt.waitRows)
 	}
 	if err != nil {
-		return out, waits, waitRows, meta, 0, nil, fmt.Errorf("read %s: %w", src.Path, err)
+		return out, waits, waitRows, meta, 0, nil, 0, fmt.Errorf("read %s: %w", src.Path, err)
 	}
-	return out, waits, waitRows, meta, hiddenCount, hiddenRoles, nil
+	return out, waits, waitRows, meta, hiddenCount, hiddenRoles, noEvents, nil
+}
+
+// rawLinesMatching returns the line numbers whose raw JSON matches --raw.
+func rawLinesMatching(path string, re *regexp.Regexp) (map[int]bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	lines := map[int]bool{}
+	reader := bufio.NewReader(file)
+	line := 0
+	for {
+		part, err := reader.ReadBytes('\n')
+		if len(part) > 0 {
+			line++
+			if re.Match(part) {
+				lines[line] = true
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				return nil, err
+			}
+			break
+		}
+	}
+	return lines, nil
 }
 
 func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Duration, []waitSample, transcript.Meta, error) {
@@ -867,13 +924,14 @@ func scan(sources []source, opts options, home string) (result, error) {
 	liveNames, liveErr := liveSessionNames(home)
 	res := result{names: map[string]string{}, linkIDs: sourceLinkIDs(sources, allPaths, home, liveNames), searchPaths: allPaths, liveNames: liveNames, liveErr: liveErr, files: len(sources)}
 	type fileResult struct {
-		hits      []hit
-		waits     []time.Duration
-		waitRows  []waitSample
-		meta      transcript.Meta
-		rawHidden int
-		rawRoles  []transcript.Role
-		err       error
+		hits        []hit
+		waits       []time.Duration
+		waitRows    []waitSample
+		meta        transcript.Meta
+		rawHidden   int
+		rawRoles    []transcript.Role
+		rawNoEvents int
+		err         error
 	}
 	results := make([]fileResult, len(sources))
 	var (
@@ -883,8 +941,8 @@ func scan(sources []source, opts options, home string) (result, error) {
 	for range scanWorkerCount() {
 		wg.Go(func() {
 			for i := range jobs {
-				hits, waits, waitRows, meta, rawHidden, rawRoles, err := f.fileWithRawSummary(sources[i])
-				results[i] = fileResult{hits, waits, waitRows, meta, rawHidden, rawRoles, err}
+				hits, waits, waitRows, meta, rawHidden, rawRoles, rawNoEvents, err := f.fileWithRawSummary(sources[i])
+				results[i] = fileResult{hits, waits, waitRows, meta, rawHidden, rawRoles, rawNoEvents, err}
 			}
 		})
 	}
@@ -901,6 +959,7 @@ func scan(sources []source, opts options, home string) (result, error) {
 		res.waitRows = append(res.waitRows, item.waitRows...)
 		res.rawHidden += item.rawHidden
 		res.rawRoles = mergeRoles(res.rawRoles, item.rawRoles)
+		res.rawNoEvents += item.rawNoEvents
 		res.bad += item.meta.Bad
 		if item.meta.FirstBad != nil && res.firstBad == nil {
 			res.firstBad = fmt.Errorf("%s %w", res.linkIDs[src.Path], item.meta.FirstBad)
@@ -928,6 +987,13 @@ func scan(sources []source, opts options, home string) (result, error) {
 // problems — что не прочиталось, для итоговой строки: события оттуда в ответ не вошли.
 func (res result) problems() string {
 	var s string
+	if res.rawErr != nil {
+		problem := res.rawErr.Error()
+		if len(problem) > 120 {
+			problem = problem[:117] + "..."
+		}
+		s += fmt.Sprintf("; raw summary unavailable: %s", problem)
+	}
 	if n := len(res.errs); n > 0 {
 		s += fmt.Sprintf("; %d transcript(s) unreadable, first: %v", n, res.errs[0])
 	}
@@ -947,7 +1013,7 @@ func report(res result, opts options, e env, w io.Writer) int {
 	w = buffered
 	hits := res.hits
 	if len(hits) == 0 {
-		fmt.Fprintf(w, "tl: no events in %d transcript(s)%s%s%s\n", res.files, windowNote(opts, e), rawHiddenNote(res), res.problems())
+		fmt.Fprintf(w, "tl: no events in %d transcript(s)%s%s%s%s\n", res.files, windowNote(opts, e), rawHiddenNote(res), rawNoEventsNote(res), res.problems())
 		if len(res.errs) > 0 {
 			return exitUsage
 		}
@@ -1006,7 +1072,7 @@ func report(res result, opts options, e env, w io.Writer) int {
 	if skipped > 0 {
 		summary += fmt.Sprintf("; %d earlier not shown (--since, --grep or --max 0)", skipped)
 	}
-	fmt.Fprintln(w, summary+rawHiddenNote(res)+res.problems()+"; full event: tl <id:line>")
+	fmt.Fprintln(w, summary+rawHiddenNote(res)+rawNoEventsNote(res)+res.problems()+"; full event: tl <id:line>")
 	return 0
 }
 

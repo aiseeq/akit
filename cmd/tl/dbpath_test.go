@@ -265,7 +265,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				f.mtime.Unix()*1000, ms(f.first), f.session, f.parent, f.kind, f.project, f.cwd)
 		}
 	case "raw-hidden":
-		if !strings.Contains(sql, "GROUP BY file_id, line") || !strings.Contains(sql, "countIf(role IN {visible_roles:Array(String)}) = 0") {
+		if strings.Count(sql, "FROM raw WHERE") != 1 || !strings.Contains(sql, "groupUniqArrayArrayIf") || !strings.Contains(sql, "line <=") {
 			s.t.Errorf("raw-hidden query does not aggregate hidden-only lines: %s", sql)
 		}
 		type lineKey struct {
@@ -273,21 +273,35 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			line int
 		}
 		lineRoles := map[lineKey]map[transcript.Role]bool{}
+		eventCounts := map[lineKey]int{}
 		visible := chArray(param("visible_roles"))
 		for _, f := range s.files {
+			for i := 0; i < min(f.evLines, len(f.raw)); i++ {
+				if s.rawMatch(q, f, i+1) {
+					lineRoles[lineKey{f.id, i + 1}] = map[transcript.Role]bool{}
+				}
+			}
 			for _, event := range f.events {
-				if !s.match(q, sql, f, event) {
+				if event.ev.Line > f.evLines {
 					continue
 				}
 				key := lineKey{f.id, event.ev.Line}
+				eventCounts[key]++
+				if !s.match(q, sql, f, event) {
+					continue
+				}
 				if lineRoles[key] == nil {
 					lineRoles[key] = map[transcript.Role]bool{}
 				}
 				lineRoles[key][event.ev.Role] = true
 			}
 		}
-		count, roles := 0, map[transcript.Role]bool{}
-		for _, found := range lineRoles {
+		count, noEvents, roles := 0, 0, map[transcript.Role]bool{}
+		for key, found := range lineRoles {
+			if eventCounts[key] == 0 {
+				noEvents++
+				continue
+			}
 			showable := false
 			for _, role := range visible {
 				if found[transcript.Role(role)] {
@@ -308,7 +322,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				names = append(names, string(role))
 			}
 		}
-		row(count, strings.Join(names, ","))
+		row(count, strings.Join(names, ","), noEvents)
 	case "link_names":
 		for _, f := range s.files {
 			if f.kind == transcriptdb.KindCodexExt && strings.Contains(sql, "WHERE kind != 'codex-ext'") {
@@ -391,6 +405,22 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write(out.Bytes())
+}
+
+func (s *fakeCH) rawMatch(q url.Values, f *chFile, line int) bool {
+	if line < 1 || line > len(f.raw) || line > f.evLines {
+		return false
+	}
+	param := func(name string) string { return q.Get("param_" + name) }
+	raw := f.raw[line-1]
+	for i := 0; param(fmt.Sprintf("rawlit%d", i)) != ""; i++ {
+		if !slices.ContainsFunc(chArray(param(fmt.Sprintf("rawlit%d", i))), func(lit string) bool {
+			return strings.Contains(strings.ToLower(raw), strings.ToLower(lit))
+		}) {
+			return false
+		}
+	}
+	return param("raw") != "" && regexp.MustCompile(tsvUnescape(param("raw"))).MatchString(raw)
 }
 
 func fakeFileMatches(q url.Values, sql string, f *chFile) bool {
@@ -753,6 +783,7 @@ func rawHiddenCorpus(t *testing.T) (env, []string) {
 	t.Helper()
 	e := fakeHome(t)
 	path := writeReviewClaude(t, e, "-home-x-proj", "6a7b8c9d-0000-4000-8000-000000000003",
+		`{"type":"api-request","model":"empty-model"}`,
 		rawModelRecord("2026-10-25T10:10:00Z", "hidden-model", false),
 		rawModelRecord("2026-10-25T10:10:01Z", "mixed-model", true),
 	)
@@ -796,6 +827,100 @@ func TestRawHiddenRoleSummaryFiles(t *testing.T) {
 	checkRawHiddenSummary(t, e)
 }
 
+func TestRawHiddenSummaryWithVisibleEventsAndFilters(t *testing.T) {
+	e, _ := rawHiddenCorpus(t)
+	e.backend = backendFiles
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"events-and-hidden", []string{"--all", "--raw", "hidden-model|mixed-model", "--max", "0"}, "1 line(s) matched --raw only in hidden roles (think, cmd): --role all"},
+		{"time-excludes-hidden", []string{"--all", "--raw", "hidden-model", "--since", "2026-10-26", "--max", "0"}, ""},
+		{"grep-excludes-hidden", []string{"--all", "--raw", "hidden-model", "--grep", "^$", "--max", "0"}, ""},
+		{"eventless", []string{"--all", "--raw", "empty-model", "--max", "0"}, "1 matched line(s) carry no events"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			code, out, errOut := runTL(t, e, test.args...)
+			if code != 0 && code != exitNone {
+				t.Fatalf("exit %d: %s\n%s", code, errOut, out)
+			}
+			if test.want != "" && !strings.Contains(out, test.want) || test.want == "" && strings.Contains(out, "matched --raw only in hidden roles") {
+				t.Fatalf("summary = %q, want note %q", out, test.want)
+			}
+			if test.name == "events-and-hidden" && !strings.Contains(out, "1 event(s)") {
+				t.Fatalf("expected a visible event and hidden summary together: %s", out)
+			}
+		})
+	}
+}
+
+func TestRawHiddenSummaryMergesAcrossFiles(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	second := writeReviewClaude(t, e, "-home-x-other", "7a7b8c9d-0000-4000-8000-000000000004",
+		`{"type":"attachment","timestamp":"2026-10-25T10:10:02Z","attachment":{"type":"hook_success","stdout":"attach-model"}}`)
+	paths = append(paths, second)
+	for _, backend := range []string{backendFiles, backendDB} {
+		t.Run(backend, func(t *testing.T) {
+			e.backend = backend
+			var ch *fakeCH
+			var srv *httptest.Server
+			if backend == backendDB {
+				ch = newFakeCH(t, paths, map[string]int{})
+				srv = httptest.NewServer(ch)
+				defer srv.Close()
+				t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+			}
+			code, out, errOut := runTL(t, e, "--all", "--raw", "hidden-model|attach-model", "--max", "0")
+			if code != 0 && code != exitNone {
+				t.Fatalf("exit %d: %s\n%s", code, errOut, out)
+			}
+			want := "2 line(s) matched --raw only in hidden roles (think, cmd, attach): --role all"
+			if !strings.Contains(out, want) {
+				t.Fatalf("summary = %q, want %q", out, want)
+			}
+		})
+	}
+}
+
+func TestRawHiddenSummaryDeduplicatesMergedRoles(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	second := writeReviewClaude(t, e, "-home-x-other", "7a7b8c9d-0000-4000-8000-000000000005",
+		`{"type":"assistant","timestamp":"2026-10-25T10:10:03Z","message":{"model":"duplicate-model","content":[{"type":"thinking","thinking":"private synthetic detail"},{"type":"tool_use","name":"Bash","input":{"command":"private synthetic detail"}}]}}`)
+	paths = append(paths, second)
+	for _, backend := range []string{backendFiles, backendDB} {
+		t.Run(backend, func(t *testing.T) {
+			e.backend = backend
+			if backend == backendDB {
+				srv := httptest.NewServer(newFakeCH(t, paths, map[string]int{}))
+				defer srv.Close()
+				t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+			}
+			code, out, errOut := runTL(t, e, "--all", "--raw", "hidden-model|duplicate-model", "--max", "0")
+			if code != 0 && code != exitNone {
+				t.Fatalf("exit %d: %s\n%s", code, errOut, out)
+			}
+			want := "2 line(s) matched --raw only in hidden roles (think, cmd): --role all"
+			if !strings.Contains(out, want) || strings.Contains(out, "think, cmd, think") {
+				t.Fatalf("summary = %q, want unique merged roles %q", out, want)
+			}
+		})
+	}
+}
+
+func TestRawNoEventsSummaryDB(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, out, errOut := runTL(t, e, "--all", "--raw", "empty-model", "--max", "0")
+	if code != exitNone || !strings.Contains(out, "1 matched line(s) carry no events") || !slices.Contains(ch.requests(), "raw-hidden") {
+		t.Fatalf("eventless raw summary missing: exit=%d out=%q stderr=%q requests=%v", code, out, errOut, ch.requests())
+	}
+}
+
 func TestRawHiddenRoleSummaryDB(t *testing.T) {
 	e, paths := rawHiddenCorpus(t)
 	ch := newFakeCH(t, paths, map[string]int{})
@@ -806,6 +931,33 @@ func TestRawHiddenRoleSummaryDB(t *testing.T) {
 	checkRawHiddenSummary(t, e)
 	if !slices.Contains(ch.requests(), "raw-hidden") {
 		t.Fatal("database did not query the hidden-role aggregate")
+	}
+}
+
+func TestRawHiddenDBFailureKeepsEventsAndReportsProblem(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	ch.fail = map[string]bool{"raw-hidden": true}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, out, errOut := runTL(t, e, "--all", "--raw", "mixed-model", "--max", "0")
+	if code != 0 || !strings.Contains(out, "event(s)") || !strings.Contains(out, "raw summary unavailable") || strings.Contains(errOut, "reading files instead") {
+		t.Fatalf("database raw-summary failure changed event result: exit=%d out=%q stderr=%q", code, out, errOut)
+	}
+}
+
+func TestRawHiddenDBUsageSkipsAggregate(t *testing.T) {
+	e, paths := rawHiddenCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	_, _, errOut := runTL(t, e, "--all", "--usage", "--raw", "model", "--max", "0")
+	if strings.Contains(errOut, "reading files instead") || slices.Contains(ch.requests(), "raw-hidden") {
+		t.Fatalf("usage ran the hidden raw aggregate or fell back: requests=%v stderr=%q", ch.requests(), errOut)
 	}
 }
 

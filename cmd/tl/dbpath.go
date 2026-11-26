@@ -592,7 +592,21 @@ func (d *dbPath) result(sources []source) (result, error) {
 	}
 	var all []sortedHit
 	var hitsErr error
+	type rawSummary struct {
+		count, noEvents int
+		roles           []transcript.Role
+		err             error
+	}
+	rawDone := make(chan rawSummary, 1)
 	if missing == nil && len(inDB) > 0 {
+		if d.opts.raw != "" && !d.opts.usage {
+			go func() {
+				rawCtx, cancel := context.WithTimeout(d.ctx, dbQueryTimeout/2)
+				defer cancel()
+				count, roles, noEvents, err := d.hiddenRawMatches(rawCtx, inDB)
+				rawDone <- rawSummary{count, noEvents, roles, err}
+			}()
+		}
 		all, hitsErr = d.storedHits(inDB)
 	}
 	res := <-links
@@ -605,12 +619,9 @@ func (d *dbPath) result(sources []source) (result, error) {
 	if hitsErr != nil {
 		return res, hitsErr
 	}
-	if d.opts.raw != "" {
-		hiddenCount, hiddenRoles, err := d.hiddenRawMatches(inDB)
-		if err != nil {
-			return res, err
-		}
-		res.rawHidden, res.rawRoles = hiddenCount, hiddenRoles
+	if d.opts.raw != "" && !d.opts.usage && len(inDB) > 0 {
+		raw := <-rawDone
+		res.rawHidden, res.rawRoles, res.rawNoEvents, res.rawErr = raw.count, raw.roles, raw.noEvents, raw.err
 	}
 	bad := map[string]badLines{}
 	if err := d.badLines(inDB, bad); err != nil {
@@ -633,55 +644,90 @@ func (d *dbPath) result(sources []source) (result, error) {
 	return res, nil
 }
 
-// hiddenRawMatches counts raw-matched lines on the server whose matching events all fall outside --role.
-func (d *dbPath) hiddenRawMatches(inDB []stored) (int, []transcript.Role, error) {
+// hiddenRawMatches counts hidden-only and eventless raw matches on the server.
+func (d *dbPath) hiddenRawMatches(ctx context.Context, inDB []stored) (int, []transcript.Role, int, error) {
 	visible := make([]string, 0, len(d.opts.roles))
 	for _, role := range transcript.Roles {
 		if d.opts.roles[role] {
 			visible = append(visible, string(role))
 		}
 	}
-	if len(visible) == len(transcript.Roles) {
-		return 0, nil, nil
-	}
 	if len(inDB) == 0 {
-		return 0, nil, nil
+		return 0, nil, 0, nil
 	}
 	ids := make([]uint64, 0, len(inDB))
-	kinds := make([]string, 0, len(inDB))
+	kindSet := map[string]bool{}
+	evLines := make(map[uint64]int, len(inDB))
 	for _, stored := range inDB {
 		ids = append(ids, stored.file.id)
 		kind := stored.file.kind
 		if kind == "" {
 			kind = kindOfSource(stored.src)
 		}
-		kinds = append(kinds, kind)
+		kindSet[kind] = true
+		evLines[stored.file.id] = stored.file.evLines
 	}
+	kinds := slices.Sorted(maps.Keys(kindSet))
 	opts := d.opts
 	opts.roles = make(map[transcript.Role]bool, len(transcript.Roles))
 	for _, role := range transcript.Roles {
 		opts.roles[role] = true
 	}
-	w, err := d.whereOpts(ids, slices.Compact(kinds), opts)
+	pattern := opts.raw
+	opts.raw = ""
+	opts.since, opts.until, opts.grep = time.Time{}, time.Time{}, ""
+	w, err := d.whereOpts(ids, kinds, opts)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	w.params["visible_roles"] = chStrings(visible)
-	lines := "SELECT file_id, line, groupUniqArray(role) AS roles FROM events WHERE " + w.sql +
-		" GROUP BY file_id, line HAVING countIf(role IN {visible_roles:Array(String)}) = 0"
-	sql := "SELECT (SELECT count() FROM (" + lines + ")), " +
-		"(SELECT arrayStringConcat(groupUniqArray(role), ',') FROM (SELECT arrayJoin(roles) AS role FROM (" + lines + ")))"
-	rows, err := d.query(chQuery{Name: "raw-hidden", SQL: sql, Params: w.params, Settings: w.settings})
+	rawCond, rawParams, err := rawCondition(pattern)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
-	if len(rows) != 1 || len(rows[0]) != 2 {
-		return 0, nil, fmt.Errorf("raw-hidden: got %d rows, want one aggregate row", len(rows))
+	maps.Copy(w.params, rawParams)
+	maps.Copy(w.settings, rawSettings)
+	var lineLimits []string
+	for id, lines := range evLines {
+		lineLimits = append(lineLimits, fmt.Sprintf("(file_id = %d AND line <= %d)", id, lines))
+	}
+	slices.Sort(lineLimits)
+	lineLimit := "(" + strings.Join(lineLimits, " OR ") + ")"
+	eventOpts := d.opts
+	eventOpts.raw = ""
+	eventOpts.roles = opts.roles
+	filtered, err := d.whereOpts(ids, kinds, eventOpts)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	for key, value := range filtered.params {
+		if _, exists := w.params[key]; !exists {
+			w.params[key] = value
+		}
+	}
+	eventFilter := strings.TrimPrefix(filtered.sql, "file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} AND role IN {roles:Array(String)}")
+	eventFilter = strings.TrimPrefix(eventFilter, " AND ")
+	if eventFilter == "" {
+		eventFilter = "1"
+	}
+	sql := "WITH raw_lines AS (SELECT file_id, line FROM raw WHERE file_id IN {files:Array(UInt64)} AND " + lineLimit + " AND " + rawCond + "), " +
+		"line_roles AS (SELECT file_id, line, groupUniqArrayIf(role, " + eventFilter + ") AS roles, count() AS event_count " +
+		"FROM events WHERE file_id IN {files:Array(UInt64)} AND kind IN {kinds:Array(String)} AND " + lineLimit +
+		" AND (file_id, line) IN (SELECT file_id, line FROM raw_lines) GROUP BY file_id, line) " +
+		"SELECT countIf(notEmpty(roles) AND NOT hasAny(roles, {visible_roles:Array(String)})), " +
+		"arrayStringConcat(groupUniqArrayArrayIf(roles, notEmpty(roles) AND NOT hasAny(roles, {visible_roles:Array(String)})), ','), " +
+		"countIf(event_count = 0) FROM raw_lines LEFT JOIN line_roles USING (file_id, line)"
+	rows, err := d.queryIn(ctx, chQuery{Name: "raw-hidden", SQL: sql, Params: w.params, Settings: w.settings})
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	if len(rows) != 1 || len(rows[0]) != 3 {
+		return 0, nil, 0, fmt.Errorf("raw-hidden: got %d rows, want one aggregate row", len(rows))
 	}
 	p := fields{row: rows[0]}
 	count := p.int(0)
 	if p.err != nil {
-		return 0, nil, fmt.Errorf("raw-hidden: %w", p.err)
+		return 0, nil, 0, fmt.Errorf("raw-hidden: %w", p.err)
 	}
 	roleSet := map[transcript.Role]bool{}
 	for name := range strings.SplitSeq(rows[0][1], ",") {
@@ -695,7 +741,11 @@ func (d *dbPath) hiddenRawMatches(inDB []stored) (int, []transcript.Role, error)
 			roles = append(roles, role)
 		}
 	}
-	return count, roles, nil
+	noEvents, err := strconv.Atoi(rows[0][2])
+	if err != nil {
+		return 0, nil, 0, fmt.Errorf("raw-hidden eventless count: %w", err)
+	}
+	return count, roles, noEvents, nil
 }
 
 // badLines are the unparsable lines of one file that pass the active raw prefilter.
