@@ -239,7 +239,8 @@ func (a *attachment) text() string {
 }
 
 func attachmentPathText(raw json.RawMessage, path []string) (string, bool) {
-	if len(raw) == 0 {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) { // null is not a known empty value
 		return "", false
 	}
 	var items []json.RawMessage

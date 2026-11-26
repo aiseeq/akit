@@ -143,6 +143,17 @@ func TestAttachmentTextUnknownNestedArrayUsesFallback(t *testing.T) {
 	}
 }
 
+func TestAttachmentTextNestedNullIsUnknown(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"instructions","files":[{"content":"visible"},null],"filename":"fallback.txt"}`,
+		`{"type":"instructions","files":[{"content":"visible"},{"content":null}],"filename":"fallback.txt"}`,
+	} {
+		if got, want := parsedAttachmentText(t, raw), "fallback.txt"; got != want {
+			t.Fatalf("%s: text = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestAttachmentTextNestedArraySkipsEmptyKnownValues(t *testing.T) {
 	got := parsedAttachmentText(t, `{"type":"instructions","files":[{"content":"visible"},{"content":""},{"content":[]}]}`)
 	if want := "visible"; got != want {
