@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -172,9 +173,7 @@ func absoluteTranscriptPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved
 	}
-	if absolute, err := filepath.Abs(path); err == nil {
-		return absolute
-	}
+	// An unresolved path stays uncleaned: a lexical ".." after a symlink may name another, existing file.
 	return path
 }
 
@@ -249,7 +248,7 @@ func transcriptPaths(home string) ([]string, error) {
 		}
 	}
 	sort.Strings(paths)
-	return paths, nil
+	return slices.Compact(paths), nil // a project link and its target name one transcript
 }
 
 func canonicalProjectLinks(root string) (map[string]string, error) {
@@ -267,11 +266,8 @@ func canonicalProjectLinks(root string) (map[string]string, error) {
 		}
 		path := filepath.Join(root, entry.Name())
 		resolved, err := filepath.EvalSymlinks(path)
-		if errors.Is(err, os.ErrNotExist) {
+		if err != nil { // a dangling or looping link holds no transcripts; it must not hide the others
 			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("resolve transcript project link %s: %w", path, err)
 		}
 		links[entry.Name()] = resolved
 	}

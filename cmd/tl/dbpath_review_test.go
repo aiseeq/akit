@@ -87,6 +87,31 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chdir(project) })
 		probeComparePath(t, e, "missing relative path", "missing.jsonl", true, false)
 	})
+	t.Run("missing path through symlink and dot dot", func(t *testing.T) {
+		// far/.. is parent/from by the kernel; a lexical clean would name the existing parent/<project>/x.jsonl.
+		if err := os.Mkdir(filepath.Join(fromDir, "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(fromDir, "sub"), filepath.Join(parent, "far")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(parent); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(project) })
+		arg := "far/../" + projectName + "/x.jsonl"
+		e.backend = backendFiles
+		if code, out, _ := runTL(t, e, arg, "--role", "all", "--max", "0"); code == 0 || out != "" {
+			t.Fatalf("files %q: exit %d, output %q; want a missing transcript", arg, code, out)
+		}
+		probeComparePath(t, e, "missing path through symlink and dot dot", arg, true, false)
+	})
+	t.Run("looping project link", func(t *testing.T) {
+		if err := os.Symlink("loop", filepath.Join(parent, "loop")); err != nil {
+			t.Fatal(err)
+		}
+		probeComparePath(t, e, "looping project link", dbOtherSession, false, true)
+	})
 }
 
 func probeComparePath(t *testing.T, e env, label, arg string, allowMissing, wantTranscript bool) {
