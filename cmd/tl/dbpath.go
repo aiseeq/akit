@@ -269,7 +269,10 @@ func (d *dbPath) sessionFilePredicate() (where, error) {
 		fmt.Fprintf(d.trace, "tl: db live session registry: %v\n", aliveErr)
 	}
 	for _, arg := range args {
-		arg = normalizeSessionArg(arg, d.e.home)
+		if ref := refArg.FindStringSubmatch(arg); ref != nil {
+			arg = ref[1]
+		}
+		arg = sessionArg(arg, d.e.home)
 		if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 			paths = append(paths, arg)
 			continue
@@ -393,7 +396,7 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 }
 
 func (d *dbPath) find(arg string) (string, error) {
-	arg = normalizeSessionArg(arg, d.e.home)
+	arg = sessionArg(arg, d.e.home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		if d.files[arg] != nil {
 			return arg, nil
@@ -749,16 +752,25 @@ var roleRank = map[transcript.Role]int{transcript.User: 0, transcript.Ask: 1, tr
 	transcript.Cmd: 5, transcript.Out: 6, transcript.Attach: 7, transcript.Note: 8}
 
 // sortHits is the order of scan: by time, then path, then line; the events of one line in the order the file has
-// them.
+// them. It sorts indices: a hit is large, and a stable sort in place moves every one of them many times.
 func sortHits(hits []sortedHit) {
-	sort.SliceStable(hits, func(i, j int) bool {
+	order := make([]int, len(hits))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortFunc(order, func(i, j int) int {
 		a, b := &hits[i], &hits[j]
 		if c := a.ev.Time.Compare(b.ev.Time); c != 0 {
-			return c < 0
+			return c
 		}
 		return cmp.Or(cmp.Compare(a.src.Path, b.src.Path), cmp.Compare(a.ev.Line, b.ev.Line), cmp.Compare(a.seq, b.seq), cmp.Compare(a.rank, b.rank),
-			cmp.Compare(a.part, b.part), cmp.Compare(a.off, b.off)) < 0
+			cmp.Compare(a.part, b.part), cmp.Compare(a.off, b.off), cmp.Compare(i, j))
 	})
+	sorted := make([]sortedHit, len(hits))
+	for to, from := range order {
+		sorted[to] = hits[from]
+	}
+	copy(hits, sorted)
 }
 
 // dbEvent is an event from its columns in the events table; text is Shown() there. The fields set here are the
@@ -942,80 +954,50 @@ func msToTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
-// usageHits reads the priced usage rows selected by the matching events; price fields live in usage, not raw.
+// usageEventSQL keeps the events of a reply with usage: it has an id or a model. A Codex token report passes without
+// them too: one loaded before the usage columns existed has none, and it must not be missed in silence.
+const usageEventSQL = "(reply_id != '' OR request_id != '' OR model != '' OR (kind IN " + codexKindsSQL + " AND who = 'token_count'))"
+
+// usageVersionSQL are the columns of one version of the usage of a reply. Within a file only the first event of a
+// version decides what usageReplies counts, the rest repeat it; a reply without ids is counted at every event.
+const usageVersionSQL = "model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo"
+
+// usageHits reads the usage of the replies from their events in the window; usageReplies counts them as it counts
+// the events of the files. The usage table has one row of a reply, the event with the most output: a window that
+// starts or ends between the events of a reply cannot be answered from it.
 func (d *dbPath) usageHits(ids []uint64, kinds []string, byID map[uint64]stored) ([]sortedHit, error) {
-	w, err := d.where(ids, kinds)
+	rows, err := d.selectEvents("usage", func(w where) chQuery {
+		return chQuery{SQL: "SELECT file_id, usage_session = '' AS legacy, " + usageVersionSQL + ", toUnixTimestamp64Milli((min((ts, line)) AS first).1), first.2 FROM events WHERE " +
+			w.sql + " AND " + usageEventSQL + " GROUP BY file_id, legacy, " + usageVersionSQL + ", if(reply_id = '' AND request_id = '', (line, seq), (0, 0))",
+			Params: w.params, Settings: w.settings}
+	}, ids, kinds)
 	if err != nil {
 		return nil, err
 	}
-	legacy, err := d.query(chQuery{Name: "usage_legacy", SQL: "SELECT count() FROM events WHERE " + w.sql + " AND usage_session = '' AND (reply_id != '' OR (kind IN " + codexKindsSQL + " AND who = 'token_count'))", Params: w.params, Settings: w.settings})
-	if err != nil {
-		return nil, err
-	}
-	if len(legacy) != 1 || len(legacy[0]) != 1 {
-		return nil, fmt.Errorf("usage legacy: expected one count row")
-	}
-	if n, err := strconv.ParseUint(legacy[0][0], 10, 64); err != nil {
-		return nil, fmt.Errorf("usage legacy count: %w", err)
-	} else if n != 0 {
-		return nil, errors.New("usage session metadata is incomplete")
-	}
-	usageWhere := "(session, reply_id, if(reply_id = '', request_id, '')) IN (SELECT usage_session, reply_id, if(reply_id = '', request_id, '') FROM events WHERE " + w.sql + " AND (reply_id != '' OR request_id != ''))"
-	if !d.opts.since.IsZero() {
-		usageWhere += " AND ts >= {since:DateTime64(3, 'UTC')}"
-	}
-	if !d.opts.until.IsZero() {
-		usageWhere += " AND ts <= {until:DateTime64(3, 'UTC')}"
-	}
-	rows, err := d.query(chQuery{Name: "usage", SQL: "SELECT file_id, toUnixTimestamp64Milli(ts), session, model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo FROM usage WHERE " + usageWhere,
-		Params: w.params, Settings: w.settings})
-	if err != nil {
-		return nil, err
-	}
-	type usageKey struct{ session, reply, request string }
-	type pricedHit struct {
-		hit sortedHit
-		out uint64
-	}
-	best := make(map[usageKey]pricedHit, len(rows))
-	keys := make([]usageKey, 0, len(rows))
+	hits := make([]sortedHit, 0, len(rows))
 	for _, row := range rows {
-		if len(row) != 14 {
-			return nil, fmt.Errorf("usage: %d fields in a row, want 14", len(row))
+		if len(row) != 15 {
+			return nil, fmt.Errorf("usage: %d fields in a row, want 15", len(row))
 		}
 		p := fields{row: row}
-		id, ms := p.uint(0), int64(p.uint(1))
-		in, out, read, write, w5, w1 := p.uint(6), p.uint(7), p.uint(8), p.uint(9), p.uint(10), p.uint(11)
+		id, legacy, ms, line := p.uint(0), p.uint(1), int64(p.uint(13)), p.int(14)
+		in, out, read, write, w5, w1 := p.uint(5), p.uint(6), p.uint(7), p.uint(8), p.uint(9), p.uint(10)
 		if p.err != nil {
 			return nil, fmt.Errorf("usage: %w", p.err)
 		}
+		if legacy != 0 {
+			return nil, errors.New("usage session metadata is incomplete")
+		}
+		reply := &transcript.Reply{Model: row[2], ID: row[3], RequestID: row[4]}
 		s, ok := byID[id]
-		if !ok {
-			continue
+		if !ok || reply.Model == "" && reply.ID == "" && reply.RequestID == "" {
+			continue // not a file of this call, or a token report that is no call
 		}
-		request := row[5]
-		if row[4] != "" {
-			request = ""
-		}
-		key := usageKey{row[2], row[4], request}
-		if old, ok := best[key]; ok && old.out >= out {
-			continue
-		}
-		u := price.Usage{Input: int64(in), Output: int64(out), CacheRead: int64(read), CacheWrite: int64(write), Write5m: int64(w5), Write1h: int64(w1), Fast: row[12] == "1" || row[12] == "true", Geo: row[13]}
-		reply := &transcript.Reply{Model: row[3], ID: row[4], RequestID: row[5], Usage: &u}
-		ev := dbEvent(0, ms, string(transcript.Agent), "", "")
-		ev.Reply = reply
-		if _, ok := best[key]; !ok {
-			keys = append(keys, key)
-		}
-		best[key] = pricedHit{hit: sortedHit{hit: hit{src: s.src, ev: ev}, fileID: id}, out: out}
-	}
-	slices.SortFunc(keys, func(a, b usageKey) int {
-		return cmp.Or(cmp.Compare(a.session, b.session), cmp.Compare(a.reply, b.reply), cmp.Compare(a.request, b.request))
-	})
-	hits := make([]sortedHit, 0, len(keys))
-	for _, key := range keys {
-		hits = append(hits, best[key].hit)
+		u := price.NewUsage(int64(in), int64(out), int64(read), int64(write), int64(w5), int64(w1), row[11] == "true", row[12])
+		reply.Usage = &u
+		h := sortedHit{hit: hit{src: s.src, ev: dbEvent(line, ms, string(transcript.Agent), "", "")}, fileID: id}
+		h.ev.Reply = reply
+		hits = append(hits, h)
 	}
 	return hits, nil
 }
@@ -1097,6 +1079,7 @@ func (d *dbPath) showRef(ref eventRef, width int, w, stderr io.Writer) (int, err
 
 // printRef prints the events of one line in full, the way showRef does.
 func printRef(ref string, lineNo, width int, found []sortedHit, w io.Writer) int {
+	ref = strings.TrimPrefix(ref, idPrefix)
 	if len(found) == 0 {
 		fmt.Fprintf(w, "tl: no event at %s:%d (service record, unparsable line or out of range)\n", ref, lineNo)
 		return exitNone

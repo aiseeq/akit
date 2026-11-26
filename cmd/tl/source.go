@@ -89,7 +89,7 @@ func find(arg, home string) (string, error) {
 
 // findIn is find over the transcript names that names lists: the folders, or the database's list of files.
 func findIn(arg, home string, names func() ([]string, error)) (string, error) {
-	arg = normalizeSessionArg(arg, home)
+	arg = sessionArg(arg, home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		if _, err := os.Stat(arg); err != nil {
 			return "", fmt.Errorf("transcript %s: %w", arg, err)
@@ -150,18 +150,17 @@ func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts (%s); give more of the id", arg, len(matches), strings.Join(shown, ", "))
 }
 
-// normalizeSessionArg removes the optional reference prefix and expands home-relative paths for either resolver.
-func normalizeSessionArg(arg, home string) string {
-	if id, _, ok, err := parseRef(arg); ok && err == nil {
-		arg = id
-	} else {
-		arg = strings.TrimPrefix(arg, "id:")
-	}
+// sessionArg is a session argument as the resolvers of both backends look it up: without its "id:" prefix and with
+// "~/" expanded. The prefix goes once, and the line of a reference is split off before, by parseRef.
+func sessionArg(arg, home string) string {
+	arg = strings.TrimPrefix(arg, idPrefix)
 	if strings.HasPrefix(arg, "~/") {
 		arg = filepath.Join(home, arg[2:])
 	}
 	return arg
 }
+
+const idPrefix = "id:"
 
 var refArg = regexp.MustCompile(`^(.+):([1-9][0-9]{0,8})$`)
 
@@ -315,18 +314,19 @@ func commonPrefix(a, b string) int {
 }
 
 type eventRef struct {
-	id   string
+	id   string // as given, the "id:" prefix included: find takes it off
 	line int
 }
 
-// parseRef узнаёт аргумент вида «id:строка» или «id:<id>:строка» (форма из документации); не он — ok=false.
+// parseRef узнаёт аргумент вида «id:строка» или «id:<id>:строка» (форма из документации) и отделяет строку; не он —
+// ok=false.
 func parseRef(arg string) (string, int, bool, error) {
 	m := refArg.FindStringSubmatch(arg)
 	if m == nil {
 		return "", 0, false, nil
 	}
-	id := strings.TrimPrefix(m[1], "id:")
-	if id == "" {
+	id := m[1]
+	if id == idPrefix {
 		return "", 0, true, fmt.Errorf("ref %s: empty id", arg)
 	}
 	line, err := strconv.Atoi(m[2])

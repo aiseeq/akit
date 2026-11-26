@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,9 +34,10 @@ type fakeCH struct {
 	t           *testing.T
 	files       []*chFile
 	mu          sync.Mutex
-	names       []string      // log_comment of each request, in order
-	eventWhole  []string      // whole-text limits used by the event listing
-	eventSQL    []string      // event projections, for the text-preservation contract
+	names       []string // log_comment of each request, in order
+	eventWhole  []string // whole-text limits used by the event listing
+	eventSQL    []string // event projections, for the text-preservation contract
+	usageSQL    []string
 	gate        chan struct{} // when set, requests wait for it to close
 	fail        map[string]bool
 	legacyUsage bool
@@ -195,6 +197,9 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.eventWhole = append(s.eventWhole, q.Get("param_whole"))
 		s.eventSQL = append(s.eventSQL, sql)
 	}
+	if name == "usage" {
+		s.usageSQL = append(s.usageSQL, sql)
+	}
 	gate := s.gate
 	s.mu.Unlock()
 	if gate != nil {
@@ -220,10 +225,7 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	param := func(name string) string { return q.Get("param_" + name) }
 	switch name {
 	case "usage_legacy":
-		// Claude replies and Codex token reports loaded before usage_session existed both carry an empty one
-		if !strings.Contains(sql, "usage_session = '' AND (reply_id != '' OR (kind IN ('codex', 'codex-ext') AND who = 'token_count'))") {
-			s.t.Errorf("legacy usage query misses incomplete session rows: %s", sql)
-		}
+		// what a query of the usage table asks first
 		if s.legacyUsage {
 			row(1)
 		} else {
@@ -249,87 +251,12 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			row(f.path, f.lines)
 		}
 	case "usage":
-		if !strings.Contains(sql, "SELECT usage_session, reply_id, if(reply_id = '', request_id, '') FROM events") {
-			s.t.Errorf("usage query does not use the canonical session key: %s", sql)
-		}
-		type usageKey struct{ session, reply, request string }
-		best := map[usageKey]struct {
-			f                     *chFile
-			e                     chEvent
-			u                     *price.Usage
-			model, reply, request string
-		}{}
-		final := strings.Contains(sql, "usage FINAL")
-		selected := map[usageKey]bool{}
-		keyFor := func(f *chFile, e chEvent) (usageKey, *price.Usage, string, string, string, bool) {
-			var u *price.Usage
-			var model, reply, request string
-			if e.ev.Reply != nil {
-				model, reply, request, u = e.ev.Reply.Model, e.ev.Reply.ID, e.ev.Reply.RequestID, e.ev.Reply.Usage
-			} else if e.ev.Tokens != nil {
-				model, reply, u = e.ev.Tokens.Model, fmt.Sprintf("codex:%d", e.ev.Line), e.ev.Tokens.PriceUsage()
+		for _, u := range s.usageAnswer(q, sql) {
+			if strings.Contains(sql, " FROM usage") {
+				row(u.file.id, u.at, u.session, u.model, u.reply, u.request, u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Write5m, u.Write1h, u.Fast, u.Geo)
+			} else {
+				row(u.file.id, u.legacy, u.model, u.reply, u.request, u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Write5m, u.Write1h, u.Fast, u.Geo, u.at, u.line)
 			}
-			if u == nil || reply == "" && request == "" {
-				return usageKey{}, nil, "", "", "", false
-			}
-			session := f.session
-			if transcriptdb.IsCodexKind(f.kind) {
-				session = f.path
-			} else if f.parent != "" {
-				session = f.parent
-			}
-			if reply != "" {
-				request = ""
-			}
-			return usageKey{session, reply, request}, u, model, reply, request, true
-		}
-		if final {
-			for _, f := range s.files {
-				for _, e := range f.events {
-					if !s.match(q, sql, f, e) {
-						continue
-					}
-					if k, _, _, _, _, ok := keyFor(f, e); ok {
-						selected[k] = true
-					}
-				}
-			}
-		}
-		for _, f := range s.files {
-			for _, e := range f.events {
-				if !final && !s.match(q, sql, f, e) {
-					continue
-				}
-				k, u, model, reply, request, ok := keyFor(f, e)
-				if !ok || final && !selected[k] {
-					continue
-				}
-				old, ok := best[k]
-				if !ok || u.Output > old.u.Output {
-					best[k] = struct {
-						f                     *chFile
-						e                     chEvent
-						u                     *price.Usage
-						model, reply, request string
-					}{f, e, u, model, reply, request}
-				}
-			}
-		}
-		if final {
-			for k, b := range best {
-				if !s.match(q, sql, b.f, b.e) {
-					delete(best, k)
-				}
-			}
-		}
-		for k, b := range best {
-			_ = k
-			fast := "0"
-			if b.u.Fast {
-				fast = "1"
-			}
-			row(b.f.id, ms(b.e.ev.Time), k.session, b.model, b.reply, b.request, b.u.Input, b.u.Output, b.u.CacheRead, b.u.CacheWrite,
-				b.u.Write5m, b.u.Write1h, fast, b.u.Geo)
 		}
 	case "events":
 		for _, f := range s.files {
@@ -440,6 +367,111 @@ func ms(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
+// chUsage are the usage columns of one event.
+type chUsage struct {
+	file                           *chFile
+	at                             int64
+	line                           int
+	seq                            uint64
+	legacy                         int
+	session, model, reply, request string
+	price.Usage
+}
+
+// usageColumns are the usage columns of an event as the loader fills them: zero where it has no usage.
+func (s *fakeCH) usageColumns(f *chFile, e chEvent) chUsage {
+	c := chUsage{file: f, at: ms(e.ev.Time), line: e.ev.Line, seq: e.seq, session: f.session}
+	if transcriptdb.IsCodexKind(f.kind) {
+		c.session = f.path
+	} else if f.parent != "" {
+		c.session = f.parent
+	}
+	if r := e.ev.Reply; r != nil {
+		if r.Usage != nil {
+			c.model, c.reply, c.request, c.Usage = r.Model, r.ID, r.RequestID, *r.Usage
+		}
+	} else if u := e.ev.Tokens.PriceUsage(); u != nil && !s.legacyUsage {
+		c.model, c.reply, c.Usage = e.ev.Tokens.Model, fmt.Sprintf("codex:%d", e.ev.Line), *u
+	}
+	if s.legacyUsage {
+		c.legacy = 1
+	}
+	return c
+}
+
+// usageAnswer is the answer to the usage query: the versions of usage in the events it selects. A query of the
+// usage table gets the rows that table holds: it is a ReplacingMergeTree, and an insert leaves one row of a key —
+// the one with the most output, the last inserted of equal ones.
+func (s *fakeCH) usageAnswer(q url.Values, sql string) []chUsage {
+	type key struct{ session, reply, request string }
+	var inserted []key
+	table := map[key]chUsage{}
+	asked := map[key]bool{}
+	canonical := func(c chUsage) key {
+		if c.reply != "" {
+			return key{c.session, c.reply, ""}
+		}
+		return key{c.session, "", c.request}
+	}
+	var versions []chUsage
+	seen := map[string]int{}
+	for _, f := range s.files {
+		for _, e := range f.events {
+			c := s.usageColumns(f, e)
+			if c.reply != "" || c.request != "" {
+				k := key{c.session, c.reply, c.request}
+				old, ok := table[k]
+				if !ok {
+					inserted = append(inserted, k)
+				}
+				if !ok || c.Output >= old.Output {
+					table[k] = c
+				}
+			}
+			if !s.match(q, sql, f, e) || !usageSelected(sql, c, e.ev.Who) {
+				continue
+			}
+			asked[canonical(c)] = true
+			group := fmt.Sprintf("%d %d %q %q %q %+v", f.id, c.legacy, c.model, c.reply, c.request, c.Usage)
+			if c.reply == "" && c.request == "" && strings.Contains(sql, "if(reply_id = '' AND request_id = '', (line, seq), (0, 0))") {
+				group += fmt.Sprintf(" %d %d", c.line, c.seq)
+			}
+			i, ok := seen[group]
+			switch {
+			case !ok:
+				seen[group] = len(versions)
+				versions = append(versions, c)
+			case strings.Contains(sql, "min((ts, line))") == (cmp.Or(cmp.Compare(c.at, versions[i].at), cmp.Compare(c.line, versions[i].line)) < 0):
+				versions[i] = c
+			}
+		}
+	}
+	if !strings.Contains(sql, " FROM usage") {
+		// as on the server, the order of the groups is not the order of the events
+		slices.Reverse(versions)
+		return versions
+	}
+	_, outer, _ := strings.Cut(sql, "(reply_id != '' OR request_id != ''))")
+	var rows []chUsage
+	for _, k := range inserted {
+		c := table[k]
+		at := time.UnixMilli(c.at)
+		if !asked[canonical(c)] || strings.Contains(outer, "ts >= {since") && at.Before(chParseTime(s.t, q.Get("param_since"))) ||
+			strings.Contains(outer, "ts <= {until") && at.After(chParseTime(s.t, q.Get("param_until"))) {
+			continue
+		}
+		rows = append(rows, c)
+	}
+	return rows
+}
+
+// usageSelected is the part of the WHERE of a usage query that keeps the events with usage.
+func usageSelected(sql string, c chUsage, who string) bool {
+	return strings.Contains(sql, "reply_id != ''") && c.reply != "" || strings.Contains(sql, "request_id != ''") && c.request != "" ||
+		strings.Contains(sql, "model != ''") && c.model != "" ||
+		strings.Contains(sql, "(kind IN ('codex', 'codex-ext') AND who = 'token_count')") && transcriptdb.IsCodexKind(c.file.kind) && who == "token_count"
+}
+
 // match is the WHERE of the events queries: the same conditions ClickHouse evaluates.
 func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 	param := func(name string) string { return q.Get("param_" + name) }
@@ -449,14 +481,15 @@ func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 		return false
 	}
 	ts := time.UnixMilli(ms(ev.Time))
-	if v := param("since"); v != "" && ts.Before(chParseTime(s.t, v)) {
-		return false
+	if v := param("since"); v != "" {
+		at := chParseTime(s.t, v)
+		if strings.Contains(sql, "ts >= {since:") && ts.Before(at) || strings.Contains(sql, "ts > {since:") && !ts.After(at) {
+			return false
+		}
 	}
-	if v := param("until"); v != "" && ts.After(chParseTime(s.t, v)) {
-		return false
-	}
-	if strings.Contains(sql, "reply_id != '' OR request_id != ''") {
-		if ev.Reply != nil && ev.Reply.ID == "" && ev.Reply.RequestID == "" || ev.Reply == nil && ev.Tokens == nil {
+	if v := param("until"); v != "" {
+		at := chParseTime(s.t, v)
+		if strings.Contains(sql, "ts <= {until:") && ts.After(at) || strings.Contains(sql, "ts < {until:") && !ts.Before(at) {
 			return false
 		}
 	}
@@ -966,7 +999,9 @@ func TestDBServerErrorReadsFiles(t *testing.T) {
 
 func TestDBUsageIncompleteSessionFallsBackToFiles(t *testing.T) {
 	e, paths, _ := dbCorpus(t)
-	ch := newFakeCH(t, paths, map[string]int{})
+	rollout := filepath.Join(e.home, ".codex", "sessions", "2026", "10", "25", "rollout-2026-10-25T10-20-00-0199bbbb-0000-7000-8000-000000000001.jsonl")
+	writeWorkFile(t, rollout, extRolloutRows("/work/extproj", "внешний запуск"))
+	ch := newFakeCH(t, append(paths, rollout), map[string]int{})
 	ch.legacyUsage = true
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
@@ -977,65 +1012,206 @@ func TestDBUsageIncompleteSessionFallsBackToFiles(t *testing.T) {
 	if err := os.WriteFile(statePath, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	e.backend = backendFiles
-	codeFiles, outFiles, _ := runTL(t, e, "--all", "--usage")
-	e.backend = backendDB
-	codeDB, outDB, warning := runTL(t, e, "--all", "--usage")
-	if codeDB != codeFiles || outDB != outFiles || !strings.Contains(warning, "usage session metadata is incomplete") || !strings.Contains(warning, "reading files instead") {
-		t.Fatalf("incomplete usage did not fall back: files=(%d,%q), db=(%d,%q,%q)", codeFiles, outFiles, codeDB, outDB, warning)
+	// a Codex token report loaded before the usage columns existed has neither an id nor a model
+	for _, args := range [][]string{{"--all", "--usage"}, {rollout, "--usage"}} {
+		e.backend = backendFiles
+		codeFiles, outFiles, _ := runTL(t, e, args...)
+		e.backend = backendDB
+		codeDB, outDB, warning := runTL(t, e, args...)
+		if codeFiles != 0 || codeDB != codeFiles || outDB != outFiles || !strings.Contains(warning, "usage session metadata is incomplete") || !strings.Contains(warning, "reading files instead") {
+			t.Errorf("%q: incomplete usage did not fall back: files=(%d,%q), db=(%d,%q,%q)", args, codeFiles, outFiles, codeDB, outDB, warning)
+		}
 	}
 }
 
+// usageSameAsFiles runs tl --usage through both paths, requires the same answer and returns it.
+func usageSameAsFiles(t *testing.T, e env, args ...string) (int, string) {
+	t.Helper()
+	args = append([]string{"--usage"}, args...)
+	e.backend = backendFiles
+	codeF, outF, _ := runTL(t, e, args...)
+	e.backend = backendDB
+	codeD, outD, errD := runTL(t, e, args...)
+	if codeF != codeD || outF != outD || strings.Contains(errD, "instead") {
+		t.Errorf("%q: files (%d):\n%s\ndb (%d, %s):\n%s", args, codeF, outF, codeD, errD, outD)
+	}
+	return codeD, outD
+}
+
+// A window counts a reply by its events inside the window alone: one is enough, and the tokens are of the event with
+// the most output among them, the first of equal ones.
 func TestDBUsageWindowSelectsReplyVersionsByEventTime(t *testing.T) {
 	e := fakeHome(t)
-	path := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", "abab1234-0000-4000-8000-000000000001.jsonl")
-	first := usageRecord("windowed", "claude-opus-5-5", "first", 10, 0, 0, 2)
-	last := strings.ReplaceAll(usageRecord("windowed", "claude-opus-5-5", "last", 10, 0, 0, 20), "2026-10-25T10:00:00Z", "2026-10-25T10:01:00Z")
-	writeWorkFile(t, path, []string{first, last})
-	ch := newFakeCH(t, []string{path}, map[string]int{})
+	project := filepath.Join(e.home, ".claude", "projects", "-home-x-proj")
+	at := func(record, clock string) string { return strings.ReplaceAll(record, "10:00:00Z", clock) }
+	version := func(clock string, read, out int64) string {
+		return at(usageRecord("windowed", "claude-opus-5-5", clock, 10, 0, read, out), clock)
+	}
+	var paths []string
+	session := func(n int, rows ...string) string {
+		path := filepath.Join(project, fmt.Sprintf("abab123%d-0000-4000-8000-000000000001.jsonl", n))
+		writeWorkFile(t, path, rows)
+		paths = append(paths, path)
+		return path
+	}
+	grows := session(1, version("10:00:00.000Z", 1, 2), version("10:01:00.000Z", 2, 20))
+	equal := session(2, version("10:00:00.000Z", 100, 20), version("10:01:00.000Z", 200, 20), version("10:02:00.000Z", 300, 20))
+	shrinks := session(3, version("10:00:00.000Z", 1, 20), version("10:01:00.000Z", 2, 2))
+	repeats := session(4, version("10:00:00.000Z", 1, 20), version("10:01:00.000Z", 1, 20), version("10:02:00.000Z", 1, 20))
+	returns := session(6, version("10:00:00.000Z", 100, 20), version("10:01:00.000Z", 200, 20), version("10:02:00.000Z", 100, 20))
+	outOfOrder := session(5, version("10:01:00.000Z", 200, 20), version("10:00:00.000Z", 100, 20))
+	ch := newFakeCH(t, paths, map[string]int{})
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 
+	const day = "2026-10-25T"
 	for _, tc := range []struct {
-		name, bound string
-		wantOut     string
+		name, path, since, until string
+		read, out                string // "" — no reply in the window
 	}{
-		{"until", "--until", "2"},
-		{"since", "--since", "20"},
+		{"whole", grows, "", "", "2", "20"},
+		{"until between", grows, "", "10:00:30Z", "1", "2"},
+		{"since between", grows, "10:00:30Z", "", "2", "20"},
+		{"until at the first event", grows, "", "10:00:00.000Z", "1", "2"},
+		{"until before the first event", grows, "", "09:59:59.999Z", "", ""},
+		{"since at the last event", grows, "10:01:00.000Z", "", "2", "20"},
+		{"since after the last event", grows, "10:01:00.001Z", "", "", ""},
+		{"between the events", grows, "10:00:00.001Z", "10:00:59.999Z", "", ""},
+		{"equal, whole", equal, "", "", "100", "20"},
+		{"equal, until", equal, "", "10:00:30Z", "100", "20"},
+		{"equal, since", equal, "10:00:30Z", "", "200", "20"},
+		{"equal, both", equal, "10:00:30Z", "10:01:30Z", "200", "20"},
+		{"equal, last alone", equal, "10:01:30Z", "", "300", "20"},
+		{"shrinks, whole", shrinks, "", "", "1", "20"},
+		{"shrinks, since", shrinks, "10:00:30Z", "", "2", "2"},
+		{"repeats, until", repeats, "", "10:00:30Z", "1", "20"},
+		{"repeats, middle", repeats, "10:00:30Z", "10:01:30Z", "1", "20"},
+		{"returns, whole", returns, "", "", "100", "20"},
+		{"returns, since", returns, "10:00:30Z", "", "200", "20"},
+		{"out of order, whole", outOfOrder, "", "", "100", "20"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			at := "2026-10-25T10:00:30Z"
-			args := []string{"--usage", path, tc.bound, at}
-			e.backend = backendFiles
-			codeFiles, outFiles, _ := runTL(t, e, args...)
-			e.backend = backendDB
-			codeDB, outDB, errDB := runTL(t, e, args...)
-			if codeFiles != codeDB || outFiles != outDB || strings.Contains(errDB, "reading files instead") {
-				t.Fatalf("files (%d):\n%s\ndb (%d, %s):\n%s", codeFiles, outFiles, codeDB, errDB, outDB)
+		args := []string{tc.path}
+		if tc.since != "" {
+			args = append(args, "--since", day+tc.since)
+		}
+		if tc.until != "" {
+			args = append(args, "--until", day+tc.until)
+		}
+		code, out := usageSameAsFiles(t, e, args...)
+		if tc.out == "" {
+			if code != exitNone {
+				t.Errorf("%s: exit %d, want %d:\n%s", tc.name, code, exitNone, out)
 			}
-			rows := strings.Split(strings.TrimSpace(outDB), "\n")
-			fields := strings.Split(rows[2], "\t")
-			if len(fields) < 6 || fields[5] != tc.wantOut {
-				t.Fatalf("window selected output tokens %v, want %s:\n%s", fields, tc.wantOut, outDB)
-			}
-		})
+			continue
+		}
+		fields := strings.Split(strings.Split(out, "\n")[1], "\t")
+		if len(fields) < 6 || fields[1] != "1" || fields[4] != tc.read || fields[5] != tc.out {
+			t.Errorf("%s: want 1 reply, cache read %s, output %s:\n%s", tc.name, tc.read, tc.out, out)
+		}
 	}
 }
 
+// A reply belongs to the session that has its first event in the window, whichever session has the most output;
+// replies without ids are counted at every event, a repeated token report of Codex is not a call.
+func TestDBUsageCountsRepliesAsFiles(t *testing.T) {
+	e := fakeHome(t)
+	project := filepath.Join(e.home, ".claude", "projects", "-home-x-proj")
+	at := func(record, clock string) string { return strings.ReplaceAll(record, "10:00:00Z", clock) }
+	noIDs := func(record string) string {
+		return strings.NewReplacer(`"requestId":"req-",`, "", `"id":"",`, "").Replace(record)
+	}
+	const one, two = "abab1111-0000-4000-8000-000000000001", "abab2222-0000-4000-8000-000000000001"
+	paths := []string{
+		filepath.Join(project, one+".jsonl"),
+		filepath.Join(project, two+".jsonl"),
+		// the copies of one subagent under two sessions: the later one has the most output
+		filepath.Join(project, one, "subagents", "agent-c0c0c0c0.jsonl"),
+		filepath.Join(project, two, "subagents", "agent-c0c0c0c0.jsonl"),
+		filepath.Join(e.home, ".local", "state", "worker", "w1", "codex", "sessions", "2026", "10", "25", "rollout-2026-10-25T10-20-00-0199cccc-0000-7000-8000-000000000001.jsonl"),
+		filepath.Join(project, sessionID+".jsonl"),
+	}
+	writeWorkFile(t, paths[0], []string{userRecord("2026-10-25T09:59:00Z", "one"), usageRecord("shared", "claude-opus-5-5", "parent", 10, 0, 0, 3)})
+	writeWorkFile(t, paths[1], []string{
+		userRecord("2026-10-25T09:59:00Z", "two"),
+		noIDs(usageRecord("", "claude-opus-5-5", "no ids", 10, 0, 0, 7)),
+		noIDs(usageRecord("", "claude-opus-5-5", "no ids again", 10, 0, 0, 7)),
+		strings.NewReplacer(`"requestId":"req-"`, `"requestId":"req-only"`, `"id":"",`, "", `"model":"",`, "").Replace(usageRecord("", "", "request only", 10, 0, 0, 5)),
+		strings.NewReplacer(`"requestId":"req-message",`, "", `"model":"",`, "").Replace(usageRecord("message", "", "message id only", 10, 0, 0, 6)),
+	})
+	writeWorkFile(t, paths[2], []string{usageRecord("shared", "claude-opus-5-5", "copy", 10, 0, 0, 1), at(usageRecord("shared", "claude-opus-5-5", "copy", 10, 0, 0, 4), "10:02:00Z")})
+	writeWorkFile(t, paths[3], []string{at(usageRecord("shared", "claude-opus-5-5", "copy", 10, 0, 0, 9), "10:01:00Z")})
+	rollout := extRolloutRows("/work/proj", "запуск")
+	writeWorkFile(t, paths[4], append(rollout, rollout[len(rollout)-1]))
+	ch := newFakeCH(t, paths, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	for _, tc := range []struct {
+		replies string
+		args    []string
+	}{
+		{"7", []string{"--all", "--codex"}},
+		{"6", []string{"--all"}},
+		{"1", []string{"--all", "--since", "2026-10-25T10:00:30Z"}},
+		{"1", []string{"--all", "--since", "2026-10-25T10:01:30Z"}},
+		{"2", []string{one, "--subagents"}},
+		{"1", []string{paths[4]}},
+	} {
+		_, out := usageSameAsFiles(t, e, tc.args...)
+		rows := strings.Split(out, "\n")
+		if i := slices.IndexFunc(rows, func(r string) bool { return strings.HasPrefix(r, "total\t") }); i < 0 || strings.Split(rows[i], "\t")[1] != tc.replies {
+			t.Errorf("%q: want %s replies:\n%s", tc.args, tc.replies, out)
+		}
+	}
+	for _, sql := range ch.usageSQL {
+		if n := strings.Count(sql, "model, reply_id, request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo"); n != 2 {
+			t.Errorf("the usage columns are %d times in the query, want in SELECT and GROUP BY: %s", n, sql)
+		}
+	}
+}
+
+// Every form of a session and of a reference means the same through both paths.
 func TestDBSessionReferencePrefixes(t *testing.T) {
 	e, paths, _ := dbCorpus(t)
 	ch := newFakeCH(t, paths, map[string]int{})
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-	for _, arg := range []string{"id:" + dbOtherSession[:8], "id:" + dbOtherSession[:8] + ":2", "~/" + strings.TrimPrefix(paths[1], e.home+string(filepath.Separator))} {
+	id, tilded := dbOtherSession[:8], "~/"+strings.TrimPrefix(paths[1], e.home+string(filepath.Separator))
+	for _, tc := range []struct {
+		arg  string
+		code int
+	}{
+		{id, 0},
+		{id + ":2", 0},
+		{"id:" + id, 0},
+		{"id:" + id + ":2", 0},
+		{paths[1], 0},
+		{paths[1] + ":2", 0},
+		{"id:" + paths[1] + ":2", 0},
+		{tilded, 0},
+		{tilded + ":2", 0},
+		{"id:" + tilded, 0},
+		// a second line or a second prefix is not a part of the form
+		{id + ":5:2", exitUsage},
+		{"id:" + id + ":5:2", exitUsage},
+		{"id:id:" + id + ":2", exitUsage},
+		{"id:id:" + id, exitUsage},
+		{"id:" + id + ":", exitUsage},
+		{"id::2", exitUsage},
+		{"id:", exitUsage},
+	} {
 		e.backend = backendFiles
-		wantCode, wantOut, _ := runTL(t, e, arg)
+		codeF, outF, errF := runTL(t, e, tc.arg)
 		e.backend = backendDB
-		code, out, errOut := runTL(t, e, arg)
-		if code != wantCode || out != wantOut || strings.Contains(errOut, "reading files instead") {
-			t.Errorf("%q: files=(%d,%q), db=(%d,%q,%q)", arg, wantCode, wantOut, code, out, errOut)
+		codeD, outD, errD := runTL(t, e, tc.arg)
+		if codeF != tc.code || codeD != tc.code || outF != outD || tc.code == 0 && strings.Contains(errD, "instead") {
+			t.Errorf("%q: want exit %d: files=(%d,%q), db=(%d,%q,%q)", tc.arg, tc.code, codeF, outF, codeD, outD, errD)
+		}
+		// a reference prints its id without the prefix; an empty id is named so on both paths
+		if strings.Contains(outF, " id:") || tc.arg == "id::2" && (!strings.Contains(errF, "empty id") || !strings.Contains(errD, "empty id")) {
+			t.Errorf("%q: files=(%q,%q), db=(%q,%q)", tc.arg, outF, errF, outD, errD)
 		}
 	}
 }
