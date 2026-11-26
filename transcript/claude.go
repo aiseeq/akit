@@ -95,6 +95,7 @@ type attachment struct {
 	Snippet  json.RawMessage `json:"snippet"`
 	Filename json.RawMessage `json:"filename"`
 	Path     json.RawMessage `json:"path"`
+	Skills   json.RawMessage `json:"skills"`
 }
 
 type part struct {
@@ -200,14 +201,44 @@ func attached(raw json.RawMessage, ev func(Role, string, string) Event) []Event 
 	return []Event{e}
 }
 
-// text — сообщение вложения: первое непустое строковое поле из известных.
+// text — сообщение вложения: первое непустое строковое поле или массив строк из известных.
 func (a *attachment) text() string {
-	for _, f := range []json.RawMessage{a.Content, a.Text, a.Stdout, a.Snippet, a.Prompt, a.Filename, a.Path} {
-		if s := str(f); s != "" {
+	for _, field := range []struct {
+		raw      json.RawMessage
+		itemName string
+	}{{a.Content, ""}, {a.Text, ""}, {a.Stdout, ""}, {a.Snippet, ""}, {a.Prompt, ""}, {a.Filename, ""}, {a.Path, ""}, {a.Skills, "name"}} {
+		if s := attachmentFieldText(field.raw, field.itemName); s != "" {
 			return s
 		}
 	}
 	return ""
+}
+
+func attachmentFieldText(raw json.RawMessage, itemName string) string {
+	if s := str(raw); s != "" {
+		return s
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return ""
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		if s := str(item); s != "" {
+			lines = append(lines, s)
+			continue
+		}
+		var named map[string]json.RawMessage
+		if itemName == "" || json.Unmarshal(item, &named) != nil {
+			return ""
+		}
+		if s := str(named[itemName]); s != "" {
+			lines = append(lines, s)
+		} else {
+			return ""
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 const (
