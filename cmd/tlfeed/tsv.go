@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
 	"github.com/aiseeq/akit/transcriptdb"
@@ -108,7 +110,7 @@ func msTime(t time.Time) string {
 const (
 	rawColumns   = "file_id, line, off, raw"
 	eventColumns = "ts, file_id, session, kind, project, line, seq, role, who, text, images, error, subtype, model, reply_id, " +
-		"request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo, cwd, usage_session"
+		"request_id, in_tok, out_tok, cache_read, cache_write, cache_write_5m, cache_write_1h, fast, geo, cwd, usage_session, flat_len"
 	fileColumns = "file_id, path, kind, project, session, parent, name, description, size, ingested, lines, ev_lines, mtime, inode, " +
 		"first_ts, last_ts, bad, tail, gen, dirty, ver, cwd"
 	// usageColumns — the columns of usage as usage_mv fills them from events
@@ -125,7 +127,8 @@ func rawRow(b *bytes.Buffer, id uint64, line int, off int64, raw []byte) {
 	r.end()
 }
 
-// eventRow — one event as tl shows it: text is Shown(), the reply's usage goes to its token columns.
+// eventRow — one event as tl shows it: text is Shown(), the reply's usage goes to its token columns. flat_len is
+// the length of the text as a listing flattens it: tl reads only the start of a long text and needs its length.
 func eventRow(b *bytes.Buffer, f *file, e *transcript.Event, seq uint16) {
 	r := row{b}
 	r.ms(e.Time)
@@ -137,7 +140,8 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event, seq uint16) {
 	r.num(uint64(seq))
 	r.str(string(e.Role))
 	r.str(e.Who)
-	r.str(e.Shown())
+	shown := e.Shown()
+	r.str(shown)
 	r.num(uint64(min(max(e.Images, 0), 65535)))
 	r.flag(e.Error)
 	r.str(e.Subtype)
@@ -169,12 +173,13 @@ func eventRow(b *bytes.Buffer, f *file, e *transcript.Event, seq uint16) {
 	r.str(geo)
 	r.str(e.Cwd)
 	if transcriptdb.IsCodexKind(f.kind) {
-		r.last(strings.TrimSuffix(filepath.Base(f.src.Path), ".jsonl"))
+		r.str(strings.TrimSuffix(filepath.Base(f.src.Path), ".jsonl"))
 	} else if f.src.ParentID != "" {
-		r.last(f.src.ParentID)
+		r.str(f.src.ParentID)
 	} else {
-		r.last(f.src.ID)
+		r.str(f.src.ID)
 	}
+	r.last(strconv.FormatUint(min(uint64(utf8.RuneCountInString(transcript.Short(shown, 0))), math.MaxUint32), 10))
 }
 
 // fileRow — the state of a file after this pass. A dirty row is written before rows past its lines and ev_lines

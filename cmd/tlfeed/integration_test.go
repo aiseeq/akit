@@ -11,10 +11,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 // lossy passes requests to a server; the next lose inserts into raw are applied there, but the loader gets an
@@ -124,6 +128,20 @@ func TestLiveServer(t *testing.T) {
 	verifyAll(t, srv, db, h.home)
 	if n := scalar(t, srv, "SELECT count() FROM "+db+".raw WHERE loaded_at > now64(3) - 600"); n == "0" {
 		t.Fatal("raw rows without loaded_at")
+	}
+	// the stored flattened length of every event is the one transcript.Short gives its stored text
+	data, err := srv.query(context.Background(), "SELECT text, flat_len FROM "+db+".events FORMAT TabSeparated", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := tsvRows(data)
+	for _, row := range rows {
+		if want := strconv.Itoa(utf8.RuneCountInString(transcript.Short(row[0], 0))); row[1] != want {
+			t.Fatalf("flat_len %s of %q, want %s", row[1], row[0], want)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("no events")
 	}
 
 	// growth whose raw insert is applied but its answer lost twice: the loader sends it again with the same

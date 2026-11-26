@@ -890,6 +890,11 @@ func TestStatements(t *testing.T) {
 	if !strings.Contains(eventColumns, "project, line, seq, role") {
 		t.Fatalf("event insert columns omit seq: %s", eventColumns)
 	}
+	// a table made before flat_len gets it, 0 on its rows: tl reads such a row as before the column
+	if !strings.Contains(joined, "flat_len UInt32 DEFAULT 0,") || !strings.Contains(joined, "ADD COLUMN IF NOT EXISTS flat_len UInt32 DEFAULT 0 AFTER usage_session") ||
+		!strings.Contains(eventColumns, ", flat_len") {
+		t.Fatalf("events schema lacks the flattened length column, its migration or its insert: %s", eventColumns)
+	}
 	for _, s := range got {
 		if strings.HasPrefix(s, "CREATE TABLE IF NOT EXISTS tq.usage") && !strings.Contains(s, "max_bytes_to_merge_at_max_space_in_pool = 524288") {
 			t.Fatalf("usage table lacks the merge cap: %q", s)

@@ -37,10 +37,12 @@ type fakeCH struct {
 	names       []string // log_comment of each request, in order
 	eventWhole  []string // whole-text limits used by the event listing
 	eventSQL    []string // event projections, for the text-preservation contract
+	eventRunes  []int    // the characters of each event text the listing answers carried, in order
 	usageSQL    []string
 	gate        chan struct{} // when set, requests wait for it to close
 	fail        map[string]bool
 	legacyUsage bool
+	noFlatLen   bool // the events table has rows loaded before flat_len, with 0 there
 }
 
 type chFile struct {
@@ -60,6 +62,29 @@ type chEvent struct {
 	ev  transcript.Event
 	seq uint64
 	off uint64
+	// flatLen is flat_len as the loader writes it: the characters of transcript.Short of the shown text
+	flatLen int
+}
+
+// wantEventTextSQL is the projection of the text of a listing the fake knows: what it answers is eventText, and
+// TestLiveEventText holds that a real server answers the same to it.
+const wantEventTextSQL = "if((lengthUTF8(text) <= {cut:UInt32} OR (flat_len = 0 AND lengthUTF8(text) <= {whole:UInt32})) AS whole_text, " +
+	"text, substringUTF8(text, 1, {cut:UInt32})), if(whole_text, 0, if(flat_len > 0, flat_len, " +
+	`lengthUTF8(arrayStringConcat(arrayFilter(x -> x != '', splitByRegexp({ws:String}, ` +
+	`replaceAll(replaceRegexpAll(text, {trim:String}, ''), '\n', ' ⏎ '))), ' '))))`
+
+// eventText is the text and the flattened length the listing query gives for an event: a text up to cut, or up to
+// whole without a stored length, whole with 0; a longer one as its first cut characters with the stored length,
+// or the counted one where none is stored.
+func eventText(text string, flatLen, cut, whole int) (string, int) {
+	r := []rune(text)
+	if len(r) <= cut || flatLen == 0 && len(r) <= whole {
+		return text, 0
+	}
+	if flatLen == 0 {
+		flatLen = len([]rune(transcript.Short(text, 0)))
+	}
+	return string(r[:cut]), flatLen
 }
 
 func TestSortHitsUsesSequenceBeforeRoleAndPart(t *testing.T) {
@@ -136,7 +161,7 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 			if ev.Line <= n {
 				seq := seqByLine[ev.Line]
 				seqByLine[ev.Line]++
-				f.events = append(f.events, chEvent{ev: ev, seq: seq, off: uint64(len(f.events))})
+				f.events = append(f.events, chEvent{ev: ev, seq: seq, off: uint64(len(f.events)), flatLen: len([]rune(transcript.Short(ev.Shown(), 0)))})
 				if f.first.IsZero() || ev.Time.Before(f.first) {
 					f.first = ev.Time
 				}
@@ -266,14 +291,21 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				ev := e.ev
 				text, flat := ev.Shown(), 0
-				if strings.Contains(sql, "substringUTF8(text") {
+				switch {
+				case strings.Contains(sql, wantEventTextSQL):
 					cut, _ := strconv.Atoi(param("cut"))
 					whole, _ := strconv.Atoi(param("whole"))
-					truncateWhole := strings.Contains(sql, "lengthUTF8(text) <= {whole:UInt32}, substringUTF8(text")
-					if r := []rune(text); len(r) > whole || truncateWhole && len(r) > cut {
-						text, flat = string(r[:cut]), len([]rune(transcript.Short(ev.Shown(), 0)))
+					stored := e.flatLen
+					if s.noFlatLen {
+						stored = 0
 					}
+					text, flat = eventText(text, stored, cut, whole)
+				case !strings.Contains(sql, "SELECT file_id, line, seq, toUnixTimestamp64Milli(ts), role, who, subtype, text, 0, _part"):
+					s.t.Errorf("an event projection the fake does not know: %s", sql)
 				}
+				s.mu.Lock()
+				s.eventRunes = append(s.eventRunes, utf8.RuneCountInString(text))
+				s.mu.Unlock()
 				row(f.id, ev.Line, e.seq, ms(ev.Time), ev.Role, ev.Who, ev.Subtype, text, flat, "all_1_1_0", e.off)
 			}
 		}
@@ -764,26 +796,108 @@ func TestDBPrintsAsFiles(t *testing.T) {
 			t.Error("usage queried raw for price details")
 		}
 	}()
-	// texts up to wholeText come whole and are cut here; with 0 every long one comes as its start and the server's
-	// count of its flattened length
+	// rows with flat_len come as their start past the cut; rows without it (loaded before the column) as before
+	// it: texts up to wholeText whole and cut here, and with 0 every long one as its start and the server's count
+	// of its flattened length
 	defer func(whole int) { wholeText = whole }(wholeText)
-	for _, whole := range []int{wholeText, 0} {
-		wholeText = whole
-		for _, args := range dbForms {
-			e.backend = backendFiles
-			codeF, outF, _ := runTL(t, e, args...)
-			e.backend = backendDB
-			codeD, outD, errD := runTL(t, e, args...)
-			if strings.Contains(errD, "instead") {
-				t.Errorf("whole %d, %q: the database path fell back: %s", whole, args, errD)
-			}
-			if codeF != codeD || outF != outD {
-				t.Errorf("whole %d, %q: files exit %d, db exit %d\nfiles:\n%s\ndb:\n%s", whole, args, codeF, codeD, outF, outD)
-			}
-			if outF == "" {
-				t.Errorf("%q: empty answer", args)
+	for _, noFlatLen := range []bool{false, true} {
+		ch.noFlatLen = noFlatLen
+		for _, whole := range []int{wholeText, 0} {
+			wholeText = whole
+			for _, args := range dbForms {
+				e.backend = backendFiles
+				codeF, outF, _ := runTL(t, e, args...)
+				e.backend = backendDB
+				codeD, outD, errD := runTL(t, e, args...)
+				if strings.Contains(errD, "instead") {
+					t.Errorf("no flat_len %v, whole %d, %q: the database path fell back: %s", noFlatLen, whole, args, errD)
+				}
+				if codeF != codeD || outF != outD {
+					t.Errorf("no flat_len %v, whole %d, %q: files exit %d, db exit %d\nfiles:\n%s\ndb:\n%s", noFlatLen, whole, args, codeF, codeD, outF, outD)
+				}
+				if outF == "" {
+					t.Errorf("%q: empty answer", args)
+				}
 			}
 		}
+	}
+}
+
+// A long text that flattens to the width is shown whole and read whole; one character more and it is cut from its
+// start. Trailing spaces make the text longer than the cut.
+func TestDBStartOfTextAtTheWidth(t *testing.T) {
+	const width = 60
+	for _, flat := range []int{width, width + 1} {
+		t.Run(strconv.Itoa(flat), func(t *testing.T) {
+			e, paths, unloaded := dbCorpus(t)
+			marker := fmt.Sprintf("edge-flat-%d", flat)
+			text := marker + " " + strings.Repeat("y", flat-len(marker)-1) + strings.Repeat(" ", 2*textCut(width))
+			if got := utf8.RuneCountInString(transcript.Short(text, 0)); got != flat || utf8.RuneCountInString(text) <= textCut(width) {
+				t.Fatalf("fixture flattens to %d, want %d; %d characters, want more than %d", got, flat, utf8.RuneCountInString(text), textCut(width))
+			}
+			f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := fmt.Fprintln(f, agentRecord("2026-10-25T11:00:00Z", text)) // agent text keeps its trailing spaces
+			if err := errors.Join(writeErr, f.Close()); err != nil {
+				t.Fatal(err)
+			}
+			ch := newFakeCH(t, paths, unloaded)
+			srv := httptest.NewServer(ch)
+			defer srv.Close()
+			t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+			args := []string{paths[0], "--grep", marker, "--role", "agent", "--width", strconv.Itoa(width)}
+			e.backend = backendFiles
+			wantCode, wantOut, _ := runTL(t, e, args...)
+			e.backend = backendDB
+			code, out, stderr := runTL(t, e, args...)
+			if code != wantCode || out != wantOut || strings.Contains(stderr, "reading files instead") {
+				t.Fatalf("files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+			}
+			ch.mu.Lock()
+			defer ch.mu.Unlock()
+			if !slices.ContainsFunc(ch.eventRunes, func(n int) bool { return n > flat && n <= textCut(width) }) {
+				t.Fatalf("the text did not come cut from the events query: %v", ch.eventRunes)
+			}
+			if whole := slices.Contains(ch.names, "texts"); whole != (flat <= width) {
+				t.Fatalf("flattened to %d at width %d: the whole text read again %v, want %v", flat, width, whole, flat <= width)
+			}
+		})
+	}
+}
+
+// A text whose start loses the cut to masking, a secret at the end of the first window, comes whole by a second
+// query and is cut as the files cut it, though its row has flat_len and it came as its start.
+func TestDBMaskedStartReadsWholeText(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	marker := "masked-edge-fixture "
+	f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// width 60: the first window is 572 characters, the start 1144; the secret covers both and masks to a label
+	text := marker + "password=" + strings.Repeat("x9", 900) + " потом текст " + strings.Repeat("хвост ", 100)
+	_, writeErr := fmt.Fprintln(f, userRecord("2026-10-25T11:00:00Z", text))
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	args := []string{paths[0], "--grep", marker, "--role", "user", "--width", "60"}
+	e.backend = backendFiles
+	wantCode, wantOut, _ := runTL(t, e, args...)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, args...)
+	if code != wantCode || out != wantOut || !strings.Contains(out, "потом") || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("masked start differs: files=(%d,%q), db=(%d,%q,%q)", wantCode, wantOut, code, out, stderr)
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if !slices.Contains(ch.names, "texts") || slices.Contains(ch.eventRunes, utf8.RuneCountInString(text)) {
+		t.Fatalf("the text should come as its start and then whole: queries %v, characters %v", ch.names, ch.eventRunes)
 	}
 }
 
@@ -906,6 +1020,8 @@ func TestDBWideListingUsesAWholeLimitAtLeastAsWideAsItsCut(t *testing.T) {
 	}
 }
 
+// A row loaded before flat_len, with 0 there, is read as before the column: a text up to wholeText comes whole
+// and is cut here, though it is longer than the cut.
 func TestDBShortCutReadsWholeText(t *testing.T) {
 	e, paths, unloaded := dbCorpus(t)
 	marker := "whole-text-fixture "
@@ -919,6 +1035,7 @@ func TestDBShortCutReadsWholeText(t *testing.T) {
 		t.Fatal(err)
 	}
 	ch := newFakeCH(t, paths, unloaded)
+	ch.noFlatLen = true
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
@@ -932,12 +1049,54 @@ func TestDBShortCutReadsWholeText(t *testing.T) {
 	}
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	for _, sql := range ch.eventSQL {
-		if strings.Contains(sql, "lengthUTF8(text) <= {whole:UInt32}, text, substringUTF8") {
-			return
+	if !slices.Contains(ch.eventRunes, utf8.RuneCountInString(text)) {
+		t.Fatalf("a text below the whole-text limit of a row without flat_len did not come whole: %v characters", ch.eventRunes)
+	}
+	if slices.Contains(ch.names, "texts") {
+		t.Fatalf("a text that came whole was read again: %v", ch.names)
+	}
+}
+
+// A row with flat_len comes as the start of its text when the text is longer than the cut, below wholeText too:
+// the listing cuts it by the stored length and prints what the files give, without reading the text again.
+func TestDBCutsByStoredFlatLen(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	marker := "stored-length-fixture "
+	f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// runs of spaces and line breaks: the flattened length differs from the length of the text
+	text := marker + strings.Repeat("слово  за\r\nсловом 　", 400) + " unique-tail-marker"
+	_, writeErr := fmt.Fprintln(f, userRecord("2026-10-25T11:00:00Z", text))
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	for _, width := range []string{"60", "80", "200"} {
+		args := []string{paths[0], "--grep", marker, "--role", "user", "--width", width}
+		e.backend = backendFiles
+		wantCode, wantOut, _ := runTL(t, e, args...)
+		e.backend = backendDB
+		code, out, stderr := runTL(t, e, args...)
+		if code != wantCode || out != wantOut || !strings.Contains(out, "…(+") || strings.Contains(stderr, "reading files instead") {
+			t.Fatalf("width %s: listing by the stored length differs: files=(%d,%q), db=(%d,%q,%q)", width, wantCode, wantOut, code, out, stderr)
+		}
+		w, _ := strconv.Atoi(width)
+		ch.mu.Lock()
+		runes, names := slices.Clone(ch.eventRunes), slices.Clone(ch.names)
+		ch.eventRunes, ch.names = nil, nil
+		ch.mu.Unlock()
+		if len(runes) == 0 || slices.Max(runes) > textCut(w) {
+			t.Fatalf("width %s: the listing carried %v characters of the texts, want at most the cut %d", width, runes, textCut(w))
+		}
+		if slices.Contains(names, "texts") {
+			t.Fatalf("width %s: a text cut by its stored length was read again: %v", width, names)
 		}
 	}
-	t.Fatalf("event query does not preserve whole text below the whole-text limit: %v", ch.eventSQL)
 }
 
 // A database that does not answer leaves the call to the files, with a warning.
@@ -1268,6 +1427,32 @@ func TestLiveFlatLen(t *testing.T) {
 		}
 		if want := strconv.Itoa(len([]rune(transcript.Short(text, 0)))); len(rows) != 1 || rows[0][0] != want {
 			t.Errorf("%q: server %v, Short %s", text, rows, want)
+		}
+	}
+}
+
+// A real server answers the projection of a listing as the fake does: by flat_len where it is stored, the old way
+// where it is 0; the fake knows the projection the listing sends.
+func TestLiveEventText(t *testing.T) {
+	if eventTextSQL != wantEventTextSQL {
+		t.Fatalf("the listing sends a projection the fake does not know:\n%s\nwant\n%s", eventTextSQL, wantEventTextSQL)
+	}
+	c := liveDB(t)
+	const cut, whole = 20, 40
+	texts := []string{"", "  ", "short", strings.Repeat("ab ", 7), strings.Repeat("ab ", 10), strings.Repeat("слово\r\n ", 6),
+		strings.Repeat("x 　y ", 12), strings.Repeat(" \n", 30)}
+	for _, text := range texts {
+		for _, stored := range []int{0, len([]rune(transcript.Short(text, 0))), 7} {
+			rows, err := c.SelectTSV(t.Context(), chQuery{Name: "test-event-text", SQL: "SELECT " + eventTextSQL + " FROM (SELECT {t:String} AS text, {f:UInt32} AS flat_len)",
+				Params: map[string]string{"t": chString(text), "f": strconv.Itoa(stored), "cut": strconv.Itoa(cut), "whole": strconv.Itoa(whole),
+					"ws": chString(spaceClass + "+"), "trim": chString("^" + spaceClass + "+|" + spaceClass + "+$")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantText, wantFlat := eventText(text, stored, cut, whole)
+			if len(rows) != 1 || len(rows[0]) != 2 || rows[0][0] != wantText || rows[0][1] != strconv.Itoa(wantFlat) {
+				t.Errorf("%q, flat_len %d: server %q, fake %q %d", text, stored, rows, wantText, wantFlat)
+			}
 		}
 	}
 }

@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/price"
 	"github.com/aiseeq/akit/transcript"
@@ -20,8 +22,8 @@ func TestEventRowKeepsClaudePriceFields(t *testing.T) {
 		Line: 1, Role: transcript.Agent, Reply: &transcript.Reply{ID: "reply", RequestID: "request", Model: "claude-opus-5-5", Usage: u},
 	}, 7)
 	fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
-	if len(fields) != 26 {
-		t.Fatalf("event row has %d columns, want 26: %q", len(fields), b.String())
+	if len(fields) != 27 {
+		t.Fatalf("event row has %d columns, want 27: %q", len(fields), b.String())
 	}
 	if fields[6] != "7" {
 		t.Fatalf("event sequence = %q, want 7", fields[6])
@@ -74,6 +76,25 @@ func TestEventRowCodexUsesFullRolloutAndSkipsMissingUsage(t *testing.T) {
 	fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
 	if fields[14] != "" || fields[15] != "" {
 		t.Fatalf("reply without usage was included in usage keys: %q", fields[14:16])
+	}
+}
+
+// flat_len is the length transcript.Short gives the text the row stores, the shown one: line breaks, CRLF, runs of
+// unicode spaces, images, empty and blank texts.
+func TestEventRowFlatLen(t *testing.T) {
+	col := evCol(t, "flat_len")
+	for _, ev := range []transcript.Event{
+		{Text: ""}, {Text: " \t\r\n 　 "}, {Text: "слово"}, {Text: "  a  b\n\nc  "}, {Text: "строка\r\nещё\r\n"},
+		{Text: "a b  c　d\u0085e"}, {Text: "картинка", Images: 2}, {Images: 1},
+		{Text: strings.Repeat("слово  за\tсловом\n", 300)},
+	} {
+		var b bytes.Buffer
+		eventRow(&b, &file{src: transcript.Source{ID: "session"}}, &ev, 0)
+		fields := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\t")
+		want := strconv.Itoa(utf8.RuneCountInString(transcript.Short(ev.Shown(), 0)))
+		if len(fields) != len(strings.Split(eventColumns, ",")) || fields[col] != want {
+			t.Errorf("%q with %d images: flat_len %q of %d columns, want %s", ev.Text, ev.Images, fields[col], len(fields), want)
+		}
 	}
 }
 

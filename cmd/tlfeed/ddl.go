@@ -125,6 +125,8 @@ CREATE TABLE IF NOT EXISTS {db}.events
     geo LowCardinality(String) DEFAULT '',
     cwd LowCardinality(String),
     usage_session String DEFAULT '',
+    -- characters of transcript.Short(text, 0); 0 on rows loaded before the column, until they are recounted
+    flat_len UInt32 DEFAULT 0,
     head String MATERIALIZED substringUTF8(text, 1, 300) CODEC(ZSTD(3)),
     hay String MATERIALIZED lowerUTF8(concat(who, ' ', text)) CODEC(LZ4),
     INDEX hay_ng hay TYPE text(tokenizer = ngrams(3)),
@@ -143,6 +145,7 @@ ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS cache_write_1h UInt64 DEFAULT 0
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS fast Bool DEFAULT false AFTER cache_write_1h;
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS geo LowCardinality(String) DEFAULT '' AFTER fast;
 ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS usage_session String DEFAULT '' AFTER cwd;
+ALTER TABLE {db}.events ADD COLUMN IF NOT EXISTS flat_len UInt32 DEFAULT 0 AFTER usage_session;
 
 CREATE TABLE IF NOT EXISTS {db}.replies
 (

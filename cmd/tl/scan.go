@@ -965,26 +965,33 @@ func maskedShorts(hits []hit, width int) []string {
 		return nil
 	}
 	cuts := make([]string, len(hits))
+	eachParallel(len(hits), func(i int) {
+		if hits[i].cut == nil {
+			cuts[i] = maskedShort(hits[i].ev.Shown(), width)
+		}
+	})
+	return cuts
+}
+
+// eachParallel calls do for 0..n-1 on all processors, in batches; it returns once every call is over.
+func eachParallel(n int, do func(i int)) {
 	const batch = 64
 	var next atomic.Int64
 	var wg sync.WaitGroup
-	for range min(runtime.GOMAXPROCS(0), len(hits)/batch+1) {
+	for range min(runtime.GOMAXPROCS(0), n/batch+1) {
 		wg.Go(func() {
 			for {
 				from := int(next.Add(batch)) - batch
-				if from >= len(hits) {
+				if from >= n {
 					return
 				}
-				for i := from; i < min(from+batch, len(hits)); i++ {
-					if hits[i].cut == nil {
-						cuts[i] = maskedShort(hits[i].ev.Shown(), width)
-					}
+				for i := from; i < min(from+batch, n); i++ {
+					do(i)
 				}
 			}
 		})
 	}
 	wg.Wait()
-	return cuts
 }
 
 // maskWindow is how far past the cut the text is masked first: a secret that
@@ -1007,11 +1014,11 @@ func maskedShort(text string, width int) string {
 	if total <= width {
 		return start
 	}
-	if cut, ok := maskedCut([]rune(start), total, width); ok {
+	if cut, ok := maskedCut(start, total, width); ok {
 		return cut
 	}
 	flat, _ := flatten(text, -1)
-	cut, _ := maskedCut([]rune(flat), total, width)
+	cut, _ := maskedCut(flat, total, width)
 	return cut
 }
 
@@ -1076,24 +1083,47 @@ func flatten(text string, limit int) (string, int) {
 	return b.String(), total
 }
 
-// maskedCut is the cut of maskedShort for a flattened text of total runes known by its start r; false — the
-// start is too short for the cut, the whole text is needed.
-func maskedCut(r []rune, total, width int) (string, bool) {
+// maskedCut is the cut of maskedShort for a flattened text of total runes known by its start; false — the start is
+// too short for the cut, the whole text is needed. It counts runes in place: a byte that is not UTF-8 is a rune
+// and is cut as U+FFFD, as a conversion to []rune and back has it; masking a valid text leaves it valid.
+func maskedCut(start string, total, width int) (string, bool) {
+	if !utf8.ValidString(start) {
+		start = string([]rune(start))
+	}
 	n := min(total, width+maskWindow)
 	for {
-		if n > len(r) {
+		end, ok := runeEnd(start, n)
+		if !ok {
 			return "", false
 		}
-		masked, _ := hide(string(r[:n]))
-		m := []rune(masked)
-		if n == total && len(m) <= width {
+		masked, _ := hide(start[:end])
+		m := utf8.RuneCountInString(masked)
+		if n == total && m <= width {
 			return masked, true
 		}
-		if n == total || len(m) >= width+maskWindow {
-			return string(m[:width]) + fmt.Sprintf("…(+%d)", len(m)-width+total-n), true
+		if n == total || m >= width+maskWindow {
+			cut, _ := runeEnd(masked, width)
+			return masked[:cut] + fmt.Sprintf("…(+%d)", m-width+total-n), true
 		}
 		n = min(total, 2*n)
 	}
+}
+
+// runeEnd is the byte offset in s after its first n runes; false — s has fewer.
+func runeEnd(s string, n int) (int, bool) {
+	i := 0
+	for range n {
+		if i >= len(s) {
+			return 0, false
+		}
+		if s[i] < utf8.RuneSelf {
+			i++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+	}
+	return i, true
 }
 
 func windowNote(opts options, e env) string {

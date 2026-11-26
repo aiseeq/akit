@@ -812,10 +812,17 @@ func (d *dbPath) storedHits(inDB []stored) ([]sortedHit, error) {
 // textCut is how much of a long text a listing reads: the first cut of maskedShort and its first widening.
 func textCut(width int) int { return 2 * (width + maskWindow) }
 
-// wholeText is the longest text, in characters, a listing reads whole and cuts itself. The server counts the
-// flattened length of a text with regular expressions at tens of MB/s, slower than sending the text and counting it
-// here; only a longer text comes as its start and that count.
+// wholeText is the longest text, in characters, a listing reads whole and cuts itself when its row has no
+// flat_len: one loaded before the column, until it is recounted. The server counts the flattened length of such a
+// text with regular expressions at tens of MB/s, slower than sending the text and counting it here; only a longer
+// text comes as its start and that count.
 var wholeText = 1 << 16
+
+// eventTextSQL are the text and the flattened length of an event in a listing: a text up to the cut comes whole
+// with 0, a longer one as its start and the length transcript.Short gives it. The loader stores that length in
+// flat_len; a row without it (0 there) comes whole up to wholeText, a longer one gets it counted (flatLenSQL).
+const eventTextSQL = "if((lengthUTF8(text) <= {cut:UInt32} OR (flat_len = 0 AND lengthUTF8(text) <= {whole:UInt32})) AS whole_text, " +
+	"text, substringUTF8(text, 1, {cut:UInt32})), if(whole_text, 0, if(flat_len > 0, flat_len, " + flatLenSQL + "))"
 
 // flatLenSQL is the length of transcript.Short(text, 0) in characters: spaces as unicode.IsSpace has them,
 // trimmed, a line break as " ⏎ ", runs of spaces as one.
@@ -828,8 +835,7 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 	width := d.opts.width
 	text := "text, 0"
 	if width > 0 {
-		text = "if(lengthUTF8(text) <= {whole:UInt32}, text, substringUTF8(text, 1, {cut:UInt32})), " +
-			"if(lengthUTF8(text) <= {whole:UInt32}, 0, " + flatLenSQL + ")"
+		text = eventTextSQL
 	}
 	rows, err := d.selectEvents("events", func(w where) chQuery {
 		if width > 0 {
@@ -845,7 +851,9 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 		return nil, err
 	}
 	hits := make([]sortedHit, 0, len(rows))
-	var long []int // rows whose start does not decide the cut
+	// rows that came as their start: the hit and the flattened length of its whole text, cut below
+	type start struct{ at, flat int }
+	var starts []start
 	for _, row := range rows {
 		if len(row) != 11 {
 			return nil, fmt.Errorf("events: %d fields in a row, want 11", len(row))
@@ -863,17 +871,28 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 			off: off, fileID: id}
 		h.ev.Subtype = row[6]
 		if flat > 0 {
-			cut, ok := "", false
-			if flat > width {
-				cut, ok = maskedCut([]rune(transcript.Short(row[7], 0)), flat, width)
-			}
-			if ok {
-				h.cut = &cut
-			} else {
-				long = append(long, len(hits))
-			}
+			starts = append(starts, start{at: len(hits), flat: flat})
 		}
 		hits = append(hits, h)
+	}
+	// masking the starts is most of the time of a long listing, and the starts do not depend on each other
+	cutStart := time.Now()
+	cuts := make([]string, len(starts))
+	cutOK := make([]bool, len(starts))
+	eachParallel(len(starts), func(i int) {
+		if s := starts[i]; s.flat > width {
+			flat, _ := flatten(hits[s.at].ev.Text, -1)
+			cuts[i], cutOK[i] = maskedCut(flat, s.flat, width)
+		}
+	})
+	d.tracef("cuts", cutStart, len(starts))
+	var long []int // rows whose start does not decide the cut
+	for i, s := range starts {
+		if cutOK[i] {
+			hits[s.at].cut = &cuts[i]
+		} else {
+			long = append(long, s.at)
+		}
 	}
 	if len(long) > 0 {
 		if err := d.wholeTexts(hits, long); err != nil {

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
 )
@@ -58,7 +60,7 @@ func TestMaskedShortAsWholeFlatten(t *testing.T) {
 		if width <= 0 || len(r) <= width {
 			return flat
 		}
-		cut, _ := maskedCut(r, len(r), width)
+		cut, _ := runeMaskedCut(r, len(r), width)
 		return cut
 	}
 	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
@@ -72,6 +74,59 @@ func TestMaskedShortAsWholeFlatten(t *testing.T) {
 		for _, width := range []int{0, 1, 30, 300} {
 			if got, want := maskedShort(text, width), old(text, width); got != want {
 				t.Fatalf("width %d, %q:\n got %q\nwant %q", width, text, got, want)
+			}
+		}
+	}
+}
+
+// runeMaskedCut is maskedCut over a slice of runes, as it was written first.
+func runeMaskedCut(r []rune, total, width int) (string, bool) {
+	n := min(total, width+maskWindow)
+	for {
+		if n > len(r) {
+			return "", false
+		}
+		masked, _ := hide(string(r[:n]))
+		m := []rune(masked)
+		if n == total && len(m) <= width {
+			return masked, true
+		}
+		if n == total || len(m) >= width+maskWindow {
+			return string(m[:width]) + fmt.Sprintf("…(+%d)", len(m)-width+total-n), true
+		}
+		n = min(total, 2*n)
+	}
+}
+
+// maskedCut counting runes in the string cuts as over its runes: every start of a flattened text, short of the
+// cut and past it, with secrets and bytes that are not UTF-8.
+func TestMaskedCutAsRunes(t *testing.T) {
+	key := "sk" + "-proj-" + strings.Repeat("x9Y8", 6)
+	texts := flattenCases()[:300]
+	for _, n := range []int{10, 300, 900, 1700} {
+		texts = append(texts, strings.Repeat("слово ", n/6+1), strings.Repeat("a ", n)+key+" tail", "password="+strings.Repeat("x9", n)+" потом",
+			strings.Repeat(key+" \xff", n/20+1), strings.Repeat("🙂\xe2\x80 ", n/4))
+	}
+	for _, text := range texts {
+		flat, total := flatten(text, -1)
+		r := []rune(flat)
+		for _, width := range []int{1, 30, 300} {
+			for _, size := range []int{0, width, width + maskWindow - 1, width + maskWindow, 2 * (width + maskWindow), len(r)} {
+				size = min(size, len(r))
+				got, gotOK := maskedCut(string(r[:size]), total, width)
+				want, wantOK := runeMaskedCut(r[:size], total, width)
+				if got != want || gotOK != wantOK {
+					t.Fatalf("width %d, start of %d runes of %q:\n got %q %v\nwant %q %v", width, size, text, got, gotOK, want, wantOK)
+				}
+				if utf8.ValidString(flat) {
+					continue
+				}
+				// the start as the bytes of the text: its bad bytes are runes too
+				end, _ := runeEnd(flat, size)
+				got, gotOK = maskedCut(flat[:end], total, width)
+				if got != want || gotOK != wantOK {
+					t.Fatalf("width %d, start of %d bytes of %q:\n got %q %v\nwant %q %v", width, end, text, got, gotOK, want, wantOK)
+				}
 			}
 		}
 	}
