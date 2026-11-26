@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -170,4 +171,122 @@ func TestProbeTextEndsNewlineDollar(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	probeCompare(t, e, "dot over newline, case-sensitive", "--all", "--grep", "(?-i)Error.X", "--max", "0")
+}
+
+// The loader stores transcript paths as spelled under HOME; a HOME or a projects root reached through a symlink must
+// not turn the argument into a resolved path the base does not hold.
+func TestTranscriptPathsThroughLinkedHome(t *testing.T) {
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	e, paths, unloaded := dbCorpus(t)
+	real := e.home
+	link := filepath.Join(t.TempDir(), "home-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	e.home = link
+	for i, p := range paths {
+		paths[i] = link + strings.TrimPrefix(p, real)
+	}
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	var state dbState
+	if b, err := os.ReadFile(statePath); err != nil || json.Unmarshal(b, &state) != nil {
+		t.Fatalf("read feeder state: %v", err)
+	}
+	state.Home = link
+	b, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	name := filepath.Join(".claude", "projects", "-home-x-proj", dbOtherSession+".jsonl")
+	rollout := paths[len(paths)-1]
+	for _, form := range []struct{ label, dir, arg string }{
+		{"path through the home link", real, filepath.Join(link, name)},
+		{"resolved path", real, filepath.Join(real, name)},
+		{"home-relative path", real, "~/" + name},
+		{"relative path from the resolved project", filepath.Join(real, filepath.Dir(name)), dbOtherSession + ".jsonl"},
+		{"uuid", real, dbOtherSession},
+		{"resolved rollout", real, real + strings.TrimPrefix(rollout, link)},
+	} {
+		t.Run(form.label, func(t *testing.T) {
+			if err := os.Chdir(form.dir); err != nil {
+				t.Fatal(err)
+			}
+			probeComparePath(t, e, form.label, form.arg, false, true)
+		})
+	}
+	e.backend = backendFiles
+	if code, out, errOut := runTL(t, e, real+strings.TrimPrefix(rollout, link), "--role", "all", "--max", "0"); code != 0 || strings.Contains(out, real) {
+		t.Errorf("resolved rollout: exit %d, the output names the resolved path instead of a short id:\n%s\n%s", code, out, errOut)
+	}
+}
+
+func TestTranscriptPathsThroughLinkedProjectsRoot(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	projects := filepath.Join(e.home, ".claude", "projects")
+	store := filepath.Join(t.TempDir(), "projects")
+	if err := os.Rename(projects, store); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(store, projects); err != nil {
+		t.Fatal(err)
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	resolved := filepath.Join(store, "-home-x-proj", dbOtherSession+".jsonl")
+	for _, arg := range []string{dbOtherSession, resolved} {
+		probeComparePath(t, e, "linked projects root", arg, false, true)
+		e.backend = backendFiles
+		if _, out, _ := runTL(t, e, arg, "--role", "all", "--max", "0"); strings.Contains(out, store) {
+			t.Errorf("%q: the output names the resolved projects root:\n%s", arg, out)
+		}
+	}
+}
+
+// A project link out of the projects root is a project of its own: the loader stores its transcripts under the link.
+func TestTranscriptPathsThroughProjectLinkOutOfRoot(t *testing.T) {
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	e, paths, unloaded := dbCorpus(t)
+	projects := filepath.Join(e.home, ".claude", "projects")
+	outside := filepath.Join(t.TempDir(), "outside-project")
+	const id = "5c5c5c5c-0000-4000-8000-000000000005"
+	writeWorkFile(t, filepath.Join(outside, id+".jsonl"), []string{userRecord("2026-10-25T11:10:00.000Z", "synthetic linked project")})
+	if err := os.Symlink(outside, filepath.Join(projects, "linked-out")); err != nil {
+		t.Fatal(err)
+	}
+	paths = append(paths, filepath.Join(projects, "linked-out", id+".jsonl"))
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	if err := os.Chdir(projects); err != nil {
+		t.Fatal(err)
+	}
+	for _, arg := range []string{id, filepath.Join("linked-out", id+".jsonl")} {
+		probeComparePath(t, e, "project link out of the root", arg, false, true)
+	}
 }

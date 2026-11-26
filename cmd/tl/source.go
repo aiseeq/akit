@@ -151,30 +151,130 @@ func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 	return "", fmt.Errorf("%q is ambiguous: matches %d transcripts (%s); give more of the id", arg, len(matches), strings.Join(shown, ", "))
 }
 
-// sessionArg normalizes a session argument for both backends: it strips "id:", expands "~/", and resolves filesystem
-// paths to absolute paths, following symlinks when they exist. parseRef removes a line suffix before this call.
+// sessionArg normalizes a session argument for both backends: it strips "id:", expands "~/", and turns a filesystem
+// path into the name the transcript has under home (see transcriptName). parseRef removes a line suffix before this call.
 func sessionArg(arg, home string) string {
 	arg = strings.TrimPrefix(arg, idPrefix)
 	if strings.HasPrefix(arg, "~/") {
 		arg = filepath.Join(home, arg[2:])
 	}
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, string(filepath.Separator)) {
-		arg = absoluteTranscriptPath(arg)
+		arg = transcriptName(arg, home)
 	}
 	return arg
 }
 
-func absoluteTranscriptPath(path string) string {
+// transcriptName is the name a transcript path has in the search area: the path as it is spelled under home, the way
+// the loader stores it, whatever symlinks the given path, home or the transcript roots go through, and a project link
+// replaced by the project it names. A path that does not resolve is returned absolute and uncleaned: a lexical ".."
+// after a symlink may name another, existing file.
+func transcriptName(path, home string) string {
 	if !filepath.IsAbs(path) {
 		if cwd, err := os.Getwd(); err == nil {
 			path = cwd + string(filepath.Separator) + path
 		}
 	}
+	roots := transcriptRoots(home)
+	if !hasDotDot(path) { // without ".." the lexical form names the same file as the kernel walk
+		if clean := filepath.Clean(path); roots.lexical(clean) {
+			return roots.canonicalProject(clean)
+		}
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return roots.canonicalProject(roots.homeForm(resolved))
+	}
+	return path
+}
+
+func hasDotDot(path string) bool {
+	return slices.Contains(strings.Split(filepath.ToSlash(path), "/"), "..")
+}
+
+// searchRoots are the transcript roots as spelled under home and as the kernel resolves them. workers is the folder
+// above the per-worker codex sessions: their pattern holds a "*" no symlink resolves.
+type searchRoots struct {
+	projects, workers         string
+	realProjects, realWorkers string
+	links                     map[string]string // project link name → project, "" for a name that is not a link
+}
+
+func transcriptRoots(home string) searchRoots {
+	workers, _, _ := strings.Cut(transcript.WorkerSessions(home), string(filepath.Separator)+"*")
+	r := searchRoots{projects: absoluteRoot(session.ProjectsDir(home)), workers: absoluteRoot(workers), links: map[string]string{}}
+	r.realProjects, r.realWorkers = realRoot(r.projects), realRoot(r.workers)
+	return r
+}
+
+func absoluteRoot(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		return absolute
+	}
+	return path
+}
+
+func realRoot(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved
 	}
-	// An unresolved path stays uncleaned: a lexical ".." after a symlink may name another, existing file.
 	return path
+}
+
+func (r searchRoots) lexical(path string) bool {
+	return underDir(path, r.projects) || underDir(path, r.workers)
+}
+
+// homeForm spells a resolved path under the transcript root it lies in.
+func (r searchRoots) homeForm(path string) string {
+	for _, root := range [][2]string{{r.realProjects, r.projects}, {r.realWorkers, r.workers}} {
+		if rest, ok := strings.CutPrefix(path, root[0]+string(filepath.Separator)); ok {
+			return filepath.Join(root[1], rest)
+		}
+	}
+	return path
+}
+
+// canonicalProject replaces a project link in a path under the projects root by the project it names.
+func (r searchRoots) canonicalProject(path string) string {
+	relative, ok := strings.CutPrefix(path, r.projects+string(filepath.Separator))
+	if !ok {
+		return path
+	}
+	project, rest, nested := strings.Cut(relative, string(filepath.Separator))
+	target, ok := r.projectLink(project)
+	if !ok {
+		return path
+	}
+	if !nested {
+		return target
+	}
+	return filepath.Join(target, rest)
+}
+
+// projectLink is the project a link in the projects root names, spelled under the root; a link out of the root, a
+// dangling or a looping one names none.
+func (r searchRoots) projectLink(name string) (string, bool) {
+	target, seen := r.links[name]
+	if !seen {
+		target = r.linkTarget(name)
+		r.links[name] = target
+	}
+	return target, target != ""
+}
+
+func (r searchRoots) linkTarget(name string) string {
+	path := filepath.Join(r.projects, name)
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			if target := r.homeForm(resolved); filepath.Dir(target) == r.projects && target != path {
+				return target
+			}
+		}
+	}
+	return "" // not a link, or a link out of the root, dangling or looping
+}
+
+func underDir(path, dir string) bool {
+	return strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
 const idPrefix = "id:"
@@ -229,11 +329,7 @@ func sourceFullID(src source) string {
 // transcriptPaths lists only transcript names in the same roots searched by find.
 func transcriptPaths(home string) ([]string, error) {
 	var paths []string
-	projectsRoot := canonicalSearchRoot(session.ProjectsDir(home))
-	projectLinks, err := canonicalProjectLinks(projectsRoot)
-	if err != nil {
-		return nil, fmt.Errorf("read transcript project links: %w", err)
-	}
+	roots := transcriptRoots(home)
 	for i, pattern := range transcriptPatterns(home) {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -244,69 +340,20 @@ func transcriptPaths(home string) ([]string, error) {
 			continue
 		}
 		for _, match := range matches {
-			paths = append(paths, canonicalProjectPath(match, projectsRoot, projectLinks))
+			paths = append(paths, roots.canonicalProject(match))
 		}
 	}
 	sort.Strings(paths)
 	return slices.Compact(paths), nil // a project link and its target name one transcript
 }
 
-func canonicalProjectLinks(root string) (map[string]string, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[string]string{}, nil
-		}
-		return nil, fmt.Errorf("read project directory: %w", err)
-	}
-	links := make(map[string]string)
-	for _, entry := range entries {
-		if entry.Type()&os.ModeSymlink == 0 {
-			continue
-		}
-		path := filepath.Join(root, entry.Name())
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil { // a dangling or looping link holds no transcripts; it must not hide the others
-			continue
-		}
-		links[entry.Name()] = resolved
-	}
-	return links, nil
-}
-
-func canonicalProjectPath(path, root string, links map[string]string) string {
-	relative, ok := strings.CutPrefix(path, root+string(filepath.Separator))
-	if !ok {
-		return path
-	}
-	project, rest, nested := strings.Cut(relative, string(filepath.Separator))
-	canonical, ok := links[project]
-	if !ok {
-		return path
-	}
-	if !nested {
-		return canonical
-	}
-	return filepath.Join(canonical, rest)
-}
-
-func canonicalSearchRoot(path string) string {
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return resolved
-	}
-	if absolute, err := filepath.Abs(path); err == nil {
-		return absolute
-	}
-	return path
-}
-
 // transcriptPatterns — the names find and the link ids know: Claude Code sessions, their subagents, worker rollouts.
 func transcriptPatterns(home string) []string {
-	projects := canonicalSearchRoot(session.ProjectsDir(home))
+	roots := transcriptRoots(home)
 	return []string{
-		filepath.Join(projects, "*", "*.jsonl"),
-		filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"),
-		filepath.Join(canonicalSearchRoot(transcript.WorkerSessions(home)), "*", "*", "*", "rollout-*.jsonl"),
+		filepath.Join(roots.projects, "*", "*.jsonl"),
+		filepath.Join(roots.projects, "*", "*", "subagents", "agent-*.jsonl"),
+		filepath.Join(absoluteRoot(transcript.WorkerSessions(home)), "*", "*", "*", "rollout-*.jsonl"),
 	}
 }
 
