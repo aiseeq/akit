@@ -4156,16 +4156,14 @@ func transitionBody(body string, o *options, next string, _ io.Writer) (string, 
 
 var waitOwnTicketRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])(?:после|за)\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^\pL\pN_./-]|\.(?:$|\s))`)
 var waitOwnQueueRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_])своя\s+очередь(?:$|[^\pL\pN_])`)
-var waitTerminalOwnQueueRE = regexp.MustCompile(`(?i)(?:^|:)\s*очередь\s*$`)
-var waitLeadingOwnQueueRE = regexp.MustCompile(`(?i)^жду\s+очередь\s*$`)
-var waitDatedOwnQueueRE = regexp.MustCompile(`(?i)^(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2})\s+\d{1,2}:\d{2}\s*:\s*жду\s+очередь\s*$`)
+var waitTerminalOwnQueueRE = regexp.MustCompile(`(?i)(?:^|:)\s*(?:жду\s+)?очередь\s*$`)
 var waitQueueAfterRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])очередь\s+после\s+(?:своего\s+)?(?:тикета\s+)?([a-z0-9]+(?:-[a-z0-9]+)*)(?:$|[^\pL\pN_./-])`)
 var waitQueueAfterMarkerRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_])очередь\s+после\s+g\d+(?:$|[^\pL\pN_])`)
 var waitAfterMarkerRE = regexp.MustCompile(`(?i)(?:^|[^\pL\pN_./-])после\s+g\d+(?:$|[^\pL\pN_./-])`)
 
 func ownWaitHint(t task, value string) (string, error) {
 	hint := "после своего тикета — `tk set <ID> --blocks <X>`; своя очередь — оставь открытым"
-	if waitOwnQueueRE.MatchString(value) || waitTerminalOwnQueueRE.MatchString(value) || waitLeadingOwnQueueRE.MatchString(value) || waitDatedOwnQueueRE.MatchString(value) || waitQueueAfterRE.MatchString(value) || waitQueueAfterMarkerRE.MatchString(value) || waitAfterMarkerRE.MatchString(value) {
+	if waitOwnQueueRE.MatchString(value) || waitTerminalOwnQueueRE.MatchString(value) || waitQueueAfterRE.MatchString(value) || waitQueueAfterMarkerRE.MatchString(value) || waitAfterMarkerRE.MatchString(value) {
 		return hint, nil
 	}
 	project := taskProject(t.path)
