@@ -35,15 +35,19 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 	if !slices.Contains(filePaths, paths[2]) || !slices.Contains(filePaths, paths[1]) {
 		t.Fatalf("file path search misses parent or subagent: parent=%t subagent=%t", slices.Contains(filePaths, paths[1]), slices.Contains(filePaths, paths[2]))
 	}
-	ch := newFakeCH(t, paths, unloaded)
-	srv := httptest.NewServer(ch)
-	defer srv.Close()
-	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
-
 	alias := filepath.Join(parent, "project-alias")
 	if err := os.Symlink(project, alias); err != nil {
 		t.Fatal(err)
 	}
+	for _, path := range slices.Clone(paths) { // the loader lists the files of a project link under the link too
+		if rest, ok := strings.CutPrefix(path, project+string(filepath.Separator)); ok {
+			paths = append(paths, filepath.Join(alias, rest))
+		}
+	}
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	aliasDotDot := filepath.Join(e.home, "alias-dotdot")
 	if err := os.Symlink(project, aliasDotDot); err != nil {
 		t.Fatal(err)
@@ -66,6 +70,7 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 		{"Codex rollout absolute", project, rollout, true},
 		{"Codex rollout relative", rolloutDir, filepath.Base(rollout), true},
 		{"line reference", project, "x.jsonl:1", true},
+
 		{"directory path", project, "./", false},
 	}
 	for _, form := range forms {
@@ -81,6 +86,10 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 			probeComparePath(t, e, form.name, form.arg, false, form.valid)
 		})
 	}
+	t.Run("uuid in a linked project", func(t *testing.T) {
+		// The loader lists the transcript under the link and under the project: ambiguous on both backends.
+		probeComparePath(t, e, "uuid in a linked project", dbOtherSession, true, false)
+	})
 	t.Run("missing relative path", func(t *testing.T) {
 		if err := os.Chdir(project); err != nil {
 			t.Fatal(err)
@@ -111,7 +120,8 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 		if err := os.Symlink("loop", filepath.Join(parent, "loop")); err != nil {
 			t.Fatal(err)
 		}
-		probeComparePath(t, e, "looping project link", dbOtherSession, false, true)
+		// The project link makes the Claude ids ambiguous on both backends, as the loader lists both names; a rollout is not.
+		probeComparePath(t, e, "looping project link", findUUID(filepath.Base(rollout)), false, true)
 	})
 }
 
@@ -187,6 +197,9 @@ func TestTranscriptPathsThroughLinkedHome(t *testing.T) {
 	})
 	e, paths, unloaded := dbCorpus(t)
 	real := e.home
+	codexRel := filepath.Join(".codex", "sessions", "2026", "10", "25", "rollout-2026-10-25T10-20-00-0199bbbb-0000-7000-8000-000000000001.jsonl")
+	writeWorkFile(t, filepath.Join(real, codexRel), extRolloutRows("/work/extproj", "synthetic codex session"))
+	paths = append(paths, filepath.Join(real, codexRel))
 	link := filepath.Join(t.TempDir(), "home-link")
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
@@ -213,8 +226,12 @@ func TestTranscriptPathsThroughLinkedHome(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	name := filepath.Join(".claude", "projects", "-home-x-proj", dbOtherSession+".jsonl")
-	rollout := paths[len(paths)-1]
+	rollout := paths[len(paths)-2]
 	for _, form := range []struct{ label, dir, arg string }{
+		{"codex session through the home link", real, filepath.Join(link, codexRel)},
+		{"home-relative codex session", real, "~/" + codexRel},
+		{"resolved codex session", real, filepath.Join(real, codexRel)},
+		{"relative codex session", filepath.Join(real, filepath.Dir(codexRel)), filepath.Base(codexRel)},
 		{"path through the home link", real, filepath.Join(link, name)},
 		{"resolved path", real, filepath.Join(real, name)},
 		{"home-relative path", real, "~/" + name},
@@ -237,18 +254,48 @@ func TestTranscriptPathsThroughLinkedHome(t *testing.T) {
 
 func TestTranscriptPathsThroughLinkedProjectsRoot(t *testing.T) {
 	e, paths, unloaded := dbCorpus(t)
+	// The projects root goes to a folder in home, the Codex sessions root out of home: a name under home may still
+	// go through a root link, and a resolved name lies under no spelled root.
 	projects := filepath.Join(e.home, ".claude", "projects")
-	store := filepath.Join(t.TempDir(), "projects")
+	store := filepath.Join(e.home, "store", "projects")
+	if err := os.MkdirAll(filepath.Dir(store), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(projects, store); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(store, projects); err != nil {
 		t.Fatal(err)
 	}
+	codexStore := filepath.Join(t.TempDir(), "codex-sessions")
+	codexRel := filepath.Join("2026", "10", "25", "rollout-2026-10-25T10-20-00-0199bbbb-0000-7000-8000-000000000001.jsonl")
+	writeWorkFile(t, filepath.Join(codexStore, codexRel), extRolloutRows("/work/extproj", "synthetic codex session"))
+	if err := os.MkdirAll(filepath.Join(e.home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(codexStore, filepath.Join(e.home, ".codex", "sessions")); err != nil {
+		t.Fatal(err)
+	}
+	paths = append(paths, filepath.Join(e.home, ".codex", "sessions", codexRel))
 	ch := newFakeCH(t, paths, unloaded)
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	probeComparePath(t, e, "resolved codex session", filepath.Join(codexStore, codexRel), false, true)
+	workers := filepath.Join(e.home, ".local", "state", "worker")
+	workerStore := filepath.Join(t.TempDir(), "worker")
+	if err := os.Rename(workers, workerStore); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(workerStore, workers); err != nil {
+		t.Fatal(err)
+	}
+	rollout := paths[len(paths)-2]
+	rest, ok := strings.CutPrefix(rollout, workers)
+	if !ok {
+		t.Fatalf("rollout %s is not under %s", rollout, workers)
+	}
+	probeComparePath(t, e, "resolved worker rollout", workerStore+rest, false, true)
 	resolved := filepath.Join(store, "-home-x-proj", dbOtherSession+".jsonl")
 	for _, arg := range []string{dbOtherSession, resolved} {
 		probeComparePath(t, e, "linked projects root", arg, false, true)
