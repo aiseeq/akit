@@ -164,11 +164,16 @@ func sessionArg(arg, home string) string {
 }
 
 func absoluteTranscriptPath(path string) string {
-	if absolute, err := filepath.Abs(path); err == nil {
-		path = absolute
+	if !filepath.IsAbs(path) {
+		if cwd, err := os.Getwd(); err == nil {
+			path = cwd + string(filepath.Separator) + path
+		}
 	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
+		return resolved
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		return absolute
 	}
 	return path
 }
@@ -225,26 +230,87 @@ func sourceFullID(src source) string {
 // transcriptPaths lists only transcript names in the same roots searched by find.
 func transcriptPaths(home string) ([]string, error) {
 	var paths []string
-	for _, pattern := range transcriptPatterns(home) {
+	projectsRoot := canonicalSearchRoot(session.ProjectsDir(home))
+	projectLinks, err := canonicalProjectLinks(projectsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("read transcript project links: %w", err)
+	}
+	for i, pattern := range transcriptPatterns(home) {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, fmt.Errorf("glob transcript names: %w", err)
 		}
-		for _, path := range matches {
-			paths = append(paths, absoluteTranscriptPath(path))
+		if i == 2 {
+			paths = append(paths, matches...)
+			continue
+		}
+		for _, match := range matches {
+			paths = append(paths, canonicalProjectPath(match, projectsRoot, projectLinks))
 		}
 	}
 	sort.Strings(paths)
 	return paths, nil
 }
 
+func canonicalProjectLinks(root string) (map[string]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]string{}, nil
+		}
+		return nil, fmt.Errorf("read project directory: %w", err)
+	}
+	links := make(map[string]string)
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve transcript project link %s: %w", path, err)
+		}
+		links[entry.Name()] = resolved
+	}
+	return links, nil
+}
+
+func canonicalProjectPath(path, root string, links map[string]string) string {
+	relative, ok := strings.CutPrefix(path, root+string(filepath.Separator))
+	if !ok {
+		return path
+	}
+	project, rest, nested := strings.Cut(relative, string(filepath.Separator))
+	canonical, ok := links[project]
+	if !ok {
+		return path
+	}
+	if !nested {
+		return canonical
+	}
+	return filepath.Join(canonical, rest)
+}
+
+func canonicalSearchRoot(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		return absolute
+	}
+	return path
+}
+
 // transcriptPatterns — the names find and the link ids know: Claude Code sessions, their subagents, worker rollouts.
 func transcriptPatterns(home string) []string {
-	projects := session.ProjectsDir(home)
+	projects := canonicalSearchRoot(session.ProjectsDir(home))
 	return []string{
 		filepath.Join(projects, "*", "*.jsonl"),
 		filepath.Join(projects, "*", "*", "subagents", "agent-*.jsonl"),
-		filepath.Join(transcript.WorkerSessions(home), "*", "*", "*", "rollout-*.jsonl"),
+		filepath.Join(canonicalSearchRoot(transcript.WorkerSessions(home)), "*", "*", "*", "rollout-*.jsonl"),
 	}
 }
 

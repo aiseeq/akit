@@ -43,6 +43,10 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 	if err := os.Symlink(project, alias); err != nil {
 		t.Fatal(err)
 	}
+	aliasDotDot := filepath.Join(e.home, "alias-dotdot")
+	if err := os.Symlink(project, aliasDotDot); err != nil {
+		t.Fatal(err)
+	}
 	fromDir := filepath.Join(parent, "from")
 	if err := os.Mkdir(fromDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -50,15 +54,18 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 	rolloutDir := filepath.Dir(rollout)
 	forms := []struct {
 		name, dir, arg string
+		valid          bool
 	}{
-		{"project basename", project, "x.jsonl"},
-		{"project dot path", project, "./x.jsonl"},
-		{"parent project path", fromDir, filepath.Join("..", projectName, "x.jsonl")},
-		{"symlink project path", parent, filepath.Join("project-alias", "x.jsonl")},
-		{"agent path", project, filepath.Join(dbOtherSession, "subagents", "agent-a1b2c3d4.jsonl")},
-		{"Codex rollout absolute", project, rollout},
-		{"Codex rollout relative", rolloutDir, filepath.Base(rollout)},
-		{"line reference", project, "x.jsonl:1"},
+		{"project basename", project, "x.jsonl", true},
+		{"project dot path", project, "./x.jsonl", true},
+		{"parent project path", fromDir, filepath.Join("..", projectName, "x.jsonl"), true},
+		{"symlink project path", parent, filepath.Join("project-alias", "x.jsonl"), true},
+		{"symlink dot dot path", e.home, "alias-dotdot/../" + projectName + "/x.jsonl", true},
+		{"agent path", project, filepath.Join(dbOtherSession, "subagents", "agent-a1b2c3d4.jsonl"), true},
+		{"Codex rollout absolute", project, rollout, true},
+		{"Codex rollout relative", rolloutDir, filepath.Base(rollout), true},
+		{"line reference", project, "x.jsonl:1", true},
+		{"directory path", project, "./", false},
 	}
 	for _, form := range forms {
 		t.Run(form.name, func(t *testing.T) {
@@ -70,7 +77,7 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 					t.Errorf("restore working directory: %v", err)
 				}
 			})
-			probeComparePath(t, e, form.name, form.arg, false)
+			probeComparePath(t, e, form.name, form.arg, false, form.valid)
 		})
 	}
 	t.Run("missing relative path", func(t *testing.T) {
@@ -78,11 +85,11 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chdir(project) })
-		probeComparePath(t, e, "missing relative path", "missing.jsonl", true)
+		probeComparePath(t, e, "missing relative path", "missing.jsonl", true, false)
 	})
 }
 
-func probeComparePath(t *testing.T, e env, label, arg string, allowMissing bool) {
+func probeComparePath(t *testing.T, e env, label, arg string, allowMissing, wantTranscript bool) {
 	t.Helper()
 	e.backend = backendFiles
 	codeF, outF, errF := runTL(t, e, arg, "--role", "all", "--max", "0")
@@ -96,6 +103,9 @@ func probeComparePath(t *testing.T, e env, label, arg string, allowMissing bool)
 	}
 	if codeF != codeD || outF != outD || errF != errComparable || !allowMissing && strings.Contains(errD, "is not in the database") {
 		t.Errorf("%s %q: files exit %d, db exit %d\nfiles out:\n%s\ndb out:\n%s\nfiles err: %s\ndb err: %s", label, arg, codeF, codeD, outF, outD, errF, errD)
+	}
+	if wantTranscript && (codeF != 0 || codeD != 0 || outF == "" || outD == "") {
+		t.Errorf("%s %q: expected both backends to succeed with output; files exit %d, db exit %d; files output %q; db output %q", label, arg, codeF, codeD, outF, outD)
 	}
 }
 

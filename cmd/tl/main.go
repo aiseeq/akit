@@ -726,6 +726,9 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 	if e.collect != nil {
 		*e.collect = answer{}
 	}
+	if errors.Is(err, errNonRegularTranscript) {
+		return 0, false, nil
+	}
 	return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
 }
 

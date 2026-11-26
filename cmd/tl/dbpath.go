@@ -36,6 +36,7 @@ const (
 const dbQueryTimeout = 60 * time.Second
 
 var errLiveSessionNotLoaded = errors.New("live session is not loaded in the database")
+var errNonRegularTranscript = errors.New("transcript is not a regular file")
 
 // filesTimeout bounds the first query, the list of files: it takes well under a second, so a server that hangs
 // sends the call to the files in seconds rather than at dbQueryTimeout.
@@ -393,8 +394,12 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 func (d *dbPath) find(arg string) (string, error) {
 	arg = sessionArg(arg, d.e.home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
-		if _, err := os.Stat(arg); err != nil {
+		info, err := os.Stat(arg)
+		if err != nil {
 			return "", fmt.Errorf("transcript %s: %w", arg, err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("%w: %s", errNonRegularTranscript, arg)
 		}
 		if d.files[arg] != nil {
 			return arg, nil
