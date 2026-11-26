@@ -273,10 +273,7 @@ func (d *dbPath) sessionFilePredicate() (where, error) {
 		if ref := refArg.FindStringSubmatch(arg); ref != nil {
 			arg = ref[1]
 		}
-		arg, err := sessionArg(arg, d.e.home)
-		if err != nil {
-			return where{}, err
-		}
+		arg = sessionArg(arg, d.e.home)
 		if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 			paths = append(paths, arg)
 			continue
@@ -395,10 +392,7 @@ func (d *dbPath) selectedAll(f *dbFile, since time.Time) bool {
 }
 
 func (d *dbPath) find(arg string) (string, error) {
-	arg, err := sessionArg(arg, d.e.home)
-	if err != nil {
-		return "", err
-	}
+	arg = sessionArg(arg, d.e.home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		info, err := os.Stat(arg)
 		if err != nil {

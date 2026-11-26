@@ -90,10 +90,7 @@ func find(arg, home string) (string, error) {
 
 // findIn is find over the transcript names that names lists: the folders, or the database's list of files.
 func findIn(arg, home string, names func() ([]string, error)) (string, error) {
-	arg, err := sessionArg(arg, home)
-	if err != nil {
-		return "", err
-	}
+	arg = sessionArg(arg, home)
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, "/") {
 		if _, err := os.Stat(arg); err != nil {
 			return "", fmt.Errorf("transcript %s: %w", arg, err)
@@ -156,7 +153,7 @@ func findIn(arg, home string, names func() ([]string, error)) (string, error) {
 
 // sessionArg normalizes a session argument for both backends: it strips "id:", expands "~/", and turns a filesystem
 // path into the name the transcript has under home (see transcriptName). parseRef removes a line suffix before this call.
-func sessionArg(arg, home string) (string, error) {
+func sessionArg(arg, home string) string {
 	arg = strings.TrimPrefix(arg, idPrefix)
 	if strings.HasPrefix(arg, "~/") {
 		arg = filepath.Join(home, arg[2:])
@@ -164,32 +161,29 @@ func sessionArg(arg, home string) (string, error) {
 	if strings.HasSuffix(arg, ".jsonl") || strings.Contains(arg, string(filepath.Separator)) {
 		return transcriptName(arg, home)
 	}
-	return arg, nil
+	return arg
 }
 
 // transcriptName is the name a transcript path has in the search area: the path as it is spelled under home, the way
 // the loader stores it, whatever symlinks the given path, home or the transcript roots go through. A project link
 // keeps its own name: the loader lists the files under the link as well. A path that does not resolve is returned
 // absolute and uncleaned: a lexical ".." after a symlink may name another, existing file.
-func transcriptName(path, home string) (string, error) {
+func transcriptName(path, home string) string {
 	if !filepath.IsAbs(path) {
 		if cwd, err := os.Getwd(); err == nil {
 			path = cwd + string(filepath.Separator) + path
 		}
 	}
-	roots, err := transcriptRoots(home)
-	if err != nil {
-		return "", err
-	}
+	roots := transcriptRoots(home)
 	if !hasDotDot(path) { // without ".." the lexical form names the same file as the kernel walk
 		if clean := filepath.Clean(path); roots.lexical(clean) {
-			return clean, nil
+			return clean
 		}
 	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return roots.homeForm(resolved), nil
+		return roots.homeForm(resolved)
 	}
-	return path, nil
+	return path
 }
 
 func hasDotDot(path string) bool {
@@ -199,35 +193,21 @@ func hasDotDot(path string) bool {
 // searchRoot is a transcript root as spelled for the loader and as the kernel resolves it.
 type searchRoot struct{ spelled, real string }
 
-// searchRoots are the transcript roots, the most specific first; home goes last, as the root of the other ones.
+// searchRoots are the transcript roots, each spelled as the loader lists it and as the kernel resolves it.
 type searchRoots []searchRoot
 
-// transcriptRoots are the folders the loader lists transcripts in: Claude projects, worker tasks and Codex
-// sessions, each cut at its first glob segment, which no symlink resolves; then home.
-func transcriptRoots(home string) (searchRoots, error) {
-	codex, err := transcript.CodexRoots(home)
-	if err != nil {
-		return nil, err
-	}
-	dirs := append([]string{session.ProjectsDir(home), transcript.WorkerSessions(home)}, codex...)
-	dirs = append(dirs, home)
+// transcriptRoots are the folders the loader lists transcripts in under home: Claude projects, worker tasks and the
+// default Codex sessions, each cut at its first glob segment, which no symlink resolves. The roots of the Codex roots
+// file are not read here: a broken file must not fail a path argument; a path under such a root keeps the name
+// the kernel resolves it to.
+func transcriptRoots(home string) searchRoots {
+	dirs := append([]string{session.ProjectsDir(home), transcript.WorkerSessions(home)}, transcript.DefaultCodexRoots(home)...)
 	roots := make(searchRoots, 0, len(dirs))
 	for _, dir := range dirs {
-		spelled := absoluteRoot(globBase(dir))
+		spelled := absoluteRoot(transcript.CodexRootBase(dir))
 		roots = append(roots, searchRoot{spelled: spelled, real: realRoot(spelled)})
 	}
-	return roots, nil
-}
-
-// globBase is the part of a root pattern before its first segment with a glob character.
-func globBase(pattern string) string {
-	parts := strings.Split(pattern, string(filepath.Separator))
-	for i, part := range parts {
-		if strings.ContainsAny(part, "*?[") {
-			return strings.Join(parts[:i], string(filepath.Separator))
-		}
-	}
-	return pattern
+	return roots
 }
 
 func absoluteRoot(path string) string {
@@ -244,13 +224,12 @@ func realRoot(path string) string {
 	return path
 }
 
-// lexical tells whether a path is spelled under a transcript root other than home itself: under home a lexical name
-// may still go through a symlink to a root, which the loader spells otherwise.
+// lexical tells whether a path is spelled under a transcript root.
 func (r searchRoots) lexical(path string) bool {
-	return slices.ContainsFunc(r[:len(r)-1], func(root searchRoot) bool { return underDir(path, root.spelled) })
+	return slices.ContainsFunc(r, func(root searchRoot) bool { return underDir(path, root.spelled) })
 }
 
-// homeForm spells a resolved path under the most specific transcript root it lies in.
+// homeForm spells a resolved path under the transcript root it lies in.
 func (r searchRoots) homeForm(path string) string {
 	for _, root := range r {
 		if rest, ok := strings.CutPrefix(path, root.real+string(filepath.Separator)); ok {

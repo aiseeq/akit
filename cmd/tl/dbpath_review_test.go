@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/aiseeq/akit/transcript"
 )
 
 func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
@@ -115,6 +117,16 @@ func TestRelativeTranscriptPathsMatchFilesAndDB(t *testing.T) {
 			t.Fatalf("files %q: exit %d, output %q; want a missing transcript", arg, code, out)
 		}
 		probeComparePath(t, e, "missing path through symlink and dot dot", arg, true, false)
+	})
+	t.Run("broken codex roots file", func(t *testing.T) {
+		// The roots file serves --codex-ext; a bad line in it must not fail a Claude transcript path.
+		roots := transcript.CodexRootsFile(e.home)
+		writeWorkFile(t, roots, []string{"relative/sessions"})
+		t.Cleanup(func() { _ = os.Remove(roots) })
+		if err := os.Chdir(project); err != nil {
+			t.Fatal(err)
+		}
+		probeComparePath(t, e, "broken codex roots file", "x.jsonl", false, true)
 	})
 	t.Run("looping project link", func(t *testing.T) {
 		if err := os.Symlink("loop", filepath.Join(parent, "loop")); err != nil {
