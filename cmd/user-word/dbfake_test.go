@@ -96,6 +96,33 @@ func (c fakeCorpus) answer(sql string, params map[string]string) ([][]string, er
 		return c.rawRows(sql, params)
 	case strings.Contains(sql, "SELECT DISTINCT files.path"):
 		return c.candidates(params)
+	case strings.Contains(sql, "files.path IN {paths:Array(String)}"):
+		paths, err := arrayParam(params["paths"])
+		if err != nil {
+			return nil, err
+		}
+		from, err1 := timeParam(params["from"])
+		until, err2 := timeParam(params["until"])
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("brief line times %v", params)
+		}
+		var selected []fakeEvent
+		for _, ev := range c.events {
+			if slices.Contains(paths, ev.path) && !ev.ts.Before(from) && !ev.ts.After(until) && slices.Contains([]string{"user", "ask", "agent"}, ev.role) {
+				selected = append(selected, ev)
+			}
+		}
+		slices.SortStableFunc(selected, func(a, b fakeEvent) int {
+			if d := strings.Compare(a.path, b.path); d != 0 {
+				return d
+			}
+			return a.line - b.line
+		})
+		var rows [][]string
+		for _, ev := range selected {
+			rows = append(rows, []string{ev.path, strconv.FormatUint(ev.fileID, 10), strconv.Itoa(ev.line), strconv.FormatInt(ev.ts.UnixMilli(), 10), ev.role, ev.text, strconv.Itoa(ev.images), strconv.Itoa(c.bad[ev.path])})
+		}
+		return rows, nil
 	case strings.Contains(sql, "countIf("):
 		return c.counts(sql, params)
 	}

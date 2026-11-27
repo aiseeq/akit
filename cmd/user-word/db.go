@@ -172,6 +172,20 @@ func askAnswer(raw []byte) string {
 
 // rawLines — сырые строки файлов по ключам. Строки нет - ошибка: без неё ответ базы не повторить.
 func (d *wordDB) rawLines(keys []rawKey) (map[rawKey][]byte, error) {
+	out, err := d.rawLinesPresent(keys)
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range keys {
+		if _, ok := out[k]; !ok {
+			return nil, fmt.Errorf("raw: no line %d of file %d", k.line, k.file)
+		}
+	}
+	return out, nil
+}
+
+// rawLinesPresent returns every available raw row without failing when an individual row is absent.
+func (d *wordDB) rawLinesPresent(keys []rawKey) (map[rawKey][]byte, error) {
 	out := make(map[rawKey][]byte, len(keys))
 	if len(keys) == 0 {
 		return out, nil
@@ -193,11 +207,6 @@ func (d *wordDB) rawLines(keys []rawKey) (map[rawKey][]byte, error) {
 			return nil, fmt.Errorf("raw key %q %q", r[0], r[1])
 		}
 		out[rawKey{file: id, line: n}] = []byte(r[2])
-	}
-	for _, k := range keys {
-		if _, ok := out[k]; !ok {
-			return nil, fmt.Errorf("raw: no line %d of file %d", k.line, k.file)
-		}
 	}
 	return out, nil
 }
@@ -297,6 +306,21 @@ func (d *wordDB) briefRecordDays(recordWindows map[string]markerRecordInterval) 
 		}
 	}
 	return recordDays, nil
+}
+
+// briefLines reads the candidate transcripts and quote window from events. Files with bad rows are handled by the
+// caller from disk, where malformed-row warnings and records absent from events remain available.
+func (d *wordDB) briefLines(paths []string, from, until time.Time) ([][]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	rows, err := d.query("brief_lines", "SELECT files.path, toString(events.file_id), toString(events.line), "+
+		"toString(toUnixTimestamp64Milli(events.ts)), events.role, events.text, toString(events.images), toString(files.bad) "+
+		"FROM events INNER JOIN files FINAL USING (file_id) WHERE files.path IN {paths:Array(String)} "+
+		"AND (events.role IN {roles:Array(String)} OR events.role = 'agent') AND events.ts >= {from:DateTime64(3, 'UTC')} "+
+		"AND events.ts <= {until:DateTime64(3, 'UTC')} AND events.line <= files.ev_lines ORDER BY files.path, events.line",
+		map[string]string{"paths": transcriptdb.Strings(paths), "roles": userWordRoles, "from": transcriptdb.Time(from), "until": transcriptdb.Time(until)})
+	return rows, err
 }
 
 // dbFindHits — findHitsUsing по базе: реплики пользователя с куском из транскриптов сессий, которые выбрал бы

@@ -142,6 +142,10 @@ func TestUserWordBriefReadsOnlyNamedTranscripts(t *testing.T) {
 				t.Errorf("candidate params %v", params)
 			}
 			return named + "\n/elsewhere/not-a-session.jsonl\n"
+		case strings.Contains(sql, "files.path IN {paths:Array(String)}"):
+			return named + "\t3\t2\t1793440740000\tuser\tоставь кэш сборки\t0\t0\n"
+		case strings.Contains(sql, " FROM raw "):
+			return "3\t2\t" + human("2026-10-31T09:59:00Z", "оставь кэш сборки") + "\n"
 		case strings.Contains(sql, "countIf"):
 			return "1\t1\n"
 		}
@@ -212,6 +216,8 @@ func TestUserWordBriefScannedDaysCountAsRecords(t *testing.T) {
 		switch {
 		case strings.HasPrefix(sql, "SELECT DISTINCT files.path"):
 			return named + "\n"
+		case strings.Contains(sql, "files.path IN {paths:Array(String)}"):
+			return ""
 		case strings.Contains(sql, "countIf"):
 			return "0\t0\n"
 		}
@@ -221,6 +227,61 @@ func TestUserWordBriefScannedDaysCountAsRecords(t *testing.T) {
 	_, out, _ := runUW(t, e, "--brief", b, "--until", "2026-10-31 12:00")
 	if !strings.Contains(out, "no matching user line on marker day") || strings.Contains(out, "no transcript records on marker day") {
 		t.Fatalf("database output:\n%s", out)
+	}
+}
+
+// A clean database event supplies the quote after its source file is removed; record days come from events too.
+func TestUserWordBriefQuoteAndRecordDayFromDatabase(t *testing.T) {
+	defer func() { activeWordDB = nil }()
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-x-proj", "db-only",
+		human("2026-10-31T09:59:00Z", "оставь кэш сборки"))
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	healthyLoader(t, e.home, time.Now())
+	fakeDB(t, func(sql string, params map[string]string) string {
+		switch {
+		case strings.HasPrefix(sql, "SELECT DISTINCT files.path"):
+			return p + "\n"
+		case strings.Contains(sql, "SELECT files.path, toString(events.file_id)"):
+			if params["paths"] == "" || params["roles"] == "" || params["from"] == "" || params["until"] == "" {
+				t.Errorf("missing brief line query params: %v", params)
+			}
+			return p + "\t3\t7\t1793440740000\tuser\tоставь кэш сборки\t0\t0\n"
+		case strings.Contains(sql, " FROM raw "):
+			return "3\t7\t" + human("2026-10-31T09:59:00Z", "оставь кэш сборки") + "\n"
+		case strings.Contains(sql, "countIf("):
+			return "1\n"
+		}
+		t.Errorf("unexpected query %s", sql)
+		return ""
+	})
+	var stderr bytes.Buffer
+	initWordDB(e, &stderr)
+	day, _ := time.ParseInLocation(time.DateOnly, "2026-10-31", e.loc)
+	hits, days, _, err := dbBriefQuotes(map[string][]string{"2026-10-31": {"оставь кэш сборки"}},
+		map[string]markerRecordInterval{markerRecordDayKey(day): {start: day, end: day.AddDate(0, 0, 1)}}, e, time.Date(2026, 10, 31, 12, 0, 0, 0, e.loc))
+	if err != nil || len(hits["2026-10-31"]) != 1 || !days[markerRecordDayKey(day)] {
+		t.Fatalf("database quote/record day: hits=%#v days=%v err=%v", hits, days, err)
+	}
+}
+
+func TestUserWordBriefBadCandidateReadsFile(t *testing.T) {
+	defer func() { activeWordDB = nil }()
+	e := testEnv(t)
+	p := writeTranscript(t, e.home, "-home-x-proj", "bad-brief",
+		human("2026-10-31T09:59:00Z", "оставь кэш сборки"), `{"type":"user","timestamp":`)
+	b := writeBrief(t, t.TempDir(), "Кэш (пользователь 31.10: «оставь кэш сборки»).\n")
+	fakeCorpusDB(t, e)
+	code, out, stderr := runUW(t, e, "--brief", b, "--until", "2026-10-31 12:00")
+	combined := out + stderr
+	if code != 0 || !strings.Contains(combined, "оставь кэш сборки") || !strings.Contains(combined, "malformed") ||
+		strings.Contains(combined, "reading files instead") {
+		t.Fatalf("bad transcript fallback (%d):\n%s\n%s", code, out, stderr)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal(err)
 	}
 }
 
