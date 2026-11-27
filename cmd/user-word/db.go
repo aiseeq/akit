@@ -30,7 +30,7 @@ var activeWordDB *wordDB
 
 func initWordDB(e env, stderr io.Writer) {
 	activeWordDB = nil
-	if c, st := transcriptdb.Backend("user-word", e.home, stderr); c != nil {
+	if c, st := transcriptdb.Backend(context.Background(), "user-word", e.home, stderr); c != nil {
 		activeWordDB = &wordDB{client: c, through: st.DBThrough, stderr: stderr}
 	}
 }

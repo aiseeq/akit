@@ -37,14 +37,7 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	cleanup, err := dbtest.Isolate()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
-	code := m.Run()
-	cleanup()
-	os.Exit(code)
+	dbtest.Main(m)
 }
 
 func countLines(t *testing.T, path string) int {

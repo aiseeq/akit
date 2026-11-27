@@ -52,7 +52,7 @@ func Connect(tool, home string) (*Client, State, error) {
 // or a nil client when the tool reads the files. Why the database is not used goes to warn as one line of the tool:
 // an unknown TL_BACKEND ("…; reading files"), an unhealthy loader or a bad address ("…; reading files instead").
 // TL_BACKEND=files is not a warning.
-func Backend(tool, home string, warn io.Writer) (*Client, State) {
+func Backend(ctx context.Context, tool, home string, warn io.Writer) (*Client, State) {
 	src, err := SourceFromEnv()
 	if err != nil {
 		fmt.Fprintf(warn, "%s: %v; reading files\n", tool, err)
@@ -63,7 +63,7 @@ func Backend(tool, home string, warn io.Writer) (*Client, State) {
 	}
 	c, state, err := Connect(tool, home)
 	if err != nil {
-		if !NoLoader(context.Background(), err) {
+		if !NoLoader(ctx, err) {
 			fmt.Fprintf(warn, "%s: database: %v; reading files instead\n", tool, err)
 		}
 		return nil, State{}

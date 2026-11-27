@@ -23,7 +23,7 @@ type priorDB struct {
 var activePriorDB *priorDB
 
 func priorBackend(home string, stderr io.Writer) *priorDB {
-	c, state := transcriptdb.Backend("prior", home, stderr)
+	c, state := transcriptdb.Backend(context.Background(), "prior", home, stderr)
 	if c == nil {
 		return nil
 	}

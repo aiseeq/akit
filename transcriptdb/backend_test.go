@@ -60,11 +60,11 @@ func TestBackend(t *testing.T) {
 	var warn bytes.Buffer
 
 	t.Setenv("TL_BACKEND", "")
-	if c, st := Backend("tool1", home, &warn); c == nil || warn.Len() > 0 || !st.DBThrough.Equal(through) {
+	if c, st := Backend(t.Context(), "tool1", home, &warn); c == nil || warn.Len() > 0 || !st.DBThrough.Equal(through) {
 		t.Fatalf("database by default: %v %q", c, warn.String())
 	}
 	t.Setenv("TL_BACKEND", "files")
-	if c, _ := Backend("tool1", home, &warn); c != nil || warn.Len() > 0 {
+	if c, _ := Backend(t.Context(), "tool1", home, &warn); c != nil || warn.Len() > 0 {
 		t.Fatalf("TL_BACKEND=files: %v %q", c, warn.String())
 	}
 	// A machine without a loader and a server reads the files quietly unless the database is asked for by name.
@@ -72,29 +72,29 @@ func TestBackend(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("TL_BACKEND", "")
 	t.Setenv("TL_CLICKHOUSE_URL", closedURL(t))
-	if c, _ := Backend("tool1", bare, &warn); c != nil || warn.Len() > 0 {
+	if c, _ := Backend(t.Context(), "tool1", bare, &warn); c != nil || warn.Len() > 0 {
 		t.Fatalf("no loader, default: %v %q", c, warn.String())
 	}
 	// A server that answers while the state file is missing is a caller with another state folder: a warning.
 	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
-	if c, _ := Backend("tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
+	if c, _ := Backend(t.Context(), "tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
 		t.Fatalf("no state, server answers: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("TL_BACKEND", "db")
-	if c, _ := Backend("tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
+	if c, _ := Backend(t.Context(), "tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
 		t.Fatalf("no loader, TL_BACKEND=db: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("XDG_STATE_HOME", stateHome)
 	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
 	t.Setenv("TL_BACKEND", "dbx")
-	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: TL_BACKEND=\"dbx\" is not files or db; reading files\n" {
+	if c, _ := Backend(t.Context(), "tool1", home, &warn); c != nil || warn.String() != "tool1: TL_BACKEND=\"dbx\" is not files or db; reading files\n" {
 		t.Fatalf("unknown backend: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("TL_BACKEND", "db")
-	c, st := Backend("tool1", home, &warn)
+	c, st := Backend(t.Context(), "tool1", home, &warn)
 	if c == nil || warn.Len() > 0 || !st.DBThrough.Equal(through) {
 		t.Fatalf("healthy loader: %v %+v %q", c, st, warn.String())
 	}
@@ -102,19 +102,19 @@ func TestBackend(t *testing.T) {
 		t.Fatalf("query of the tool: %v %q", err, comment)
 	}
 	t.Setenv("TL_CLICKHOUSE_URL", "not a url")
-	if c, _ := Backend("tool1", home, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: bad TL_CLICKHOUSE_URL") ||
+	if c, _ := Backend(t.Context(), "tool1", home, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: bad TL_CLICKHOUSE_URL") ||
 		!strings.HasSuffix(warn.String(), "; reading files instead\n") {
 		t.Fatalf("bad address: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
 	loaderState(t, home, time.Now().Add(-time.Hour))
-	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: database: tlfeed heartbeat is stale or invalid; reading files instead\n" {
+	if c, _ := Backend(t.Context(), "tool1", home, &warn); c != nil || warn.String() != "tool1: database: tlfeed heartbeat is stale or invalid; reading files instead\n" {
 		t.Fatalf("stale loader: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("TL_BACKEND", "")
-	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: database: tlfeed heartbeat is stale or invalid; reading files instead\n" {
+	if c, _ := Backend(t.Context(), "tool1", home, &warn); c != nil || warn.String() != "tool1: database: tlfeed heartbeat is stale or invalid; reading files instead\n" {
 		t.Fatalf("stale loader, default: %v %q", c, warn.String())
 	}
 	// Connect does not read TL_BACKEND: the caller has chosen the database.
