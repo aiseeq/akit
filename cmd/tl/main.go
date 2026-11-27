@@ -128,9 +128,11 @@ from the database are not visible. REF may read its requested line from disk.
 Every database answer reports its freshness time in local time. If its state is missing, stale,
 unhealthy, for another home, or the database fails, stderr says so and tl reads
 the files; with no loader state and no server answering (a machine without the
-database) tl reads the files quietly unless TL_BACKEND=db. TL_BACKEND=files reads the files only and repeats a
-share of calls (TL_SHADOW_RATE, default 0.1, 0 off) through the database in a
-background process after the answer and appends one JSON line to
+database) tl reads the files quietly unless TL_BACKEND=db. A share of calls
+(TL_SHADOW_RATE, default 0.1, 0 off) is repeated through the other path in a
+background process after the answer: database answers through the files,
+TL_BACKEND=files answers through the database; a fallback from the database to
+the files is journaled too. Each appends one JSON line to
 TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
 counts of both paths up to the call's start or --until, "diff" (-1 when the
 repeat failed), both times. TL_DB_TRACE=1 prints the time of each query.
@@ -181,8 +183,11 @@ type options struct {
 
 var errHelp = errors.New("help")
 var errHelpJSON = errors.New("help json")
+var shadowValueFlags = []string{"--role", "--since", "--until", "--gap", "--key-gap", "--grep", "--raw", "-C", "--project", "--wait", "--q", "--max", "--width"}
+
 var machineHelp = func() clihelp.Help {
-	help := clihelp.NewRoot("tl", strings.Fields("-h --help --help-json --all --codex --codex-ext --no-subagents --subagents --usage --open-questions --worktime --version --role --since --until --gap --key-gap --grep --raw -C --project --wait --wait-all --q --max --width"), strings.Fields("--role --since --until --gap --key-gap --grep --raw -C --project --wait --q --max --width"), "args", "read session events or references with optional filters")
+	flags := append(strings.Fields("-h --help --help-json --all --codex --codex-ext --no-subagents --subagents --usage --open-questions --worktime --version --wait-all"), shadowValueFlags...)
+	help := clihelp.NewRoot("tl", flags, shadowValueFlags, "args", "read session events or references with optional filters")
 	help.Commands[0].NoDashdash = true
 	return help
 }()
@@ -227,18 +232,26 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 	}
 	e := env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now,
-		backend: backendFromEnv(stderr)}
+		backend: backendFromEnv(stderr), warn: stderr}
 	if os.Getenv("TL_DB_TRACE") != "" {
 		e.dbTrace = stderr
 	}
+	prepareShadow(opts, &e, stderr)
+	code := run(opts, e, stdout, stderr)
+	shadowAfter(e.collect, opts, e, code, time.Since(begin), stderr)
+	return code
+}
+
+func prepareShadow(opts options, e *env, stderr io.Writer) {
 	if pick, err := pickShadow(opts, e.backend); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: %v; no shadow\n", err))
 	} else if pick {
 		e.collect = &answer{}
+		e.shadowPicked = true
 	}
-	code := run(opts, e, stdout, stderr)
-	shadowAfter(e.collect, opts, e, code, time.Since(begin), stderr)
-	return code
+	if e.backend == backendDB && dbForm(opts) {
+		e.fallback = &fallbackState{}
+	}
 }
 
 // backendFromEnv is TL_BACKEND: db (the default) or files.
@@ -258,15 +271,24 @@ func printMasked(w io.Writer, text string) {
 
 // env — то, что tl берёт из окружения; в тестах подменяется.
 type env struct {
-	home       string
-	configHome string
-	sessionID  string
-	now        time.Time
-	backend    string    // TL_BACKEND: files or db
-	dbThrough  time.Time // freshness boundary from tlfeed state.json
-	collect    *answer   // set when the shadow repeats this call: what the answer found
-	dbTrace    io.Writer // TL_DB_TRACE: the time of each database query
-	warn       io.Writer // the stderr of the call, unbuffered: a fallback to the files is told before they are read
+	home         string
+	configHome   string
+	sessionID    string
+	now          time.Time
+	backend      string    // TL_BACKEND: files or db
+	dbThrough    time.Time // freshness boundary from tlfeed state.json
+	collect      *answer   // set when the shadow repeats this call: what the answer found
+	shadowLimits map[string]int
+	shadowPicked bool
+	fallback     *fallbackState
+	dbTrace      io.Writer // TL_DB_TRACE: the time of each database query
+	warn         io.Writer // the stderr of the call, unbuffered: a fallback to the files is told before they are read
+}
+
+type fallbackState struct {
+	reason  string
+	started time.Time
+	filesS  float64
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
@@ -697,11 +719,24 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		if ok {
 			return code
 		}
+		if e.fallback != nil && e.fallback.reason != "" {
+			e.fallback.started = time.Now()
+		}
 	}
 	if len(refs) > 0 {
-		return reportRefs(refs, opts, e, stdout, stderr)
+		code := reportRefs(refs, opts, e, stdout, stderr)
+		finishFallback(e.fallback)
+		return code
 	}
-	return runOutputSessions(opts, e, stdout, stderr)
+	code := runOutputSessions(opts, e, stdout, stderr)
+	finishFallback(e.fallback)
+	return code
+}
+
+func finishFallback(fallback *fallbackState) {
+	if fallback != nil && !fallback.started.IsZero() {
+		fallback.filesS = time.Since(fallback.started).Seconds()
+	}
 }
 
 // runOutputDB answers through the database; false — it could not, nothing is printed but the warning, and the
@@ -712,6 +747,9 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 		return 0, false, nil
 	}
 	if err != nil {
+		if e.fallback != nil {
+			e.fallback.reason = hideSafe(err.Error())
+		}
 		return 0, false, fmt.Errorf("database: %w; reading files instead", err)
 	}
 	e.dbThrough = state.DBThrough
@@ -720,6 +758,7 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 		var out, errs bytes.Buffer
 		var code int
 		if code, err = runDB(context.Background(), c, opts, e, refs, &out, &errs); err == nil {
+			captureShadowLimits(c, &e)
 			errs.WriteString(transcriptdb.FreshnessLine("tl", e.dbThrough, time.Now()))
 			_, outErr := io.Copy(stdout, &out)
 			_, errErr := io.Copy(stderr, &errs)
@@ -735,7 +774,28 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 	if errors.Is(err, errNonRegularTranscript) {
 		return 0, false, nil
 	}
+	if e.fallback != nil {
+		e.fallback.reason = hideSafe(err.Error())
+	}
 	return 0, false, fmt.Errorf("database: %w; reading files instead", err)
+}
+
+func captureShadowLimits(c *chClient, e *env) {
+	if !e.shadowPicked {
+		return
+	}
+	limits, err := shadowLineLimits(c)
+	if err != nil {
+		if e.dbTrace != nil {
+			fmt.Fprintf(e.dbTrace, "tl: shadow line limits: %v\n", err)
+		}
+		e.shadowLimits = nil
+	} else {
+		e.shadowLimits = limits
+	}
+	if e.collect != nil {
+		e.collect.limits = e.shadowLimits
+	}
 }
 
 type dbState = transcriptdb.State

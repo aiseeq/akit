@@ -139,7 +139,162 @@ func TestShadowDropsFileKeysPastStoredLines(t *testing.T) {
 	}
 }
 
+func TestShadowRepeatsDBThroughFilesWithLineCaps(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	t.Setenv("HOME", e.home)
+	main := paths[0]
+	args := []string{"--since", "2026-10-01", "--role", "all", main}
+	now := time.Now()
+	opts, err := parseArgs(args, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := resolve(opts, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := scan(sources, opts, e.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := answerKeys(&answer{res: &res}, opts)
+	cutoff := now.Add(time.Minute)
+	limits := map[string]int{main: 100000}
+	spec := shadowSpec{Args: args, Now: now, Cutoff: cutoff, Keys: keys, Primary: backendDB,
+		Limits: limits, PrimaryCode: 0}
+	rec := shadowRepeat(spec, e.home)
+	if rec.Error != "" || rec.Primary != backendDB || rec.Diff != 0 || rec.FilesKeys != rec.DBKeys || rec.DBS != round3(spec.PrimaryS) || rec.DBCode != spec.PrimaryCode {
+		t.Fatalf("database primary repeat: %+v", rec)
+	}
+	firstLine := 0
+	for _, key := range keys {
+		_, raw, ok := strings.Cut(key, ":")
+		line, parseErr := strconv.Atoi(raw)
+		if ok && parseErr == nil && (firstLine == 0 || line < firstLine) {
+			firstLine = line
+		}
+	}
+	lateLimits := map[string]int{main: firstLine}
+	spec.Keys = filterShadowLines(keys, lateLimits)
+	spec.Limits = lateLimits
+	rec = shadowRepeat(spec, e.home)
+	if rec.Error != "" || rec.Diff != 0 {
+		t.Fatalf("event loaded after database answer: %+v", rec)
+	}
+	// The primary database missed one event inside its captured line boundary.
+	spec.Keys = append([]string(nil), keys[1:]...)
+	spec.Limits = map[string]int{main: 100000}
+	rec = shadowRepeat(spec, e.home)
+	if rec.Error != "" || rec.Diff != 1 || len(rec.OnlyFiles) != 1 {
+		t.Fatalf("line capped repeat: %+v", rec)
+	}
+}
+
+func TestShadowRepeatTimeoutRecord(t *testing.T) {
+	old := shadowRepeatTimeout
+	shadowRepeatTimeout = time.Millisecond
+	t.Cleanup(func() { shadowRepeatTimeout = old })
+	spec := shadowSpec{Args: []string{"--all"}, Primary: backendDB, Started: time.Now().Add(-time.Second)}
+	rec := shadowRepeat(spec, t.TempDir())
+	if rec.Diff != -1 || rec.Error != "files repeat timed out after 30m" {
+		t.Fatalf("timeout record: %+v", rec)
+	}
+}
+
+func TestFirstShadowFormIsSelectedAtTinyRate(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TL_SHADOW_RATE", "0.0001")
+	opts := options{originalArgs: []string{"--role", "user", "session-a"}}
+	old := shadowRandomFloat
+	shadowRandomFloat = func() float64 { return 0.5 }
+	t.Cleanup(func() { shadowRandomFloat = old })
+	if pick, err := pickShadow(opts, backendDB); err != nil || !pick {
+		t.Fatalf("first form pick = %v, %v", pick, err)
+	}
+	if pick, err := pickShadow(opts, backendDB); err != nil || pick {
+		t.Fatalf("second form pick = %v, %v", pick, err)
+	}
+}
+
+func TestDBUnselectedDoesNotCollectOrQueryShadowFiles(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_SHADOW_RATE", "0")
+	args := []string{"--all", "--max", "0"}
+	opts, err := parseArgs(args, e.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.backend = backendDB
+	prepareShadow(opts, &e, io.Discard)
+	if e.collect != nil || e.shadowPicked {
+		t.Fatalf("unselected call has shadow collector: collect=%v picked=%v", e.collect, e.shadowPicked)
+	}
+	if _, ok, err := runOutputDB(opts, e, nil, io.Discard, io.Discard); err != nil || !ok {
+		t.Fatal("database did not answer synthetic call")
+	}
+	if got := countOf(ch.requests(), "shadow_files"); got != 0 {
+		t.Fatalf("unselected call queried shadow_files %d times; requests=%v", got, ch.requests())
+	}
+}
+
+func TestFallbackJournalFromStartAtZeroRate(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	ch.fail = map[string]bool{"events": true}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	journal := filepath.Join(t.TempDir(), "journal.jsonl")
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_SHADOW_RATE", "0")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	var stderr bytes.Buffer
+	start([]string{"--all", "--max", "0"}, e.now, io.Discard, &stderr)
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec shadowRecord
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Primary != backendDB || rec.Fallback == "" || rec.Diff != -1 || rec.FilesCode == exitUsage {
+		t.Fatalf("fallback record: %+v", rec)
+	}
+}
+
+func TestNoLoaderDoesNotWriteFallbackJournal(t *testing.T) {
+	e, _, _ := dbCorpus(t)
+	state := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	if err := os.Remove(state); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(t.TempDir(), "journal.jsonl")
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_BACKEND", "")
+	t.Setenv("TL_CLICKHOUSE_URL", "http://127.0.0.1:1")
+	t.Setenv("TL_SHADOW_RATE", "0")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	start([]string{"--all"}, e.now, io.Discard, io.Discard)
+	if countLines(t, journal) != 0 {
+		t.Fatal("NoLoader call wrote a fallback journal row")
+	}
+}
+
 func TestShadowRepeatUsesCallTimeForFileKeys(t *testing.T) {
+	previousSpawner := shadowSpawner
+	shadowSpawner = func(specPath, _, _ string) error {
+		go func() { _ = runShadowChild(specPath) }()
+		return nil
+	}
+	t.Cleanup(func() { shadowSpawner = previousSpawner })
 	e, paths, unloaded := dbCorpus(t)
 	cutoff := e.now
 	file, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
@@ -361,7 +516,7 @@ func TestPickShadowOnlyForFiles(t *testing.T) {
 	if pick, err := pickShadow(opts, backendFiles); err != nil || !pick {
 		t.Fatalf("files at rate 1: pick=%t err=%v", pick, err)
 	}
-	if pick, err := pickShadow(opts, backendDB); err != nil || pick {
+	if pick, err := pickShadow(opts, backendDB); err != nil || !pick {
 		t.Fatalf("database: pick=%t err=%v", pick, err)
 	}
 }
