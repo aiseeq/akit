@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,10 @@ func TestUserWordBriefReadsOnlyNamedTranscripts(t *testing.T) {
 	if !strings.Contains(files, "ambiguous: 2 lines") || !strings.Contains(files, "no transcript records on marker day") {
 		t.Fatalf("files output:\n%s", files)
 	}
+	info, err := os.Stat(named)
+	if err != nil {
+		t.Fatal(err)
+	}
 	healthyLoader(t, e.home, time.Now())
 	fakeDB(t, func(sql string, params map[string]string) string {
 		switch {
@@ -143,7 +148,7 @@ func TestUserWordBriefReadsOnlyNamedTranscripts(t *testing.T) {
 			}
 			return named + "\n/elsewhere/not-a-session.jsonl\n"
 		case strings.Contains(sql, "files.path IN {paths:Array(String)}"):
-			return named + "\t3\t2\t1793440740000\tuser\tоставь кэш сборки\t0\t0\n"
+			return named + "\t3\t2\t1793440740000\tuser\tоставь кэш сборки\t0\t0\t2\t" + strconv.FormatInt(info.Size(), 10) + "\t" + strconv.FormatInt(info.Size(), 10) + "\t2\n"
 		case strings.Contains(sql, " FROM raw "):
 			return "3\t2\t" + human("2026-10-31T09:59:00Z", "оставь кэш сборки") + "\n"
 		case strings.Contains(sql, "countIf"):
@@ -230,8 +235,8 @@ func TestUserWordBriefScannedDaysCountAsRecords(t *testing.T) {
 	}
 }
 
-// A clean database event supplies the quote after its source file is removed; record days come from events too.
-func TestUserWordBriefQuoteAndRecordDayFromDatabase(t *testing.T) {
+// A removed transcript is not a brief candidate, while record days still come from events.
+func TestUserWordBriefSkipsRemovedTranscriptAndKeepsRecordDay(t *testing.T) {
 	defer func() { activeWordDB = nil }()
 	e := testEnv(t)
 	p := writeTranscript(t, e.home, "-home-x-proj", "db-only",
@@ -248,7 +253,7 @@ func TestUserWordBriefQuoteAndRecordDayFromDatabase(t *testing.T) {
 			if params["paths"] == "" || params["roles"] == "" || params["from"] == "" || params["until"] == "" {
 				t.Errorf("missing brief line query params: %v", params)
 			}
-			return p + "\t3\t7\t1793440740000\tuser\tоставь кэш сборки\t0\t0\n"
+			return p + "\t3\t7\t1793440740000\tuser\tоставь кэш сборки\t0\t0\t7\t123\t123\t7\n"
 		case strings.Contains(sql, " FROM raw "):
 			return "3\t7\t" + human("2026-10-31T09:59:00Z", "оставь кэш сборки") + "\n"
 		case strings.Contains(sql, "countIf("):
@@ -262,7 +267,7 @@ func TestUserWordBriefQuoteAndRecordDayFromDatabase(t *testing.T) {
 	day, _ := time.ParseInLocation(time.DateOnly, "2026-10-31", e.loc)
 	hits, days, _, err := dbBriefQuotes(map[string][]string{"2026-10-31": {"оставь кэш сборки"}},
 		map[string]markerRecordInterval{markerRecordDayKey(day): {start: day, end: day.AddDate(0, 0, 1)}}, e, time.Date(2026, 10, 31, 12, 0, 0, 0, e.loc))
-	if err != nil || len(hits["2026-10-31"]) != 1 || !days[markerRecordDayKey(day)] {
+	if err != nil || len(hits["2026-10-31"]) != 0 || !days[markerRecordDayKey(day)] {
 		t.Fatalf("database quote/record day: hits=%#v days=%v err=%v", hits, days, err)
 	}
 }

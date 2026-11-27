@@ -1073,6 +1073,15 @@ func dbBriefQuotes(fragments map[string][]string, recordWindows map[string]marke
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	// The files backend only sees transcripts that still exist in the session inventory.
+	onDisk := make(map[string]bool, len(paths))
+	kept := paths[:0]
+	for _, path := range paths {
+		if fileOnDisk(onDisk, path) {
+			kept = append(kept, path)
+		}
+	}
+	paths = kept
 	recordDays, err := activeWordDB.briefRecordDays(recordWindows)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1114,6 +1123,17 @@ func scanBriefDatabaseRows(rows [][]string, filters briefQuoteFilters, fragments
 	if err != nil {
 		return nil, err
 	}
+	for _, path := range paths {
+		state := states[path]
+		if state.bad || state.stale {
+			continue
+		}
+		for _, index := range briefDatabaseAgentIndexes(state.lines, fragments, until, loc) {
+			if key, ok := state.lineKeys[index]; ok && !state.lines[index].ask {
+				allKeys = append(allKeys, key)
+			}
+		}
+	}
 	raw, err := activeWordDB.rawLinesPresent(allKeys)
 	if err != nil {
 		return nil, err
@@ -1121,20 +1141,22 @@ func scanBriefDatabaseRows(rows [][]string, filters briefQuoteFilters, fragments
 	var out []briefQuoteScanResult
 	for _, path := range paths {
 		state := states[path]
-		if state.bad || briefMissingRaw(state, raw) {
+		if state.bad || state.stale || briefMissingRaw(state, raw) {
 			out = append(out, scanBriefTranscript(path, filters, fragments, until, loc))
 			continue
 		}
 		briefEnrichDatabaseLines(state, raw)
-		out = append(out, briefQuoteScanResult{path: path, hits: briefDatabaseHits(path, state.lines, fragments, until, loc)})
+		out = append(out, briefQuoteScanResult{path: path, hits: briefDatabaseHits(path, state.lines, fragments, until, loc, state.lineKeys, raw)})
 	}
 	return out, nil
 }
 
 type briefDatabaseState struct {
-	lines   []line
-	rawKeys map[int]rawKey
-	bad     bool
+	lines    []line
+	rawKeys  map[int]rawKey
+	lineKeys map[int]rawKey
+	bad      bool
+	stale    bool
 }
 
 func briefDatabaseStates(rows [][]string) (map[string]*briefDatabaseState, []string, []rawKey, error) {
@@ -1142,18 +1164,27 @@ func briefDatabaseStates(rows [][]string) (map[string]*briefDatabaseState, []str
 	var paths []string
 	var keys []rawKey
 	for _, row := range rows {
-		if len(row) != 8 {
-			return nil, nil, nil, fmt.Errorf("brief events: %d columns, want 8", len(row))
+		if len(row) != 12 {
+			return nil, nil, nil, fmt.Errorf("brief events: %d columns, want 12", len(row))
 		}
 		state := states[row[0]]
 		if state == nil {
-			state = &briefDatabaseState{rawKeys: make(map[int]rawKey)}
+			state = &briefDatabaseState{rawKeys: make(map[int]rawKey), lineKeys: make(map[int]rawKey)}
 			states[row[0]] = state
 			paths = append(paths, row[0])
 		}
 		if row[7] != "0" {
 			state.bad = true
 			continue
+		}
+		evLines, evErr := strconv.Atoi(row[8])
+		ingested, ingestedErr := strconv.ParseInt(row[9], 10, 64)
+		size, sizeErr := strconv.ParseInt(row[10], 10, 64)
+		lines, linesErr := strconv.Atoi(row[11])
+		stat, statErr := os.Stat(row[0])
+		if evErr != nil || ingestedErr != nil || sizeErr != nil || linesErr != nil || statErr != nil ||
+			stat.Size() != size || ingested > stat.Size() || evLines < 0 || evLines < lines {
+			state.stale = true
 		}
 		l, key, ok, err := eventLine(row[1], row[2], row[3], row[4], row[5], row[6])
 		if err != nil {
@@ -1162,7 +1193,8 @@ func briefDatabaseStates(rows [][]string) (map[string]*briefDatabaseState, []str
 		if ok {
 			index := len(state.lines)
 			state.lines = append(state.lines, l)
-			if l.user {
+			state.lineKeys[index] = key
+			if l.ask {
 				state.rawKeys[index] = key
 				keys = append(keys, key)
 			}
@@ -1181,32 +1213,57 @@ func briefMissingRaw(state *briefDatabaseState, raw map[rawKey][]byte) bool {
 }
 
 func briefEnrichDatabaseLines(state *briefDatabaseState, raw map[rawKey][]byte) {
+	for i := range state.lines {
+		if state.lines[i].user {
+			state.lines[i].contextHuman = true
+		}
+	}
 	for index, key := range state.rawKeys {
-		state.lines[index].contextHuman = briefContextHuman(raw[key])
 		if state.lines[index].ask {
 			state.lines[index].match = askAnswer(raw[key])
 		}
 	}
 }
 
-func briefDatabaseHits(path string, lines []line, fragments map[string][]string, until time.Time, loc *time.Location) []hit {
+func briefDatabaseAgentIndexes(lines []line, fragments map[string][]string, until time.Time, loc *time.Location) []int {
+	var indexes []int
+	for i := range lines {
+		l := &lines[i]
+		dayFragments := fragments[l.t.In(loc).Format(time.DateOnly)]
+		// Ask rows need their answer text from raw before we can tell whether they
+		// match. Include the nearby agent row for asks in requested quote days.
+		if l.t.After(until) || len(dayFragments) == 0 || (!l.ask && (!l.user || !briefDatabaseQuoteMatch(*l, dayFragments))) {
+			continue
+		}
+		limit := 1
+		if l.ask {
+			limit = 5
+		}
+		for j, count := i-1, 0; j >= 0 && count < limit; j-- {
+			if lines[j].user {
+				continue
+			}
+			if !l.ask && j+1 < len(lines) && lines[j+1].ask {
+				continue
+			}
+			indexes = append(indexes, j)
+			count++
+		}
+	}
+	return indexes
+}
+
+func briefDatabaseHits(path string, lines []line, fragments map[string][]string, until time.Time, loc *time.Location, rawKeys map[int]rawKey, agentRaw map[rawKey][]byte) []hit {
 	var hits []hit
 	for i := range lines {
 		l := &lines[i]
-		if l.user && !l.t.After(until) && matchesBriefQuote(*l, fragments[l.t.In(loc).Format(time.DateOnly)]) {
+		if l.user && !l.t.After(until) && briefDatabaseQuoteMatch(*l, fragments[l.t.In(loc).Format(time.DateOnly)]) {
 			hits = append(hits, hit{path: path, line: *l})
 		}
 	}
 	for i := range hits {
 		at := findLine(lines, hits[i].line)
-		var agent *line
-		for j := at - 1; j >= 0; j-- {
-			if !lines[j].user {
-				a := lines[j]
-				agent = &a
-				break
-			}
-		}
+		agent := briefDatabaseAgentBefore(lines, at, rawKeys, agentRaw)
 		shown := make(map[string]bool)
 		later := 0
 		for j := at + 1; j < len(lines); j++ {
@@ -1219,13 +1276,43 @@ func briefDatabaseHits(path string, lines []line, fragments map[string][]string,
 			}
 		}
 		hits[i].moreLater = max(0, later-briefLater)
-		contextLines := briefQuoteContextWithAgent(lines, at, hits[i].t, agent, shown)
+		contextLines := briefQuoteContextWithAgent(lines, at, hits[i].line, agent, shown)
 		if contextAt := findLine(contextLines, hits[i].line); contextAt >= 0 {
 			contextLines[contextAt].moreLater = hits[i].moreLater
 		}
 		hits[i].context = &briefQuoteContext{lines: contextLines}
 	}
 	return hits
+}
+
+func briefDatabaseAgentBefore(lines []line, at int, rawKeys map[int]rawKey, raw map[rawKey][]byte) *line {
+	for j := at - 1; j >= 0; j-- {
+		if lines[j].user {
+			continue
+		}
+		if key, ok := rawKeys[j]; ok {
+			if scanBriefRecordHints(raw[key]).askCall {
+				continue
+			}
+			if parsed, err := briefAgentFromRaw(raw[key]); err == nil && parsed != nil {
+				return parsed
+			}
+		}
+		a := lines[j]
+		return &a
+	}
+	return nil
+}
+
+// The file scanner filters raw JSON records before parsing. Apply that same short word edge check to event text.
+func briefDatabaseQuoteMatch(l line, fragments []string) bool {
+	text := searchableText(l)
+	for _, fragment := range fragments {
+		if matchesBriefQuote(l, []string{fragment}) && prefilter(briefQuoteFragment(fragment))(jsonEscaped(text)) {
+			return true
+		}
+	}
+	return false
 }
 
 func briefWordScanDays(word briefWord, loc *time.Location) []time.Time {
@@ -1350,7 +1437,7 @@ func briefContextLines(h hit, word briefWord, contexts map[string][]line, quoteC
 		if h.context != nil {
 			return h.context.lines, nil
 		}
-		key := h.path + "\x00" + h.t.String() + "\x00" + h.text
+		key := h.path + "\x00" + h.t.UTC().Format(time.RFC3339Nano) + "\x00" + h.text
 		if cached, ok := quoteContexts[key]; ok {
 			return cached.lines, nil
 		}
@@ -2833,7 +2920,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 		at := findLine(lines, hits[i].line)
 		var contextLines []line
 		if at >= 0 {
-			contextLines = briefQuoteContextWithAgent(lines, at, hits[i].t, agent, collector.lateShown[key])
+			contextLines = briefQuoteContextWithAgent(lines, at, hits[i].line, agent, collector.lateShown[key])
 			if contextAt := findLine(contextLines, hits[i].line); contextAt >= 0 {
 				contextLines[contextAt].moreLater = max(0, collector.lateCounts[quoteLineKey(hits[i].line)]-briefLater)
 			}
@@ -2849,7 +2936,7 @@ func scanBriefTranscript(path string, filters briefQuoteFilters, fragments map[s
 	return briefQuoteScanResult{path: path, hits: hits, warnings: warnings, recordDays: collector.recordDays}
 }
 
-func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agent *line, shownForQuote map[string]bool) []line {
+func briefQuoteContextWithAgent(lines []line, at int, target line, agent *line, shownForQuote map[string]bool) []line {
 	out := make([]line, 0, briefLater+2)
 	if agent != nil {
 		out = append(out, *agent)
@@ -2859,13 +2946,17 @@ func briefQuoteContextWithAgent(lines []line, at int, targetTime time.Time, agen
 		if !l.user {
 			continue
 		}
-		if !l.t.Equal(targetTime) {
+		isTarget := l.t.Equal(target.t) && l.text == target.text && (target.no == 0 || l.no == target.no)
+		if !isTarget {
+			if !l.t.After(target.t) {
+				continue
+			}
 			if !shownForQuote[l.t.Format(time.RFC3339Nano)] {
 				continue
 			}
 		}
 		out = append(out, l)
-		if l.contextHuman && !l.t.Equal(targetTime) {
+		if l.contextHuman && !l.t.Equal(target.t) {
 			later++
 			if later >= briefLater {
 				break
@@ -3017,7 +3108,7 @@ func mergeBriefQuoteResults(results []briefQuoteScanResult, capacity int, loc *t
 		}
 		for _, h := range result.hits {
 			date := h.t.In(loc).Format(time.DateOnly)
-			key := date + "\x00" + h.t.String() + "\x00" + h.text
+			key := date + "\x00" + strconv.FormatInt(h.t.UnixMilli(), 10) + "\x00" + h.text
 			if seen[key] {
 				continue
 			}

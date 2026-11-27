@@ -315,11 +315,13 @@ func (d *wordDB) briefLines(paths []string, from, until time.Time) ([][]string, 
 		return nil, nil
 	}
 	rows, err := d.query("brief_lines", "SELECT files.path, toString(events.file_id), toString(events.line), "+
-		"toString(toUnixTimestamp64Milli(events.ts)), events.role, events.text, toString(events.images), toString(files.bad) "+
+		"toString(toUnixTimestamp64Milli(events.ts)), events.role, events.text, toString(events.images), toString(files.bad), "+
+		"toString(files.ev_lines), toString(files.ingested), toString(files.size), toString(files.lines) "+
 		"FROM events INNER JOIN files FINAL USING (file_id) WHERE files.path IN {paths:Array(String)} "+
-		"AND (events.role IN {roles:Array(String)} OR events.role = 'agent') AND events.ts >= {from:DateTime64(3, 'UTC')} "+
+		"AND ((events.role IN {roles:Array(String)} AND events.ts >= {from:DateTime64(3, 'UTC')}) OR "+
+		"(events.role = 'agent' AND events.ts >= {agent_from:DateTime64(3, 'UTC')})) "+
 		"AND events.ts <= {until:DateTime64(3, 'UTC')} AND events.line <= files.ev_lines ORDER BY files.path, events.line",
-		map[string]string{"paths": transcriptdb.Strings(paths), "roles": userWordRoles, "from": transcriptdb.Time(from), "until": transcriptdb.Time(until)})
+		map[string]string{"paths": transcriptdb.Strings(paths), "roles": userWordRoles, "from": transcriptdb.Time(from), "agent_from": transcriptdb.Time(from.Add(-24 * time.Hour)), "until": transcriptdb.Time(until)})
 	return rows, err
 }
 

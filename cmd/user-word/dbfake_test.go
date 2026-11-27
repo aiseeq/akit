@@ -29,9 +29,12 @@ type fakeEvent struct {
 }
 
 type fakeCorpus struct {
-	events []fakeEvent
-	raw    map[[2]uint64]string
-	bad    map[string]int
+	events  []fakeEvent
+	raw     map[[2]uint64]string
+	bad     map[string]int
+	sizes   map[string]int64
+	lines   map[string]int
+	evLines map[string]int
 }
 
 // loadFakeCorpus reads every session transcript under home as the loader does.
@@ -42,13 +45,16 @@ func loadFakeCorpus(t *testing.T, home string) fakeCorpus {
 		t.Fatal(err)
 	}
 	slices.Sort(paths)
-	c := fakeCorpus{raw: map[[2]uint64]string{}, bad: map[string]int{}}
+	c := fakeCorpus{raw: map[[2]uint64]string{}, bad: map[string]int{}, sizes: map[string]int64{}, lines: map[string]int{}, evLines: map[string]int{}}
 	for i, path := range paths {
 		id := uint64(100 + i)
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
+		c.sizes[path] = int64(len(data))
+		c.lines[path] = strings.Count(strings.TrimSuffix(string(data), "\n"), "\n") + 1
+		c.evLines[path] = c.lines[path]
 		for n, raw := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
 			c.raw[[2]uint64{id, uint64(n + 1)}] = raw
 		}
@@ -67,8 +73,15 @@ func loadFakeCorpus(t *testing.T, home string) fakeCorpus {
 // fakeCorpusDB serves the queries of user-word from the synthetic transcripts under e.home, so the same command
 // can run through the files and through the database and its stdout be compared.
 func fakeCorpusDB(t *testing.T, e env) {
+	fakeCorpusDBAdjust(t, e, nil)
+}
+
+func fakeCorpusDBAdjust(t *testing.T, e env, adjust func(*fakeCorpus)) {
 	t.Helper()
 	c := loadFakeCorpus(t, e.home)
+	if adjust != nil {
+		adjust(&c)
+	}
 	healthyLoader(t, e.home, time.Now())
 	fakeDB(t, func(sql string, params map[string]string) string {
 		rows, err := c.answer(sql, params)
@@ -95,7 +108,7 @@ func (c fakeCorpus) answer(sql string, params map[string]string) ([][]string, er
 	case strings.Contains(sql, " FROM raw "):
 		return c.rawRows(sql, params)
 	case strings.Contains(sql, "SELECT DISTINCT files.path"):
-		return c.candidates(params)
+		return c.candidates(sql, params)
 	case strings.Contains(sql, "files.path IN {paths:Array(String)}"):
 		paths, err := arrayParam(params["paths"])
 		if err != nil {
@@ -107,8 +120,14 @@ func (c fakeCorpus) answer(sql string, params map[string]string) ([][]string, er
 			return nil, fmt.Errorf("brief line times %v", params)
 		}
 		var selected []fakeEvent
+		agentFrom, agentErr := timeParam(params["agent_from"])
+		if agentErr != nil {
+			return nil, fmt.Errorf("brief agent time %v", params)
+		}
 		for _, ev := range c.events {
-			if slices.Contains(paths, ev.path) && !ev.ts.Before(from) && !ev.ts.After(until) && slices.Contains([]string{"user", "ask", "agent"}, ev.role) {
+			inWindow := slices.Contains([]string{"user", "ask"}, ev.role) && !ev.ts.Before(from) || ev.role == "agent" && !ev.ts.Before(agentFrom)
+			if slices.Contains(paths, ev.path) && inWindow && !ev.ts.After(until) &&
+				(!strings.Contains(sql, "events.line <= files.ev_lines") || ev.line <= c.evLines[ev.path]) {
 				selected = append(selected, ev)
 			}
 		}
@@ -120,7 +139,7 @@ func (c fakeCorpus) answer(sql string, params map[string]string) ([][]string, er
 		})
 		var rows [][]string
 		for _, ev := range selected {
-			rows = append(rows, []string{ev.path, strconv.FormatUint(ev.fileID, 10), strconv.Itoa(ev.line), strconv.FormatInt(ev.ts.UnixMilli(), 10), ev.role, ev.text, strconv.Itoa(ev.images), strconv.Itoa(c.bad[ev.path])})
+			rows = append(rows, []string{ev.path, strconv.FormatUint(ev.fileID, 10), strconv.Itoa(ev.line), strconv.FormatInt(ev.ts.UnixMilli(), 10), ev.role, ev.text, strconv.Itoa(ev.images), strconv.Itoa(c.bad[ev.path]), strconv.Itoa(c.evLines[ev.path]), strconv.FormatInt(c.sizes[ev.path], 10), strconv.FormatInt(c.sizes[ev.path], 10), strconv.Itoa(c.lines[ev.path])})
 		}
 		return rows, nil
 	case strings.Contains(sql, "countIf("):
@@ -206,6 +225,10 @@ func (c fakeCorpus) value(ev fakeEvent, column string) (string, error) {
 		return strconv.Itoa(ev.images), nil
 	case "toString(bad)":
 		return strconv.Itoa(c.bad[ev.path]), nil
+	case "toString(ev_lines)":
+		return strconv.Itoa(c.evLines[ev.path]), nil
+	case "toString(size)":
+		return strconv.FormatInt(c.sizes[ev.path], 10), nil
 	}
 	return "", fmt.Errorf("column %q", column)
 }
@@ -230,7 +253,7 @@ func (c fakeCorpus) rawRows(sql string, params map[string]string) ([][]string, e
 }
 
 // candidates — the paths with a user or ask line in a marker day that has one of the day's terms.
-func (c fakeCorpus) candidates(params map[string]string) ([][]string, error) {
+func (c fakeCorpus) candidates(sql string, params map[string]string) ([][]string, error) {
 	paths := map[string]bool{}
 	for i := 0; params[fmt.Sprintf("s%d", i)] != ""; i++ {
 		start, err1 := timeParam(params[fmt.Sprintf("s%d", i)])
@@ -240,7 +263,9 @@ func (c fakeCorpus) candidates(params map[string]string) ([][]string, error) {
 			return nil, fmt.Errorf("candidate params %v", params)
 		}
 		for _, ev := range c.events {
-			if (ev.role == "user" || ev.role == "ask") && !ev.ts.Before(start) && ev.ts.Before(end) && (len(terms) == 0 || ev.hayHasAny(terms)) {
+			if (ev.role == "user" || ev.role == "ask") && !ev.ts.Before(start) && ev.ts.Before(end) &&
+				(!strings.Contains(sql, "events.line <= files.ev_lines") || ev.line <= c.evLines[ev.path]) &&
+				(len(terms) == 0 || ev.hayHasAny(terms)) {
 				paths[ev.path] = true
 			}
 		}
