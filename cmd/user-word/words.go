@@ -3348,7 +3348,16 @@ func transcriptOffset(f *os.File, size int64, target time.Time, samples []transc
 		if pos >= size {
 			break
 		}
-		if stamp.IsZero() || stamp.Before(target) {
+		// A record whose first bytes hold no stamp (an assistant record stamps after its content) is as late as
+		// the next stamped one: it is skipped only when that one is before the target.
+		for stamp.IsZero() && end < hi {
+			var next int64
+			if _, stamp, next, err = transcriptRecordAt(f, end, size); err != nil {
+				return 0, err
+			}
+			end = next
+		}
+		if !stamp.IsZero() && stamp.Before(target) {
 			if end <= lo {
 				break
 			}
