@@ -14,6 +14,7 @@ import (
 
 	"github.com/aiseeq/akit/proc"
 	"github.com/aiseeq/akit/session"
+	"github.com/aiseeq/akit/transcript"
 )
 
 func TestDBFilePredicateCarriesProjectCWDAndLiveSession(t *testing.T) {
@@ -408,5 +409,34 @@ func TestProbeUnreadableStored(t *testing.T) {
 	code, out, stderr := runTL(t, e, "--all", "--grep", "закрытый", "--max", "0")
 	if code != 0 || !strings.Contains(out, "закрытый sub") || strings.Contains(stderr, "reading files instead") {
 		t.Fatalf("unreadable disk transcript affected database answer: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+}
+
+// The loader keeps the words of the user in Claude Code sessions past the event retention: a search of them alone
+// stays on the database at any depth, while any other role or a Codex rollout still falls back.
+func TestDBRetentionKeepsClaudeUserWords(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-100 * 24 * time.Hour)
+	claude := "/p/session.jsonl"
+	codex := "/w/rollout-2026-08-01T10-00-00-0199aaaa-0000-7000-8000-000000000001.jsonl"
+	files := map[string]*dbFile{claude: {path: claude, first: old}, codex: {path: codex, first: old}}
+	userWords := map[transcript.Role]bool{transcript.User: true, transcript.Ask: true}
+	for _, tc := range []struct {
+		name    string
+		opts    options
+		sources []source
+		want    bool
+	}{
+		{"user words of an old session", options{roles: userWords}, []source{{Path: claude}}, false},
+		{"user words of an old window", options{roles: userWords, since: old}, nil, false},
+		{"user and agent of an old session", options{roles: map[transcript.Role]bool{transcript.User: true, transcript.Agent: true}}, []source{{Path: claude}}, true},
+		{"user words of an old rollout", options{roles: userWords, codex: true}, []source{{Path: codex}}, true},
+		{"user words of an old window with codex", options{roles: userWords, codex: true, since: old}, nil, true},
+		{"user words of an old window with codex-ext", options{roles: userWords, codexExt: true, since: old}, nil, true},
+		{"no role filter", options{}, []source{{Path: claude}}, true},
+	} {
+		if got := dbRetentionExceeded(tc.opts, tc.sources, files, now); got != tc.want {
+			t.Errorf("%s: dbRetentionExceeded = %t, want %t", tc.name, got, tc.want)
+		}
 	}
 }

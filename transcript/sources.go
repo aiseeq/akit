@@ -18,6 +18,12 @@ import (
 // EventRetention is the age after which the loader may remove transcript events.
 const EventRetention = 90 * 24 * time.Hour
 
+// EventKeptForever tells whether the loader keeps an event of this transcript kind ("claude" or "codex") and role
+// past EventRetention: the words of the user in Claude Code sessions.
+func EventKeptForever(kind string, role Role) bool {
+	return kind == "claude" && (role == User || role == Ask)
+}
+
 // Source describes a transcript file and, for a subagent, its parent.
 type Source struct {
 	Path, ID, ParentID, Description string

@@ -146,10 +146,17 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 
 func dbRetentionExceeded(opts options, sources []source, files map[string]*dbFile, now time.Time) bool {
 	cutoff := now.Add(-transcript.EventRetention + 24*time.Hour)
-	if !opts.since.IsZero() && opts.since.Before(cutoff) {
+	if !opts.since.IsZero() && opts.since.Before(cutoff) && (opts.codex || opts.codexExt || !rolesKeptForever(opts, "claude")) {
 		return true
 	}
 	for _, src := range sources {
+		kind := "claude"
+		if isCodexRollout(src.Path) {
+			kind = "codex"
+		}
+		if rolesKeptForever(opts, kind) {
+			continue
+		}
 		if f := files[src.Path]; f != nil && !f.first.IsZero() && f.first.Before(cutoff) {
 			return true
 		}
@@ -1263,4 +1270,20 @@ func eventsAt(path string, lineNo int) ([]transcript.Event, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	return found, nil
+}
+
+// rolesKeptForever tells whether every role the search asks for is one the loader keeps past the event retention
+// in transcripts of this kind; a search without a role filter asks for all of them.
+func rolesKeptForever(opts options, kind string) bool {
+	asked := 0
+	for role, on := range opts.roles {
+		if !on {
+			continue
+		}
+		if !transcript.EventKeptForever(kind, role) {
+			return false
+		}
+		asked++
+	}
+	return asked > 0
 }

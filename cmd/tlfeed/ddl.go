@@ -19,7 +19,7 @@ func eventTTL() string {
 }
 
 func eventRetained(at time.Time, kind, role string, now time.Time) bool {
-	return at.Truncate(time.Second).Add(time.Duration(eventRetentionDays)*24*time.Hour).After(now) || kind == "claude" && (role == "user" || role == "ask")
+	return at.Truncate(time.Second).Add(time.Duration(eventRetentionDays)*24*time.Hour).After(now) || transcript.EventKeptForever(kind, transcript.Role(role))
 }
 
 func eventRetentionPredicate(column string) string {
