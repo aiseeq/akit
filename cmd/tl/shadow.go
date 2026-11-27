@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,16 +21,13 @@ import (
 	"time"
 )
 
-// The shadow: with TL_BACKEND=files (not the default) a share of the calls (TL_SHADOW_RATE, 0.1 by default, 0 — off) repeats the
-// query through the database after the answer, in a process of its own that the call does not wait for. It
-// compares the events both paths found and writes one JSON line per call to the journal (TL_SHADOW_JOURNAL,
-// $XDG_STATE_HOME/akit/tl-shadow.jsonl by default). Both sides count only events up to the moment the call began
-// (or its --until, if earlier): lines written while the files were read are in one path only by timing.
+// Shadow repeats selected database answers through files and selected file answers through the database. Repeats
+// run detached and write one JSON line to the shadow journal. Database-to-files repeats are capped at the database
+// line counts captured when the primary answer completed; database fallbacks are journaled separately.
 
 const (
 	shadowChildEnv     = "TL_SHADOW_CHILD"
 	defaultShadowRate  = 0.1
-	shadowTimeout      = 60 * time.Second
 	shadowPerForm      = 2 // repeats of one form at once
 	shadowAll          = 4 // repeats at once in all
 	shadowSampleKeys   = 10
@@ -38,11 +36,15 @@ const (
 	shadowLogName      = "errors.log"
 )
 
+var shadowRepeatTimeout = 30 * time.Minute
+var shadowRandomFloat = rand.Float64
+
 // answer is what one call found, for the shadow: the result of a listing or --usage, the events of tl REF.
 type answer struct {
 	res    *result
 	refs   []hit
 	filled bool
+	limits map[string]int
 }
 
 // shadowRate is TL_SHADOW_RATE: a share from 0 to 1.
@@ -77,19 +79,25 @@ func shadowJournal(home string) string {
 
 // shadowSpec is what the repeat gets from the call: its arguments and moment, and what the file path found.
 type shadowSpec struct {
-	Args      []string  `json:"args"`
-	Now       time.Time `json:"now"`
-	Cutoff    time.Time `json:"cutoff"`
-	Keys      []string  `json:"keys"`
-	FilesS    float64   `json:"files_s"`
-	FilesCode int       `json:"files_code"`
-	Journal   string    `json:"journal"`
-	Slots     string    `json:"slots"`
+	Args        []string       `json:"args"`
+	Now         time.Time      `json:"now"`
+	Cutoff      time.Time      `json:"cutoff"`
+	Keys        []string       `json:"keys"`
+	PrimaryS    float64        `json:"primary_s"`
+	PrimaryCode int            `json:"primary_code"`
+	Primary     string         `json:"primary"`
+	Limits      map[string]int `json:"limits,omitempty"`
+	Fallback    string         `json:"fallback,omitempty"`
+	Started     time.Time      `json:"started"`
+	Journal     string         `json:"journal"`
+	Slots       string         `json:"slots"`
 }
 
 // shadowRecord is one line of the journal.
 type shadowRecord struct {
 	Time      string   `json:"time"`
+	Primary   string   `json:"primary"`
+	Fallback  string   `json:"fallback,omitempty"`
 	Args      []string `json:"args"`
 	Until     string   `json:"until"`
 	FilesKeys int      `json:"files_keys"`
@@ -233,8 +241,30 @@ func formSlot(args []string) string {
 	return hex.EncodeToString(sum[:6])
 }
 
+func shadowForm(args []string) string {
+	flags := make([]string, 0, len(args))
+	positionals := 0
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			positionals++
+			continue
+		}
+		name := a
+		if j := strings.IndexByte(name, '='); j >= 0 {
+			name = name[:j]
+		}
+		flags = append(flags, name)
+		if !strings.Contains(a, "=") && slices.Contains(shadowValueFlags, name) && i+1 < len(args) {
+			i++
+		}
+	}
+	return strings.Join(flags, "\x00") + fmt.Sprintf("\x00%d", positionals)
+}
+
 // shadowStarts counts the repeats this process started.
 var shadowStarts atomic.Int64
+var shadowSpawner = spawnShadow
 
 // startShadow starts the repeat of the call through the database, detached from it; the call does not wait for
 // it. Nothing starts when shadowPerForm repeats of this form or shadowAll in all already run. The repeat has no
@@ -242,6 +272,9 @@ var shadowStarts atomic.Int64
 func startShadow(spec shadowSpec, form string) error {
 	if err := os.MkdirAll(spec.Slots, 0o700); err != nil {
 		return fmt.Errorf("shadow slots: %w", err)
+	}
+	if spec.Started.IsZero() {
+		spec.Started = time.Now()
 	}
 	for _, slot := range []struct {
 		prefix string
@@ -256,7 +289,7 @@ func startShadow(spec shadowSpec, form string) error {
 	if err != nil {
 		return err
 	}
-	if err := spawnShadow(specPath, filepath.Join(spec.Slots, shadowLogName)); err != nil {
+	if err := shadowSpawner(specPath, filepath.Join(spec.Slots, shadowLogName), spec.Primary); err != nil {
 		return errors.Join(err, removeSpec(specPath))
 	}
 	shadowStarts.Add(1)
@@ -286,7 +319,7 @@ func removeSpec(path string) error {
 	return nil
 }
 
-func spawnShadow(specPath, logPath string) error {
+func spawnShadow(specPath, logPath, primary string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find tl executable: %w", err)
@@ -295,8 +328,18 @@ func spawnShadow(specPath, logPath string) error {
 	if err != nil {
 		return fmt.Errorf("shadow log: %w", err)
 	}
-	cmd := exec.Command(exe)
-	cmd.Env = append(os.Environ(), shadowChildEnv+"="+specPath)
+	program, prefix := exe, []string{}
+	if primary == backendDB {
+		if graft, lookErr := exec.LookPath("graft"); lookErr == nil {
+			program = graft
+			prefix = []string{"exec", "--heavy", "--local", "--", exe}
+		}
+	}
+	cmd := exec.Command(program, prefix...)
+	cmd.Env = shadowEnv(map[string]string{shadowChildEnv: specPath})
+	if primary == backendDB {
+		cmd.Env = shadowEnv(map[string]string{shadowChildEnv: specPath, "TL_BACKEND": backendFiles})
+	}
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = detached()
 	err = cmd.Start()
@@ -309,6 +352,31 @@ func spawnShadow(specPath, logPath string) error {
 		return fmt.Errorf("start shadow: %w", err)
 	}
 	return closeErr
+}
+
+func shadowEnv(values map[string]string) []string {
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		keep := true
+		for key := range values {
+			if strings.HasPrefix(entry, key+"=") {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			env = append(env, entry)
+		}
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		env = append(env, key+"="+values[key])
+	}
+	return env
 }
 
 // slotFree tells whether one of the n slots named prefix is not held now.
@@ -352,7 +420,27 @@ func holdSlot(dir, prefix string, n int) (bool, error) {
 
 // shadowAfter starts the repeat of a call answered from files, when it was picked for the shadow.
 func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration, stderr io.Writer) {
-	if a == nil || !a.filled || code != 0 && code != exitNone {
+	if journalFallback(opts, e, code, elapsed, stderr) {
+		return
+	}
+	if a == nil {
+		return
+	}
+	if e.backend == backendDB {
+		limits := e.shadowLimits
+		if limits == nil {
+			limits = a.limits
+		}
+		if !a.filled || code != 0 && code != exitNone || !e.shadowPicked || limits == nil {
+			return
+		}
+		cutoff := shadowCutoff(opts, e.now)
+		spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysThrough(a, opts, cutoff),
+			PrimaryS: elapsed.Seconds(), PrimaryCode: code, Primary: backendDB, Limits: limits,
+			Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
+		if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {
+			printMasked(stderr, fmt.Sprintf("tl: shadow: %v\n", err))
+		}
 		return
 	}
 	_, err := readDBState(e.home)
@@ -363,11 +451,35 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 		return
 	}
 	cutoff := shadowCutoff(opts, e.now)
-	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysThrough(a, opts, cutoff), FilesS: elapsed.Seconds(),
-		FilesCode: code, Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
+	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysThrough(a, opts, cutoff), PrimaryS: elapsed.Seconds(),
+		PrimaryCode: code, Primary: backendFiles, Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
 	if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: shadow: %v\n", err))
 	}
+}
+
+func journalFallback(opts options, e env, code int, elapsed time.Duration, stderr io.Writer) bool {
+	if e.fallback == nil || e.fallback.reason == "" {
+		return false
+	}
+	filesS := elapsed.Seconds()
+	if e.fallback.filesS > 0 {
+		filesS = e.fallback.filesS
+	}
+	rec := shadowRecord{Time: time.Now().Format(time.RFC3339), Args: hideArgs(opts.originalArgs), Primary: backendDB,
+		Fallback: e.fallback.reason, FilesS: round3(filesS), FilesCode: code, Diff: -1}
+	if err := appendJournal(shadowJournal(e.home), rec); err != nil {
+		printMasked(stderr, fmt.Sprintf("tl: shadow journal: %v\n", err))
+	}
+	return true
+}
+
+func hideArgs(args []string) []string {
+	masked := make([]string, len(args))
+	for i, arg := range args {
+		masked[i] = hideSafe(arg)
+	}
+	return masked
 }
 
 // runShadowChild is the repeat: it reads its spec, asks the database the same, compares and writes the journal.
@@ -409,10 +521,22 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 	for i, a := range spec.Args {
 		args[i] = hideSafe(a)
 	}
-	rec := shadowRecord{Time: time.Now().Format(time.RFC3339), Args: args, FilesKeys: len(spec.Keys), FilesS: round3(spec.FilesS),
-		FilesCode: spec.FilesCode, Diff: -1}
+	primary := spec.Primary
+	if primary == "" {
+		primary = backendFiles
+	}
+	rec := shadowRecord{Time: time.Now().Format(time.RFC3339), Args: args, Primary: primary, Fallback: spec.Fallback, Diff: -1}
+	if primary == backendFiles {
+		rec.FilesKeys, rec.FilesS, rec.FilesCode = len(spec.Keys), round3(spec.PrimaryS), spec.PrimaryCode
+	} else {
+		rec.DBKeys, rec.DBS, rec.DBCode = len(spec.Keys), round3(spec.PrimaryS), spec.PrimaryCode
+	}
 	if !spec.Cutoff.IsZero() {
 		rec.Until = spec.Cutoff.Format(time.RFC3339Nano)
+	}
+	if !spec.Started.IsZero() && time.Since(spec.Started) >= shadowRepeatTimeout {
+		rec.Error = "files repeat timed out after 30m"
+		return rec
 	}
 	opts, err := parseArgs(spec.Args, spec.Now)
 	if err != nil {
@@ -420,11 +544,6 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		return rec
 	}
 	opts = boundShadowOptions(opts, spec.Cutoff)
-	c, err := newCHClientFromEnv()
-	if err != nil {
-		rec.Error = err.Error()
-		return rec
-	}
 	refs, err := splitRefs(opts.args)
 	if err != nil {
 		rec.Error = err.Error()
@@ -432,13 +551,50 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 	}
 	a := &answer{}
 	e := env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: spec.Now, collect: a}
-	ctx, cancel := context.WithTimeout(context.Background(), shadowTimeout)
+	remaining := shadowRepeatTimeout
+	if !spec.Started.IsZero() {
+		remaining -= time.Since(spec.Started)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), max(remaining, time.Millisecond))
 	defer cancel()
 	start := time.Now()
-	code, err := runDB(ctx, c, opts, e, refs, io.Discard, io.Discard)
-	rec.DBS, rec.DBCode = round3(time.Since(start).Seconds()), code
+	var code int
+	var c *chClient
+	if primary == backendFiles {
+		var clientErr error
+		c, clientErr = newCHClientFromEnv()
+		if clientErr != nil {
+			rec.Error = hideSafe(clientErr.Error())
+			return rec
+		}
+		code, err = runDB(ctx, c, opts, e, refs, io.Discard, io.Discard)
+		rec.DBS, rec.DBCode = round3(time.Since(start).Seconds()), code
+	} else {
+		e.backend = backendFiles
+		fileAnswer := &answer{}
+		e.collect = fileAnswer
+		done := make(chan int, 1)
+		go func() { done <- runOutput(opts, e, io.Discard, io.Discard) }()
+		select {
+		case code = <-done:
+		case <-ctx.Done():
+			rec.Error = "files repeat timed out after 30m"
+			return rec
+		}
+		keys := filterShadowLines(answerKeysThrough(fileAnswer, opts, spec.Cutoff), spec.Limits)
+		rec.FilesS, rec.FilesCode, rec.FilesKeys = round3(time.Since(start).Seconds()), code, len(keys)
+		rec.Diff, rec.OnlyFiles, rec.OnlyDB = keyDiff(keys, spec.Keys)
+		if code != spec.PrimaryCode {
+			rec.Error = fmt.Sprintf("exit %d through files, %d through database", code, spec.PrimaryCode)
+		}
+		return rec
+	}
 	if err != nil {
-		rec.Error = hideSafe(err.Error())
+		if errors.Is(err, context.DeadlineExceeded) {
+			rec.Error = "files repeat timed out after 30m"
+		} else {
+			rec.Error = hideSafe(err.Error())
+		}
 		return rec
 	}
 	limits, err := shadowLineLimits(c)
@@ -450,14 +606,14 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 	keys := filterShadowLines(answerKeys(a, opts), limits)
 	rec.DBKeys = len(keys)
 	rec.Diff, rec.OnlyFiles, rec.OnlyDB = keyDiff(spec.Keys, keys)
-	if code != spec.FilesCode {
-		rec.Error = fmt.Sprintf("exit %d through the database, %d through files", code, spec.FilesCode)
+	if code != spec.PrimaryCode {
+		rec.Error = fmt.Sprintf("exit %d through the database, %d through files", code, spec.PrimaryCode)
 	}
 	return rec
 }
 
 func shadowLineLimits(c *chClient) (map[string]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), shadowTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), shadowRepeatTimeout)
 	defer cancel()
 	rows, err := c.SelectTSV(ctx, chQuery{Name: "shadow_files", SQL: "SELECT path, lines FROM files FINAL"})
 	if err != nil {
@@ -526,12 +682,61 @@ func appendJournal(path string, rec shadowRecord) error {
 
 // pickShadow decides whether this call is repeated through the database.
 func pickShadow(opts options, backend string) (bool, error) {
-	if backend != backendFiles || !dbForm(opts) {
+	if !dbForm(opts) || backend != backendFiles && backend != backendDB {
 		return false, nil
 	}
 	rate, err := shadowRate()
 	if err != nil {
 		return false, err
 	}
-	return rate > 0 && rand.Float64() < rate, nil
+	if rate == 0 {
+		return false, nil
+	}
+	if backend == backendDB {
+		form := shadowForm(opts.originalArgs)
+		if unseen, err := rememberShadowForm(form); err != nil {
+			return false, err
+		} else if unseen {
+			return true, nil
+		}
+	}
+	return shadowRandomFloat() < rate, nil
+}
+
+func rememberShadowForm(form string) (_ bool, retErr error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false, fmt.Errorf("find home for shadow forms: %w", err)
+	}
+	dir := filepath.Join(stateDir(home), shadowSlotsDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, fmt.Errorf("create shadow slots directory: %w", err)
+	}
+	path := filepath.Join(dir, "seen-forms")
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return false, fmt.Errorf("open seen shadow forms: %w", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close seen shadow forms: %w", err))
+		}
+	}()
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, fmt.Errorf("seek seen shadow forms: %w", err)
+	}
+	b, err := io.ReadAll(file)
+	if err != nil {
+		return false, fmt.Errorf("read seen shadow forms: %w", err)
+	}
+	if slices.Contains(strings.Split(string(b), "\n"), form) {
+		return false, nil
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return false, fmt.Errorf("seek end of seen shadow forms: %w", err)
+	}
+	if _, err := fmt.Fprintln(file, form); err != nil {
+		return false, fmt.Errorf("append seen shadow form: %w", err)
+	}
+	return true, nil
 }
