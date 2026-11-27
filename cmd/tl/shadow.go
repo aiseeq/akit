@@ -162,16 +162,16 @@ func answerKeysThrough(a *answer, opts options, cutoff time.Time) []string {
 	}
 	filtered := &answer{filled: a.filled}
 	if a.res == nil {
-		for _, ref := range a.refs {
-			if !ref.ev.Time.After(cutoff) {
-				filtered.refs = append(filtered.refs, ref)
+		for i := range a.refs {
+			if !a.refs[i].ev.Time.After(cutoff) {
+				filtered.refs = append(filtered.refs, a.refs[i])
 			}
 		}
 	} else {
 		res := &result{}
-		for _, h := range a.res.hits {
-			if !h.ev.Time.After(cutoff) {
-				res.hits = append(res.hits, h)
+		for i := range a.res.hits {
+			if !a.res.hits[i].ev.Time.After(cutoff) {
+				res.hits = append(res.hits, a.res.hits[i])
 			}
 		}
 		filtered.res = res
