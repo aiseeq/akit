@@ -3331,6 +3331,9 @@ func parseTranscriptTimestamp(value []byte) (time.Time, error) {
 }
 
 func transcriptOffset(f *os.File, size int64, target time.Time, samples []transcriptSample) (int64, error) {
+	// Some records stamp up to minutes before the ones they follow (attachments, snapshots); a probe on such a
+	// record would put the start past the records of the target's first minutes, so the start is searched earlier.
+	target = target.Add(-transcriptStampSlack)
 	lo, hi := int64(0), size
 	for _, sample := range samples {
 		if sample.stamp.Before(target) {
@@ -3352,7 +3355,7 @@ func transcriptOffset(f *os.File, size int64, target time.Time, samples []transc
 		// the next stamped one: it is skipped only when that one is before the target.
 		for stamp.IsZero() && end < hi {
 			var next int64
-			if _, stamp, next, err = transcriptRecordAt(f, end, size); err != nil {
+			if stamp, next, err = transcriptRecordFrom(f, end, size); err != nil {
 				return 0, err
 			}
 			end = next
@@ -3373,6 +3376,42 @@ func transcriptOffset(f *os.File, size int64, target time.Time, samples []transc
 }
 
 const transcriptRecordReadBuffer = 68 << 10
+
+// transcriptStampSlack bounds how far back a record's stamp goes against the records before it.
+const transcriptStampSlack = 15 * time.Minute
+
+// transcriptRecordFrom reads the record that starts at pos: its stamp from the first 4 KiB and the offset after it.
+// Reading forward from a known start skips the backward search of transcriptRecordAt.
+func transcriptRecordFrom(f *os.File, pos, size int64) (time.Time, int64, error) {
+	if pos >= size {
+		return time.Time{}, size, nil
+	}
+	var chunk [4 << 10]byte
+	n, err := f.ReadAt(chunk[:], pos)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return time.Time{}, 0, err
+	}
+	line := chunk[:n]
+	if i := bytes.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	// the stamp of this record only: a short record without one is followed by the next in the same chunk
+	stamp, err := transcriptTimestampPrefix(line)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	end := pos
+	for n > 0 {
+		if i := bytes.IndexByte(chunk[:n], '\n'); i >= 0 {
+			return stamp, end + int64(i+1), nil
+		}
+		end += int64(n)
+		if n, err = f.ReadAt(chunk[:], end); err != nil && !errors.Is(err, io.EOF) {
+			return time.Time{}, 0, err
+		}
+	}
+	return stamp, size, nil
+}
 
 func transcriptRecordAt(f *os.File, offset, size int64) (int64, time.Time, int64, error) {
 	if offset >= size {

@@ -44,11 +44,11 @@ func TestTranscriptOffsetKeepsRecordsWithLateStamp(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got > offsets[target] {
-			t.Errorf("target record %d at %d: start %d is past it", target, offsets[target], got)
+		if got > offsets[max(0, target-15)] {
+			t.Errorf("target record %d: start %d is past the records stamped within the slack before it", target, got)
 		}
-		if got < offsets[max(0, target-20)] {
-			t.Errorf("target record %d: start %d is more than 20 records before it", target, got)
+		if got < offsets[max(0, target-25)] {
+			t.Errorf("target record %d: start %d is more than 25 records before it", target, got)
 		}
 	}
 }
@@ -77,11 +77,34 @@ func TestTranscriptOffsetKeepsUnstampedRunUpToBound(t *testing.T) {
 	}
 	defer f.Close()
 	samples := []transcriptSample{{offset: 0, stamp: base}, {offset: bound, stamp: base.Add(31 * time.Minute)}}
-	got, err := transcriptOffset(f, int64(b.Len()), base.Add(5*time.Minute), samples)
+	got, err := transcriptOffset(f, int64(b.Len()), base.Add(25*time.Minute), samples)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got > offsets[5] {
-		t.Fatalf("start %d is past record 5 at %d", got, offsets[5])
+	if got > offsets[10] {
+		t.Fatalf("start %d is past record 10 at %d, the first one within the slack before the target", got, offsets[10])
+	}
+}
+
+// A short record without a stamp has no stamp of its own, even when the next record's stamp is in the same read.
+func TestTranscriptRecordFromStampsOnlyItsRecord(t *testing.T) {
+	data := `{"type":"mode","mode":"normal"}` + "\n" + `{"type":"user","timestamp":"2026-03-01T00:00:00Z"}` + "\n"
+	path := filepath.Join(t.TempDir(), "t.jsonl")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	first := int64(strings.IndexByte(data, '\n') + 1)
+	stamp, end, err := transcriptRecordFrom(f, 0, int64(len(data)))
+	if err != nil || !stamp.IsZero() || end != first {
+		t.Fatalf("first record: %v %d %v", stamp, end, err)
+	}
+	stamp, end, err = transcriptRecordFrom(f, first, int64(len(data)))
+	if err != nil || !stamp.Equal(time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)) || end != int64(len(data)) {
+		t.Fatalf("second record: %v %d %v", stamp, end, err)
 	}
 }
