@@ -26,7 +26,7 @@ func Isolate() (func() error, error) {
 	if err := l.Close(); err != nil {
 		return nil, errors.Join(fmt.Errorf("dbtest: %w", err), cleanup())
 	}
-	for k, v := range map[string]string{"XDG_STATE_HOME": dir, "TL_CLICKHOUSE_URL": "http://" + addr} {
+	for k, v := range map[string]string{"XDG_STATE_HOME": dir, "TL_CLICKHOUSE_URL": "http://" + addr, "TL_BACKEND": ""} {
 		if err := os.Setenv(k, v); err != nil {
 			return nil, errors.Join(fmt.Errorf("dbtest: %w", err), cleanup())
 		}

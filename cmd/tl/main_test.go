@@ -411,3 +411,35 @@ func TestUnknownCountFlagNamesMax(t *testing.T) {
 		}
 	}
 }
+
+// orderLog records the writes to stdout and stderr in the order they came.
+type orderLog struct {
+	name  string
+	order *[]string
+}
+
+func (w orderLog) Write(p []byte) (int, error) {
+	*w.order = append(*w.order, w.name+": "+string(p))
+	return len(p), nil
+}
+
+// A fallback to the files is told on stderr before the files are read: a caller that stops tl by a deadline
+// still sees why it was slow.
+func TestFallbackWarningGoesOutBeforeTheFiles(t *testing.T) {
+	e := fakeHome(t)
+	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
+	raw, _ := json.Marshal(dbState{Heartbeat: time.Now().Add(-time.Hour).Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.backend = backendDB
+	opts, err := parseArgs([]string{"--all", "--grep", "fixture"}, e.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	run(opts, e, orderLog{"stdout", &order}, orderLog{"stderr", &order})
+	if len(order) < 2 || !strings.HasPrefix(order[0], "stderr: tl: database: ") || !strings.Contains(order[0], "reading files instead") {
+		t.Fatalf("writes %q: want the fallback warning first, before the answer", order)
+	}
+}

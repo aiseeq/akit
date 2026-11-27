@@ -266,6 +266,7 @@ type env struct {
 	dbThrough  time.Time // freshness boundary from tlfeed state.json
 	collect    *answer   // set when the shadow repeats this call: what the answer found
 	dbTrace    io.Writer // TL_DB_TRACE: the time of each database query
+	warn       io.Writer // the stderr of the call, unbuffered: a fallback to the files is told before they are read
 }
 
 func parseArgs(args []string, now time.Time) (options, error) {
@@ -569,6 +570,7 @@ func setRoles(opts *options, list string) error {
 // lines is masked as one event; the one-line listing is masked one line at a time.
 func run(opts options, e env, stdout, stderr io.Writer) int {
 	var out, errs bytes.Buffer
+	e.warn = stderr
 	code := runOutput(opts, e, &out, &errs)
 	if err := errors.Join(writeMasked(stdout, out.String()), writeMasked(stderr, errs.String())); err != nil {
 		fmt.Fprintf(stderr, "tl: write output: %v\n", err)
@@ -686,7 +688,11 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 	if e.backend == backendDB && dbForm(opts) {
 		code, ok, err := runOutputDB(opts, e, refs, stdout, stderr)
 		if err != nil {
-			fmt.Fprintf(stderr, "tl: %v\n", err)
+			warn := stderr
+			if e.warn != nil {
+				warn = e.warn
+			}
+			printMasked(warn, fmt.Sprintf("tl: %v\n", err))
 		}
 		if ok {
 			return code

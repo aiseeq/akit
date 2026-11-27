@@ -75,6 +75,12 @@ func TestBackend(t *testing.T) {
 	if c, _ := Backend(t.Context(), "tool1", bare, &warn); c != nil || warn.Len() > 0 {
 		t.Fatalf("no loader, default: %v %q", c, warn.String())
 	}
+	// A bad address is not a machine without the database: a warning.
+	t.Setenv("TL_CLICKHOUSE_URL", "not a url")
+	if c, _ := Backend(t.Context(), "tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
+		t.Fatalf("no state, bad address: %v %q", c, warn.String())
+	}
+	warn.Reset()
 	// A server that answers while the state file is missing is a caller with another state folder: a warning.
 	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
 	if c, _ := Backend(t.Context(), "tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
