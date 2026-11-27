@@ -159,7 +159,7 @@ func TestShadowRepeatUsesCallTimeForFileKeys(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	t.Setenv("HOME", e.home)
-	t.Setenv("TL_BACKEND", "")
+	t.Setenv("TL_BACKEND", backendFiles)
 	journal := filepath.Join(t.TempDir(), "shadow.jsonl")
 	t.Setenv("TL_SHADOW_JOURNAL", journal)
 	statePath := filepath.Join(os.Getenv("XDG_STATE_HOME"), "akit", "tlfeed", "state.json")
@@ -232,7 +232,7 @@ func TestShadowRepeatsThroughDB(t *testing.T) {
 	}
 	t.Setenv("TL_SHADOW_JOURNAL", journal)
 	t.Setenv("TL_SHADOW_RATE", "1")
-	t.Setenv("TL_BACKEND", "")
+	t.Setenv("TL_BACKEND", backendFiles)
 	t.Setenv(shadowPidsEnv, pids)
 	args := []string{"--all", "--role", "all", "--grep", "sub", "--max", "0"}
 	call := func() string {

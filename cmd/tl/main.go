@@ -121,13 +121,13 @@ one. The value itself is not recoverable. The mask also hides some names that lo
 pk_test_… identifier): N tells whether it may be the name you expect, and the
 same TAG elsewhere shows where the same text recurs. Without the key the
 markers are [скрыто:KIND] and stderr says why.
-Database: TL_BACKEND=db answers --all, --grep, --raw, --usage, SESSION and REF from
+Database: tl answers --all, --grep, --raw, --usage, SESSION and REF from
 the ClickHouse tables of the transcript loader (TL_CLICKHOUSE_URL, default
 http://127.0.0.1:18123; TL_CLICKHOUSE_DB, default tr; read-only). Files missing
 from the database are not visible. REF may read its requested line from disk.
 Every database answer reports its freshness time in local time. If its state is missing, stale,
 unhealthy, for another home, or the database fails, stderr says so and tl reads
-the files. The default TL_BACKEND=files repeats a
+the files. TL_BACKEND=files reads the files only and repeats a
 share of calls (TL_SHADOW_RATE, default 0.1, 0 off) through the database in a
 background process after the answer and appends one JSON line to
 TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
@@ -240,17 +240,13 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	return code
 }
 
-// backendFromEnv is TL_BACKEND: files (the default) or db.
+// backendFromEnv is TL_BACKEND: db (the default) or files.
 func backendFromEnv(stderr io.Writer) string {
-	switch b := os.Getenv("TL_BACKEND"); b {
-	case "", backendFiles:
-		return backendFiles
-	case backendDB:
-		return backendDB
-	default:
-		printMasked(stderr, fmt.Sprintf("tl: TL_BACKEND=%q is not files or db; reading files\n", b))
-		return backendFiles
+	src, err := transcriptdb.SourceFromEnv()
+	if err != nil {
+		printMasked(stderr, fmt.Sprintf("tl: %v; reading files\n", err))
 	}
+	return string(src)
 }
 
 // printMasked prints like fmt.Fprint, with secret values masked.
@@ -705,6 +701,9 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 // caller reads the files.
 func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, bool, error) {
 	state, err := readDBState(e.home)
+	if transcriptdb.NoLoader(err) {
+		return 0, false, nil
+	}
 	if err != nil {
 		return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
 	}

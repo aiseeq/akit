@@ -2,7 +2,7 @@
 // per transcript, its newest version under FINAL), raw (the lines of a file as they are on disk) and usage (token
 // usage of the model replies). The client is read-only: every query goes with readonly=1.
 //
-// A tool picks the database with TL_BACKEND=db (SourceFromEnv, Backend) or explicitly (Connect, New); the address is
+// A tool picks the database by TL_BACKEND, db by default (SourceFromEnv, Backend), or explicitly (Connect, New); the address is
 // TL_CLICKHOUSE_URL and TL_CLICKHOUSE_DB. Lines of a file come from raw only when the database holds all of them in
 // order: a gap, a cut answer or a file not loaded to its end is a SourceError, and Open reads such a file from disk.
 package transcriptdb

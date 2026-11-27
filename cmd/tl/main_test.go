@@ -124,7 +124,8 @@ func TestUnhealthyDBStateFallsBackToFiles(t *testing.T) {
 		mutate  func(*dbState)
 		warning string
 	}{
-		{"missing", nil, "read tlfeed state"},
+		{"missing, asked by name", nil, "read tlfeed state"},
+		{"missing, by default", nil, ""},
 		{"stale", func(s *dbState) { s.Heartbeat = time.Now().Add(-11 * time.Minute).Format(time.RFC3339Nano) }, "heartbeat is stale"},
 		{"error", func(s *dbState) { s.Error = "database error" }, "reports an error"},
 		{"home", func(s *dbState) { s.Home = t.TempDir() }, "home does not match"},
@@ -141,10 +142,22 @@ func TestUnhealthyDBStateFallsBackToFiles(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// A home without a loader reads the files quietly unless TL_BACKEND=db names the database.
+			if tc.warning != "" {
+				t.Setenv("TL_BACKEND", backendDB)
+			} else {
+				t.Setenv("TL_BACKEND", "")
+			}
 			e.backend = backendFiles
 			wantCode, wantOut, _ := runTL(t, e, "--all", "--grep", "fixture")
 			e.backend = backendDB
 			code, out, stderr := runTL(t, e, "--all", "--grep", "fixture")
+			if tc.warning == "" {
+				if code != wantCode || out != wantOut || stderr != "" {
+					t.Fatalf("no loader by default: code=%d out=%q stderr=%q; want code=%d out=%q and no warning", code, out, stderr, wantCode, wantOut)
+				}
+				return
+			}
 			if code != wantCode || out != wantOut || !strings.Contains(stderr, tc.warning) || !strings.Contains(stderr, "reading files instead") {
 				t.Fatalf("fallback code=%d out=%q stderr=%q; want code=%d out=%q warning %q", code, out, stderr, wantCode, wantOut, tc.warning)
 			}

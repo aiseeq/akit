@@ -26,10 +26,10 @@ import (
 
 // The database path answers only from the tables the transcript loader fills — files, events and raw.
 
-// backendDB and backendFiles are the values of TL_BACKEND; files is the default.
+// backendDB and backendFiles are the values of TL_BACKEND; db is the default.
 const (
-	backendFiles = "files"
-	backendDB    = "db"
+	backendFiles = string(transcriptdb.Files)
+	backendDB    = string(transcriptdb.DB)
 )
 
 // dbQueryTimeout bounds one call through the database; past it the call reads the files.

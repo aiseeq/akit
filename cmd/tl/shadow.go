@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// The shadow: with TL_BACKEND=files a share of the calls (TL_SHADOW_RATE, 0.1 by default, 0 — off) repeats the
+// The shadow: with TL_BACKEND=files (not the default) a share of the calls (TL_SHADOW_RATE, 0.1 by default, 0 — off) repeats the
 // query through the database after the answer, in a process of its own that the call does not wait for. It
 // compares the events both paths found and writes one JSON line per call to the journal (TL_SHADOW_JOURNAL,
 // $XDG_STATE_HOME/akit/tl-shadow.jsonl by default). Both sides count only events up to the moment the call began

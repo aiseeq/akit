@@ -553,7 +553,7 @@ func replies(w io.Writer, q query, s paths) {
 	}
 }
 
-// replyLineIndexes — номера строк реплик в транскриптах. При TL_BACKEND=db их ищет база; чего она не нашла (строка
+// replyLineIndexes — номера строк реплик в транскриптах. По умолчанию их ищет база; чего она не нашла (строка
 // ещё не загружена, транскрипта в базе нет), то и ошибку запроса - сканом файла, как без базы.
 func replyLineIndexes(needlesByPath map[string]map[string]struct{}) (map[string]map[string]int, map[string]error) {
 	lineIndexes := make(map[string]map[string]int, len(needlesByPath))
