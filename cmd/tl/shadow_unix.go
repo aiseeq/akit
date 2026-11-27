@@ -26,5 +26,17 @@ func takeSlot(path string) (func(), error) {
 	return func() { f.Close() }, nil
 }
 
+func lockShadowResult(path string) (func(), *os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }, f, nil
+}
+
 // detached starts the repeat in a session of its own: it outlives the call and its terminal.
 func detached() *syscall.SysProcAttr { return &syscall.SysProcAttr{Setsid: true} }

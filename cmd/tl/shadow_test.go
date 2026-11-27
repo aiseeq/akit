@@ -94,6 +94,54 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+func reverseShadowFromStart(t *testing.T, e env, serverURL string, args []string) shadowRecord {
+	t.Helper()
+	stateHome := t.TempDir()
+	statePath := filepath.Join(stateHome, "akit", "tlfeed", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateData, err := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", serverURL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_SHADOW_RATE", "1")
+	var rec shadowRecord
+	runs := 0
+	old := shadowSpawner
+	shadowSpawner = func(specPath, _, _ string) error {
+		data, err := os.ReadFile(specPath)
+		if err != nil {
+			return err
+		}
+		var spec shadowSpec
+		if err := json.Unmarshal(data, &spec); err != nil {
+			return err
+		}
+		if err := removeSpec(specPath); err != nil {
+			return err
+		}
+		rec = shadowRepeat(spec, e.home)
+		runs++
+		return nil
+	}
+	t.Cleanup(func() { shadowSpawner = old })
+	if code := start(args, e.now, io.Discard, io.Discard); code != 0 {
+		t.Fatalf("primary database code=%d", code)
+	}
+	if runs != 1 {
+		t.Fatalf("reverse repeats=%d, want 1", runs)
+	}
+	return rec
+}
+
 func countOf(list []string, name string) int {
 	n := 0
 	for _, s := range list {
@@ -234,6 +282,114 @@ func TestShadowAnswerKeysApplyLineCapsToRefs(t *testing.T) {
 	}
 }
 
+func TestDatabaseShadowDropsFilesMissingFromDatabaseLimits(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	loaded := []string{paths[0], paths[2], paths[3]}
+	ch := newFakeCH(t, loaded, nil)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	rec := reverseShadowFromStart(t, e, srv.URL, []string{"--all", "--max", "0"})
+	if rec.Error != "" || rec.Diff != 0 || len(rec.OnlyFiles) != 0 {
+		t.Fatalf("unloaded transcript should not count as a mismatch: %+v", rec)
+	}
+}
+
+func TestDatabaseShadowREFPastCapturedLineLimitIsIgnored(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	refPath := paths[1]
+	ch := newFakeCH(t, paths, map[string]int{refPath: 1})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ref := sourceFullID(source{Path: refPath, ID: refPath})[:8] + ":20"
+	rec := reverseShadowFromStart(t, e, srv.URL, []string{ref})
+	if rec.Error != "" || rec.Diff != 0 || len(rec.OnlyDB) != 0 {
+		t.Fatalf("REF beyond captured line limit should be ignored: %+v", rec)
+	}
+}
+
+func TestUsageIsExcludedFromShadowSelection(t *testing.T) {
+	t.Setenv("TL_SHADOW_RATE", "1")
+	opts, err := parseArgs([]string{"--all", "--usage"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked, err := pickShadow(opts, backendDB); err != nil || picked {
+		t.Fatalf("usage shadow selection = %v, %v", picked, err)
+	}
+}
+
+func TestExpectedRetentionFallbackIsMarked(t *testing.T) {
+	journal := filepath.Join(t.TempDir(), "journal.jsonl")
+	e := env{home: t.TempDir(), fallback: &fallbackState{reason: "requested data may predate retained events"}}
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	if !journalFallback(options{originalArgs: []string{"--all"}}, e, 0, time.Second, io.Discard) {
+		t.Fatal("fallback was not journaled")
+	}
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec shadowRecord
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Expected {
+		t.Fatalf("retention fallback not marked expected: %+v", rec)
+	}
+}
+
+func TestGraftServiceLinesAreFiltered(t *testing.T) {
+	for _, line := range []string{"graft: waiting in queue\n", "graft: admitted after 2s\n", "graft: moved from scope x\n"} {
+		if !graftServiceLine(line) {
+			t.Errorf("graft service line passed through: %q", line)
+		}
+	}
+	if graftServiceLine("graft: exec failed\n") {
+		t.Fatal("graft error line was filtered")
+	}
+}
+
+func TestShadowLauncherAndSurvivingRepeatJournalTimeoutOnce(t *testing.T) {
+	oldTimeout, oldCommand := shadowRepeatTimeout, shadowCommand
+	shadowRepeatTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { shadowRepeatTimeout, shadowCommand = oldTimeout, oldCommand })
+	dir := t.TempDir()
+	spec := shadowSpec{Args: []string{"--all"}, Primary: backendDB, Started: time.Now(), Journal: filepath.Join(dir, "journal.jsonl"), Slots: filepath.Join(dir, "slots")}
+	if err := os.MkdirAll(spec.Slots, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	specPath, err := writeSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &spec); err != nil {
+		t.Fatal(err)
+	}
+	childDone := make(chan error, 1)
+	shadowCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		go func() {
+			<-ctx.Done()
+			childDone <- appendShadowRecord(spec, timeoutRecord(spec))
+		}()
+		return exec.CommandContext(ctx, "/bin/sleep", "2")
+	}
+	if err := runShadowLauncher(specPath, filepath.Join(dir, "errors.log"), backendDB); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := countLines(t, spec.Journal); got != 1 {
+		t.Fatalf("timeout was journaled %d times, want 1", got)
+	}
+}
+
 func TestShadowRepeatTimeoutRecord(t *testing.T) {
 	old := shadowRepeatTimeout
 	shadowRepeatTimeout = time.Millisecond
@@ -261,6 +417,26 @@ func TestShadowFilesRepeatTimesOutDuringRun(t *testing.T) {
 	rec := shadowRepeat(spec, t.TempDir())
 	if rec.Diff != -1 || rec.Error != "files repeat timed out after 30m" {
 		t.Fatalf("mid-run timeout record: %+v", rec)
+	}
+}
+
+func TestDatabaseRepeatTimeoutHasCorrectError(t *testing.T) {
+	oldTimeout := shadowRepeatTimeout
+	shadowRepeatTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { shadowRepeatTimeout = oldTimeout })
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	gate := make(chan struct{})
+	ch.gate, ch.gateName = gate, "events"
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	defer close(gate)
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	spec := shadowSpec{Args: []string{"--all", "--max", "0"}, Now: time.Now(), Primary: backendFiles, Started: time.Now()}
+	rec := shadowRepeat(spec, e.home)
+	if rec.Diff != -1 || rec.Error != "database repeat timed out after 30m" {
+		t.Fatalf("database repeat timeout record: %+v", rec)
 	}
 }
 
@@ -482,6 +658,90 @@ func TestFallbackChildDoesNotDuplicateJournalOrWarning(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "tl: ") {
 		t.Fatalf("admission fallback child repeated warning: %s", stderr.String())
+	}
+	if got := len(ch.requests()); got != 0 {
+		t.Fatalf("admission fallback child queried the database %d times", got)
+	}
+}
+
+func TestSeenFormsLockWaitsWithoutStderrNoise(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_SHADOW_RATE", "0.1")
+	statePath := filepath.Join(state, "akit", "tlfeed", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateData, err := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(state, "akit", shadowSlotsDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release, err := takeSlot(filepath.Join(dir, "seen-forms.lock"))
+	if err != nil || release == nil {
+		t.Fatalf("hold seen-forms lock: %v", err)
+	}
+	oldSpawner := shadowSpawner
+	shadowSpawner = func(path, _, _ string) error { return removeSpec(path) }
+	t.Cleanup(func() { shadowSpawner = oldSpawner })
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- start([]string{"--all", "--max", "0"}, e.now, io.Discard, &stderr) }()
+	time.Sleep(30 * time.Millisecond)
+	release()
+	if code := <-done; code != 0 {
+		t.Fatalf("call while lock was held returned %d", code)
+	}
+	if got := strings.TrimSpace(stderr.String()); got != "" && !strings.HasPrefix(got, "tl: данные актуальны на ") {
+		t.Fatalf("seen-forms contention printed to stderr: %q", stderr.String())
+	}
+}
+
+func TestRunShadowChildUsesLauncherHeldSlots(t *testing.T) {
+	dir := t.TempDir()
+	spec := shadowSpec{Args: []string{"--unknown-shadow-test-flag"}, Primary: backendDB,
+		Journal: filepath.Join(dir, "journal.jsonl"), Slots: filepath.Join(dir, "slots")}
+	if err := os.MkdirAll(spec.Slots, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	specPath, err := writeSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slot := range []struct {
+		prefix string
+		count  int
+	}{{"form-" + formSlot(spec.Args), shadowPerForm}, {"all", shadowAll}} {
+		for range slot.count {
+			held, err := holdSlot(spec.Slots, slot.prefix, slot.count)
+			if err != nil {
+				t.Fatalf("hold launcher slot: %v", err)
+			}
+			if !held {
+				break
+			}
+		}
+	}
+	defer releaseHeldSlots()
+	t.Setenv("TL_SHADOW_SLOTS_HELD", "1")
+	if err := runShadowChild(specPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := countLines(t, spec.Journal); got != 1 {
+		t.Fatalf("repeat with inherited slots wrote %d rows, want 1", got)
 	}
 }
 

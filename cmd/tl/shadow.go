@@ -93,6 +93,7 @@ type shadowSpec struct {
 	Started     time.Time      `json:"started"`
 	Journal     string         `json:"journal"`
 	Slots       string         `json:"slots"`
+	ResultID    string         `json:"result_id,omitempty"`
 }
 
 // shadowRecord is one line of the journal.
@@ -187,8 +188,11 @@ func answerKeysWithin(a *answer, opts options, cutoff time.Time, limits map[stri
 		if !cutoff.IsZero() && h.ev.Time.After(cutoff) {
 			return false
 		}
+		if limits == nil {
+			return true
+		}
 		limit, ok := limits[h.src.Path]
-		return !ok || h.ev.Line <= limit
+		return ok && h.ev.Line <= limit
 	}
 	for i := range a.refs {
 		if keep(a.refs[i]) {
@@ -329,13 +333,14 @@ func startShadow(spec shadowSpec, form string) error {
 }
 
 func writeSpec(spec shadowSpec) (string, error) {
-	data, err := json.Marshal(spec)
-	if err != nil {
-		return "", fmt.Errorf("shadow spec: %w", err)
-	}
 	f, err := os.CreateTemp(spec.Slots, "spec-*.json")
 	if err != nil {
 		return "", fmt.Errorf("shadow spec: %w", err)
+	}
+	spec.ResultID = filepath.Base(f.Name())
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return "", errors.Join(fmt.Errorf("shadow spec: %w", err), f.Close(), removeSpec(f.Name()))
 	}
 	_, werr := f.Write(data)
 	if err := errors.Join(werr, f.Close()); err != nil {
@@ -418,8 +423,7 @@ func runShadowLauncher(specPath, logPath, primary string) error {
 	flushErr := filteredLog.Flush()
 	closeErr := logFile.Close()
 	if ctx.Err() != nil {
-		_ = removeSpec(specPath)
-		return errors.Join(appendJournal(spec.Journal, timeoutRecord(spec)), flushErr, closeErr)
+		return errors.Join(appendShadowRecord(spec, timeoutRecord(spec)), removeSpec(specPath), flushErr, closeErr)
 	}
 	return errors.Join(err, flushErr, closeErr)
 }
@@ -438,7 +442,7 @@ func (w *graftLogWriter) Write(p []byte) (int, error) {
 		}
 		line := string(w.buf[:i+1])
 		w.buf = w.buf[i+1:]
-		if !strings.HasPrefix(line, "graft: waiting") {
+		if !graftServiceLine(line) {
 			if _, err := io.WriteString(w.w, line); err != nil {
 				return len(p), err
 			}
@@ -448,13 +452,18 @@ func (w *graftLogWriter) Write(p []byte) (int, error) {
 }
 
 func (w *graftLogWriter) Flush() error {
-	if len(w.buf) == 0 || strings.HasPrefix(string(w.buf), "graft: waiting") {
+	if len(w.buf) == 0 || graftServiceLine(string(w.buf)) {
 		w.buf = nil
 		return nil
 	}
 	_, err := w.w.Write(w.buf)
 	w.buf = nil
 	return err
+}
+
+func graftServiceLine(line string) bool {
+	return strings.HasPrefix(line, "graft: waiting") || strings.HasPrefix(line, "graft: admitted after ") ||
+		strings.HasPrefix(line, "graft: moved from ")
 }
 
 func holdShadowSlots(spec shadowSpec) bool {
@@ -632,7 +641,7 @@ func runShadowChild(specPath string) error {
 		// the plain mask stays: the journal holds arguments, not event texts
 		fmt.Fprintf(os.Stderr, "tl: shadow: %v\n", err)
 	}
-	return appendJournal(spec.Journal, shadowRepeat(spec, home))
+	return appendShadowRecord(spec, shadowRepeat(spec, home))
 }
 
 func timeoutRecord(spec shadowSpec) shadowRecord {
@@ -725,7 +734,11 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			rec.Error = "files repeat timed out after 30m"
+			if primary == backendFiles {
+				rec.Error = "database repeat timed out after 30m"
+			} else {
+				rec.Error = "files repeat timed out after 30m"
+			}
 		} else {
 			rec.Error = hideSafe(err.Error())
 		}
@@ -788,6 +801,43 @@ func appendJournal(path string, rec shadowRecord) error {
 	return errors.Join(f.Close())
 }
 
+// appendShadowRecord lets a launcher and its detached repeat race to report one timeout only once.
+func appendShadowRecord(spec shadowSpec, rec shadowRecord) error {
+	if spec.ResultID == "" {
+		return appendJournal(spec.Journal, rec)
+	}
+	if err := os.MkdirAll(spec.Slots, 0o700); err != nil {
+		return fmt.Errorf("shadow result: %w", err)
+	}
+	marker := filepath.Join(spec.Slots, "result-"+spec.ResultID+".lock")
+	release, f, err := lockShadowResult(marker)
+	if err != nil {
+		return fmt.Errorf("shadow result lock: %w", err)
+	}
+	defer release()
+	defer f.Close()
+	state, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("read shadow result lock: %w", err)
+	}
+	if string(state) == "done" {
+		return nil
+	}
+	if err := appendJournal(spec.Journal, rec); err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("mark shadow result: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("mark shadow result: %w", err)
+	}
+	if _, err := io.WriteString(f, "done"); err != nil {
+		return fmt.Errorf("mark shadow result: %w", err)
+	}
+	return f.Sync()
+}
+
 // pickShadow decides whether this call is repeated through the other backend.
 func pickShadow(opts options, backend string) (bool, error) {
 	// --usage aggregates events into session rows, so its keys have no event line to cap.
@@ -826,15 +876,13 @@ func rememberShadowForm(form string) (_ bool, retErr error) {
 	if err != nil {
 		return false, fmt.Errorf("open seen shadow forms: %w", err)
 	}
-	release, err := takeSlot(path + ".lock")
-	if err != nil || release == nil {
+	release, lockFile, err := lockShadowResult(path + ".lock")
+	if err != nil {
 		_ = file.Close()
-		if err != nil {
-			return false, fmt.Errorf("lock seen shadow forms: %w", err)
-		}
-		return false, errors.New("lock seen shadow forms: already held")
+		return false, fmt.Errorf("lock seen shadow forms: %w", err)
 	}
 	defer release()
+	defer lockFile.Close()
 	defer func() {
 		if err := file.Close(); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("close seen shadow forms: %w", err))

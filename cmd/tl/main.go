@@ -131,8 +131,10 @@ the files; with no loader state and no server answering (a machine without the
 database) tl reads the files quietly unless TL_BACKEND=db. A share of calls
 (TL_SHADOW_RATE, default 0.1, 0 off) is repeated through the other path in a
 background process after the answer: database answers through the files,
-TL_BACKEND=files answers through the database. The files repeat runs in the
-heavy queue and is limited to the database's captured line counts. A database
+TL_BACKEND=files answers through the database. The first call form not yet
+recorded in seen-forms is always repeated when the share is above zero; later
+calls use the share. The files repeat runs in the heavy queue and is limited to
+the database's captured line counts. A database
 fallback is always journaled, independent of the share; expected retention
 fallbacks are marked. Each result appends one JSON line with its primary path to
 TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
@@ -241,8 +243,13 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	if err := useMaskKey(maskKeyPath(home)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 	}
+	fallbackChild := os.Getenv("TL_FALLBACK_CHILD") == "1"
+	backend := backendFromEnv(stderr)
+	if fallbackChild {
+		backend = backendFiles
+	}
 	e := env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now,
-		backend: backendFromEnv(stderr), warn: stderr, fallbackChild: os.Getenv("TL_FALLBACK_CHILD") == "1"}
+		backend: backend, warn: stderr, fallbackChild: fallbackChild}
 	if os.Getenv("TL_DB_TRACE") != "" {
 		e.dbTrace = stderr
 	}
