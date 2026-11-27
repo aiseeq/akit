@@ -3079,7 +3079,7 @@ func literalEchoBody(values []string, parts []mapped) (mapped, error) {
 			if stop >= 0 {
 				value = value[:stop]
 			}
-			text, _, err := shExpand.Format(nil, bashEscapeInput(value, true), nil)
+			text, _, err := shExpand.Format(formatConfig(), bashEscapeInput(value, true), nil)
 			if err != nil {
 				return mapped{}, fmt.Errorf("shellcmd: expand piped echo: %w", err)
 			}
@@ -3137,7 +3137,7 @@ func literalPrintfBodyMode(values []string, stopFormat bool) (mapped, bool, erro
 				}
 			}
 		}
-		text, consumed, err := shExpand.Format(nil, current, bashPrintfArgs(current, currentArgs))
+		text, consumed, err := shExpand.Format(formatConfig(), current, bashPrintfArgs(current, currentArgs))
 		if err != nil {
 			return mapped{}, false, fmt.Errorf("shellcmd: format piped printf: %w", err)
 		}
@@ -7132,7 +7132,7 @@ func (m *mapped) unescapeANSI(raw string, base int) error {
 			}
 		} else {
 			var err error
-			decoded, _, err = shExpand.Format(nil, escape, nil)
+			decoded, _, err = shExpand.Format(formatConfig(), escape, nil)
 			if err != nil {
 				return fmt.Errorf("shellcmd: decode ANSI-C escape: %w", err)
 			}
@@ -11120,4 +11120,10 @@ func zshDashScriptBoundary(name string) bool {
 	default:
 		return false
 	}
+}
+
+// formatConfig gives each expand.Format call its own config: with a nil config the package shares one, and
+// Format writes its environment and output buffer there, so parallel callers would corrupt each other.
+func formatConfig() *shExpand.Config {
+	return &shExpand.Config{}
 }
