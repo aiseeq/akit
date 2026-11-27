@@ -1059,8 +1059,8 @@ func briefQuoteHitsByDay(words []briefWord, e env, until time.Time) (map[string]
 	return scanBriefQuotes(inventory, dayFragments, recordWindows, until, e.loc)
 }
 
-// dbBriefQuotes — scanBriefQuotes по транскриптам, которые назвала база: остальные недавние транскрипты реплики с
-// цитатой не содержат. Цитата и её контекст по-прежнему читаются из файла - тем же проходом, что без базы.
+// dbBriefQuotes reconstructs scanBriefQuotes results from database rows for candidate transcripts, reading a file
+// only when indexed data is incomplete.
 func dbBriefQuotes(fragments map[string][]string, recordWindows map[string]markerRecordInterval, e env, until time.Time) (map[string][]hit, map[string]bool, []line, error) {
 	filters, err := makeBriefQuoteFilters(fragments, recordWindows, e.loc)
 	if err != nil {
@@ -1077,7 +1077,26 @@ func dbBriefQuotes(fragments map[string][]string, recordWindows map[string]marke
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	results := scanBriefTranscriptPaths(paths, filters, foldBriefQuotes(fragments), until, e.loc)
+	rows, err := activeWordDB.briefLines(paths, filters.from.Add(-transcriptStampSlack), until)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	results, err := scanBriefDatabaseRows(rows, filters, foldBriefQuotes(fragments), until, e.loc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// A candidate without usable event rows can still contain data the database did not index.
+	seen := make(map[string]bool, len(results))
+	for _, result := range results {
+		seen[result.path] = true
+	}
+	var missing []string
+	for _, path := range paths {
+		if !seen[path] {
+			missing = append(missing, path)
+		}
+	}
+	results = append(results, scanBriefTranscriptPaths(missing, filters, foldBriefQuotes(fragments), until, e.loc)...)
 	hits, scanned, warnings, err := mergeBriefQuoteResults(results, len(fragments), e.loc)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1086,6 +1105,127 @@ func dbBriefQuotes(fragments map[string][]string, recordWindows map[string]marke
 		recordDays[key] = true
 	}
 	return hits, recordDays, warnings, nil
+}
+
+// scanBriefDatabaseRows reconstructs quote hits and their nearby context from ordered events rows. Ask records need
+// raw because events stores their displayed text, not the answer text used for matching.
+func scanBriefDatabaseRows(rows [][]string, filters briefQuoteFilters, fragments map[string][]string, until time.Time, loc *time.Location) ([]briefQuoteScanResult, error) {
+	states, paths, allKeys, err := briefDatabaseStates(rows)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := activeWordDB.rawLinesPresent(allKeys)
+	if err != nil {
+		return nil, err
+	}
+	var out []briefQuoteScanResult
+	for _, path := range paths {
+		state := states[path]
+		if state.bad || briefMissingRaw(state, raw) {
+			out = append(out, scanBriefTranscript(path, filters, fragments, until, loc))
+			continue
+		}
+		briefEnrichDatabaseLines(state, raw)
+		out = append(out, briefQuoteScanResult{path: path, hits: briefDatabaseHits(path, state.lines, fragments, until, loc)})
+	}
+	return out, nil
+}
+
+type briefDatabaseState struct {
+	lines   []line
+	rawKeys map[int]rawKey
+	bad     bool
+}
+
+func briefDatabaseStates(rows [][]string) (map[string]*briefDatabaseState, []string, []rawKey, error) {
+	states := make(map[string]*briefDatabaseState)
+	var paths []string
+	var keys []rawKey
+	for _, row := range rows {
+		if len(row) != 8 {
+			return nil, nil, nil, fmt.Errorf("brief events: %d columns, want 8", len(row))
+		}
+		state := states[row[0]]
+		if state == nil {
+			state = &briefDatabaseState{rawKeys: make(map[int]rawKey)}
+			states[row[0]] = state
+			paths = append(paths, row[0])
+		}
+		if row[7] != "0" {
+			state.bad = true
+			continue
+		}
+		l, key, ok, err := eventLine(row[1], row[2], row[3], row[4], row[5], row[6])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if ok {
+			index := len(state.lines)
+			state.lines = append(state.lines, l)
+			if l.user {
+				state.rawKeys[index] = key
+				keys = append(keys, key)
+			}
+		}
+	}
+	return states, paths, keys, nil
+}
+
+func briefMissingRaw(state *briefDatabaseState, raw map[rawKey][]byte) bool {
+	for _, key := range state.rawKeys {
+		if _, ok := raw[key]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func briefEnrichDatabaseLines(state *briefDatabaseState, raw map[rawKey][]byte) {
+	for index, key := range state.rawKeys {
+		state.lines[index].contextHuman = briefContextHuman(raw[key])
+		if state.lines[index].ask {
+			state.lines[index].match = askAnswer(raw[key])
+		}
+	}
+}
+
+func briefDatabaseHits(path string, lines []line, fragments map[string][]string, until time.Time, loc *time.Location) []hit {
+	var hits []hit
+	for i := range lines {
+		l := &lines[i]
+		if l.user && !l.t.After(until) && matchesBriefQuote(*l, fragments[l.t.In(loc).Format(time.DateOnly)]) {
+			hits = append(hits, hit{path: path, line: *l})
+		}
+	}
+	for i := range hits {
+		at := findLine(lines, hits[i].line)
+		var agent *line
+		for j := at - 1; j >= 0; j-- {
+			if !lines[j].user {
+				a := lines[j]
+				agent = &a
+				break
+			}
+		}
+		shown := make(map[string]bool)
+		later := 0
+		for j := at + 1; j < len(lines); j++ {
+			if !lines[j].user || !lines[j].contextHuman || !lines[j].t.After(hits[i].t) || lines[j].t.After(until) {
+				continue
+			}
+			later++
+			if later <= briefLater {
+				shown[lines[j].t.Format(time.RFC3339Nano)] = true
+			}
+		}
+		hits[i].moreLater = max(0, later-briefLater)
+		contextLines := briefQuoteContextWithAgent(lines, at, hits[i].t, agent, shown)
+		if contextAt := findLine(contextLines, hits[i].line); contextAt >= 0 {
+			contextLines[contextAt].moreLater = hits[i].moreLater
+		}
+		hits[i].context = &briefQuoteContext{lines: contextLines}
+	}
+	return hits
 }
 
 func briefWordScanDays(word briefWord, loc *time.Location) []time.Time {
