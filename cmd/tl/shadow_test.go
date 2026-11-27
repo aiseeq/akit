@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -23,8 +25,34 @@ import (
 // shadowPidsEnv names a file the repeat started from a test adds its pid to: what the call started is seen.
 const shadowPidsEnv = "TL_TEST_SHADOW_PIDS"
 
-// TestMain is also the repeat of the shadow: startShadow runs this test binary with TL_SHADOW_CHILD set.
+// TestMain dispatches detached shadow repeats and helper children before running tests.
 func TestMain(m *testing.M) {
+	if spec := os.Getenv("TL_SHADOW_LAUNCH"); spec != "" {
+		data, err := os.ReadFile(spec)
+		if err != nil {
+			os.Exit(exitUsage)
+		}
+		var shadow shadowSpec
+		if err := json.Unmarshal(data, &shadow); err != nil || !holdShadowSlots(shadow) {
+			os.Exit(exitUsage)
+		}
+		if path := os.Getenv(shadowPidsEnv); path != "" {
+			if f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600); err == nil {
+				_, _ = f.WriteString(strconv.Itoa(os.Getpid()) + "\n")
+				_ = f.Close()
+			}
+		}
+		if os.Getenv("TL_SHADOW_PRIMARY") == backendDB {
+			_ = os.Setenv("TL_BACKEND", backendFiles)
+		}
+		_ = os.Setenv("TL_SHADOW_SLOTS_HELD", "1")
+		err = runShadowChild(spec)
+		releaseHeldSlots()
+		if err != nil {
+			os.Exit(exitUsage)
+		}
+		os.Exit(0)
+	}
 	if spec := os.Getenv(shadowChildEnv); spec != "" {
 		if path := os.Getenv(shadowPidsEnv); path != "" {
 			if f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600); err == nil {
@@ -36,6 +64,9 @@ func TestMain(m *testing.M) {
 			os.Exit(exitUsage)
 		}
 		os.Exit(0)
+	}
+	if os.Getenv("TL_TEST_FALLBACK_CHILD_HELPER") == "1" {
+		os.Exit(start(os.Args[1:], time.Now(), os.Stdout, os.Stderr))
 	}
 	dbtest.Main(m)
 }
@@ -190,6 +221,19 @@ func TestShadowRepeatsDBThroughFilesWithLineCaps(t *testing.T) {
 	}
 }
 
+func TestShadowAnswerKeysApplyLineCapsToRefs(t *testing.T) {
+	opts := options{}
+	files := &answer{refs: []hit{{src: source{Path: "/p/a.jsonl"}, ev: transcript.Event{Line: 20}}}}
+	db := &answer{refs: []hit{{src: source{Path: "/p/a.jsonl"}, ev: transcript.Event{Line: 20}}}}
+	limits := map[string]int{"/p/a.jsonl": 19}
+	fileKeys := answerKeysWithin(files, opts, time.Time{}, limits)
+	dbKeys := answerKeysWithin(db, opts, time.Time{}, limits)
+	diff, onlyFiles, onlyDB := keyDiff(fileKeys, dbKeys)
+	if len(fileKeys) != 0 || len(dbKeys) != 0 || diff != 0 || len(onlyFiles) != 0 || len(onlyDB) != 0 {
+		t.Fatalf("REF beyond captured line limit: files=%v db=%v", fileKeys, dbKeys)
+	}
+}
+
 func TestShadowRepeatTimeoutRecord(t *testing.T) {
 	old := shadowRepeatTimeout
 	shadowRepeatTimeout = time.Millisecond
@@ -198,6 +242,77 @@ func TestShadowRepeatTimeoutRecord(t *testing.T) {
 	rec := shadowRepeat(spec, t.TempDir())
 	if rec.Diff != -1 || rec.Error != "files repeat timed out after 30m" {
 		t.Fatalf("timeout record: %+v", rec)
+	}
+}
+
+func TestShadowFilesRepeatTimesOutDuringRun(t *testing.T) {
+	oldTimeout, oldRun := shadowRepeatTimeout, shadowRunFiles
+	shadowRepeatTimeout = 20 * time.Millisecond
+	blocked := make(chan struct{})
+	shadowRunFiles = func(opts options, e env, stdout, stderr io.Writer) int {
+		<-blocked
+		return 0
+	}
+	t.Cleanup(func() {
+		close(blocked)
+		shadowRepeatTimeout, shadowRunFiles = oldTimeout, oldRun
+	})
+	spec := shadowSpec{Args: []string{"--all"}, Primary: backendDB, Started: time.Now()}
+	rec := shadowRepeat(spec, t.TempDir())
+	if rec.Diff != -1 || rec.Error != "files repeat timed out after 30m" {
+		t.Fatalf("mid-run timeout record: %+v", rec)
+	}
+}
+
+func TestShadowLauncherHoldsSlotsThroughRepeatAndTimesOut(t *testing.T) {
+	oldTimeout, oldCommand := shadowRepeatTimeout, shadowCommand
+	shadowRepeatTimeout = time.Second
+	marker := filepath.Join(t.TempDir(), "backend")
+	shadowCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "/bin/sh", "-c", `printf '%s' "$TL_BACKEND" > "$1"; exec sleep 2`, "sh", marker)
+	}
+	t.Cleanup(func() { shadowRepeatTimeout, shadowCommand = oldTimeout, oldCommand })
+	dir := t.TempDir()
+	spec := shadowSpec{Args: []string{"--all"}, Primary: backendDB, Started: time.Now(), Journal: filepath.Join(dir, "journal.jsonl"),
+		Slots: filepath.Join(dir, "slots")}
+	if err := os.MkdirAll(spec.Slots, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	heldMu.Lock()
+	heldBefore := len(heldSlots)
+	heldMu.Unlock()
+	specPath, err := writeSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runShadowLauncher(specPath, filepath.Join(dir, "errors.log"), backendDB) }()
+	waitFor(t, "shadow repeat slot", func() bool {
+		heldMu.Lock()
+		held := len(heldSlots) > heldBefore
+		heldMu.Unlock()
+		got, err := os.ReadFile(marker)
+		return held && err == nil && string(got) == backendFiles
+	})
+	if got, err := os.ReadFile(marker); err != nil || string(got) != backendFiles {
+		t.Fatalf("reverse repeat backend = %q, err=%v", got, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if free, err := slotFree(spec.Slots, "all", shadowAll); err != nil || !free {
+		t.Fatalf("slot after timed out repeat: free=%v err=%v", free, err)
+	}
+	data, err := os.ReadFile(spec.Journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec shadowRecord
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Diff != -1 || rec.Error != "files repeat timed out after 30m" {
+		t.Fatalf("launcher timeout record: %+v", rec)
 	}
 }
 
@@ -243,6 +358,83 @@ func TestDBUnselectedDoesNotCollectOrQueryShadowFiles(t *testing.T) {
 	}
 }
 
+func TestDatabaseAnswerStartsCappedReverseShadow(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	gate := make(chan struct{})
+	ch.gate = gate
+	ch.gateName = "events"
+	ch.eventStarted = make(chan struct{}, 1)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	dir := t.TempDir()
+	t.Setenv("HOME", e.home)
+	stateHome := filepath.Join(dir, "state")
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	statePath := filepath.Join(stateHome, "akit", "tlfeed", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateData, _ := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_SHADOW_RATE", "1")
+	journal := filepath.Join(dir, "journal.jsonl")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	loadedPath := paths[0]
+	appendWhenEventQueryArrives := make(chan error, 1)
+	go func() {
+		select {
+		case <-ch.eventStarted:
+		case <-time.After(10 * time.Second):
+			appendWhenEventQueryArrives <- errors.New("database did not reach events query")
+			close(gate)
+			return
+		}
+		f, err := os.OpenFile(loadedPath, os.O_APPEND|os.O_WRONLY, 0)
+		if err == nil {
+			_, err = fmt.Fprintln(f, userRecord(e.now.Add(-time.Second).Format(time.RFC3339Nano), "appended while db answers"))
+			err = errors.Join(err, f.Close())
+		}
+		appendWhenEventQueryArrives <- err
+		close(gate)
+	}()
+	oldSpawner := shadowSpawner
+	shadowSpawner = func(specPath, _, _ string) error {
+		go func() { _ = runShadowChild(specPath) }()
+		return nil
+	}
+	t.Cleanup(func() { shadowSpawner = oldSpawner })
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	code := start([]string{"--all", "--max", "0"}, e.now, &stdout, &stderr)
+	t.Logf("synthetic database call through completed output: %s", time.Since(started))
+	if err := <-appendWhenEventQueryArrives; err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("primary database call code=%d stderr=%s", code, stderr.String())
+	}
+	waitFor(t, "reverse shadow journal", func() bool { return countLines(t, journal) == 1 })
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec shadowRecord
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Primary != backendDB || rec.Diff != 0 || rec.Error != "" {
+		t.Fatalf("database reverse shadow record: %+v", rec)
+	}
+	if countOf(ch.requests(), "shadow_files") != 0 {
+		t.Fatalf("database answer issued shadow_files query: %v", ch.requests())
+	}
+}
+
 func TestFallbackJournalFromStartAtZeroRate(t *testing.T) {
 	e, paths, unloaded := dbCorpus(t)
 	ch := newFakeCH(t, paths, unloaded)
@@ -267,6 +459,82 @@ func TestFallbackJournalFromStartAtZeroRate(t *testing.T) {
 	}
 	if rec.Primary != backendDB || rec.Fallback == "" || rec.Diff != -1 || rec.FilesCode == exitUsage {
 		t.Fatalf("fallback record: %+v", rec)
+	}
+}
+
+func TestFallbackChildDoesNotDuplicateJournalOrWarning(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	ch.fail = map[string]bool{"events": true}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	journal := filepath.Join(t.TempDir(), "journal.jsonl")
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_FALLBACK_CHILD", "1")
+	t.Setenv("TL_SHADOW_RATE", "0")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	var stderr bytes.Buffer
+	start([]string{"--all", "--max", "0"}, e.now, io.Discard, &stderr)
+	if countLines(t, journal) != 0 {
+		t.Fatal("admission fallback child wrote a duplicate journal row")
+	}
+	if strings.Contains(stderr.String(), "tl: ") {
+		t.Fatalf("admission fallback child repeated warning: %s", stderr.String())
+	}
+}
+
+func TestAdmissionFallbackWritesOneJournalRowAndWarning(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	ch.fail = map[string]bool{"events": true}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	graft := filepath.Join(bin, "graft")
+	if err := os.WriteFile(graft, []byte("#!/bin/sh\nshift 4\nTL_TEST_FALLBACK_CHILD_HELPER=1 GRAFT_THREADS=1 exec \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldThreshold := heavyThreshold
+	heavyThreshold = 0
+	t.Cleanup(func() { heavyThreshold = oldThreshold })
+	oldThreads, hadThreads := os.LookupEnv("GRAFT_THREADS")
+	if err := os.Unsetenv("GRAFT_THREADS"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if hadThreads {
+			_ = os.Setenv("GRAFT_THREADS", oldThreads)
+		} else {
+			_ = os.Unsetenv("GRAFT_THREADS")
+		}
+	})
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("HOME", e.home)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendDB)
+	t.Setenv("TL_SHADOW_RATE", "0")
+	journal := filepath.Join(dir, "journal.jsonl")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	var stderr bytes.Buffer
+	code := start([]string{"--all", "--max", "0"}, e.now, io.Discard, &stderr)
+	if code != 0 {
+		t.Fatalf("admission fallback code=%d stderr=%s", code, stderr.String())
+	}
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(string(data), "\n"); count != 1 {
+		t.Fatalf("admission fallback journal has %d rows: %s", count, data)
+	}
+	if got := strings.Count(stderr.String(), "synthetic query failure"); got != 1 {
+		t.Fatalf("database fallback warning repeated %d times: %s", got, stderr.String())
 	}
 }
 
@@ -296,6 +564,8 @@ func TestShadowRepeatUsesCallTimeForFileKeys(t *testing.T) {
 	}
 	t.Cleanup(func() { shadowSpawner = previousSpawner })
 	e, paths, unloaded := dbCorpus(t)
+	e.backend = backendFiles
+	e.shadowPicked = true
 	cutoff := e.now
 	file, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
@@ -507,7 +777,7 @@ func TestHoldSlotSurvivesGC(t *testing.T) {
 
 // The shadow repeats through the database only what files answered: a call answered by the database (the default)
 // is not compared with itself.
-func TestPickShadowOnlyForFiles(t *testing.T) {
+func TestPickShadowForBothBackends(t *testing.T) {
 	t.Setenv("TL_SHADOW_RATE", "1")
 	opts, err := parseArgs([]string{"--all", "--grep", "x"}, time.Now())
 	if err != nil {
@@ -518,5 +788,39 @@ func TestPickShadowOnlyForFiles(t *testing.T) {
 	}
 	if pick, err := pickShadow(opts, backendDB); err != nil || !pick {
 		t.Fatalf("database: pick=%t err=%v", pick, err)
+	}
+}
+
+func TestFailedFilesAnswerDoesNotStartShadow(t *testing.T) {
+	t.Setenv("TL_SHADOW_RATE", "1")
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	args := []string{"deadbeef-nonexistent"}
+	opts, err := parseArgs(args, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := shadowSpawner
+	starts := 0
+	shadowSpawner = func(string, string, string) error { starts++; return nil }
+	t.Cleanup(func() { shadowSpawner = old })
+	e := env{home: t.TempDir(), now: time.Now(), backend: backendFiles, shadowPicked: true}
+	statePath := filepath.Join(stateHome, "akit", "tlfeed", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateData, _ := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shadowAfter(&answer{filled: false}, opts, e, exitUsage, time.Second, io.Discard)
+	if starts != 0 {
+		t.Fatalf("failed files call started %d repeats", starts)
+	}
+}
+
+func TestShadowFormSkipsFlagValues(t *testing.T) {
+	if got, want := shadowForm([]string{"--grep", "needle", "--role", "user", "session"}), "--grep\x00--role\x001"; got != want {
+		t.Fatalf("shadow form %q, want %q", got, want)
 	}
 }

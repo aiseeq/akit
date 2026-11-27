@@ -72,13 +72,14 @@ type dbFile struct {
 }
 
 type dbPath struct {
-	c     *chClient
-	ctx   context.Context
-	opts  options
-	e     env
-	f     *filter
-	files map[string]*dbFile
-	trace io.Writer
+	c             *chClient
+	ctx           context.Context
+	opts          options
+	e             env
+	f             *filter
+	files         map[string]*dbFile
+	answerSources []source
+	trace         io.Writer
 	// traceMu keeps the trace lines of the queries that run at once whole.
 	traceMu sync.Mutex
 }
@@ -116,12 +117,17 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 		if e.collect != nil {
 			e.collect.filled = true
 		}
-		return d.refs(refs, stdout, stderr)
+		code, err := d.refs(refs, stdout, stderr)
+		d.captureAnswerLimits()
+		return code, err
 	}
 	start := time.Now()
 	sources, err := d.resolve()
 	if err != nil {
 		return 0, err
+	}
+	if e.collect != nil {
+		d.answerSources = sources
 	}
 	if dbRetentionExceeded(opts, sources, d.files, d.e.now) {
 		return 0, errors.New("requested data may predate retained events")
@@ -135,6 +141,7 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 	d.tracef("result", start, len(res.hits))
 	if e.collect != nil {
 		e.collect.res, e.collect.filled = &res, true
+		d.captureAnswerLimits()
 	}
 	start = time.Now()
 	defer d.tracef("report", start, len(res.hits))
@@ -142,6 +149,32 @@ func runDB(ctx context.Context, c *chClient, opts options, e env, refs []eventRe
 		return reportUsage(res, sources, opts, e, stdout), nil
 	}
 	return report(res, opts, e, stdout), nil
+}
+
+func (d *dbPath) captureAnswerLimits() {
+	if d.e.collect == nil {
+		return
+	}
+	limits := make(map[string]int)
+	for _, src := range d.answerSources {
+		if f := d.files[src.Path]; f != nil {
+			limits[src.Path] = f.evLines
+		}
+	}
+	add := func(h hit) {
+		if f := d.files[h.src.Path]; f != nil {
+			limits[h.src.Path] = f.evLines
+		}
+	}
+	if d.e.collect.res != nil {
+		for i := range d.e.collect.res.hits {
+			add(d.e.collect.res.hits[i])
+		}
+	}
+	for i := range d.e.collect.refs {
+		add(d.e.collect.refs[i])
+	}
+	d.e.collect.limits = limits
 }
 
 func dbRetentionExceeded(opts options, sources []source, files map[string]*dbFile, now time.Time) bool {

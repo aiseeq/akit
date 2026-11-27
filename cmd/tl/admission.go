@@ -62,6 +62,7 @@ func admission(sources []source, args []string, stdout, stderr io.Writer, cache 
 		}
 		cmd := exec.Command(graft, append([]string{"exec", "--heavy", "--local", "--", executable}, args...)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
+		cmd.Env = shadowEnv(map[string]string{"TL_FALLBACK_CHILD": "1"})
 		if err := cmd.Run(); err != nil {
 			var exit *exec.ExitError
 			if errors.As(err, &exit) {

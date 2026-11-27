@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,9 +21,9 @@ import (
 	"time"
 )
 
-// Shadow repeats selected database answers through files and selected file answers through the database. Repeats
-// run detached and write one JSON line to the shadow journal. Database-to-files repeats are capped at the database
-// line counts captured when the primary answer completed; database fallbacks are journaled separately.
+// Shadow repeats selected answers through the other backend. Repeats run detached and write one JSON line to the
+// shadow journal. Database-to-files repeats are capped at the database line counts captured for the answer;
+// database fallbacks are journaled separately.
 
 const (
 	shadowChildEnv     = "TL_SHADOW_CHILD"
@@ -38,6 +38,8 @@ const (
 
 var shadowRepeatTimeout = 30 * time.Minute
 var shadowRandomFloat = rand.Float64
+var shadowCommand = exec.CommandContext
+var shadowRunFiles = runOutput
 
 // answer is what one call found, for the shadow: the result of a listing or --usage, the events of tl REF.
 type answer struct {
@@ -98,6 +100,7 @@ type shadowRecord struct {
 	Time      string   `json:"time"`
 	Primary   string   `json:"primary"`
 	Fallback  string   `json:"fallback,omitempty"`
+	Expected  bool     `json:"expected,omitempty"`
 	Args      []string `json:"args"`
 	Until     string   `json:"until"`
 	FilesKeys int      `json:"files_keys"`
@@ -168,6 +171,35 @@ func answerKeysThrough(a *answer, opts options, cutoff time.Time) []string {
 		for _, h := range a.res.hits {
 			if !h.ev.Time.After(cutoff) {
 				res.hits = append(res.hits, h)
+			}
+		}
+		filtered.res = res
+	}
+	return answerKeys(filtered, opts)
+}
+
+func answerKeysWithin(a *answer, opts options, cutoff time.Time, limits map[string]int) []string {
+	if a == nil {
+		return nil
+	}
+	filtered := &answer{filled: a.filled}
+	keep := func(h hit) bool {
+		if !cutoff.IsZero() && h.ev.Time.After(cutoff) {
+			return false
+		}
+		limit, ok := limits[h.src.Path]
+		return !ok || h.ev.Line <= limit
+	}
+	for i := range a.refs {
+		if keep(a.refs[i]) {
+			filtered.refs = append(filtered.refs, a.refs[i])
+		}
+	}
+	if a.res != nil {
+		res := &result{}
+		for i := range a.res.hits {
+			if keep(a.res.hits[i]) {
+				res.hits = append(res.hits, a.res.hits[i])
 			}
 		}
 		filtered.res = res
@@ -266,7 +298,7 @@ func shadowForm(args []string) string {
 var shadowStarts atomic.Int64
 var shadowSpawner = spawnShadow
 
-// startShadow starts the repeat of the call through the database, detached from it; the call does not wait for
+// startShadow starts a detached repeat of the call; the call does not wait for
 // it. Nothing starts when shadowPerForm repeats of this form or shadowAll in all already run. The repeat has no
 // terminal: what it cannot write to the journal goes to shadowLogName beside the slots.
 func startShadow(spec shadowSpec, form string) error {
@@ -328,22 +360,11 @@ func spawnShadow(specPath, logPath, primary string) error {
 	if err != nil {
 		return fmt.Errorf("shadow log: %w", err)
 	}
-	program, prefix := exe, []string{}
-	if primary == backendDB {
-		if graft, lookErr := exec.LookPath("graft"); lookErr == nil {
-			program = graft
-			prefix = []string{"exec", "--heavy", "--local", "--", exe}
-		}
-	}
-	cmd := exec.Command(program, prefix...)
-	cmd.Env = shadowEnv(map[string]string{shadowChildEnv: specPath})
-	if primary == backendDB {
-		cmd.Env = shadowEnv(map[string]string{shadowChildEnv: specPath, "TL_BACKEND": backendFiles})
-	}
+	cmd := exec.Command(exe)
+	cmd.Env = shadowEnv(map[string]string{"TL_SHADOW_LAUNCH": specPath, "TL_SHADOW_LOG": logPath, "TL_SHADOW_PRIMARY": primary})
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = detached()
 	err = cmd.Start()
-	// the repeat has its own copy of the log; this one is not written here
 	closeErr := logFile.Close()
 	if err != nil {
 		return errors.Join(fmt.Errorf("start shadow: %w", err), closeErr)
@@ -352,6 +373,110 @@ func spawnShadow(specPath, logPath, primary string) error {
 		return fmt.Errorf("start shadow: %w", err)
 	}
 	return closeErr
+}
+
+func runShadowLauncher(specPath, logPath, primary string) error {
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		return fmt.Errorf("shadow spec: %w", err)
+	}
+	var spec shadowSpec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return fmt.Errorf("shadow spec %s: %w", specPath, err)
+	}
+	if !holdShadowSlots(spec) {
+		return removeSpec(specPath)
+	}
+	defer releaseHeldSlots()
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find tl executable: %w", err)
+	}
+	program, args := exe, []string{}
+	if primary == backendDB {
+		if graft, lookErr := exec.LookPath("graft"); lookErr == nil {
+			program = graft
+			args = []string{"exec", "--heavy", "--local", "--", exe}
+		}
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), spec.Started.Add(shadowRepeatTimeout))
+	defer cancel()
+	cmd := shadowCommand(ctx, program, args...)
+	values := map[string]string{shadowChildEnv: specPath, "TL_SHADOW_SLOTS_HELD": "1", "TL_SHADOW_LAUNCH": "", "TL_SHADOW_LOG": "", "TL_SHADOW_PRIMARY": ""}
+	if primary == backendDB {
+		values["TL_BACKEND"] = backendFiles
+	}
+	cmd.Env = shadowEnv(values)
+	cmd.Stdout = io.Discard
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("shadow log: %w", err)
+	}
+	filteredLog := &graftLogWriter{w: logFile}
+	cmd.Stderr = filteredLog
+	err = cmd.Run()
+	flushErr := filteredLog.Flush()
+	closeErr := logFile.Close()
+	if ctx.Err() != nil {
+		_ = removeSpec(specPath)
+		return errors.Join(appendJournal(spec.Journal, timeoutRecord(spec)), flushErr, closeErr)
+	}
+	return errors.Join(err, flushErr, closeErr)
+}
+
+type graftLogWriter struct {
+	w   io.Writer
+	buf []byte
+}
+
+func (w *graftLogWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := strings.IndexByte(string(w.buf), '\n')
+		if i < 0 {
+			break
+		}
+		line := string(w.buf[:i+1])
+		w.buf = w.buf[i+1:]
+		if !strings.HasPrefix(line, "graft: waiting") {
+			if _, err := io.WriteString(w.w, line); err != nil {
+				return len(p), err
+			}
+		}
+	}
+	return len(p), nil
+}
+
+func (w *graftLogWriter) Flush() error {
+	if len(w.buf) == 0 || strings.HasPrefix(string(w.buf), "graft: waiting") {
+		w.buf = nil
+		return nil
+	}
+	_, err := w.w.Write(w.buf)
+	w.buf = nil
+	return err
+}
+
+func holdShadowSlots(spec shadowSpec) bool {
+	formHeld, err := holdSlot(spec.Slots, "form-"+formSlot(spec.Args), shadowPerForm)
+	if err != nil || !formHeld {
+		return false
+	}
+	allHeld, err := holdSlot(spec.Slots, "all", shadowAll)
+	if err != nil || !allHeld {
+		releaseHeldSlots()
+		return false
+	}
+	return true
+}
+
+func releaseHeldSlots() {
+	heldMu.Lock()
+	defer heldMu.Unlock()
+	for _, release := range heldSlots {
+		release()
+	}
+	heldSlots = nil
 }
 
 func shadowEnv(values map[string]string) []string {
@@ -368,12 +493,7 @@ func shadowEnv(values map[string]string) []string {
 			env = append(env, entry)
 		}
 	}
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(values)) {
 		env = append(env, key+"="+values[key])
 	}
 	return env
@@ -418,7 +538,7 @@ func holdSlot(dir, prefix string, n int) (bool, error) {
 	return false, nil
 }
 
-// shadowAfter starts the repeat of a call answered from files, when it was picked for the shadow.
+// shadowAfter journals database fallbacks and starts a repeat for a selected primary answer.
 func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration, stderr io.Writer) {
 	if journalFallback(opts, e, code, elapsed, stderr) {
 		return
@@ -426,17 +546,16 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 	if a == nil {
 		return
 	}
+	if !a.filled || code != 0 && code != exitNone {
+		return
+	}
 	if e.backend == backendDB {
-		limits := e.shadowLimits
-		if limits == nil {
-			limits = a.limits
-		}
-		if !a.filled || code != 0 && code != exitNone || !e.shadowPicked || limits == nil {
+		if !e.shadowPicked || a.limits == nil {
 			return
 		}
 		cutoff := shadowCutoff(opts, e.now)
-		spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysThrough(a, opts, cutoff),
-			PrimaryS: elapsed.Seconds(), PrimaryCode: code, Primary: backendDB, Limits: limits,
+		spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysWithin(a, opts, cutoff, a.limits),
+			PrimaryS: elapsed.Seconds(), PrimaryCode: code, Primary: backendDB, Limits: a.limits,
 			Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
 		if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {
 			printMasked(stderr, fmt.Sprintf("tl: shadow: %v\n", err))
@@ -450,8 +569,11 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 		}
 		return
 	}
+	if e.backend != backendFiles || !e.shadowPicked {
+		return
+	}
 	cutoff := shadowCutoff(opts, e.now)
-	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysThrough(a, opts, cutoff), PrimaryS: elapsed.Seconds(),
+	spec := shadowSpec{Args: opts.originalArgs, Now: e.now, Cutoff: cutoff, Keys: answerKeysWithin(a, opts, cutoff, nil), PrimaryS: elapsed.Seconds(),
 		PrimaryCode: code, Primary: backendFiles, Journal: shadowJournal(e.home), Slots: filepath.Join(stateDir(e.home), shadowSlotsDirName)}
 	if err := startShadow(spec, formSlot(opts.originalArgs)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: shadow: %v\n", err))
@@ -467,7 +589,8 @@ func journalFallback(opts options, e env, code int, elapsed time.Duration, stder
 		filesS = e.fallback.filesS
 	}
 	rec := shadowRecord{Time: time.Now().Format(time.RFC3339), Args: hideArgs(opts.originalArgs), Primary: backendDB,
-		Fallback: e.fallback.reason, FilesS: round3(filesS), FilesCode: code, Diff: -1}
+		Fallback: e.fallback.reason, Expected: strings.Contains(e.fallback.reason, "requested data may predate retained events"),
+		FilesS: round3(filesS), FilesCode: code, Diff: -1}
 	if err := appendJournal(shadowJournal(e.home), rec); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: shadow journal: %v\n", err))
 	}
@@ -482,8 +605,7 @@ func hideArgs(args []string) []string {
 	return masked
 }
 
-// runShadowChild is the repeat: it reads its spec, asks the database the same, compares and writes the journal.
-// All slots of its form or of all held — it was started past the limit, and leaves.
+// runShadowChild repeats the call, compares the answers and writes the journal.
 func runShadowChild(specPath string) error {
 	data, err := os.ReadFile(specPath)
 	if err != nil {
@@ -496,14 +618,11 @@ func runShadowChild(specPath string) error {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return fmt.Errorf("shadow spec %s: %w", specPath, err)
 	}
-	for _, slot := range []struct {
-		prefix string
-		n      int
-	}{{"form-" + formSlot(spec.Args), shadowPerForm}, {"all", shadowAll}} {
-		held, err := holdSlot(spec.Slots, slot.prefix, slot.n)
-		if err != nil || !held {
-			return err
+	if os.Getenv("TL_SHADOW_SLOTS_HELD") != "1" {
+		if !holdShadowSlots(spec) {
+			return nil
 		}
+		defer releaseHeldSlots()
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -514,6 +633,21 @@ func runShadowChild(specPath string) error {
 		fmt.Fprintf(os.Stderr, "tl: shadow: %v\n", err)
 	}
 	return appendJournal(spec.Journal, shadowRepeat(spec, home))
+}
+
+func timeoutRecord(spec shadowSpec) shadowRecord {
+	primary := spec.Primary
+	if primary == "" {
+		primary = backendFiles
+	}
+	rec := shadowRecord{Time: time.Now().Format(time.RFC3339), Args: hideArgs(spec.Args), Primary: primary, Fallback: spec.Fallback,
+		Diff: -1, Error: "files repeat timed out after 30m"}
+	if primary == backendDB {
+		rec.DBKeys, rec.DBS, rec.DBCode = len(spec.Keys), round3(spec.PrimaryS), spec.PrimaryCode
+	} else {
+		rec.FilesKeys, rec.FilesS, rec.FilesCode = len(spec.Keys), round3(spec.PrimaryS), spec.PrimaryCode
+	}
+	return rec
 }
 
 func shadowRepeat(spec shadowSpec, home string) shadowRecord {
@@ -535,7 +669,7 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		rec.Until = spec.Cutoff.Format(time.RFC3339Nano)
 	}
 	if !spec.Started.IsZero() && time.Since(spec.Started) >= shadowRepeatTimeout {
-		rec.Error = "files repeat timed out after 30m"
+		rec = timeoutRecord(spec)
 		return rec
 	}
 	opts, err := parseArgs(spec.Args, spec.Now)
@@ -574,14 +708,14 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		fileAnswer := &answer{}
 		e.collect = fileAnswer
 		done := make(chan int, 1)
-		go func() { done <- runOutput(opts, e, io.Discard, io.Discard) }()
+		go func() { done <- shadowRunFiles(opts, e, io.Discard, io.Discard) }()
 		select {
 		case code = <-done:
 		case <-ctx.Done():
 			rec.Error = "files repeat timed out after 30m"
 			return rec
 		}
-		keys := filterShadowLines(answerKeysThrough(fileAnswer, opts, spec.Cutoff), spec.Limits)
+		keys := answerKeysWithin(fileAnswer, opts, spec.Cutoff, spec.Limits)
 		rec.FilesS, rec.FilesCode, rec.FilesKeys = round3(time.Since(start).Seconds()), code, len(keys)
 		rec.Diff, rec.OnlyFiles, rec.OnlyDB = keyDiff(keys, spec.Keys)
 		if code != spec.PrimaryCode {
@@ -597,40 +731,14 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		}
 		return rec
 	}
-	limits, err := shadowLineLimits(c)
-	if err != nil {
-		rec.Error = err.Error()
-		return rec
-	}
-	spec.Keys = filterShadowLines(spec.Keys, limits)
-	keys := filterShadowLines(answerKeys(a, opts), limits)
+	keys := answerKeysWithin(a, opts, spec.Cutoff, a.limits)
+	spec.Keys = filterShadowLines(spec.Keys, a.limits)
 	rec.DBKeys = len(keys)
 	rec.Diff, rec.OnlyFiles, rec.OnlyDB = keyDiff(spec.Keys, keys)
 	if code != spec.PrimaryCode {
 		rec.Error = fmt.Sprintf("exit %d through the database, %d through files", code, spec.PrimaryCode)
 	}
 	return rec
-}
-
-func shadowLineLimits(c *chClient) (map[string]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), shadowRepeatTimeout)
-	defer cancel()
-	rows, err := c.SelectTSV(ctx, chQuery{Name: "shadow_files", SQL: "SELECT path, lines FROM files FINAL"})
-	if err != nil {
-		return nil, err
-	}
-	limits := make(map[string]int, len(rows))
-	for _, row := range rows {
-		if len(row) != 2 {
-			return nil, fmt.Errorf("shadow files: want 2 fields, got %d", len(row))
-		}
-		n, err := strconv.Atoi(row[1])
-		if err != nil {
-			return nil, fmt.Errorf("shadow files lines %q: %w", row[1], err)
-		}
-		limits[row[0]] = n
-	}
-	return limits, nil
 }
 
 func filterShadowLines(keys []string, limits map[string]int) []string {
@@ -680,9 +788,10 @@ func appendJournal(path string, rec shadowRecord) error {
 	return errors.Join(f.Close())
 }
 
-// pickShadow decides whether this call is repeated through the database.
+// pickShadow decides whether this call is repeated through the other backend.
 func pickShadow(opts options, backend string) (bool, error) {
-	if !dbForm(opts) || backend != backendFiles && backend != backendDB {
+	// --usage aggregates events into session rows, so its keys have no event line to cap.
+	if !dbForm(opts) || opts.usage || backend != backendFiles && backend != backendDB {
 		return false, nil
 	}
 	rate, err := shadowRate()
@@ -713,10 +822,19 @@ func rememberShadowForm(form string) (_ bool, retErr error) {
 		return false, fmt.Errorf("create shadow slots directory: %w", err)
 	}
 	path := filepath.Join(dir, "seen-forms")
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return false, fmt.Errorf("open seen shadow forms: %w", err)
 	}
+	release, err := takeSlot(path + ".lock")
+	if err != nil || release == nil {
+		_ = file.Close()
+		if err != nil {
+			return false, fmt.Errorf("lock seen shadow forms: %w", err)
+		}
+		return false, errors.New("lock seen shadow forms: already held")
+	}
+	defer release()
 	defer func() {
 		if err := file.Close(); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("close seen shadow forms: %w", err))

@@ -32,18 +32,20 @@ import (
 // the transcripts of a synthetic home: it evaluates the conditions the client sends (parameters, LIKE, the regular
 // expressions, the raw prefilter) in Go. Every request must be a read-only POST.
 type fakeCH struct {
-	t           *testing.T
-	files       []*chFile
-	mu          sync.Mutex
-	names       []string // log_comment of each request, in order
-	eventWhole  []string // whole-text limits used by the event listing
-	eventSQL    []string // event projections, for the text-preservation contract
-	eventRunes  []int    // the characters of each event text the listing answers carried, in order
-	usageSQL    []string
-	gate        chan struct{} // when set, requests wait for it to close
-	fail        map[string]bool
-	legacyUsage bool
-	noFlatLen   bool // the events table has rows loaded before flat_len, with 0 there
+	t            *testing.T
+	files        []*chFile
+	mu           sync.Mutex
+	names        []string // log_comment of each request, in order
+	eventWhole   []string // whole-text limits used by the event listing
+	eventSQL     []string // event projections, for the text-preservation contract
+	eventRunes   []int    // the characters of each event text the listing answers carried, in order
+	usageSQL     []string
+	gate         chan struct{} // when set, requests wait for it to close
+	gateName     string
+	eventStarted chan struct{}
+	fail         map[string]bool
+	legacyUsage  bool
+	noFlatLen    bool // the events table has rows loaded before flat_len, with 0 there
 }
 
 type chFile struct {
@@ -222,13 +224,19 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if name == "events" {
 		s.eventWhole = append(s.eventWhole, q.Get("param_whole"))
 		s.eventSQL = append(s.eventSQL, sql)
+		if s.eventStarted != nil {
+			select {
+			case s.eventStarted <- struct{}{}:
+			default:
+			}
+		}
 	}
 	if name == "usage" {
 		s.usageSQL = append(s.usageSQL, sql)
 	}
 	gate := s.gate
 	s.mu.Unlock()
-	if gate != nil {
+	if gate != nil && (s.gateName == "" || name == s.gateName) {
 		<-gate
 	}
 	s.mu.Lock()

@@ -131,11 +131,14 @@ the files; with no loader state and no server answering (a machine without the
 database) tl reads the files quietly unless TL_BACKEND=db. A share of calls
 (TL_SHADOW_RATE, default 0.1, 0 off) is repeated through the other path in a
 background process after the answer: database answers through the files,
-TL_BACKEND=files answers through the database; a fallback from the database to
-the files is journaled too. Each appends one JSON line to
+TL_BACKEND=files answers through the database. The files repeat runs in the
+heavy queue and is limited to the database's captured line counts. A database
+fallback is always journaled, independent of the share; expected retention
+fallbacks are marked. Each result appends one JSON line with its primary path to
 TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
 counts of both paths up to the call's start or --until, "diff" (-1 when the
-repeat failed), both times. TL_DB_TRACE=1 prints the time of each query.
+repeat failed), both times. --usage is not shadowed. TL_DB_TRACE=1 prints the
+time of each query.
 Exit: 0 found, 1 none, 2 usage/IO error.
 `
 
@@ -193,6 +196,13 @@ var machineHelp = func() clihelp.Help {
 }()
 
 func main() {
+	if spec := os.Getenv("TL_SHADOW_LAUNCH"); spec != "" {
+		if err := runShadowLauncher(spec, os.Getenv("TL_SHADOW_LOG"), os.Getenv("TL_SHADOW_PRIMARY")); err != nil {
+			fmt.Fprintf(os.Stderr, "%s tl: shadow: %v\n", time.Now().Format(time.RFC3339), err)
+			os.Exit(exitUsage)
+		}
+		os.Exit(0)
+	}
 	if spec := os.Getenv(shadowChildEnv); spec != "" {
 		if err := runShadowChild(spec); err != nil {
 			fmt.Fprintf(os.Stderr, "%s tl: shadow: %v\n", time.Now().Format(time.RFC3339), err)
@@ -232,7 +242,7 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 	}
 	e := env{home: home, configHome: os.Getenv("XDG_CONFIG_HOME"), sessionID: os.Getenv("CLAUDE_CODE_SESSION_ID"), now: now,
-		backend: backendFromEnv(stderr), warn: stderr}
+		backend: backendFromEnv(stderr), warn: stderr, fallbackChild: os.Getenv("TL_FALLBACK_CHILD") == "1"}
 	if os.Getenv("TL_DB_TRACE") != "" {
 		e.dbTrace = stderr
 	}
@@ -249,7 +259,7 @@ func prepareShadow(opts options, e *env, stderr io.Writer) {
 		e.collect = &answer{}
 		e.shadowPicked = true
 	}
-	if e.backend == backendDB && dbForm(opts) {
+	if e.backend == backendDB && dbForm(opts) && !e.fallbackChild {
 		e.fallback = &fallbackState{}
 	}
 }
@@ -271,18 +281,18 @@ func printMasked(w io.Writer, text string) {
 
 // env — то, что tl берёт из окружения; в тестах подменяется.
 type env struct {
-	home         string
-	configHome   string
-	sessionID    string
-	now          time.Time
-	backend      string    // TL_BACKEND: files or db
-	dbThrough    time.Time // freshness boundary from tlfeed state.json
-	collect      *answer   // set when the shadow repeats this call: what the answer found
-	shadowLimits map[string]int
-	shadowPicked bool
-	fallback     *fallbackState
-	dbTrace      io.Writer // TL_DB_TRACE: the time of each database query
-	warn         io.Writer // the stderr of the call, unbuffered: a fallback to the files is told before they are read
+	home          string
+	configHome    string
+	sessionID     string
+	now           time.Time
+	backend       string    // TL_BACKEND: files or db
+	dbThrough     time.Time // freshness boundary from tlfeed state.json
+	collect       *answer   // set when the shadow repeats this call: what the answer found
+	shadowPicked  bool
+	fallback      *fallbackState
+	fallbackChild bool
+	dbTrace       io.Writer // TL_DB_TRACE: the time of each database query
+	warn          io.Writer // the stderr of the call, unbuffered: a fallback to the files is told before they are read
 }
 
 type fallbackState struct {
@@ -709,7 +719,7 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 	}
 	if e.backend == backendDB && dbForm(opts) {
 		code, ok, err := runOutputDB(opts, e, refs, stdout, stderr)
-		if err != nil {
+		if err != nil && !e.fallbackChild {
 			warn := stderr
 			if e.warn != nil {
 				warn = e.warn
@@ -758,7 +768,6 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 		var out, errs bytes.Buffer
 		var code int
 		if code, err = runDB(context.Background(), c, opts, e, refs, &out, &errs); err == nil {
-			captureShadowLimits(c, &e)
 			errs.WriteString(transcriptdb.FreshnessLine("tl", e.dbThrough, time.Now()))
 			_, outErr := io.Copy(stdout, &out)
 			_, errErr := io.Copy(stderr, &errs)
@@ -778,24 +787,6 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 		e.fallback.reason = hideSafe(err.Error())
 	}
 	return 0, false, fmt.Errorf("database: %w; reading files instead", err)
-}
-
-func captureShadowLimits(c *chClient, e *env) {
-	if !e.shadowPicked {
-		return
-	}
-	limits, err := shadowLineLimits(c)
-	if err != nil {
-		if e.dbTrace != nil {
-			fmt.Fprintf(e.dbTrace, "tl: shadow line limits: %v\n", err)
-		}
-		e.shadowLimits = nil
-	} else {
-		e.shadowLimits = limits
-	}
-	if e.collect != nil {
-		e.collect.limits = e.shadowLimits
-	}
 }
 
 type dbState = transcriptdb.State
