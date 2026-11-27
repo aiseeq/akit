@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/session"
+	"github.com/aiseeq/akit/transcript"
 	"github.com/aiseeq/akit/transcriptdb"
 )
 
@@ -43,6 +44,9 @@ func (d *wordDB) query(name, sql string, params map[string]string) ([][]string, 
 	}
 	return rows, err
 }
+
+// userWordRoles — роли слов пользователя (transcript.UserWordRoles) значением параметра Array(String) запроса.
+var userWordRoles = transcriptdb.ArrayParam(transcript.UserWordRoles, func(r transcript.Role) string { return transcriptdb.Quote(string(r)) })
 
 // errReadFile — транскрипт читается из файла, а запуск остаётся на базе: в базе нет того, что даёт файл.
 var errReadFile = errors.New("the database lacks what the file gives")
@@ -209,7 +213,7 @@ func sessionTranscript(home, path string) bool {
 // реплика пользователя с куском слова цитаты: проход цитат --brief читает с диска только их, по порядку путей.
 // Кусок - prefilterBest: без первой буквы и без «е», поэтому есть и в lowerUTF8 реплики при любом регистре и «ё».
 func (d *wordDB) briefCandidates(home string, fragments map[string][]string, loc *time.Location) ([]string, error) {
-	params := map[string]string{}
+	params := map[string]string{"roles": userWordRoles}
 	var conds []string
 	for i, date := range slices.Sorted(maps.Keys(fragments)) {
 		day, err := time.ParseInLocation(time.DateOnly, date, loc)
@@ -229,7 +233,7 @@ func (d *wordDB) briefCandidates(home string, fragments map[string][]string, loc
 		return nil, nil
 	}
 	rows, err := d.query("brief_candidates", "SELECT DISTINCT files.path FROM events INNER JOIN files FINAL USING (file_id) "+
-		"WHERE events.role IN ('user','ask') AND events.kind = 'claude' AND events.line <= files.ev_lines AND ("+
+		"WHERE events.role IN {roles:Array(String)} AND events.kind = 'claude' AND events.line <= files.ev_lines AND ("+
 		strings.Join(conds, " OR ")+") ORDER BY files.path", params)
 	if err != nil {
 		return nil, err
@@ -298,7 +302,7 @@ func (d *wordDB) briefRecordDays(recordWindows map[string]markerRecordInterval) 
 // dbFindHits — findHitsUsing по базе: реплики пользователя с куском из транскриптов сессий, которые выбрал бы
 // transcripts (путь вида проекты/*/*.jsonl, --project - подстрокой пути, файл есть на диске), в том же порядке.
 func dbFindHits(opts options, e env) ([]hit, []line, error) {
-	params := map[string]string{}
+	params := map[string]string{"roles": userWordRoles}
 	filter := ""
 	// Кусок prefilterBest есть в lowerUTF8 реплики при любом регистре и «ё»; без него - все реплики окна.
 	if term, _ := prefilterBest(opts.frag); term != "" {
@@ -316,7 +320,7 @@ func dbFindHits(opts options, e env) ([]hit, []line, error) {
 	rows, err := activeWordDB.query("search", "SELECT files.path, toString(events.file_id), toString(events.line), toString(toUnixTimestamp64Milli(events.ts)), "+
 		"events.role, events.text, toString(events.images) "+
 		"FROM events INNER JOIN files FINAL USING (file_id) WHERE events.line <= files.ev_lines AND events.kind = 'claude' "+
-		"AND events.role IN ('user','ask')"+filter+" ORDER BY events.ts, files.path, events.line", params)
+		"AND events.role IN {roles:Array(String)}"+filter+" ORDER BY events.ts, files.path, events.line", params)
 	if err != nil {
 		return nil, nil, err
 	}

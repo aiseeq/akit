@@ -19,13 +19,16 @@ import (
 // EventRetention is the age after which the loader may remove transcript events.
 const EventRetention = 90 * 24 * time.Hour
 
+// UserWordRoles are the roles of the words of the user: what they typed and what they answered in a question window.
+var UserWordRoles = []Role{User, Ask}
+
 // KeptForeverKinds and KeptForeverRoles are the transcript kinds (as the loader stores them: claude, sub, codex,
 // codex-ext) and the roles whose events the loader keeps past EventRetention: the words of the user in Claude Code
 // transcripts. A subagent transcript has no events of these roles (its brief is a note), so listing it keeps nothing
 // more; it makes the rule hold for every Claude Code transcript.
 var (
 	KeptForeverKinds = []string{"claude", "sub"}
-	KeptForeverRoles = []Role{User, Ask}
+	KeptForeverRoles = UserWordRoles
 )
 
 // EventKeptForever tells whether the loader keeps an event of this transcript kind and role past EventRetention.
