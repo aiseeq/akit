@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -66,19 +67,27 @@ func TestBackend(t *testing.T) {
 	if c, _ := Backend("tool1", home, &warn); c != nil || warn.Len() > 0 {
 		t.Fatalf("TL_BACKEND=files: %v %q", c, warn.String())
 	}
-	// A home without a loader reads the files quietly unless the database is asked for by name.
+	// A machine without a loader and a server reads the files quietly unless the database is asked for by name.
 	bare, stateHome := t.TempDir(), os.Getenv("XDG_STATE_HOME")
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("TL_BACKEND", "")
+	t.Setenv("TL_CLICKHOUSE_URL", closedURL(t))
 	if c, _ := Backend("tool1", bare, &warn); c != nil || warn.Len() > 0 {
 		t.Fatalf("no loader, default: %v %q", c, warn.String())
 	}
+	// A server that answers while the state file is missing is a caller with another state folder: a warning.
+	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
+	if c, _ := Backend("tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
+		t.Fatalf("no state, server answers: %v %q", c, warn.String())
+	}
+	warn.Reset()
 	t.Setenv("TL_BACKEND", "db")
-	if c, _ := Backend("tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: TL_BACKEND=db: read tlfeed state: ") {
+	if c, _ := Backend("tool1", bare, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: read tlfeed state: ") {
 		t.Fatalf("no loader, TL_BACKEND=db: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
 	t.Setenv("TL_BACKEND", "dbx")
 	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: TL_BACKEND=\"dbx\" is not files or db; reading files\n" {
 		t.Fatalf("unknown backend: %v %q", c, warn.String())
@@ -93,19 +102,19 @@ func TestBackend(t *testing.T) {
 		t.Fatalf("query of the tool: %v %q", err, comment)
 	}
 	t.Setenv("TL_CLICKHOUSE_URL", "not a url")
-	if c, _ := Backend("tool1", home, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: TL_BACKEND=db: bad TL_CLICKHOUSE_URL") ||
+	if c, _ := Backend("tool1", home, &warn); c != nil || !strings.HasPrefix(warn.String(), "tool1: database: bad TL_CLICKHOUSE_URL") ||
 		!strings.HasSuffix(warn.String(), "; reading files instead\n") {
 		t.Fatalf("bad address: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("TL_CLICKHOUSE_URL", s.URL)
 	loaderState(t, home, time.Now().Add(-time.Hour))
-	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: TL_BACKEND=db: tlfeed heartbeat is stale or invalid; reading files instead\n" {
+	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: database: tlfeed heartbeat is stale or invalid; reading files instead\n" {
 		t.Fatalf("stale loader: %v %q", c, warn.String())
 	}
 	warn.Reset()
 	t.Setenv("TL_BACKEND", "")
-	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: TL_BACKEND=db: tlfeed heartbeat is stale or invalid; reading files instead\n" {
+	if c, _ := Backend("tool1", home, &warn); c != nil || warn.String() != "tool1: database: tlfeed heartbeat is stale or invalid; reading files instead\n" {
 		t.Fatalf("stale loader, default: %v %q", c, warn.String())
 	}
 	// Connect does not read TL_BACKEND: the caller has chosen the database.
@@ -116,5 +125,44 @@ func TestBackend(t *testing.T) {
 	}
 	if _, _, err := Connect("tool2", t.TempDir()); err == nil {
 		t.Fatal("Connect accepted the loader of another home")
+	}
+}
+
+// closedURL is an address no server listens at: a port taken and released.
+func closedURL(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return "http://" + addr
+}
+
+func TestPing(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ping" {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, "Ok.\n")
+	}))
+	defer ok.Close()
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "down", http.StatusServiceUnavailable) }))
+	defer down.Close()
+	for _, tc := range []struct {
+		url  string
+		want bool
+	}{{ok.URL, true}, {down.URL, false}, {closedURL(t), false}} {
+		c, err := New(tc.url, "tr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.Ping(t.Context()) == nil; got != tc.want {
+			t.Errorf("Ping %s = %t, want %t", tc.url, got, tc.want)
+		}
 	}
 }

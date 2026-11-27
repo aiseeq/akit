@@ -69,6 +69,25 @@ func New(base, db string) (*Client, error) {
 	return &Client{base: strings.TrimRight(base, "/") + "/", db: db, tool: defaultTool, hc: &http.Client{Transport: tr}}, nil
 }
 
+// Ping asks the server's /ping; nil — it answered OK.
+func (c *Client) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"ping", nil)
+	if err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ping: %s", resp.Status)
+	}
+	return nil
+}
+
 // WithTool is a copy of the client whose queries carry log_comment "<tool>:<query name>", so system.query_log tells
 // the tool that sent them. The copy shares the connections of c.
 func (c *Client) WithTool(tool string) *Client {

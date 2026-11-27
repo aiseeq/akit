@@ -562,7 +562,7 @@ func replyLineIndexes(needlesByPath map[string]map[string]struct{}) (map[string]
 	if activePriorDB != nil {
 		found, err := activePriorDB.timestampLines(needlesByPath)
 		if err != nil {
-			fmt.Fprintf(activePriorDB.stderr, "prior: TL_BACKEND=db: %v; reading files instead\n", err)
+			fmt.Fprintf(activePriorDB.stderr, "prior: database: %v; reading files instead\n", err)
 			activePriorDB = nil
 		} else {
 			activePriorDB.fresh()

@@ -418,7 +418,7 @@ func fileOnDisk(known map[string]bool, path string) bool {
 
 func setWordFreshnessFailure(err error) {
 	if activeWordDB != nil {
-		fmt.Fprintf(activeWordDB.stderr, "user-word: TL_BACKEND=db: %v; reading files instead\n", err)
+		fmt.Fprintf(activeWordDB.stderr, "user-word: database: %v; reading files instead\n", err)
 		activeWordDB = nil
 	}
 }

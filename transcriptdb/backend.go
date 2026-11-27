@@ -1,11 +1,13 @@
 package transcriptdb
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"time"
 )
 
 // Source is where a tool reads transcripts: the files on disk or the database.
@@ -61,17 +63,30 @@ func Backend(tool, home string, warn io.Writer) (*Client, State) {
 	}
 	c, state, err := Connect(tool, home)
 	if err != nil {
-		if !NoLoader(err) {
-			fmt.Fprintf(warn, "%s: TL_BACKEND=db: %v; reading files instead\n", tool, err)
+		if !NoLoader(context.Background(), err) {
+			fmt.Fprintf(warn, "%s: database: %v; reading files instead\n", tool, err)
 		}
 		return nil, State{}
 	}
 	return c, state
 }
 
-// NoLoader tells that the database was not asked for by name (TL_BACKEND unset) and this home has no loader at
-// all (no loader state file): the tool reads the files without a warning, as on a machine without the database.
-// With TL_BACKEND=db the same is a warning.
-func NoLoader(err error) bool {
-	return os.Getenv("TL_BACKEND") == "" && errors.Is(err, fs.ErrNotExist)
+// NoLoader tells that the database was not asked for by name (TL_BACKEND unset) and this machine has none: no
+// loader state file for the home and no server answering at TL_CLICKHOUSE_URL. The tool then reads the files
+// without a warning. A server that answers while the state file is missing (another XDG_STATE_HOME or HOME of the
+// caller) is a warning, as is anything with TL_BACKEND=db.
+func NoLoader(ctx context.Context, err error) bool {
+	if os.Getenv("TL_BACKEND") != "" || !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	if c, cerr := NewFromEnv(); cerr == nil {
+		ctx, cancel := context.WithTimeout(ctx, pingTimeout)
+		defer cancel()
+		return c.Ping(ctx) != nil
+	}
+	// a bad address is not a machine without the database: Connect reports it as a warning
+	return false
 }
+
+// pingTimeout bounds the probe of NoLoader: a machine without the server refuses the connection at once.
+const pingTimeout = 200 * time.Millisecond

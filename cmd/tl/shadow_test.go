@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aiseeq/akit/internal/dbtest"
 	"github.com/aiseeq/akit/transcript"
 )
 
@@ -36,7 +37,14 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	os.Exit(m.Run())
+	cleanup, err := dbtest.Isolate()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
 func countLines(t *testing.T, path string) int {
@@ -346,5 +354,21 @@ func TestHoldSlotSurvivesGC(t *testing.T) {
 	}
 	if held, err := holdSlot(dir, "form", 1); err != nil || held {
 		t.Errorf("a second hold of the only slot %v %v", held, err)
+	}
+}
+
+// The shadow repeats through the database only what files answered: a call answered by the database (the default)
+// is not compared with itself.
+func TestPickShadowOnlyForFiles(t *testing.T) {
+	t.Setenv("TL_SHADOW_RATE", "1")
+	opts, err := parseArgs([]string{"--all", "--grep", "x"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pick, err := pickShadow(opts, backendFiles); err != nil || !pick {
+		t.Fatalf("files at rate 1: pick=%t err=%v", pick, err)
+	}
+	if pick, err := pickShadow(opts, backendDB); err != nil || pick {
+		t.Fatalf("database: pick=%t err=%v", pick, err)
 	}
 }

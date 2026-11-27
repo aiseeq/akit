@@ -49,6 +49,8 @@ ignored for timezone selection, so the quote is searched in the default timezone
 If there are no transcript records on the marker day, not found reports this
 reason. Two-digit marker years use the usual 00–68 and 69–99
 year ranges.
+Transcripts are read from the loader database, as by tl: no database or a failing one
+reads the files, with a warning on stderr; TL_BACKEND=files reads the files only.
 Exit: 0 found, 1 not found, 2 usage/IO error.
 `
 

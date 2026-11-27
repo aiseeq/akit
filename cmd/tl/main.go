@@ -127,7 +127,8 @@ http://127.0.0.1:18123; TL_CLICKHOUSE_DB, default tr; read-only). Files missing
 from the database are not visible. REF may read its requested line from disk.
 Every database answer reports its freshness time in local time. If its state is missing, stale,
 unhealthy, for another home, or the database fails, stderr says so and tl reads
-the files. TL_BACKEND=files reads the files only and repeats a
+the files; with no loader state and no server answering (a machine without the
+database) tl reads the files quietly unless TL_BACKEND=db. TL_BACKEND=files reads the files only and repeats a
 share of calls (TL_SHADOW_RATE, default 0.1, 0 off) through the database in a
 background process after the answer and appends one JSON line to
 TL_SHADOW_JOURNAL (default $XDG_STATE_HOME/akit/tl-shadow.jsonl): event
@@ -701,11 +702,11 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 // caller reads the files.
 func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, bool, error) {
 	state, err := readDBState(e.home)
-	if transcriptdb.NoLoader(err) {
+	if transcriptdb.NoLoader(context.Background(), err) {
 		return 0, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
+		return 0, false, fmt.Errorf("database: %w; reading files instead", err)
 	}
 	e.dbThrough = state.DBThrough
 	c, err := newCHClientFromEnv()
@@ -728,7 +729,7 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 	if errors.Is(err, errNonRegularTranscript) {
 		return 0, false, nil
 	}
-	return 0, false, fmt.Errorf("TL_BACKEND=db: %w; reading files instead", err)
+	return 0, false, fmt.Errorf("database: %w; reading files instead", err)
 }
 
 type dbState = transcriptdb.State
