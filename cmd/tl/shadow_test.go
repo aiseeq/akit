@@ -341,7 +341,14 @@ func TestExpectedRetentionFallbackIsMarked(t *testing.T) {
 }
 
 func TestGraftServiceLinesAreFiltered(t *testing.T) {
-	for _, line := range []string{"graft: waiting in queue\n", "graft: admitted after 2s\n", "graft: moved from scope x\n"} {
+	for _, line := range []string{
+		"graft: exec: waiting for the heavy queue\n",
+		"graft: exec: load is above the limit, waiting\n",
+		"graft: exec: heavy, admitted after 214.228s\n",
+		"graft: exec: moved from /scope/a to /scope/b\n",
+		"graft: exec: heavy, moved from /scope/a to /scope/b\n",
+		"graft: exec: runnable 6, starting after 17s\n",
+	} {
 		if !graftServiceLine(line) {
 			t.Errorf("graft service line passed through: %q", line)
 		}
@@ -409,8 +416,9 @@ func TestShadowFilesRepeatTimesOutDuringRun(t *testing.T) {
 		<-blocked
 		return 0
 	}
+	unlock := time.AfterFunc(250*time.Millisecond, func() { close(blocked) })
 	t.Cleanup(func() {
-		close(blocked)
+		unlock.Stop()
 		shadowRepeatTimeout, shadowRunFiles = oldTimeout, oldRun
 	})
 	spec := shadowSpec{Args: []string{"--all"}, Primary: backendDB, Started: time.Now()}
@@ -710,6 +718,29 @@ func TestSeenFormsLockWaitsWithoutStderrNoise(t *testing.T) {
 	}
 }
 
+func TestSeenFormsLockTimeoutSkipsSilently(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(stateHome, "akit", shadowSlotsDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release, err := takeSlot(filepath.Join(dir, "seen-forms.lock"))
+	if err != nil || release == nil {
+		t.Fatalf("hold seen-forms lock: %v", err)
+	}
+	defer release()
+	start := time.Now()
+	unseen, err := rememberShadowForm("synthetic-form")
+	if err != nil || unseen {
+		t.Fatalf("contended rememberShadowForm = (%t, %v), want silent skip", unseen, err)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("seen-forms lock timeout after %s, want about 1s", elapsed)
+	}
+}
+
 func TestRunShadowChildUsesLauncherHeldSlots(t *testing.T) {
 	dir := t.TempDir()
 	spec := shadowSpec{Args: []string{"--unknown-shadow-test-flag"}, Primary: backendDB,
@@ -778,7 +809,7 @@ func TestAdmissionFallbackWritesOneJournalRowAndWarning(t *testing.T) {
 	t.Setenv("HOME", e.home)
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	t.Setenv("TL_BACKEND", backendDB)
-	t.Setenv("TL_SHADOW_RATE", "0")
+	t.Setenv("TL_SHADOW_RATE", "1")
 	journal := filepath.Join(dir, "journal.jsonl")
 	t.Setenv("TL_SHADOW_JOURNAL", journal)
 	var stderr bytes.Buffer
@@ -795,6 +826,75 @@ func TestAdmissionFallbackWritesOneJournalRowAndWarning(t *testing.T) {
 	}
 	if got := strings.Count(stderr.String(), "synthetic query failure"); got != 1 {
 		t.Fatalf("database fallback warning repeated %d times: %s", got, stderr.String())
+	}
+	settle, tick := time.NewTimer(300*time.Millisecond), time.NewTicker(10*time.Millisecond)
+	defer settle.Stop()
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if count := countLines(t, journal); count != 1 {
+				t.Fatalf("fallback admission wrote %d journal rows after child shadows settled, want 1", count)
+			}
+		case <-settle.C:
+			return
+		}
+	}
+}
+
+func TestAdmissionFilesParentKeepsDirectShadow(t *testing.T) {
+	e, paths, unloaded := dbCorpus(t)
+	ch := newFakeCH(t, paths, unloaded)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	dir := t.TempDir()
+	stateHome := filepath.Join(dir, "state")
+	statePath := filepath.Join(stateHome, "akit", "tlfeed", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateData, err := json.Marshal(dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: e.home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	graft := filepath.Join(bin, "graft")
+	if err := os.WriteFile(graft, []byte("#!/bin/sh\nshift 4\nTL_TEST_FALLBACK_CHILD_HELPER=1 GRAFT_THREADS=1 exec \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldThreshold := heavyThreshold
+	heavyThreshold = 0
+	t.Cleanup(func() { heavyThreshold = oldThreshold })
+	unsetEnv(t, "GRAFT_THREADS")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", e.home)
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	t.Setenv("TL_BACKEND", backendFiles)
+	t.Setenv("TL_SHADOW_RATE", "1")
+	journal := filepath.Join(dir, "journal.jsonl")
+	t.Setenv("TL_SHADOW_JOURNAL", journal)
+	var stderr bytes.Buffer
+	if code := start([]string{"--all", "--max", "0"}, e.now, io.Discard, &stderr); code != 0 {
+		t.Fatalf("files admission code=%d stderr=%s", code, stderr.String())
+	}
+	waitFor(t, "files-parent shadow journal row", func() bool { return countLines(t, journal) == 1 })
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec shadowRecord
+	if err := json.Unmarshal(bytes.TrimSpace(data), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Primary != backendFiles || rec.Diff != 0 {
+		t.Fatalf("admission child shadow record = %+v, want files primary and equal output", rec)
 	}
 }
 

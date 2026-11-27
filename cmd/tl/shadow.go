@@ -462,8 +462,11 @@ func (w *graftLogWriter) Flush() error {
 }
 
 func graftServiceLine(line string) bool {
-	return strings.HasPrefix(line, "graft: waiting") || strings.HasPrefix(line, "graft: admitted after ") ||
-		strings.HasPrefix(line, "graft: moved from ")
+	return strings.HasPrefix(line, "graft: waiting") ||
+		strings.HasPrefix(line, "graft: exec: waiting") || strings.HasPrefix(line, "graft: exec: ") && strings.Contains(line, ", waiting") ||
+		strings.HasPrefix(line, "graft: exec: heavy, admitted after ") ||
+		strings.Contains(line, "moved from ") && strings.HasPrefix(line, "graft: exec: ") ||
+		strings.HasPrefix(line, "graft: exec: runnable ")
 }
 
 func holdShadowSlots(spec shadowSpec) bool {
@@ -814,8 +817,8 @@ func appendShadowRecord(spec shadowSpec, rec shadowRecord) error {
 	if err != nil {
 		return fmt.Errorf("shadow result lock: %w", err)
 	}
-	defer release()
 	defer f.Close()
+	defer release()
 	state, err := io.ReadAll(f)
 	if err != nil {
 		return fmt.Errorf("read shadow result lock: %w", err)
@@ -876,13 +879,17 @@ func rememberShadowForm(form string) (_ bool, retErr error) {
 	if err != nil {
 		return false, fmt.Errorf("open seen shadow forms: %w", err)
 	}
-	release, lockFile, err := lockShadowResult(path + ".lock")
+	release, lockFile, acquired, err := lockShadowResultTimeout(path+".lock", time.Second)
 	if err != nil {
 		_ = file.Close()
 		return false, fmt.Errorf("lock seen shadow forms: %w", err)
 	}
-	defer release()
+	if !acquired {
+		_ = file.Close()
+		return false, nil
+	}
 	defer lockFile.Close()
+	defer release()
 	defer func() {
 		if err := file.Close(); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("close seen shadow forms: %w", err))

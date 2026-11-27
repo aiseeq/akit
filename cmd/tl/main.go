@@ -260,11 +260,13 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 }
 
 func prepareShadow(opts options, e *env, stderr io.Writer) {
-	if pick, err := pickShadow(opts, e.backend); err != nil {
-		printMasked(stderr, fmt.Sprintf("tl: %v; no shadow\n", err))
-	} else if pick {
-		e.collect = &answer{}
-		e.shadowPicked = true
+	if !e.fallbackChild {
+		if pick, err := pickShadow(opts, e.backend); err != nil {
+			printMasked(stderr, fmt.Sprintf("tl: %v; no shadow\n", err))
+		} else if pick {
+			e.collect = &answer{}
+			e.shadowPicked = true
+		}
 	}
 	if e.backend == backendDB && dbForm(opts) && !e.fallbackChild {
 		e.fallback = &fallbackState{}

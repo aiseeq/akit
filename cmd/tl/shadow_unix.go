@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
 // takeSlot holds the lock file at path until release or the end of the process; a nil release — another process
@@ -27,15 +28,39 @@ func takeSlot(path string) (func(), error) {
 }
 
 func lockShadowResult(path string) (func(), *os.File, error) {
+	release, f, _, err := lockShadowResultTimeout(path, 0)
+	return release, f, err
+}
+
+func lockShadowResultTimeout(path string, timeout time.Duration) (func(), *os.File, bool, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, nil, false, fmt.Errorf("open %s: %w", path, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("lock %s: %w", path, err)
+	if timeout <= 0 {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			f.Close()
+			return nil, nil, false, fmt.Errorf("lock %s: %w", path, err)
+		}
+	} else {
+		deadline := time.Now().Add(timeout)
+		for {
+			err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+				f.Close()
+				return nil, nil, false, fmt.Errorf("lock %s: %w", path, err)
+			}
+			if !time.Now().Before(deadline) {
+				f.Close()
+				return nil, nil, false, nil
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }, f, nil
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }, f, true, nil
 }
 
 // detached starts the repeat in a session of its own: it outlives the call and its terminal.
