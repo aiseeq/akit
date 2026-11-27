@@ -11,8 +11,19 @@ import (
 const (
 	eventRetentionDays    = int(transcript.EventRetention / (24 * time.Hour))
 	eventUsageRebuildDays = eventRetentionDays - 1
-	retainedEventKinds    = "kind = 'claude' AND role IN ('user', 'ask')"
 )
+
+// retainedEventKinds is the SQL form of transcript.EventKeptForever.
+var retainedEventKinds = "kind IN (" + sqlList(transcript.KeptForeverKinds) + ") AND role IN (" +
+	sqlList(transcript.KeptForeverRoles) + ")"
+
+func sqlList[T ~string](values []T) string {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = "'" + string(v) + "'"
+	}
+	return strings.Join(quoted, ", ")
+}
 
 func eventTTL() string {
 	return "toDateTime(ts) + INTERVAL " + strconv.Itoa(eventRetentionDays) + " DAY DELETE WHERE NOT (" + retainedEventKinds + ")"

@@ -150,11 +150,7 @@ func dbRetentionExceeded(opts options, sources []source, files map[string]*dbFil
 		return true
 	}
 	for _, src := range sources {
-		kind := "claude"
-		if isCodexRollout(src.Path) {
-			kind = "codex"
-		}
-		if rolesKeptForever(opts, kind) {
+		if rolesKeptForever(opts, kindOfSource(src)) {
 			continue
 		}
 		if f := files[src.Path]; f != nil && !f.first.IsZero() && f.first.Before(cutoff) {

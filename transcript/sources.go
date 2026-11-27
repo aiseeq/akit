@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -18,10 +19,18 @@ import (
 // EventRetention is the age after which the loader may remove transcript events.
 const EventRetention = 90 * 24 * time.Hour
 
-// EventKeptForever tells whether the loader keeps an event of this transcript kind ("claude" or "codex") and role
-// past EventRetention: the words of the user in Claude Code sessions.
+// KeptForeverKinds and KeptForeverRoles are the transcript kinds (as the loader stores them: claude, sub, codex,
+// codex-ext) and the roles whose events the loader keeps past EventRetention: the words of the user in Claude Code
+// transcripts. A subagent transcript has no events of these roles (its brief is a note), so listing it keeps nothing
+// more; it makes the rule hold for every Claude Code transcript.
+var (
+	KeptForeverKinds = []string{"claude", "sub"}
+	KeptForeverRoles = []Role{User, Ask}
+)
+
+// EventKeptForever tells whether the loader keeps an event of this transcript kind and role past EventRetention.
 func EventKeptForever(kind string, role Role) bool {
-	return kind == "claude" && (role == User || role == Ask)
+	return slices.Contains(KeptForeverKinds, kind) && slices.Contains(KeptForeverRoles, role)
 }
 
 // Source describes a transcript file and, for a subagent, its parent.

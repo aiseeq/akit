@@ -419,7 +419,8 @@ func TestDBRetentionKeepsClaudeUserWords(t *testing.T) {
 	old := now.Add(-100 * 24 * time.Hour)
 	claude := "/p/session.jsonl"
 	codex := "/w/rollout-2026-08-01T10-00-00-0199aaaa-0000-7000-8000-000000000001.jsonl"
-	files := map[string]*dbFile{claude: {path: claude, first: old}, codex: {path: codex, first: old}}
+	sub := "/p/session/subagents/agent-a1.jsonl"
+	files := map[string]*dbFile{claude: {path: claude, first: old}, codex: {path: codex, first: old}, sub: {path: sub, first: old}}
 	userWords := map[transcript.Role]bool{transcript.User: true, transcript.Ask: true}
 	for _, tc := range []struct {
 		name    string
@@ -434,6 +435,8 @@ func TestDBRetentionKeepsClaudeUserWords(t *testing.T) {
 		{"user words of an old window with codex", options{roles: userWords, codex: true, since: old}, nil, true},
 		{"user words of an old window with codex-ext", options{roles: userWords, codexExt: true, since: old}, nil, true},
 		{"no role filter", options{}, []source{{Path: claude}}, true},
+		{"user words of an old subagent", options{roles: userWords}, []source{{Path: sub, ParentID: "session"}}, false},
+		{"agent of an old subagent", options{roles: map[transcript.Role]bool{transcript.Agent: true}}, []source{{Path: sub, ParentID: "session"}}, true},
 	} {
 		if got := dbRetentionExceeded(tc.opts, tc.sources, files, now); got != tc.want {
 			t.Errorf("%s: dbRetentionExceeded = %t, want %t", tc.name, got, tc.want)

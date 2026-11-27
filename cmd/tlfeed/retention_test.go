@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const literalEventTTL = "toDateTime(ts) + INTERVAL 90 DAY DELETE WHERE NOT (kind = 'claude' AND role IN ('user', 'ask'))"
+const literalEventTTL = "toDateTime(ts) + INTERVAL 90 DAY DELETE WHERE NOT (kind IN ('claude', 'sub') AND role IN ('user', 'ask'))"
 
 func TestEventTTLInSchema(t *testing.T) {
 	var eventsDDL string
@@ -36,11 +36,11 @@ func TestRetentionSQL(t *testing.T) {
 	if got, want := eventTTL(), literalEventTTL; got != want {
 		t.Fatalf("event TTL %q, want %q", got, want)
 	}
-	if got, want := eventRetentionPredicate("ts"), "(toDateTime(ts) + INTERVAL 90 DAY > now() OR (kind = 'claude' AND role IN ('user', 'ask')))"; got != want {
+	if got, want := eventRetentionPredicate("ts"), "(toDateTime(ts) + INTERVAL 90 DAY > now() OR (kind IN ('claude', 'sub') AND role IN ('user', 'ask')))"; got != want {
 		t.Fatalf("retention predicate %q, want %q", got, want)
 	}
 	at := time.Date(2026, 11, 23, 12, 34, 56, 0, time.UTC)
-	if got, want := eventRetentionPredicateAt("ts", at), "(toDateTime(ts) + INTERVAL 90 DAY > toDateTime('2026-11-23 12:34:56', 'UTC') OR (kind = 'claude' AND role IN ('user', 'ask')))"; got != want {
+	if got, want := eventRetentionPredicateAt("ts", at), "(toDateTime(ts) + INTERVAL 90 DAY > toDateTime('2026-11-23 12:34:56', 'UTC') OR (kind IN ('claude', 'sub') AND role IN ('user', 'ask')))"; got != want {
 		t.Fatalf("fixed retention predicate %q, want %q", got, want)
 	}
 	if got, want := eventWithinRetentionAt("ts", at, eventUsageRebuildDays), "toDateTime(ts) + INTERVAL 89 DAY > toDateTime('2026-11-23 12:34:56', 'UTC')"; got != want {
@@ -63,7 +63,9 @@ func TestEventRetainedBoundaries(t *testing.T) {
 		{"old-claude-user", "claude", "user", cut.Add(-24 * time.Hour), true},
 		{"old-claude-ask", "claude", "ask", cut.Add(-24 * time.Hour), true},
 		{"old-claude-peer", "claude", "peer", cut.Add(-24 * time.Hour), false},
-		{"old-sub-user", "sub", "user", cut.Add(-24 * time.Hour), false},
+		{"old-sub-user", "sub", "user", cut.Add(-24 * time.Hour), true},
+		{"old-sub-agent", "sub", "agent", cut.Add(-24 * time.Hour), false},
+		{"old-codex-ext-user", "codex-ext", "user", cut.Add(-24 * time.Hour), false},
 		{"old-codex-user", "codex", "user", cut.Add(-24 * time.Hour), false},
 	}
 	for _, tc := range cases {
@@ -84,7 +86,7 @@ type retentionEvent struct {
 // boolean operator, and exception list. The fake server uses this instead of duplicating the Go retention rule.
 var (
 	retentionComparisonRE = regexp.MustCompile(`toDateTime\(ts\) \+ INTERVAL (\d+) DAY (>|<=) (?:toDateTime\('([^']+)', 'UTC'\)|now\(\))`)
-	retentionExceptionRE  = regexp.MustCompile(`kind = '([^']+)' AND role IN \(([^)]*)\)`)
+	retentionExceptionRE  = regexp.MustCompile(`kind IN \(([^)]*)\) AND role IN \(([^)]*)\)`)
 	retentionRoleRE       = regexp.MustCompile(`'([^']+)'`)
 )
 
@@ -111,11 +113,15 @@ func retainedByRetentionSQL(query string, at time.Time, kind, role string) (bool
 	if ex == nil {
 		return within, nil
 	}
-	keptRole := false
-	for _, r := range retentionRoleRE.FindAllStringSubmatch(ex[2], -1) {
-		keptRole = keptRole || role == r[1]
+	listed := func(list, value string) bool {
+		for _, v := range retentionRoleRE.FindAllStringSubmatch(list, -1) {
+			if v[1] == value {
+				return true
+			}
+		}
+		return false
 	}
-	kept := kind == ex[1] && keptRole
+	kept := listed(ex[1], kind) && listed(ex[2], role)
 	switch {
 	case strings.Contains(query, " OR "):
 		return within || kept, nil
@@ -222,15 +228,15 @@ func TestCheckUsesTranscriptKind(t *testing.T) {
 	old := now.Add(-91 * 24 * time.Hour)
 	path := t.TempDir() + "/session.jsonl"
 	data := fmt.Appendf(nil,
-		`{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":%q,"message":{"role":"user","content":"old sub user"}}`+"\n", old.Format("2006-01-02T15:04:05.000Z"))
+		`{"parentUuid":null,"type":"user","origin":{"kind":"human"},"timestamp":%q,"message":{"role":"user","content":"old codex user"}}`+"\n", old.Format("2006-01-02T15:04:05.000Z"))
 	write(t, path, data)
 	c := &checker{out: io.Discard}
-	r := []string{path, "1", strconv.Itoa(len(data)), "1", "0", "1", "sub"}
+	r := []string{path, "1", strconv.Itoa(len(data)), "1", "0", "1", "codex"}
 	if err := c.checkFile(path, r, [2]string{"1", "1"}, "0", now); err != nil {
 		t.Fatal(err)
 	}
 	if c.bad != 0 {
-		t.Fatal("old user event of a sub file was counted as retained")
+		t.Fatal("old user event of a codex file was counted as retained")
 	}
 }
 
