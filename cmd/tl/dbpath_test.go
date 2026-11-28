@@ -1281,6 +1281,98 @@ func TestDBFallsBackForFilesMissingFromFilesTable(t *testing.T) {
 	}
 }
 
+func TestDBFindRotatedTranscriptByID(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	path := paths[1]
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	for _, args := range [][]string{{dbOtherSession[:8]}, {dbOtherSession[:8] + ":2"}} {
+		code, out, stderr := runTL(t, e, args...)
+		if code != 0 || !strings.Contains(out, "простое решение") || strings.Contains(stderr, "no transcript with this id") {
+			t.Errorf("rotated transcript %v: code=%d out=%q stderr=%q", args, code, out, stderr)
+		}
+	}
+}
+
+func TestDBFindPrefersDiskTranscriptToStalePrefix(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	stale := *ch.files[0]
+	stale.session = dbOtherSession[:8] + "-stale"
+	stale.path = filepath.Join(t.TempDir(), stale.session+".jsonl")
+	stale.id += 1
+	if stale.id == ch.files[1].id || len(stale.events) == 0 || stale.events[0].ev.Shown() == ch.files[1].events[0].ev.Shown() {
+		t.Fatalf("fixture must have distinct file ids and event data: disk=%+v stale=%+v", ch.files[1], &stale)
+	}
+	ch.files = append(ch.files, &stale)
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, dbOtherSession[:8])
+	if code != 0 || !strings.Contains(out, "простое решение") || strings.Contains(out, "привет, сделай sub") || strings.Contains(stderr, "ambiguous") {
+		t.Fatalf("disk transcript did not win over stale row: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+}
+
+func TestDBSubagentsUseStoredFilesWhenRotated(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	if err := os.Remove(paths[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(paths[2]); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, out, stderr := runTL(t, e, dbOtherSession[:8], "--subagents", "--role", "all", "--max", "0")
+	if code != 0 || !strings.Contains(out, "задача субагенту: sub") || strings.Contains(stderr, "reading files instead") {
+		t.Fatalf("rotated db subagent missing: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+}
+
+func TestDBFindAmbiguousRotatedPrefix(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	stale := *ch.files[1]
+	stale.session = "5e6f7a8b-1111-4000-8000-000000000003"
+	stale.path = filepath.Join(t.TempDir(), stale.session+".jsonl")
+	ch.files = append(ch.files, &stale)
+	if err := os.Remove(paths[1]); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, _, stderr := runTL(t, e, dbOtherSession[:8])
+	if code != exitUsage || !strings.Contains(stderr, "ambiguous") {
+		t.Fatalf("two rotated matches: code=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestDBFindMissingIDKeepsExistingError(t *testing.T) {
+	e, paths, _ := dbCorpus(t)
+	ch := newFakeCH(t, paths, map[string]int{})
+	srv := httptest.NewServer(ch)
+	defer srv.Close()
+	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
+	e.backend = backendDB
+	code, _, stderr := runTL(t, e, "ffffff00")
+	if code == 0 || !strings.Contains(stderr, "no transcript with this id in the database") {
+		t.Fatalf("missing ID error changed: code=%d stderr=%q", code, stderr)
+	}
+}
+
 func TestDBDoesNotReadUnloadedTail(t *testing.T) {
 	e, paths, _ := dbCorpus(t)
 	unloaded := map[string]int{paths[1]: 2}

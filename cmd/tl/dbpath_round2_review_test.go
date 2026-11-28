@@ -168,8 +168,8 @@ func TestDBFindPrioritizesLiveNames(t *testing.T) {
 func TestDBFindSkipsGoneIDPrefix(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gone-00000000-0000-4000-8000-000000000001.jsonl")
 	d := &dbPath{e: env{home: t.TempDir()}, files: map[string]*dbFile{path: {path: path, name: "gone-session", session: "gone0000"}}}
-	if _, err := d.findAfterLive("gone0000", nil, nil); err == nil || strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("gone file participated in ID lookup: %v", err)
+	if got, err := d.findAfterLive("gone0000", nil, nil); err != nil || got != path {
+		t.Fatalf("gone file lookup = %q, %v; want database path %q", got, err, path)
 	}
 }
 

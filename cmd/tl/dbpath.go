@@ -390,10 +390,33 @@ func (d *dbPath) resolveSessions() ([]source, error) {
 			if err != nil {
 				return nil, err
 			}
+			if len(subs) == 0 {
+				subs = d.dbSubSources(path)
+			}
 			out = append(out, subs...)
 		}
 	}
 	return out, nil
+}
+
+// dbSubSources returns stored children only when the parent has no subagent files on disk.
+func (d *dbPath) dbSubSources(parentPath string) []source {
+	parent := d.files[parentPath]
+	if parent == nil {
+		return nil
+	}
+	parentID := parent.session
+	if parentID == "" {
+		parentID = sourceFullID(source{Path: parentPath, ID: parentPath})
+	}
+	var out []source
+	for _, f := range d.files {
+		if f.kind == "sub" && f.parent == parentID {
+			out = append(out, source{Path: f.path, ID: f.session, ParentID: f.parent, Description: f.desc})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
 }
 
 func (d *dbPath) resolveAll() ([]source, error) {
@@ -465,7 +488,7 @@ func (d *dbPath) findAfterLive(arg string, alive map[string]session.Info, aliveE
 	if len(arg) < 6 {
 		return "", fmt.Errorf("%q: session id must be at least 6 characters", arg)
 	}
-	var matches []string
+	var matches, rotated []string
 	for path, f := range d.files {
 		if f.kind == transcriptdb.KindCodexExt {
 			continue // named by its path only, as in the files
@@ -474,9 +497,18 @@ func (d *dbPath) findAfterLive(arg string, alive map[string]session.Info, aliveE
 		if id == "" {
 			id = sourceFullID(source{Path: path, ID: path})
 		}
-		if (strings.HasPrefix(id, arg) || strings.HasPrefix(sourceFullID(source{Path: path, ID: path}), arg)) && dbTranscriptPresent(path) {
-			matches = append(matches, path)
+		if strings.HasPrefix(id, arg) || strings.HasPrefix(sourceFullID(source{Path: path, ID: path}), arg) {
+			if dbTranscriptPresent(path) {
+				matches = append(matches, path)
+			} else {
+				rotated = append(rotated, path)
+			}
 		}
+	}
+	// Prefer names that still exist on disk. Rotated names remain usable from the database
+	// only when no live candidate matches the prefix.
+	if len(matches) == 0 {
+		matches = rotated
 	}
 	sort.Strings(matches)
 	if len(matches) == 1 {
