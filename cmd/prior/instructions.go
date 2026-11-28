@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type instructionRoot struct {
@@ -113,15 +115,7 @@ func instructions(w io.Writer, q query, roots []instructionRoot, home string, no
 	files, fileNotes := instructionFiles(roots)
 	allNotes := append(slicesClone(notes), fileNotes...)
 	docs := readInstructionDocs(files, home, &allNotes)
-	var builtLines = make(map[string]bool)
-	for _, doc := range docs {
-		if !doc.fragment {
-			for _, line := range doc.lines {
-				builtLines[normalizeInstruction(line.text)] = true
-			}
-		}
-	}
-	hits := instructionMatches(q, docs, builtLines)
+	hits := instructionMatches(q, docs, builtInstructionLines(docs))
 	for _, note := range uniqueStrings(allNotes) {
 		fmt.Fprintln(w, note)
 	}
@@ -157,6 +151,12 @@ func instructions(w io.Writer, q query, roots []instructionRoot, home string, no
 func instructionFiles(roots []instructionRoot) ([]instructionFile, []string) {
 	byPath := make(map[string]instructionFile)
 	var notes []string
+	addResolved := func(real string, root instructionRoot) {
+		real = filepath.Clean(real)
+		if existing, ok := byPath[real]; !ok || (existing.fragment && !root.fragment) {
+			byPath[real] = instructionFile{path: real, fragment: root.fragment}
+		}
+	}
 	add := func(path string, root instructionRoot) {
 		real, err := filepath.EvalSymlinks(path)
 		if err != nil {
@@ -165,10 +165,7 @@ func instructionFiles(roots []instructionRoot) ([]instructionFile, []string) {
 			}
 			return
 		}
-		real = filepath.Clean(real)
-		if existing, ok := byPath[real]; !ok || (existing.fragment && !root.fragment) {
-			byPath[real] = instructionFile{path: real, fragment: root.fragment}
-		}
+		addResolved(real, root)
 	}
 	for _, root := range roots {
 		info, err := os.Stat(root.path)
@@ -184,20 +181,7 @@ func instructionFiles(roots []instructionRoot) ([]instructionFile, []string) {
 			}
 			continue
 		}
-		walkErr := filepath.WalkDir(root.path, func(path string, entry fs.DirEntry, err error) error {
-			if err != nil {
-				notes = append(notes, fmt.Sprintf("(каталог инструкций не прочитался: %s: %v)", path, err))
-				return nil
-			}
-			if entry.IsDir() || (!root.anyFile && filepath.Ext(path) != ".md") {
-				return nil
-			}
-			add(path, root)
-			return nil
-		})
-		if walkErr != nil {
-			notes = append(notes, fmt.Sprintf("(каталог инструкций не прочитался: %s: %v)", root.path, walkErr))
-		}
+		walkInstructionRoot(root, addResolved, add, func(note string) { notes = append(notes, note) })
 	}
 	files := make([]instructionFile, 0, len(byPath))
 	for _, file := range byPath {
@@ -212,6 +196,32 @@ func instructionFiles(roots []instructionRoot) ([]instructionFile, []string) {
 	return files, uniqueStrings(notes)
 }
 
+// walkInstructionRoot adds the instruction files below a directory root and passes what did not read to note, in
+// walk order. addResolved takes a path already free of links, add one that may still be or contain a link.
+func walkInstructionRoot(root instructionRoot, addResolved, add func(string, instructionRoot), note func(string)) {
+	// WalkDir does not descend into linked directories, so below the resolved root only a linked file itself
+	// needs EvalSymlinks; resolving every path would lstat each of its components.
+	realRoot, rootErr := filepath.EvalSymlinks(root.path)
+	walkErr := filepath.WalkDir(root.path, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			note(fmt.Sprintf("(каталог инструкций не прочитался: %s: %v)", path, err))
+			return nil
+		}
+		if entry.IsDir() || (!root.anyFile && filepath.Ext(path) != ".md") {
+			return nil
+		}
+		if rel, relErr := filepath.Rel(root.path, path); rootErr == nil && relErr == nil && entry.Type()&fs.ModeSymlink == 0 {
+			addResolved(filepath.Join(realRoot, rel), root)
+			return nil
+		}
+		add(path, root)
+		return nil
+	})
+	if walkErr != nil {
+		note(fmt.Sprintf("(каталог инструкций не прочитался: %s: %v)", root.path, walkErr))
+	}
+}
+
 func readInstructionDocs(files []instructionFile, home string, notes *[]string) []instructionDoc {
 	canonicalHome, err := filepath.EvalSymlinks(home)
 	if err != nil {
@@ -220,7 +230,7 @@ func readInstructionDocs(files []instructionFile, home string, notes *[]string) 
 	}
 	var docs []instructionDoc
 	for _, file := range files {
-		data, err := os.ReadFile(file.path)
+		data, err := readFileRaw(file.path)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				*notes = append(*notes, fmt.Sprintf("(инструкция не прочиталась: %s: %v)", file.path, err))
@@ -283,7 +293,26 @@ func fragmentBody(lines []instructionLine, path string) ([]instructionLine, bool
 	return lines[end+1:], false
 }
 
-func instructionMatches(q query, docs []instructionDoc, builtLines map[string]bool) []instructionHit {
+// builtInstructionLines returns a lookup of normalized lines of non-fragment documents, built on first use:
+// only a matched fragment line needs it.
+func builtInstructionLines(docs []instructionDoc) func(string) bool {
+	var built map[string]bool
+	return func(normalized string) bool {
+		if built == nil {
+			built = make(map[string]bool)
+			for _, doc := range docs {
+				if !doc.fragment {
+					for _, line := range doc.lines {
+						built[normalizeInstruction(line.text)] = true
+					}
+				}
+			}
+		}
+		return built[normalized]
+	}
+}
+
+func instructionMatches(q query, docs []instructionDoc, builtLines func(string) bool) []instructionHit {
 	var hits []instructionHit
 	for _, doc := range docs {
 		body := make([]string, len(doc.lines))
@@ -293,7 +322,7 @@ func instructionMatches(q query, docs []instructionDoc, builtLines map[string]bo
 		matches := matchingLines(q, []byte(strings.Join(body, "\n")), q.runs)
 		for _, match := range matches {
 			line := doc.lines[match.number-1]
-			if doc.fragment && builtLines[normalizeInstruction(line.text)] {
+			if doc.fragment && builtLines(normalizeInstruction(line.text)) {
 				continue
 			}
 			rows := []instructionLine{line}
@@ -335,8 +364,43 @@ func previousRuleLine(lines []instructionLine, before int) *instructionLine {
 	return nil
 }
 
+// normalizeInstruction is strings.ToLower(strings.Join(strings.Fields(strings.ReplaceAll(line, "`", "")), " "))
+// in one pass: fields split at Unicode spaces, runes lowered one by one, invalid bytes become U+FFFD.
 func normalizeInstruction(line string) string {
-	return strings.ToLower(strings.Join(strings.Fields(strings.ReplaceAll(line, "`", "")), " "))
+	if strings.IndexByte(line, '`') >= 0 {
+		line = strings.ReplaceAll(line, "`", "")
+	}
+	out := make([]byte, 0, len(line))
+	space := false
+	for i := 0; i < len(line); {
+		c := line[i]
+		if c < utf8.RuneSelf {
+			i++
+			if c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' {
+				space = len(out) > 0
+				continue
+			}
+			if space {
+				out, space = append(out, ' '), false
+			}
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			out = append(out, c)
+			continue
+		}
+		r, n := utf8.DecodeRuneInString(line[i:])
+		i += n
+		if unicode.IsSpace(r) {
+			space = len(out) > 0
+			continue
+		}
+		if space {
+			out, space = append(out, ' '), false
+		}
+		out = utf8.AppendRune(out, unicode.ToLower(r))
+	}
+	return string(out)
 }
 
 func slicesClone(values []string) []string {

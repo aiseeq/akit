@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"regexp/syntax"
@@ -157,6 +158,59 @@ func foldText(text string) string {
 	return folded.String()
 }
 
+// appendFold appends foldText(string(src)) to dst without building an intermediate string.
+func appendFold(dst, src []byte) []byte {
+	for i := 0; i < len(src); {
+		b := src[i]
+		if b < utf8.RuneSelf {
+			if b >= 'a' && b <= 'z' {
+				b -= 'a' - 'A'
+			}
+			dst = append(dst, b)
+			i++
+			continue
+		}
+		// Two-byte sequences (Cyrillic, Greek, Latin supplements) are decoded inline: they dominate non-ASCII text.
+		if b >= 0xC2 && b < 0xE0 && i+1 < len(src) && src[i+1]&0xC0 == 0x80 {
+			r := bmpFold[rune(b&0x1F)<<6|rune(src[i+1]&0x3F)]
+			if r >= 0x80 && r < 0x800 {
+				dst = append(dst, 0xC0|byte(r>>6), 0x80|byte(r&0x3F))
+			} else {
+				dst = utf8.AppendRune(dst, r)
+			}
+			i += 2
+			continue
+		}
+		r, n := utf8.DecodeRune(src[i:])
+		dst = utf8.AppendRune(dst, foldRuneFast(r))
+		i += n
+	}
+	return dst
+}
+
+func runMayMatchBytes(data []byte, literals []runNeedle) bool {
+	for _, needle := range literals {
+		found := true
+		for _, variants := range needle {
+			part := false
+			for _, variant := range variants {
+				if bytes.Contains(data, []byte(variant)) {
+					part = true
+					break
+				}
+			}
+			if !part {
+				found = false
+				break
+			}
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 func runMayMatch(data string, literals []runNeedle) bool {
 	for _, needle := range literals {
 		found := true
@@ -183,7 +237,7 @@ func runMayMatch(data string, literals []runNeedle) bool {
 // runMayMatchASCII rejects lines that lack a required ASCII literal before Unicode
 // folding. Non-ASCII literals are left to runMayMatch, so this filter cannot reject
 // a possible Unicode case-fold match.
-func runMayMatchASCII(data string, literals []runNeedle) bool {
+func runMayMatchASCII[T string | []byte](data T, literals []runNeedle) bool {
 	for _, needle := range literals {
 		possible := true
 		for _, variants := range needle {
@@ -224,7 +278,7 @@ func safeFoldedASCII(text string) bool {
 	return true
 }
 
-func containsFoldedASCII(text, needle string) bool {
+func containsFoldedASCII[T string | []byte](text T, needle string) bool {
 	if len(needle) == 0 {
 		return true
 	}

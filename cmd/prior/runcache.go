@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,35 +10,43 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"unicode/utf8"
 )
 
 const (
 	runCacheVersion        = 10
 	transcriptCacheVersion = 6
 	cacheDirMode           = 0700
-	runBloomBytes          = 768
-	runIndexBloomBytes     = 128
+	// The index keeps the full per-report bloom, so a rejected report needs no file of its own in the cache.
+	runBloomBytes      = 768
+	runIndexBloomBytes = runBloomBytes
 	// Two probes reduce false positives for long reports at the fixed index size.
 	runBloomHashes        = 2
-	runHeaderBytes        = 24 + 16 + runBloomBytes
 	runIndexKeyBytes      = 32
 	runIndexMetadataBytes = 52
 	runIndexRecordBytes   = runIndexKeyBytes + runIndexMetadataBytes + runIndexBloomBytes
 	bloomFnvPrime         = uint64(1099511628211)
 )
 
-var runCacheMagic = [4]byte{'P', 'R', 'V', 'A'}
-var replyCacheMagic = [4]byte{'R', 'P', 'L', '2'}
-var runIndexMagic = [8]byte{'P', 'R', 'I', 'D', 'X', '0', '1', '4'}
+var runIndexMagic = [8]byte{'P', 'R', 'I', 'D', 'X', '0', '1', '6'}
+
+// runIndexName is the report index file. Its absence marks a cache that may still hold files of earlier layouts:
+// the call that writes the index first removes them (removeOldLayoutCacheFiles).
+const runIndexName = "runs-index-v14.bin"
+
 var openPriorSource = os.Open
 
 type transcriptLinesCache struct {
@@ -66,9 +73,49 @@ type replyPrewarmCache struct {
 	PrefixHash   []byte `json:"prefix_hash"`
 }
 
+// runIndexManifest is the report index. A loaded index keeps the file's records as they are, sorted by path
+// hash, and decodes only the entry a report looks up; an index being built keeps its entries in Files.
 type runIndexManifest struct {
 	Version int                      `json:"version"`
 	Files   map[string]runIndexEntry `json:"files"`
+	records []byte
+	missing bool // no index file existed
+}
+
+func (index runIndexManifest) count() int {
+	return len(index.Files) + len(index.records)/runIndexRecordBytes
+}
+
+// lookup returns the current entry of path. A record whose bloom fails its checksum counts as absent, so the
+// report is read and its entry written anew.
+func (index runIndexManifest) lookup(path string) (runIndexEntry, bool) {
+	if entry, ok := index.Files[runIndexKey(path)]; ok {
+		return entry, true
+	}
+	key := sha256.Sum256([]byte(path))
+	n := len(index.records) / runIndexRecordBytes
+	i := sort.Search(n, func(i int) bool {
+		return bytes.Compare(index.records[i*runIndexRecordBytes:i*runIndexRecordBytes+runIndexKeyBytes], key[:]) >= 0
+	})
+	if i == n {
+		return runIndexEntry{}, false
+	}
+	record := index.records[i*runIndexRecordBytes : (i+1)*runIndexRecordBytes]
+	if !bytes.Equal(record[:runIndexKeyBytes], key[:]) {
+		return runIndexEntry{}, false
+	}
+	metadata := record[runIndexKeyBytes : runIndexKeyBytes+runIndexMetadataBytes]
+	bloom := record[runIndexKeyBytes+runIndexMetadataBytes:]
+	entry := runIndexEntry{
+		Size: int64(binary.LittleEndian.Uint64(metadata[:8])), ModTime: int64(binary.LittleEndian.Uint64(metadata[8:16])),
+		Device: binary.LittleEndian.Uint64(metadata[16:24]), Inode: binary.LittleEndian.Uint64(metadata[24:32]),
+		CRC: binary.LittleEndian.Uint32(metadata[32:36]), Bloom: bloom[:len(bloom):len(bloom)],
+	}
+	copy(entry.ContentHash[:], metadata[36:52])
+	if entry.Size < 0 || crc32.ChecksumIEEE(bloom) != entry.CRC {
+		return runIndexEntry{}, false
+	}
+	return entry, true
 }
 
 type runIndexEntry struct {
@@ -292,8 +339,9 @@ func saveCacheBytes(path string, data []byte) (err error) {
 	return nil
 }
 
-func readCachedReplies(path string) ([]byte, error) {
-	cacheFile := replyCachePath(path)
+// readReplies reads the reply journal and returns a snapshot that did not change while it was read. The
+// journal is read from its file every time: a full read costs less than unpacking a compressed copy of it.
+func readReplies(path string) ([]byte, error) {
 	var lastData []byte
 	for attempt := 1; attempt <= 3; attempt++ {
 		source, err := openPriorSource(path)
@@ -304,7 +352,7 @@ func readCachedReplies(path string) ([]byte, error) {
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("журнал ответов не прочитался: %w", err), source.Close())
 		}
-		device, inode, identityOK := fileIdentity(info)
+		_, _, identityOK := fileIdentity(info)
 		if !identityOK || !info.Mode().IsRegular() {
 			data, readErr := io.ReadAll(source)
 			closeErr := source.Close()
@@ -320,11 +368,13 @@ func readCachedReplies(path string) ([]byte, error) {
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("журнал ответов не прочитался: %w", err), source.Close())
 		}
-		data, err := replyDataFromSource(source, cacheFile, info, device, inode)
-		if err != nil {
-			return nil, errors.Join(err, source.Close())
+		data := make([]byte, 0, info.Size()+bytes.MinRead)
+		buf := bytes.NewBuffer(data)
+		if _, err := buf.ReadFrom(io.NewSectionReader(source, 0, math.MaxInt64)); err != nil {
+			return nil, errors.Join(fmt.Errorf("журнал ответов не прочитался: %w", err), source.Close())
 		}
-		lastData = append(lastData[:0], data...)
+		data = buf.Bytes()
+		lastData = data // each attempt reads into a buffer of its own
 		if replyReadAttemptHook != nil {
 			replyReadAttemptHook(path, attempt)
 		}
@@ -339,41 +389,12 @@ func readCachedReplies(path string) ([]byte, error) {
 		if !stable {
 			continue
 		}
-		if cacheFile != "" {
-			logCacheError(writeReplyCache(cacheFile, info, device, inode, beforeHash, data))
-		}
 		return data, nil
 	}
 	return lastData, nil
 }
 
 var replyReadAttemptHook func(string, int)
-
-func replyDataFromSource(source *os.File, cacheFile string, info os.FileInfo, device, inode uint64) ([]byte, error) {
-	var data []byte
-	if cacheFile != "" {
-		state, cacheErr := readReplyCache(cacheFile, source, info, device, inode)
-		logCacheError(cacheErr)
-		if state.Valid {
-			return state.Data, nil
-		}
-		if state.PrefixValid && state.Size < info.Size() && len(state.Data) > 0 && state.Data[len(state.Data)-1] == '\n' {
-			data, cacheErr = appendReplyTailFile(source, info.Size(), state.Size, state.Data)
-			logCacheError(cacheErr)
-		}
-	}
-	if data != nil {
-		return data, nil
-	}
-	if _, err := source.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("журнал ответов не позиционировался: %w", err)
-	}
-	data, err := io.ReadAll(source)
-	if err != nil {
-		return nil, fmt.Errorf("журнал ответов не прочитался: %w", err)
-	}
-	return data, nil
-}
 
 func replySourceStable(path string, source *os.File, info os.FileInfo, data, beforeHash []byte) (bool, error) {
 	after, statErr := source.Stat()
@@ -386,198 +407,44 @@ func replySourceStable(path string, source *os.File, info os.FileInfo, data, bef
 		after.ModTime().Equal(info.ModTime()) && int64(len(data)) == info.Size() && bytes.Equal(beforeHash, afterHash), nil
 }
 
-func appendReplyTailFile(f *os.File, size, offset int64, prefix []byte) ([]byte, error) {
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("журнал не позиционировался: %w", err)
-	}
-	tail, readErr := io.ReadAll(io.LimitReader(f, size-offset+1))
-	if readErr != nil {
-		return nil, fmt.Errorf("дописанный журнал не прочитался: %w", readErr)
-	}
-	if int64(len(tail)) != size-offset {
-		return nil, nil
-	}
-	return append(prefix, tail...), nil
-}
-
-func replyCachePath(path string) string {
-	hash := sha256.Sum256([]byte(path))
-	return cachePath("replies-" + hex.EncodeToString(hash[:]) + ".bin")
-}
-
-type replyCacheState struct {
-	Data        []byte
-	Size        int64
-	Valid       bool
-	PrefixValid bool
-}
-
-const replyCacheHeaderBytes = 68
-
-func readReplyCache(path string, source *os.File, sourceInfo os.FileInfo, device, inode uint64) (replyCacheState, error) {
-	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return replyCacheState{}, nil
-	}
-	if err != nil {
-		return replyCacheState{}, fmt.Errorf("кэш журнала не открылся: %w", err)
-	}
-	header := make([]byte, replyCacheHeaderBytes)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return replyCacheState{}, errors.Join(fmt.Errorf("заголовок кэша журнала не прочитался: %w", err), f.Close())
-	}
-	if !bytes.Equal(header[:4], replyCacheMagic[:]) {
-		return replyCacheState{}, errors.Join(fmt.Errorf("формат кэша журнала не подходит"), f.Close())
-	}
-	size := int64(binary.LittleEndian.Uint64(header[4:12]))
-	mtime := int64(binary.LittleEndian.Uint64(header[12:20]))
-	cacheDevice := binary.LittleEndian.Uint64(header[20:28])
-	cacheInode := binary.LittleEndian.Uint64(header[28:36])
-	if size < 0 || size > sourceInfo.Size() || cacheDevice != device || cacheInode != inode {
-		if err := f.Close(); err != nil {
-			return replyCacheState{}, fmt.Errorf("кэш журнала не закрылся: %w", err)
-		}
-		return replyCacheState{}, nil
-	}
-	prefixHash := make([]byte, sha256.Size)
-	copy(prefixHash, header[36:replyCacheHeaderBytes])
-	actualHash, hashErr := filePrefixHash(source, size)
-	if hashErr != nil {
-		return replyCacheState{}, errors.Join(hashErr, f.Close())
-	}
-	if !bytes.Equal(prefixHash, actualHash) || (size == sourceInfo.Size() && mtime != sourceInfo.ModTime().UnixNano()) {
-		closeErr := f.Close()
-		if closeErr != nil {
-			return replyCacheState{}, fmt.Errorf("кэш журнала не закрылся: %w", closeErr)
-		}
-		return replyCacheState{}, nil
-	}
-	compressed, err := io.ReadAll(io.LimitReader(f, size+(1<<20)))
-	closeErr := f.Close()
-	if err != nil {
-		return replyCacheState{}, fmt.Errorf("тело кэша журнала не прочиталось: %w", err)
-	}
-	if closeErr != nil {
-		return replyCacheState{}, fmt.Errorf("кэш журнала не закрылся: %w", closeErr)
-	}
-	data, err := decompressRun(compressed, size)
-	if err != nil || int64(len(data)) != size {
-		return replyCacheState{}, fmt.Errorf("кэш журнала повреждён")
-	}
-	return replyCacheState{Data: data, Size: size, PrefixValid: true, Valid: size == sourceInfo.Size() && mtime == sourceInfo.ModTime().UnixNano()}, nil
-}
-
-func writeReplyCache(path string, info os.FileInfo, device, inode uint64, prefixHash, data []byte) error {
-	var compressed bytes.Buffer
-	gz, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-	if err != nil {
-		return fmt.Errorf("компрессор журнала не создался: %w", err)
-	}
-	if _, err := gz.Write(data); err == nil {
-		err = gz.Close()
-	} else {
-		err = errors.Join(err, gz.Close())
-	}
-	if err != nil {
-		return fmt.Errorf("кэш журнала не сжался: %w", err)
-	}
-	if len(prefixHash) != sha256.Size {
-		return fmt.Errorf("хеш префикса журнала недопустим")
-	}
-	header := make([]byte, replyCacheHeaderBytes)
-	copy(header[:4], replyCacheMagic[:])
-	binary.LittleEndian.PutUint64(header[4:12], uint64(info.Size()))
-	binary.LittleEndian.PutUint64(header[12:20], uint64(info.ModTime().UnixNano()))
-	binary.LittleEndian.PutUint64(header[20:28], device)
-	binary.LittleEndian.PutUint64(header[28:36], inode)
-	copy(header[36:], prefixHash)
-	return saveCacheBytes(path, append(header, compressed.Bytes()...))
-}
-
-func runEntryPath(path string) string {
-	hash := sha256.Sum256([]byte(path))
-	return cachePath("run-" + hex.EncodeToString(hash[:]) + ".bin")
-}
-
 func runIndexKey(path string) string {
 	hash := sha256.Sum256([]byte(path))
 	return hex.EncodeToString(hash[:])
 }
 
+// loadRunIndex reads the index in one piece and checks only its header and length; entries are decoded on lookup.
+// The length follows from the number of records, so the index has no size limit that a growing report tree
+// could reach.
 func loadRunIndex() (runIndexManifest, error) {
-	index := runIndexManifest{Version: runCacheVersion, Files: make(map[string]runIndexEntry)}
-	path := cachePath("runs-index-v12.bin")
+	index := runIndexManifest{Version: runCacheVersion}
+	path := cachePath(runIndexName)
 	if path == "" {
 		return index, nil
 	}
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return index, nil
-	}
-	if err != nil {
-		return index, fmt.Errorf("отчётный индекс не stat-нулся: %w", err)
-	}
-	if info.Size() > 128<<20 {
-		return index, fmt.Errorf("отчётный индекс слишком велик")
-	}
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
+	data, err := readFileRaw(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		index.missing = true
 		return index, nil
 	}
 	if err != nil {
 		return index, fmt.Errorf("отчётный индекс не прочитался: %w", err)
 	}
-	r := bytes.NewReader(data)
-	header := make([]byte, 16)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return index, fmt.Errorf("заголовок отчётного индекса не прочитался: %w", err)
+	if len(data) < 16 {
+		return index, fmt.Errorf("заголовок отчётного индекса не прочитался: %w", io.ErrUnexpectedEOF)
 	}
-	if !bytes.Equal(header[:8], runIndexMagic[:]) || binary.LittleEndian.Uint32(header[8:12]) != runCacheVersion {
+	if !bytes.Equal(data[:8], runIndexMagic[:]) || binary.LittleEndian.Uint32(data[8:12]) != runCacheVersion {
 		return index, fmt.Errorf("версия отчётного индекса не подходит")
 	}
-	count := binary.LittleEndian.Uint32(header[12:16])
-	if count > 1_000_000 {
-		return index, fmt.Errorf("число записей отчётного индекса недопустимо")
+	count := uint64(binary.LittleEndian.Uint32(data[12:16]))
+	if uint64(len(data)-16) != count*runIndexRecordBytes {
+		return index, fmt.Errorf("размер отчётного индекса не совпадает с числом записей")
 	}
-	for range count {
-		if uint64(runIndexRecordBytes) > uint64(r.Len()) {
-			return index, fmt.Errorf("размер записи отчётного индекса недопустим")
-		}
-		pathHash := make([]byte, runIndexKeyBytes)
-		metadata := make([]byte, runIndexMetadataBytes)
-		bloom := make([]byte, runIndexBloomBytes)
-		if _, err := io.ReadFull(r, pathHash); err != nil {
-			return index, fmt.Errorf("хеш пути отчётного индекса не прочитался: %w", err)
-		}
-		if _, err := io.ReadFull(r, metadata); err != nil {
-			return index, fmt.Errorf("метаданные отчётного индекса не прочитались: %w", err)
-		}
-		if _, err := io.ReadFull(r, bloom); err != nil {
-			return index, fmt.Errorf("фильтр отчётного индекса не прочитался: %w", err)
-		}
-		entry := runIndexEntry{
-			Size: int64(binary.LittleEndian.Uint64(metadata[:8])), ModTime: int64(binary.LittleEndian.Uint64(metadata[8:16])),
-			Device: binary.LittleEndian.Uint64(metadata[16:24]), Inode: binary.LittleEndian.Uint64(metadata[24:32]),
-			CRC: binary.LittleEndian.Uint32(metadata[32:36]), Bloom: bloom,
-		}
-		copy(entry.ContentHash[:], metadata[36:52])
-		if entry.Size < 0 || crc32.ChecksumIEEE(bloom) != entry.CRC {
-			return index, fmt.Errorf("запись отчётного индекса повреждена")
-		}
-		key := hex.EncodeToString(pathHash)
-		if _, exists := index.Files[key]; exists {
-			return index, fmt.Errorf("путь отчётного индекса повторяется")
-		}
-		index.Files[key] = entry
-	}
-	if r.Len() != 0 {
-		return index, fmt.Errorf("в отчётном индексе остались лишние данные")
-	}
+	index.records = data[16:]
 	return index, nil
 }
 
 func saveRunIndex(index runIndexManifest) error {
-	path := cachePath("runs-index-v12.bin")
+	path := cachePath(runIndexName)
 	if path == "" {
 		return nil
 	}
@@ -610,7 +477,7 @@ func matchRunFilesCached(q query, files []string) []runFileResult {
 	index, indexErr := loadRunIndex()
 	logCacheError(indexErr)
 	indexChanged := atomic.Bool{}
-	if indexErr != nil || len(index.Files) != len(files) {
+	if indexErr != nil || index.count() != len(files) {
 		indexChanged.Store(true)
 	}
 	results := make([]runFileResult, len(files))
@@ -641,16 +508,42 @@ func matchRunFilesCached(q query, files []string) []runFileResult {
 				next.Files[runIndexKey(files[i])] = entry
 			}
 		}
-		logCacheError(saveRunIndex(next))
+		saveErr := saveRunIndex(next)
+		logCacheError(saveErr)
+		if saveErr == nil && index.missing {
+			removeOldLayoutCacheFiles()
+		}
 	}
 	return results
 }
 
+// oldLayoutCacheFile matches the cache files of earlier prior layouts: per-report entries, compressed reply
+// journals and report indexes before runIndexName.
+var oldLayoutCacheFile = regexp.MustCompile(`^(?:run-[0-9a-f]{64}\.bin|replies-[0-9a-f]{64}\.bin|runs-index-v(?:[2-9]|1[0-3])\.(?:bin|json)|runs-v1\.gob|runs-data-v1\.bin)$`)
+
+// removeOldLayoutCacheFiles deletes files of earlier layouts from the prior cache directory. It runs once, when the
+// current index is written for the first time, so an older build still in use next to this one rebuilds its
+// files at most once instead of on every call. A file that is gone already is not an error.
+func removeOldLayoutCacheFiles() {
+	dir := filepath.Dir(cachePath(runIndexName))
+	entries, errs := readDirEntries(dir)
+	for _, err := range errs {
+		logCacheError(err)
+	}
+	for _, entry := range entries {
+		if entry.dir || !oldLayoutCacheFile.MatchString(entry.name) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			logCacheError(err)
+		}
+	}
+}
+
 type runContentRead struct {
-	done  chan struct{}
-	line  string
-	valid bool
-	err   error
+	done chan struct{}
+	line string
+	err  error
 }
 
 // runContentReads shares one cached report scan per content fingerprint within a query.
@@ -659,219 +552,314 @@ type runContentReads struct {
 	entries map[[16]byte]*runContentRead
 }
 
-func (reads *runContentReads) get(hash [16]byte, load func() (string, bool, error)) (string, bool, error) {
+// errRunSourceChanged is returned by a load whose report changed while it was read: its result belongs to no
+// fingerprint, so it is not shared and every other report with that fingerprint loads its own.
+var errRunSourceChanged = errors.New("отчёт изменился во время чтения")
+
+func (reads *runContentReads) get(hash [16]byte, load func() (string, error)) (string, error) {
 	reads.mu.Lock()
 	if cached := reads.entries[hash]; cached != nil {
 		reads.mu.Unlock()
 		<-cached.done
-		return cached.line, cached.valid, cached.err
+		if errors.Is(cached.err, errRunSourceChanged) {
+			return load()
+		}
+		return cached.line, cached.err
 	}
 	cached := &runContentRead{done: make(chan struct{})}
 	reads.entries[hash] = cached
 	reads.mu.Unlock()
 
-	cached.line, cached.valid, cached.err = load()
+	cached.line, cached.err = load()
+	if errors.Is(cached.err, errRunSourceChanged) {
+		reads.mu.Lock()
+		delete(reads.entries, hash)
+		reads.mu.Unlock()
+	}
 	close(cached.done)
-	return cached.line, cached.valid, cached.err
+	return cached.line, cached.err
 }
 
+// runSource is a report opened by a raw descriptor. Regular files gain nothing from the runtime poller, and
+// os.Open spends five more system calls per file on it; thousands of reports are opened per query.
+type runSource struct {
+	fd   int
+	path string
+	stat syscall.Stat_t
+}
+
+var openRunSource = func(path string) (int, error) {
+	fd, err := openRaw(path, 0)
+	if err != nil {
+		return -1, pathError("open", path, err)
+	}
+	return fd, nil
+}
+
+func (s *runSource) fstat(stat *syscall.Stat_t) error {
+	for {
+		err := syscall.Fstat(s.fd, stat)
+		if err != syscall.EINTR {
+			if err != nil {
+				return pathError("stat", s.path, err)
+			}
+			return nil
+		}
+	}
+}
+
+// unchanged reports whether the open report still has the identity, size and mtime seen before reading it.
+func (s *runSource) unchanged() bool {
+	var current syscall.Stat_t
+	return s.fstat(&current) == nil && current.Dev == s.stat.Dev && current.Ino == s.stat.Ino &&
+		current.Size == s.stat.Size && current.Mtim == s.stat.Mtim
+}
+
+func (s *runSource) size() int64 { return s.stat.Size }
+
+func (s *runSource) modTime() int64 { return s.stat.Mtim.Sec*1e9 + s.stat.Mtim.Nsec }
+
+// readAll reads the report from its start into buf until end of file, or until stop bytes when stop is not
+// negative: callers that stop early check afterwards that the report has not changed.
+func (s *runSource) readAll(buf []byte, stop int64) ([]byte, error) {
+	data := buf[:0]
+	if want := int(max(s.size(), 0)) + 512; cap(data) < want {
+		data = make([]byte, 0, want)
+	}
+	for stop < 0 || int64(len(data)) < stop {
+		if len(data) == cap(data) {
+			data = append(data, 0)[:len(data)]
+		}
+		end := cap(data)
+		if stop >= 0 && int64(end) > stop {
+			end = int(stop)
+		}
+		n, err := syscall.Pread(s.fd, data[len(data):end], int64(len(data)))
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, pathError("read", s.path, err)
+		}
+		if n == 0 {
+			break
+		}
+		data = data[:len(data)+n]
+	}
+	return data, nil
+}
+
+// runBufferPool keeps report read buffers between reports; it holds only *[]byte.
+type runBufferPool struct{ pool sync.Pool }
+
+func (p *runBufferPool) get() *[]byte {
+	if buf, ok := p.pool.Get().(*[]byte); ok {
+		return buf
+	}
+	return new([]byte) // an empty pool
+}
+
+func (p *runBufferPool) put(buf *[]byte) { p.pool.Put(buf) }
+
+var runBuffers runBufferPool
+
 func matchRunFileCached(q query, path string, index runIndexManifest, changed *atomic.Bool, contentReads *runContentReads) (string, runIndexEntry, bool, error) {
+	indexed, rejected, statErr := rejectedByIndex(q, path, index)
+	if rejected {
+		return "", indexed, true, nil
+	}
+	// A report the index could not settle is opened and read; when its stat failed, the open below meets the same
+	// failure and reports it in place of the report, as an uncached read does.
+	logCacheError(statErr)
+	fd, err := openRunSource(path)
+	if err != nil {
+		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
+	}
+	defer syscall.Close(fd)
+	source := &runSource{fd: fd, path: path}
+	if err := source.fstat(&source.stat); err != nil {
+		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
+	}
+	if source.stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return matchIrregularRunFile(q, path)
+	}
+	if line, entry, hit := cachedRunFileHit(q, path, index, changed, source, contentReads); hit {
+		return line, entry, true, nil
+	}
+	return readRunSource(q, source, changed)
+}
+
+// rejectedByIndex settles a report without opening it: its index entry is current, its bloom rules the query out
+// and the report is still readable. Then it returns the entry and true. Otherwise the report is not rejected:
+// false, with the error of a stat or access check that failed, if one did.
+func rejectedByIndex(q query, path string, index runIndexManifest) (runIndexEntry, bool, error) {
+	entry, ok := index.lookup(path)
+	if !ok || runFilterMayMatchBloom(q.runs, entry.Bloom) {
+		return runIndexEntry{}, false, nil
+	}
+	source := &runSource{path: path}
+	if err := retryEINTR(func() error { return syscall.Stat(path, &source.stat) }); err != nil {
+		return runIndexEntry{}, false, pathError("stat", path, err)
+	}
+	if source.stat.Mode&syscall.S_IFMT != syscall.S_IFREG || !runIndexMetadataMatches(entry, source) {
+		return runIndexEntry{}, false, nil
+	}
+	if err := retryEINTR(func() error { return syscall.Access(path, unixReadOK) }); err != nil {
+		return runIndexEntry{}, false, pathError("access", path, err)
+	}
+	return entry, true, nil
+}
+
+// retryEINTR runs call until it is not interrupted by a signal.
+func retryEINTR(call func() error) error {
+	for {
+		if err := call(); err != syscall.EINTR {
+			return err
+		}
+	}
+}
+
+const unixReadOK = 0x4 // R_OK of access(2)
+
+// matchIrregularRunFile reads a report that is not a regular file through the ordinary file API, uncached.
+func matchIrregularRunFile(q query, path string) (string, runIndexEntry, bool, error) {
 	source, err := openPriorSource(path)
 	if err != nil {
 		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
 	}
 	defer source.Close()
-	info, err := source.Stat()
-	if err != nil {
-		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
+	data, readErr := io.ReadAll(source)
+	if readErr != nil {
+		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", readErr)
 	}
-	device, inode, identityOK := fileIdentity(info)
-	if !identityOK || !info.Mode().IsRegular() {
-		data, readErr := io.ReadAll(source)
-		if readErr != nil {
-			return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", readErr)
-		}
-		return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
-	}
-	entryPath := runEntryPath(path)
-	if line, entry, hit := cachedRunFileHit(q, path, index, changed, source, info, device, inode, contentReads); hit {
-		return line, entry, true, nil
-	}
-	return readRunSource(q, source, entryPath, changed)
+	return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
 }
 
-func cachedRunFileHit(q query, path string, index runIndexManifest, changed *atomic.Bool, source *os.File, info os.FileInfo, device, inode uint64, contentReads *runContentReads) (string, runIndexEntry, bool) {
-	entryPath := runEntryPath(path)
-	if entryPath == "" {
-		return "", runIndexEntry{}, false
-	}
-	entry, ok := index.Files[runIndexKey(path)]
-	if !ok || !runIndexMetadataMatches(entry, info, device, inode) {
+func cachedRunFileHit(q query, path string, index runIndexManifest, changed *atomic.Bool, source *runSource, contentReads *runContentReads) (string, runIndexEntry, bool) {
+	entry, ok := index.lookup(path)
+	if !ok || !runIndexMetadataMatches(entry, source) {
 		changed.Store(true)
 		return "", runIndexEntry{}, false
 	}
-	line, valid, cacheErr := contentReads.get(entry.ContentHash, func() (string, bool, error) {
-		return readRunEntry(q, entryPath, entry, info)
-	})
-	if cacheErr != nil {
-		logCacheError(cacheErr)
-		changed.Store(true)
+	line := ""
+	if runFilterMayMatchBloom(q.runs, entry.Bloom) {
+		var readErr error
+		line, readErr = contentReads.get(entry.ContentHash, func() (string, error) {
+			found, err := readRunSourceMatch(q, source)
+			if err == nil && !source.unchanged() {
+				return "", errRunSourceChanged
+			}
+			return found, err
+		})
+		if errors.Is(readErr, errRunSourceChanged) {
+			return "", runIndexEntry{}, false
+		}
+		if readErr != nil {
+			logCacheError(readErr)
+			return "", runIndexEntry{}, false
+		}
 	}
-	current, statErr := source.Stat()
-	if valid && statErr == nil && os.SameFile(info, current) && info.Size() == current.Size() && info.ModTime().Equal(current.ModTime()) {
+	// The source is checked again before the indexed result is used.
+	if source.unchanged() {
 		return line, entry, true
 	}
 	return "", runIndexEntry{}, false
 }
 
-func readRunSource(q query, source *os.File, entryPath string, changed *atomic.Bool) (string, runIndexEntry, bool, error) {
-	if _, err := source.Seek(0, io.SeekStart); err != nil {
-		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не позиционировался: %w", err)
+func readRunSourceMatch(q query, source *runSource) (string, error) {
+	if runEntryReadHook != nil {
+		runEntryReadHook(source.path)
 	}
-	data, err := io.ReadAll(source)
+	buf := runBuffers.get()
+	defer runBuffers.put(buf)
+	data, err := source.readAll((*buf)[:0], source.size())
+	if err != nil {
+		return "", err
+	}
+	*buf = data[:0]
+	return firstMatchDataFiltered(q, data, q.runs), nil
+}
+
+func readRunSource(q query, source *runSource, changed *atomic.Bool) (string, runIndexEntry, bool, error) {
+	changed.Store(true)
+	buf := runBuffers.get()
+	defer runBuffers.put(buf)
+	data, err := source.readAll((*buf)[:0], -1)
 	if err != nil {
 		return "", runIndexEntry{}, false, fmt.Errorf("отчёт не прочитался: %w", err)
 	}
-	info, err := source.Stat()
-	if err != nil {
+	*buf = data[:0]
+	if runSourceReadHook != nil {
+		runSourceReadHook(source.path)
+	}
+	var after syscall.Stat_t
+	if err := source.fstat(&after); err != nil {
 		return "", runIndexEntry{}, false, fmt.Errorf("отчёт после чтения не stat-нулся: %w", err)
 	}
-	device, inode, identityOK := fileIdentity(info)
-	if !identityOK || int64(len(data)) != info.Size() {
-		changed.Store(true)
-		return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
+	line := firstMatchDataFiltered(q, data, q.runs)
+	if int64(len(data)) != after.Size {
+		return line, runIndexEntry{}, false, nil
 	}
-	if entryPath != "" {
-		entry, cacheErr := writeRunEntry(entryPath, info, device, inode, data)
-		if cacheErr != nil {
-			logCacheError(cacheErr)
-			changed.Store(true)
-		} else {
-			changed.Store(true)
-			return firstMatchDataFiltered(q, data, q.runs), entry, true, nil
-		}
-	}
-	return firstMatchDataFiltered(q, data, q.runs), runIndexEntry{}, false, nil
+	source.stat = after
+	return line, newRunIndexEntry(source, data), true, nil
 }
 
-func runIndexMetadataMatches(entry runIndexEntry, info os.FileInfo, device, inode uint64) bool {
-	return entry.Size == info.Size() && entry.ModTime == info.ModTime().UnixNano() &&
-		entry.Device == device && entry.Inode == inode && len(entry.Bloom) == runIndexBloomBytes && crc32.ChecksumIEEE(entry.Bloom) == entry.CRC
-}
-
-func readRunEntry(q query, path string, entry runIndexEntry, info os.FileInfo) (string, bool, error) {
-	if !runFilterMayMatchBloom(q.runs, entry.Bloom) {
-		return "", true, nil
-	}
-	if runEntryReadHook != nil {
-		runEntryReadHook(path)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", false, fmt.Errorf("кэш отчёта не открылся: %w", err)
-	}
-	header := make([]byte, runHeaderBytes)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return "", false, errors.Join(fmt.Errorf("заголовок кэша отчёта не прочитался: %w", err), f.Close())
-	}
-	contentHash := header[24:40]
-	fullBloom := header[40:]
-	if !bytes.Equal(header[:4], runCacheMagic[:]) ||
-		int64(binary.LittleEndian.Uint64(header[4:12])) != info.Size() ||
-		int64(binary.LittleEndian.Uint64(header[12:20])) != entry.ModTime ||
-		!bytes.Equal(contentHash, entry.ContentHash[:]) ||
-		crc32.ChecksumIEEE(fullBloom) != binary.LittleEndian.Uint32(header[20:24]) {
-		if err := f.Close(); err != nil {
-			return "", false, fmt.Errorf("кэш отчёта не закрылся: %w", err)
-		}
-		return "", false, nil
-	}
-	if !runFilterMayMatchBloom(q.runs, fullBloom) {
-		if err := f.Close(); err != nil {
-			return "", false, fmt.Errorf("кэш отчёта не закрылся: %w", err)
-		}
-		return "", true, nil
-	}
-	reader, err := gzip.NewReader(io.LimitReader(f, info.Size()+(1<<20)))
-	if err != nil {
-		return "", false, errors.Join(fmt.Errorf("кэш отчёта не распаковался: %w", err), f.Close())
-	}
-	limited := &io.LimitedReader{R: reader, N: info.Size() + 1}
-	line, readErr := firstMatchStream(q, limited, q.runs)
-	gzipErr := reader.Close()
-	fileErr := f.Close()
-	if readErr != nil {
-		return "", false, errors.Join(readErr, gzipErr, fileErr)
-	}
-	if limited.N == 0 && line == "" {
-		return "", false, errors.Join(fmt.Errorf("кэшированный отчёт превышает исходный размер"), gzipErr, fileErr)
-	}
-	if gzipErr != nil {
-		return "", false, errors.Join(fmt.Errorf("поток кэша отчёта не закрылся: %w", gzipErr), fileErr)
-	}
-	if fileErr != nil {
-		return "", false, fmt.Errorf("кэш отчёта не закрылся: %w", fileErr)
-	}
-	return line, true, nil
+func runIndexMetadataMatches(entry runIndexEntry, source *runSource) bool {
+	return entry.Size == source.size() && entry.ModTime == source.modTime() &&
+		entry.Device == uint64(source.stat.Dev) && entry.Inode == source.stat.Ino && len(entry.Bloom) == runIndexBloomBytes && crc32.ChecksumIEEE(entry.Bloom) == entry.CRC
 }
 
 var runEntryReadHook func(string)
 
-func writeRunEntry(path string, info os.FileInfo, device, inode uint64, data []byte) (runIndexEntry, error) {
-	var compressed bytes.Buffer
-	gz, err := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
-	if err != nil {
-		return runIndexEntry{}, fmt.Errorf("компрессор отчёта не создался: %w", err)
-	}
-	if _, err := gz.Write(data); err == nil {
-		err = gz.Close()
-	} else {
-		closeErr := gz.Close()
-		err = errors.Join(err, closeErr)
-	}
-	if err != nil {
-		return runIndexEntry{}, fmt.Errorf("кэш отчёта не сжался: %w", err)
-	}
-	header := make([]byte, runHeaderBytes)
-	copy(header[:4], runCacheMagic[:])
-	binary.LittleEndian.PutUint64(header[4:12], uint64(info.Size()))
-	binary.LittleEndian.PutUint64(header[12:20], uint64(info.ModTime().UnixNano()))
+// runSourceReadHook runs between reading a report that is indexed anew and checking that it did not change.
+var runSourceReadHook func(string)
+
+func newRunIndexEntry(source *runSource, data []byte) runIndexEntry {
 	contentHashFull := sha256.Sum256(data)
 	var contentHash [16]byte
 	copy(contentHash[:], contentHashFull[:len(contentHash)])
-	copy(header[24:40], contentHash[:])
-	fullBloom := runTextBloom(data)
-	binary.LittleEndian.PutUint32(header[20:24], crc32.ChecksumIEEE(fullBloom))
-	copy(header[40:], fullBloom)
-	bloom := runTextBloomSize(data, runIndexBloomBytes)
-	crc := crc32.ChecksumIEEE(bloom)
-	if err := saveCacheBytes(path, append(header, compressed.Bytes()...)); err != nil {
-		return runIndexEntry{}, err
-	}
-	return runIndexEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Device: device, Inode: inode, ContentHash: contentHash, Bloom: bloom, CRC: crc}, nil
+	bloom := runTextBloom(data)
+	return runIndexEntry{Size: source.size(), ModTime: source.modTime(), Device: uint64(source.stat.Dev), Inode: source.stat.Ino, ContentHash: contentHash, Bloom: bloom, CRC: crc32.ChecksumIEEE(bloom)}
 }
 
 func runTextBloom(data []byte) []byte {
 	return runTextBloomSize(data, runBloomBytes)
 }
 
+// runTextBloomSize records every run of three runes of each folded line. Rune trigrams separate Cyrillic
+// words far better than byte trigrams: those of two-byte text are mostly pairs of letters.
 func runTextBloomSize(data []byte, size int) []byte {
 	bloom := make([]byte, size)
+	var folded []byte
 	for at := 0; at < len(data); {
 		end := bytes.IndexByte(data[at:], '\n')
 		if end < 0 {
 			end = len(data) - at
 		}
-		folded := foldText(string(data[at : at+end]))
-		for i := 0; i+3 <= len(folded); i++ {
-			bloomAdd(bloom, folded[i:i+3])
-		}
+		folded = appendFold(folded[:0], data[at:at+end])
+		forEachRuneTrigram(string(folded), func(gram string) { bloomAdd(bloom, gram) })
 		if at+end == len(data) {
 			break
 		}
 		at += end + 1
 	}
 	return bloom
+}
+
+// forEachRuneTrigram calls fn with every substring of text that holds three consecutive runes.
+func forEachRuneTrigram(text string, fn func(string)) {
+	var starts [3]int
+	n := 0
+	for i := range text {
+		if n >= 3 {
+			fn(text[starts[n%3]:i])
+		}
+		starts[n%3] = i
+		n++
+	}
+	if n >= 3 {
+		fn(text[starts[n%3]:])
+	}
 }
 
 func bloomAdd(bloom []byte, gram string) {
@@ -927,37 +915,21 @@ func bloomMayMatchNeedle(needle runNeedle, bloom []byte) bool {
 
 func bloomMayMatchComponent(variants []string, bloom []byte) bool {
 	for _, variant := range variants {
-		if len(variant) < 3 || bloomHasVariant(variant, bloom) {
+		if utf8.RuneCountInString(variant) < 3 || bloomHasVariant(variant, bloom) {
 			return true
 		}
 	}
 	return false
 }
 
+// bloomHasVariant reports whether every rune trigram of the folded variant may be in the bloom. Each line is
+// folded rune by rune, so a line that contains the variant contains all of its trigrams.
 func bloomHasVariant(variant string, bloom []byte) bool {
-	for i := 0; i+3 <= len(variant); i++ {
-		if !bloomHas(bloom, variant[i:i+3]) {
-			return false
+	found := true
+	forEachRuneTrigram(variant, func(gram string) {
+		if found && !bloomHas(bloom, gram) {
+			found = false
 		}
-	}
-	return true
-}
-
-func decompressRun(data []byte, maxBytes int64) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("кэш отчёта не распаковался: %w", err)
-	}
-	content, readErr := io.ReadAll(io.LimitReader(r, maxBytes+1))
-	closeErr := r.Close()
-	if readErr != nil {
-		return nil, fmt.Errorf("кэш отчёта не прочитался: %w", readErr)
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("кэш отчёта не закрылся: %w", closeErr)
-	}
-	if int64(len(content)) > maxBytes {
-		return nil, fmt.Errorf("кэш отчёта превысил исходный размер")
-	}
-	return content, nil
+	})
+	return found
 }

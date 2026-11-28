@@ -272,3 +272,46 @@ func TestInstructionUnreadableFileAndDirectoryAreReported(t *testing.T) {
 		t.Fatalf("permission failures are not reported:\n%s", out)
 	}
 }
+
+func TestNormalizeInstructionMatchesFieldsJoin(t *testing.T) {
+	reference := func(line string) string {
+		return strings.ToLower(strings.Join(strings.Fields(strings.ReplaceAll(line, "`", "")), " "))
+	}
+	for _, line := range []string{
+		"", "  ", "Rule `code` here", "\tПравило С  ПРОБЕЛАМИ и\u0085всё ", "İSTANBUL", "\xd0`\xb6", "a\xffb", "ǅ ǈ Σ",
+	} {
+		if got, want := normalizeInstruction(line), reference(line); got != want {
+			t.Errorf("normalizeInstruction(%q) = %q, want %q", line, got, want)
+		}
+	}
+	for b := range 256 {
+		for c := range 256 {
+			line := string([]byte{'A', byte(b), byte(c), ' ', 0xd0})
+			if got, want := normalizeInstruction(line), reference(line); got != want {
+				t.Fatalf("normalizeInstruction(%q) = %q, want %q", line, got, want)
+			}
+		}
+	}
+	for r := rune(0); r <= 0x10FFFF; r++ {
+		line := "x" + string(r) + "Y"
+		if got, want := normalizeInstruction(line), reference(line); got != want {
+			t.Fatalf("normalizeInstruction(%q) = %q, want %q", line, got, want)
+		}
+	}
+}
+
+// A linked file inside a walked instruction tree is named by its target, as a linked root file is.
+func TestInstructionTreeLinkedFileUsesTargetPath(t *testing.T) {
+	home := t.TempDir()
+	write(t, filepath.Join(home, "notes", "shared.md"), "- rule treelinkword\n")
+	if err := os.MkdirAll(filepath.Join(home, ".claude", "skills", "one"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(home, "notes", "shared.md"), filepath.Join(home, ".claude", "skills", "one", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	out := searchInstructions(t, home, "treelinkword")
+	if !strings.Contains(out, "notes/shared.md:1") || strings.Contains(out, "skills/one/SKILL.md") {
+		t.Fatalf("linked file was not named by its target:\n%s", out)
+	}
+}
