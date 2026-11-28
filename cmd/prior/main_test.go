@@ -666,13 +666,22 @@ func TestReplyPrewarmCacheSkipsAndIndexesAppendedHeaders(t *testing.T) {
 }
 
 func TestCachedRepliesAppendAndInvalidation(t *testing.T) {
-	t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", cacheDir)
 	path := filepath.Join(t.TempDir(), "user-replies.md")
 	initial := "first reply\n"
 	write(t, path, initial)
-	got, err := readCachedReplies(path)
+	got, err := readReplies(path)
 	if err != nil || string(got) != initial {
 		t.Fatalf("initial cache read = %q, %v", got, err)
+	}
+	got, err = readReplies(path)
+	if err != nil || string(got) != initial {
+		t.Fatalf("unchanged cache read = %q, %v", got, err)
+	}
+	// The journal is read from its file: no compressed copy is written to the cache.
+	if entries, err := os.ReadDir(cacheDir); err == nil && len(entries) > 0 {
+		t.Fatalf("journal read wrote cache files: %v", entries)
 	}
 	appendix := "second reply\n"
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
@@ -686,7 +695,7 @@ func TestCachedRepliesAppendAndInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := initial + appendix
-	got, err = readCachedReplies(path)
+	got, err = readReplies(path)
 	if err != nil || string(got) != want {
 		t.Fatalf("appended cache read = %q, %v; want %q", got, err, want)
 	}
@@ -702,17 +711,9 @@ func TestCachedRepliesAppendAndInvalidation(t *testing.T) {
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
-	got, err = readCachedReplies(path)
+	got, err = readReplies(path)
 	if err != nil || string(got) != replacement {
 		t.Fatalf("same-size changed cache read = %q, %v; want %q", got, err, replacement)
-	}
-	cachePath := replyCachePath(path)
-	if err := os.WriteFile(cachePath, []byte("broken cache"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	got, err = readCachedReplies(path)
-	if err != nil || string(got) != replacement {
-		t.Fatalf("broken cache rebuild = %q, %v; want %q", got, err, replacement)
 	}
 }
 
@@ -724,7 +725,7 @@ func TestCachedRepliesRejectsRewrittenPrefixBeforeAppend(t *testing.T) {
 		fmt.Fprintf(&old, "### 2026-01-01T00:%02d:00Z lead\nzebra ответ %d\n\n", i, i+1)
 	}
 	write(t, path, old.String())
-	if _, err := readCachedReplies(path); err != nil {
+	if _, err := readReplies(path); err != nil {
 		t.Fatal(err)
 	}
 	rebuilt := strings.Replace(old.String(), "zebra ответ 5", "horse ответ 5 исправлено", 1) +
@@ -732,7 +733,7 @@ func TestCachedRepliesRejectsRewrittenPrefixBeforeAppend(t *testing.T) {
 	if err := os.WriteFile(path, []byte(rebuilt), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := readCachedReplies(path)
+	got, err := readReplies(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -816,7 +817,7 @@ func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
 		t.Setenv("AKIT_PRIOR_CACHE_DIR", filepath.Join(t.TempDir(), "cache"))
 		path := filepath.Join(t.TempDir(), "user-replies.md")
 		write(t, path, "cached reply\n")
-		if _, err := readCachedReplies(path); err != nil {
+		if _, err := readReplies(path); err != nil {
 			t.Fatal(err)
 		}
 		previous := openPriorSource
@@ -827,7 +828,7 @@ func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
 			return os.Open(got)
 		}
 		t.Cleanup(func() { openPriorSource = previous })
-		if _, err := readCachedReplies(path); err == nil || err.Error() != "forced source open failure" {
+		if _, err := readReplies(path); err == nil || err.Error() != "forced source open failure" {
 			t.Fatalf("cached journal hid source open error: %v", err)
 		}
 	})
@@ -847,14 +848,14 @@ func TestUnreadableSourcesDoNotUseCachedText(t *testing.T) {
 			t.Fatalf("warm source result=%v cache=%v err=%v", ok, entry, err)
 		}
 		index.Files[runIndexKey(path)] = entry
-		previous := openPriorSource
-		openPriorSource = func(got string) (*os.File, error) {
+		previous := openRunSource
+		openRunSource = func(got string) (int, error) {
 			if got == path {
-				return nil, fmt.Errorf("forced source open failure")
+				return -1, fmt.Errorf("forced source open failure")
 			}
-			return os.Open(got)
+			return previous(got)
 		}
-		t.Cleanup(func() { openPriorSource = previous })
+		t.Cleanup(func() { openRunSource = previous })
 		if _, _, _, err := matchRunFileCached(q, path, index, &changed, contentReads); err == nil || !strings.Contains(err.Error(), "forced source open failure") {
 			t.Fatalf("cached report hid source open error: %v", err)
 		}
@@ -883,12 +884,9 @@ func TestReadCachedRepliesReturnsSnapshotAfterRepeatedAppends(t *testing.T) {
 	}
 	t.Cleanup(func() { replyReadAttemptHook = nil })
 
-	got, err := readCachedReplies(path)
+	got, err := readReplies(path)
 	if err != nil || string(got) != "base\ntail1\ntail2\n" {
 		t.Fatalf("unstable journal snapshot = %q, %v; want last completed snapshot", got, err)
-	}
-	if _, err := os.Stat(replyCachePath(path)); !os.IsNotExist(err) {
-		t.Fatalf("unstable journal snapshot was cached: stat err=%v", err)
 	}
 }
 
@@ -899,7 +897,7 @@ func TestCachedRepliesRejectsReplacedInodeOutsideFingerprintWindows(t *testing.T
 	if err := os.WriteFile(path, oldData, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readCachedReplies(path); err != nil {
+	if _, err := readReplies(path); err != nil {
 		t.Fatal(err)
 	}
 	oldFile, err := os.Open(path)
@@ -933,7 +931,7 @@ func TestCachedRepliesRejectsReplacedInodeOutsideFingerprintWindows(t *testing.T
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := readCachedReplies(path)
+	got, err := readReplies(path)
 	want, readErr := os.ReadFile(path)
 	if err != nil || readErr != nil || !bytes.Equal(got, want) {
 		t.Fatalf("replacement inode cache read differs from source: err=%v readErr=%v", err, readErr)

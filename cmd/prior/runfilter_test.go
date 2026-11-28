@@ -9,15 +9,94 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestFoldRuneFastMatchesBMP(t *testing.T) {
 	for r := rune(0); r <= 0xFFFF; r++ {
 		if got, want := foldRuneFast(r), foldRune(r); got != want {
 			t.Fatalf("foldRuneFast(%U) = %U, want %U", r, got, want)
+		}
+	}
+}
+
+func firstMatchLine(q query, line []byte, filter []runNeedle) bool {
+	match, _ := firstMatchLineFolded(q, line, filter, nil)
+	return match
+}
+
+func TestFirstMatchLiteralFastPathMatchesRegexp(t *testing.T) {
+	queries := [][]string{{"needle"}, {"обратная", "тень"}, {"Σίσυφος"}, {"Kelvin"}, {""}}
+	lines := []string{
+		"needle in a report", "NEEDLE in a report", "обратная тень", "ОБРАТНАЯ ТЕНЬ",
+		"ΣΊΣΥΦΟΣ", "σίσυφος", "Kelvin", "Kelvin", "nothing here", "",
+	}
+	for _, words := range queries {
+		q, err := newQuery(words)
+		if err != nil {
+			t.Fatal(err)
+		}
+		filter := q.runs
+		q.literalOnly = false // force the regexp path for the same query
+		for _, line := range lines {
+			want := firstMatchLine(q, []byte(line), filter)
+			q.literals = make([]string, len(words))
+			for i, word := range words {
+				if regexp.QuoteMeta(word) == word {
+					q.literals[i] = foldText(word)
+				}
+			}
+			q.literalOnly = true
+			got := firstMatchLine(q, []byte(line), filter)
+			if got != want {
+				t.Errorf("firstMatchLine(%q, %q) fast = %t, regexp = %t", words, line, got, want)
+			}
+			q.literalOnly = false
+			q.literals = nil
+		}
+	}
+}
+
+// The line scan with a reused fold buffer returns the same line as the regexp applied line by line.
+func TestFirstMatchDataMatchesRegexpLineScan(t *testing.T) {
+	queries := [][]string{
+		{"needle"}, {"Kelvin"}, {"тень", "Σίσυφος"}, {"a\nb"}, {""}, {"ſecret"}, {"журнал", "откатов"},
+		{"окн[оа] сжатия", "compact"}, {"ёлка"}, {"^$"},
+	}
+	texts := []string{
+		"before\nKelvin match\nafter\n",
+		"Kelvin on the first line\nkelvin later\n",
+		"nothing\nОБРАТНАЯ ТЕНЬ\nΣΊΣΥΦΟΣ\n",
+		"a\nb on separate lines\n",
+		"first\n\nlast",
+		"",
+		"\n",
+		"SECRET\nſecret\n",
+		"Журнал\nЖУРНАЛ ОТКАТОВ\n",
+		"\xff\xfe журнал \xd0\n\xd0\x96УРНАЛ\n",
+		"Окно сжатия\nCOMPACT\n",
+		"ЁЛКА и ёлка\n",
+	}
+	for _, words := range queries {
+		q, err := newQuery(words)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, text := range texts {
+			var want string
+			for line := range bytes.SplitSeq([]byte(text), []byte{'\n'}) {
+				if q.any.Match(line) {
+					want = string(line)
+					break
+				}
+			}
+			if got := firstMatchDataFiltered(q, []byte(text), q.runs); got != want {
+				t.Errorf("query %q, text %q: got %q, want %q", words, text, got, want)
+			}
 		}
 	}
 }
@@ -84,23 +163,14 @@ func TestRunCacheInvalidation(t *testing.T) {
 	}
 	assertSame(q)
 
-	// Unreadable cache data is a miss and is replaced by a valid cache.
-	cachePath := runEntryPath(two)
-	if err := os.WriteFile(cachePath, []byte("not a gob"), 0600); err != nil {
+	// An unreadable index is a miss and is replaced by a valid index.
+	indexPath := cachePath(runIndexName)
+	if err := os.WriteFile(indexPath, []byte("not an index"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	assertSame(q)
-	file, err := os.Open(cachePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	header := make([]byte, runHeaderBytes)
-	if _, err := file.Read(header); err != nil || !bytes.Equal(header[:4], runCacheMagic[:]) {
-		_ = file.Close()
-		t.Fatalf("cache was not rebuilt: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
+	if _, err := loadRunIndex(); err != nil {
+		t.Fatalf("index was not rebuilt: %v", err)
 	}
 
 	// Replacing a report with the same size and mtime must still invalidate its cached content.
@@ -150,7 +220,7 @@ func TestRunCacheReadsIdenticalContentsOnce(t *testing.T) {
 		t.Fatalf("shared report results = %+v", got)
 	}
 	if reads.Load() != 1 {
-		t.Fatalf("identical reports read %d cache entries; want one", reads.Load())
+		t.Fatalf("identical reports read %d report bodies; want one", reads.Load())
 	}
 }
 
@@ -213,19 +283,6 @@ func TestRunBloomDoesNotRejectMatches(t *testing.T) {
 		if !runFilterMayMatchBloom(q.runs, runTextBloom([]byte(tc.text))) {
 			t.Errorf("bloom rejected %q for pattern %q", tc.text, tc.pattern)
 		}
-	}
-}
-
-func TestFirstMatchStreamMatchesDataSearch(t *testing.T) {
-	data := strings.Repeat("x", 5000) + "needle on a long line\nsecond needle\nlast"
-	q, err := newQuery([]string{"needle"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := firstMatchDataFiltered(q, []byte(data), q.runs)
-	got, err := firstMatchStream(q, bytes.NewReader([]byte(data)), q.runs)
-	if err != nil || got != want {
-		t.Fatalf("streamed match = %q, %v; want %q", got, err, want)
 	}
 }
 
@@ -460,5 +517,230 @@ func TestRunsReportsUnreadableFileInPlace(t *testing.T) {
 	if results[0].err != nil || results[1].err == nil || results[2].err != nil ||
 		results[0].line != "needle three" || results[2].line != "needle one" {
 		t.Fatalf("results: %+v", results)
+	}
+}
+
+func TestAppendFoldMatchesFoldText(t *testing.T) {
+	var buf []byte
+	for r := rune(0); r <= 0x10FFFF+1; r++ {
+		input := string(r)
+		buf = appendFold(buf[:0], []byte(input))
+		if string(buf) != foldText(input) {
+			t.Fatalf("rune %U: appendFold = %q, foldText = %q", r, buf, foldText(input))
+		}
+	}
+	for b := range 256 {
+		for c := range 256 {
+			input := []byte{byte(b), byte(c), 'a', 0xd0}
+			buf = appendFold(buf[:0], input)
+			if string(buf) != foldText(string(input)) {
+				t.Fatalf("bytes % x: appendFold = %q, foldText = %q", input, buf, foldText(string(input)))
+			}
+		}
+	}
+}
+
+// The index alone rejects reports by their bloom: on a warm index only reports that may match are opened
+// for reading, and the cache holds no per-report files.
+func TestRunIndexBloomRejectsWithoutReading(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	t.Setenv("AKIT_PRIOR_CACHE_DIR", cacheDir)
+	dir := t.TempDir()
+	var filler strings.Builder
+	for i := range 200 {
+		fmt.Fprintf(&filler, "строка отчёта %d про журнал и разное\n", i)
+	}
+	write(t, filepath.Join(dir, "2026-01-01", "match.md"), filler.String()+"обратная тень\n")
+	write(t, filepath.Join(dir, "2026-01-02", "other.md"), filler.String())
+	write(t, filepath.Join(dir, "2026-01-03", "small.md"), "nothing relevant\n")
+	files, errs := runMarkdownFiles(dir)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	q, err := newQuery([]string{"обратная", "тень"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold := matchRunFilesCached(q, files)
+	var reads []string
+	var mu sync.Mutex
+	runEntryReadHook = func(path string) {
+		mu.Lock()
+		reads = append(reads, filepath.Base(path))
+		mu.Unlock()
+	}
+	t.Cleanup(func() { runEntryReadHook = nil })
+	warm := matchRunFilesCached(q, files)
+	if !reflect.DeepEqual(cold, warm) || !reflect.DeepEqual(warm, matchRunFiles(q, files, q.runs)) {
+		t.Fatalf("cold %+v, warm %+v differ from uncached", cold, warm)
+	}
+	if !reflect.DeepEqual(reads, []string{"match.md"}) {
+		t.Fatalf("warm index read reports %v; want only match.md", reads)
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != runIndexName {
+		var names []string
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("cache holds %v; want only %s", names, runIndexName)
+	}
+}
+
+// The anchor scanner skips only lines the filter rejects: on random text with case variants, multi-byte and
+// invalid sequences, report, reply and line matching agree with the regexp applied to every line.
+func TestLineScannerMatchesRegexpRandomized(t *testing.T) {
+	alphabet := []string{
+		"ж", "Ж", "у", "У", "р", "Р", "к", "К", "a", "A", "k", "K", "K", "s", "S", "ſ", "σ", "Σ", "ς",
+		"ё", "Ё", " ", "\n", "\n", "—", "\xd0", "\xb6", "\xff", "\xe2\x84", "x", "ки",
+	}
+	words := []string{"жур", "к", "ks", "Kk", "ſs", "σς", "ёж", "ки", "a k", "—к", "xx", "ж\n", "zzz", "kи"}
+	rng := rand.New(rand.NewSource(0x5ca4))
+	randomText := func() string {
+		var b strings.Builder
+		for range rng.Intn(60) {
+			b.WriteString(alphabet[rng.Intn(len(alphabet))])
+		}
+		return b.String()
+	}
+	for range 3000 {
+		var query []string
+		for range 1 + rng.Intn(3) {
+			query = append(query, words[rng.Intn(len(words))])
+		}
+		if rng.Intn(5) == 0 {
+			query = append(query, "к[иa]")
+		}
+		q, err := newQuery(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := randomText()
+		var want string
+		var wantLines []queryLine
+		for i, line := range strings.Split(text, "\n") {
+			if i == strings.Count(text, "\n") && line == "" && text != "" {
+				break // no line after the final newline
+			}
+			if q.any.MatchString(line) {
+				if wantLines == nil {
+					want = line
+				}
+				wantLines = append(wantLines, queryLine{number: i + 1, text: line})
+			}
+		}
+		if got := firstMatchDataFiltered(q, []byte(text), q.runs); got != want {
+			t.Fatalf("query %q, text %q: first match %q, want %q", query, text, got, want)
+		}
+		if got := matchingLines(q, []byte(text), q.runs); !reflect.DeepEqual(got, wantLines) {
+			t.Fatalf("query %q, text %q: lines %+v, want %+v", query, text, got, wantLines)
+		}
+		reply := "### 2026-01-01T00:00:00Z x · claude 0123abcd\n" + text
+		hits := replyBlocks(reply, q)
+		if (len(hits) > 0) != (len(wantLines) > 0) {
+			t.Fatalf("query %q, text %q: reply hits %+v, want lines %+v", query, text, hits, wantLines)
+		}
+		if len(hits) > 0 {
+			wantWords := 0
+			for _, word := range q.words {
+				for _, line := range wantLines {
+					if word.MatchString(line.text) {
+						wantWords++
+						break
+					}
+				}
+			}
+			if hits[0].words != wantWords {
+				t.Fatalf("query %q, text %q: reply words %d, want %d", query, text, hits[0].words, wantWords)
+			}
+		}
+		if want != "" && !runFilterMayMatchBloom(q.runs, runTextBloom([]byte(text))) {
+			t.Fatalf("query %q, text %q: the report bloom rejected a match", query, text)
+		}
+	}
+}
+
+func TestForEachRuneTrigram(t *testing.T) {
+	for _, text := range []string{"", "a", "ab", "abc", "журнал", "aж—𝄞b", "ж\xffу"} {
+		var got []string
+		forEachRuneTrigram(text, func(gram string) { got = append(got, gram) })
+		var want []string
+		var starts []int
+		for i := range text {
+			starts = append(starts, i)
+		}
+		starts = append(starts, len(text))
+		for i := 0; i+3 < len(starts); i++ {
+			want = append(want, text[starts[i]:starts[i+3]])
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%q: trigrams %q, want %q", text, got, want)
+		}
+	}
+}
+
+// Rune trigrams reject a report whose letter pairs, but not letter triples, cover the word: byte trigrams of
+// two-byte text are letter pairs and let such reports through.
+func TestRunBloomRejectsWordFromLetterPairs(t *testing.T) {
+	q, err := newQuery([]string{"журнал"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := []byte("жуть\nурна\nрнк\nналог\nалый\n")
+	if !byteTrigramsInBloom(foldText("журнал"), byteTrigramBloom(text)) {
+		t.Fatal("the byte-trigram bloom is expected to pass this text")
+	}
+	if runFilterMayMatchBloom(q.runs, runTextBloom(text)) {
+		t.Error("the report bloom passed a text without the word")
+	}
+	if !runFilterMayMatchBloom(q.runs, runTextBloom([]byte("старый ЖУРНАЛ\n"))) {
+		t.Error("the report bloom rejected the word in upper case")
+	}
+}
+
+func byteTrigramsInBloom(variant string, bloom []byte) bool {
+	for i := 0; i+3 <= len(variant); i++ {
+		if !bloomHas(bloom, variant[i:i+3]) {
+			return false
+		}
+	}
+	return true
+}
+
+func byteTrigramBloom(data []byte) []byte {
+	bloom := make([]byte, runBloomBytes)
+	for line := range strings.Lines(string(data)) {
+		folded := foldText(strings.TrimSuffix(line, "\n"))
+		for i := 0; i+3 <= len(folded); i++ {
+			bloomAdd(bloom, folded[i:i+3])
+		}
+	}
+	return bloom
+}
+
+func TestDecodeRuneMatchesUTF8(t *testing.T) {
+	check := func(p []byte) {
+		r, n := decodeRune(p)
+		wr, wn := utf8.DecodeRune(p)
+		if r != wr || n != wn {
+			t.Fatalf("decodeRune(%x) = %U %d, want %U %d", p, r, n, wr, wn)
+		}
+		r, n = decodeLastRune(p)
+		wr, wn = utf8.DecodeLastRune(p)
+		if r != wr || n != wn {
+			t.Fatalf("decodeLastRune(%x) = %U %d, want %U %d", p, r, n, wr, wn)
+		}
+	}
+	check(nil)
+	for a := range 256 {
+		check([]byte{byte(a)})
+		for b := range 256 {
+			check([]byte{byte(a), byte(b)})
+			check([]byte{0xe2, byte(a), byte(b)})
+			check([]byte{byte(a), byte(b), 0x80})
+		}
 	}
 }

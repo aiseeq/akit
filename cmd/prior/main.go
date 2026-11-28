@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"os"
 	"regexp"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/aiseeq/akit/clihelp"
@@ -37,6 +38,7 @@ usage: prior <слово> [слово…] - слова темы, любое из
 Транскрипты prior ищет в базе загрузчика (как tl): база сбоит — файлы, с предупреждением в stderr; на машине без
 базы (нет состояния загрузчика и сервер не отвечает) — файлы молча; TL_BACKEND=files — только файлы.
 Exit: 0 поиск выполнен или справка напечатана; 2 ошибка аргументов, подготовки поиска или записи справки JSON.
+Для профиля CPU: PRIOR_CPUPROFILE=<файл> prior <слова…>.
 `
 
 const exitUsage = 2
@@ -51,6 +53,31 @@ var machineHelp = func() clihelp.Help {
 }()
 
 func main() {
+	code := runMain()
+	if code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runMain() (code int) {
+	if profile := os.Getenv("PRIOR_CPUPROFILE"); profile != "" {
+		f, err := os.Create(profile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "prior: create CPU profile: %v\n", err)
+			return exitUsage
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "prior: start CPU profile: %v\n", err)
+			return exitUsage
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			if err := f.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "prior: close CPU profile: %v\n", err)
+			}
+		}()
+	}
 	words, err := parseArgs(os.Args[1:])
 	if errors.Is(err, errHelp) {
 		fmt.Print(usage)
@@ -59,26 +86,27 @@ func main() {
 	if errors.Is(err, errHelpJSON) {
 		if err := clihelp.Print(os.Stdout, machineHelp); err != nil {
 			fmt.Fprintf(os.Stderr, "prior: write help: %v\n", err)
-			os.Exit(exitUsage)
+			return exitUsage
 		}
-		return
+		return 0
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "prior: %v\n(prior -h for usage)\n", err)
-		os.Exit(exitUsage)
+		return exitUsage
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "prior: %v\n", err)
-		os.Exit(exitUsage)
+		return exitUsage
 	}
 	q, err := newQuery(words)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "prior: %v\n", err)
-		os.Exit(exitUsage)
+		return exitUsage
 	}
 	activePriorDB = priorBackend(home, os.Stderr)
 	run(q, home, os.Stdout)
+	return 0
 }
 
 func parseArgs(args []string) ([]string, error) {
@@ -105,11 +133,16 @@ func parseArgs(args []string) ([]string, error) {
 
 // query — слова поиска: каждое отдельно (для карточек важно, сколько разных слов совпало) и все вместе.
 type query struct {
-	words    []*regexp.Regexp
-	any      *regexp.Regexp
-	wordRuns [][]runNeedle
+	words       []*regexp.Regexp
+	literals    []string // folded literal words; empty for words that contain regexp syntax
+	literalOnly bool
+	any         *regexp.Regexp
+	wordRuns    [][]runNeedle
 	// runs — литералы, без которых q.any не совпадёт; по ним отчёты отсеиваются до построчной проверки.
 	runs []runNeedle
+	// runsScan — сканер строк для runs, готовый к копированию (nil — runs так не ищутся).
+	runsScan      *lineScanner
+	runsScanTried bool
 	// phrases — аргументы, где фраза из phraseWords слов и больше: каждый ищется одной фразой целиком, и слова
 	// темы, отданные одним аргументом в кавычках, молча не находят ничего.
 	phrases []string
@@ -130,13 +163,19 @@ func phraseLen(arg string) int {
 }
 
 func newQuery(words []string) (query, error) {
-	var q query
+	q := query{literalOnly: true}
 	for _, w := range words {
 		re, err := regexp.Compile("(?i)" + w)
 		if err != nil {
 			return q, fmt.Errorf("слово %q: %w", w, err)
 		}
 		q.words = append(q.words, re)
+		if regexp.QuoteMeta(w) == w {
+			q.literals = append(q.literals, foldText(w))
+		} else {
+			q.literalOnly = false
+			q.literals = append(q.literals, "")
+		}
 		literals, err := newRunFilter(re)
 		if err != nil {
 			return q, err
@@ -148,6 +187,8 @@ func newQuery(words []string) (query, error) {
 	}
 	q.any = regexp.MustCompile("(?i)(?:" + strings.Join(words, ")|(?:") + ")") // каждое слово уже скомпилировалось
 	q.runs = queryRunFilter(words, q.wordRuns)
+	q.runsScan, _ = newLineScanner(q.runs)
+	q.runsScanTried = true
 	return q, nil
 }
 
@@ -155,8 +196,26 @@ func (q query) matchWord(i int, text string) bool {
 	return matchFiltered(q.words[i], q.wordRuns[i], text)
 }
 
+// matchWordFolded reports whether word i matches text; folded must be foldText(text). A word without regexp
+// syntax matches exactly where its folded form occurs in the folded text, as in firstMatchLineFolded.
 func (q query) matchWordFolded(i int, text, folded string) bool {
+	if q.literalOnly {
+		return strings.Contains(folded, q.literals[i])
+	}
 	return matchFilteredFolded(q.words[i], q.wordRuns[i], text, folded)
+}
+
+// matchAnyFolded reports whether q.any matches text; folded must be foldText(text).
+func (q query) matchAnyFolded(text, folded string) bool {
+	if q.literalOnly {
+		for _, literal := range q.literals {
+			if strings.Contains(folded, literal) {
+				return true
+			}
+		}
+		return false
+	}
+	return matchFilteredFolded(q.any, q.runs, text, folded)
 }
 
 // width — потолок строки вывода в рунах.
@@ -328,37 +387,37 @@ func matchingLines(q query, data []byte, filter []runNeedle) []queryLine {
 	if filter == nil {
 		filter = q.runs
 	}
-	text := string(data)
-	folded := text
-	if len(filter) > 0 {
-		folded = foldText(text)
-	}
-	if len(filter) > 0 && !runMayMatch(folded, filter) {
-		return nil
-	}
+	scanner, scan := q.scannerFor(filter)
 	var matches []queryLine
-	number := 0
-	textAt, foldedAt := 0, 0
-	for textAt < len(text) {
-		lineEnd := strings.IndexByte(text[textAt:], '\n')
-		foldedEnd := strings.IndexByte(folded[foldedAt:], '\n')
+	var folded []byte
+	newlines, counted := 0, 0
+	for at := 0; at < len(data); {
+		if scan {
+			next, ok := scanner.nextLine(data, at)
+			if !ok {
+				break
+			}
+			at = next
+		}
+		newlines += bytes.Count(data[counted:at], []byte{'\n'})
+		counted = at
+		lineEnd := bytes.IndexByte(data[at:], '\n')
 		if lineEnd < 0 {
-			lineEnd = len(text) - textAt
+			lineEnd = len(data) - at
 		}
-		if foldedEnd < 0 {
-			foldedEnd = len(folded) - foldedAt
+		line := data[at : at+lineEnd]
+		pass := true
+		if len(filter) > 0 {
+			folded = appendFold(folded[:0], line)
+			pass = runMayMatchBytes(folded, filter)
 		}
-		line := text[textAt : textAt+lineEnd]
-		foldedLine := folded[foldedAt : foldedAt+foldedEnd]
-		number++
-		if matchFilteredFolded(q.any, filter, line, foldedLine) {
-			matches = append(matches, queryLine{number: number, text: line})
+		if pass && q.any.Match(line) {
+			matches = append(matches, queryLine{number: newlines + 1, text: string(line)})
 		}
-		if textAt+lineEnd == len(text) {
+		if at+lineEnd == len(data) {
 			break
 		}
-		textAt += lineEnd + 1
-		foldedAt += foldedEnd + 1
+		at += lineEnd + 1
 	}
 	return matches
 }

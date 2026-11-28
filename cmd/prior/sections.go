@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -208,7 +209,7 @@ func runs(w io.Writer, q query, dir string) {
 	for _, err := range walkErrors {
 		fmt.Fprintf(w, "(%v)\n", err)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(files)))
+	slices.SortFunc(files, func(a, b string) int { return strings.Compare(b, a) }) // newest first; paths are unique
 
 	results := matchRunFilesCached(q, files)
 	var matches []runMatch
@@ -262,25 +263,16 @@ func runMarkdownFiles(root string) ([]string, []error) {
 	}
 	var walk func(string)
 	walk = func(dir string) {
-		f, err := os.Open(dir)
-		if err != nil {
-			walkErrors = append(walkErrors, runWalkError{err: err})
-			return
-		}
-		entries, err := f.ReadDir(-1)
-		closeErr := f.Close()
-		if err != nil {
+		entries, err := readDirEntries(dir)
+		for _, err := range err {
 			walkErrors = append(walkErrors, runWalkError{err: err})
 		}
-		if closeErr != nil {
-			walkErrors = append(walkErrors, runWalkError{err: closeErr})
-		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		slices.SortFunc(entries, func(a, b dirEntry) int { return strings.Compare(a.name, b.name) })
 		for _, entry := range entries {
-			path := filepath.Join(dir, entry.Name())
-			if entry.IsDir() {
+			path := filepath.Join(dir, entry.name)
+			if entry.dir {
 				walk(path)
-			} else if strings.HasSuffix(entry.Name(), ".md") {
+			} else if strings.HasSuffix(entry.name, ".md") {
 				files = append(files, path)
 			}
 		}
@@ -374,13 +366,26 @@ func firstMatchDataFiltered(q query, data []byte, filter []runNeedle) string {
 	if filter == nil {
 		filter = q.runs
 	}
+	// Only lines the scanner cannot rule out are folded, one at a time into a reused buffer, and the scan
+	// stops at the first match.
+	scanner, scan := q.scannerFor(filter)
+	var folded []byte
 	for at := 0; at < len(data); {
+		if scan {
+			next, ok := scanner.nextLine(data, at)
+			if !ok {
+				return ""
+			}
+			at = next
+		}
 		end := bytes.IndexByte(data[at:], '\n')
 		if end < 0 {
 			end = len(data) - at
 		}
 		line := data[at : at+end]
-		if firstMatchLine(q, line, filter) {
+		var match bool
+		match, folded = firstMatchLineFolded(q, line, filter, folded[:0])
+		if match {
 			return string(line)
 		}
 		if at+end == len(data) {
@@ -391,36 +396,27 @@ func firstMatchDataFiltered(q query, data []byte, filter []runNeedle) string {
 	return ""
 }
 
-func firstMatchLine(q query, line []byte, filter []runNeedle) bool {
-	// The cheap literal filter rejects most lines before the regexp processes its alternatives.
-	if len(filter) > 0 && !runMayMatchASCII(string(line), filter) {
-		return false
+// firstMatchLineFolded reports whether line matches q; buf is scratch space for the folded line and is returned for reuse.
+func firstMatchLineFolded(q query, line []byte, filter []runNeedle, buf []byte) (bool, []byte) {
+	if q.literalOnly {
+		buf = appendFold(buf, line)
+		for _, literal := range q.literals {
+			if literal == "" || bytes.Contains(buf, []byte(literal)) {
+				return true, buf
+			}
+		}
+		return false, buf
 	}
-	folded := foldText(string(line))
-	return (len(filter) == 0 || runMayMatch(folded, filter)) && q.any.Match(line)
-}
-
-func firstMatchStream(q query, source io.Reader, filter []runNeedle) (string, error) {
-	reader := bufio.NewReaderSize(source, 4096)
-	line := make([]byte, 0, 4096)
-	for {
-		part, err := reader.ReadSlice('\n')
-		line = append(line, part...)
-		if errors.Is(err, bufio.ErrBufferFull) {
-			continue
-		}
-		content := bytes.TrimSuffix(line, []byte{'\n'})
-		if firstMatchLine(q, content, filter) {
-			return string(content), nil
-		}
-		if err == io.EOF {
-			return "", nil
-		}
-		if err != nil {
-			return "", fmt.Errorf("отчёт не распаковался: %w", err)
-		}
-		line = line[:0]
+	if len(filter) > 0 && !runMayMatchASCII(line, filter) {
+		return false, buf
 	}
+	if len(filter) > 0 {
+		buf = appendFold(buf, line)
+		if !runMayMatchBytes(buf, filter) {
+			return false, buf
+		}
+	}
+	return q.any.Match(line), buf
 }
 
 // maxReplies — сколько совпавших реплик показывать.
@@ -440,6 +436,12 @@ type replyHit struct {
 // replyBlocks — блоки журнала, где совпало хоть что-то: один блок - одно место в выводе, даже если совпали и фраза
 // агента, и ответ.
 func replyBlocks(data string, q query) []replyHit {
+	return replyBlocksOf(data, []byte(data), q)
+}
+
+// replyBlocksOf is replyBlocks for a journal held both as text and as raw, the same bytes, so that the caller
+// that already has both does not copy the journal again.
+func replyBlocksOf(data string, raw []byte, q query) []replyHit {
 	var hits []replyHit
 	var cur replyHit
 	first, matched := "", false
@@ -454,7 +456,11 @@ func replyBlocks(data string, q query) []replyHit {
 		cur, first, matched = replyHit{}, "", false
 		clear(seen)
 	}
+	lines := newReplyLineFilter(q, raw)
+	at := 0
 	for l := range strings.Lines(data) {
+		lineAt := at
+		at += len(l)
 		l = strings.TrimSuffix(l, "\n")
 		if strings.HasPrefix(l, "### ") {
 			flush()
@@ -467,8 +473,11 @@ func replyBlocks(data string, q query) []replyHit {
 		} else if first == "" && l != "" {
 			first = l
 		}
+		if !lines.mayMatch(lineAt) {
+			continue // the line cannot pass q.runs, so matchAnyFolded would reject it
+		}
 		folded := foldText(l)
-		if !matchFilteredFolded(q.any, q.runs, l, folded) {
+		if !q.matchAnyFolded(l, folded) {
 			continue
 		}
 		matched = true
@@ -486,22 +495,51 @@ func replyBlocks(data string, q query) []replyHit {
 	return hits
 }
 
+// replyLineFilter tells which journal lines may pass q.runs, by the line scanner; without a scanner every line may.
+type replyLineFilter struct {
+	scanner   *lineScanner
+	scan      bool
+	raw       []byte
+	candidate int // start of the next line the scanner cannot rule out; -1: none left, -2: not searched
+}
+
+func newReplyLineFilter(q query, raw []byte) *replyLineFilter {
+	scanner, scan := q.scannerFor(q.runs)
+	return &replyLineFilter{scanner: scanner, scan: scan, raw: raw, candidate: -2}
+}
+
+// mayMatch reports whether the line starting at lineAt may pass q.runs. Lines are asked in increasing order.
+func (f *replyLineFilter) mayMatch(lineAt int) bool {
+	if !f.scan {
+		return true
+	}
+	if f.candidate == -2 || f.candidate >= 0 && f.candidate < lineAt {
+		next, ok := f.scanner.nextLine(f.raw, lineAt)
+		f.candidate = next
+		if !ok {
+			f.candidate = -1
+		}
+	}
+	return f.candidate == lineAt
+}
+
 // replies — реплики пользователя из журнала, который дописывает программа разбора daydigest: заголовок блока, «в ответ на»
 // (последняя фраза агента) и сама строка.
 func replies(w io.Writer, q query, s paths) {
 	if err := exec.Command(s.daydigest, "-log", s.replies).Run(); err != nil {
 		fmt.Fprintf(w, "(daydigest не дописал журнал - он может отставать: %v)\n", err)
 	}
-	data, err := readCachedReplies(s.replies)
+	data, err := readReplies(s.replies)
 	if err != nil {
 		fmt.Fprintf(w, "(нет журнала: %v)\n", err)
 		return
 	}
 	transcripts := indexTranscripts(s.projects)
+	text := string(data)
 	if activePriorDB == nil {
-		prewarmReplyTranscripts(s.replies, string(data), transcripts)
+		prewarmReplyTranscripts(s.replies, text, transcripts)
 	}
-	hits := replyBlocks(string(data), q)
+	hits := replyBlocksOf(text, data, q)
 	if len(hits) == 0 {
 		fmt.Fprintln(w, "(нет)")
 		if activePriorDB != nil {
