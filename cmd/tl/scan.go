@@ -749,23 +749,32 @@ func (f *filter) file(src source) ([]hit, []time.Duration, []waitSample, transcr
 
 // fileWithRawSummary is file with the rawSummary of the file under --raw.
 func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitSample, transcript.Meta, rawSummary, error) {
-	var keep func([]byte, transcript.ToolNames) bool
-	if len(f.needles) > 0 || f.rawRE != nil {
-		keep = f.keepWithState
-	}
-	var wt *waitTracker
-	if f.opts.waitProg != "" || f.opts.waitAll {
-		wt = newWaitTracker(f.opts)
-	}
+	keep := f.eventKeep()
+	wt := f.newWaitTracker()
 	if wt != nil && (f.opts.waitCache != nil || waitrec.IsRollout(src.Path)) {
 		hits, waits, rows, meta, err := f.cachedWaitFile(src, wt)
 		return hits, waits, rows, meta, rawSummary{}, err
 	}
-	var (
-		out    []hit
-		before []transcript.Event // последние -C событий окна до найденного
-		after  int                // сколько событий после найденного ещё показать
-	)
+	return f.readFileWithContext(src, keep, wt, f.readEvents)
+}
+
+func (f *filter) eventKeep() func([]byte, transcript.ToolNames) bool {
+	if len(f.needles) > 0 || f.rawRE != nil {
+		return f.keepWithState
+	}
+	return nil
+}
+
+func (f *filter) newWaitTracker() *waitTracker {
+	if f.opts.waitProg != "" || f.opts.waitAll {
+		return newWaitTracker(f.opts)
+	}
+	return nil
+}
+
+func (f *filter) readFileWithContext(src source, keep func([]byte, transcript.ToolNames) bool, wt *waitTracker, read func(string, func([]byte, transcript.ToolNames) bool, func(transcript.Event)) (transcript.Meta, error)) ([]hit, []time.Duration, []waitSample, transcript.Meta, rawSummary, error) {
+	var out []hit
+	window := contextStream{src: src, radius: f.opts.context}
 	lineRoles := map[int]*rawLineRoles{}
 	consume := func(ev transcript.Event) {
 		f.recordRawLineRole(lineRoles, ev)
@@ -779,25 +788,15 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 		if !f.inWindow(ev) {
 			return
 		}
-		switch {
-		case f.match(ev):
-			for i := range before {
-				out = append(out, hit{src: src, ev: before[i]})
-			}
-			before = before[:0]
+		if f.opts.context > 0 {
+			window.add(ev, f.match(ev))
+			return
+		}
+		if f.match(ev) {
 			out = append(out, hit{src: src, ev: ev})
-			after = f.opts.context
-		case after > 0:
-			out = append(out, hit{src: src, ev: ev})
-			after--
-		case f.opts.context > 0:
-			if len(before) == f.opts.context {
-				before = before[1:]
-			}
-			before = append(before, ev)
 		}
 	}
-	meta, err := f.readEvents(src.Path, keep, consume)
+	meta, err := read(src.Path, keep, consume)
 	var waits []time.Duration
 	var waitRows []waitSample
 	if wt != nil {
@@ -805,9 +804,95 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 		waitRows = f.waitRowsInWindow(wt.waitRows)
 	}
 	if err != nil {
+		if f.opts.context > 0 {
+			out = window.hits()
+		}
 		return out, waits, waitRows, meta, rawSummary{}, fmt.Errorf("read %s: %w", src.Path, err)
 	}
+	if f.opts.context > 0 {
+		out = window.hits()
+	}
 	return out, waits, waitRows, meta, rawHiddenSummary(lineRoles), nil
+}
+
+// contextStream holds only the last radius events and the selected result while scanning a file.
+type contextStream struct {
+	src    source
+	radius int
+	before []transcript.Event
+	head   int
+	after  int
+	out    []hit
+}
+
+func (s *contextStream) add(ev transcript.Event, matched bool) {
+	if matched {
+		for i := range s.before {
+			pos := s.head + i
+			if pos >= len(s.before) {
+				pos -= len(s.before)
+			}
+			s.out = append(s.out, hit{src: s.src, ev: s.before[pos]})
+		}
+		s.before = s.before[:0]
+		s.head = 0
+		s.out = append(s.out, hit{src: s.src, ev: ev})
+		s.after = s.radius
+		return
+	}
+	if s.after > 0 {
+		s.out = append(s.out, hit{src: s.src, ev: ev})
+		s.after--
+		return
+	}
+	if s.radius == 0 {
+		return
+	}
+	if len(s.before) < s.radius {
+		s.before = append(s.before, ev)
+		return
+	}
+	s.before[s.head] = ev
+	s.head++
+	if s.head == s.radius {
+		s.head = 0
+	}
+}
+
+func (s *contextStream) hits() []hit { return s.out }
+
+// contextWindow marks events within n positions of any match in the already-filtered file order.
+func contextWindow(matches []bool, n int) []bool {
+	keep := make([]bool, len(matches))
+	if n >= len(matches) {
+		for _, matched := range matches {
+			if matched {
+				clear(keep)
+				for i := range keep {
+					keep[i] = true
+				}
+				return keep
+			}
+		}
+		return keep
+	}
+	last := -1
+	for pos, matched := range matches {
+		if !matched {
+			continue
+		}
+		lo, hi := contextWindowBounds(pos, n, len(matches))
+		for i := max(lo, last+1); i <= hi; i++ {
+			keep[i] = true
+		}
+		last = max(last, hi)
+	}
+	return keep
+}
+
+// contextWindowBounds uses the remaining distance to the file edge before adding n, avoiding integer overflow.
+func contextWindowBounds(pos, n, length int) (int, int) {
+	return max(0, pos-n), pos + min(n, length-1-pos)
 }
 
 func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Duration, []waitSample, transcript.Meta, error) {

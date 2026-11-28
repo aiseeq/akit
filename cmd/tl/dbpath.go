@@ -50,7 +50,7 @@ var rawSettings = url.Values{"max_threads": {"8"}, "max_block_size": {"1024"}, "
 
 // dbForm tells whether the database path answers this call; the other forms read files.
 func dbForm(opts options) bool {
-	return !opts.version && !opts.worktime && !opts.openQuestions && opts.waitProg == "" && !opts.waitAll && opts.context == 0
+	return !opts.version && !opts.worktime && !opts.openQuestions && !(opts.usage && opts.context > 0) && opts.waitProg == "" && !opts.waitAll
 }
 
 // dbFile is one transcript's metadata in files FINAL.
@@ -386,7 +386,7 @@ func (d *dbPath) resolveSessions() ([]source, error) {
 		}
 		out = append(out, src)
 		if d.opts.subagents {
-			subs, err := transcript.SubSources(path)
+			subs, err := d.subagentSources(path, src)
 			if err != nil {
 				return nil, err
 			}
@@ -417,6 +417,29 @@ func (d *dbPath) dbSubSources(parentPath string) []source {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+func (d *dbPath) subagentSources(path string, parent source) ([]source, error) {
+	prefix := strings.TrimSuffix(path, ".jsonl") + "/subagents/agent-"
+	var files []*dbFile
+	for _, f := range d.files {
+		if f.kind == "sub" && f.parent == parent.ID && strings.HasPrefix(f.path, prefix) {
+			files = append(files, f)
+		}
+	}
+	slices.SortFunc(files, func(a, b *dbFile) int { return strings.Compare(a.path, b.path) })
+	var out []source
+	for _, f := range files {
+		// files FINAL retains removed paths; match SubSources by checking each candidate on disk.
+		if _, err := os.Stat(f.path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stat subagent %s: %w", f.path, err)
+		}
+		out = append(out, source{Path: f.path, ID: f.session, ParentID: f.parent, Description: f.desc})
+	}
+	return out, nil
 }
 
 func (d *dbPath) resolveAll() ([]source, error) {
@@ -572,7 +595,10 @@ type where struct {
 }
 
 func (d *dbPath) where(ids []uint64, kinds []string) (where, error) {
-	opts := d.opts
+	return d.whereOptions(d.opts, ids, kinds)
+}
+
+func (d *dbPath) whereOptions(opts options, ids []uint64, kinds []string) (where, error) {
 	w := where{params: map[string]string{}, settings: url.Values{}}
 	roles := make([]string, 0, len(opts.roles))
 	for _, r := range transcript.Roles {
@@ -600,6 +626,23 @@ func (d *dbPath) where(ids []uint64, kinds []string) (where, error) {
 	}
 	w.sql = strings.Join(conds, " AND ")
 	return w, nil
+}
+
+func (d *dbPath) selectContextEvents(name string, build func(where) chQuery, ids []uint64, kinds []string) ([][]string, error) {
+	// Neighbours are drawn from the same role and time window as the file scanner, before grep is applied,
+	// but only for files that have a matching event.
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	opts := d.opts
+	opts.grep = ""
+	w, err := d.whereOptions(opts, ids, kinds)
+	if err != nil {
+		return nil, err
+	}
+	q := build(w)
+	q.Name = "events-context-" + name
+	return d.query(q)
 }
 
 // rawFromSQL is the raw lines of the files that pass the condition after it: the event query and the raw summary
@@ -942,7 +985,8 @@ type sortedHit struct {
 	part string
 	off  uint64
 	// key identifies a row of the database for a second read of it
-	fileID uint64
+	fileID  uint64
+	matched bool
 }
 
 // roleRank orders the roles of one line as a record writes them: thinking, text, then the tool calls.
@@ -1033,37 +1077,130 @@ const flatLenSQL = `lengthUTF8(arrayStringConcat(arrayFilter(x -> x != '', split
 
 const spaceClass = `[\t\n\v\f\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]`
 
+type eventTextStart struct{ at, flat int }
+
 func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored) ([]sortedHit, error) {
 	width := d.opts.width
-	text := "text, 0"
-	if width > 0 {
-		text = eventTextSQL
+	var grep string
+	if d.opts.context > 0 {
+		_, params, err := grepCondition(d.opts.grep)
+		if err != nil {
+			return nil, fmt.Errorf("context grep: %w", err)
+		}
+		grep = params["grep"]
 	}
-	rows, err := d.selectEvents("events", func(w where) chQuery {
+	selectRows := d.selectEvents
+	if d.opts.context > 0 {
+		var err error
+		ids, err = d.contextMatchIDs(ids, kinds)
+		if err != nil {
+			return nil, err
+		}
+		selectRows = d.selectContextEvents
+	}
+	rows, err := selectRows("events", d.eventQuery(width, grep), ids, kinds)
+	if err != nil {
+		return nil, err
+	}
+	hits, starts, err := d.parseEventRows(rows, byID)
+	if err != nil {
+		return nil, err
+	}
+	if d.opts.context > 0 {
+		indexes := contextIndexes(hits, d.opts.context)
+		selected := make([]bool, len(hits))
+		for _, idx := range indexes {
+			selected[idx] = true
+		}
+		filtered := make([]sortedHit, 0, len(indexes))
+		remap := make([]int, len(hits))
+		for i := range remap {
+			remap[i] = -1
+		}
+		for i := range hits {
+			if selected[i] {
+				remap[i] = len(filtered)
+				filtered = append(filtered, hits[i])
+			}
+		}
+		filteredStarts := make([]eventTextStart, 0, len(starts))
+		for _, start := range starts {
+			if remap[start.at] >= 0 {
+				filteredStarts = append(filteredStarts, eventTextStart{at: remap[start.at], flat: start.flat})
+			}
+		}
+		hits, starts = filtered, filteredStarts
+	}
+	if err := d.cutEventTexts(hits, starts, width); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+func (d *dbPath) eventQuery(width int, grep string) func(where) chQuery {
+	return func(w where) chQuery {
+		projection, matchExpr := "text, 0", ""
 		if width > 0 {
+			projection = eventTextSQL
 			w.params["cut"] = strconv.Itoa(textCut(width))
 			w.params["whole"] = strconv.Itoa(max(wholeText, textCut(width)))
 			w.params["ws"] = chString(spaceClass + "+")
 			w.params["trim"] = chString("^" + spaceClass + "+|" + spaceClass + "+$")
 		}
-		return chQuery{SQL: "SELECT file_id, line, seq, toUnixTimestamp64Milli(ts), role, who, subtype, " + text + ", _part, _part_offset FROM events WHERE " + w.sql,
+		if d.opts.context > 0 {
+			// Match full event text on the server while returning only the normal listing projection.
+			w.params["grep"] = grep
+			matchExpr = ", match(concat(who, ' ', text), {grep:String})"
+		}
+		return chQuery{SQL: "SELECT file_id, line, seq, toUnixTimestamp64Milli(ts), role, who, subtype, " + projection + ", _part, _part_offset" + matchExpr + " FROM events WHERE " + w.sql,
 			Params: w.params, Settings: w.settings}
-	}, ids, kinds)
+	}
+}
+
+func (d *dbPath) contextMatchIDs(ids []uint64, kinds []string) ([]uint64, error) {
+	w, err := d.whereOptions(d.opts, ids, kinds)
 	if err != nil {
 		return nil, err
 	}
-	hits := make([]sortedHit, 0, len(rows))
-	// rows that came as their start: the hit and the flattened length of its whole text, cut below
-	type start struct{ at, flat int }
-	var starts []start
+	rows, err := d.query(chQuery{Name: "context-matches", SQL: "SELECT DISTINCT file_id FROM events WHERE " + w.sql,
+		Params: w.params, Settings: w.settings})
+	if err != nil {
+		return nil, err
+	}
+	matched := make(map[uint64]struct{}, len(rows))
 	for _, row := range rows {
-		if len(row) != 11 {
-			return nil, fmt.Errorf("events: %d fields in a row, want 11", len(row))
+		if len(row) == 0 {
+			return nil, errors.New("context-matches: missing file_id")
+		}
+		id, err := strconv.ParseUint(row[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("context-matches file_id %q: %w", row[0], err)
+		}
+		matched[id] = struct{}{}
+	}
+	ids = make([]uint64, 0, len(matched))
+	for id := range matched {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+func (d *dbPath) parseEventRows(rows [][]string, byID map[uint64]stored) ([]sortedHit, []eventTextStart, error) {
+	hits := make([]sortedHit, 0, len(rows))
+	var starts []eventTextStart
+	wantFields := 11
+	if d.opts.context > 0 {
+		wantFields++
+	}
+	for _, row := range rows {
+		if len(row) != wantFields {
+			return nil, nil, fmt.Errorf("events: %d fields in a row, want %d", len(row), wantFields)
 		}
 		p := fields{row: row}
 		id, line, seq, ms, flat, off := p.uint(0), p.int(1), p.uint(2), int64(p.uint(3)), p.int(8), p.uint(10)
 		if p.err != nil {
-			return nil, fmt.Errorf("events: %w", p.err)
+			return nil, nil, fmt.Errorf("events: %w", p.err)
 		}
 		s, ok := byID[id]
 		if !ok || line > s.file.evLines {
@@ -1072,12 +1209,19 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 		h := sortedHit{hit: hit{src: s.src, ev: dbEvent(line, ms, row[4], row[5], row[7])}, seq: seq, rank: roleRank[transcript.Role(row[4])], part: row[9],
 			off: off, fileID: id}
 		h.ev.Subtype = row[6]
+		if d.opts.context > 0 {
+			h.matched = row[11] == "1"
+		}
 		if flat > 0 {
-			starts = append(starts, start{at: len(hits), flat: flat})
+			starts = append(starts, eventTextStart{at: len(hits), flat: flat})
 		}
 		hits = append(hits, h)
 	}
-	// masking the starts is most of the time of a long listing, and the starts do not depend on each other
+	return hits, starts, nil
+}
+
+func (d *dbPath) cutEventTexts(hits []sortedHit, starts []eventTextStart, width int) error {
+	// Masking starts is most of the time of a long listing; each start is independent.
 	cutStart := time.Now()
 	cuts := make([]string, len(starts))
 	cutOK := make([]bool, len(starts))
@@ -1088,7 +1232,7 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 		}
 	})
 	d.tracef("cuts", cutStart, len(starts))
-	var long []int // rows whose start does not decide the cut
+	var long []int
 	for i, s := range starts {
 		if cutOK[i] {
 			hits[s.at].cut = &cuts[i]
@@ -1096,12 +1240,40 @@ func (d *dbPath) eventRows(ids []uint64, kinds []string, byID map[uint64]stored)
 			long = append(long, s.at)
 		}
 	}
-	if len(long) > 0 {
-		if err := d.wholeTexts(hits, long); err != nil {
-			return nil, err
+	if len(long) == 0 {
+		return nil
+	}
+	return d.wholeTexts(hits, long)
+}
+
+func contextIndexes(all []sortedHit, n int) []int {
+	byFile := make(map[string][]int)
+	for i := range all {
+		byFile[all[i].src.Path] = append(byFile[all[i].src.Path], i)
+	}
+	keep := make([]bool, len(all))
+	for _, indexes := range byFile {
+		slices.SortFunc(indexes, func(i, j int) int {
+			return cmp.Or(cmp.Compare(all[i].hit.ev.Line, all[j].hit.ev.Line), cmp.Compare(all[i].seq, all[j].seq))
+		})
+		matches := make([]bool, len(indexes))
+		for pos, idx := range indexes {
+			matches[pos] = all[idx].matched
+		}
+		window := contextWindow(matches, n)
+		for pos, yes := range window {
+			if yes {
+				keep[indexes[pos]] = true
+			}
 		}
 	}
-	return hits, nil
+	var out []int
+	for i := range all {
+		if keep[i] {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 // wholeTexts reads the whole text of the events at idx: masking shrank their start below the cut.

@@ -423,13 +423,6 @@ func (f *fakeCH) usageFromEvents(query string) ([][]string, error) {
 	return out, nil
 }
 
-func eventValue(event []string, index int, fallback string) string {
-	if index >= len(event) {
-		return fallback
-	}
-	return event[index]
-}
-
 func TestRetentionPredicateAgainstClickHouse(t *testing.T) {
 	if os.Getenv("AKIT_CLICKHOUSE_READ_TEST") != "1" {
 		t.Skip("set AKIT_CLICKHOUSE_READ_TEST=1 to compare retention SQL with ClickHouse; run -run TestRetentionPredicateAgainstClickHouse")

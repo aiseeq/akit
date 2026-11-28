@@ -12,6 +12,7 @@ import (
 
 	"github.com/aiseeq/akit/timearg"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 const sessionID = "1a2b3c4d-0000-4000-8000-000000000001"
@@ -68,6 +69,58 @@ func freshnessIn(s string) string {
 	return "\x00"
 }
 
+func TestFallbackChildEnvEmptyIsFalseAndInvalidIsRejected(t *testing.T) {
+	previousHide := hide
+	t.Cleanup(func() { hide = previousHide })
+	t.Setenv("TL_FALLBACK_CHILD", "")
+	var stdout, stderr bytes.Buffer
+	if code := start([]string{"--version"}, time.Now(), &stdout, &stderr); code != 0 || stdout.Len() == 0 {
+		t.Fatalf("empty TL_FALLBACK_CHILD: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	t.Setenv("TL_FALLBACK_CHILD", "perhaps")
+	stdout.Reset()
+	stderr.Reset()
+	if code := start([]string{"--version"}, time.Now(), &stdout, &stderr); code != exitUsage || !strings.Contains(stderr.String(), "TL_FALLBACK_CHILD") {
+		t.Fatalf("invalid TL_FALLBACK_CHILD: code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestOptionalBooleanEnvironment(t *testing.T) {
+	for _, name := range []string{"TL_FALLBACK_CHILD", "TL_SHADOW_SLOTS_HELD"} {
+		t.Run(name, func(t *testing.T) {
+			for _, value := range []struct {
+				name string
+				raw  string
+				set  bool
+				want bool
+				bad  bool
+			}{{name: "unset"}, {name: "empty", set: true}, {name: "true", raw: "true", set: true, want: true}, {name: "false", raw: "false", set: true}, {name: "invalid", raw: "perhaps", set: true, bad: true}} {
+				t.Run(value.name, func(t *testing.T) {
+					if value.set {
+						t.Setenv(name, value.raw)
+					} else {
+						old, had := os.LookupEnv(name)
+						if err := os.Unsetenv(name); err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() {
+							if had {
+								_ = os.Setenv(name, old)
+							} else {
+								_ = os.Unsetenv(name)
+							}
+						})
+					}
+					got, err := parseBoolEnv(name)
+					if value.bad && err == nil || !value.bad && (err != nil || got != value.want) {
+						t.Errorf("parseBoolEnv(%s=%q) = (%t,%v), want (%t, error=%t)", name, os.Getenv(name), got, err, value.want, value.bad)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestReadDBStateHealth(t *testing.T) {
 	home, stateHome := t.TempDir(), t.TempDir()
 	t.Setenv("XDG_STATE_HOME", stateHome)
@@ -86,7 +139,7 @@ func TestReadDBStateHealth(t *testing.T) {
 		}
 	}
 	valid := dbState{Heartbeat: time.Now().Format(time.RFC3339Nano), DBThrough: time.Now(), Home: home}
-	if _, err := readDBState(home); err == nil {
+	if _, err := transcriptdb.CheckHealth(home); err == nil {
 		t.Fatal("missing state accepted")
 	}
 	for _, tc := range []struct {
@@ -104,13 +157,13 @@ func TestReadDBStateHealth(t *testing.T) {
 			st := valid
 			tc.change(&st)
 			write(st)
-			if _, err := readDBState(home); err == nil {
+			if _, err := transcriptdb.CheckHealth(home); err == nil {
 				t.Fatal("unhealthy state accepted")
 			}
 		})
 	}
 	write(valid)
-	if got, err := readDBState(home); err != nil || !got.DBThrough.Equal(valid.DBThrough) {
+	if got, err := transcriptdb.CheckHealth(home); err != nil || !got.DBThrough.Equal(valid.DBThrough) {
 		t.Fatalf("valid state: %+v, %v", got, err)
 	}
 }

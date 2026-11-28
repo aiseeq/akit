@@ -673,6 +673,33 @@ type transferredUnblockTarget struct {
 	refs    []string
 }
 
+func transferredUnblockRefs(t task, key string) ([]string, map[string]struct{}, error) {
+	ledgerDirs := make(map[string]struct{})
+	var matches []string
+	for _, ref := range headerLinks(t.body, blockedPrefix) {
+		sourceDir, _, err := referenceLocation(taskProject(t.path), ref)
+		if err != nil {
+			return nil, nil, err
+		}
+		ledgerDirs[sourceDir] = struct{}{}
+		_, _, err = linkedPath(dirProject(sourceDir), ref)
+		if err == nil || !errors.Is(err, os.ErrNotExist) {
+			if err != nil {
+				return nil, nil, err
+			}
+			continue // a live or archived task with this slug is a different blocker
+		}
+		rows, err := readTransferLedger(sourceDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		if row, ok := transferredRecord(rows, filepath.Base(ref)); ok && row.Key == key {
+			matches = append(matches, ref)
+		}
+	}
+	return matches, ledgerDirs, nil
+}
+
 func unblockTransferredKey(o options, key string, out, errout io.Writer) int {
 	targets := make([]transferredUnblockTarget, 0, len(o.unblocks))
 	for _, raw := range o.unblocks {
@@ -684,30 +711,11 @@ func unblockTransferredKey(o options, key string, out, errout io.Writer) int {
 		if err != nil {
 			return reportFindError(err, raw, errout)
 		}
-		ledgerDirs := map[string]struct{}{dir: {}}
-		var matches []string
-		for _, ref := range headerLinks(t.body, blockedPrefix) {
-			sourceDir, _, locationErr := referenceLocation(taskProject(t.path), ref)
-			if locationErr != nil {
-				return fail(errout, locationErr)
-			}
-			ledgerDirs[sourceDir] = struct{}{}
-			project := dirProject(sourceDir)
-			_, _, linkedErr := linkedPath(project, ref)
-			if linkedErr == nil {
-				continue // a live or archived task with this slug is a different blocker
-			}
-			if !errors.Is(linkedErr, os.ErrNotExist) {
-				return fail(errout, linkedErr)
-			}
-			rows, readErr := readTransferLedger(sourceDir)
-			if readErr != nil {
-				return fail(errout, readErr)
-			}
-			if row, ok := transferredRecord(rows, filepath.Base(ref)); ok && row.Key == key {
-				matches = append(matches, ref)
-			}
+		matches, ledgerDirs, err := transferredUnblockRefs(t, key)
+		if err != nil {
+			return fail(errout, err)
 		}
+		ledgerDirs[dir] = struct{}{}
 		foundKey := false
 		for ledgerDir := range ledgerDirs {
 			rows, readErr := readTransferLedger(ledgerDir)

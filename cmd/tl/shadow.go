@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aiseeq/akit/transcriptdb"
 )
 
 // Shadow repeats selected answers through the other backend. Repeats run detached and write one JSON line to the
@@ -574,7 +576,7 @@ func shadowAfter(a *answer, opts options, e env, code int, elapsed time.Duration
 		}
 		return
 	}
-	_, err := readDBState(e.home)
+	_, err := transcriptdb.CheckHealth(e.home)
 	if err != nil {
 		if e.dbTrace != nil {
 			fmt.Fprintf(e.dbTrace, "tl: shadow freshness state: %v; no shadow\n", err)
@@ -630,7 +632,11 @@ func runShadowChild(specPath string) error {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return fmt.Errorf("shadow spec %s: %w", specPath, err)
 	}
-	if os.Getenv("TL_SHADOW_SLOTS_HELD") != "1" {
+	slotsHeld, err := parseBoolEnv("TL_SHADOW_SLOTS_HELD")
+	if err != nil {
+		return fmt.Errorf("TL_SHADOW_SLOTS_HELD: %w", err)
+	}
+	if !slotsHeld {
 		if !holdShadowSlots(spec) {
 			return nil
 		}
@@ -745,6 +751,7 @@ func shadowRepeat(spec shadowSpec, home string) shadowRecord {
 		} else {
 			rec.Error = hideSafe(err.Error())
 		}
+		fmt.Fprintf(os.Stderr, "tl: shadow repeat: %s\n", rec.Error)
 		return rec
 	}
 	keys := answerKeysWithin(a, opts, spec.Cutoff, a.limits)
@@ -844,7 +851,9 @@ func appendShadowRecord(spec shadowSpec, rec shadowRecord) error {
 // pickShadow decides whether this call is repeated through the other backend.
 func pickShadow(opts options, backend string) (bool, error) {
 	// --usage aggregates events into session rows, so its keys have no event line to cap.
-	if !dbForm(opts) || opts.usage || backend != backendFiles && backend != backendDB {
+	// Context output is derived from neighbouring events; shadow's per-row line/time cap can drop the
+	// matching event while retaining its neighbour and report a false backend difference.
+	if !dbForm(opts) || opts.usage || opts.context > 0 || backend != backendFiles && backend != backendDB {
 		return false, nil
 	}
 	rate, err := shadowRate()

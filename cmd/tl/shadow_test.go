@@ -282,6 +282,14 @@ func TestShadowAnswerKeysApplyLineCapsToRefs(t *testing.T) {
 	}
 }
 
+func TestPickShadowSkipsContextForms(t *testing.T) {
+	t.Setenv("TL_SHADOW_RATE", "1")
+	opts := options{context: 1}
+	if pick, err := pickShadow(opts, backendDB); err != nil || pick {
+		t.Fatalf("pickShadow(context) = %v, %v; want false, nil", pick, err)
+	}
+}
+
 func TestDatabaseShadowDropsFilesMissingFromDatabaseLimits(t *testing.T) {
 	e, paths, _ := dbCorpus(t)
 	loaded := []string{paths[0], paths[2], paths[3]}
@@ -677,12 +685,12 @@ func TestSeenFormsLockWaitsWithoutStderrNoise(t *testing.T) {
 	ch := newFakeCH(t, paths, unloaded)
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
 	t.Setenv("HOME", e.home)
 	t.Setenv("TL_CLICKHOUSE_URL", srv.URL)
 	t.Setenv("TL_BACKEND", backendDB)
-	t.Setenv("TL_SHADOW_RATE", "0.1")
+	t.Setenv("TL_SHADOW_RATE", "1")
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
 	statePath := filepath.Join(state, "akit", "tlfeed", "state.json")
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
 		t.Fatal(err)
@@ -702,19 +710,58 @@ func TestSeenFormsLockWaitsWithoutStderrNoise(t *testing.T) {
 	if err != nil || release == nil {
 		t.Fatalf("hold seen-forms lock: %v", err)
 	}
-	oldSpawner := shadowSpawner
-	shadowSpawner = func(path, _, _ string) error { return removeSpec(path) }
-	t.Cleanup(func() { shadowSpawner = oldSpawner })
-	var stderr bytes.Buffer
-	done := make(chan int, 1)
-	go func() { done <- start([]string{"--all", "--max", "0"}, e.now, io.Discard, &stderr) }()
-	time.Sleep(30 * time.Millisecond)
-	release()
-	if code := <-done; code != 0 {
-		t.Fatalf("call while lock was held returned %d", code)
+	started := make(chan struct{}, 1)
+	contended := make(chan struct{}, 1)
+	oldContended := shadowLockContended
+	shadowLockContended = func() {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case contended <- struct{}{}:
+		default:
+		}
 	}
-	if got := strings.TrimSpace(stderr.String()); got != "" && !strings.HasPrefix(got, "tl: данные актуальны на ") {
-		t.Fatalf("seen-forms contention printed to stderr: %q", stderr.String())
+	t.Cleanup(func() { shadowLockContended = oldContended })
+	oldSpawner := shadowSpawner
+	shadowSpawner = func(string, string, string) error { return nil }
+	t.Cleanup(func() { shadowSpawner = oldSpawner })
+	type result struct {
+		code   int
+		stdout string
+		stderr string
+	}
+	done := make(chan result, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		code := start([]string{"--all", "--max", "0"}, e.now, &stdout, &stderr)
+		done <- result{code: code, stdout: stdout.String(), stderr: stderr.String()}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		release()
+		t.Fatal("ordinary invocation did not start waiting for the occupied seen-forms lock")
+	}
+	select {
+	case <-contended:
+	case <-time.After(5 * time.Second):
+		release()
+		t.Fatal("ordinary invocation did not report lock contention to the test")
+	}
+	release()
+	select {
+	case got := <-done:
+		if got.code != 0 || got.stdout == "" {
+			t.Fatalf("ordinary invocation after releasing lock = (%d,%q,%q)", got.code, got.stdout, got.stderr)
+		}
+		freshness := "tl: данные актуальны на " + freshnessIn(got.stderr) + "\n"
+		if strings.ReplaceAll(got.stderr, freshness, "") != "" {
+			t.Fatalf("ordinary invocation wrote lock noise to stderr: %q", got.stderr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ordinary invocation did not resume after releasing the lock")
 	}
 }
 

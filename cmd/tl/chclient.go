@@ -1,10 +1,6 @@
 package main
 
-import (
-	"time"
-
-	"github.com/aiseeq/akit/transcriptdb"
-)
+import "github.com/aiseeq/akit/transcriptdb"
 
 // Compatibility names keep tl's call sites and tests stable; the implementation lives in transcriptdb.
 type chClient = transcriptdb.Client
@@ -24,9 +20,11 @@ func tlNamed(c *chClient, err error) (*chClient, error) {
 	return c.WithTool("tl"), nil
 }
 
-func chString(s string) string    { return transcriptdb.String(s) }
-func chStrings(v []string) string { return transcriptdb.Strings(v) }
-func chUints(v []uint64) string   { return transcriptdb.Uints(v) }
-func chTime(t time.Time) string   { return transcriptdb.Time(t) }
-func tsvEscape(s string) string   { return transcriptdb.TSVEscape(s) }
-func tsvUnescape(s string) string { return transcriptdb.TSVUnescape(s) }
+var (
+	chString    = transcriptdb.String
+	chStrings   = transcriptdb.Strings
+	chUints     = transcriptdb.Uints
+	chTime      = transcriptdb.Time
+	tsvEscape   = transcriptdb.TSVEscape
+	tsvUnescape = transcriptdb.TSVUnescape
+)

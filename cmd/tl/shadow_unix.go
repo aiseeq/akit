@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var shadowLockContended = func() {}
+
 // takeSlot holds the lock file at path until release or the end of the process; a nil release — another process
 // holds it.
 func takeSlot(path string) (func(), error) {
@@ -53,6 +55,7 @@ func lockShadowResultTimeout(path string, timeout time.Duration) (func(), *os.Fi
 				f.Close()
 				return nil, nil, false, fmt.Errorf("lock %s: %w", path, err)
 			}
+			shadowLockContended()
 			if !time.Now().Before(deadline) {
 				f.Close()
 				return nil, nil, false, nil
@@ -60,7 +63,11 @@ func lockShadowResultTimeout(path string, timeout time.Duration) (func(), *os.Fi
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }, f, true, nil
+	return func() {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+			fmt.Fprintf(os.Stderr, "tl: release shadow lock: %v\n", err)
+		}
+	}, f, true, nil
 }
 
 // detached starts the repeat in a session of its own: it outlives the call and its terminal.

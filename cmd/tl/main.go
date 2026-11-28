@@ -243,7 +243,11 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	if err := useMaskKey(maskKeyPath(home)); err != nil {
 		printMasked(stderr, fmt.Sprintf("tl: %v\n", err))
 	}
-	fallbackChild := os.Getenv("TL_FALLBACK_CHILD") == "1"
+	fallbackChild, err := parseBoolEnv("TL_FALLBACK_CHILD")
+	if err != nil {
+		printMasked(stderr, fmt.Sprintf("tl: TL_FALLBACK_CHILD: %v\n", err))
+		return exitUsage
+	}
 	backend := backendFromEnv(stderr)
 	if fallbackChild {
 		backend = backendFiles
@@ -257,6 +261,15 @@ func start(args []string, now time.Time, stdout, stderr io.Writer) int {
 	code := run(opts, e, stdout, stderr)
 	shadowAfter(e.collect, opts, e, code, time.Since(begin), stderr)
 	return code
+}
+
+// Empty and unset boolean settings are false; a non-empty value must be a standard boolean.
+func parseBoolEnv(name string) (bool, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return false, nil
+	}
+	return strconv.ParseBool(raw)
 }
 
 func prepareShadow(opts options, e *env, stderr io.Writer) {
@@ -722,11 +735,15 @@ func runOutput(opts options, e env, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "tl: %v\n", err)
 		return exitUsage
 	}
+	if opts.all && len(opts.args) > 0 && len(refs) == 0 {
+		fmt.Fprintln(stderr, "tl: --all and SESSION together; pick one")
+		return exitUsage
+	}
 	if opts.openQuestions && len(refs) > 0 {
 		fmt.Fprintln(stderr, "tl: --open-questions needs a SESSION, not an event reference")
 		return exitUsage
 	}
-	if e.backend == backendDB && dbForm(opts) {
+	if e.backend == backendDB && dbForm(opts) && !(opts.all && len(refs) > 0) {
 		code, ok, err := runOutputDB(opts, e, refs, stdout, stderr)
 		if err != nil && !e.fallbackChild {
 			warn := stderr
@@ -761,7 +778,7 @@ func finishFallback(fallback *fallbackState) {
 // runOutputDB answers through the database; false — it could not, nothing is printed but the warning, and the
 // caller reads the files.
 func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer) (int, bool, error) {
-	state, err := readDBState(e.home)
+	state, err := transcriptdb.CheckHealth(e.home)
 	if transcriptdb.NoLoader(context.Background(), err) {
 		return 0, false, nil
 	}
@@ -799,8 +816,6 @@ func runOutputDB(opts options, e env, refs []eventRef, stdout, stderr io.Writer)
 }
 
 type dbState = transcriptdb.State
-
-func readDBState(home string) (dbState, error) { return transcriptdb.CheckHealth(home) }
 
 func reportRefs(refs []eventRef, opts options, e env, stdout, stderr io.Writer) int {
 	// REF — событие целиком; режет его только явный --width, не ширина списка по умолчанию.

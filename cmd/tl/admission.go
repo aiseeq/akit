@@ -62,7 +62,7 @@ func admission(sources []source, args []string, stdout, stderr io.Writer, cache 
 		}
 		cmd := exec.Command(graft, append([]string{"exec", "--heavy", "--local", "--", executable}, args...)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
-		values := map[string]string{"TL_FALLBACK_CHILD": ""}
+		values := map[string]string{}
 		if backendFromEnv(io.Discard) == backendDB {
 			values["TL_FALLBACK_CHILD"] = "1"
 		}

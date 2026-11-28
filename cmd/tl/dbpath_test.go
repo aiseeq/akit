@@ -40,6 +40,7 @@ type fakeCH struct {
 	eventWhole   []string // whole-text limits used by the event listing
 	eventSQL     []string // event projections, for the text-preservation contract
 	eventRunes   []int    // the characters of each event text the listing answers carried, in order
+	contextFiles [][]string
 	usageSQL     []string
 	gate         chan struct{} // when set, requests wait for it to close
 	gateName     string
@@ -232,6 +233,9 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if name == "events-context-events" {
+		s.contextFiles = append(s.contextFiles, chArray(q.Get("param_files")))
+	}
 	if name == "usage" {
 		s.usageSQL = append(s.usageSQL, sql)
 	}
@@ -295,16 +299,23 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				row(u.file.id, u.legacy, u.model, u.reply, u.request, u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Write5m, u.Write1h, u.Fast, u.Geo, u.at, u.line)
 			}
 		}
-	case "events":
+	case "events", "context-matches", "events-context-events":
+		matchedFiles := map[uint64]bool{}
 		for _, f := range s.files {
 			for _, e := range f.events {
 				if !s.match(q, sql, f, e) {
 					continue
 				}
+				if name == "context-matches" {
+					if !matchedFiles[f.id] {
+						row(f.id)
+						matchedFiles[f.id] = true
+					}
+					continue
+				}
 				ev := e.ev
 				text, flat := ev.Shown(), 0
-				switch {
-				case strings.Contains(sql, wantEventTextSQL):
+				if strings.Contains(sql, wantEventTextSQL) {
 					cut, _ := strconv.Atoi(param("cut"))
 					whole, _ := strconv.Atoi(param("whole"))
 					stored := e.flatLen
@@ -312,13 +323,21 @@ func (s *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						stored = 0
 					}
 					text, flat = eventText(text, stored, cut, whole)
-				case !strings.Contains(sql, "SELECT file_id, line, seq, toUnixTimestamp64Milli(ts), role, who, subtype, text, 0, _part"):
+				} else if !strings.Contains(sql, "SELECT file_id, line, seq, toUnixTimestamp64Milli(ts), role, who, subtype, text, 0, _part") {
 					s.t.Errorf("an event projection the fake does not know: %s", sql)
 				}
 				s.mu.Lock()
 				s.eventRunes = append(s.eventRunes, utf8.RuneCountInString(text))
 				s.mu.Unlock()
-				row(f.id, ev.Line, e.seq, ms(ev.Time), ev.Role, ev.Who, ev.Subtype, text, flat, "all_1_1_0", e.off)
+				values := []any{f.id, ev.Line, e.seq, ms(ev.Time), ev.Role, ev.Who, ev.Subtype, text, flat, "all_1_1_0", e.off}
+				if name == "events-context-events" {
+					matched := "0"
+					if re2Match(tsvUnescape(param("grep")), ev.Who+" "+ev.Shown()) {
+						matched = "1"
+					}
+					values = append(values, matched)
+				}
+				row(values...)
 			}
 		}
 	case "bad":
@@ -601,6 +620,9 @@ func (s *fakeCH) match(q url.Values, sql string, f *chFile, e chEvent) bool {
 	text := ev.Who + " " + ev.Shown()
 	hay := lowerUTF8(text)
 	grep := sql
+	if _, conditions, ok := strings.Cut(grep, " FROM events WHERE "); ok {
+		grep = conditions
+	}
 	if i := strings.Index(grep, "(file_id, line) IN (SELECT"); i >= 0 {
 		grep = grep[:i]
 	}
@@ -1045,8 +1067,20 @@ func dbCorpus(t *testing.T) (env, []string, map[string]int) {
 		`{"type":"assistant","timestamp":"2026-10-25T10:10:08Z","requestId":"req-m3","message":{"id":"m3","model":"claude-opus-5-5",`+
 			`"role":"assistant","content":[{"type":"text","text":"быстрый ответ"}],"usage":{"input_tokens":7,"cache_creation_input_tokens":5000,`+
 			`"cache_read_input_tokens":0,"output_tokens":90,"speed":"fast","cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5000}}}}`,
-		userRecord("2026-10-25T10:11:00.000Z", "хвост: sub ещё не в базе"),
-		agentRecord("2026-10-25T10:11:05.000Z", "Готово и хвост"),
+		userRecord("2026-10-25T10:20:00.000Z", "needle first"),
+		agentRecord("2026-10-25T10:20:01.000Z", "a1"),
+		agentRecord("2026-10-25T10:20:02.000Z", "a2"),
+		userRecord("2026-10-25T10:20:03.000Z", "u3"),
+		agentRecord("2026-10-25T10:20:04.000Z", "a4 needle"),
+		agentRecord("2026-10-25T10:20:05.000Z", "a5"),
+		userRecord("2026-10-25T10:20:06.000Z", "u6"),
+		agentRecord("2026-10-25T10:20:07.000Z", "a7"),
+		userRecord("2026-10-25T10:20:08.000Z", "NEEDLE last ёжик"),
+		userRecord("2026-10-25T10:20:09.000Z", "needle alpha"),
+		agentRecord("2026-10-25T10:20:10.000Z", "neighbour"),
+		userRecord("2026-10-25T10:20:11.000Z", "needle beta"),
+		userRecord("2026-10-25T10:20:12.000Z", "хвост: sub ещё не в базе"),
+		agentRecord("2026-10-25T10:20:13.000Z", "Готово и хвост"),
 	)
 	sub := filepath.Join(e.home, ".claude", "projects", "-home-x-proj", dbOtherSession, "subagents", "agent-a1b2c3d4.jsonl")
 	writeWorkFile(t, sub, []string{
@@ -1068,6 +1102,22 @@ func dbCorpus(t *testing.T) (env, []string, map[string]int) {
 }
 
 var dbForms = [][]string{
+	{"--all", "--grep", "needle", "-C", "1", "--max", "0"},
+	{"--all", "--grep", "needle", "-C", "3", "--max", "0"},
+	{"--all", "--grep", "needle", "-C", "2", "--max", "3"},
+	{"--all", "--grep", "needle", "-C", "1", "--role", "user", "--max", "0"},
+	{"--all", "--grep", "needle", "-C", "1", "--role", "agent", "--max", "0"},
+	{"--all", "--grep", "needle", "-C", "1", "--role", "all", "--max", "0"},
+	{"--all", "--grep", "needle", "-C", "2", "--since", "2026-10-25T10:20:02Z", "--until", "2026-10-25T10:20:06Z", "--max", "0"},
+	{"--all", "--grep", "sub|прост", "-C", "2", "--role", "all", "--max", "0"},
+	{"--all", "--grep", "ёжик|готово", "-C", "1", "--role", "all", "--max", "0"},
+	{"--all", "--grep", "exec|ls", "-C", "1", "--codex", "--role", "all", "--max", "0"},
+	{"--all", "--grep", "needle", "-C", "1", "--width", "10", "--max", "0"},
+	{"--all", "--grep", "sub", "-C", "1", "--no-subagents", "--role", "all", "--max", "0"},
+	{"--all", "--grep", "ответ", "-C", "1", "--usage"},
+	{dbOtherSession[:8], "--grep", "sub", "-C", "1", "--subagents", "--role", "all", "--max", "0"},
+	{"7f7f7f7f", "--grep", "needle", "-C", "1", "--max", "0"},
+	{"--all", "--grep", "needle", "--raw", "alpha", "-C", "1", "--max", "0"},
 	{"--all", "--grep", "sub"},
 	{"--all", "--role", "all", "--max", "0"},
 	{"--all", "--role", "all", "--max", "0", "--width", "30"},
@@ -1101,6 +1151,18 @@ var dbForms = [][]string{
 // texts, --usage, sessions with subagents and single events.
 func TestDBPrintsAsFiles(t *testing.T) {
 	e, paths, _ := dbCorpus(t)
+	seven := writeReviewClaude(t, e, "-home-x-proj", "7f7f7f7f-0000-4000-8000-00000000000a",
+		userRecord("2026-10-25T10:20:00.000Z", "needle first"),
+		agentRecord("2026-10-25T10:20:01.000Z", "a1"),
+		agentRecord("2026-10-25T10:20:02.000Z", "a2"),
+		userRecord("2026-10-25T10:20:03.000Z", "u3"),
+		agentRecord("2026-10-25T10:20:04.000Z", "a4 needle"),
+		agentRecord("2026-10-25T10:20:05.000Z", "a5"),
+		userRecord("2026-10-25T10:20:06.000Z", "u6"),
+		agentRecord("2026-10-25T10:20:07.000Z", "a7"),
+		userRecord("2026-10-25T10:20:08.000Z", "NEEDLE last ёжик"),
+	)
+	paths = append(paths, seven)
 	ch := newFakeCH(t, paths, map[string]int{})
 	srv := httptest.NewServer(ch)
 	defer srv.Close()
@@ -1135,8 +1197,8 @@ func TestDBPrintsAsFiles(t *testing.T) {
 				if codeF != codeD || outF != outD {
 					t.Errorf("no flat_len %v, whole %d, %q: files exit %d, db exit %d\nfiles:\n%s\ndb:\n%s", noFlatLen, whole, args, codeF, codeD, outF, outD)
 				}
-				if outF == "" {
-					t.Errorf("%q: empty answer", args)
+				if outD == "" {
+					t.Errorf("database %q: empty answer", args)
 				}
 			}
 		}

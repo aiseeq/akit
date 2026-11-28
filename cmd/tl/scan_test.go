@@ -10,6 +10,7 @@ import (
 	"regexp/syntax"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
@@ -38,6 +39,28 @@ func TestRequiredLiterals(t *testing.T) {
 		if !equalNeedles(got, tt.want) {
 			t.Errorf("%q: got %#v, want %#v", tt.pattern, got, tt.want)
 		}
+	}
+}
+
+func TestContextKeepsPartialMatchesWhenFileReadFails(t *testing.T) {
+	opts, err := parseArgs([]string{"--grep", "needle", "-C", "1"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := newFilter(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := source{Path: filepath.Join(t.TempDir(), "partial.jsonl"), ID: "partial"}
+	got, _, _, _, _, readErr := f.readFileWithContext(src, nil, nil, func(_ string, _ func([]byte, transcript.ToolNames) bool, consume func(transcript.Event)) (transcript.Meta, error) {
+		consume(transcript.Event{Line: 1, Role: transcript.User, Who: "user", Text: "needle before read error"})
+		return transcript.Meta{}, fmt.Errorf("synthetic read failure")
+	})
+	if readErr == nil || !strings.Contains(readErr.Error(), src.Path) {
+		t.Fatalf("read error = %v, want error naming %s", readErr, src.Path)
+	}
+	if len(got) != 1 || got[0].ev.Text != "needle before read error" {
+		t.Fatalf("partial context hits = %#v, want the match before the read error", got)
 	}
 }
 
