@@ -28,6 +28,18 @@ type Follow struct {
 	skip int
 }
 
+// OnCodexCommands registers a callback for completed Codex shell commands (item_completed of a CommandExecution),
+// the same results ReadWithCodexCommandsDiscardOutput gives, without Output. It must be set before the first line is
+// fed. For a line the callback runs before the line's events; lines up to SkipThrough do not reach it. A Follow
+// started anew after ErrFollowRestart reads from the first line and gives the earlier results again.
+func (f *Follow) OnCodexCommands(fn func(CodexCommandResult)) error {
+	if f.rd.lineNo > 0 {
+		return errors.New("transcript: codex command callback after the first feed")
+	}
+	f.rd.commandFn = fn
+	return nil
+}
+
 // SkipThrough — строки с первой по n-ю (их события у вызывающего уже есть) Follow не разбирает целиком, а только
 // ведёт по ним состояние, как ReadWithTools для отброшенных фильтром строк: имена инструментов по id вызова и
 // состояние codex. События этих строк не отдаются, у следующих — те же, что дал бы полный разбор. Meta.Bad считает
