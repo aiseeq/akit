@@ -877,9 +877,11 @@ func reportWaitOutput(res result, sources []source, opts options, stdout, stderr
 			return 0
 		}
 	}
-	if n := opts.waitCache.misses.Load(); n > 0 {
-		// Причина промаха — запись под этот код ещё не писалась или транскрипт после неё дописан.
-		fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
+	if opts.waitCache != nil {
+		if n := opts.waitCache.misses.Load(); n > 0 {
+			// Причина промаха — запись под этот код ещё не писалась или транскрипт после неё дописан.
+			fmt.Fprintf(stderr, "tl: wait cache: %d of %d transcript(s) read without cache (no usable entry: first read under this tl code, a changed transcript, or a missing or damaged entry)\n", n, len(sources))
+		}
 	}
 	if opts.waitAll {
 		return reportWaitAll(res, stdout)

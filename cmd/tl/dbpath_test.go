@@ -25,6 +25,7 @@ import (
 
 	"github.com/aiseeq/akit/price"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 	"github.com/aiseeq/akit/transcriptdb"
 )
 
@@ -146,9 +147,9 @@ func newFakeCH(t *testing.T, paths []string, unloaded map[string]int) *fakeCH {
 			f.session = sourceFullID(source{Path: path, ID: path})[:8]
 		}
 		switch {
-		case isCodexRollout(path) && strings.Contains(path, string(filepath.Separator)+"worker"+string(filepath.Separator)):
+		case waitrec.IsRollout(path) && strings.Contains(path, string(filepath.Separator)+"worker"+string(filepath.Separator)):
 			f.kind = "codex"
-		case isCodexRollout(path):
+		case waitrec.IsRollout(path):
 			f.kind = transcriptdb.KindCodexExt
 		case strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)):
 			f.kind = "sub"

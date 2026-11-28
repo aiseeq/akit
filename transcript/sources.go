@@ -41,6 +41,9 @@ type Source struct {
 	Path, ID, ParentID, Description string
 }
 
+// IsRollout reports whether a transcript path uses Codex's rollout filename form.
+func IsRollout(path string) bool { return strings.HasPrefix(filepath.Base(path), "rollout-") }
+
 var sourceUUIDTail = regexp.MustCompile(`([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
 
 // NewSource describes a transcript path, extracting its session id when present.
@@ -94,8 +97,7 @@ func AllSourcesWindow(home string, since, until time.Time, project string, codex
 func SelectSources(paths []string, since, until time.Time, project string) ([]Source, error) {
 	var out []Source
 	for _, p := range paths {
-		codexSource := strings.Contains(p, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator)) ||
-			strings.HasPrefix(filepath.Base(p), "rollout-")
+		codexSource := strings.Contains(p, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator)) || IsRollout(p)
 		pathMatches := projectPathMatches(p, project)
 		if !pathMatches && !codexSource {
 			continue
@@ -296,7 +298,7 @@ func AllSourcesWalkOrder(home string, since time.Time, project string, codex, in
 				return nil
 			}
 			if strings.Contains(root, filepath.Join(".local", "state", "worker")) &&
-				(!strings.Contains(path, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator)) || !strings.HasPrefix(filepath.Base(path), "rollout-")) {
+				(!strings.Contains(path, string(filepath.Separator)+"codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator)) || !IsRollout(path)) {
 				return nil
 			}
 			if src, ok := byPath[path]; ok {

@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 )
 
 // hit — событие с его файлом.
@@ -756,7 +757,7 @@ func (f *filter) fileWithRawSummary(src source) ([]hit, []time.Duration, []waitS
 	if f.opts.waitProg != "" || f.opts.waitAll {
 		wt = newWaitTracker(f.opts)
 	}
-	if wt != nil && (f.opts.waitCache != nil || isCodexRollout(src.Path)) {
+	if wt != nil && (f.opts.waitCache != nil || waitrec.IsRollout(src.Path)) {
 		hits, waits, rows, meta, err := f.cachedWaitFile(src, wt)
 		return hits, waits, rows, meta, rawSummary{}, err
 	}
@@ -824,13 +825,13 @@ func (f *filter) cachedWaitFile(src source, wt *waitTracker) ([]hit, []time.Dura
 }
 
 func (f *filter) cachedWaitEventInWindow(event *cachedWaitEvent) bool {
-	text := event.Text
+	text := ""
 	if event.Role == transcript.Cmd {
 		text = event.Command
 	}
 	return f.inWindow(transcript.Event{
 		Role: event.Role, Text: text, Time: event.Time, CallID: event.CallID, Line: event.Line,
-		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain, Error: event.Error, Raw: event.Raw,
+		MessageID: event.MessageID, Who: event.Who, Sidechain: event.Sidechain,
 	})
 }
 
@@ -864,11 +865,10 @@ func (f *filter) readEvents(path string, keep func([]byte, transcript.ToolNames)
 // waitEvents: through the cache when there is one; a codex rollout without it is
 // read the same way, since its command completions need matching to the calls.
 func (f *filter) waitEvents(path string) ([]cachedWaitEvent, error) {
-	codex := isCodexRollout(path)
 	if f.opts.waitCache != nil {
-		return f.opts.waitCache.events(path, codex)
+		return f.opts.waitCache.events(path)
 	}
-	return readWaitEvents(path, codex)
+	return readWaitEvents(path)
 }
 
 // scan читает файлы параллельно; ошибка одного файла не мешает остальным и уходит в итог (result.errs).

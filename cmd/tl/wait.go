@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/aiseeq/akit/shellcmd"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 	transcriptwaits "github.com/aiseeq/akit/transcript/waits"
 )
 
@@ -66,15 +66,10 @@ func newWaitTracker(opts options) *waitTracker {
 }
 
 func (t *waitTracker) event(ev transcript.Event) {
-	command, bg := "", false
-	if ev.Role == transcript.Cmd {
-		command, bg = waitCommand(ev)
+	record := waitrec.FromEvent(ev)
+	if waitrec.Keep(record) {
+		t.eventCall(cachedWaitEvent{Record: record})
 	}
-	t.eventCall(cachedWaitEvent{
-		Role: ev.Role, CallID: ev.CallID, Text: ev.Text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID,
-		Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: ev.Raw,
-		Command: command, BG: bg,
-	})
 }
 
 func (t *waitTracker) eventCall(event cachedWaitEvent) {
@@ -86,8 +81,8 @@ func (t *waitTracker) eventCall(event cachedWaitEvent) {
 }
 
 func (t *waitTracker) trackCall(event cachedWaitEvent) {
-	if session, ok := waitPollSession(event); ok {
-		call := &waitCall{poll: true, session: session, at: event.Time}
+	if event.Poll {
+		call := &waitCall{poll: true, session: event.Session, at: event.Time}
 		t.calls[event.CallID] = call
 		return
 	}
@@ -97,7 +92,7 @@ func (t *waitTracker) trackCall(event cachedWaitEvent) {
 		clear(t.messages)
 		t.current = event.MessageID
 	}
-	if event.Command == "" && (event.MessageID == "" || event.Sidechain || !isSerialTool(event.Who)) {
+	if !waitrec.Keep(event.Record) {
 		return
 	}
 	call := t.calls[event.CallID]
@@ -112,18 +107,10 @@ func (t *waitTracker) trackCall(event cachedWaitEvent) {
 	}
 	call.count++
 	call.bg = call.bg || event.BG
-	if call.count == 1 && event.MessageID != "" && !event.Sidechain && isSerialTool(event.Who) {
+	if call.count == 1 && event.MessageID != "" && !event.Sidechain && waitrec.Serial(event.Who) {
 		t.messages[event.MessageID] = append(t.messages[event.MessageID], call)
 	}
 	t.calls[event.CallID] = call
-}
-
-func waitPollSession(event cachedWaitEvent) (string, bool) {
-	if event.Who != "write_stdin" && !(event.Who == "exec" && strings.Contains(event.Command, "write_stdin(") && !strings.Contains(event.Command, "exec_command(")) {
-		return "", false
-	}
-	session := transcriptwaits.SessionOf(transcript.Event{Text: event.Command, Raw: event.Raw})
-	return session, session != ""
 }
 
 func (t *waitTracker) trackResult(event cachedWaitEvent) {
@@ -133,7 +120,7 @@ func (t *waitTracker) trackResult(event cachedWaitEvent) {
 	}
 	if call.poll {
 		delete(t.calls, event.CallID)
-		if _, running := transcriptwaits.Running(event.Text); running {
+		if event.Running {
 			return
 		}
 		wait := t.sessions[call.session]
@@ -144,9 +131,9 @@ func (t *waitTracker) trackResult(event cachedWaitEvent) {
 		return
 	}
 	call.done, call.result = true, event.Time
-	call.refused = event.Error && permissionRefusal(event.Raw)
+	call.refused = event.ErrText != "" && permissionRefusal([]byte(event.ErrText))
 	delete(t.calls, event.CallID)
-	if session, running := transcriptwaits.Running(event.Text); running && call.codex {
+	if session, running := event.Session, event.Running; running && call.codex {
 		// Сессию с тем же номером получила новая команда: брошенное ожидание прежней не кончится её опросом.
 		delete(t.sessions, session)
 		if call.command != "" && call.count == 1 && !call.bg && !call.refused && t.matches(call) {
@@ -225,15 +212,6 @@ func (t *waitTracker) cachedEvent(event cachedWaitEvent) {
 	if call := t.calls[event.CallID]; first && call != nil && event.Command != "" {
 		call.calls, call.invalid, call.parsed = event.Calls, event.Invalid, true
 	}
-}
-
-var parallelTools = map[string]bool{
-	"Read": true, "Grep": true, "Glob": true, "WebFetch": true, "WebSearch": true, "Agent": true,
-	"Task": true, "TaskCreate": true, "TaskGet": true, "TaskList": true, "TaskOutput": true, "TaskStop": true,
-}
-
-func isSerialTool(tool string) bool {
-	return !parallelTools[tool] && !strings.HasPrefix(tool, "Task")
 }
 
 func permissionRefusal(raw []byte) bool {
@@ -316,38 +294,6 @@ func reportWaitAll(res result, stdout io.Writer) int {
 		fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\t%d\t%d\t%d\n", k.day, k.program, k.sub, len(waits), sum.Milliseconds(), p95.Milliseconds(), max.Milliseconds())
 	}
 	return 0
-}
-
-func waitCommand(ev transcript.Event) (string, bool) {
-	if ev.Who == "Bash" {
-		var input struct {
-			Command         string `json:"command"`
-			RunInBackground bool   `json:"run_in_background"`
-		}
-		if json.Unmarshal(ev.Raw, &input) == nil {
-			if input.Command != "" {
-				return input.Command, input.RunInBackground
-			}
-			return ev.Text, input.RunInBackground
-		}
-	}
-	if ev.Who != "exec" && ev.Who != "exec_command" && ev.Who != "shell" {
-		return "", false
-	}
-	command := ev.Text
-	if command == "" {
-		var input struct {
-			Cmd     string `json:"cmd"`
-			Command string `json:"command"`
-		}
-		if json.Unmarshal(ev.Raw, &input) == nil {
-			command = input.Cmd
-			if command == "" {
-				command = input.Command
-			}
-		}
-	}
-	return command, false
 }
 
 func matchedWaitCommand(command, prog, sub string) bool {

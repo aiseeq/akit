@@ -16,6 +16,7 @@ import (
 	"github.com/aiseeq/akit/rates"
 	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 )
 
 // tally — расход ответов модели: токены и цена по API.
@@ -281,7 +282,7 @@ func usageScope(sources []source, opts options, e env) string {
 		}
 	}
 	scope := "read: " + read + "; not counted: runs without a transcript (claude -p --no-session-persistence)"
-	if opts.codex || opts.codexExt || slices.ContainsFunc(sources, func(s source) bool { return isCodexRollout(s.Path) }) {
+	if opts.codex || opts.codexExt || slices.ContainsFunc(sources, func(s source) bool { return waitrec.IsRollout(s.Path) }) {
 		scope += "; codex rollout token_count included"
 	}
 	if opts.codexExt {
@@ -371,6 +372,3 @@ func usageProvider(model string) string {
 		return ""
 	}
 }
-
-// isCodexRollout — файл codex: codex называет журналы сессий rollout-<время>-<id>.jsonl.
-func isCodexRollout(path string) bool { return strings.HasPrefix(filepath.Base(path), "rollout-") }

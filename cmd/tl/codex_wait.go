@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 )
 
 type codexWaitResult struct {
@@ -59,18 +60,22 @@ func matchCodexWaitResults(events []codexWaitCall, results []transcript.CodexCom
 	positions := make([]int, len(events))
 	nextCall := 0
 	for _, result := range results {
-		for nextCall < len(events) && events[nextCall].line <= result.Line {
+		done, ok := waitrec.Done(result)
+		if !ok { //nolint:fallback-return // Invalid completions still consume their matching call, but output time supplies the end.
+			done.Time = time.Time{}
+		}
+		for nextCall < len(events) && events[nextCall].line <= done.Line {
 			key := codexCommandWord(normalized[nextCall])
 			positions[nextCall] = len(pending[key])
 			pending[key] = append(pending[key], nextCall)
 			nextCall++
 		}
-		command := normalizeCodexCommand(result.Command)
+		command := normalizeCodexCommand(done.Command)
 		key := codexCommandWord(command)
 		candidate := -1
 		for _, index := range pending[key] {
 			call := events[index]
-			if call.at.IsZero() || call.out.IsZero() || result.Started.Before(call.at.Add(-time.Second)) || result.Started.After(call.out.Add(time.Second)) || !strings.HasPrefix(command, normalized[index]) {
+			if call.at.IsZero() || call.out.IsZero() || done.Started.Before(call.at.Add(-time.Second)) || done.Started.After(call.out.Add(time.Second)) || !strings.HasPrefix(command, normalized[index]) {
 				continue
 			}
 			if candidate < 0 || call.line > events[candidate].line || call.line == events[candidate].line && index > candidate {
@@ -84,7 +89,7 @@ func matchCodexWaitResults(events []codexWaitCall, results []transcript.CodexCom
 			list[position] = list[last]
 			positions[list[position]] = position
 			pending[key] = list[:last]
-			matcher.record(events[candidate], result)
+			matcher.record(events[candidate], done)
 		}
 	}
 	matcher.indexCalls(events)
@@ -98,9 +103,9 @@ func codexCommandWord(command string) string {
 	return command
 }
 
-func (m *codexWaitMatcher) record(event codexWaitCall, result transcript.CodexCommandResult) {
+func (m *codexWaitMatcher) record(event codexWaitCall, result waitrec.Record) {
 	key := codexWaitEventKey{line: event.line, call: event.call, text: event.text}
-	m.byEvent[key] = append(m.byEvent[key], codexWaitResult{command: result.Command, end: result.Completed})
+	m.byEvent[key] = append(m.byEvent[key], codexWaitResult{command: result.Command, end: result.Time})
 }
 
 func (m *codexWaitMatcher) indexCalls(events []codexWaitCall) {

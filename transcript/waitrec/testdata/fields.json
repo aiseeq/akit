@@ -1,0 +1,24 @@
+{
+  "events": [
+    {"role":"cmd","who":"Bash","call_id":"bash-bg","time":"2026-11-27T10:00:00Z","message_id":"m1","text":"fallback","raw":"{\"command\":\"make test\",\"run_in_background\":true}"},
+    {"role":"cmd","who":"exec","call_id":"exec-cmd","time":"2026-11-27T10:00:01Z","message_id":"m1","text":"","raw":"{\"cmd\":\"go test ./...\"}"},
+    {"role":"cmd","who":"exec_command","call_id":"exec-command","time":"2026-11-27T10:00:02Z","message_id":"m1","text":"","raw":"{\"command\":\"git status\"}"},
+    {"role":"cmd","who":"write_stdin","call_id":"poll","time":"2026-11-27T10:00:03Z","message_id":"m1","text":"","raw":"{\"session_id\":42}"},
+    {"role":"cmd","who":"exec","call_id":"exec-poll","time":"2026-11-27T10:00:04Z","message_id":"m1","text":"write_stdin({session_id:43})","raw":"{\"session_id\":43}"},
+    {"role":"out","who":"Bash","call_id":"err","time":"2026-11-27T10:00:05Z","error":true,"text":"permission denied","raw":"{\"message\":\"permission denied\"}"},
+    {"role":"out","who":"Bash","call_id":"running","time":"2026-11-27T10:00:06Z","text":"Process running with session ID 44"},
+    {"role":"out","who":"Bash","call_id":"finished","time":"2026-11-27T10:00:07Z","text":"done"},
+    {"role":"cmd","who":"Edit","call_id":"edit","time":"2026-11-27T10:00:08Z","message_id":"m2","text":"file.go"},
+    {"role":"cmd","who":"Edit","call_id":"side-edit","time":"2026-11-27T10:00:08Z","message_id":"m2","sidechain":true,"text":"side.go"},
+    {"role":"cmd","who":"Read","call_id":"side-read","time":"2026-11-27T10:00:09Z","message_id":"m2","sidechain":true,"text":"file.go"},
+    {"role":"cmd","who":"Grep","call_id":"parallel-read","time":"2026-11-27T10:00:10Z","message_id":"m2","text":"needle"},
+    {"role":"cmd","who":"TaskCustom","call_id":"parallel-task","time":"2026-11-27T10:00:10Z","message_id":"m2","text":"task"},
+    {"role":"cmd","who":"Bash","call_id":"bash-text-fallback","time":"2026-11-27T10:00:10Z","message_id":"m2","text":"fallback from event text","raw":"{\"command\":\"\",\"run_in_background\":false}"},
+    {"role":"agent","who":"assistant","call_id":"agent","time":"2026-11-27T10:00:11Z","message_id":"m3","text":"finished"}
+  ],
+  "done": [
+    {"line":40,"started":"2026-11-27T10:01:00Z","completed":"2026-11-27T10:01:03Z","command":"go test ./..."},
+    {"line":41,"started":"2026-11-27T10:02:00Z","completed":"1970-01-01T00:00:00Z","command":"tk done zero"},
+    {"line":42,"started":"2026-11-27T10:03:00Z","completed":"2026-11-27T10:03:04Z","command":""}
+  ]
+}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 	"github.com/aiseeq/akit/transcriptdb"
 )
 
@@ -119,7 +120,7 @@ func kindOf(home string, src transcript.Source) (kind, project string) {
 		task, _, _ := strings.Cut(rel, sep)
 		return "codex", "worker:" + task
 	}
-	if strings.HasPrefix(filepath.Base(src.Path), "rollout-") {
+	if waitrec.IsRollout(src.Path) {
 		return transcriptdb.KindCodexExt, ""
 	}
 	if strings.Contains(src.Path, sep+"codex"+sep+"sessions"+sep) {

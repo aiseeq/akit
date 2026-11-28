@@ -21,6 +21,7 @@ import (
 	"github.com/aiseeq/akit/price"
 	"github.com/aiseeq/akit/session"
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 	"github.com/aiseeq/akit/transcriptdb"
 )
 
@@ -523,7 +524,7 @@ const codexKindsSQL = "('codex', '" + transcriptdb.KindCodexExt + "')"
 // root outside worker is codex-ext there, its files row tells (storedHits).
 func kindOfSource(src source) string {
 	switch {
-	case isCodexRollout(src.Path):
+	case waitrec.IsRollout(src.Path):
 		return "codex"
 	case src.ParentID != "":
 		return "sub"
@@ -846,7 +847,7 @@ func (d *dbPath) badLines(inDB []stored, out map[string]badLines) error {
 
 func (d *dbPath) storedBadLines(s stored, lines []storedRawLine) (badLines, error) {
 	fl := transcript.NewFollow()
-	codex := isCodexRollout(s.src.Path)
+	codex := waitrec.IsRollout(s.src.Path)
 	if codex {
 		for _, line := range lines {
 			if err := fl.Prescan(append(bytes.Clone(line.b), '\n')); err != nil {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
+	"github.com/aiseeq/akit/transcript/waitrec"
 )
 
 func writeWaitTranscript(t *testing.T, e env, name, contents string) string {
@@ -320,8 +321,8 @@ func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
 		if s.refused {
 			raw = []byte(`{"error":"permission denied by user"}`)
 		}
-		all.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: s.id, Time: at, Who: "Bash", Command: s.command, BG: s.bg})
-		all.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: s.id, Time: at.Add(s.delay), Error: s.refused, Raw: raw})
+		all.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: s.id, Time: at, Who: "Bash", Command: s.command, BG: s.bg}})
+		all.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: s.id, Time: at.Add(s.delay), ErrText: string(raw)}})
 	}
 	groups := map[string][]time.Duration{}
 	byProgramDay := map[string][]time.Duration{}
@@ -388,8 +389,8 @@ func TestWaitAllPropertyAndDailyTSV(t *testing.T) {
 func TestWaitAllKeepsMidnightCrossingOnStartDay(t *testing.T) {
 	start := time.Date(2026, 10, 25, 23, 59, 59, 0, time.Local)
 	tracker := newWaitTracker(options{waitAll: true})
-	tracker.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "cross", Time: start, Command: "alpha build"})
-	tracker.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "cross", Time: start.Add(3 * time.Second)})
+	tracker.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "cross", Time: start, Command: "alpha build"}})
+	tracker.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "cross", Time: start.Add(3 * time.Second)}})
 	if len(tracker.waitRows) != 1 || tracker.waitRows[0].At.In(time.Local).Format(time.DateOnly) != start.Format(time.DateOnly) {
 		t.Fatalf("midnight wait rows = %+v; want one row on start day %s", tracker.waitRows, start.Format(time.DateOnly))
 	}
@@ -435,8 +436,8 @@ func runWaitTrackerForSpecs(base time.Time, specs []waitAllTestSpec, program, su
 		if s.refused {
 			raw = []byte(`{"error":"permission denied by user"}`)
 		}
-		filtered.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: s.id, Time: at, Who: "Bash", Command: s.command, BG: s.bg})
-		filtered.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: s.id, Time: at.Add(s.delay), Error: s.refused, Raw: raw})
+		filtered.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: s.id, Time: at, Who: "Bash", Command: s.command, BG: s.bg}})
+		filtered.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: s.id, Time: at.Add(s.delay), ErrText: string(raw)}})
 	}
 	return filtered.waits
 }
@@ -467,6 +468,21 @@ func TestWaitStartsAfterEarlierSerialCallInSameMessage(t *testing.T) {
 			events = append(events, fmt.Sprintf("%s %s %s %s %s", ev.Role, ev.Who, ev.CallID, ev.MessageID, ev.Text))
 		})
 		t.Fatalf("waits = %v, want %v; events=%v readErr=%v", waits, want, events, readErr)
+	}
+}
+
+func TestWaitSerialExcludesReadFromMessageChain(t *testing.T) {
+	tracker := newWaitTracker(options{})
+	tracker.eventCall(cachedWaitEvent{Record: waitrec.Record{
+		Role: transcript.Cmd, CallID: "read", MessageID: "message", Who: "Read", Command: "tk done read",
+	}})
+	tracker.eventCall(cachedWaitEvent{Record: waitrec.Record{
+		Role: transcript.Cmd, CallID: "next", MessageID: "message", Who: "Bash", Command: "tk done next",
+	}})
+
+	chain := tracker.messages["message"]
+	if len(chain) != 1 || chain[0].command != "tk done next" {
+		t.Fatalf("message chain = %#v, want only the sequential Bash call", chain)
 	}
 }
 
@@ -521,14 +537,14 @@ func TestWaitExcludesBackgroundPermissionRefusalAndSidechainPredecessor(t *testi
 func TestWaitPreToolUseHookErrorIsRefusal(t *testing.T) {
 	start := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
 	denied := newWaitTracker(options{waitProg: "tk", waitSub: "done"})
-	denied.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "hook", Time: start, Command: "tk done hook", Who: "Bash"})
-	denied.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "hook", Time: start.Add(30 * time.Second), Error: true, Raw: []byte(`{"content":"PreToolUse:Bash hook error"}`)})
+	denied.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "hook", Time: start, Command: "tk done hook", Who: "Bash"}})
+	denied.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "hook", Time: start.Add(30 * time.Second), ErrText: `{"content":"PreToolUse:Bash hook error"}`}})
 	if len(denied.waits) != 0 {
 		t.Fatalf("PreToolUse refusal produced waits %v", denied.waits)
 	}
 	allowed := newWaitTracker(options{waitProg: "tk", waitSub: "done"})
-	allowed.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "ok", Time: start, Command: "tk done hook", Who: "Bash"})
-	allowed.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "ok", Time: start.Add(2 * time.Second), Raw: []byte(`{"content":"command ran"}`)})
+	allowed.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "ok", Time: start, Command: "tk done hook", Who: "Bash"}})
+	allowed.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "ok", Time: start.Add(2 * time.Second)}})
 	if fmt.Sprint(allowed.waits) != fmt.Sprint([]time.Duration{2 * time.Second}) {
 		t.Fatalf("ordinary output waits = %v", allowed.waits)
 	}
@@ -859,6 +875,57 @@ func TestWaitCodexUsesItemCompletionTime(t *testing.T) {
 	}
 }
 
+func TestWaitCodexZeroCompletionUsesOutputTime(t *testing.T) {
+	e := fakeHome(t)
+	base := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	rows := []string{
+		`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`,
+	}
+	for i := 1; i <= 3; i++ {
+		call := base.Add(time.Duration(i) * time.Second)
+		started := call.Add(time.Second).UnixMilli()
+		rows = append(rows,
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c%d","name":"exec","input":%q}}`, call.Format(time.RFC3339), i, `exec_command({cmd:"tk done zero"})`),
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":0,"item":{"type":"CommandExecution","command":["/bin/bash","-lc","tk done zero"],"exit_code":0,"aggregated_output":"ok"}}}`, started),
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c%d","output":"ok"}}`, call.Add(5*time.Second).Format(time.RFC3339), i),
+		)
+	}
+	path := writeWaitTranscript(t, e, "rollout-zero-completion.jsonl", strings.Join(rows, "\n")+"\n")
+	code, out, stderr := runTL(t, e, "--wait", "tk done", "--q", "50", path)
+	if code != 0 || out != "5000\n" || !strings.Contains(stderr, "3 wait event(s)") {
+		t.Fatalf("zero completion wait = (%d, %q, %q), want output-time 5000ms", code, out, stderr)
+	}
+}
+
+func TestWaitCodexZeroCompletionDoesNotStealNextSameCommand(t *testing.T) {
+	e := fakeHome(t)
+	rows := []string{`{"timestamp":"2026-10-25T10:00:00Z","type":"session_meta","payload":{"id":"synthetic"}}`}
+	for i := range 3 {
+		a := time.Date(2026, 10, 25, 10, i, 1, 0, time.UTC)
+		b := a.Add(5500 * time.Millisecond)
+		rows = append(rows,
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"function_call","call_id":"a%d","name":"exec_command","arguments":"{\"cmd\":\"tk done x\"}"}}`, a.Format(time.RFC3339Nano), i),
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":0,"item":{"type":"CommandExecution","command":["/bin/bash","-lc","tk done x"],"exit_code":0}}}`, a.UnixMilli()),
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"function_call_output","call_id":"a%d","output":"ok"}}`, a.Add(5*time.Second).Format(time.RFC3339Nano), i),
+			fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"function_call","call_id":"b%d","name":"exec_command","arguments":"{\"cmd\":\"tk done x\"}"}}`, b.Format(time.RFC3339Nano), i),
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":%d,"completed_at_ms":%d,"item":{"type":"CommandExecution","command":["/bin/bash","-lc","tk done x"],"exit_code":0}}}`, b.UnixMilli(), b.Add(20*time.Second).UnixMilli()),
+		)
+	}
+	path := writeWaitTranscript(t, e, "rollout-zero-steal.jsonl", strings.Join(rows, "\n")+"\n")
+	code, out, stderr := runTL(t, e, "--wait", "tk done", "--q", "50", path)
+	if code != 0 || out != "5000\n" || !strings.Contains(stderr, "3 wait event(s)") {
+		t.Fatalf("zero completion matching = (%d, %q, %q), want 5000ms from each output", code, out, stderr)
+	}
+}
+
+func TestReportWaitOutputWithoutCache(t *testing.T) {
+	var stdout, stderr strings.Builder
+	code := reportWaitOutput(result{}, nil, options{q: 50}, &stdout, &stderr)
+	if code != 3 || !strings.Contains(stderr.String(), "0 wait event(s)") {
+		t.Fatalf("report without cache = (%d, %q, %q), want insufficient-events report", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestWaitCodexMatchesCommandResultsByText(t *testing.T) {
 	e := fakeHome(t)
 	base := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
@@ -917,7 +984,7 @@ func TestWaitCodexRejectsStartAfterOutputAllowance(t *testing.T) {
 func TestWaitCodexRejectsStartBeforeCallAllowance(t *testing.T) {
 	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
 	call := codexWaitCall{line: 2, call: "not-started-yet", text: "tl result", at: base, out: base.Add(time.Second)}
-	result := transcript.CodexCommandResult{Line: 4, Started: base.Add(-2500 * time.Millisecond), Command: call.text}
+	result := transcript.CodexCommandResult{Line: 4, Started: base.Add(-2500 * time.Millisecond), Completed: base, Command: call.text}
 	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
 	if len(matcher.byEvent) != 0 {
 		t.Fatalf("completion started before the call allowance matched: %+v", matcher.byEvent)
@@ -927,7 +994,7 @@ func TestWaitCodexRejectsStartBeforeCallAllowance(t *testing.T) {
 func TestWaitCodexRejectsMissingCallStartTime(t *testing.T) {
 	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
 	call := codexWaitCall{line: 2, call: "missing-start", text: "tl result", out: base}
-	result := transcript.CodexCommandResult{Line: 4, Command: call.text}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Completed: base.Add(time.Second), Command: call.text}
 	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
 	if len(matcher.byEvent) != 0 {
 		t.Fatalf("result matched a call with no start time: %+v", matcher.byEvent)
@@ -956,7 +1023,7 @@ func TestWaitCodexUsesFullCommandPrefixWithinOverlappingWindows(t *testing.T) {
 func TestWaitCodexSplitsCommandWordOnTab(t *testing.T) {
 	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
 	call := codexWaitCall{line: 2, call: "tab", text: "tk", at: base, out: base.Add(time.Second)}
-	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: "tk\tdone arg"}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Completed: base.Add(time.Second), Command: "tk\tdone arg"}
 	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
 	if len(matcher.byEvent[codexWaitEventKey{line: call.line, call: call.call, text: call.text}]) != 1 {
 		t.Fatal("tab-separated command word did not match")
@@ -984,7 +1051,7 @@ func TestWaitCodexDoesNotReplaceOutputWithZeroCompletionTime(t *testing.T) {
 	call := codexWaitCall{line: 2, call: "zero-end", text: "tl result", at: base, out: base.Add(time.Second)}
 	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: call.text}
 	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
-	out := cachedWaitEvent{Role: transcript.Out, CallID: call.call, Time: base.Add(2 * time.Second)}
+	out := cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: call.call, Time: base.Add(2 * time.Second)}}
 	matcher.applyCached(&out)
 	if !out.Time.Equal(base.Add(2 * time.Second)) {
 		t.Fatalf("output time = %v, was replaced with zero completion time", out.Time)
@@ -1018,7 +1085,7 @@ func TestWaitCodexRejectsCompletionStartedBeforeCall(t *testing.T) {
 func TestWaitCodexNormalizesQuotedCommandText(t *testing.T) {
 	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
 	call := codexWaitCall{line: 2, call: "quoted", text: "  tl 'quoted arg'\\n--flag  ", at: base, out: base.Add(time.Second)}
-	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: "tl 'quoted arg'\n--flag"}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Completed: base.Add(time.Second), Command: "tl 'quoted arg'\n--flag"}
 	matcher := matchCodexWaitResults([]codexWaitCall{call}, []transcript.CodexCommandResult{result})
 	if len(matcher.byEvent[codexWaitEventKey{line: call.line, call: call.call, text: call.text}]) != 1 {
 		t.Fatal("trimmed command with escaped newline was not matched")
@@ -1048,7 +1115,7 @@ func TestWaitCodexBreaksSameLineCandidateTieByOrder(t *testing.T) {
 	base := time.Date(2026, 11, 10, 14, 0, 0, 0, time.UTC)
 	first := codexWaitCall{line: 2, call: "first", text: "tl tie", at: base, out: base.Add(time.Second)}
 	last := codexWaitCall{line: 2, call: "last", text: "tl tie", at: base, out: base.Add(time.Second)}
-	result := transcript.CodexCommandResult{Line: 4, Started: base, Command: "tl tie"}
+	result := transcript.CodexCommandResult{Line: 4, Started: base, Completed: base.Add(time.Second), Command: "tl tie"}
 	matcher := matchCodexWaitResults([]codexWaitCall{first, last}, []transcript.CodexCommandResult{result})
 	if len(matcher.byEvent[codexWaitEventKey{line: last.line, call: last.call, text: last.text}]) != 1 || len(matcher.byEvent[codexWaitEventKey{line: first.line, call: first.call, text: first.text}]) != 0 {
 		t.Fatalf("same-line result did not go to the last candidate: %+v", matcher.byEvent)
@@ -1121,19 +1188,19 @@ func TestWaitTrackerKeepsOnlyCurrentMessage(t *testing.T) {
 	tr := newWaitTracker(options{waitProg: "worker", waitSub: "run"})
 	at := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
 	for i, id := range []string{"c1", "c2"} {
-		tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: id, Time: at, Line: i + 1, MessageID: "m1", Who: "Bash", Command: "worker run x"})
+		tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: id, Time: at, Line: i + 1, MessageID: "m1", Who: "Bash", Command: "worker run x"}})
 	}
-	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c1", Time: at.Add(10 * time.Second), Line: 3})
-	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c2", Time: at.Add(25 * time.Second), Line: 4})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "c1", Time: at.Add(10 * time.Second), Line: 3}})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "c2", Time: at.Add(25 * time.Second), Line: 4}})
 	if len(tr.waits) != 2 || tr.waits[1] != 15*time.Second {
 		t.Errorf("waits %v, want [10s 15s]", tr.waits)
 	}
-	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "c3", Time: at.Add(30 * time.Second), Line: 5, MessageID: "m2", Who: "Bash", Command: "worker run y"})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "c3", Time: at.Add(30 * time.Second), Line: 5, MessageID: "m2", Who: "Bash", Command: "worker run y"}})
 	if len(tr.messages) != 1 || len(tr.messages["m2"]) != 1 {
 		t.Errorf("messages after the next one: %v", tr.messages)
 	}
 	// Подагент (sidechain) со своим сообщением не сбрасывает сообщение родителя.
-	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "s1", Time: at.Add(31 * time.Second), Line: 6, MessageID: "sub", Who: "Bash", Command: "ls", Sidechain: true})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "s1", Time: at.Add(31 * time.Second), Line: 6, MessageID: "sub", Who: "Bash", Command: "ls", Sidechain: true}})
 	if len(tr.messages["m2"]) != 1 {
 		t.Errorf("sidechain message dropped the parent one: %v", tr.messages)
 	}
@@ -1143,10 +1210,10 @@ func TestWaitTrackerKeepsOnlyCurrentMessage(t *testing.T) {
 func TestWaitStartAfterEditAndSameLine(t *testing.T) {
 	tr := newWaitTracker(options{waitProg: "worker", waitSub: "run"})
 	at := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
-	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "e1", Time: at, Line: 7, MessageID: "m1", Who: "Edit"})
-	tr.eventCall(cachedWaitEvent{Role: transcript.Cmd, CallID: "c1", Time: at, Line: 7, MessageID: "m1", Who: "Bash", Command: "worker run x"})
-	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "e1", Time: at.Add(4 * time.Second), Line: 8})
-	tr.eventCall(cachedWaitEvent{Role: transcript.Out, CallID: "c1", Time: at.Add(19 * time.Second), Line: 9})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "e1", Time: at, Line: 7, MessageID: "m1", Who: "Edit"}})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Cmd, CallID: "c1", Time: at, Line: 7, MessageID: "m1", Who: "Bash", Command: "worker run x"}})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "e1", Time: at.Add(4 * time.Second), Line: 8}})
+	tr.eventCall(cachedWaitEvent{Record: waitrec.Record{Role: transcript.Out, CallID: "c1", Time: at.Add(19 * time.Second), Line: 9}})
 	if len(tr.waits) != 1 || tr.waits[0] != 15*time.Second {
 		t.Errorf("waits %v, want [15s]: Edit of the same message and line comes first", tr.waits)
 	}

@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/aiseeq/akit/transcript"
-	transcriptwaits "github.com/aiseeq/akit/transcript/waits"
+	"github.com/aiseeq/akit/transcript/waitrec"
 )
 
 const waitCacheMaxAge = 30 * 24 * time.Hour
@@ -25,25 +25,14 @@ const waitCacheMaxAge = 30 * 24 * time.Hour
 var afterWaitRead = func(string) {}
 
 // waitCacheVersion — формат записи кэша ожиданий.
-const waitCacheVersion = 9
+const waitCacheVersion = 10
 
 var errWaitCacheDecode = errors.New("invalid wait cache entry")
 
 type cachedWaitEvent struct {
-	Role      transcript.Role
-	CallID    string
-	Text      string
-	Time      time.Time
-	Line      int
-	MessageID string
-	Who       string
-	Sidechain bool
-	Error     bool
-	Raw       []byte
-	Command   string
-	BG        bool
-	Calls     []cachedShellCall
-	Invalid   bool
+	waitrec.Record
+	Calls   []cachedShellCall
+	Invalid bool
 }
 
 type cachedShellCall struct {
@@ -197,7 +186,7 @@ func (c *waitCache) cleanup(now time.Time) {
 	}
 }
 
-func (c *waitCache) events(path string, codex bool) ([]cachedWaitEvent, error) {
+func (c *waitCache) events(path string) ([]cachedWaitEvent, error) {
 	if events, state, err := c.load(path, true); err == nil && state == waitCacheHit {
 		return events, nil
 	} else if err != nil && !errors.Is(err, errWaitCacheDecode) {
@@ -208,7 +197,7 @@ func (c *waitCache) events(path string, codex bool) ([]cachedWaitEvent, error) {
 		return nil, err
 	}
 	c.misses.Add(1)
-	events, err := readWaitEvents(path, codex)
+	events, err := readWaitEvents(path)
 	if err != nil {
 		return nil, err
 	}
@@ -222,13 +211,17 @@ func (c *waitCache) events(path string, codex bool) ([]cachedWaitEvent, error) {
 
 // readWaitEvents reads what a wait needs; a codex rollout gets its command
 // completions in the same pass, matched to the calls.
-func readWaitEvents(path string, codex bool) ([]cachedWaitEvent, error) {
+func readWaitEvents(path string) ([]cachedWaitEvent, error) {
 	events := make([]cachedWaitEvent, 0)
 	var commandResults []transcript.CodexCommandResult
 	var err error
 	addEvent := func(ev transcript.Event) {
-		events = append(events, cacheWaitEvents(ev)...)
+		if record := waitrec.FromEvent(ev); waitrec.Keep(record) {
+			calls, invalid := cachedCallsFor(record.Command)
+			events = append(events, cachedWaitEvent{Record: record, Calls: calls, Invalid: invalid})
+		}
 	}
+	codex := waitrec.IsRollout(path)
 	if codex {
 		_, err = transcript.ReadWithCodexCommandsDiscardOutput(path, addEvent, func(result transcript.CodexCommandResult) {
 			commandResults = append(commandResults, result)
@@ -248,51 +241,11 @@ func readWaitEvents(path string, codex bool) ([]cachedWaitEvent, error) {
 	return events, nil
 }
 
-func cacheWaitEvents(ev transcript.Event) []cachedWaitEvent {
-	if ev.Role == transcript.Cmd {
-		command, bg := waitCommand(ev)
-		if _, poll := waitPollSession(cacheWaitCall(ev, command, bg, nil, false)); poll {
-			return []cachedWaitEvent{cacheWaitCall(ev, command, bg, nil, false)}
-		}
-		if command == "" && ev.MessageID != "" && !ev.Sidechain && isSerialTool(ev.Who) {
-			// Последовательный инструмент без команды (Edit, Write) — предшественник для начала соседа.
-			return []cachedWaitEvent{cacheWaitCall(ev, "", false, nil, false)}
-		}
-		if command != "" {
-			cachedCalls, invalid := parseWaitCalls(command)
-			return []cachedWaitEvent{cacheWaitCall(ev, command, bg, cachedCalls, invalid)}
-		}
-	} else if ev.Role == transcript.Out {
-		// Текст вывода нужен только ошибке: по нему узнаётся отказ разрешения; весь вывод раздул бы кэш.
-		var raw []byte
-		if ev.Error {
-			raw = append([]byte(nil), ev.Raw...)
-		}
-		text := ""
-		if _, running := transcriptwaits.Running(ev.Text); running {
-			text = ev.Text
-		}
-		return []cachedWaitEvent{{Role: ev.Role, CallID: ev.CallID, Text: text, Time: ev.Time, Line: ev.Line, MessageID: ev.MessageID, Who: ev.Who, Sidechain: ev.Sidechain, Error: ev.Error, Raw: raw}}
+func cachedCallsFor(command string) ([]cachedShellCall, bool) {
+	if command == "" {
+		return nil, false
 	}
-	return nil
-}
-
-func cacheWaitCall(ev transcript.Event, command string, bg bool, calls []cachedShellCall, invalid bool) cachedWaitEvent {
-	var cached cachedWaitEvent
-	cached.Role = ev.Role
-	cached.CallID = ev.CallID
-	cached.Time = ev.Time
-	cached.Line = ev.Line
-	cached.MessageID = ev.MessageID
-	cached.Who = ev.Who
-	cached.Sidechain = ev.Sidechain
-	cached.Error = ev.Error
-	cached.Raw = append([]byte(nil), ev.Raw...)
-	cached.Command = command
-	cached.BG = bg
-	cached.Calls = calls
-	cached.Invalid = invalid
-	return cached
+	return parseWaitCalls(command)
 }
 
 // saveRecord пишет запись атомарно: временный файл, Sync, переименование — усечённой записи читатель не
